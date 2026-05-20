@@ -1,4 +1,8 @@
-import { Shimmer3RClient, SensorBitmapShimmer3 } from "./shimmer3r.js";
+// NOTE: The extension imports the shared SDK dist rather than duplicating shimmer3r.js.
+// For local development, ensure `shimmer-ble-sdk/dist/shimmer-ble.esm.js` has been built
+// (`cd shimmer-ble-sdk && npm run build`).  For packaged extension releases, bundle or
+// copy the dist file and adjust this import accordingly.
+import { Shimmer3RClient, SensorBitmapShimmer3 } from "../shimmer-ble-sdk/dist/shimmer-ble.esm.js";
 // 1. Initialize Charts
 const gsrCtx = document.getElementById('gsrChart').getContext('2d');
 const ppgCtx = document.getElementById('ppgChart').getContext('2d');
