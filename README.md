@@ -10,7 +10,7 @@ Web Bluetooth demos and a typed JavaScript/TypeScript SDK for Shimmer sensor dev
 
 ```
 shimmer-ble-sdk/     ← @shimmerresearch/web-ble — TypeScript SDK (build → dist/)
-demos/               ← canonical source for all demo applications
+demos/               ← browser demos and GitHub Pages content
   break-gyro/        ┐
   break-emg/         │
   punch-highG/       │
@@ -20,18 +20,9 @@ demos/               ← canonical source for all demo applications
   ShimmerCapture/    │
   Verisense/         ┘
 shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Chrome)
-
-break-gyro/          ┐
-break-emg/           │
-punch-highG/         │
-brick/               │ compatibility redirect folders kept so the existing
-rythmgame-emggyro/   │ GitHub Pages URLs continue to work
-video-ppg/           │
-ShimmerCapture/      │
-Verisense/           ┘
 ```
 
-If you are editing demo code, work in `demos/`. The root-level demo folders are URL-preserving redirect wrappers only.
+If you are editing demo code, work in `demos/`.
 
 ---
 
@@ -42,20 +33,20 @@ If you are editing demo code, work in `demos/`. The root-level demo folders are 
 
 | Demo | Link |
 |---|---|
-| Gyro breakout game | [break-gyro](https://shimmerresearch.github.io/webBLEDemos/break-gyro/) |
-| EMG breakout game | [break-emg](https://shimmerresearch.github.io/webBLEDemos/break-emg/) |
-| 200 G accel punch detector | [punch-highG](https://shimmerresearch.github.io/webBLEDemos/punch-highG/) |
-| EMG + Gyro rhythm game | [rythmgame-emggyro](https://shimmerresearch.github.io/webBLEDemos/rythmgame-emggyro/) |
-| PPG heart-rate visualiser | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/video-ppg/) |
-| Two-device gyro brick game | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/) |
-| Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
+| Gyro breakout game | [break-gyro](https://shimmerresearch.github.io/webBLEDemos/demos/break-gyro/) |
+| EMG breakout game | [break-emg](https://shimmerresearch.github.io/webBLEDemos/demos/break-emg/) |
+| 200 G accel punch detector | [punch-highG](https://shimmerresearch.github.io/webBLEDemos/demos/punch-highG/) |
+| EMG + Gyro rhythm game | [rythmgame-emggyro](https://shimmerresearch.github.io/webBLEDemos/demos/rythmgame-emggyro/) |
+| PPG heart-rate visualiser | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/demos/video-ppg/) |
+| Two-device gyro brick game | [brick](https://shimmerresearch.github.io/webBLEDemos/demos/brick/) |
+| Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/demos/ShimmerCapture/) |
 
 ### Verisense
 **Requirements:** Verisense device (Pulse Plus or GSR Plus), Chrome/Edge
 
 | Demo | Link |
 |---|---|
-| Wrist sensor (accel + GSR streaming) | [Verisense](https://shimmerresearch.github.io/webBLEDemos/Verisense/) |
+| Wrist sensor (accel + GSR streaming) | [Verisense](https://shimmerresearch.github.io/webBLEDemos/demos/Verisense/) |
 
 ### Chrome Extension
 [Shimmer3R Chrome Extension](https://github.com/ShimmerEngineering/webBLEDemos/tree/main/shimmer-extension) — source code only; load via **chrome://extensions → Developer mode → Load unpacked**.

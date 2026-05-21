@@ -7,6 +7,4 @@ The page supports BLE streaming, optional Web Serial connection, operational con
 **Requirements:** Verisense device (Pulse Plus or GSR Plus), Chrome or Edge
 
 - Canonical source: [`/demos/Verisense/`](./)
-- Stable public URL: [https://shimmerresearch.github.io/webBLEDemos/Verisense/](https://shimmerresearch.github.io/webBLEDemos/Verisense/)
-
-The root-level `Verisense/` folder is kept only as a compatibility redirect so the existing public URL continues to work.
+- Live demo URL: [https://shimmerresearch.github.io/webBLEDemos/demos/Verisense/](https://shimmerresearch.github.io/webBLEDemos/demos/Verisense/)
