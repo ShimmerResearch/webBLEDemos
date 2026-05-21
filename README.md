@@ -42,7 +42,7 @@ If you are editing demo code, work in `demos/`.
 | Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/demos/ShimmerCapture/) |
 
 ### Verisense
-**Requirements:** Verisense device (Pulse Plus or GSR Plus), Chrome/Edge
+**Requirements:** Verisense device (IMU or Pulse+), Chrome/Edge
 
 | Demo | Link |
 |---|---|
