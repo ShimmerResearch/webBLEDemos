@@ -6,4 +6,7 @@ Connect a Shimmer3R over Web Bluetooth, configure sensors and sampling rate, the
 
 **Requirements:** Shimmer3R device, firmware ≥ v1.0.22, Chrome or Edge (Web Bluetooth required)
 
-[Live demo →](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)
+- Canonical source: [`/demos/ShimmerCapture/`](../ShimmerCapture/)
+- Stable public URL: [https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)
+
+The root-level `ShimmerCapture/` folder is kept only as a compatibility redirect so the existing public URL continues to work.

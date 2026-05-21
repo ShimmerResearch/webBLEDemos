@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-T26GWN0LJW');
+</script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Arcade Punching Bag</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: black;
+      color: white;
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: start;
+      height: 100vh;
+      overflow-x: hidden;
+      overflow-y: auto;
+    }
+
+    #controls {
+      margin: 15px 0;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 10px;
+    }
+
+    button {
+      padding: 10px 16px;
+      font-size: 16px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+    }
+
+    #scanBtn { background: #2196F3; color: white; }
+    #connectBtn { background: #4CAF50; color: white; }
+    #streamBtn { background: #FFC107; color: black; }
+    #disconnectBtn { background: #f44336; color: white; }
+    #resetScoreBtn { background: #9C27B0; color: white; }
+
+    #scoreDisplay, #statusConsole, #punchCounter {
+      margin: 10px 0;
+      font-size: 18px;
+      font-family: monospace;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 90vw;
+      text-align: center;
+    }
+
+    #punchingBag {
+      width: min(90vw, 360px);
+      height: calc(min(90vw, 360px) * 1.5);
+      background-image: url('idle.png');
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: contain;
+      image-rendering: pixelated;
+      transition: opacity 0.1s ease;
+      margin: 0 auto;
+    }
+	
+#banner {
+  width: 100%;
+  max-width: 720px;
+  margin: 10px auto 0;
+  background-image: url('banner.png');
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: contain;
+  aspect-ratio: 3 / 1;
+}
+#introOverlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0,0,0,0.9);
+  color: #fff;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 9999;
+}
+
+.introContent {
+  max-width: 500px;
+  padding: 20px;
+  background: #111;
+  border: 2px solid #fff;
+  border-radius: 10px;
+  text-align: left;
+  font-size: 16px;
+}
+
+.introContent h2 {
+  margin-top: 0;
+  color: #0f0;
+}
+
+.introContent ul {
+  padding-left: 20px;
+}
+
+.introContent .btnHint {
+  background: #444;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: monospace;
+}
+  </style>
+</head>
+<body>
+
+  <div id="introOverlay">
+  <div class="introContent">
+    <h2>🎮 Welcome to Punching Bag!</h2>
+    <p>Here's what you need to know to get started:</p>
+    <ul>
+      <li><strong>Connect your Bluetooth device:</strong> Click <span class="btnHint">🔍 Scan</span>, then <span class="btnHint">🔗 Configure</span>.</li>
+      <li><strong>Start data stream:</strong> Tap <span class="btnHint">📡 Start Streaming</span> to enable high G measurements.</li>
+      <li><strong>Punching:</strong> Is measured <strong>along the Z-axis</strong>.</li>
+      <li><strong>Objective:</strong> Punch and get into the high score list!</li>
+      <li><strong>Start game:</strong> Click <span class="btnHint">▶️ Start Game</span>.</li>
+    </ul>
+	    <!-- ✅ Minimum Requirements -->
+    <p><strong>Requirements:</strong></p>
+    <ul>
+      <li><strong>Device:</strong> Shimmer3R with high G sensor</li>
+      <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
+    </ul>
+    <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram" style="width: 100%; max-width: 300px; display: block; margin: 10px auto;" />
+    <p style="font-size: 14px; color: #aaa; text-align: center;">
+      Punching is measured along the <strong>Z-axis</strong>.
+    </p>
+        <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px;">
+      <input type="checkbox" id="dontShowAgain" />
+      <label for="dontShowAgain">Don't show this again</label>
+    </div>
+    <button id="closeIntroBtn">Got it!</button>
+  </div>
+</div>
+
+
+<!-- Highscore Modal -->
+<div id="highScoreModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.8); color:white; display:flex; align-items:center; justify-content:center; flex-direction:column; z-index:999;">
+  <div style="background:black; border:2px solid white; padding:20px; text-align:center; border-radius:10px; max-width:90vw;">
+    <h2>🏆 High Score!</h2>
+    <p>You made it to the top 10!</p>
+    <label>Enter your initials:</label><br/>
+    <input id="initialsInput" maxlength="3" style="font-size:20px; text-transform:uppercase; text-align:center;" /><br/><br/>
+    <button onclick="submitHighScore()">✅ Submit</button>
+    <button onclick="closeHighScoreModal()">❌ Cancel</button>
+  </div>
+</div>
+
+  <div id="controls">
+    <button id="scanBtn">🔍 Scan Bluetooth</button>
+    <button id="connectBtn" disabled>🔗 Configure</button>
+    <button id="streamBtn" disabled>📡 Start Streaming</button>
+    <button id="disconnectBtn" disabled>❌ Disconnect</button>
+    <button id="resetScoreBtn">🔁 Reset High Scores</button>
+	<button onclick="showHighScoreBoard()">📜 View High Scores</button>
+	  <button id="showTipBtn">💡 Show Tip</button>
+  </div>
+
+  <p id="scoreDisplay">💥 Max Punch Score: 0</p>
+  <p id="punchCounter">🥊 Punch Count: 0</p>
+  <p id="statusConsole">Status: Ready</p>
+  <!-- Insert this just before the punching bag div -->
+<div id="banner"></div>
+  <div id="punchingBag"></div>
+
+    <script type="module">
+    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../../shimmer-ble-sdk/dist/shimmer-ble.esm.js';
+
+    // --- UI state ---
+    const scanBtn        = document.getElementById("scanBtn");
+    const connectBtn     = document.getElementById("connectBtn");
+    const streamBtn      = document.getElementById("streamBtn");
+    const disconnectBtn  = document.getElementById("disconnectBtn");
+    const resetScoreBtn  = document.getElementById("resetScoreBtn");
+
+    let maxAccel = 0;
+    let punchTimeout = null;
+    let punchCount = 0;
+
+    const PUNCH_THRESHOLD = 30;
+    const BUFFER_SIZE = 102;
+    let circularBuffer = [];
+    let isBufferingPunch = false;
+
+    // High-score storage
+    let highScores = JSON.parse(localStorage.getItem("highScores") || "[]");
+    window.pendingHighScore = null;
+    document.getElementById("highScoreModal").style.display = "none";
+
+    function updateScoreDisplay(value) {
+      document.getElementById("scoreDisplay").textContent = `💥 Max Punch Score: ${value}`;
+    }
+    function updatePunchCount(value) {
+      document.getElementById("punchCounter").textContent = `🥊 Punch Count: ${value}`;
+    }
+    function updateStatus(text) {
+      document.getElementById("statusConsole").textContent = `Status: ${text}`;
+    }
+    function updateNewData(text) {
+      document.getElementById("statusConsole").textContent = `Streaming: ${text}`;
+    }
+
+    function checkHighScore(score) {
+      if (score <= 0) return;
+      if (highScores.length < 10 || score > highScores[9].score) {
+        showHighScoreModal(score);
+      }
+    }
+    function showHighScoreModal(score) {
+      document.getElementById("highScoreModal").style.display = "flex";
+      document.getElementById("initialsInput").focus();
+      document.getElementById("initialsInput").value = "";
+      window.pendingHighScore = score;
+    }
+    window.closeHighScoreModal = function () {
+      document.getElementById("highScoreModal").style.display = "none";
+      window.pendingHighScore = null;
+    };
+    window.submitHighScore = function () {
+      const initials = document.getElementById("initialsInput").value.toUpperCase().substring(0, 3);
+      if (!initials) return alert("Enter your initials!");
+
+      highScores.push({ initials, score: window.pendingHighScore });
+      highScores.sort((a, b) => b.score - a.score);
+      highScores = highScores.slice(0, 10);
+      localStorage.setItem("highScores", JSON.stringify(highScores));
+      window.closeHighScoreModal();
+      window.showHighScoreBoard();
+    };
+    window.showHighScoreBoard = function () {
+      let output = "🏆 TOP 10 SCORES 🏆\n";
+      highScores.forEach((entry, i) => {
+        output += `${i + 1}. ${entry.initials} – ${entry.score}\n`;
+      });
+      alert(output);
+    };
+
+    // Intro overlay persistence
+    window.addEventListener("DOMContentLoaded", () => {
+      if (localStorage.getItem("hideIntroOverlay") === "true") {
+        document.getElementById("introOverlay").style.display = "none";
+      }
+    });
+    document.getElementById("closeIntroBtn").addEventListener("click", () => {
+      const dontShow = document.getElementById("dontShowAgain").checked;
+      if (dontShow) localStorage.setItem("hideIntroOverlay", "true");
+      document.getElementById("introOverlay").style.display = "none";
+    });
+    document.getElementById("showTipBtn").addEventListener("click", () => {
+      document.getElementById("introOverlay").style.display = "flex";
+      localStorage.removeItem("hideIntroOverlay");
+    });
+
+    // Punching bag sprite
+    const bag = document.getElementById("punchingBag");
+    bag.style.backgroundImage = "url('idle.png')";
+
+    // --- Shimmer client (shimmer3r.js) ---
+    const shimmer = new Shimmer3RClient({
+      debug: true,
+      timestampFmt: "u24",
+    });
+
+    shimmer.onStatus = (msg) => updateStatus(msg);
+
+    // Use ACCEL_ALT as HIGH-G accel. Channels: 0x14/0x15/0x16 → HG_ACCEL_X/Y/Z (packed 12-bit).
+    shimmer.onStreamFrame = (oc) => {
+      const zField = oc.get("HG_ACCEL_Z", "raw") || oc.get("HG_ACCEL_Z");
+      if (!zField) return;
+
+      const accelZ = zField.value;
+      updateNewData(`HG Accel Z: ${accelZ}`);
+
+      // Keep circular buffer capped
+      circularBuffer.push(accelZ);
+      if (circularBuffer.length > BUFFER_SIZE) circularBuffer.shift();
+
+      // Punch detection (Z-axis)
+      if (!isBufferingPunch && Math.abs(accelZ) > PUNCH_THRESHOLD) {
+        isBufferingPunch = true;
+        circularBuffer = [accelZ];
+        updateStatus("Punch detected – buffering…");
+      } else if (isBufferingPunch && circularBuffer.length >= BUFFER_SIZE) {
+        const maxPunch = Math.max(...circularBuffer.map(v => Math.abs(v)));
+        maxAccel = Math.max(maxAccel, maxPunch);
+        punchCount++;
+
+        updateScoreDisplay(maxPunch);
+        updatePunchCount(punchCount);
+        checkHighScore(maxPunch);
+
+        bag.style.backgroundImage = "url('punch.png')";
+        clearTimeout(punchTimeout);
+        punchTimeout = setTimeout(() => (bag.style.backgroundImage = "url('idle.png')"), 1000);
+
+        isBufferingPunch = false;
+      }
+    };
+
+    function setButtons({ scan = true, connect = false, stream = false, disconnect = false } = {}) {
+      scanBtn.disabled = !scan;
+      connectBtn.disabled = !connect;
+      streamBtn.disabled = !stream;
+      disconnectBtn.disabled = !disconnect;
+    }
+
+    // Initial state (same UX: Scan → Connect → Start Streaming)
+    setButtons({ scan: true, connect: false, stream: false, disconnect: false });
+    updateStatus("Ready");
+
+    // Step 1: Scan (we connect here, because Web Bluetooth prompts on requestDevice)
+    scanBtn.addEventListener("click", async () => {
+      try {
+        await shimmer.connect();
+        const name = shimmer.device?.name || "Shimmer3R";
+        updateStatus("Device selected: " + name);
+        setButtons({ scan: true, connect: true, stream: false, disconnect: true });
+      } catch (err) {
+        console.error(err);
+        updateStatus("Scan/connect failed");
+      }
+    });
+
+    // Step 2: "Connect" button now performs Inquiry (build schema / confirm channels)
+    connectBtn.addEventListener("click", async () => {
+      try {
+	    await shimmer.setSamplingRate(51.2);
+        await shimmer.setSensors(4194304);
+        const info = await shimmer.inquiry();
+        
+        updateStatus(`Connected. Channels: ${info?.numChannels ?? "?"}`);
+        setButtons({ scan: true, connect: true, stream: true, disconnect: true });
+      } catch (err) {
+        console.error(err);
+        updateStatus("Inquiry failed");
+      }
+    });
+
+    // Step 3: Configure + start streaming (ACCEL_ALT bitmask + 51.2 Hz match old code)
+    streamBtn.addEventListener("click", async () => {
+      try {
+        // Match previous divisor 0x0280 => 32768/640 = 51.2 Hz
+        await shimmer.setSamplingRate(51.2);
+
+        // Some builds require internal expansion rail; safe to enable.
+        try { await shimmer.setInternalExpPower(1); } catch {}
+
+        // Enable only ACCEL_ALT (high-g) channels (0x14/0x15/0x16)
+        await shimmer.setSensors(SensorBitmapShimmer3.SENSOR_ACCEL_ALT);
+
+        // Ensure schema is built after enabling sensors
+        await shimmer.inquiry();
+
+        await shimmer.startStreaming();
+        updateStatus("Streaming started");
+      } catch (err) {
+        console.error(err);
+        updateStatus("Stream start failed");
+      }
+    });
+
+    disconnectBtn.addEventListener("click", async () => {
+      try {
+        await shimmer.disconnect();
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setButtons({ scan: true, connect: false, stream: false, disconnect: false });
+        updateStatus("Disconnected");
+      }
+    });
+
+    resetScoreBtn.addEventListener("click", () => {
+      const password = prompt("Enter password to reset high scores:");
+      if (password !== "shimmer") {
+        updateStatus("❌ Incorrect password. Reset cancelled.");
+        return;
+      }
+
+      maxAccel = 0;
+      punchCount = 0;
+      circularBuffer = [];
+      isBufferingPunch = false;
+      window.pendingHighScore = null;
+
+      highScores = [];
+      localStorage.removeItem("highScores");
+
+      updateScoreDisplay(0);
+      updatePunchCount(0);
+      updateStatus("✅ Score and high scores reset");
+    });
+  </script>
+</body>
+</html>

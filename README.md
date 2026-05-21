@@ -10,16 +10,28 @@ Web Bluetooth demos and a typed JavaScript/TypeScript SDK for Shimmer sensor dev
 
 ```
 shimmer-ble-sdk/     ← @shimmerresearch/web-ble — TypeScript SDK (build → dist/)
-ShimmerCapture/      ← data capture / CSV download demo
-Verisense/           ← Verisense wrist-sensor streaming demo
+demos/               ← canonical source for all demo applications
+  break-gyro/        ┐
+  break-emg/         │
+  punch-highG/       │
+  brick/             │  Shimmer3R demos
+  rythmgame-emggyro/ │
+  video-ppg/         │
+  ShimmerCapture/    │
+  Verisense/         ┘
+shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Chrome)
+
 break-gyro/          ┐
 break-emg/           │
-punch-highG/         │  Shimmer3R demos (served via GitHub Pages)
-brick/               │
-rythmgame-emggyro/   │
-video-ppg/           ┘
-shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Chrome)
+punch-highG/         │
+brick/               │ compatibility redirect folders kept so the existing
+rythmgame-emggyro/   │ GitHub Pages URLs continue to work
+video-ppg/           │
+ShimmerCapture/      │
+Verisense/           ┘
 ```
+
+If you are editing demo code, work in `demos/`. The root-level demo folders are URL-preserving redirect wrappers only.
 
 ---
 
@@ -71,4 +83,3 @@ npm test        # run unit tests
 ```
 
 See [`shimmer-ble-sdk/README.md`](shimmer-ble-sdk/README.md) for full API documentation and usage examples.
-
