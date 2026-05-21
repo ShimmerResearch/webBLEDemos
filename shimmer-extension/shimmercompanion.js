@@ -1,6 +1,7 @@
 // NOTE: The extension imports the shared SDK dist rather than duplicating shimmer3r.js.
-// For local development, first run `cd ../shimmer-ble-sdk && npm install && npm run build`
-// from the `shimmer-extension/` folder so `../shimmer-ble-sdk/dist/shimmer-ble.esm.js` exists.
+// For local development, first build the SDK from the repo root with
+// `cd shimmer-ble-sdk && npm install && npm run build` so
+// `../shimmer-ble-sdk/dist/shimmer-ble.esm.js` exists relative to this file.
 // For packaged extension releases, prefer bundling the SDK into the extension build so the
 // package is self-contained. Copying the built dist file is acceptable only for simple manual
 // releases, but requires keeping the import path and copied file in sync.
