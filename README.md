@@ -10,19 +10,14 @@ Web Bluetooth demos and a typed JavaScript/TypeScript SDK for Shimmer sensor dev
 
 ```
 shimmer-ble-sdk/     ← @shimmerresearch/web-ble — TypeScript SDK (build → dist/)
-ShimmerAPI/          ← legacy ES-module source for Shimmer3R (superseded by the SDK)
-Verisense/           ← legacy source for Verisense (superseded by the SDK)
-examples/            ← updated demo pages that import from the SDK dist
-  shimmer3r/         ← Shimmer3R demos
-  verisense/         ← Verisense demos
+ShimmerCapture/      ← data capture / CSV download demo
+Verisense/           ← Verisense wrist-sensor streaming demo
 break-gyro/          ┐
 break-emg/           │
-punch-highG/         │  original standalone demos (still served via GitHub Pages)
+punch-highG/         │  Shimmer3R demos (served via GitHub Pages)
 brick/               │
 rythmgame-emggyro/   │
-video-ppg/           │
-ShimmerCapture/      ┘
-Verisense/           ← original Verisense demo (still served via GitHub Pages)
+video-ppg/           ┘
 shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Chrome)
 ```
 

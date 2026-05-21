@@ -15,7 +15,7 @@ Web Bluetooth SDK for Shimmer sensor devices.
 
 ```html
 <script type="module">
-  import { Shimmer3RClient, SensorBitmapShimmer3 } from '../../shimmer-ble-sdk/dist/shimmer-ble.esm.js';
+  import { Shimmer3RClient, SensorBitmapShimmer3 } from '../shimmer-ble-sdk/dist/shimmer-ble.esm.js';
 
   const client = new Shimmer3RClient({ timestampFmt: 'u24', debug: true });
 
@@ -38,7 +38,7 @@ Web Bluetooth SDK for Shimmer sensor devices.
 
 ```html
 <script type="module">
-  import { VerisenseBleDevice } from '../../shimmer-ble-sdk/dist/shimmer-ble.esm.js';
+  import { VerisenseBleDevice } from '../shimmer-ble-sdk/dist/shimmer-ble.esm.js';
 
   const v = new VerisenseBleDevice({ hardwareIdentifier: 'VERISENSE_PULSE_PLUS' });
   v.on('streamPacket', (pkt) => console.log(pkt.sensorId, pkt.decoded));
