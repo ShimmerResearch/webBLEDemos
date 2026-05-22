@@ -12,6 +12,7 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Spell Caster — Shimmer Gyro Demo</title>
+
   <style>
     :root {
       --bg:      #06060f;
@@ -60,6 +61,16 @@
     #disconnBtn { background: #f44336; color: #fff; }
     #startBtn   { background: #9C27B0; color: #fff; }
     #showTipBtn { background: #37474F; color: #fff; }
+    #trainBtn { background: #7c3aed; color: #fff; }
+    #clearTrainBtn { background: #455A64; color: #fff; }
+    #trainSpellSel {
+      background: #1f2937;
+      color: #e5e7eb;
+      border: 1px solid #374151;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
     #deviceName { font-size: 13px; color: #9999bb; }
 
     /* ── Console ── */
@@ -86,7 +97,7 @@
     }
     .spellBadge .bigEmoji { font-size: 26px; display: block; margin-bottom: 2px; }
     .spellBadge .spellLabel { font-size: 11px; font-weight: 600; letter-spacing: 1px; }
-    .spellBadge .castCount { font-size: 22px; font-weight: 700; line-height: 1.2; }
+    .spellBadge .castCount { font-size: 22px, font-weight: 700, line-height: 1.2; }
 
     /* ── Canvas ── */
     canvas {
@@ -229,6 +240,13 @@
   <button id="streamBtn" disabled>📡 Stream</button>
   <button id="disconnBtn" disabled>❌ Disconnect</button>
   <button id="startBtn">▶️ Start</button>
+  <select id="trainSpellSel" title="Spell to train">
+    <option value="thunder">⚡ Thunder</option>
+    <option value="inferno">🔥 Inferno</option>
+    <option value="torrent">🌊 Torrent</option>
+  </select>
+  <button id="trainBtn">🎯 Train Next</button>
+  <button id="clearTrainBtn">🧹 Clear Training</button>
   <button id="showTipBtn">💡 Help</button>
   <span id="deviceName">No device</span>
 </div>
@@ -282,9 +300,21 @@ const SPELLS = [
 ];
 
 // ── Constants ─────────────────────────────────────────────────────────────
-const GESTURE_THRESHOLD = 2500; // raw gyro units for a sharp gesture
-const COOLDOWN_MS       = 1400; // ms between casts
-const CAST_TEXT_MS      = 1900; // how long cast text is visible
+const GESTURE_THRESHOLD      = 2500; // fallback raw gyro units
+const COOLDOWN_MS            = 1400;
+const CAST_TEXT_MS           = 1900;
+const FILTER_ALPHA           = 0.28;
+const MOTION_ENTER_THRESHOLD = 1800;
+const MOTION_EXIT_THRESHOLD  = 900;
+const MOTION_END_SILENCE_MS  = 170;
+const MIN_SEGMENT_SAMPLES    = 10;
+const MAX_SEGMENT_SAMPLES    = 120;
+const PREBUFFER_SAMPLES      = 16;
+const DTW_RESAMPLE_POINTS    = 48;
+const DTW_WINDOW             = 12;
+const DTW_ACCEPT_DISTANCE    = 0.19;
+const DTW_MARGIN_DISTANCE    = 0.025;
+const TRAINING_STORAGE_KEY   = 'spellTrainingV1';
 
 // ── Canvas & Context ──────────────────────────────────────────────────────
 const canvas = document.getElementById('spellCanvas');
@@ -304,30 +334,237 @@ resizeCanvas();
 let gameRunning    = false;
 let lastCastTime   = 0;
 let particles      = [];
-let castEffects    = [];   // animated text+flash events
+let castEffects    = [];
 let flashAlpha     = 0;
 let flashRgb       = [0, 0, 0];
 let scores         = { thunder: 0, inferno: 0, torrent: 0 };
 let castSet        = new Set();
 let animTick       = 0;
 
-// ── Gesture entry-point (called by BLE module and keyboard) ───────────────
-window.onGyroFrame = function(gx, gy, gz) {
+// ── Gesture Engine State ──────────────────────────────────────────────────
+let filteredState  = { ready: false, x: 0, y: 0, z: 0 };
+let motionActive   = false;
+let motionSegment  = [];
+let preBuffer      = [];
+let lastMotionTs   = 0;
+let trainingArmed  = false;
+const trainedSamples = { thunder: [], inferno: [], torrent: [] };
+
+function getSpellById(id) {
+  return SPELLS.find(s => s.id === id);
+}
+
+function pushPreBuffer(sample) {
+  preBuffer.push(sample);
+  if (preBuffer.length > PREBUFFER_SAMPLES) preBuffer.shift();
+}
+
+function compactSegment(segment) {
+  return segment.map(p => [
+    Math.round(p.x * 100) / 100,
+    Math.round(p.y * 100) / 100,
+    Math.round(p.z * 100) / 100,
+  ]);
+}
+
+function uncompactSegment(compact) {
+  return compact.map(v => ({ x: v[0], y: v[1], z: v[2] }));
+}
+
+function saveTraining() {
+  localStorage.setItem(TRAINING_STORAGE_KEY, JSON.stringify({
+    thunder: trainedSamples.thunder.map(compactSegment),
+    inferno: trainedSamples.inferno.map(compactSegment),
+    torrent: trainedSamples.torrent.map(compactSegment),
+  }));
+}
+
+function loadTraining() {
+  try {
+    const raw = localStorage.getItem(TRAINING_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    for (const s of SPELLS) {
+      const rows = Array.isArray(parsed[s.id]) ? parsed[s.id] : [];
+      trainedSamples[s.id] = rows.filter(Array.isArray).map(uncompactSegment);
+    }
+  } catch {}
+}
+
+function getTrainingCount(id) {
+  return trainedSamples[id]?.length || 0;
+}
+
+function resampleSeries(segment, count = DTW_RESAMPLE_POINTS) {
+  if (segment.length === 0) return [];
+  if (segment.length === 1) return Array.from({ length: count }, () => ({ ...segment[0] }));
+  const out = [];
+  const maxIdx = segment.length - 1;
+  for (let i = 0; i < count; i++) {
+    const pos = (i * maxIdx) / (count - 1);
+    const lo = Math.floor(pos);
+    const hi = Math.min(maxIdx, lo + 1);
+    const t = pos - lo;
+    const a = segment[lo], b = segment[hi];
+    out.push({
+      x: a.x + (b.x - a.x) * t,
+      y: a.y + (b.y - a.y) * t,
+      z: a.z + (b.z - a.z) * t,
+    });
+  }
+  return out;
+}
+
+function normalizeSeries(series) {
+  let peak = 0;
+  for (const p of series) peak = Math.max(peak, Math.hypot(p.x, p.y, p.z));
+  const scale = peak > 1 ? peak : 1;
+  return series.map(p => ({ x: p.x / scale, y: p.y / scale, z: p.z / scale }));
+}
+
+function prepareSegment(segment) {
+  return normalizeSeries(resampleSeries(segment, DTW_RESAMPLE_POINTS));
+}
+
+function dtwDistance(a, b, windowSize = DTW_WINDOW) {
+  const n = a.length, m = b.length;
+  if (!n || !m) return Number.POSITIVE_INFINITY;
+  const w = Math.max(windowSize, Math.abs(n - m));
+  const inf = Number.POSITIVE_INFINITY;
+  let prev = new Array(m + 1).fill(inf);
+  let curr = new Array(m + 1).fill(inf);
+  prev[0] = 0;
+
+  for (let i = 1; i <= n; i++) {
+    curr.fill(inf);
+    const start = Math.max(1, i - w);
+    const end = Math.min(m, i + w);
+    for (let j = start; j <= end; j++) {
+      const dx = a[i - 1].x - b[j - 1].x;
+      const dy = a[i - 1].y - b[j - 1].y;
+      const dz = a[i - 1].z - b[j - 1].z;
+      const cost = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      curr[j] = cost + Math.min(prev[j], curr[j - 1], prev[j - 1]);
+    }
+    [prev, curr] = [curr, prev];
+  }
+
+  return prev[m] / (n + m);
+}
+
+function fallbackClassify(segment) {
+  let px = 0, py = 0, pz = 0;
+  for (const s of segment) {
+    px = Math.max(px, Math.abs(s.x));
+    py = Math.max(py, Math.abs(s.y));
+    pz = Math.max(pz, Math.abs(s.z));
+  }
+  const peak = Math.max(px, py, pz);
+  if (peak < GESTURE_THRESHOLD) return null;
+  if (pz >= px && pz >= py) return { spell: SPELLS[0], confidence: 1, magnitude: peak };
+  if (px >= py) return { spell: SPELLS[1], confidence: 1, magnitude: peak };
+  return { spell: SPELLS[2], confidence: 1, magnitude: peak };
+}
+
+function classifySegment(segment) {
+  const available = SPELLS.filter(s => getTrainingCount(s.id) > 0);
+  if (available.length === 0) return fallbackClassify(segment);
+
+  const input = prepareSegment(segment);
+  const ranked = [];
+
+  for (const s of available) {
+    let best = Number.POSITIVE_INFINITY;
+    for (const sample of trainedSamples[s.id]) {
+      const dist = dtwDistance(input, prepareSegment(sample));
+      if (dist < best) best = dist;
+    }
+    ranked.push({ id: s.id, dist: best });
+  }
+
+  ranked.sort((a, b) => a.dist - b.dist);
+  const best = ranked[0];
+  const second = ranked[1];
+  if (!best || !Number.isFinite(best.dist)) return null;
+
+  const margin = second ? (second.dist - best.dist) : Number.POSITIVE_INFINITY;
+  if (best.dist > DTW_ACCEPT_DISTANCE || margin < DTW_MARGIN_DISTANCE) return null;
+
+  let peak = 0;
+  for (const s of segment) peak = Math.max(peak, Math.abs(s.x), Math.abs(s.y), Math.abs(s.z));
+  const confidence = Math.max(0, Math.min(1, 1 - best.dist / DTW_ACCEPT_DISTANCE));
+  return { spell: getSpellById(best.id), confidence, magnitude: peak || 2500 };
+}
+
+function finalizeSegment() {
+  const segment = motionSegment.slice();
+  motionSegment = [];
+  motionActive = false;
+  if (segment.length < MIN_SEGMENT_SAMPLES) return;
+
+  if (trainingArmed) {
+    const trainSel = document.getElementById('trainSpellSel');
+    const spellId = trainSel.value;
+    trainedSamples[spellId].push(segment.map(p => ({ x: p.x, y: p.y, z: p.z })));
+    if (trainedSamples[spellId].length > 24) trainedSamples[spellId].shift();
+    saveTraining();
+    trainingArmed = false;
+    document.getElementById('trainBtn').textContent = '🎯 Train Next';
+    window._uiLog(`🎯 Trained ${spellId.toUpperCase()} (${getTrainingCount(spellId)} samples)`);
+    return;
+  }
+
   if (!gameRunning) return;
   const now = Date.now();
   if (now - lastCastTime < COOLDOWN_MS) return;
 
-  const ax = Math.abs(gx), ay = Math.abs(gy), az = Math.abs(gz);
-  const peak = Math.max(ax, ay, az);
-  if (peak < GESTURE_THRESHOLD) return;
-
-  let spell;
-  if (az >= ax && az >= ay)      spell = SPELLS[0]; // thunder (z)
-  else if (ax >= ay)             spell = SPELLS[1]; // inferno (x)
-  else                           spell = SPELLS[2]; // torrent (y)
+  const result = classifySegment(segment);
+  if (!result) {
+    window._uiLog('…Gesture not recognized');
+    return;
+  }
 
   lastCastTime = now;
-  castSpell(spell, peak);
+  castSpell(result.spell, result.magnitude);
+  window._uiLog(`✨ ${result.spell.name} (${Math.round(result.confidence * 100)}%)`);
+}
+
+// ── Gesture entry-point (called by BLE module and keyboard) ───────────────
+window.onGyroFrame = function(gx, gy, gz) {
+  const now = Date.now();
+
+  if (!filteredState.ready) {
+    filteredState.ready = true;
+    filteredState.x = gx;
+    filteredState.y = gy;
+    filteredState.z = gz;
+  } else {
+    filteredState.x += FILTER_ALPHA * (gx - filteredState.x);
+    filteredState.y += FILTER_ALPHA * (gy - filteredState.y);
+    filteredState.z += FILTER_ALPHA * (gz - filteredState.z);
+  }
+
+  const sample = { x: filteredState.x, y: filteredState.y, z: filteredState.z, t: now };
+  pushPreBuffer(sample);
+
+  const energy = Math.max(Math.abs(sample.x), Math.abs(sample.y), Math.abs(sample.z));
+
+  if (!motionActive) {
+    if (energy >= MOTION_ENTER_THRESHOLD) {
+      motionActive = true;
+      motionSegment = preBuffer.slice();
+      lastMotionTs = now;
+    }
+    return;
+  }
+
+  motionSegment.push(sample);
+  if (energy >= MOTION_EXIT_THRESHOLD) lastMotionTs = now;
+
+  const silentFor = now - lastMotionTs;
+  if (silentFor >= MOTION_END_SILENCE_MS || motionSegment.length >= MAX_SEGMENT_SAMPLES) {
+    finalizeSegment();
+  }
 };
 
 // ── Cast a spell ──────────────────────────────────────────────────────────
@@ -335,23 +572,18 @@ function castSpell(spell, magnitude) {
   scores[spell.id]++;
   castSet.add(spell.id);
 
-  // Update badge count
   document.getElementById('cnt-' + spell.id).textContent = scores[spell.id];
 
-  // Flash badge background briefly
   const badge = document.getElementById('badge-' + spell.id);
   badge.style.background = spell.color + '55';
   setTimeout(() => { badge.style.background = ''; }, 700);
 
-  // Screen colour flash
   flashRgb   = spell.rgb;
   flashAlpha = 0.5;
 
-  // Orb centre in canvas coords
   const ox = spell.orbX * canvas.width;
   const oy = spell.orbY * canvas.height;
 
-  // Spawn particles
   const count = Math.min(60 + Math.floor(magnitude / 150), 90);
   for (let i = 0; i < count; i++) {
     const angle = Math.random() * Math.PI * 2;
@@ -367,27 +599,12 @@ function castSpell(spell, magnitude) {
     });
   }
 
-  // Shockwave ring
-  castEffects.push({
-    type: 'ring', spell,
-    x: ox, y: oy,
-    t0: Date.now(), r: 10,
-  });
+  castEffects.push({ type: 'ring', spell, x: ox, y: oy, t0: Date.now(), r: 10 });
+  castEffects.push({ type: 'text', spell, x: ox, y: oy - 70, t0: Date.now() });
 
-  // Cast text
-  castEffects.push({
-    type: 'text', spell,
-    x: ox, y: oy - 70,
-    t0: Date.now(),
-  });
-
-  // Win check
-  if (castSet.size === 3) {
-    setTimeout(triggerWin, 1800);
-  }
+  if (castSet.size === 3) setTimeout(triggerWin, 1800);
 }
 
-// ── Win screen ────────────────────────────────────────────────────────────
 function triggerWin() {
   const total = scores.thunder + scores.inferno + scores.torrent;
   document.getElementById('winTally').textContent =
@@ -395,7 +612,6 @@ function triggerWin() {
   document.getElementById('winOverlay').style.display = 'flex';
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────────
 function drawBackground() {
   const g = ctx.createLinearGradient(0, 0, 0, canvas.height);
   g.addColorStop(0, '#07071a');
@@ -403,7 +619,6 @@ function drawBackground() {
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Subtle star field (deterministic, redrawn each frame is fine at 60fps)
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
   // Use a simple LCG seeded by 1 to keep stars stable
   let s = 1;
@@ -425,7 +640,6 @@ function drawOrb(spell, tick) {
   const pulse = Math.sin(tick * 0.045 + idx * 2.1) * 5;
   const r = 40 + pulse;
 
-  // Outer glow
   const glow = ctx.createRadialGradient(x, y, 0, x, y, r * 2.4);
   glow.addColorStop(0, spell.color + 'bb');
   glow.addColorStop(0.5, spell.color + '44');
@@ -435,7 +649,6 @@ function drawOrb(spell, tick) {
   ctx.fillStyle = glow;
   ctx.fill();
 
-  // Core sphere
   const core = ctx.createRadialGradient(x - r * 0.28, y - r * 0.28, r * 0.08, x, y, r);
   core.addColorStop(0, '#ffffff');
   core.addColorStop(0.25, spell.color);
@@ -445,7 +658,6 @@ function drawOrb(spell, tick) {
   ctx.fillStyle = core;
   ctx.fill();
 
-  // Emoji
   ctx.save();
   ctx.font = 'bold 24px system-ui';
   ctx.textAlign = 'center';
@@ -456,14 +668,12 @@ function drawOrb(spell, tick) {
   ctx.fillText(spell.emoji, x, y - 1);
   ctx.restore();
 
-  // Name label
   ctx.font = 'bold 12px system-ui';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'top';
   ctx.fillStyle = spell.color;
   ctx.fillText(spell.name, x, y + r + 8);
 
-  // Gesture hint
   ctx.font = '10px system-ui';
   ctx.fillStyle = '#ffffff66';
   ctx.fillText(spell.hintText, x, y + r + 24);
@@ -474,7 +684,7 @@ function drawParticles() {
     const p = particles[i];
     p.x  += p.vx;
     p.y  += p.vy;
-    p.vy += 0.09; // gravity
+    p.vy += 0.09;
     p.alpha -= p.decay;
     if (p.alpha <= 0) { particles.splice(i, 1); continue; }
     ctx.save();
@@ -552,7 +762,7 @@ function drawPrompt() {
   ctx.font        = '13px system-ui';
   ctx.textAlign   = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('Perform a sharp gesture to cast a spell', canvas.width / 2, 24);
+  ctx.fillText('Perform a trained gesture to cast a spell', canvas.width / 2, 24);
   ctx.restore();
 }
 
@@ -579,7 +789,6 @@ function drawCooldownBar() {
   ctx.fillText('cooldown', canvas.width / 2, by - 4);
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────
 function gameLoop() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawBackground();
@@ -593,7 +802,6 @@ function gameLoop() {
   requestAnimationFrame(gameLoop);
 }
 
-// ── UI wiring ─────────────────────────────────────────────────────────────
 function resetGame() {
   gameRunning = true;
   scores      = { thunder: 0, inferno: 0, torrent: 0 };
@@ -613,7 +821,9 @@ document.addEventListener('DOMContentLoaded', () => {
   if (localStorage.getItem('hideSpellIntro') === 'true') {
     document.getElementById('introOverlay').style.display = 'none';
   }
+  loadTraining();
   gameLoop();
+  window._uiLog(`Training loaded: ⚡${getTrainingCount('thunder')} 🔥${getTrainingCount('inferno')} 🌊${getTrainingCount('torrent')}`);
 });
 
 document.getElementById('closeIntroBtn').addEventListener('click', () => {
@@ -631,12 +841,27 @@ document.getElementById('showTipBtn').addEventListener('click', () => {
 document.getElementById('startBtn').addEventListener('click', resetGame);
 document.getElementById('playAgainBtn').addEventListener('click', resetGame);
 
+document.getElementById('trainBtn').addEventListener('click', () => {
+  trainingArmed = true;
+  const id = document.getElementById('trainSpellSel').value;
+  document.getElementById('trainBtn').textContent = `🎯 Waiting: ${id.toUpperCase()}`;
+  window._uiLog(`🎯 Perform one clean ${id.toUpperCase()} motion`);
+});
+
+document.getElementById('clearTrainBtn').addEventListener('click', () => {
+  for (const s of SPELLS) trainedSamples[s.id] = [];
+  saveTraining();
+  window._uiLog('🧹 Cleared all trained gesture samples');
+});
+
 // Keyboard shortcuts for testing without BLE
 document.addEventListener('keydown', (e) => {
   if (!gameRunning) return;
-  if (e.key === '1') window.onGyroFrame(0,    0,    3500);  // Thunder (Z)
-  if (e.key === '2') window.onGyroFrame(3500, 0,    0);    // Inferno (X)
-  if (e.key === '3') window.onGyroFrame(0,    3500, 0);    // Torrent (Y)
+  const now = Date.now();
+  if (now - lastCastTime < COOLDOWN_MS) return;
+  if (e.key === '1') { lastCastTime = now; castSpell(SPELLS[0], 3500); }
+  if (e.key === '2') { lastCastTime = now; castSpell(SPELLS[1], 3500); }
+  if (e.key === '3') { lastCastTime = now; castSpell(SPELLS[2], 3500); }
 });
 
 const logEl = document.getElementById('console');
