@@ -646,10 +646,10 @@ function finalizeSegment() {
 
   if (trainingArmed) {
     const id = document.getElementById('trainSpellSel').value;
-    trainedSamples[id].push(motionSegment);
+    trainedSamples[id] = [motionSegment];  // Replace with single new sample
     saveTraining();
-    window._uiLog(`✅ Trained ${id.toUpperCase()}: ${trainedSamples[id].length} samples`);
-
+    window._uiLog(`✅ Trained ${id.toUpperCase()}: ${trainedSamples[id].length} sample`);
+    
     document.getElementById('trainBtn').textContent = '🎯 Train Next';
     trainingArmed = false;
   } else if (gameRunning) {
