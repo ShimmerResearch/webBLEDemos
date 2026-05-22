@@ -290,25 +290,28 @@
     </p>
 
     <h3>🪄 The Three Spells</h3>
+    <p style="font-size:12px;color:#7778aa;margin:8px 0">
+      💡 <strong>Tip:</strong> Gyros detect <strong>rotation</strong>, not linear movement. Train sharp, rotational gestures for best results.
+    </p>
     <div class="spellItem">
       <span class="spellIcon">⚡</span>
       <div>
-        <strong style="color:#a855f7">THUNDER</strong> — Flick wrist <strong>left / right</strong> sharply<br>
-        <small style="color:#6666aa">Z-axis dominant gyro spike</small>
+        <strong style="color:#a855f7">THUNDER</strong> — Train your own motion<br>
+        <small style="color:#6666aa">Example: Sharp wrist flick left-right, twist, or snap</small>
       </div>
     </div>
     <div class="spellItem">
       <span class="spellIcon">🔥</span>
       <div>
-        <strong style="color:#ef4444">INFERNO</strong> — Thrust arm <strong>forward / back</strong><br>
-        <small style="color:#6666aa">X-axis dominant gyro spike</small>
+        <strong style="color:#ef4444">INFERNO</strong> — Train your own motion<br>
+        <small style="color:#6666aa">Example: Arm rotation, rapid pitch motion, or circular swing</small>
       </div>
     </div>
     <div class="spellItem">
       <span class="spellIcon">🌊</span>
       <div>
-        <strong style="color:#3b82f6">TORRENT</strong> — Roll / tilt wrist <strong>side to side</strong><br>
-        <small style="color:#6666aa">Y-axis dominant gyro spike</small>
+        <strong style="color:#3b82f6">TORRENT</strong> — Train your own motion<br>
+        <small style="color:#6666aa">Example: Wrist roll, tilt side-to-side, or figure-8 motion</small>
       </div>
     </div>
     <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram"
@@ -319,7 +322,8 @@
       <li>Click <span class="btnHint">🔍 Scan</span> and select your Shimmer3R</li>
       <li>Click <span class="btnHint">⚙️ Configure</span> to enable gyro streaming</li>
       <li>Click <span class="btnHint">📡 Stream</span> to start data</li>
-      <li>Click <span class="btnHint">▶️ Start</span> to begin</li>
+      <li><strong>Train each spell:</strong> Select spell → Click <span class="btnHint">🎯 Train Next</span> → Perform motion cleanly</li>
+      <li>Once all three spells trained, click <span class="btnHint">▶️ Start</span> to play</li>
     </ol>
     <p style="font-size:13px;color:#5555aa">
       <strong>Device:</strong> Shimmer3R &nbsp;|&nbsp;
@@ -332,7 +336,7 @@
         <input type="checkbox" id="dontShowAgain"> Don't show again
       </label>
       <button id="closeIntroBtn"
-        style="background:#a855f7;color:#fff;border:none;border-radius:8px;
+        style="background:#a855f7;color:#fff;border:none:border-radius:8px;
                padding:9px 20px;cursor:pointer;font-size:14px;font-weight:600;">
         Got it! ✨
       </button>
@@ -375,8 +379,8 @@
 <div id="trainingPanel">
   <div id="thresholdControls">
     <label for="thresholdSlider">DTW match threshold</label>
-    <input id="thresholdSlider" type="range" min="0.08" max="0.35" step="0.005" value="0.255" />
-    <span id="thresholdValue">0.255</span>
+    <input id="thresholdSlider" type="range" min="0.08" max="0.35" step="0.005" />
+    <span id="thresholdValue">—</span>
   </div>
   <div id="plotLegend">Training plots: X = red, Y = green, Z = blue</div>
   <div id="plotGrid">
@@ -544,6 +548,8 @@ function loadThreshold() {
   const raw = Number(localStorage.getItem(THRESHOLD_STORAGE_KEY));
   if (Number.isFinite(raw)) {
     dtwAcceptDistance = Math.min(0.35, Math.max(0.08, raw));
+  } else {
+    dtwAcceptDistance = null;
   }
 }
 
@@ -551,8 +557,13 @@ function updateThresholdUi() {
   const slider = document.getElementById('thresholdSlider');
   const valueEl = document.getElementById('thresholdValue');
   if (!slider || !valueEl) return;
-  slider.value = dtwAcceptDistance.toFixed(3);
-  valueEl.textContent = dtwAcceptDistance.toFixed(3);
+  if (dtwAcceptDistance === null) {
+    slider.value = '';
+    valueEl.textContent = '—';
+  } else {
+    slider.value = dtwAcceptDistance.toFixed(3);
+    valueEl.textContent = dtwAcceptDistance.toFixed(3);
+  }
 }
 
 function persistThreshold(value) {
@@ -610,6 +621,10 @@ function dtwDistance(s1, s2) {
 
 function classifySegment(segment) {
   if (segment.length < MIN_SEGMENT_SAMPLES) return null;
+  if (dtwAcceptDistance === null) {
+    window._uiLog('⚠️ Set DTW threshold before casting');
+    return null;
+  }
 
   const prepared = prepareSegment(segment);
   let bestSpell = null;
@@ -1031,7 +1046,8 @@ document.addEventListener('DOMContentLoaded', () => {
   updateThresholdUi();
   drawTrainingPlots();
   gameLoop();
-  window._uiLog(`Training loaded: ⚡${getTrainingCount('thunder')} 🔥${getTrainingCount('inferno')} 🌊${getTrainingCount('torrent')}`);
+  const trained = `⚡${getTrainingCount('thunder')} 🔥${getTrainingCount('inferno')} 🌊${getTrainingCount('torrent')}`;
+  window._uiLog(dtwAcceptDistance === null ? `📋 Train spells first • Trained: ${trained}` : `✅ Training loaded: ${trained}`);
 });
 
 document.getElementById('closeIntroBtn').addEventListener('click', () => {
