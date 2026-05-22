@@ -83,80 +83,199 @@
       overflow-y: auto; border-radius: 4px;
     }
 
-    /* ── Spell Badges ── */
-    #spellRow {
-      display: flex; justify-content: center;
-      gap: 12px; margin: 6px auto;
-      max-width: 600px; padding: 0 8px;
+    #trainingPanel {
+      max-width: 860px;
+      margin: 10px auto 0;
+      padding: 0 8px;
     }
-    .spellBadge {
-      flex: 1; text-align: center;
-      border-radius: 10px; padding: 8px 4px;
-      border: 2px solid #2a2a4a;
-      transition: border-color 0.3s, background 0.3s;
+    #thresholdControls {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      color: #aab0d6;
+      font-size: 13px;
+      margin-bottom: 8px;
     }
-    .spellBadge .bigEmoji { font-size: 26px; display: block; margin-bottom: 2px; }
-    .spellBadge .spellLabel { font-size: 11px; font-weight: 600; letter-spacing: 1px; }
-    .spellBadge .castCount { font-size: 22px, font-weight: 700, line-height: 1.2; }
-
-    /* ── Canvas ── */
-    canvas {
-      display: block; margin: 6px auto 0;
-      border: 2px solid #1a1a36;
-      border-radius: 12px;
-      background: var(--bg);
-      width: 100%; max-width: 600px;
-      height: auto;
+    #thresholdSlider {
+      width: min(260px, 75vw);
+      accent-color: #a855f7;
     }
-
-    /* ── Key hint ── */
-    #keyHint {
-      text-align: center; color: #444466;
-      font-size: 11px; margin: 4px 0 8px;
+    #thresholdValue {
+      min-width: 52px;
+      text-align: right;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: #e8eaf6;
+    }
+    #plotLegend {
+      text-align: center;
+      color: #7f89b3;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    #plotGrid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 10px;
+    }
+    .plotCard {
+      background: #0b0b1a;
+      border: 1px solid #242447;
+      border-radius: 10px;
+      padding: 8px;
+    }
+    .plotTitle {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: #d5d8f0;
+      font-size: 12px;
+      margin-bottom: 6px;
+      letter-spacing: 0.5px;
+    }
+    .plotCanvas {
+      display: block;
+      width: 100%;
+      height: 130px;
+      background: #050510;
+      border: 1px solid #17172d;
+      border-radius: 8px;
     }
 
     /* ── Intro Overlay ── */
     #introOverlay {
-      position: fixed; inset: 0;
-      background: rgba(0,0,0,0.93);
-      display: flex; justify-content: center; align-items: center;
-      z-index: 9999;
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.85);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 1000;
+      backdrop-filter: blur(2px);
     }
     .introContent {
-      max-width: 520px; background: var(--panel);
-      border: 2px solid #2a2a55; border-radius: 14px;
-      padding: 22px 24px; max-height: 92vh; overflow-y: auto;
+      background: linear-gradient(135deg, #0e0e22 0%, #1a1a3a 100%);
+      border: 2px solid #2d3255;
+      border-radius: 16px;
+      padding: 28px;
+      max-width: 520px;
+      max-height: 90vh;
+      overflow-y: auto;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+      color: #e8eaf6;
     }
-    .introContent h2 { margin: 0 0 10px; color: #c4b5fd; font-size: 1.3rem; }
-    .introContent h3 { color: #a0aabb; font-size: 1rem; margin: 14px 0 6px; }
-    .introContent ul, .introContent ol { padding-left: 20px; margin: 6px 0; }
-    .introContent li { margin-bottom: 7px; line-height: 1.4; }
+    .introContent h2 {
+      margin: 0 0 12px;
+      font-size: 1.6rem;
+      text-align: center;
+      letter-spacing: 2px;
+    }
+    .introContent h3 {
+      font-size: 1.1rem;
+      margin: 16px 0 8px;
+      color: #d5d8f0;
+      letter-spacing: 1px;
+    }
+    .introContent ol {
+      margin: 8px 0;
+      padding-left: 20px;
+      line-height: 1.7;
+    }
+    .spellItem {
+      display: flex; gap: 12px;
+      margin: 8px 0; padding: 8px;
+      background: rgba(255,255,255,0.05);
+      border-radius: 8px;
+    }
+    .spellIcon {
+      font-size: 1.8rem;
+      min-width: 40px;
+      display: flex; align-items: center; justify-content: center;
+    }
     .btnHint {
-      background: #2a2a4a; padding: 2px 7px;
-      border-radius: 4px; font-family: monospace; font-size: 13px;
+      background: #1f2937; padding: 2px 6px;
+      border-radius: 4px; font-size: 0.9em;
+      font-family: ui-monospace, monospace;
     }
-    .spellItem { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
-    .spellIcon { font-size: 28px; line-height: 1; flex-shrink: 0; }
     .introFoot {
       display: flex; justify-content: space-between;
-      align-items: center; margin-top: 14px; flex-wrap: wrap; gap: 8px;
+      align-items: center; margin-top: 16px;
     }
 
     /* ── Win Overlay ── */
     #winOverlay {
-      position: fixed; inset: 0;
-      background: rgba(0,0,0,0.88);
+      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.9);
       display: none; flex-direction: column;
-      justify-content: center; align-items: center;
-      z-index: 9998; text-align: center; padding: 20px;
+      align-items: center; justify-content: center;
+      z-index: 999;
+      text-align: center;
+      color: #e8eaf6;
     }
-    #winOverlay h2 { font-size: clamp(1.8rem, 6vw, 2.8rem); color: #ffd700; margin-bottom: 8px; }
-    #winOverlay .winSub { color: #ccc; font-size: 1rem; margin-bottom: 4px; }
-    #winOverlay .winTally { color: #ffd700; font-size: 1.3rem; margin: 8px 0; }
+    .winSub {
+      color: #9999bb; margin: 8px 0 0;
+    }
+    .winTally {
+      font-size: 1.1rem; margin: 14px 0;
+      font-family: ui-monospace, monospace;
+    }
     #playAgainBtn {
-      margin-top: 20px; background: #ffd700; color: #000;
-      padding: 12px 30px; font-size: 16px; font-weight: 700;
-      border-radius: 10px; cursor: pointer; border: none;
+      background: #a855f7; color: #fff;
+      padding: 12px 24px; font-size: 16px;
+      margin-top: 16px; cursor: pointer;
+      border-radius: 8px; border: none;
+    }
+    #playAgainBtn:hover { background: #9333ea; }
+
+    /* ── Spell Row ── */
+    #spellRow {
+      display: flex; justify-content: center;
+      gap: 16px; margin: 12px 0;
+    }
+    .spellBadge {
+      border: 3px solid;
+      border-radius: 12px;
+      padding: 12px 20px;
+      text-align: center;
+      background: rgba(0,0,0,0.3);
+      transition: all 0.2s;
+      min-width: 100px;
+    }
+    .bigEmoji {
+      font-size: 2.2rem;
+      display: block;
+      margin: 0 0 4px;
+    }
+    .spellLabel {
+      font-size: 0.85rem;
+      font-weight: 600;
+      letter-spacing: 1px;
+      margin: 4px 0;
+    }
+    .castCount {
+      font-size: 1.4rem;
+      font-weight: bold;
+      color: #fff;
+    }
+
+    /* ── Canvas & Hint ── */
+    #spellCanvas {
+      display: block;
+      margin: 12px auto;
+      border: 2px solid #2d3255;
+      border-radius: 8px;
+      background: #000;
+    }
+    #keyHint {
+      text-align: center;
+      font-size: 12px;
+      color: #7878aa;
+      margin: 8px 0;
+    }
+    kbd {
+      background: #1f2937;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
     }
   </style>
 </head>
@@ -192,7 +311,7 @@
         <small style="color:#6666aa">Y-axis dominant gyro spike</small>
       </div>
     </div>
-    <img src="../break-gyro/shimmer3_coords.png" alt="Shimmer3 Axis Diagram"
+    <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram"
          style="width:100%;max-width:280px;display:block;margin:10px auto;border-radius:8px;opacity:0.85"/>
 
     <h3>📡 Setup Steps</h3>
@@ -253,6 +372,29 @@
 
 <div id="console"></div>
 
+<div id="trainingPanel">
+  <div id="thresholdControls">
+    <label for="thresholdSlider">DTW match threshold</label>
+    <input id="thresholdSlider" type="range" min="0.08" max="0.35" step="0.005" value="0.255" />
+    <span id="thresholdValue">0.255</span>
+  </div>
+  <div id="plotLegend">Training plots: X = red, Y = green, Z = blue</div>
+  <div id="plotGrid">
+    <div class="plotCard">
+      <div class="plotTitle"><span>⚡ Thunder</span><span id="plotCount-thunder">0 samples</span></div>
+      <canvas id="plot-thunder" class="plotCanvas" width="320" height="130"></canvas>
+    </div>
+    <div class="plotCard">
+      <div class="plotTitle"><span>🔥 Inferno</span><span id="plotCount-inferno">0 samples</span></div>
+      <canvas id="plot-inferno" class="plotCanvas" width="320" height="130"></canvas>
+    </div>
+    <div class="plotCard">
+      <div class="plotTitle"><span>🌊 Torrent</span><span id="plotCount-torrent">0 samples</span></div>
+      <canvas id="plot-torrent" class="plotCanvas" width="320" height="130"></canvas>
+    </div>
+  </div>
+</div>
+
 <!-- Spell score badges -->
 <div id="spellRow">
   <div class="spellBadge" id="badge-thunder" style="border-color:#a855f7">
@@ -300,7 +442,7 @@ const SPELLS = [
 ];
 
 // ── Constants ─────────────────────────────────────────────────────────────
-const GESTURE_THRESHOLD      = 2500; // fallback raw gyro units
+const GESTURE_THRESHOLD      = 2500;
 const COOLDOWN_MS            = 1400;
 const CAST_TEXT_MS           = 1900;
 const FILTER_ALPHA           = 0.28;
@@ -312,9 +454,10 @@ const MAX_SEGMENT_SAMPLES    = 120;
 const PREBUFFER_SAMPLES      = 16;
 const DTW_RESAMPLE_POINTS    = 48;
 const DTW_WINDOW             = 12;
-const DTW_ACCEPT_DISTANCE    = 0.19;
+const DEFAULT_DTW_ACCEPT_DISTANCE = 0.255;
 const DTW_MARGIN_DISTANCE    = 0.025;
 const TRAINING_STORAGE_KEY   = 'spellTrainingV1';
+const THRESHOLD_STORAGE_KEY  = 'spellDtwAcceptDistanceV1';
 
 // ── Canvas & Context ──────────────────────────────────────────────────────
 const canvas = document.getElementById('spellCanvas');
@@ -348,6 +491,7 @@ let motionSegment  = [];
 let preBuffer      = [];
 let lastMotionTs   = 0;
 let trainingArmed  = false;
+let dtwAcceptDistance = DEFAULT_DTW_ACCEPT_DISTANCE;
 const trainedSamples = { thunder: [], inferno: [], torrent: [] };
 
 function getSpellById(id) {
@@ -377,6 +521,7 @@ function saveTraining() {
     inferno: trainedSamples.inferno.map(compactSegment),
     torrent: trainedSamples.torrent.map(compactSegment),
   }));
+  drawTrainingPlots();
 }
 
 function loadTraining() {
@@ -393,6 +538,27 @@ function loadTraining() {
 
 function getTrainingCount(id) {
   return trainedSamples[id]?.length || 0;
+}
+
+function loadThreshold() {
+  const raw = Number(localStorage.getItem(THRESHOLD_STORAGE_KEY));
+  if (Number.isFinite(raw)) {
+    dtwAcceptDistance = Math.min(0.35, Math.max(0.08, raw));
+  }
+}
+
+function updateThresholdUi() {
+  const slider = document.getElementById('thresholdSlider');
+  const valueEl = document.getElementById('thresholdValue');
+  if (!slider || !valueEl) return;
+  slider.value = dtwAcceptDistance.toFixed(3);
+  valueEl.textContent = dtwAcceptDistance.toFixed(3);
+}
+
+function persistThreshold(value) {
+  dtwAcceptDistance = Math.min(0.35, Math.max(0.08, value));
+  localStorage.setItem(THRESHOLD_STORAGE_KEY, dtwAcceptDistance.toFixed(3));
+  updateThresholdUi();
 }
 
 function resampleSeries(segment, count = DTW_RESAMPLE_POINTS) {
@@ -426,107 +592,156 @@ function prepareSegment(segment) {
   return normalizeSeries(resampleSeries(segment, DTW_RESAMPLE_POINTS));
 }
 
-function dtwDistance(a, b, windowSize = DTW_WINDOW) {
-  const n = a.length, m = b.length;
-  if (!n || !m) return Number.POSITIVE_INFINITY;
-  const w = Math.max(windowSize, Math.abs(n - m));
-  const inf = Number.POSITIVE_INFINITY;
-  let prev = new Array(m + 1).fill(inf);
-  let curr = new Array(m + 1).fill(inf);
-  prev[0] = 0;
+function dtwDistance(s1, s2) {
+  const n = s1.length, m = s2.length;
+  const dp = Array(n + 1).fill(null).map(() => Array(m + 1).fill(Infinity));
+  dp[0][0] = 0;
 
   for (let i = 1; i <= n; i++) {
-    curr.fill(inf);
-    const start = Math.max(1, i - w);
-    const end = Math.min(m, i + w);
-    for (let j = start; j <= end; j++) {
-      const dx = a[i - 1].x - b[j - 1].x;
-      const dy = a[i - 1].y - b[j - 1].y;
-      const dz = a[i - 1].z - b[j - 1].z;
-      const cost = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      curr[j] = cost + Math.min(prev[j], curr[j - 1], prev[j - 1]);
+    for (let j = 1; j <= m; j++) {
+      const p1 = s1[i - 1], p2 = s2[j - 1];
+      const d = Math.hypot(p1.x - p2.x, p1.y - p2.y, p1.z - p2.z);
+      const cost = d * d;
+      dp[i][j] = cost + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
     }
-    [prev, curr] = [curr, prev];
   }
-
-  return prev[m] / (n + m);
-}
-
-function fallbackClassify(segment) {
-  let px = 0, py = 0, pz = 0;
-  for (const s of segment) {
-    px = Math.max(px, Math.abs(s.x));
-    py = Math.max(py, Math.abs(s.y));
-    pz = Math.max(pz, Math.abs(s.z));
-  }
-  const peak = Math.max(px, py, pz);
-  if (peak < GESTURE_THRESHOLD) return null;
-  if (pz >= px && pz >= py) return { spell: SPELLS[0], confidence: 1, magnitude: peak };
-  if (px >= py) return { spell: SPELLS[1], confidence: 1, magnitude: peak };
-  return { spell: SPELLS[2], confidence: 1, magnitude: peak };
+  return Math.sqrt(dp[n][m] / (n + m));
 }
 
 function classifySegment(segment) {
-  const available = SPELLS.filter(s => getTrainingCount(s.id) > 0);
-  if (available.length === 0) return fallbackClassify(segment);
+  if (segment.length < MIN_SEGMENT_SAMPLES) return null;
 
-  const input = prepareSegment(segment);
-  const ranked = [];
+  const prepared = prepareSegment(segment);
+  let bestSpell = null;
+  let bestDistance = Infinity;
 
-  for (const s of available) {
-    let best = Number.POSITIVE_INFINITY;
-    for (const sample of trainedSamples[s.id]) {
-      const dist = dtwDistance(input, prepareSegment(sample));
-      if (dist < best) best = dist;
+  for (const spell of SPELLS) {
+    if (trainedSamples[spell.id].length === 0) continue;
+
+    let spellMinDist = Infinity;
+    for (const trainedSeg of trainedSamples[spell.id]) {
+      const trainedPrepared = prepareSegment(trainedSeg);
+      const d = dtwDistance(prepared, trainedPrepared);
+      spellMinDist = Math.min(spellMinDist, d);
     }
-    ranked.push({ id: s.id, dist: best });
+
+    if (spellMinDist < bestDistance) {
+      bestDistance = spellMinDist;
+      bestSpell = spell;
+    }
   }
 
-  ranked.sort((a, b) => a.dist - b.dist);
-  const best = ranked[0];
-  const second = ranked[1];
-  if (!best || !Number.isFinite(best.dist)) return null;
-
-  const margin = second ? (second.dist - best.dist) : Number.POSITIVE_INFINITY;
-  if (best.dist > DTW_ACCEPT_DISTANCE || margin < DTW_MARGIN_DISTANCE) return null;
-
-  let peak = 0;
-  for (const s of segment) peak = Math.max(peak, Math.abs(s.x), Math.abs(s.y), Math.abs(s.z));
-  const confidence = Math.max(0, Math.min(1, 1 - best.dist / DTW_ACCEPT_DISTANCE));
-  return { spell: getSpellById(best.id), confidence, magnitude: peak || 2500 };
+  if (bestSpell && bestDistance <= dtwAcceptDistance) {
+    return { spell: bestSpell, distance: bestDistance };
+  }
+  return null;
 }
 
 function finalizeSegment() {
-  const segment = motionSegment.slice();
-  motionSegment = [];
-  motionActive = false;
-  if (segment.length < MIN_SEGMENT_SAMPLES) return;
+  if (motionSegment.length < MIN_SEGMENT_SAMPLES) {
+    motionActive = false;
+    motionSegment = [];
+    return;
+  }
 
   if (trainingArmed) {
-    const trainSel = document.getElementById('trainSpellSel');
-    const spellId = trainSel.value;
-    trainedSamples[spellId].push(segment.map(p => ({ x: p.x, y: p.y, z: p.z })));
-    if (trainedSamples[spellId].length > 24) trainedSamples[spellId].shift();
+    const id = document.getElementById('trainSpellSel').value;
+    trainedSamples[id].push(motionSegment);
     saveTraining();
-    trainingArmed = false;
+    window._uiLog(`✅ Trained ${id.toUpperCase()}: ${trainedSamples[id].length} samples`);
+
     document.getElementById('trainBtn').textContent = '🎯 Train Next';
-    window._uiLog(`🎯 Trained ${spellId.toUpperCase()} (${getTrainingCount(spellId)} samples)`);
+    trainingArmed = false;
+  } else if (gameRunning) {
+    const now = Date.now();
+    if (now - lastCastTime >= COOLDOWN_MS) {
+      const result = classifySegment(motionSegment);
+      if (result) {
+        lastCastTime = now;
+        const lastSample = motionSegment[motionSegment.length - 1];
+        const mag = Math.hypot(lastSample.x, lastSample.y, lastSample.z);
+        castSpell(result.spell, mag);
+        window._uiLog(`✨ ${result.spell.name} (dist: ${result.distance.toFixed(3)})`);
+      }
+    }
+  }
+
+  motionActive = false;
+  motionSegment = [];
+}
+
+function drawSeries(plotCtx, series, key, color, alpha, lineWidth) {
+  if (!series.length) return;
+  const w = plotCtx.canvas.width;
+  const h = plotCtx.canvas.height;
+  const padX = 8;
+  const padY = 10;
+  const usableW = w - padX * 2;
+  const usableH = h - padY * 2;
+  plotCtx.beginPath();
+  for (let i = 0; i < series.length; i++) {
+    const x = padX + (i / Math.max(1, series.length - 1)) * usableW;
+    const y = padY + usableH * (0.5 - series[i][key] * 0.42);
+    if (i === 0) plotCtx.moveTo(x, y);
+    else plotCtx.lineTo(x, y);
+  }
+  plotCtx.strokeStyle = color;
+  plotCtx.globalAlpha = alpha;
+  plotCtx.lineWidth = lineWidth;
+  plotCtx.stroke();
+  plotCtx.globalAlpha = 1;
+}
+
+function drawTrainingPlot(spellId) {
+  const canvas = document.getElementById(`plot-${spellId}`);
+  const countEl = document.getElementById(`plotCount-${spellId}`);
+  if (!canvas || !countEl) return;
+
+  const plotCtx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  const samples = trainedSamples[spellId] || [];
+  countEl.textContent = `${samples.length} sample${samples.length === 1 ? '' : 's'}`;
+
+  plotCtx.clearRect(0, 0, w, h);
+  plotCtx.fillStyle = '#050510';
+  plotCtx.fillRect(0, 0, w, h);
+
+  plotCtx.strokeStyle = '#17172d';
+  plotCtx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const y = ((i + 1) * h) / 5;
+    plotCtx.beginPath();
+    plotCtx.moveTo(0, y);
+    plotCtx.lineTo(w, y);
+    plotCtx.stroke();
+  }
+  plotCtx.strokeStyle = '#2d3255';
+  plotCtx.beginPath();
+  plotCtx.moveTo(0, h / 2);
+  plotCtx.lineTo(w, h / 2);
+  plotCtx.stroke();
+
+  if (!samples.length) {
+    plotCtx.fillStyle = '#6f769f';
+    plotCtx.font = '12px system-ui';
+    plotCtx.textAlign = 'center';
+    plotCtx.textBaseline = 'middle';
+    plotCtx.fillText('No trained samples yet', w / 2, h / 2);
     return;
   }
 
-  if (!gameRunning) return;
-  const now = Date.now();
-  if (now - lastCastTime < COOLDOWN_MS) return;
+  const prepared = samples.map(prepareSegment);
+  prepared.forEach((series, index) => {
+    const strong = index === prepared.length - 1;
+    drawSeries(plotCtx, series, 'x', '#ef4444', strong ? 0.95 : 0.22, strong ? 2.2 : 1.1);
+    drawSeries(plotCtx, series, 'y', '#22c55e', strong ? 0.95 : 0.22, strong ? 2.2 : 1.1);
+    drawSeries(plotCtx, series, 'z', '#3b82f6', strong ? 0.95 : 0.22, strong ? 2.2 : 1.1);
+  });
+}
 
-  const result = classifySegment(segment);
-  if (!result) {
-    window._uiLog('…Gesture not recognized');
-    return;
-  }
-
-  lastCastTime = now;
-  castSpell(result.spell, result.magnitude);
-  window._uiLog(`✨ ${result.spell.name} (${Math.round(result.confidence * 100)}%)`);
+function drawTrainingPlots() {
+  for (const spell of SPELLS) drawTrainingPlot(spell.id);
 }
 
 // ── Gesture entry-point (called by BLE module and keyboard) ───────────────
@@ -620,7 +835,6 @@ function drawBackground() {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  // Use a simple LCG seeded by 1 to keep stars stable
   let s = 1;
   const lcg = () => { s = (s * 1664525 + 1013904223) & 0xffffffff; return (s >>> 0) / 0xffffffff; };
   for (let i = 0; i < 80; i++) {
@@ -822,6 +1036,9 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('introOverlay').style.display = 'none';
   }
   loadTraining();
+  loadThreshold();
+  updateThresholdUi();
+  drawTrainingPlots();
   gameLoop();
   window._uiLog(`Training loaded: ⚡${getTrainingCount('thunder')} 🔥${getTrainingCount('inferno')} 🌊${getTrainingCount('torrent')}`);
 });
@@ -852,6 +1069,10 @@ document.getElementById('clearTrainBtn').addEventListener('click', () => {
   for (const s of SPELLS) trainedSamples[s.id] = [];
   saveTraining();
   window._uiLog('🧹 Cleared all trained gesture samples');
+});
+
+document.getElementById('thresholdSlider').addEventListener('input', (e) => {
+  persistThreshold(Number(e.target.value));
 });
 
 // Keyboard shortcuts for testing without BLE
