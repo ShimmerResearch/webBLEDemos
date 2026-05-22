@@ -816,15 +816,6 @@ function castSpell(spell, magnitude) {
 
   castEffects.push({ type: 'ring', spell, x: ox, y: oy, t0: Date.now(), r: 10 });
   castEffects.push({ type: 'text', spell, x: ox, y: oy - 70, t0: Date.now() });
-
-  if (castSet.size === 3) setTimeout(triggerWin, 1800);
-}
-
-function triggerWin() {
-  const total = scores.thunder + scores.inferno + scores.torrent;
-  document.getElementById('winTally').textContent =
-    `⚡ ×${scores.thunder}  🔥 ×${scores.inferno}  🌊 ×${scores.torrent}  —  ${total} total casts`;
-  document.getElementById('winOverlay').style.display = 'flex';
 }
 
 function drawBackground() {
