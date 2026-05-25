@@ -6,5 +6,4 @@ The page supports BLE streaming, optional Web Serial connection, operational con
 
 **Requirements:** Verisense device (IMU or Pulse+), Chrome or Edge
 
-- Canonical source: [`/demos/Verisense/`](./)
-- Live demo URL: [https://shimmerresearch.github.io/webBLEDemos/demos/Verisense/](https://shimmerresearch.github.io/webBLEDemos/demos/Verisense/)
+- Live demo URL: [https://shimmerresearch.github.io/webBLEDemos/Verisense/](https://shimmerresearch.github.io/webBLEDemos/Verisense/)
