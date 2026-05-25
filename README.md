@@ -18,6 +18,8 @@ If sufficient interest is registered, we may prioritize building a more fully sc
 
 [Two Gyro Example](https://shimmerresearch.github.io/webBLEDemos/brick/)
 
+[Spell Caster — Gyro Demo](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/)
+
 [Shimmer Capture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)
 
 [Shimmer3R Chrome Extension](https://github.com/ShimmerEngineering/webBLEDemos/tree/main/shimmer-extension) source code only, will require loading this locally via Chrome
