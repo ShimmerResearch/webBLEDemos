@@ -1,11 +1,12 @@
 // NOTE: The extension imports the shared SDK dist rather than duplicating shimmer3r.js.
-// For local development, first build the SDK from the repo root with
-// `cd shimmer-ble-sdk && npm install && npm run build` so
-// `../shimmer-ble-sdk/dist/shimmer-ble.esm.js` exists relative to this file.
+// For local development, clone the SDK repository (https://github.com/ShimmerResearch/shimmer-web-sdk)
+// as a sibling directory next to this repo so that
+// `../shimmer-web-sdk/dist/shimmer-ble.esm.js` exists relative to this file,
+// then run `cd ../shimmer-web-sdk && npm install && npm run build`.
 // For packaged extension releases, prefer bundling the SDK into the extension build so the
 // package is self-contained. Copying the built dist file is acceptable only for simple manual
 // releases, but requires keeping the import path and copied file in sync.
-import { Shimmer3RClient, SensorBitmapShimmer3 } from "../shimmer-ble-sdk/dist/shimmer-ble.esm.js";
+import { Shimmer3RClient, SensorBitmapShimmer3 } from "../shimmer-web-sdk/dist/shimmer-ble.esm.js";
 // 1. Initialize Charts
 const gsrCtx = document.getElementById('gsrChart').getContext('2d');
 const ppgCtx = document.getElementById('ppgChart').getContext('2d');
