@@ -2,21 +2,25 @@
 
 A Chrome extension that surfaces Shimmer3R sensor data (GSR, PPG) as an overlay while browsing.
 
-The extension uses the `@shimmerresearch/shimmer-web-sdk` SDK (`../shimmer-web-sdk/dist/shimmer-ble.esm.js`) for all BLE communication — there is no longer a separate copy of `shimmer3r.js` inside this folder.
+The extension uses the `@shimmerresearch/shimmer-web-sdk` SDK for all BLE communication. For MV3, the SDK module must be inside this extension folder at `vendor/shimmer-ble.esm.js`.
 
 ## Loading the extension locally
 
-1. Clone the SDK repository as a sibling directory next to this repo:
+1. Clone the SDK repository:
    ```
    git clone https://github.com/ShimmerResearch/shimmer-web-sdk
    ```
-   The directory layout should look like:
+2. Build the SDK:
    ```
-   webBLEDemos/
-   shimmer-web-sdk/
+   cd shimmer-web-sdk
+   npm install
+   npm run build
    ```
-2. Build the SDK: `cd shimmer-web-sdk && npm install && npm run build`
-3. Open Chrome and navigate to `chrome://extensions/`.
-4. Enable **Developer mode** (toggle in the top-right corner).
-5. Click **Load unpacked** and select this `shimmer-extension/` folder.
-6. The Shimmer companion icon should appear in the Chrome toolbar.
+3. Copy the built ESM file into this extension:
+   ```
+   cp dist/shimmer-ble.esm.js /path/to/webBLEDemos/shimmer-extension/vendor/shimmer-ble.esm.js
+   ```
+4. Open Chrome and navigate to `chrome://extensions/`.
+5. Enable **Developer mode** (toggle in the top-right corner).
+6. Click **Load unpacked** and select this `shimmer-extension/` folder.
+7. The Shimmer companion icon should appear in the Chrome toolbar.
