@@ -1,11 +1,12 @@
 <!doctype html>
 <html lang="en">
+
 <head>
-<!-- Google tag (gtag.js) -->
+  <!-- Google tag (gtag.js) -->
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
   <script>
     window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}    
+    function gtag() { dataLayer.push(arguments); }
     gtag('js', new Date());
     gtag('config', 'G-T26GWN0LJW');
   </script>
@@ -13,16 +14,56 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Verisense Stream (Accel + GSR)</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin: 10px 0; }
-    button, select, input { padding: 10px 12px; }
-    .card { border: 1px solid #444; border-radius: 12px; padding: 12px; }
-    pre { background:#111; color:#ddd; padding:10px; border-radius:12px; overflow:auto; max-height: 320px; }
-    small { color:#666; }
-    .grid { display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
-    canvas { display:block; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      margin: 16px;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin: 10px 0;
+    }
+
+    button,
+    select,
+    input {
+      padding: 10px 12px;
+    }
+
+    .card {
+      border: 1px solid #444;
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    pre {
+      background: #111;
+      color: #ddd;
+      padding: 10px;
+      border-radius: 12px;
+      overflow: auto;
+      max-height: 320px;
+    }
+
+    small {
+      color: #666;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+    }
+
+    canvas {
+      display: block;
+    }
   </style>
 </head>
+
 <body>
   <h2>Verisense Stream (Accel1 + GSR)</h2>
   <small>Must be served over <b>https</b> or <b>http://localhost</b>. Click buttons (user gesture required).</small>
@@ -43,32 +84,34 @@
     </div>
   </div>
 
-    <div class="card" style="margin-top:12px;">
-      <div class="row">
-        <b>Operational Config</b>
-        <button id="btnApplyOpCfg" disabled>Apply</button>
-        <span id="opcfgStatus" style="opacity:0.8;"></span>
-      </div>
-      <div class="row">
-        <label><input type="checkbox" id="chkAccelEnable" checked /> Accel1 enabled</label>
-        <label><input type="checkbox" id="chkGsrEnable" checked /> GSR enabled</label>
-        <label><input type="checkbox" id="chkBattEnable" checked /> Battery</label>
-        <small style="opacity:0.8;">(Checkboxes affect parsing immediately; <b>Apply</b> writes to device.)</small>
-      </div>
+  <div class="card" style="margin-top:12px;">
+    <div class="row">
+      <b>Operational Config</b>
+      <button id="btnApplyOpCfg" disabled>Apply</button>
+      <span id="opcfgStatus" style="opacity:0.8;"></span>
     </div>
+    <div class="row">
+      <label><input type="checkbox" id="chkAccelEnable" checked /> Accel1 enabled</label>
+      <label><input type="checkbox" id="chkGsrEnable" checked /> GSR enabled</label>
+      <label><input type="checkbox" id="chkBattEnable" checked /> Battery</label>
+      <small style="opacity:0.8;">(Checkboxes affect parsing immediately; <b>Apply</b> writes to device.)</small>
+    </div>
+  </div>
 
-    <div class="grid">
+  <div class="grid">
     <div class="card">
       <h3>Latest accel sample</h3>
       <div id="latest">—</div>
-      <canvas id="plot" width="520" height="170" style="width:100%; background:#111; border-radius:12px; margin-top:8px;"></canvas>
+      <canvas id="plot" width="520" height="170"
+        style="width:100%; background:#111; border-radius:12px; margin-top:8px;"></canvas>
       <small id="plotInfo"></small>
     </div>
 
     <div class="card">
       <h3>Latest GSR sample</h3>
       <div id="latestGsr">—</div>
-      <canvas id="plotGsr" width="520" height="170" style="width:100%; background:#111; border-radius:12px; margin-top:8px;"></canvas>
+      <canvas id="plotGsr" width="520" height="170"
+        style="width:100%; background:#111; border-radius:12px; margin-top:8px;"></canvas>
       <small id="plotGsrInfo"></small>
     </div>
 
@@ -80,15 +123,14 @@
       </div>
     </div>
   </div>
-<div class="dfu-link-container" style="margin: 10px 0;">
-    <a href="https://shimmerengineering.github.io/ASM_web-bluetooth-dfu/examples/web.html" 
-       target="_blank" 
-       style="background-color: #007bff; color: white; padding: 10px 15px; text-decoration: none; border-radius: 5px; font-family: sans-serif; display: inline-block;">
-        🔗 Open DFU Update Tool
+  <div class="dfu-link-container" style="margin: 10px 0;">
+    <a href="https://shimmerengineering.github.io/ASM_web-bluetooth-dfu/examples/web.html" target="_blank"
+      style="background-color: #007bff; color: white; padding: 10px 15px; text-decoration: none; border-radius: 5px; font-family: sans-serif; display: inline-block;">
+      🔗 Open DFU Update Tool
     </a>
-</div>
-<script type="module">
-    import { VerisenseBleDevice } from "https://cdn.jsdelivr.net/gh/ShimmerResearch/shimmer-web-sdk@v0.1.4/dist/shimmer-ble.esm.js";
+  </div>
+  <script type="module">
+    import { VerisenseBleDevice } from "https://cdn.jsdelivr.net/gh/ShimmerResearch/shimmer-web-sdk@v0.1.4/dist/shimmer-web-sdk.esm.js";
 
     const $ = (id) => document.getElementById(id);
 
@@ -98,7 +140,7 @@
     const statusEl = $("status");
 
     const btnConnect = $("btnConnect");
-	btnConnect.disabled = false;
+    btnConnect.disabled = false;
     const btnDisconnect = $("btnDisconnect");
     const btnConnectSerial = $("btnConnectSerial");
     const btnStart = $("btnStart");
@@ -110,33 +152,33 @@
     const chkGsrEnable = $("chkGsrEnable");
     const chkBattEnable = $("chkBattEnable");
 
-// --- OpConfig UI helpers ---
-function enforceGsrBattUI() {
-  const gsrOn = !!chkGsrEnable.checked;
-  chkBattEnable.disabled = !gsrOn;
-  if (!gsrOn) chkBattEnable.checked = false;
-}
+    // --- OpConfig UI helpers ---
+    function enforceGsrBattUI() {
+      const gsrOn = !!chkGsrEnable.checked;
+      chkBattEnable.disabled = !gsrOn;
+      if (!gsrOn) chkBattEnable.checked = false;
+    }
 
-function syncOpCfgUIFromDeviceState() {
-  if (!v) return;
-  chkAccelEnable.checked = !!v?.accel1?.enabled;
-  chkGsrEnable.checked = !!v?.gsr?.gsrEnabled;
-  chkBattEnable.checked = !!v?.gsr?.battEnabled;
-  enforceGsrBattUI();
-}
+    function syncOpCfgUIFromDeviceState() {
+      if (!v) return;
+      chkAccelEnable.checked = !!v?.accel1?.enabled;
+      chkGsrEnable.checked = !!v?.gsr?.gsrEnabled;
+      chkBattEnable.checked = !!v?.gsr?.battEnabled;
+      enforceGsrBattUI();
+    }
 
-// Keep decoder flags + dependent UI in sync while the user toggles checkboxes
-chkAccelEnable.addEventListener("change", () => {
-  applyDecoderEnablesFromUI();
-});
-chkGsrEnable.addEventListener("change", () => {
-  enforceGsrBattUI();
-  applyDecoderEnablesFromUI();
-});
-chkBattEnable.addEventListener("change", () => {
-  enforceGsrBattUI();
-  applyDecoderEnablesFromUI();
-});
+    // Keep decoder flags + dependent UI in sync while the user toggles checkboxes
+    chkAccelEnable.addEventListener("change", () => {
+      applyDecoderEnablesFromUI();
+    });
+    chkGsrEnable.addEventListener("change", () => {
+      enforceGsrBattUI();
+      applyDecoderEnablesFromUI();
+    });
+    chkBattEnable.addEventListener("change", () => {
+      enforceGsrBattUI();
+      applyDecoderEnablesFromUI();
+    });
 
     // Ensure initial dependent states are correct
     enforceGsrBattUI();
@@ -430,15 +472,15 @@ chkBattEnable.addEventListener("change", () => {
       let next = current;
 
       // Patch enable bits
-      if (v.accel1?.setEnabled){
-	    next = v.accel1.setEnabled(!!chkAccelEnable.checked, next);
-	    next = v.accel1.patchAccelSamplingRate(9,next);
-	  }
+      if (v.accel1?.setEnabled) {
+        next = v.accel1.setEnabled(!!chkAccelEnable.checked, next);
+        next = v.accel1.patchAccelSamplingRate(9, next);
+      }
       if (v.gsr?.setEnabled) {
-	    next = v.gsr.setEnabled({ gsr: !!chkGsrEnable.checked, batt: !!chkBattEnable.checked }, next);
-        next = v.gsr.patchGsrRange(4,next);
-	    next = v.gsr.patchGsrSamplingRate(23,next);
-	  }
+        next = v.gsr.setEnabled({ gsr: !!chkGsrEnable.checked, batt: !!chkBattEnable.checked }, next);
+        next = v.gsr.patchGsrRange(4, next);
+        next = v.gsr.patchGsrSamplingRate(23, next);
+      }
 
       const confirmed = await v.writeOpConfig(next, { verify: true });
 
@@ -464,7 +506,7 @@ chkBattEnable.addEventListener("change", () => {
       // Optional: turn off other decoders
       dev.gyroAccel2.setAccelEnabled(false);
       dev.gyroAccel2.setGyroEnabled(false);
-      dev.ppg.setChannels({ red:false, ir:false, green:false, blue:false });
+      dev.ppg.setChannels({ red: false, ir: false, green: false, blue: false });
     }
 
     function renderLatestAccel(pkt) {
@@ -595,13 +637,13 @@ chkBattEnable.addEventListener("change", () => {
       });
 
       // Optional: surface op-config logs on page
-	  dev.on("Production Config", (config) => {
-		log("Production Config received", { 
-			hw: config.hardware, 
-			fw: config.firmware, 
-			id: config.asmid 
-			});
-		});
+      dev.on("Production Config", (config) => {
+        log("Production Config received", {
+          hw: config.hardware,
+          fw: config.firmware,
+          id: config.asmid
+        });
+      });
       dev.on("opConfig", ({ op }) => log("opConfig received", { len: op?.length, head: Array.from(op?.slice?.(0, 16) ?? []) }));
       dev.on("opConfigError", (e) => log("opConfigError", e));
     }
@@ -609,7 +651,7 @@ chkBattEnable.addEventListener("change", () => {
     // --- UI actions ---
 
     btnConnect.onclick = async () => {
-	  setStatus("scanning (chooser)...");
+      setStatus("scanning (chooser)...");
       const namePrefix = "Verisense";
 
       const opts = namePrefix
@@ -784,7 +826,7 @@ chkBattEnable.addEventListener("change", () => {
         log("opcfg applied:", { accelEnabled: v?.accel1?.enabled, gsrEnabled: v?.gsr?.gsrEnabled, battEnabled: v?.gsr?.battEnabled });
       } catch (e) {
         log("opcfg apply error:", String(e?.message ?? e));
-        
+
       }
     };
 
@@ -827,4 +869,5 @@ chkBattEnable.addEventListener("change", () => {
     };
   </script>
 </body>
+
 </html>

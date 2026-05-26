@@ -1,4 +1,4 @@
-import { Shimmer3RClient, SensorBitmapShimmer3 } from "./vendor/shimmer-ble.esm.js";
+import { Shimmer3RClient, SensorBitmapShimmer3 } from "./vendor/shimmer-web-sdk.esm.js";
 // 1. Initialize Charts
 const gsrCtx = document.getElementById('gsrChart').getContext('2d');
 const ppgCtx = document.getElementById('ppgChart').getContext('2d');

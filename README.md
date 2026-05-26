@@ -56,13 +56,13 @@ shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpa
 The demos load the SDK directly from the jsDelivr CDN (served from the public GitHub repo):
 
 ```js
-import { Shimmer3RClient } from 'https://cdn.jsdelivr.net/gh/ShimmerResearch/shimmer-web-sdk@v0.1.4/dist/shimmer-ble.esm.js';
+import { Shimmer3RClient } from 'https://cdn.jsdelivr.net/gh/ShimmerResearch/shimmer-web-sdk@v0.1.4/dist/shimmer-web-sdk.esm.js';
 ```
 
 The SDK is pinned to `v0.1.4` so demo behavior stays reproducible.
 When adopting a newer SDK release, update the version in demo imports intentionally after validation.
 
-For the Chrome extension, also copy `dist/shimmer-ble.esm.js` from `shimmer-web-sdk` into:
-`webBLEDemos/shimmer-extension/vendor/shimmer-ble.esm.js` before loading unpacked.
+For the Chrome extension, also copy `dist/shimmer-web-sdk.esm.js` from `shimmer-web-sdk` into:
+`webBLEDemos/shimmer-extension/vendor/shimmer-web-sdk.esm.js` before loading unpacked.
 
 The SDK source lives at [ShimmerResearch/shimmer-web-sdk](https://github.com/ShimmerResearch/shimmer-web-sdk).
