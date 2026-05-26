@@ -2,7 +2,7 @@
 
 A Chrome extension that surfaces Shimmer3R sensor data (GSR, PPG) as an overlay while browsing.
 
-The extension uses the `@shimmerresearch/web-ble` SDK (`../shimmer-web-sdk/dist/shimmer-ble.esm.js`) for all BLE communication — there is no longer a separate copy of `shimmer3r.js` inside this folder.
+The extension uses the `@shimmerresearch/shimmer-web-sdk` SDK (`../shimmer-web-sdk/dist/shimmer-ble.esm.js`) for all BLE communication — there is no longer a separate copy of `shimmer3r.js` inside this folder.
 
 ## Loading the extension locally
 

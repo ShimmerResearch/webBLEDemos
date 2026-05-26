@@ -49,7 +49,7 @@ shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Ch
 
 ---
 
-## `@shimmerresearch/web-ble` SDK
+## `@shimmerresearch/shimmer-web-sdk` SDK
 
 The demos load the SDK directly from the jsDelivr CDN (served from the public GitHub repo):
 
