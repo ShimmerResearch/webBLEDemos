@@ -1,1163 +1,1454 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <!-- Google tag (gtag.js) -->
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
-    gtag('js', new Date());
-    gtag('config', 'G-T26GWN0LJW');
-  </script>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Spell Caster — Shimmer Gyro Demo</title>
-
-  <style>
-    :root {
-      --bg:      #06060f;
-      --panel:   #0e0e22;
-      --ink:     #e8eaf6;
-      --thunder: #a855f7;
-      --inferno: #ef4444;
-      --torrent: #3b82f6;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; padding: 0;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
-      overflow-y: auto;
-    }
-    h1 {
-      text-align: center;
-      font-size: clamp(1.2rem, 4vw, 1.8rem);
-      margin: 14px 0 2px;
-      letter-spacing: 3px;
-      text-transform: uppercase;
-    }
-    .subtitle {
-      text-align: center;
-      color: #7878aa;
-      font-size: 0.85rem;
-      margin-bottom: 10px;
-    }
-
-    /* ── Controls ── */
-    #controls {
-      display: flex; flex-wrap: wrap;
-      justify-content: center; align-items: center;
-      gap: 8px; padding: 6px 8px;
-    }
-    button {
-      border: none; border-radius: 8px;
-      padding: 9px 15px; font-size: 14px;
-      font-weight: 600; cursor: pointer;
-    }
-    #scanBtn    { background: #2196F3; color: #fff; }
-    #configBtn  { background: #4CAF50; color: #fff; }
-    #streamBtn  { background: #FFC107; color: #000; }
-    #disconnBtn { background: #f44336; color: #fff; }
-    #startBtn   { background: #9C27B0; color: #fff; }
-    #showTipBtn { background: #37474F; color: #fff; }
-    #trainBtn { background: #7c3aed; color: #fff; }
-    #clearTrainBtn { background: #455A64; color: #fff; }
-    #trainSpellSel {
-      background: #1f2937;
-      color: #e5e7eb;
-      border: 1px solid #374151;
-      border-radius: 8px;
-      padding: 8px 10px;
-      font-size: 13px;
-    }
-    #deviceName { font-size: 13px; color: #9999bb; }
-
-    /* ── Console ── */
-    #console {
-      background: #000; color: #0f0;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 12px; border: 1px solid #0f0;
-      padding: 6px 8px; max-width: 600px;
-      margin: 4px auto; height: 48px;
-      overflow-y: auto; border-radius: 4px;
-    }
-
-    #trainingPanel {
-      max-width: 860px;
-      margin: 10px auto 0;
-      padding: 0 8px;
-    }
-    #thresholdControls {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      color: #aab0d6;
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-    #thresholdSlider {
-      width: min(260px, 75vw);
-      accent-color: #a855f7;
-    }
-    #thresholdValue {
-      min-width: 52px;
-      text-align: right;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      color: #e8eaf6;
-    }
-    #plotLegend {
-      text-align: center;
-      color: #7f89b3;
-      font-size: 12px;
-      margin-bottom: 8px;
-    }
-    #plotGrid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 10px;
-    }
-    .plotCard {
-      background: #0b0b1a;
-      border: 1px solid #242447;
-      border-radius: 10px;
-      padding: 8px;
-    }
-    .plotTitle {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      color: #d5d8f0;
-      font-size: 12px;
-      margin-bottom: 6px;
-      letter-spacing: 0.5px;
-    }
-    .plotCanvas {
-      display: block;
-      width: 100%;
-      height: 130px;
-      background: #050510;
-      border: 1px solid #17172d;
-      border-radius: 8px;
-    }
-
-    /* ── Intro Overlay ── */
-    #introOverlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.85);
-      display: flex; align-items: center; justify-content: center;
-      z-index: 1000;
-      backdrop-filter: blur(2px);
-    }
-    .introContent {
-      background: linear-gradient(135deg, #0e0e22 0%, #1a1a3a 100%);
-      border: 2px solid #2d3255;
-      border-radius: 16px;
-      padding: 28px;
-      max-width: 520px;
-      max-height: 90vh;
-      overflow-y: auto;
-      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
-      color: #e8eaf6;
-    }
-    .introContent h2 {
-      margin: 0 0 12px;
-      font-size: 1.6rem;
-      text-align: center;
-      letter-spacing: 2px;
-    }
-    .introContent h3 {
-      font-size: 1.1rem;
-      margin: 16px 0 8px;
-      color: #d5d8f0;
-      letter-spacing: 1px;
-    }
-    .introContent ol {
-      margin: 8px 0;
-      padding-left: 20px;
-      line-height: 1.7;
-    }
-    .spellItem {
-      display: flex; gap: 12px;
-      margin: 8px 0; padding: 8px;
-      background: rgba(255,255,255,0.05);
-      border-radius: 8px;
-    }
-    .spellIcon {
-      font-size: 1.8rem;
-      min-width: 40px;
-      display: flex; align-items: center; justify-content: center;
-    }
-    .btnHint {
-      background: #1f2937; padding: 2px 6px;
-      border-radius: 4px; font-size: 0.9em;
-      font-family: ui-monospace, monospace;
-    }
-    .introFoot {
-      display: flex; justify-content: space-between;
-      align-items: center; margin-top: 16px;
-    }
-
-    /* ── Win Overlay ── */
-    #winOverlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.9);
-      display: none; flex-direction: column;
-      align-items: center; justify-content: center;
-      z-index: 999;
-      text-align: center;
-      color: #e8eaf6;
-    }
-    .winSub {
-      color: #9999bb; margin: 8px 0 0;
-    }
-    .winTally {
-      font-size: 1.1rem; margin: 14px 0;
-      font-family: ui-monospace, monospace;
-    }
-    #playAgainBtn {
-      background: #a855f7; color: #fff;
-      padding: 12px 24px; font-size: 16px;
-      margin-top: 16px; cursor: pointer;
-      border-radius: 8px; border: none;
-    }
-    #playAgainBtn:hover { background: #9333ea; }
-
-    /* ── Spell Row ── */
-    #spellRow {
-      display: flex; justify-content: center;
-      gap: 16px; margin: 12px 0;
-    }
-    .spellBadge {
-      border: 3px solid;
-      border-radius: 12px;
-      padding: 12px 20px;
-      text-align: center;
-      background: rgba(0,0,0,0.3);
-      transition: all 0.2s;
-      min-width: 100px;
-    }
-    .bigEmoji {
-      font-size: 2.2rem;
-      display: block;
-      margin: 0 0 4px;
-    }
-    .spellLabel {
-      font-size: 0.85rem;
-      font-weight: 600;
-      letter-spacing: 1px;
-      margin: 4px 0;
-    }
-    .castCount {
-      font-size: 1.4rem;
-      font-weight: bold;
-      color: #fff;
-    }
-
-    /* ── Canvas & Hint ── */
-    #spellCanvas {
-      display: block;
-      margin: 12px auto;
-      border: 2px solid #2d3255;
-      border-radius: 8px;
-      background: #000;
-    }
-    #keyHint {
-      text-align: center;
-      font-size: 12px;
-      color: #7878aa;
-      margin: 8px 0;
-    }
-    kbd {
-      background: #1f2937;
-      padding: 2px 6px;
-      border-radius: 3px;
-      font-family: ui-monospace, monospace;
-      font-size: 11px;
-    }
-  </style>
-</head>
-<body>
-
-<!-- ═══════════════════ INTRO OVERLAY ═══════════════════ -->
-<div id="introOverlay">
-  <div class="introContent">
-    <h2>🧙 Spell Caster — Gyro Demo</h2>
-    <p style="color:#9999bb;margin:0 0 12px">
-      Cast three magical spells with motion gestures from your <strong>Shimmer3R</strong> gyroscope.
-    </p>
-
-    <h3>🪄 The Three Spells</h3>
-    <p style="font-size:12px;color:#7778aa;margin:8px 0">
-      💡 <strong>Tip:</strong> Gyros detect <strong>rotation</strong>, not linear movement. Train sharp, rotational gestures for best results.
-    </p>
-    <div class="spellItem">
-      <span class="spellIcon">⚡</span>
-      <div>
-        <strong style="color:#a855f7">THUNDER</strong> — Train your own motion<br>
-        <small style="color:#6666aa">Example: Sharp wrist flick left-right, twist, or snap</small>
-      </div>
-    </div>
-    <div class="spellItem">
-      <span class="spellIcon">🔥</span>
-      <div>
-        <strong style="color:#ef4444">INFERNO</strong> — Train your own motion<br>
-        <small style="color:#6666aa">Example: Arm rotation, rapid pitch motion, or circular swing</small>
-      </div>
-    </div>
-    <div class="spellItem">
-      <span class="spellIcon">🌊</span>
-      <div>
-        <strong style="color:#3b82f6">TORRENT</strong> — Train your own motion<br>
-        <small style="color:#6666aa">Example: Wrist roll, tilt side-to-side, or figure-8 motion</small>
-      </div>
-    </div>
-    <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram"
-         style="width:100%;max-width:280px;display:block;margin:10px auto;border-radius:8px;opacity:0.85"/>
-
-    <h3>📡 Setup Steps</h3>
-    <ol>
-      <li>Click <span class="btnHint">🔍 Scan</span> and select your Shimmer3R</li>
-      <li>Click <span class="btnHint">⚙️ Configure</span> to enable gyro streaming</li>
-      <li>Click <span class="btnHint">📡 Stream</span> to start data</li>
-      <li><strong>Train each spell:</strong> Select spell → Click <span class="btnHint">🎯 Train Next</span> → Perform motion cleanly</li>
-      <li>Once all three spells trained, click <span class="btnHint">▶️ Start</span> to play</li>
-    </ol>
-    <p style="font-size:13px;color:#5555aa">
-      <strong>Device:</strong> Shimmer3R &nbsp;|&nbsp;
-      <strong>Firmware:</strong> v1.0.22+<br>
-      <strong>No BLE?</strong> Use keys <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> to demo each spell.
-    </p>
-
-    <div class="introFoot">
-      <label style="font-size:13px;color:#9999bb">
-        <input type="checkbox" id="dontShowAgain"> Don't show again
-      </label>
-      <button id="closeIntroBtn"
-        style="background:#a855f7;color:#fff;border:none:border-radius:8px;
-               padding:9px 20px;cursor:pointer;font-size:14px;font-weight:600;">
-        Got it! ✨
-      </button>
-    </div>
-  </div>
-</div>
-
-<!-- ═══════════════════ WIN OVERLAY ═══════════════════ -->
-<div id="winOverlay">
-  <div style="font-size:3rem">🏆</div>
-  <h2>All Spells Mastered!</h2>
-  <p class="winSub">You successfully cast all three spells.</p>
-  <p class="winTally" id="winTally"></p>
-  <button id="playAgainBtn">Play Again ↺</button>
-</div>
-
-<!-- ═══════════════════ MAIN UI ═══════════════════ -->
-<h1>🧙 Spell Caster</h1>
-<p class="subtitle">Perform motion gestures to cast spells • Shimmer3R Gyro Demo</p>
-
-<div id="controls">
-  <button id="scanBtn">🔍 Scan</button>
-  <button id="configBtn" disabled>⚙️ Configure</button>
-  <button id="streamBtn" disabled>📡 Stream</button>
-  <button id="disconnBtn" disabled>❌ Disconnect</button>
-  <button id="startBtn">▶️ Start</button>
-  <select id="trainSpellSel" title="Spell to train">
-    <option value="thunder">⚡ Thunder</option>
-    <option value="inferno">🔥 Inferno</option>
-    <option value="torrent">🌊 Torrent</option>
-  </select>
-  <button id="trainBtn">🎯 Train Next</button>
-  <button id="clearTrainBtn">🧹 Clear Training</button>
-  <button id="showTipBtn">💡 Help</button>
-  <span id="deviceName">No device</span>
-</div>
-
-<div id="console"></div>
-
-<div id="trainingPanel">
-  <div id="thresholdControls">
-    <label for="thresholdSlider">DTW match threshold</label>
-    <input id="thresholdSlider" type="range" min="0.08" max="0.35" step="0.005" />
-    <span id="thresholdValue">—</span>
-  </div>
-  <div id="plotLegend">Training plots: X = red, Y = green, Z = blue</div>
-  <div id="plotGrid">
-    <div class="plotCard">
-      <div class="plotTitle"><span>⚡ Thunder</span><span id="plotCount-thunder">0 samples</span></div>
-      <canvas id="plot-thunder" class="plotCanvas" width="320" height="130"></canvas>
-    </div>
-    <div class="plotCard">
-      <div class="plotTitle"><span>🔥 Inferno</span><span id="plotCount-inferno">0 samples</span></div>
-      <canvas id="plot-inferno" class="plotCanvas" width="320" height="130"></canvas>
-    </div>
-    <div class="plotCard">
-      <div class="plotTitle"><span>🌊 Torrent</span><span id="plotCount-torrent">0 samples</span></div>
-      <canvas id="plot-torrent" class="plotCanvas" width="320" height="130"></canvas>
-    </div>
-  </div>
-</div>
-
-<!-- Spell score badges -->
-<div id="spellRow">
-  <div class="spellBadge" id="badge-thunder" style="border-color:#a855f7">
-    <span class="bigEmoji">⚡</span>
-    <div class="spellLabel" style="color:#a855f7">THUNDER</div>
-    <div class="castCount" id="cnt-thunder">0</div>
-  </div>
-  <div class="spellBadge" id="badge-inferno" style="border-color:#ef4444">
-    <span class="bigEmoji">🔥</span>
-    <div class="spellLabel" style="color:#ef4444">INFERNO</div>
-    <div class="castCount" id="cnt-inferno">0</div>
-  </div>
-  <div class="spellBadge" id="badge-torrent" style="border-color:#3b82f6">
-    <span class="bigEmoji">🌊</span>
-    <div class="spellLabel" style="color:#3b82f6">TORRENT</div>
-    <div class="castCount" id="cnt-torrent">0</div>
-  </div>
-</div>
-
-<canvas id="spellCanvas" width="600" height="460"></canvas>
-<p id="keyHint">Keyboard: <kbd>1</kbd> Thunder &nbsp; <kbd>2</kbd> Inferno &nbsp; <kbd>3</kbd> Torrent</p>
-
-<!-- ═══════════════════ GAME SCRIPT ═══════════════════ -->
-<script>
-// ── Spell Definitions ────────────────────────────────────────────────────────
-const SPELLS = [
-  {
-    id: 'thunder', name: 'THUNDER', emoji: '⚡', axis: 'z',
-    color: '#a855f7', rgb: [168, 85, 247],
-    particleColor: '#d8b4fe', orbX: 0.5, orbY: 0.72,
-    hintText: 'Flick Z',
-  },
-  {
-    id: 'inferno', name: 'INFERNO', emoji: '🔥', axis: 'x',
-    color: '#ef4444', rgb: [239, 68, 68],
-    particleColor: '#fca5a5', orbX: 0.18, orbY: 0.38,
-    hintText: 'Pitch X',
-  },
-  {
-    id: 'torrent', name: 'TORRENT', emoji: '🌊', axis: 'y',
-    color: '#3b82f6', rgb: [59, 130, 246],
-    particleColor: '#93c5fd', orbX: 0.82, orbY: 0.38,
-    hintText: 'Roll Y',
-  },
-];
-
-// ── Constants ─────────────────────────────────────────────────────────────
-const GESTURE_THRESHOLD      = 2500;
-const COOLDOWN_MS            = 1400;
-const CAST_TEXT_MS           = 1900;
-const FILTER_ALPHA           = 0.28;
-const MOTION_ENTER_THRESHOLD = 1800;
-const MOTION_EXIT_THRESHOLD  = 900;
-const MOTION_END_SILENCE_MS  = 170;
-const MIN_SEGMENT_SAMPLES    = 10;
-const MAX_SEGMENT_SAMPLES    = 120;
-const PREBUFFER_SAMPLES      = 16;
-const DTW_RESAMPLE_POINTS    = 48;
-const DTW_WINDOW             = 12;
-const DEFAULT_DTW_ACCEPT_DISTANCE = 0.255;
-const DTW_MARGIN_DISTANCE    = 0.025;
-const TRAINING_STORAGE_KEY   = 'spellTrainingV1';
-const THRESHOLD_STORAGE_KEY  = 'spellDtwAcceptDistanceV1';
-
-// ── Canvas & Context ──────────────────────────────────────────────────────
-const canvas = document.getElementById('spellCanvas');
-const ctx    = canvas.getContext('2d');
-
-function resizeCanvas() {
-  const maxW = 600;
-  const ratio = 460 / 600;
-  const w = Math.min(window.innerWidth, maxW);
-  canvas.style.width  = w + 'px';
-  canvas.style.height = Math.round(w * ratio) + 'px';
-}
-window.addEventListener('resize', resizeCanvas);
-resizeCanvas();
-
-// ── Game State ────────────────────────────────────────────────────────────
-let gameRunning    = false;
-let lastCastTime   = 0;
-let particles      = [];
-let castEffects    = [];
-let flashAlpha     = 0;
-let flashRgb       = [0, 0, 0];
-let scores         = { thunder: 0, inferno: 0, torrent: 0 };
-let castSet        = new Set();
-let animTick       = 0;
-
-// ── Gesture Engine State ──────────────────────────────────────────────────
-let filteredState  = { ready: false, x: 0, y: 0, z: 0 };
-let motionActive   = false;
-let motionSegment  = [];
-let preBuffer      = [];
-let lastMotionTs   = 0;
-let trainingArmed  = false;
-let dtwAcceptDistance = DEFAULT_DTW_ACCEPT_DISTANCE;
-const trainedSamples = { thunder: [], inferno: [], torrent: [] };
-
-function getSpellById(id) {
-  return SPELLS.find(s => s.id === id);
-}
-
-function pushPreBuffer(sample) {
-  preBuffer.push(sample);
-  if (preBuffer.length > PREBUFFER_SAMPLES) preBuffer.shift();
-}
-
-function compactSegment(segment) {
-  return segment.map(p => [
-    Math.round(p.x * 100) / 100,
-    Math.round(p.y * 100) / 100,
-    Math.round(p.z * 100) / 100,
-  ]);
-}
-
-function uncompactSegment(compact) {
-  return compact.map(v => ({ x: v[0], y: v[1], z: v[2] }));
-}
-
-function saveTraining() {
-  localStorage.setItem(TRAINING_STORAGE_KEY, JSON.stringify({
-    thunder: trainedSamples.thunder.map(compactSegment),
-    inferno: trainedSamples.inferno.map(compactSegment),
-    torrent: trainedSamples.torrent.map(compactSegment),
-  }));
-  drawTrainingPlots();
-}
-
-function loadTraining() {
-  try {
-    const raw = localStorage.getItem(TRAINING_STORAGE_KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw);
-    for (const s of SPELLS) {
-      const rows = Array.isArray(parsed[s.id]) ? parsed[s.id] : [];
-      trainedSamples[s.id] = rows.filter(Array.isArray).map(uncompactSegment);
-    }
-  } catch {}
-}
-
-function getTrainingCount(id) {
-  return trainedSamples[id]?.length || 0;
-}
-
-function loadThreshold() {
-  const raw = Number(localStorage.getItem(THRESHOLD_STORAGE_KEY));
-  if (Number.isFinite(raw)) {
-    dtwAcceptDistance = Math.min(0.35, Math.max(0.08, raw));
-  } else {
-    dtwAcceptDistance = null;
-  }
-}
-
-function updateThresholdUi() {
-  const slider = document.getElementById('thresholdSlider');
-  const valueEl = document.getElementById('thresholdValue');
-  if (!slider || !valueEl) return;
-  if (dtwAcceptDistance === null) {
-    slider.value = '';
-    valueEl.textContent = '—';
-  } else {
-    slider.value = dtwAcceptDistance.toFixed(3);
-    valueEl.textContent = dtwAcceptDistance.toFixed(3);
-  }
-}
-
-function persistThreshold(value) {
-  dtwAcceptDistance = Math.min(0.35, Math.max(0.08, value));
-  localStorage.setItem(THRESHOLD_STORAGE_KEY, dtwAcceptDistance.toFixed(3));
-  updateThresholdUi();
-}
-
-function resampleSeries(segment, count = DTW_RESAMPLE_POINTS) {
-  if (segment.length === 0) return [];
-  if (segment.length === 1) return Array.from({ length: count }, () => ({ ...segment[0] }));
-  const out = [];
-  const maxIdx = segment.length - 1;
-  for (let i = 0; i < count; i++) {
-    const pos = (i * maxIdx) / (count - 1);
-    const lo = Math.floor(pos);
-    const hi = Math.min(maxIdx, lo + 1);
-    const t = pos - lo;
-    const a = segment[lo], b = segment[hi];
-    out.push({
-      x: a.x + (b.x - a.x) * t,
-      y: a.y + (b.y - a.y) * t,
-      z: a.z + (b.z - a.z) * t,
-    });
-  }
-  return out;
-}
-
-function normalizeSeries(series) {
-  let peak = 0;
-  for (const p of series) peak = Math.max(peak, Math.hypot(p.x, p.y, p.z));
-  const scale = peak > 1 ? peak : 1;
-  return series.map(p => ({ x: p.x / scale, y: p.y / scale, z: p.z / scale }));
-}
-
-function prepareSegment(segment) {
-  return normalizeSeries(resampleSeries(segment, DTW_RESAMPLE_POINTS));
-}
-
-function dtwDistance(s1, s2) {
-  const n = s1.length, m = s2.length;
-  const dp = Array(n + 1).fill(null).map(() => Array(m + 1).fill(Infinity));
-  dp[0][0] = 0;
-
-  for (let i = 1; i <= n; i++) {
-    for (let j = 1; j <= m; j++) {
-      const p1 = s1[i - 1], p2 = s2[j - 1];
-      const d = Math.hypot(p1.x - p2.x, p1.y - p2.y, p1.z - p2.z);
-      const cost = d * d;
-      dp[i][j] = cost + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-    }
-  }
-  return Math.sqrt(dp[n][m] / (n + m));
-}
-
-function classifySegment(segment) {
-  if (segment.length < MIN_SEGMENT_SAMPLES) return null;
-  if (dtwAcceptDistance === null) {
-    window._uiLog('⚠️ Set DTW threshold before casting');
-    return null;
-  }
-
-  const prepared = prepareSegment(segment);
-  let bestSpell = null;
-  let bestDistance = Infinity;
-
-  for (const spell of SPELLS) {
-    if (trainedSamples[spell.id].length === 0) continue;
-
-    let spellMinDist = Infinity;
-    for (const trainedSeg of trainedSamples[spell.id]) {
-      const trainedPrepared = prepareSegment(trainedSeg);
-      const d = dtwDistance(prepared, trainedPrepared);
-      spellMinDist = Math.min(spellMinDist, d);
-    }
-
-    if (spellMinDist < bestDistance) {
-      bestDistance = spellMinDist;
-      bestSpell = spell;
-    }
-  }
-
-  if (bestSpell && bestDistance <= dtwAcceptDistance) {
-    return { spell: bestSpell, distance: bestDistance };
-  }
-  return null;
-}
-
-function finalizeSegment() {
-  if (motionSegment.length < MIN_SEGMENT_SAMPLES) {
-    motionActive = false;
-    motionSegment = [];
-    return;
-  }
-
-  if (trainingArmed) {
-    const id = document.getElementById('trainSpellSel').value;
-    trainedSamples[id] = [motionSegment];  // Replace with single new sample
-    saveTraining();
-    window._uiLog(`✅ Trained ${id.toUpperCase()}: ${trainedSamples[id].length} sample`);
-    
-    document.getElementById('trainBtn').textContent = '🎯 Train Next';
-    trainingArmed = false;
-  } else if (gameRunning) {
-    const now = Date.now();
-    if (now - lastCastTime >= COOLDOWN_MS) {
-      const result = classifySegment(motionSegment);
-      if (result) {
-        lastCastTime = now;
-        const lastSample = motionSegment[motionSegment.length - 1];
-        const mag = Math.hypot(lastSample.x, lastSample.y, lastSample.z);
-        castSpell(result.spell, mag);
-        window._uiLog(`✨ ${result.spell.name} (dist: ${result.distance.toFixed(3)})`);
+  <head>
+    <!-- Google tag (gtag.js) -->
+    <script
+      async
+      src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"
+    ></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
       }
-    }
-  }
+      gtag("js", new Date());
+      gtag("config", "G-T26GWN0LJW");
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Spell Caster — Shimmer Gyro Demo</title>
 
-  motionActive = false;
-  motionSegment = [];
-}
+    <style>
+      :root {
+        --bg: #06060f;
+        --panel: #0e0e22;
+        --ink: #e8eaf6;
+        --thunder: #a855f7;
+        --inferno: #ef4444;
+        --torrent: #3b82f6;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family:
+          system-ui,
+          Segoe UI,
+          Roboto,
+          Arial,
+          sans-serif;
+        overflow-y: auto;
+      }
+      h1 {
+        text-align: center;
+        font-size: clamp(1.2rem, 4vw, 1.8rem);
+        margin: 14px 0 2px;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+      }
+      .subtitle {
+        text-align: center;
+        color: #7878aa;
+        font-size: 0.85rem;
+        margin-bottom: 10px;
+      }
 
-function drawSeries(plotCtx, series, key, color, alpha, lineWidth) {
-  if (!series.length) return;
-  const w = plotCtx.canvas.width;
-  const h = plotCtx.canvas.height;
-  const padX = 8;
-  const padY = 10;
-  const usableW = w - padX * 2;
-  const usableH = h - padY * 2;
-  plotCtx.beginPath();
-  for (let i = 0; i < series.length; i++) {
-    const x = padX + (i / Math.max(1, series.length - 1)) * usableW;
-    const y = padY + usableH * (0.5 - series[i][key] * 0.42);
-    if (i === 0) plotCtx.moveTo(x, y);
-    else plotCtx.lineTo(x, y);
-  }
-  plotCtx.strokeStyle = color;
-  plotCtx.globalAlpha = alpha;
-  plotCtx.lineWidth = lineWidth;
-  plotCtx.stroke();
-  plotCtx.globalAlpha = 1;
-}
+      /* ── Controls ── */
+      #controls {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+      }
+      button {
+        border: none;
+        border-radius: 8px;
+        padding: 9px 15px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #scanBtn {
+        background: #2196f3;
+        color: #fff;
+      }
+      #configBtn {
+        background: #4caf50;
+        color: #fff;
+      }
+      #streamBtn {
+        background: #ffc107;
+        color: #000;
+      }
+      #disconnBtn {
+        background: #f44336;
+        color: #fff;
+      }
+      #startBtn {
+        background: #9c27b0;
+        color: #fff;
+      }
+      #showTipBtn {
+        background: #37474f;
+        color: #fff;
+      }
+      #trainBtn {
+        background: #7c3aed;
+        color: #fff;
+      }
+      #clearTrainBtn {
+        background: #455a64;
+        color: #fff;
+      }
+      #trainSpellSel {
+        background: #1f2937;
+        color: #e5e7eb;
+        border: 1px solid #374151;
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-size: 13px;
+      }
+      #deviceName {
+        font-size: 13px;
+        color: #9999bb;
+      }
 
-function drawTrainingPlot(spellId) {
-  const canvas = document.getElementById(`plot-${spellId}`);
-  const countEl = document.getElementById(`plotCount-${spellId}`);
-  if (!canvas || !countEl) return;
+      /* ── Console ── */
+      #console {
+        background: #000;
+        color: #0f0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+        border: 1px solid #0f0;
+        padding: 6px 8px;
+        max-width: 600px;
+        margin: 4px auto;
+        height: 48px;
+        overflow-y: auto;
+        border-radius: 4px;
+      }
 
-  const plotCtx = canvas.getContext('2d');
-  const w = canvas.width;
-  const h = canvas.height;
-  const samples = trainedSamples[spellId] || [];
-  countEl.textContent = `${samples.length} sample${samples.length === 1 ? '' : 's'}`;
+      #trainingPanel {
+        max-width: 860px;
+        margin: 10px auto 0;
+        padding: 0 8px;
+      }
+      #thresholdControls {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        color: #aab0d6;
+        font-size: 13px;
+        margin-bottom: 8px;
+      }
+      #thresholdSlider {
+        width: min(260px, 75vw);
+        accent-color: #a855f7;
+      }
+      #thresholdValue {
+        min-width: 52px;
+        text-align: right;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #e8eaf6;
+      }
+      #plotLegend {
+        text-align: center;
+        color: #7f89b3;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+      #plotGrid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 10px;
+      }
+      .plotCard {
+        background: #0b0b1a;
+        border: 1px solid #242447;
+        border-radius: 10px;
+        padding: 8px;
+      }
+      .plotTitle {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: #d5d8f0;
+        font-size: 12px;
+        margin-bottom: 6px;
+        letter-spacing: 0.5px;
+      }
+      .plotCanvas {
+        display: block;
+        width: 100%;
+        height: 130px;
+        background: #050510;
+        border: 1px solid #17172d;
+        border-radius: 8px;
+      }
 
-  plotCtx.clearRect(0, 0, w, h);
-  plotCtx.fillStyle = '#050510';
-  plotCtx.fillRect(0, 0, w, h);
+      /* ── Intro Overlay ── */
+      #introOverlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.85);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 1000;
+        backdrop-filter: blur(2px);
+      }
+      .introContent {
+        background: linear-gradient(135deg, #0e0e22 0%, #1a1a3a 100%);
+        border: 2px solid #2d3255;
+        border-radius: 16px;
+        padding: 28px;
+        max-width: 520px;
+        max-height: 90vh;
+        overflow-y: auto;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+        color: #e8eaf6;
+      }
+      .introContent h2 {
+        margin: 0 0 12px;
+        font-size: 1.6rem;
+        text-align: center;
+        letter-spacing: 2px;
+      }
+      .introContent h3 {
+        font-size: 1.1rem;
+        margin: 16px 0 8px;
+        color: #d5d8f0;
+        letter-spacing: 1px;
+      }
+      .introContent ol {
+        margin: 8px 0;
+        padding-left: 20px;
+        line-height: 1.7;
+      }
+      .spellItem {
+        display: flex;
+        gap: 12px;
+        margin: 8px 0;
+        padding: 8px;
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 8px;
+      }
+      .spellIcon {
+        font-size: 1.8rem;
+        min-width: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .btnHint {
+        background: #1f2937;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.9em;
+        font-family: ui-monospace, monospace;
+      }
+      .introFoot {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 16px;
+      }
 
-  plotCtx.strokeStyle = '#17172d';
-  plotCtx.lineWidth = 1;
-  for (let i = 0; i < 4; i++) {
-    const y = ((i + 1) * h) / 5;
-    plotCtx.beginPath();
-    plotCtx.moveTo(0, y);
-    plotCtx.lineTo(w, y);
-    plotCtx.stroke();
-  }
-  plotCtx.strokeStyle = '#2d3255';
-  plotCtx.beginPath();
-  plotCtx.moveTo(0, h / 2);
-  plotCtx.lineTo(w, h / 2);
-  plotCtx.stroke();
+      /* ── Win Overlay ── */
+      #winOverlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.9);
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 999;
+        text-align: center;
+        color: #e8eaf6;
+      }
+      .winSub {
+        color: #9999bb;
+        margin: 8px 0 0;
+      }
+      .winTally {
+        font-size: 1.1rem;
+        margin: 14px 0;
+        font-family: ui-monospace, monospace;
+      }
+      #playAgainBtn {
+        background: #a855f7;
+        color: #fff;
+        padding: 12px 24px;
+        font-size: 16px;
+        margin-top: 16px;
+        cursor: pointer;
+        border-radius: 8px;
+        border: none;
+      }
+      #playAgainBtn:hover {
+        background: #9333ea;
+      }
 
-  if (!samples.length) {
-    plotCtx.fillStyle = '#6f769f';
-    plotCtx.font = '12px system-ui';
-    plotCtx.textAlign = 'center';
-    plotCtx.textBaseline = 'middle';
-    plotCtx.fillText('No trained samples yet', w / 2, h / 2);
-    return;
-  }
+      /* ── Spell Row ── */
+      #spellRow {
+        display: flex;
+        justify-content: center;
+        gap: 16px;
+        margin: 12px 0;
+      }
+      .spellBadge {
+        border: 3px solid;
+        border-radius: 12px;
+        padding: 12px 20px;
+        text-align: center;
+        background: rgba(0, 0, 0, 0.3);
+        transition: all 0.2s;
+        min-width: 100px;
+      }
+      .bigEmoji {
+        font-size: 2.2rem;
+        display: block;
+        margin: 0 0 4px;
+      }
+      .spellLabel {
+        font-size: 0.85rem;
+        font-weight: 600;
+        letter-spacing: 1px;
+        margin: 4px 0;
+      }
+      .castCount {
+        font-size: 1.4rem;
+        font-weight: bold;
+        color: #fff;
+      }
 
-  const prepared = samples.map(prepareSegment);
-  prepared.forEach((series, index) => {
-    const strong = index === prepared.length - 1;
-    drawSeries(plotCtx, series, 'x', '#ef4444', strong ? 0.95 : 0.22, strong ? 2.2 : 1.1);
-    drawSeries(plotCtx, series, 'y', '#22c55e', strong ? 0.95 : 0.22, strong ? 2.2 : 1.1);
-    drawSeries(plotCtx, series, 'z', '#3b82f6', strong ? 0.95 : 0.22, strong ? 2.2 : 1.1);
-  });
-}
+      /* ── Canvas & Hint ── */
+      #spellCanvas {
+        display: block;
+        margin: 12px auto;
+        border: 2px solid #2d3255;
+        border-radius: 8px;
+        background: #000;
+      }
+      #keyHint {
+        text-align: center;
+        font-size: 12px;
+        color: #7878aa;
+        margin: 8px 0;
+      }
+      kbd {
+        background: #1f2937;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-family: ui-monospace, monospace;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- ═══════════════════ INTRO OVERLAY ═══════════════════ -->
+    <div id="introOverlay">
+      <div class="introContent">
+        <h2>🧙 Spell Caster — Gyro Demo</h2>
+        <p style="color: #9999bb; margin: 0 0 12px">
+          Cast three magical spells with motion gestures from your
+          <strong>Shimmer3R</strong> gyroscope.
+        </p>
 
-function drawTrainingPlots() {
-  for (const spell of SPELLS) drawTrainingPlot(spell.id);
-}
+        <h3>🪄 The Three Spells</h3>
+        <p style="font-size: 12px; color: #7778aa; margin: 8px 0">
+          💡 <strong>Tip:</strong> Gyros detect <strong>rotation</strong>, not
+          linear movement. Train sharp, rotational gestures for best results.
+        </p>
+        <div class="spellItem">
+          <span class="spellIcon">⚡</span>
+          <div>
+            <strong style="color: #a855f7">THUNDER</strong> — Train your own
+            motion<br />
+            <small style="color: #6666aa"
+              >Example: Sharp wrist flick left-right, twist, or snap</small
+            >
+          </div>
+        </div>
+        <div class="spellItem">
+          <span class="spellIcon">🔥</span>
+          <div>
+            <strong style="color: #ef4444">INFERNO</strong> — Train your own
+            motion<br />
+            <small style="color: #6666aa"
+              >Example: Arm rotation, rapid pitch motion, or circular
+              swing</small
+            >
+          </div>
+        </div>
+        <div class="spellItem">
+          <span class="spellIcon">🌊</span>
+          <div>
+            <strong style="color: #3b82f6">TORRENT</strong> — Train your own
+            motion<br />
+            <small style="color: #6666aa"
+              >Example: Wrist roll, tilt side-to-side, or figure-8 motion</small
+            >
+          </div>
+        </div>
+        <img
+          src="shimmer3_coords.png"
+          alt="Shimmer3 Axis Diagram"
+          style="
+            width: 100%;
+            max-width: 280px;
+            display: block;
+            margin: 10px auto;
+            border-radius: 8px;
+            opacity: 0.85;
+          "
+        />
 
-// ── Gesture entry-point (called by BLE module and keyboard) ───────────────
-window.onGyroFrame = function(gx, gy, gz) {
-  const now = Date.now();
+        <h3>📡 Setup Steps</h3>
+        <ol>
+          <li>
+            Click <span class="btnHint">🔍 Scan</span> and select your Shimmer3R
+          </li>
+          <li>
+            Click <span class="btnHint">⚙️ Configure</span> to enable gyro
+            streaming
+          </li>
+          <li>Click <span class="btnHint">📡 Stream</span> to start data</li>
+          <li>
+            <strong>Train each spell:</strong> Select spell → Click
+            <span class="btnHint">🎯 Train Next</span> → Perform motion cleanly
+          </li>
+          <li>
+            Once all three spells trained, click
+            <span class="btnHint">▶️ Start</span> to play
+          </li>
+        </ol>
+        <p style="font-size: 13px; color: #5555aa">
+          <strong>Device:</strong> Shimmer3R &nbsp;|&nbsp;
+          <strong>Firmware:</strong> v1.0.22+<br />
+          <strong>No BLE?</strong> Use keys <kbd>1</kbd> <kbd>2</kbd>
+          <kbd>3</kbd> to demo each spell.
+        </p>
 
-  if (!filteredState.ready) {
-    filteredState.ready = true;
-    filteredState.x = gx;
-    filteredState.y = gy;
-    filteredState.z = gz;
-  } else {
-    filteredState.x += FILTER_ALPHA * (gx - filteredState.x);
-    filteredState.y += FILTER_ALPHA * (gy - filteredState.y);
-    filteredState.z += FILTER_ALPHA * (gz - filteredState.z);
-  }
+        <div class="introFoot">
+          <label style="font-size: 13px; color: #9999bb">
+            <input type="checkbox" id="dontShowAgain" /> Don't show again
+          </label>
+          <button
+            id="closeIntroBtn"
+            style="background:#a855f7;color:#fff;border:none:border-radius:8px;
+               padding:9px 20px;cursor:pointer;font-size:14px;font-weight:600;"
+          >
+            Got it! ✨
+          </button>
+        </div>
+      </div>
+    </div>
 
-  const sample = { x: filteredState.x, y: filteredState.y, z: filteredState.z, t: now };
-  pushPreBuffer(sample);
+    <!-- ═══════════════════ WIN OVERLAY ═══════════════════ -->
+    <div id="winOverlay">
+      <div style="font-size: 3rem">🏆</div>
+      <h2>All Spells Mastered!</h2>
+      <p class="winSub">You successfully cast all three spells.</p>
+      <p class="winTally" id="winTally"></p>
+      <button id="playAgainBtn">Play Again ↺</button>
+    </div>
 
-  const energy = Math.max(Math.abs(sample.x), Math.abs(sample.y), Math.abs(sample.z));
+    <!-- ═══════════════════ MAIN UI ═══════════════════ -->
+    <h1>🧙 Spell Caster</h1>
+    <p class="subtitle">
+      Perform motion gestures to cast spells • Shimmer3R Gyro Demo
+    </p>
 
-  if (!motionActive) {
-    if (energy >= MOTION_ENTER_THRESHOLD) {
-      motionActive = true;
-      motionSegment = preBuffer.slice();
-      lastMotionTs = now;
-    }
-    return;
-  }
+    <div id="controls">
+      <button id="scanBtn">🔍 Scan</button>
+      <button id="configBtn" disabled>⚙️ Configure</button>
+      <button id="streamBtn" disabled>📡 Stream</button>
+      <button id="disconnBtn" disabled>❌ Disconnect</button>
+      <button id="startBtn">▶️ Start</button>
+      <select id="trainSpellSel" title="Spell to train">
+        <option value="thunder">⚡ Thunder</option>
+        <option value="inferno">🔥 Inferno</option>
+        <option value="torrent">🌊 Torrent</option>
+      </select>
+      <button id="trainBtn">🎯 Train Next</button>
+      <button id="clearTrainBtn">🧹 Clear Training</button>
+      <button id="showTipBtn">💡 Help</button>
+      <span id="deviceName">No device</span>
+    </div>
 
-  motionSegment.push(sample);
-  if (energy >= MOTION_EXIT_THRESHOLD) lastMotionTs = now;
+    <div id="console"></div>
 
-  const silentFor = now - lastMotionTs;
-  if (silentFor >= MOTION_END_SILENCE_MS || motionSegment.length >= MAX_SEGMENT_SAMPLES) {
-    finalizeSegment();
-  }
-};
+    <div id="trainingPanel">
+      <div id="thresholdControls">
+        <label for="thresholdSlider">DTW match threshold</label>
+        <input
+          id="thresholdSlider"
+          type="range"
+          min="0.08"
+          max="0.35"
+          step="0.005"
+        />
+        <span id="thresholdValue">—</span>
+      </div>
+      <div id="plotLegend">Training plots: X = red, Y = green, Z = blue</div>
+      <div id="plotGrid">
+        <div class="plotCard">
+          <div class="plotTitle">
+            <span>⚡ Thunder</span><span id="plotCount-thunder">0 samples</span>
+          </div>
+          <canvas
+            id="plot-thunder"
+            class="plotCanvas"
+            width="320"
+            height="130"
+          ></canvas>
+        </div>
+        <div class="plotCard">
+          <div class="plotTitle">
+            <span>🔥 Inferno</span><span id="plotCount-inferno">0 samples</span>
+          </div>
+          <canvas
+            id="plot-inferno"
+            class="plotCanvas"
+            width="320"
+            height="130"
+          ></canvas>
+        </div>
+        <div class="plotCard">
+          <div class="plotTitle">
+            <span>🌊 Torrent</span><span id="plotCount-torrent">0 samples</span>
+          </div>
+          <canvas
+            id="plot-torrent"
+            class="plotCanvas"
+            width="320"
+            height="130"
+          ></canvas>
+        </div>
+      </div>
+    </div>
 
-// ── Cast a spell ──────────────────────────────────────────────────────────
-function castSpell(spell, magnitude) {
-  scores[spell.id]++;
-  castSet.add(spell.id);
+    <!-- Spell score badges -->
+    <div id="spellRow">
+      <div class="spellBadge" id="badge-thunder" style="border-color: #a855f7">
+        <span class="bigEmoji">⚡</span>
+        <div class="spellLabel" style="color: #a855f7">THUNDER</div>
+        <div class="castCount" id="cnt-thunder">0</div>
+      </div>
+      <div class="spellBadge" id="badge-inferno" style="border-color: #ef4444">
+        <span class="bigEmoji">🔥</span>
+        <div class="spellLabel" style="color: #ef4444">INFERNO</div>
+        <div class="castCount" id="cnt-inferno">0</div>
+      </div>
+      <div class="spellBadge" id="badge-torrent" style="border-color: #3b82f6">
+        <span class="bigEmoji">🌊</span>
+        <div class="spellLabel" style="color: #3b82f6">TORRENT</div>
+        <div class="castCount" id="cnt-torrent">0</div>
+      </div>
+    </div>
 
-  document.getElementById('cnt-' + spell.id).textContent = scores[spell.id];
+    <canvas id="spellCanvas" width="600" height="460"></canvas>
+    <p id="keyHint">
+      Keyboard: <kbd>1</kbd> Thunder &nbsp; <kbd>2</kbd> Inferno &nbsp;
+      <kbd>3</kbd> Torrent
+    </p>
 
-  const badge = document.getElementById('badge-' + spell.id);
-  badge.style.background = spell.color + '55';
-  setTimeout(() => { badge.style.background = ''; }, 700);
+    <!-- ═══════════════════ GAME SCRIPT ═══════════════════ -->
+    <script>
+      // ── Spell Definitions ────────────────────────────────────────────────────────
+      const SPELLS = [
+        {
+          id: "thunder",
+          name: "THUNDER",
+          emoji: "⚡",
+          axis: "z",
+          color: "#a855f7",
+          rgb: [168, 85, 247],
+          particleColor: "#d8b4fe",
+          orbX: 0.5,
+          orbY: 0.72,
+          hintText: "Flick Z",
+        },
+        {
+          id: "inferno",
+          name: "INFERNO",
+          emoji: "🔥",
+          axis: "x",
+          color: "#ef4444",
+          rgb: [239, 68, 68],
+          particleColor: "#fca5a5",
+          orbX: 0.18,
+          orbY: 0.38,
+          hintText: "Pitch X",
+        },
+        {
+          id: "torrent",
+          name: "TORRENT",
+          emoji: "🌊",
+          axis: "y",
+          color: "#3b82f6",
+          rgb: [59, 130, 246],
+          particleColor: "#93c5fd",
+          orbX: 0.82,
+          orbY: 0.38,
+          hintText: "Roll Y",
+        },
+      ];
 
-  flashRgb   = spell.rgb;
-  flashAlpha = 0.5;
+      // ── Constants ─────────────────────────────────────────────────────────────
+      const GESTURE_THRESHOLD = 2500;
+      const COOLDOWN_MS = 1400;
+      const CAST_TEXT_MS = 1900;
+      const FILTER_ALPHA = 0.28;
+      const MOTION_ENTER_THRESHOLD = 1800;
+      const MOTION_EXIT_THRESHOLD = 900;
+      const MOTION_END_SILENCE_MS = 170;
+      const MIN_SEGMENT_SAMPLES = 10;
+      const MAX_SEGMENT_SAMPLES = 120;
+      const PREBUFFER_SAMPLES = 16;
+      const DTW_RESAMPLE_POINTS = 48;
+      const DTW_WINDOW = 12;
+      const DEFAULT_DTW_ACCEPT_DISTANCE = 0.255;
+      const DTW_MARGIN_DISTANCE = 0.025;
+      const TRAINING_STORAGE_KEY = "spellTrainingV1";
+      const THRESHOLD_STORAGE_KEY = "spellDtwAcceptDistanceV1";
 
-  const ox = spell.orbX * canvas.width;
-  const oy = spell.orbY * canvas.height;
+      // ── Canvas & Context ──────────────────────────────────────────────────────
+      const canvas = document.getElementById("spellCanvas");
+      const ctx = canvas.getContext("2d");
 
-  const count = Math.min(60 + Math.floor(magnitude / 150), 90);
-  for (let i = 0; i < count; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const speed = 2.5 + Math.random() * 7;
-    particles.push({
-      x: ox, y: oy,
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed - 1,
-      r: 3 + Math.random() * 5,
-      alpha: 1,
-      color: Math.random() < 0.6 ? spell.color : spell.particleColor,
-      decay: 0.012 + Math.random() * 0.016,
-    });
-  }
+      function resizeCanvas() {
+        const maxW = 600;
+        const ratio = 460 / 600;
+        const w = Math.min(window.innerWidth, maxW);
+        canvas.style.width = w + "px";
+        canvas.style.height = Math.round(w * ratio) + "px";
+      }
+      window.addEventListener("resize", resizeCanvas);
+      resizeCanvas();
 
-  castEffects.push({ type: 'ring', spell, x: ox, y: oy, t0: Date.now(), r: 10 });
-  castEffects.push({ type: 'text', spell, x: ox, y: oy - 70, t0: Date.now() });
-}
+      // ── Game State ────────────────────────────────────────────────────────────
+      let gameRunning = false;
+      let lastCastTime = 0;
+      let particles = [];
+      let castEffects = [];
+      let flashAlpha = 0;
+      let flashRgb = [0, 0, 0];
+      let scores = { thunder: 0, inferno: 0, torrent: 0 };
+      let castSet = new Set();
+      let animTick = 0;
 
-function drawBackground() {
-  const g = ctx.createLinearGradient(0, 0, 0, canvas.height);
-  g.addColorStop(0, '#07071a');
-  g.addColorStop(1, '#03030c');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+      // ── Gesture Engine State ──────────────────────────────────────────────────
+      let filteredState = { ready: false, x: 0, y: 0, z: 0 };
+      let motionActive = false;
+      let motionSegment = [];
+      let preBuffer = [];
+      let lastMotionTs = 0;
+      let trainingArmed = false;
+      let dtwAcceptDistance = DEFAULT_DTW_ACCEPT_DISTANCE;
+      const trainedSamples = { thunder: [], inferno: [], torrent: [] };
 
-  ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  let s = 1;
-  const lcg = () => { s = (s * 1664525 + 1013904223) & 0xffffffff; return (s >>> 0) / 0xffffffff; };
-  for (let i = 0; i < 80; i++) {
-    const sx = lcg() * canvas.width;
-    const sy = lcg() * canvas.height;
-    const sr = lcg() * 1.2 + 0.2;
-    ctx.beginPath();
-    ctx.arc(sx, sy, sr, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
+      function getSpellById(id) {
+        return SPELLS.find((s) => s.id === id);
+      }
 
-function drawOrb(spell, tick) {
-  const x  = spell.orbX * canvas.width;
-  const y  = spell.orbY * canvas.height;
-  const idx = SPELLS.indexOf(spell);
-  const pulse = Math.sin(tick * 0.045 + idx * 2.1) * 5;
-  const r = 40 + pulse;
+      function pushPreBuffer(sample) {
+        preBuffer.push(sample);
+        if (preBuffer.length > PREBUFFER_SAMPLES) preBuffer.shift();
+      }
 
-  const glow = ctx.createRadialGradient(x, y, 0, x, y, r * 2.4);
-  glow.addColorStop(0, spell.color + 'bb');
-  glow.addColorStop(0.5, spell.color + '44');
-  glow.addColorStop(1, 'transparent');
-  ctx.beginPath();
-  ctx.arc(x, y, r * 2.4, 0, Math.PI * 2);
-  ctx.fillStyle = glow;
-  ctx.fill();
+      function compactSegment(segment) {
+        return segment.map((p) => [
+          Math.round(p.x * 100) / 100,
+          Math.round(p.y * 100) / 100,
+          Math.round(p.z * 100) / 100,
+        ]);
+      }
 
-  const core = ctx.createRadialGradient(x - r * 0.28, y - r * 0.28, r * 0.08, x, y, r);
-  core.addColorStop(0, '#ffffff');
-  core.addColorStop(0.25, spell.color);
-  core.addColorStop(1, spell.color + '55');
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fillStyle = core;
-  ctx.fill();
+      function uncompactSegment(compact) {
+        return compact.map((v) => ({ x: v[0], y: v[1], z: v[2] }));
+      }
 
-  ctx.save();
-  ctx.font = 'bold 24px system-ui';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.shadowBlur = 12;
-  ctx.shadowColor = spell.color;
-  ctx.fillStyle = '#fff';
-  ctx.fillText(spell.emoji, x, y - 1);
-  ctx.restore();
+      function saveTraining() {
+        localStorage.setItem(
+          TRAINING_STORAGE_KEY,
+          JSON.stringify({
+            thunder: trainedSamples.thunder.map(compactSegment),
+            inferno: trainedSamples.inferno.map(compactSegment),
+            torrent: trainedSamples.torrent.map(compactSegment),
+          }),
+        );
+        drawTrainingPlots();
+      }
 
-  ctx.font = 'bold 12px system-ui';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-  ctx.fillStyle = spell.color;
-  ctx.fillText(spell.name, x, y + r + 8);
+      function loadTraining() {
+        try {
+          const raw = localStorage.getItem(TRAINING_STORAGE_KEY);
+          if (!raw) return;
+          const parsed = JSON.parse(raw);
+          for (const s of SPELLS) {
+            const rows = Array.isArray(parsed[s.id]) ? parsed[s.id] : [];
+            trainedSamples[s.id] = rows
+              .filter(Array.isArray)
+              .map(uncompactSegment);
+          }
+        } catch {}
+      }
 
-  ctx.font = '10px system-ui';
-  ctx.fillStyle = '#ffffff66';
-  ctx.fillText(spell.hintText, x, y + r + 24);
-}
+      function getTrainingCount(id) {
+        return trainedSamples[id]?.length || 0;
+      }
 
-function drawParticles() {
-  for (let i = particles.length - 1; i >= 0; i--) {
-    const p = particles[i];
-    p.x  += p.vx;
-    p.y  += p.vy;
-    p.vy += 0.09;
-    p.alpha -= p.decay;
-    if (p.alpha <= 0) { particles.splice(i, 1); continue; }
-    ctx.save();
-    ctx.globalAlpha = p.alpha;
-    ctx.shadowBlur  = 8;
-    ctx.shadowColor = p.color;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-    ctx.fillStyle = p.color;
-    ctx.fill();
-    ctx.restore();
-  }
-}
+      function loadThreshold() {
+        const raw = Number(localStorage.getItem(THRESHOLD_STORAGE_KEY));
+        if (Number.isFinite(raw)) {
+          dtwAcceptDistance = Math.min(0.35, Math.max(0.08, raw));
+        } else {
+          dtwAcceptDistance = null;
+        }
+      }
 
-function drawCastEffects() {
-  const now = Date.now();
-  for (let i = castEffects.length - 1; i >= 0; i--) {
-    const e = castEffects[i];
-    const age = now - e.t0;
+      function updateThresholdUi() {
+        const slider = document.getElementById("thresholdSlider");
+        const valueEl = document.getElementById("thresholdValue");
+        if (!slider || !valueEl) return;
+        if (dtwAcceptDistance === null) {
+          slider.value = "";
+          valueEl.textContent = "—";
+        } else {
+          slider.value = dtwAcceptDistance.toFixed(3);
+          valueEl.textContent = dtwAcceptDistance.toFixed(3);
+        }
+      }
 
-    if (e.type === 'ring') {
-      const dur = 600;
-      if (age > dur) { castEffects.splice(i, 1); continue; }
-      const prog = age / dur;
-      const ringR = 10 + prog * 120;
-      ctx.save();
-      ctx.globalAlpha = (1 - prog) * 0.7;
-      ctx.strokeStyle = e.spell.color;
-      ctx.lineWidth   = 3 - prog * 2;
-      ctx.shadowBlur  = 20;
-      ctx.shadowColor = e.spell.color;
-      ctx.beginPath();
-      ctx.arc(e.x, e.y, ringR, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.restore();
-      continue;
-    }
+      function persistThreshold(value) {
+        dtwAcceptDistance = Math.min(0.35, Math.max(0.08, value));
+        localStorage.setItem(
+          THRESHOLD_STORAGE_KEY,
+          dtwAcceptDistance.toFixed(3),
+        );
+        updateThresholdUi();
+      }
 
-    if (e.type === 'text') {
-      if (age > CAST_TEXT_MS) { castEffects.splice(i, 1); continue; }
-      const prog   = age / CAST_TEXT_MS;
-      const alpha  = prog < 0.15 ? prog / 0.15 : 1 - (prog - 0.15) / 0.85;
-      const yShift = -prog * 55;
-      const scale  = prog < 0.08 ? 0.4 + prog / 0.08 * 0.6 : 1;
+      function resampleSeries(segment, count = DTW_RESAMPLE_POINTS) {
+        if (segment.length === 0) return [];
+        if (segment.length === 1)
+          return Array.from({ length: count }, () => ({ ...segment[0] }));
+        const out = [];
+        const maxIdx = segment.length - 1;
+        for (let i = 0; i < count; i++) {
+          const pos = (i * maxIdx) / (count - 1);
+          const lo = Math.floor(pos);
+          const hi = Math.min(maxIdx, lo + 1);
+          const t = pos - lo;
+          const a = segment[lo],
+            b = segment[hi];
+          out.push({
+            x: a.x + (b.x - a.x) * t,
+            y: a.y + (b.y - a.y) * t,
+            z: a.z + (b.z - a.z) * t,
+          });
+        }
+        return out;
+      }
 
-      ctx.save();
-      ctx.globalAlpha = alpha;
-      ctx.translate(e.x, e.y + yShift);
-      ctx.scale(scale, scale);
-      ctx.shadowBlur  = 30;
-      ctx.shadowColor = e.spell.color;
-      ctx.fillStyle   = '#ffffff';
-      ctx.font        = 'bold 30px system-ui';
-      ctx.textAlign   = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(e.spell.emoji + ' ' + e.spell.name + ' CAST!', 0, 0);
-      ctx.restore();
-      continue;
-    }
-  }
-}
+      function normalizeSeries(series) {
+        let peak = 0;
+        for (const p of series)
+          peak = Math.max(peak, Math.hypot(p.x, p.y, p.z));
+        const scale = peak > 1 ? peak : 1;
+        return series.map((p) => ({
+          x: p.x / scale,
+          y: p.y / scale,
+          z: p.z / scale,
+        }));
+      }
 
-function drawFlash() {
-  if (flashAlpha <= 0.005) { flashAlpha = 0; return; }
-  ctx.fillStyle = `rgba(${flashRgb[0]},${flashRgb[1]},${flashRgb[2]},${flashAlpha.toFixed(3)})`;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  flashAlpha *= 0.88;
-}
+      function prepareSegment(segment) {
+        return normalizeSeries(resampleSeries(segment, DTW_RESAMPLE_POINTS));
+      }
 
-function drawPrompt() {
-  if (!gameRunning || castEffects.some(e => e.type === 'text')) return;
-  ctx.save();
-  ctx.globalAlpha = 0.3 + Math.sin(animTick * 0.06) * 0.1;
-  ctx.fillStyle   = '#ffffff';
-  ctx.font        = '13px system-ui';
-  ctx.textAlign   = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('Perform a trained gesture to cast a spell', canvas.width / 2, 24);
-  ctx.restore();
-}
+      function dtwDistance(s1, s2) {
+        const n = s1.length,
+          m = s2.length;
+        const dp = Array(n + 1)
+          .fill(null)
+          .map(() => Array(m + 1).fill(Infinity));
+        dp[0][0] = 0;
 
-function drawCooldownBar() {
-  if (!gameRunning) return;
-  const elapsed = Date.now() - lastCastTime;
-  if (elapsed >= COOLDOWN_MS) return;
-  const frac = elapsed / COOLDOWN_MS;
-  const bw   = 140;
-  const bh   = 6;
-  const bx   = (canvas.width - bw) / 2;
-  const by   = canvas.height - 18;
-  ctx.fillStyle = '#1a1a3a';
-  ctx.beginPath();
-  ctx.roundRect(bx, by, bw, bh, 3);
-  ctx.fill();
-  ctx.fillStyle = '#a855f7';
-  ctx.beginPath();
-  ctx.roundRect(bx, by, bw * frac, bh, 3);
-  ctx.fill();
-  ctx.fillStyle = '#8888aa';
-  ctx.font = '10px system-ui';
-  ctx.textAlign = 'center';
-  ctx.fillText('cooldown', canvas.width / 2, by - 4);
-}
+        for (let i = 1; i <= n; i++) {
+          for (let j = 1; j <= m; j++) {
+            const p1 = s1[i - 1],
+              p2 = s2[j - 1];
+            const d = Math.hypot(p1.x - p2.x, p1.y - p2.y, p1.z - p2.z);
+            const cost = d * d;
+            dp[i][j] =
+              cost + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+          }
+        }
+        return Math.sqrt(dp[n][m] / (n + m));
+      }
 
-function gameLoop() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  drawBackground();
-  for (const spell of SPELLS) drawOrb(spell, animTick);
-  drawParticles();
-  drawCastEffects();
-  drawFlash();
-  drawPrompt();
-  drawCooldownBar();
-  animTick++;
-  requestAnimationFrame(gameLoop);
-}
+      function classifySegment(segment) {
+        if (segment.length < MIN_SEGMENT_SAMPLES) return null;
+        if (dtwAcceptDistance === null) {
+          window._uiLog("⚠️ Set DTW threshold before casting");
+          return null;
+        }
 
-function resetGame() {
-  gameRunning = true;
-  scores      = { thunder: 0, inferno: 0, torrent: 0 };
-  castSet.clear();
-  particles.length   = 0;
-  castEffects.length = 0;
-  flashAlpha  = 0;
-  lastCastTime = 0;
-  document.getElementById('winOverlay').style.display = 'none';
-  for (const s of SPELLS) {
-    document.getElementById('cnt-' + s.id).textContent = '0';
-    document.getElementById('badge-' + s.id).style.background = '';
-  }
-}
+        const prepared = prepareSegment(segment);
+        let bestSpell = null;
+        let bestDistance = Infinity;
 
-document.addEventListener('DOMContentLoaded', () => {
-  if (localStorage.getItem('hideSpellIntro') === 'true') {
-    document.getElementById('introOverlay').style.display = 'none';
-  }
-  loadTraining();
-  loadThreshold();
-  updateThresholdUi();
-  drawTrainingPlots();
-  gameLoop();
-  const trained = `⚡${getTrainingCount('thunder')} 🔥${getTrainingCount('inferno')} 🌊${getTrainingCount('torrent')}`;
-  window._uiLog(dtwAcceptDistance === null ? `📋 Train spells first • Trained: ${trained}` : `✅ Training loaded: ${trained}`);
-});
+        for (const spell of SPELLS) {
+          if (trainedSamples[spell.id].length === 0) continue;
 
-document.getElementById('closeIntroBtn').addEventListener('click', () => {
-  if (document.getElementById('dontShowAgain').checked) {
-    localStorage.setItem('hideSpellIntro', 'true');
-  }
-  document.getElementById('introOverlay').style.display = 'none';
-});
+          let spellMinDist = Infinity;
+          for (const trainedSeg of trainedSamples[spell.id]) {
+            const trainedPrepared = prepareSegment(trainedSeg);
+            const d = dtwDistance(prepared, trainedPrepared);
+            spellMinDist = Math.min(spellMinDist, d);
+          }
 
-document.getElementById('showTipBtn').addEventListener('click', () => {
-  document.getElementById('introOverlay').style.display = 'flex';
-  localStorage.removeItem('hideSpellIntro');
-});
+          if (spellMinDist < bestDistance) {
+            bestDistance = spellMinDist;
+            bestSpell = spell;
+          }
+        }
 
-document.getElementById('startBtn').addEventListener('click', resetGame);
-document.getElementById('playAgainBtn').addEventListener('click', resetGame);
+        if (bestSpell && bestDistance <= dtwAcceptDistance) {
+          return { spell: bestSpell, distance: bestDistance };
+        }
+        return null;
+      }
 
-document.getElementById('trainBtn').addEventListener('click', () => {
-  trainingArmed = true;
-  const id = document.getElementById('trainSpellSel').value;
-  document.getElementById('trainBtn').textContent = `🎯 Waiting: ${id.toUpperCase()}`;
-  window._uiLog(`🎯 Perform one clean ${id.toUpperCase()} motion`);
-});
+      function finalizeSegment() {
+        if (motionSegment.length < MIN_SEGMENT_SAMPLES) {
+          motionActive = false;
+          motionSegment = [];
+          return;
+        }
 
-document.getElementById('clearTrainBtn').addEventListener('click', () => {
-  for (const s of SPELLS) trainedSamples[s.id] = [];
-  saveTraining();
-  window._uiLog('🧹 Cleared all trained gesture samples');
-});
+        if (trainingArmed) {
+          const id = document.getElementById("trainSpellSel").value;
+          trainedSamples[id] = [motionSegment]; // Replace with single new sample
+          saveTraining();
+          window._uiLog(
+            `✅ Trained ${id.toUpperCase()}: ${trainedSamples[id].length} sample`,
+          );
 
-document.getElementById('thresholdSlider').addEventListener('input', (e) => {
-  persistThreshold(Number(e.target.value));
-});
+          document.getElementById("trainBtn").textContent = "🎯 Train Next";
+          trainingArmed = false;
+        } else if (gameRunning) {
+          const now = Date.now();
+          if (now - lastCastTime >= COOLDOWN_MS) {
+            const result = classifySegment(motionSegment);
+            if (result) {
+              lastCastTime = now;
+              const lastSample = motionSegment[motionSegment.length - 1];
+              const mag = Math.hypot(lastSample.x, lastSample.y, lastSample.z);
+              castSpell(result.spell, mag);
+              window._uiLog(
+                `✨ ${result.spell.name} (dist: ${result.distance.toFixed(3)})`,
+              );
+            }
+          }
+        }
 
-// Keyboard shortcuts for testing without BLE
-document.addEventListener('keydown', (e) => {
-  if (!gameRunning) return;
-  const now = Date.now();
-  if (now - lastCastTime < COOLDOWN_MS) return;
-  if (e.key === '1') { lastCastTime = now; castSpell(SPELLS[0], 3500); }
-  if (e.key === '2') { lastCastTime = now; castSpell(SPELLS[1], 3500); }
-  if (e.key === '3') { lastCastTime = now; castSpell(SPELLS[2], 3500); }
-});
+        motionActive = false;
+        motionSegment = [];
+      }
 
-const logEl = document.getElementById('console');
-window._uiLog = (t) => {
-  logEl.textContent = t + '\n' + logEl.textContent.slice(0, 400);
-};
-</script>
+      function drawSeries(plotCtx, series, key, color, alpha, lineWidth) {
+        if (!series.length) return;
+        const w = plotCtx.canvas.width;
+        const h = plotCtx.canvas.height;
+        const padX = 8;
+        const padY = 10;
+        const usableW = w - padX * 2;
+        const usableH = h - padY * 2;
+        plotCtx.beginPath();
+        for (let i = 0; i < series.length; i++) {
+          const x = padX + (i / Math.max(1, series.length - 1)) * usableW;
+          const y = padY + usableH * (0.5 - series[i][key] * 0.42);
+          if (i === 0) plotCtx.moveTo(x, y);
+          else plotCtx.lineTo(x, y);
+        }
+        plotCtx.strokeStyle = color;
+        plotCtx.globalAlpha = alpha;
+        plotCtx.lineWidth = lineWidth;
+        plotCtx.stroke();
+        plotCtx.globalAlpha = 1;
+      }
 
-<!-- ═══════════════════ BLE MODULE ═══════════════════ -->
-<script type="module">
-  import { Shimmer3RClient } from '../ShimmerAPI/shimmer3r.js';
+      function drawTrainingPlot(spellId) {
+        const canvas = document.getElementById(`plot-${spellId}`);
+        const countEl = document.getElementById(`plotCount-${spellId}`);
+        if (!canvas || !countEl) return;
 
-  const client = new Shimmer3RClient({ timestampFmt: 'u24', debug: false });
+        const plotCtx = canvas.getContext("2d");
+        const w = canvas.width;
+        const h = canvas.height;
+        const samples = trainedSamples[spellId] || [];
+        countEl.textContent = `${samples.length} sample${samples.length === 1 ? "" : "s"}`;
 
-  const scanBtn    = document.getElementById('scanBtn');
-  const configBtn  = document.getElementById('configBtn');
-  const streamBtn  = document.getElementById('streamBtn');
-  const disconnBtn = document.getElementById('disconnBtn');
-  const nameEl     = document.getElementById('deviceName');
+        plotCtx.clearRect(0, 0, w, h);
+        plotCtx.fillStyle = "#050510";
+        plotCtx.fillRect(0, 0, w, h);
 
-  client.onStatus = (msg) => window._uiLog(msg);
+        plotCtx.strokeStyle = "#17172d";
+        plotCtx.lineWidth = 1;
+        for (let i = 0; i < 4; i++) {
+          const y = ((i + 1) * h) / 5;
+          plotCtx.beginPath();
+          plotCtx.moveTo(0, y);
+          plotCtx.lineTo(w, y);
+          plotCtx.stroke();
+        }
+        plotCtx.strokeStyle = "#2d3255";
+        plotCtx.beginPath();
+        plotCtx.moveTo(0, h / 2);
+        plotCtx.lineTo(w, h / 2);
+        plotCtx.stroke();
 
-  client.onStreamFrame = (oc) => {
-    const gx = oc.get('GYRO_X')?.value;
-    const gy = oc.get('GYRO_Y')?.value;
-    const gz = oc.get('GYRO_Z')?.value;
-    if (gx == null || gy == null || gz == null) return;
-    window.onGyroFrame(gx, gy, gz);
-  };
+        if (!samples.length) {
+          plotCtx.fillStyle = "#6f769f";
+          plotCtx.font = "12px system-ui";
+          plotCtx.textAlign = "center";
+          plotCtx.textBaseline = "middle";
+          plotCtx.fillText("No trained samples yet", w / 2, h / 2);
+          return;
+        }
 
-  scanBtn.addEventListener('click', async () => {
-    try {
-      await client.connect();
-      nameEl.textContent = client.device?.name || 'Shimmer3R';
-      configBtn.disabled = false;
-      disconnBtn.disabled = false;
-      window._uiLog('✅ Connected');
-    } catch (e) { window._uiLog('❌ ' + e.message); }
-  });
+        const prepared = samples.map(prepareSegment);
+        prepared.forEach((series, index) => {
+          const strong = index === prepared.length - 1;
+          drawSeries(
+            plotCtx,
+            series,
+            "x",
+            "#ef4444",
+            strong ? 0.95 : 0.22,
+            strong ? 2.2 : 1.1,
+          );
+          drawSeries(
+            plotCtx,
+            series,
+            "y",
+            "#22c55e",
+            strong ? 0.95 : 0.22,
+            strong ? 2.2 : 1.1,
+          );
+          drawSeries(
+            plotCtx,
+            series,
+            "z",
+            "#3b82f6",
+            strong ? 0.95 : 0.22,
+            strong ? 2.2 : 1.1,
+          );
+        });
+      }
 
-  configBtn.addEventListener('click', async () => {
-    try {
-      await client.setSamplingRate(51.2);
-      await client.setSensors(0x40); // SENSOR_GYRO
-      await client.inquiry();
-      streamBtn.disabled = false;
-      window._uiLog('⚙️ Gyro configured at 51.2 Hz');
-    } catch (e) { window._uiLog('❌ ' + e.message); }
-  });
+      function drawTrainingPlots() {
+        for (const spell of SPELLS) drawTrainingPlot(spell.id);
+      }
 
-  streamBtn.addEventListener('click', async () => {
-    try {
-      await client.startStreaming();
-      window._uiLog('📡 Streaming gyro data…');
-    } catch (e) { window._uiLog('❌ ' + e.message); }
-  });
+      // ── Gesture entry-point (called by BLE module and keyboard) ───────────────
+      window.onGyroFrame = function (gx, gy, gz) {
+        const now = Date.now();
 
-  disconnBtn.addEventListener('click', async () => {
-    try {
-      await client.disconnect();
-      nameEl.textContent = 'No device';
-      configBtn.disabled = true;
-      streamBtn.disabled = true;
-      disconnBtn.disabled = true;
-      window._uiLog('🔌 Disconnected');
-    } catch (e) { window._uiLog('⚠️ ' + e.message); }
-  });
-</script>
+        if (!filteredState.ready) {
+          filteredState.ready = true;
+          filteredState.x = gx;
+          filteredState.y = gy;
+          filteredState.z = gz;
+        } else {
+          filteredState.x += FILTER_ALPHA * (gx - filteredState.x);
+          filteredState.y += FILTER_ALPHA * (gy - filteredState.y);
+          filteredState.z += FILTER_ALPHA * (gz - filteredState.z);
+        }
 
-</body>
+        const sample = {
+          x: filteredState.x,
+          y: filteredState.y,
+          z: filteredState.z,
+          t: now,
+        };
+        pushPreBuffer(sample);
+
+        const energy = Math.max(
+          Math.abs(sample.x),
+          Math.abs(sample.y),
+          Math.abs(sample.z),
+        );
+
+        if (!motionActive) {
+          if (energy >= MOTION_ENTER_THRESHOLD) {
+            motionActive = true;
+            motionSegment = preBuffer.slice();
+            lastMotionTs = now;
+          }
+          return;
+        }
+
+        motionSegment.push(sample);
+        if (energy >= MOTION_EXIT_THRESHOLD) lastMotionTs = now;
+
+        const silentFor = now - lastMotionTs;
+        if (
+          silentFor >= MOTION_END_SILENCE_MS ||
+          motionSegment.length >= MAX_SEGMENT_SAMPLES
+        ) {
+          finalizeSegment();
+        }
+      };
+
+      // ── Cast a spell ──────────────────────────────────────────────────────────
+      function castSpell(spell, magnitude) {
+        scores[spell.id]++;
+        castSet.add(spell.id);
+
+        document.getElementById("cnt-" + spell.id).textContent =
+          scores[spell.id];
+
+        const badge = document.getElementById("badge-" + spell.id);
+        badge.style.background = spell.color + "55";
+        setTimeout(() => {
+          badge.style.background = "";
+        }, 700);
+
+        flashRgb = spell.rgb;
+        flashAlpha = 0.5;
+
+        const ox = spell.orbX * canvas.width;
+        const oy = spell.orbY * canvas.height;
+
+        const count = Math.min(60 + Math.floor(magnitude / 150), 90);
+        for (let i = 0; i < count; i++) {
+          const angle = Math.random() * Math.PI * 2;
+          const speed = 2.5 + Math.random() * 7;
+          particles.push({
+            x: ox,
+            y: oy,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - 1,
+            r: 3 + Math.random() * 5,
+            alpha: 1,
+            color: Math.random() < 0.6 ? spell.color : spell.particleColor,
+            decay: 0.012 + Math.random() * 0.016,
+          });
+        }
+
+        castEffects.push({
+          type: "ring",
+          spell,
+          x: ox,
+          y: oy,
+          t0: Date.now(),
+          r: 10,
+        });
+        castEffects.push({
+          type: "text",
+          spell,
+          x: ox,
+          y: oy - 70,
+          t0: Date.now(),
+        });
+      }
+
+      function drawBackground() {
+        const g = ctx.createLinearGradient(0, 0, 0, canvas.height);
+        g.addColorStop(0, "#07071a");
+        g.addColorStop(1, "#03030c");
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.fillStyle = "rgba(255,255,255,0.55)";
+        let s = 1;
+        const lcg = () => {
+          s = (s * 1664525 + 1013904223) & 0xffffffff;
+          return (s >>> 0) / 0xffffffff;
+        };
+        for (let i = 0; i < 80; i++) {
+          const sx = lcg() * canvas.width;
+          const sy = lcg() * canvas.height;
+          const sr = lcg() * 1.2 + 0.2;
+          ctx.beginPath();
+          ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      function drawOrb(spell, tick) {
+        const x = spell.orbX * canvas.width;
+        const y = spell.orbY * canvas.height;
+        const idx = SPELLS.indexOf(spell);
+        const pulse = Math.sin(tick * 0.045 + idx * 2.1) * 5;
+        const r = 40 + pulse;
+
+        const glow = ctx.createRadialGradient(x, y, 0, x, y, r * 2.4);
+        glow.addColorStop(0, spell.color + "bb");
+        glow.addColorStop(0.5, spell.color + "44");
+        glow.addColorStop(1, "transparent");
+        ctx.beginPath();
+        ctx.arc(x, y, r * 2.4, 0, Math.PI * 2);
+        ctx.fillStyle = glow;
+        ctx.fill();
+
+        const core = ctx.createRadialGradient(
+          x - r * 0.28,
+          y - r * 0.28,
+          r * 0.08,
+          x,
+          y,
+          r,
+        );
+        core.addColorStop(0, "#ffffff");
+        core.addColorStop(0.25, spell.color);
+        core.addColorStop(1, spell.color + "55");
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = core;
+        ctx.fill();
+
+        ctx.save();
+        ctx.font = "bold 24px system-ui";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.shadowBlur = 12;
+        ctx.shadowColor = spell.color;
+        ctx.fillStyle = "#fff";
+        ctx.fillText(spell.emoji, x, y - 1);
+        ctx.restore();
+
+        ctx.font = "bold 12px system-ui";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        ctx.fillStyle = spell.color;
+        ctx.fillText(spell.name, x, y + r + 8);
+
+        ctx.font = "10px system-ui";
+        ctx.fillStyle = "#ffffff66";
+        ctx.fillText(spell.hintText, x, y + r + 24);
+      }
+
+      function drawParticles() {
+        for (let i = particles.length - 1; i >= 0; i--) {
+          const p = particles[i];
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vy += 0.09;
+          p.alpha -= p.decay;
+          if (p.alpha <= 0) {
+            particles.splice(i, 1);
+            continue;
+          }
+          ctx.save();
+          ctx.globalAlpha = p.alpha;
+          ctx.shadowBlur = 8;
+          ctx.shadowColor = p.color;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fillStyle = p.color;
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
+      function drawCastEffects() {
+        const now = Date.now();
+        for (let i = castEffects.length - 1; i >= 0; i--) {
+          const e = castEffects[i];
+          const age = now - e.t0;
+
+          if (e.type === "ring") {
+            const dur = 600;
+            if (age > dur) {
+              castEffects.splice(i, 1);
+              continue;
+            }
+            const prog = age / dur;
+            const ringR = 10 + prog * 120;
+            ctx.save();
+            ctx.globalAlpha = (1 - prog) * 0.7;
+            ctx.strokeStyle = e.spell.color;
+            ctx.lineWidth = 3 - prog * 2;
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = e.spell.color;
+            ctx.beginPath();
+            ctx.arc(e.x, e.y, ringR, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+            continue;
+          }
+
+          if (e.type === "text") {
+            if (age > CAST_TEXT_MS) {
+              castEffects.splice(i, 1);
+              continue;
+            }
+            const prog = age / CAST_TEXT_MS;
+            const alpha = prog < 0.15 ? prog / 0.15 : 1 - (prog - 0.15) / 0.85;
+            const yShift = -prog * 55;
+            const scale = prog < 0.08 ? 0.4 + (prog / 0.08) * 0.6 : 1;
+
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.translate(e.x, e.y + yShift);
+            ctx.scale(scale, scale);
+            ctx.shadowBlur = 30;
+            ctx.shadowColor = e.spell.color;
+            ctx.fillStyle = "#ffffff";
+            ctx.font = "bold 30px system-ui";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(e.spell.emoji + " " + e.spell.name + " CAST!", 0, 0);
+            ctx.restore();
+            continue;
+          }
+        }
+      }
+
+      function drawFlash() {
+        if (flashAlpha <= 0.005) {
+          flashAlpha = 0;
+          return;
+        }
+        ctx.fillStyle = `rgba(${flashRgb[0]},${flashRgb[1]},${flashRgb[2]},${flashAlpha.toFixed(3)})`;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        flashAlpha *= 0.88;
+      }
+
+      function drawPrompt() {
+        if (!gameRunning || castEffects.some((e) => e.type === "text")) return;
+        ctx.save();
+        ctx.globalAlpha = 0.3 + Math.sin(animTick * 0.06) * 0.1;
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "13px system-ui";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(
+          "Perform a trained gesture to cast a spell",
+          canvas.width / 2,
+          24,
+        );
+        ctx.restore();
+      }
+
+      function drawCooldownBar() {
+        if (!gameRunning) return;
+        const elapsed = Date.now() - lastCastTime;
+        if (elapsed >= COOLDOWN_MS) return;
+        const frac = elapsed / COOLDOWN_MS;
+        const bw = 140;
+        const bh = 6;
+        const bx = (canvas.width - bw) / 2;
+        const by = canvas.height - 18;
+        ctx.fillStyle = "#1a1a3a";
+        ctx.beginPath();
+        ctx.roundRect(bx, by, bw, bh, 3);
+        ctx.fill();
+        ctx.fillStyle = "#a855f7";
+        ctx.beginPath();
+        ctx.roundRect(bx, by, bw * frac, bh, 3);
+        ctx.fill();
+        ctx.fillStyle = "#8888aa";
+        ctx.font = "10px system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText("cooldown", canvas.width / 2, by - 4);
+      }
+
+      function gameLoop() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawBackground();
+        for (const spell of SPELLS) drawOrb(spell, animTick);
+        drawParticles();
+        drawCastEffects();
+        drawFlash();
+        drawPrompt();
+        drawCooldownBar();
+        animTick++;
+        requestAnimationFrame(gameLoop);
+      }
+
+      function resetGame() {
+        gameRunning = true;
+        scores = { thunder: 0, inferno: 0, torrent: 0 };
+        castSet.clear();
+        particles.length = 0;
+        castEffects.length = 0;
+        flashAlpha = 0;
+        lastCastTime = 0;
+        document.getElementById("winOverlay").style.display = "none";
+        for (const s of SPELLS) {
+          document.getElementById("cnt-" + s.id).textContent = "0";
+          document.getElementById("badge-" + s.id).style.background = "";
+        }
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        if (localStorage.getItem("hideSpellIntro") === "true") {
+          document.getElementById("introOverlay").style.display = "none";
+        }
+        loadTraining();
+        loadThreshold();
+        updateThresholdUi();
+        drawTrainingPlots();
+        gameLoop();
+        const trained = `⚡${getTrainingCount("thunder")} 🔥${getTrainingCount("inferno")} 🌊${getTrainingCount("torrent")}`;
+        window._uiLog(
+          dtwAcceptDistance === null
+            ? `📋 Train spells first • Trained: ${trained}`
+            : `✅ Training loaded: ${trained}`,
+        );
+      });
+
+      document.getElementById("closeIntroBtn").addEventListener("click", () => {
+        if (document.getElementById("dontShowAgain").checked) {
+          localStorage.setItem("hideSpellIntro", "true");
+        }
+        document.getElementById("introOverlay").style.display = "none";
+      });
+
+      document.getElementById("showTipBtn").addEventListener("click", () => {
+        document.getElementById("introOverlay").style.display = "flex";
+        localStorage.removeItem("hideSpellIntro");
+      });
+
+      document.getElementById("startBtn").addEventListener("click", resetGame);
+      document
+        .getElementById("playAgainBtn")
+        .addEventListener("click", resetGame);
+
+      document.getElementById("trainBtn").addEventListener("click", () => {
+        trainingArmed = true;
+        const id = document.getElementById("trainSpellSel").value;
+        document.getElementById("trainBtn").textContent =
+          `🎯 Waiting: ${id.toUpperCase()}`;
+        window._uiLog(`🎯 Perform one clean ${id.toUpperCase()} motion`);
+      });
+
+      document.getElementById("clearTrainBtn").addEventListener("click", () => {
+        for (const s of SPELLS) trainedSamples[s.id] = [];
+        saveTraining();
+        window._uiLog("🧹 Cleared all trained gesture samples");
+      });
+
+      document
+        .getElementById("thresholdSlider")
+        .addEventListener("input", (e) => {
+          persistThreshold(Number(e.target.value));
+        });
+
+      // Keyboard shortcuts for testing without BLE
+      document.addEventListener("keydown", (e) => {
+        if (!gameRunning) return;
+        const now = Date.now();
+        if (now - lastCastTime < COOLDOWN_MS) return;
+        if (e.key === "1") {
+          lastCastTime = now;
+          castSpell(SPELLS[0], 3500);
+        }
+        if (e.key === "2") {
+          lastCastTime = now;
+          castSpell(SPELLS[1], 3500);
+        }
+        if (e.key === "3") {
+          lastCastTime = now;
+          castSpell(SPELLS[2], 3500);
+        }
+      });
+
+      const logEl = document.getElementById("console");
+      window._uiLog = (t) => {
+        logEl.textContent = t + "\n" + logEl.textContent.slice(0, 400);
+      };
+    </script>
+
+    <!-- ═══════════════════ BLE MODULE ═══════════════════ -->
+    <script type="module">
+      import { Shimmer3RClient } from "../ShimmerAPI/shimmer3r.js";
+
+      const client = new Shimmer3RClient({ timestampFmt: "u24", debug: false });
+
+      const scanBtn = document.getElementById("scanBtn");
+      const configBtn = document.getElementById("configBtn");
+      const streamBtn = document.getElementById("streamBtn");
+      const disconnBtn = document.getElementById("disconnBtn");
+      const nameEl = document.getElementById("deviceName");
+
+      client.onStatus = (msg) => window._uiLog(msg);
+
+      client.onStreamFrame = (oc) => {
+        const gx = oc.get("GYRO_X")?.value;
+        const gy = oc.get("GYRO_Y")?.value;
+        const gz = oc.get("GYRO_Z")?.value;
+        if (gx == null || gy == null || gz == null) return;
+        window.onGyroFrame(gx, gy, gz);
+      };
+
+      scanBtn.addEventListener("click", async () => {
+        try {
+          await client.connect();
+          nameEl.textContent = client.device?.name || "Shimmer3R";
+          configBtn.disabled = false;
+          disconnBtn.disabled = false;
+          window._uiLog("✅ Connected");
+        } catch (e) {
+          window._uiLog("❌ " + e.message);
+        }
+      });
+
+      configBtn.addEventListener("click", async () => {
+        try {
+          await client.setSamplingRate(51.2);
+          await client.setSensors(0x40); // SENSOR_GYRO
+          await client.inquiry();
+          streamBtn.disabled = false;
+          window._uiLog("⚙️ Gyro configured at 51.2 Hz");
+        } catch (e) {
+          window._uiLog("❌ " + e.message);
+        }
+      });
+
+      streamBtn.addEventListener("click", async () => {
+        try {
+          await client.startStreaming();
+          window._uiLog("📡 Streaming gyro data…");
+        } catch (e) {
+          window._uiLog("❌ " + e.message);
+        }
+      });
+
+      disconnBtn.addEventListener("click", async () => {
+        try {
+          await client.disconnect();
+          nameEl.textContent = "No device";
+          configBtn.disabled = true;
+          streamBtn.disabled = true;
+          disconnBtn.disabled = true;
+          window._uiLog("🔌 Disconnected");
+        } catch (e) {
+          window._uiLog("⚠️ " + e.message);
+        }
+      });
+    </script>
+  </body>
 </html>
