@@ -1,3 +1,5 @@
+'use strict';
+
 /**
  * Container for a single decoded sensor frame.
  *
@@ -2836,5 +2838,31 @@ VerisenseBleDevice.NUS_SERVICE = NUS_SERVICE;
 VerisenseBleDevice.NUS_TX = NUS_TX;
 VerisenseBleDevice.NUS_RX = NUS_RX;
 
-export { BaseShimmerClient, CHANNEL_FORMATS, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, SensorBase, SensorBitmapShimmer3, SensorGSR, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TIMESTAMP_FIELD, VerisenseBleDevice, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, crc16_ccitt_false, getOversamplingRatioADS1292R, normalizeOperationalConfig, nudgeGsrResistance, parseProductionConfigPayload };
-//# sourceMappingURL=shimmer-web-sdk.esm.js.map
+exports.BaseShimmerClient = BaseShimmerClient;
+exports.CHANNEL_FORMATS = CHANNEL_FORMATS;
+exports.GSR_NAME = GSR_NAME;
+exports.NUS_RX = NUS_RX;
+exports.NUS_SERVICE = NUS_SERVICE;
+exports.NUS_TX = NUS_TX;
+exports.OPCODES = OPCODES;
+exports.OP_IDX = OP_IDX;
+exports.ObjectCluster = ObjectCluster;
+exports.SHIMMER3R_DEFAULTS = SHIMMER3R_DEFAULTS;
+exports.SensorBase = SensorBase;
+exports.SensorBitmapShimmer3 = SensorBitmapShimmer3;
+exports.SensorGSR = SensorGSR;
+exports.SensorLIS2DW12 = SensorLIS2DW12;
+exports.SensorLSM6DS3 = SensorLSM6DS3;
+exports.SensorPPG = SensorPPG;
+exports.Shimmer3RClient = Shimmer3RClient;
+exports.TIMESTAMP_FIELD = TIMESTAMP_FIELD;
+exports.VerisenseBleDevice = VerisenseBleDevice;
+exports.calibrateGsrDataToResistanceFromAmplifierEq = calibrateGsrDataToResistanceFromAmplifierEq;
+exports.calibrateShimmer3RAdcChannel = calibrateShimmer3RAdcChannel;
+exports.calibrateU12AdcValue = calibrateU12AdcValue;
+exports.crc16_ccitt_false = crc16_ccitt_false;
+exports.getOversamplingRatioADS1292R = getOversamplingRatioADS1292R;
+exports.normalizeOperationalConfig = normalizeOperationalConfig;
+exports.nudgeGsrResistance = nudgeGsrResistance;
+exports.parseProductionConfigPayload = parseProductionConfigPayload;
+//# sourceMappingURL=shimmer-web-sdk.cjs.map
