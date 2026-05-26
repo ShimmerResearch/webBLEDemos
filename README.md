@@ -51,7 +51,9 @@ update-local-sdk.cmd ←  Windows CMD launcher for update script
 | Wrist sensor (accel + GSR streaming) | [Verisense](https://shimmerresearch.github.io/webBLEDemos/Verisense/) |
 
 ### Chrome Extension
-[Shimmer3R Chrome Extension](https://github.com/ShimmerResearch/webBLEDemos/tree/main/shimmer-extension) — source code only; load via **chrome://extensions → Developer mode → Load unpacked**.
+[Shimmer3R Chrome Extension](https://github.com/ShimmerResearch/webBLEDemos/tree/main/shimmer-extension) — source code only; load via **chrome://extensions → Developer mode → Load unpacked** when you are specifically developing or testing extension features.
+
+This is optional and is **not required** for running the web demos in this repository.
 
 ---
 
@@ -189,6 +191,12 @@ When you make SDK changes in the sibling `shimmer-web-sdk` repo, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1
+```
+
+Windows CMD alternative:
+
+```cmd
+update-local-sdk.cmd
 ```
 
 The sync script uses `sdk-source.json` to copy built artifacts from `shimmer-web-sdk/dist` into `webBLEDemos/shimmer-extension/vendor`.
