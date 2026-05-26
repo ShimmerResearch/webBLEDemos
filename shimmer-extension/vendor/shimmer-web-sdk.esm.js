@@ -499,6 +499,17 @@ function hex2(v) {
     return v.toString(16).padStart(2, '0').toUpperCase();
 }
 
+function toArrayBuffer(u8) {
+    if (u8.buffer instanceof ArrayBuffer) {
+        if (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength)
+            return u8.buffer;
+        return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+    }
+    const out = new Uint8Array(u8.byteLength);
+    out.set(u8);
+    return out.buffer;
+}
+
 // ---------------------------------------------------------------------------
 // Shimmer3RClient
 // ---------------------------------------------------------------------------
@@ -1125,7 +1136,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (!this.rx)
             throw new Error('Not connected (RX missing)');
         this._log('Write', u8);
-        await this.rx.writeValue(u8);
+        await this.rx.writeValue(toArrayBuffer(u8));
     }
     async _writeExpectingAck(u8, ackTimeoutMs = 1000) {
         this._expectingAck++;
@@ -2156,7 +2167,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this.rx = await this.service.getCharacteristic(NUS_RX);
         await this.rx.startNotifications();
         this.rx.addEventListener('characteristicvaluechanged', (ev) => {
-            const dv = ev.target.value;
+            const dv = ev.target?.value;
+            if (!dv)
+                return;
             const bytes = new Uint8Array(dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength));
             this._feedStreamBytes(bytes);
         });
@@ -2484,7 +2497,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
             const result = await donePromise;
             await (this._loggedChain ?? Promise.resolve());
             if (!fileHandle) {
-                const blob = new Blob(chunks, { type: 'application/octet-stream' });
+                const blob = new Blob(chunks.map(toArrayBuffer), { type: 'application/octet-stream' });
                 return { ...result, blob };
             }
             return result;
@@ -2510,15 +2523,15 @@ class VerisenseBleDevice extends BaseShimmerClient {
         if (!this.tx)
             throw new Error('Not connected');
         if (opts.withResponse) {
-            await this.tx.writeValue(u8);
+            await this.tx.writeValue(toArrayBuffer(u8));
             return;
         }
         const txExt = this.tx;
         if (txExt.writeValueWithoutResponse) {
-            await txExt.writeValueWithoutResponse(u8);
+            await txExt.writeValueWithoutResponse(toArrayBuffer(u8));
         }
         else {
-            await this.tx.writeValue(u8);
+            await this.tx.writeValue(toArrayBuffer(u8));
         }
     }
     _makeReq(opcode, payloadBytes = []) {
@@ -2694,7 +2707,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
             return;
         }
         if (s.writable) {
-            await s.writable.write(payloadU8);
+            await s.writable.write(toArrayBuffer(payloadU8));
         }
         else {
             s.chunks.push(payloadU8.slice());
