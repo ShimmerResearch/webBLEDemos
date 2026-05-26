@@ -51,10 +51,12 @@ shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Ch
 
 ## `@shimmerresearch/web-ble` SDK
 
-The demos load the SDK directly from npm via jsDelivr CDN:
+The demos load the SDK directly from the jsDelivr CDN (served from the public GitHub repo):
 
 ```js
-import { Shimmer3RClient } from 'https://cdn.jsdelivr.net/npm/@shimmerresearch/web-ble/dist/shimmer-ble.esm.js';
+import { Shimmer3RClient } from 'https://cdn.jsdelivr.net/gh/ShimmerResearch/shimmer-web-sdk@latest/dist/shimmer-ble.esm.js';
 ```
+
+`@latest` resolves to the most recently tagged release automatically, so new SDK releases are picked up with no changes needed here.
 
 The SDK source lives at [ShimmerResearch/shimmer-web-sdk](https://github.com/ShimmerResearch/shimmer-web-sdk).
