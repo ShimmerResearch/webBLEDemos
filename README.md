@@ -19,6 +19,9 @@ spell-gyro/          │
 ShimmerCapture/      ┘
 Verisense/           ←  Verisense demo
 shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpacked in Chrome)
+update-local-sdk.ps1 ←  Build + sync local SDK artifacts
+sync-local-sdk.ps1   ←  Sync-only local SDK artifacts
+update-local-sdk.cmd ←  Windows CMD launcher for update script
 ```
 
 ---
@@ -51,18 +54,108 @@ shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpa
 
 ---
 
-## `@shimmerresearch/shimmer-web-sdk` SDK
+## Local Quickstart
 
-The demos load the SDK directly from the jsDelivr CDN (served from the public GitHub repo):
+### Prerequisites
 
-```js
-import { Shimmer3RClient } from 'https://cdn.jsdelivr.net/gh/ShimmerResearch/shimmer-web-sdk@v0.1.4/dist/shimmer-web-sdk.esm.js';
+- Chrome or Edge (Web Bluetooth support required)
+- VS Code with the **Live Server** extension
+- Node.js and npm (required to build local `shimmer-web-sdk` changes)
+- This repo (`webBLEDemos`) checked out next to `shimmer-web-sdk` (required by `update-local-sdk.ps1` / `sync-local-sdk.ps1` unless you pass a custom `-SdkRepoPath`)
+
+Expected folder layout:
+
+```text
+.../shimmer-web-workspace/
+	shimmer-web-sdk/
+	webBLEDemos/
 ```
 
-The SDK is pinned to `v0.1.4` so demo behavior stays reproducible.
-When adopting a newer SDK release, update the version in demo imports intentionally after validation.
+If your folders are not siblings, use:
 
-For the Chrome extension, also copy `dist/shimmer-web-sdk.esm.js` from `shimmer-web-sdk` into:
-`webBLEDemos/shimmer-extension/vendor/shimmer-web-sdk.esm.js` before loading unpacked.
+```powershell
+powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1 -SdkRepoPath "C:\path\to\shimmer-web-sdk"
+```
+
+### 1) Build and sync the local SDK
+
+If you are using local SDK changes, rebuild and sync the vendored SDK files:
+
+Script reference:
+
+| Script | What it does | Typical use |
+|---|---|---|
+| `update-local-sdk.ps1` | Build SDK (optional deps install) then sync vendor artifacts | Main workflow after SDK changes |
+| `sync-local-sdk.ps1` | Sync vendor artifacts only (no build) | You already built SDK elsewhere |
+| `update-local-sdk.cmd` | Windows CMD launcher for `update-local-sdk.ps1` | Double-click or cmd.exe usage |
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1
+```
+
+First run only (installs dependencies before build):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1 -InstallDeps
+```
+
+If Node.js/npm is not installed and you only want to copy already-built SDK artifacts:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1 -SkipBuild
+```
+
+Manual equivalent:
+
+```powershell
+cd ../shimmer-web-sdk
+npm run build
+cd ../webBLEDemos
+powershell -ExecutionPolicy Bypass -File .\sync-local-sdk.ps1
+```
+
+### 2) Run a demo on localhost (required for BLE)
+
+Open a demo file (for example `Verisense/index.html`) in VS Code and choose **Open with Live Server**.
+
+Use the localhost URL opened by Live Server (commonly `http://localhost:5500/...`).
+
+### 3) Connect from the page
+
+- Click **Connect (BLE)** from the demo page (user gesture is required by the browser).
+- For Verisense, you can also use **Connect USB (Serial)**.
+
+### Troubleshooting
+
+- If BLE buttons do not work, check the URL is `http://localhost/...` or `https://...` (not `file://...`).
+- If a demo fails to import the SDK, run the sync command again from `webBLEDemos` root.
+- If you updated SDK code but behavior did not change, re-run `.\update-local-sdk.ps1` from `webBLEDemos`.
+
+---
+
+## `@shimmerresearch/shimmer-web-sdk` SDK
+
+All demos now import the SDK from this repository, using a relative path that works both on localhost and on GitHub Pages:
+
+```js
+import { Shimmer3RClient } from '../shimmer-extension/vendor/shimmer-web-sdk.esm.js';
+```
+
+This means:
+
+- Local development uses the vendored SDK file without external CDN dependency.
+- GitHub Pages deployments also resolve the same path under the published `webBLEDemos` site.
+
+### Update vendored SDK from local source
+
+When you make SDK changes in the sibling `shimmer-web-sdk` repo, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1
+```
+
+The sync script copies all built artifacts from `shimmer-web-sdk/dist` into `webBLEDemos/shimmer-extension/vendor`.
+
+Manual copying into `webBLEDemos/shimmer-extension/vendor` is no longer required when you use `update-local-sdk.ps1` or `sync-local-sdk.ps1`.
 
 The SDK source lives at [ShimmerResearch/shimmer-web-sdk](https://github.com/ShimmerResearch/shimmer-web-sdk).
