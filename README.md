@@ -17,7 +17,7 @@ rythmgame-emggyro/   │  Shimmer3R demos
 video-ppg/           │
 spell-gyro/          │
 ShimmerCapture/      ┘
-Verisense/           -  Verisense demo
+Verisense/           ←  Verisense demo
 shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpacked in Chrome)
 ```
 
