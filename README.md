@@ -12,9 +12,10 @@ Web Bluetooth demos for Shimmer sensor devices, running entirely in the browser 
 break-gyro/          ┐
 break-emg/           │
 punch-highG/         │
-brick/               │  Shimmer3R demos
-rythmgame-emggyro/   │
+brick/               │
+rythmgame-emggyro/   │  Shimmer3R demos
 video-ppg/           │
+spell-gyro/          │
 ShimmerCapture/      │
 Verisense/           ┘
 shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Chrome)
@@ -35,6 +36,7 @@ shimmer-extension/   ← Shimmer3R Chrome extension (source; load unpacked in Ch
 | EMG + Gyro rhythm game | [rythmgame-emggyro](https://shimmerresearch.github.io/webBLEDemos/rythmgame-emggyro/) |
 | PPG heart-rate visualiser | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/video-ppg/) |
 | Two-device gyro brick game | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/) |
+| Spell caster (gyro gestures) | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/) |
 | Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
 
 ### Verisense
