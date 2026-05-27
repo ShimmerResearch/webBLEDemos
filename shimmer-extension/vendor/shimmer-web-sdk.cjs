@@ -3459,35 +3459,35 @@ class VerisenseBleDevice extends BaseShimmerClient {
         const rsp = await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildDebugPayload(debugId, args), timeoutMs);
         return { payload: rsp.payload };
     }
-    async readFlashLookupTable(index = 0, timeoutMs = 12000) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.FLASH_LOOKUP_TABLE_READ, this._debugIndexArgs(index), timeoutMs);
+    async readFlashLookupTable(_index = 0, timeoutMs = 12000) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.FLASH_LOOKUP_TABLE_READ, [], timeoutMs);
     }
-    async readRealWorldClockScheduler(index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.RWC_SCHEDULER_READ, this._debugIndexArgs(index));
+    async readRealWorldClockScheduler(_index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.RWC_SCHEDULER_READ);
     }
     async readRealWorldClockSchedulerParsed(index = 0) {
         const { payload } = await this.readRealWorldClockScheduler(index);
         return parseSchedulerDebugPayload(payload);
     }
-    async loadTestLookupTable(index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.LOAD_TEST_LOOKUP_TABLE, this._debugIndexArgs(index));
+    async loadTestLookupTable(_index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.LOAD_TEST_LOOKUP_TABLE);
     }
-    async checkPayloadCrcErrors(index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.CHECK_PAYLOAD_CRC_ERRORS, this._debugIndexArgs(index));
+    async checkPayloadCrcErrors(_index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.CHECK_PAYLOAD_CRC_ERRORS);
     }
     async checkPayloadCrcErrorsParsed(index = 0) {
         const { payload } = await this.checkPayloadCrcErrors(index);
         return parsePayloadCrcErrorBankIndexes(payload);
     }
-    async readEventLog(index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_EVENT_LOG, this._debugIndexArgs(index));
+    async readEventLog(_index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_EVENT_LOG);
     }
     async readEventLogParsed(index = 0) {
         const { payload } = await this.readEventLog(index);
         return parseEventLogPayload(payload);
     }
-    async readRecordBufferDetails(index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_RECORD_BUFFER_DETAILS, this._debugIndexArgs(index));
+    async readRecordBufferDetails(_index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_RECORD_BUFFER_DETAILS);
     }
     async readRecordBufferDetailsParsed(index = 0) {
         const { payload } = await this.readRecordBufferDetails(index);

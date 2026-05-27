@@ -1411,25 +1411,25 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     sendDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[], timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
-    readFlashLookupTable(index?: number, timeoutMs?: number): Promise<{
+    readFlashLookupTable(_index?: number, timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
-    readRealWorldClockScheduler(index?: number): Promise<{
+    readRealWorldClockScheduler(_index?: number): Promise<{
         payload: Uint8Array;
     }>;
     readRealWorldClockSchedulerParsed(index?: number): Promise<VerisenseSchedulerDebugPayload>;
-    loadTestLookupTable(index?: number): Promise<{
+    loadTestLookupTable(_index?: number): Promise<{
         payload: Uint8Array;
     }>;
-    checkPayloadCrcErrors(index?: number): Promise<{
+    checkPayloadCrcErrors(_index?: number): Promise<{
         payload: Uint8Array;
     }>;
     checkPayloadCrcErrorsParsed(index?: number): Promise<number[]>;
-    readEventLog(index?: number): Promise<{
+    readEventLog(_index?: number): Promise<{
         payload: Uint8Array;
     }>;
     readEventLogParsed(index?: number): Promise<VerisenseEventLogEntry[]>;
-    readRecordBufferDetails(index?: number): Promise<{
+    readRecordBufferDetails(_index?: number): Promise<{
         payload: Uint8Array;
     }>;
     readRecordBufferDetailsParsed(index?: number): Promise<VerisenseRecordBufferDetails[]>;

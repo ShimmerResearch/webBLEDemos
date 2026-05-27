@@ -422,29 +422,34 @@
 
         <div id="tab-console" class="tab active">
           <div class="section">
-            <h3>Property Reads/Writes</h3>
+            <h3>Status Reads</h3>
             <div class="row">
-              <button data-action="readStatus1">Read Status1</button>
-              <button data-action="readStatus2">Read Status2</button>
-              <button data-action="readPending">Read Pending Events</button>
-              <button data-action="readTime">Read Time</button>
-              <button data-action="writeTimeNow">Write Time = now</button>
+              <button
+                data-action="readStatus1"
+                title="Reads STATUS1. Battery values are sampled once per connection and may not refresh on repeated requests."
+              >Read Status1</button>
+              <button
+                data-action="readStatus2"
+                title="Reads STATUS2. This triggers a fresh battery voltage and percentage reading for each request."
+              >Read Status2</button>
             </div>
           </div>
 
           <div class="section">
-            <h3>Debug/Test Commands</h3>
-            <div class="section-grid-2">
-              <label>Scheduler Index <input id="schedulerIndex" type="number" value="0" min="0" max="255" /></label>
-              <label>CRC Check Index <input id="payloadCrcIndex" type="number" value="0" min="0" max="255" /></label>
-            </div>
+            <h3>Timing</h3>
             <div class="row">
+              <button data-action="readTime">Read Time</button>
+              <button data-action="writeTimeNow">Write Time = now</button>
               <button data-action="readScheduler">Read RWC Scheduler</button>
-              <button data-action="checkPayloadCrc">Check Payload CRC Errors</button>
             </div>
             <div class="row">
-              <button class="warn" data-action="clearPendingEvents">Clear Pending Events</button>
+              <button data-action="readPending">Read Pending Events</button>
+              <button class="warn" data-action="clearPendingEvents">Force Clear Pending Events</button>
             </div>
+          </div>
+
+          <div class="section">
+            <h3>Danger Zone</h3>
             <div class="row">
               <button class="warn" data-action="deleteAllBonds">Delete All Bonds</button>
               <button class="warn" data-action="systemReset">System Reset</button>
@@ -464,14 +469,10 @@
 
           <div class="section">
             <h3>Advanced</h3>
-            <div class="section-grid-2">
-              <label>Lookup Read Index <input id="lookupReadIndex" type="number" value="0" min="0" max="255" /></label>
-              <label>Record Buffers Index <input id="recordBuffersIndex" type="number" value="0" min="0"
-                  max="255" /></label>
-            </div>
             <div class="row">
               <button data-action="readLookup" class="primary">Read Flash Lookup Table</button>
               <button data-action="readRecordBuffers">Read Record Buffer Details</button>
+              <button data-action="checkPayloadCrc">Check Payload CRC Errors</button>
               <button class="warn" data-action="eraseAllLoggedData">Erase All Logged Data</button>
             </div>
             <div class="muted" id="lookupSummary">No lookup data loaded.</div>
@@ -661,9 +662,6 @@
         <div id="tab-eventlog" class="tab">
           <div class="section">
             <h3>Event Log Reader</h3>
-            <div class="section-grid-2">
-              <label>Event Log Index <input id="eventLogIndex" type="number" value="0" min="0" max="255" /></label>
-            </div>
             <div class="row">
               <button data-action="readEventLog" class="primary">Read Event Log</button>
             </div>
@@ -724,11 +722,8 @@
 
           <div class="section">
             <h3>Advanced</h3>
-            <div class="section-grid-2">
-              <label>Lookup Index <input id="testLoadLookupIndex" type="number" value="0" min="0" max="255" /></label>
-              <div class="row">
-                <button data-action="loadTestLookup">Load Test Lookup</button>
-              </div>
+            <div class="row">
+              <button data-action="loadTestLookup">Load Test Lookup</button>
             </div>
             <div class="section-grid-2">
               <label>LED Index <input id="testLedIndex" type="number" value="0" min="0" max="255" /></label>
@@ -763,6 +758,7 @@
 
   <script type="module">
     import {
+      ASM_PROPERTY,
       VerisenseBleDevice,
       OP_IDX,
       buildProductionConfigPayload,
@@ -815,15 +811,9 @@
       opGsrRange: $("opGsrRange"),
       opGsrRateCfg: $("opGsrRateCfg"),
       opGsrOverCfg: $("opGsrOverCfg"),
-      schedulerIndex: $("schedulerIndex"),
-      payloadCrcIndex: $("payloadCrcIndex"),
-      lookupReadIndex: $("lookupReadIndex"),
-      recordBuffersIndex: $("recordBuffersIndex"),
-      eventLogIndex: $("eventLogIndex"),
       testModeSelect: $("testModeSelect"),
       btnRunHardwareTest: $("btnRunHardwareTest"),
       testHwIdStatus: $("testHwIdStatus"),
-      testLoadLookupIndex: $("testLoadLookupIndex"),
       testLedIndex: $("testLedIndex"),
       testLoopCount: $("testLoopCount"),
       prodMonHex: $("prodMonHex"),
@@ -1070,6 +1060,22 @@
     function toHexArray(bytes) {
       const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
       return `[${Array.from(u8, (b) => toHexByte(b)).join(", ")}]`;
+    }
+
+    const ASM_PROPERTY_BY_VALUE = new Map(
+      Object.entries(ASM_PROPERTY).map(([name, value]) => [Number(value), name]),
+    );
+
+    function formatPendingEventsForLog(pendingProps) {
+      const list = Array.isArray(pendingProps) ? pendingProps : [];
+      return list.map((prop) => {
+        const value = Number(prop) & 0xff;
+        return {
+          value,
+          hex: toHexByte(value),
+          property: ASM_PROPERTY_BY_VALUE.get(value) ?? "UNKNOWN_PROPERTY",
+        };
+      });
     }
 
     function isDebugHeaderNackError(err) {
@@ -1578,7 +1584,13 @@
           }
           break;
         case "readPending":
-          log("pending", await v.readPendingEventsParsed());
+          {
+            const pending = await v.readPendingEventsParsed();
+            log("pending", {
+              count: pending?.length ?? 0,
+              entries: formatPendingEventsForLog(pending),
+            });
+          }
           break;
         case "readTime":
           {
@@ -1592,12 +1604,11 @@
           break;
         case "readLookup":
           {
-            const lookupReadIndex = Number(ui.lookupReadIndex?.value) || 0;
             const prevStatus = ui.statusBadge.textContent || "connected";
             try {
               setStatus("lookup-reading");
-              if (ui.lookupSummary) ui.lookupSummary.textContent = `Reading lookup table (index=${lookupReadIndex})...`;
-              log("lookup.read.start", { index: lookupReadIndex, timeoutMs: 30000, retries: 2 });
+              if (ui.lookupSummary) ui.lookupSummary.textContent = "Reading lookup table...";
+              log("lookup.read.start", { timeoutMs: 30000, retries: 2 });
 
               let attempt = 0;
               let rsp = null;
@@ -1605,8 +1616,8 @@
               while (attempt < 3 && !rsp) {
                 attempt += 1;
                 try {
-                  log("lookup.read.attempt", { attempt, index: lookupReadIndex });
-                  rsp = await v.readFlashLookupTable(lookupReadIndex, 30000);
+                  log("lookup.read.attempt", { attempt });
+                  rsp = await v.readFlashLookupTable(0, 30000);
                 } catch (e) {
                   lastErr = e;
                   log("lookup.read.retry", { attempt, error: String(e?.message ?? e) });
@@ -1632,7 +1643,6 @@
               }
 
               log("lookup.response", {
-                index: lookupReadIndex,
                 payloadLength: payload.length,
                 head: parsed.head,
                 tail: parsed.tail,
@@ -1646,39 +1656,30 @@
           break;
         case "readScheduler":
           {
-            const schedulerIndex = Number(ui.schedulerIndex?.value) || 0;
-            log("scheduler.read", { index: schedulerIndex });
-            const parsed = await v.readRealWorldClockSchedulerParsed(schedulerIndex);
-            log("scheduler.response", { index: schedulerIndex, parsed: formatSchedulerForLog(parsed) });
+            log("scheduler.read", {});
+            const parsed = await v.readRealWorldClockSchedulerParsed();
+            log("scheduler.response", { parsed: formatSchedulerForLog(parsed) });
           }
           break;
         case "loadTestLookup":
-          {
-            const lookupIndex = Number(ui.testLoadLookupIndex?.value) || 0;
-            log("loadTestLookup", await v.loadTestLookupTable(lookupIndex));
-          }
+          log("loadTestLookup", await v.loadTestLookupTable());
           break;
         case "checkPayloadCrc":
-          {
-            const payloadCrcIndex = Number(ui.payloadCrcIndex?.value) || 0;
-            log("crcErrors", await v.checkPayloadCrcErrorsParsed(payloadCrcIndex));
-          }
+          log("crcErrors", await v.checkPayloadCrcErrorsParsed());
           break;
         case "readEventLog":
           {
-            const eventLogIndex = Number(ui.eventLogIndex?.value) || 0;
-            log("eventLog.read", { index: eventLogIndex });
-            const parsed = await v.readEventLogParsed(eventLogIndex);
-            log("eventLog.response", { index: eventLogIndex, entries: parsed?.length ?? 0, parsed });
+            log("eventLog.read", {});
+            const parsed = await v.readEventLogParsed();
+            log("eventLog.response", { entries: parsed?.length ?? 0, parsed });
             renderEventLogTable(parsed);
           }
           break;
         case "readRecordBuffers":
           {
-            const recordBuffersIndex = Number(ui.recordBuffersIndex?.value) || 0;
-            log("recordBuffers.read", { index: recordBuffersIndex });
-            const parsed = await v.readRecordBufferDetailsParsed(recordBuffersIndex);
-            log("recordBuffers.response", { index: recordBuffersIndex, entries: parsed?.length ?? 0, parsed });
+            log("recordBuffers.read", {});
+            const parsed = await v.readRecordBufferDetailsParsed();
+            log("recordBuffers.response", { entries: parsed?.length ?? 0, parsed });
           }
           break;
         case "ledTest":
