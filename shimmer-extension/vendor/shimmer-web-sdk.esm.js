@@ -471,7 +471,7 @@ function concatU8(a, b) {
     return out;
 }
 /** Read a 16-bit unsigned integer, little-endian. */
-function u16le(b, o) {
+function u16le$1(b, o) {
     return (b[o] | (b[o + 1] << 8)) >>> 0;
 }
 /** Read a 16-bit unsigned integer, big-endian. */
@@ -896,7 +896,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         let base = 0;
         if (u8[0] === OPCODES.INQUIRY_RESPONSE && u8.length >= 2)
             base = 1;
-        const adcRaw = u16le(u8, base + 0);
+        const adcRaw = u16le$1(u8, base + 0);
         const samplingRateHz = 32768 / adcRaw;
         this.samplingRateHz = samplingRateHz;
         const cfg = BigInt(u8[base + 2]) |
@@ -1041,8 +1041,8 @@ class Shimmer3RClient extends BaseShimmerClient {
             if (buf[0] === preamble && buf[frameBytes] === preamble) {
                 let ts1, ts2;
                 try {
-                    ts1 = tsBytes === 2 ? u16le(buf, 1) : u24le$1(buf, 1);
-                    ts2 = tsBytes === 2 ? u16le(buf, frameBytes + 1) : u24le$1(buf, frameBytes + 1);
+                    ts1 = tsBytes === 2 ? u16le$1(buf, 1) : u24le$1(buf, 1);
+                    ts2 = tsBytes === 2 ? u16le$1(buf, frameBytes + 1) : u24le$1(buf, frameBytes + 1);
                 }
                 catch {
                     buf = buf.subarray(1);
@@ -1059,7 +1059,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 try {
                     let cursor = 1;
                     const oc = new ObjectCluster(this.device?.name ?? 'Shimmer3R');
-                    const ts = tsBytes === 2 ? u16le(frame, cursor) : u24le$1(frame, cursor);
+                    const ts = tsBytes === 2 ? u16le$1(frame, cursor) : u24le$1(frame, cursor);
                     cursor += tsBytes;
                     oc.add('TIMESTAMP', ts, 'ticks', 'raw');
                     for (const f of sch.fields) {
@@ -1069,10 +1069,10 @@ class Shimmer3RClient extends BaseShimmerClient {
                         let v;
                         switch (f.fmt) {
                             case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le(frame, cursor));
+                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$1(frame, cursor));
                                 break;
                             case 'u16':
-                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le(frame, cursor);
+                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$1(frame, cursor);
                                 break;
                             case 'i24':
                                 v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
@@ -1091,7 +1091,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                                 v = frame[cursor];
                                 break;
                             default:
-                                v = u16le(frame, cursor);
+                                v = u16le$1(frame, cursor);
                         }
                         cursor += f.sizeBytes;
                         oc.add(f.name, v, null, 'raw');
@@ -1228,18 +1228,80 @@ const NUS_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 /** NUS RX characteristic UUID (host subscribes to notifications from this). */
 const NUS_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 // ---------------------------------------------------------------------------
-// Protocol command bytes
+// Verisense protocol command/property constants
 // ---------------------------------------------------------------------------
-/** Request the device to send logged data. */
-const READ_DATA_REQ = new Uint8Array([0x12, 0x00, 0x00]);
-/** Request the device to disconnect cleanly. */
-const DISCONNECT_REQ = new Uint8Array([0x2b, 0x00, 0x00]);
-/** Acknowledge a correctly-received logged data payload. */
-const DATA_ACK = new Uint8Array([0x82, 0x00, 0x00]);
-/** Negative-acknowledge a logged data payload (triggers retransmission). */
-const DATA_NACK = new Uint8Array([0x72, 0x00, 0x00]);
-/** Header byte that signals End-of-Stream for logged data transfer. */
-const DATA_EOS_HDR = 0x42;
+/** Upper-nibble command classes used in protocol headers. */
+const ASM_COMMAND = Object.freeze({
+    READ: 0x10,
+    WRITE: 0x20,
+    RESPONSE: 0x30,
+    ACK: 0x40,
+    NACK_BAD_HEADER_COMMAND: 0x50,
+    NACK_BAD_HEADER_PROPERTY: 0x60,
+    NACK_GENERIC: 0x70,
+    ACK_NEXT_STAGE: 0x80,
+});
+/** Lower-nibble property IDs used in protocol headers. */
+const ASM_PROPERTY = Object.freeze({
+    STATUS1: 0x01,
+    DATA: 0x02,
+    PRODUCTION_CONFIGURATION: 0x03,
+    OPERATIONAL_CONFIGURATION: 0x04,
+    TIME: 0x05,
+    DFU_MODE: 0x06,
+    PENDING_EVENTS: 0x07,
+    TEST_MODE: 0x08,
+    DEBUG_COMMAND: 0x09,
+    STREAM_MODE: 0x0a,
+    DEVICE_DISCONNECT: 0x0b,
+    STATUS2: 0x0c,
+});
+/** Stream mode payload values. */
+const STREAM_MODE = Object.freeze({
+    ENABLE: 0x01,
+    DISABLE: 0x02,
+});
+/** Test mode IDs documented by Verisense firmware. */
+const TEST_MODE_ID = Object.freeze({
+    STOP: 0x00,
+    FLASH_8MB_1: 0x01,
+    FLASH_8MB_2: 0x02,
+    FLASH_128MB_512MB: 0x03,
+    EEPROM: 0x04,
+    ACCEL1_LIS2DW12: 0x05,
+    BATTERY_VOLTAGE: 0x06,
+    USB_POWER: 0x07,
+    ACCEL2_GYRO_LSM6DS3: 0x08,
+    PPG_MAX86XXX: 0x09,
+    BIOZ_MAX30002: 0x0b,
+    ACCEL2_GYRO_LSM6DSV: 0x0c,
+    MAG_LIS2MDL: 0x0d,
+    ALL_TESTS: 0xff,
+});
+/** Debug command IDs documented by Verisense firmware. */
+const DEBUG_COMMAND_ID = Object.freeze({
+    FLASH_LOOKUP_TABLE_READ: 0x01,
+    FLASH_LOOKUP_TABLE_ERASE: 0x02,
+    RWC_SCHEDULER_READ: 0x03,
+    ERASE_128MB_512MB_FLASH: 0x04,
+    ERASE_8MB_FLASH_1: 0x05,
+    ERASE_8MB_FLASH_2: 0x06,
+    ERASE_OPERATIONAL_CONFIG: 0x07,
+    ERASE_PRODUCTION_CONFIG: 0x08,
+    CLEAR_PENDING_EVENTS: 0x09,
+    ERASE_FLASH_AND_LOOKUP_TABLE: 0x0a,
+    TEST_DATA_TRANSFER_LOOP: 0x0b,
+    LOAD_TEST_LOOKUP_TABLE: 0x0c,
+    LED_TEST: 0x0d,
+    MAX86XXX_LED_TEST: 0x0e,
+    CHECK_PAYLOAD_CRC_ERRORS: 0x0f,
+    READ_EVENT_LOG: 0x10,
+    POWER_PROFILER_TEST: 0x11,
+    READ_RECORD_BUFFER_DETAILS: 0x12,
+    SYSTEM_RESET: 0x13,
+    IC_POWER_CONSUMPTION_TEST: 0x14,
+    DELETE_ALL_BONDS: 0x15,
+});
 // ---------------------------------------------------------------------------
 // Operational config byte offsets
 // ---------------------------------------------------------------------------
@@ -1303,11 +1365,10 @@ const OP_IDX = Object.freeze({
     PROX_AGC_MODE: 71,
 });
 
-/**
- * Pure byte-manipulation utilities for the Verisense protocol.
- * No side-effects; suitable for unit testing without a BLE device.
- */
 /** Read a 16-bit unsigned integer, little-endian. */
+function u16le(b0, b1) {
+    return (b1 << 8) | b0;
+}
 /** Read a signed 16-bit integer at byte offset `off`, little-endian. */
 function i16le(bytes, off) {
     const v = bytes[off] | (bytes[off + 1] << 8);
@@ -1325,9 +1386,6 @@ function u16le_at(bytes, off) {
 function nowMillis() {
     return Date.now();
 }
-// ---------------------------------------------------------------------------
-// CRC-16/CCITT-FALSE
-// ---------------------------------------------------------------------------
 /**
  * Compute CRC-16/CCITT-FALSE over `bytes`.
  *
@@ -1359,12 +1417,9 @@ function getOriginalCrcLE(payload) {
 function computeCrcLikeCSharp(payload) {
     return crc16_ccitt_false(payload.subarray(0, payload.length - 2));
 }
-// ---------------------------------------------------------------------------
-// Operational config normaliser
-// ---------------------------------------------------------------------------
 /**
  * Convert any reasonable representation of an operational config to a
- * `Uint8Array`.  Throws if the input type is unrecognised.
+ * `Uint8Array`. Throws if the input type is unrecognised.
  */
 function normalizeOperationalConfig(payload) {
     if (!payload)
@@ -1380,6 +1435,471 @@ function normalizeOperationalConfig(payload) {
         return new Uint8Array(p.buffer, p.byteOffset ?? 0, p.byteLength ?? p.buffer.byteLength);
     }
     throw new Error('normalizeOperationalConfig: unsupported payload type');
+}
+/** Alias for arbitrary protocol byte payload normalization. */
+function normalizeBytePayload(payload) {
+    return normalizeOperationalConfig(payload);
+}
+/**
+ * Derive the 6-digit pairing PIN from a Verisense unique identifier.
+ *
+ * The PIN is built from digits 2, 4 and 6 (1-based) of the identifier,
+ * followed by the decimal value of the final byte padded to 3 digits.
+ */
+function computeVerisensePairingPin(uniqueId) {
+    const normalized = String(uniqueId ?? '').trim().replace(/^Verisense-/i, '');
+    if (!/^[0-9a-fA-F]{8,}$/.test(normalized)) {
+        throw new Error('computeVerisensePairingPin: uniqueId must be a hex identifier string');
+    }
+    if (normalized.length < 6) {
+        throw new Error('computeVerisensePairingPin: uniqueId must be at least 6 hex characters');
+    }
+    const prefix = `${normalized[1]}${normalized[3]}${normalized[5]}`;
+    const suffixHex = normalized.slice(-2);
+    const suffixDec = Number.parseInt(suffixHex, 16);
+    return `${prefix}${suffixDec.toString().padStart(3, '0')}`;
+}
+const PROD_CONFIG_FLAG_DFU_ENABLED = 1 << 0;
+const LOG_EVENT_NAMES = {
+    0: 'NONE',
+    1: 'BATTERY_FALL',
+    2: 'BATTERY_RECOVER',
+    3: 'WRITE_TO_FLASH_SUCCESS',
+    4: 'WRITE_TO_FLASH_FAIL_GENERAL',
+    5: 'WRITE_TO_FLASH_FULL',
+    6: 'WRITE_TO_FLASH_FAIL_CHECK_ADDR_FREE',
+    7: 'WRITE_TO_FLASH_FAIL_LOW_BATT_CHECK_ADDR_FREE',
+    8: 'WRITE_TO_FLASH_FAIL_LOW_BATT_FLASH_ON',
+    9: 'WRITE_TO_FLASH_FAIL_LOW_BATT_FLASH_WRITE',
+    10: 'WRITE_TO_FLASH_FAIL_LOW_BATT_BEFORE_START',
+    11: 'USB_PLUGGED_IN_SOFT_DEVICE',
+    12: 'USB_PLUGGED_OUT_SOFT_DEVICE',
+    13: 'RECORDING_PAUSED',
+    14: 'RECORDING_RESUMED',
+    15: 'BATTERY_RECOVER_IN_BATT_CHECK_TIMER',
+    16: 'TSK_FREE_UP_FLASH',
+    17: 'FREE_UP_FLASH_FAIL_LOW_BATT',
+    18: 'PAYLOAD_PACKAGING_TASK_SET',
+    19: 'PAYLOAD_PACKAGING_FUNCTION_CALL',
+    20: 'BATTERY_VOLTAGE',
+    21: 'TSK_WRITE_LOOKUP_TBL_CHANGES_TO_EEPROM',
+    22: 'LPCOMP_ON',
+    23: 'LPCOMP_ON_ALREADY',
+    24: 'LPCOMP_OFF',
+    25: 'LPCOMP_TRIED_BUT_BATT_LOW',
+    26: 'BLE_CONNECTED',
+    27: 'BLE_DISCONNECTED',
+    28: 'TSK_WRITE_FLASH',
+    29: 'PPG_TIMER_START',
+    30: 'PAYLOAD_OVERSHOT',
+    31: 'ADVERTISING_START',
+    32: 'ADVERTISING_STOP',
+    33: 'NIMH_BATT_PPG_BLOCKED_BLE_RETRY',
+    34: 'NIMH_BATT_PPG_BLOCKED_BLE_ADAPT_SCH',
+    35: 'NIMH_BATT_PPG_BLOCKED_BLE_PENDING_EVENTS',
+    36: 'NIMH_BATT_BLE_BLOCKED_PPG',
+    37: 'USB_PORT_OPEN',
+    38: 'USB_PORT_CLOSED',
+    39: 'FIFO_INT_SAFETY_CHECK_EVENT_ACCEL1',
+    40: 'FIFO_INT_SAFETY_CHECK_EVENT_ACCEL2GYRO',
+    41: 'FIFO_INT_SAFETY_CHECK_EVENT_MAX86XXX',
+    42: 'FIFO_INT_SAFETY_CHECK_EVENT_MAX3000X',
+    43: 'FIFO_INT_SAFETY_CHECK_EVENT_ADC',
+    44: 'USB_PLUGGED_IN_PIN_HANDLER',
+    45: 'USB_PLUGGED_OUT_PIN_HANDLER',
+    46: 'BATTERY_CHARGER_STATUS_BAD_BATTERY',
+    47: 'BATTERY_CHARGER_STATUS_CHARGING',
+    48: 'BATTERY_CHARGER_STATUS_CHARGING_COMPLETE',
+    49: 'BATTERY_CHARGER_STATUS_POWER_DOWN',
+    50: 'LTC4123_RECOVERY_ATTEMPT',
+    51: 'LTC4123_RECOVERY_GAVE_UP',
+    52: 'LTC4123_CHRG_COMPLETE_OVERRIDDEN_BAD_BATT',
+};
+const LOOKUP_STATUS_NAMES = {
+    0: 'Zero',
+    1: 'Full',
+    2: '2Del',
+    3: 'Emty',
+    4: 'Bad',
+    5: 'NUse',
+};
+function u32le_at(bytes, off) {
+    return (((bytes[off] ?? 0) |
+        ((bytes[off + 1] ?? 0) << 8) |
+        ((bytes[off + 2] ?? 0) << 16) |
+        ((bytes[off + 3] ?? 0) << 24)) >>>
+        0);
+}
+function decodeAsciiTrimFF(bytes) {
+    let end = bytes.length;
+    while (end > 0 && bytes[end - 1] === 0xff)
+        end--;
+    if (end === 0)
+        return '';
+    return new TextDecoder().decode(bytes.slice(0, end));
+}
+/** Convert unix seconds into Verisense 7-byte RTC payload (4-byte minutes + 3-byte ticks). */
+function unixSecondsToAsmRtcBytes(unixSeconds) {
+    if (!Number.isFinite(unixSeconds) || unixSeconds < 0) {
+        throw new Error('unixSecondsToAsmRtcBytes: unixSeconds must be a finite positive number');
+    }
+    const minutes = Math.floor(unixSeconds / 60);
+    const secondsInMinute = unixSeconds - minutes * 60;
+    const ticks = Math.floor(secondsInMinute * 32768);
+    return new Uint8Array([
+        minutes & 0xff,
+        (minutes >> 8) & 0xff,
+        (minutes >> 16) & 0xff,
+        (minutes >> 24) & 0xff,
+        ticks & 0xff,
+        (ticks >> 8) & 0xff,
+        (ticks >> 16) & 0xff,
+    ]);
+}
+/** Convert Verisense 7-byte RTC payload into unix seconds. */
+function asmRtcBytesToUnixSeconds(rtc7) {
+    if (rtc7.length !== 7) {
+        throw new Error('asmRtcBytesToUnixSeconds: payload must be exactly 7 bytes');
+    }
+    const minutes = u32le_at(rtc7, 0);
+    const ticks = u24le(rtc7, 4);
+    return minutes * 60 + ticks / 32768.0;
+}
+/** Convert Verisense 8-byte minute counter payload into unix seconds. */
+function asmRtcMinutesBytesToUnixSeconds(minutes8) {
+    if (minutes8.length !== 8) {
+        throw new Error('asmRtcMinutesBytesToUnixSeconds: payload must be exactly 8 bytes');
+    }
+    let minutes = 0n;
+    for (let i = 0; i < 8; i++) {
+        minutes |= BigInt(minutes8[i]) << BigInt(i * 8);
+    }
+    return Number(minutes) * 60;
+}
+/**
+ * Build a production configuration payload (56 bytes) from structured options.
+ * This matches the Python tooling layout used by ASM_BLE.py / ASM_Device.py.
+ */
+function buildProductionConfigPayload(opts) {
+    const mo = String(opts.manufacturingOrderNumberHex ?? '').trim();
+    const mac = String(opts.macIdHex ?? '').trim();
+    if (!/^[0-9a-fA-F]{8}$/.test(mo)) {
+        throw new Error('buildProductionConfigPayload: manufacturingOrderNumberHex must be 8 hex chars');
+    }
+    if (!/^[0-9a-fA-F]{4}$/.test(mac)) {
+        throw new Error('buildProductionConfigPayload: macIdHex must be 4 hex chars');
+    }
+    const uniqueBytes = new Uint8Array(6);
+    uniqueBytes.set(new Uint8Array(mo.match(/../g).map((h) => Number.parseInt(h, 16))), 0);
+    uniqueBytes.set(new Uint8Array(mac.match(/../g).map((h) => Number.parseInt(h, 16))), 4);
+    uniqueBytes.reverse();
+    const revHwInternal = (opts.revHwInternal ?? 0) & 0xffff;
+    const revFwInternal = (opts.revFwInternal ?? 0) & 0xffff;
+    const out = new Uint8Array(56);
+    out[0] = 0x5a;
+    out.set(uniqueBytes, 1);
+    out[7] = opts.revHwMajor & 0xff;
+    out[8] = opts.revHwMinor & 0xff;
+    out[9] = opts.revFwMajor & 0xff;
+    out[10] = opts.revFwMinor & 0xff;
+    out[11] = revFwInternal & 0xff;
+    out[12] = (revFwInternal >> 8) & 0xff;
+    out[13] = revHwInternal & 0xff;
+    out[14] = (revHwInternal >> 8) & 0xff;
+    out.fill(0xff, 15, 56);
+    const passkeyId = opts.passkeyId ?? '';
+    if (passkeyId.length > 0) {
+        if (passkeyId.length !== 2) {
+            throw new Error('buildProductionConfigPayload: passkeyId must be 2 chars when provided');
+        }
+        out.set(new TextEncoder().encode(passkeyId), 15);
+    }
+    const passkey = opts.passkey ?? '';
+    if (passkey.length > 0) {
+        if (passkey.length !== 6) {
+            throw new Error('buildProductionConfigPayload: passkey must be 6 chars when provided');
+        }
+        out.set(new TextEncoder().encode(passkey), 17);
+    }
+    const advPrefix = opts.advertisingNamePrefix ?? '';
+    if (advPrefix.length > 32) {
+        throw new Error('buildProductionConfigPayload: advertisingNamePrefix must be <= 32 chars');
+    }
+    if (advPrefix.length > 0) {
+        out.set(new TextEncoder().encode(advPrefix), 23);
+    }
+    if (opts.dfuEnabled ?? true) {
+        out[55] = PROD_CONFIG_FLAG_DFU_ENABLED;
+    }
+    return out;
+}
+/** Parse production configuration with optional passkey/name/flag fields. */
+function parseProductionConfigPayloadFull(response) {
+    if (response.length < 11) {
+        throw new Error('parseProductionConfigPayloadFull: payload must be at least 11 bytes');
+    }
+    const base = parseProductionConfigPayload(response);
+    const uniqueIdentifier = [...response.slice(1, 7)]
+        .reverse()
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
+    const revHwMajor = response[7] ?? 0;
+    const revHwMinor = response[8] ?? 0;
+    const revFwMajor = response[9] ?? 0;
+    const revFwMinor = response[10] ?? 0;
+    const revFwInternal = response.length >= 13 ? u16le_at(response, 11) : 0;
+    const revHwInternal = response.length >= 15 ? u16le_at(response, 13) : 0;
+    const passkeyId = response.length >= 17 ? decodeAsciiTrimFF(response.slice(15, 17)) : '';
+    const passkey = response.length >= 23 ? decodeAsciiTrimFF(response.slice(17, 23)) : '';
+    const advertisingNamePrefix = response.length >= 55 ? decodeAsciiTrimFF(response.slice(23, 55)) : '';
+    const dfuEnabled = response.length >= 56 ? !!(response[55] & PROD_CONFIG_FLAG_DFU_ENABLED) : true;
+    return {
+        ...base,
+        manufacturingOrderNumber: uniqueIdentifier.slice(0, 8),
+        macId: uniqueIdentifier.slice(8, 12),
+        uniqueIdentifier,
+        revHwMajor,
+        revHwMinor,
+        revHwInternal,
+        revFwMajor,
+        revFwMinor,
+        revFwInternal,
+        passkeyId,
+        passkey,
+        advertisingNamePrefix,
+        dfuEnabled,
+    };
+}
+/**
+ * Parse STATUS1/STATUS2 payload into a typed object.
+ *
+ * This ports the core byte parsing from ASM_Device.parse_status while keeping
+ * the output concise and UI-friendly.
+ */
+function parseStatusPayload(response, sourceStatusProperty = 'status1') {
+    if (response.length < 24) {
+        throw new Error('parseStatusPayload: payload must be at least 24 bytes');
+    }
+    const uniqueIdentifier = [...response.slice(0, 6)]
+        .reverse()
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
+    const hasTickFields = response.length >= 56;
+    const hasExtendedCapacity = response.length >= 65;
+    const statusTimestampSeconds = hasTickFields
+        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(6, 10), ...response.slice(34, 37)]))
+        : u32le_at(response, 6) * 60;
+    const batteryMilliVolts = u16le_at(response, 10);
+    const batteryPercent = response[12] ?? 0;
+    const lastOkTransferSeconds = hasTickFields
+        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(13, 17), ...response.slice(37, 40)]))
+        : u32le_at(response, 13) * 60;
+    const lastFailTransferSeconds = hasTickFields
+        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(17, 21), ...response.slice(40, 43)]))
+        : u32le_at(response, 17) * 60;
+    const memoryFreeKb = hasExtendedCapacity
+        ? ((response[21] | (response[22] << 8) | (response[23] << 16) | (response[57] << 24)) >>> 0)
+        : ((response[21] | (response[22] << 8) | (response[23] << 16)) >>> 0);
+    const memoryCapacityKb = hasExtendedCapacity ? u32le_at(response, 60) : null;
+    const memoryUsedKb = memoryCapacityKb == null ? null : Math.max(0, memoryCapacityKb - memoryFreeKb);
+    const batteryFallCounter = response.length >= 26 ? u16le_at(response, 24) : null;
+    let statusFlags = null;
+    if (response.length >= 34) {
+        const f = response[26];
+        statusFlags = {
+            usbPluggedIn: (f & 0x01) !== 0,
+            recordingPaused: (f & 0x02) !== 0,
+            flashIsFull: (f & 0x04) !== 0,
+            powerIsGood: (f & 0x08) !== 0,
+            adaptiveSchedulerOn: (f & 0x10) !== 0,
+            dfuServiceOn: (f & 0x20) !== 0,
+            firstBoot: (f & 0x40) !== 0,
+            repeatedBatteryMeasurement: (f & 0x80) !== 0,
+        };
+    }
+    return {
+        uniqueIdentifier,
+        sourceStatusProperty,
+        statusTimestampSeconds,
+        batteryMilliVolts,
+        batteryPercent,
+        lastOkTransferSeconds,
+        lastFailTransferSeconds,
+        memoryFreeKb,
+        memoryCapacityKb,
+        memoryUsedKb,
+        statusFlags,
+        batteryFallCounter,
+    };
+}
+/** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
+function parseSchedulerDebugPayload(payload) {
+    if (payload.length < 42) {
+        throw new Error('parseSchedulerDebugPayload: payload is too short');
+    }
+    let idx = 0;
+    const currentTimeUnixSeconds = asmRtcBytesToUnixSeconds(payload.slice(idx, idx + 7));
+    idx += 7;
+    const bleControlByte = payload[idx++] ?? 0xff;
+    const bleControlCounter = bleControlByte === 0x00
+        ? 'data-transfer'
+        : bleControlByte === 0x01
+            ? 'status1'
+            : bleControlByte === 0x02
+                ? 'rtc-sync'
+                : bleControlByte === 0x03
+                    ? 'status2'
+                    : bleControlByte === 0xff
+                        ? 'never'
+                        : 'unknown';
+    const next8 = () => {
+        const v = asmRtcMinutesBytesToUnixSeconds(payload.slice(idx, idx + 8));
+        idx += 8;
+        return v;
+    };
+    const out = {
+        currentTimeUnixSeconds,
+        bleControlCounter,
+        pendingDataTransferUnixSeconds: next8(),
+        pendingStatus1UnixSeconds: next8(),
+        pendingRtcSyncUnixSeconds: next8(),
+        pendingRetryUnixSeconds: next8(),
+        retryCount: payload[idx++] ?? 0,
+        retryOperation: (payload[idx++] ?? 0) === 1 ? 'ble-on' : 'ble-off',
+    };
+    if (payload.length >= idx + 10) {
+        out.adaptiveScheduler = {
+            nextUnixSeconds: next8(),
+            enabled: (payload[idx++] ?? 0) === 1,
+            syncFailCounter: payload[idx++] ?? 0,
+        };
+    }
+    if (payload.length >= idx + 11) {
+        const nextUnixSeconds = next8();
+        const op = payload[idx++] ?? 0;
+        out.ltfRetry = {
+            nextUnixSeconds,
+            currentOperation: op === 0
+                ? 'flash-write-retry-inactive'
+                : op === 1
+                    ? 'short-flash-write-retry'
+                    : op === 2
+                        ? 'attempt-flash-write'
+                        : op === 3
+                            ? 'long-flash-write-retry'
+                            : op === 4
+                                ? 'sensor-paused-until-usb-plug-in'
+                                : 'unknown',
+            failCounterShort: payload[idx++] ?? 0,
+            failCounterLong: payload[idx++] ?? 0,
+        };
+    }
+    if (payload.length >= idx + 8) {
+        out.pendingStatus2UnixSeconds = next8();
+    }
+    if (payload.length >= idx + 8) {
+        out.ppgMeasurementUnixSeconds = next8();
+    }
+    if (payload.length >= idx + 8) {
+        out.stepCounterResetUnixSeconds = next8();
+    }
+    if (payload.length >= idx + 8) {
+        out.sensorInactivityUnixSeconds = next8();
+    }
+    return out;
+}
+/** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
+function parsePayloadCrcErrorBankIndexes(payload) {
+    if (payload.length % 2 !== 0) {
+        throw new Error('parsePayloadCrcErrorBankIndexes: payload length must be even');
+    }
+    const out = [];
+    for (let i = 0; i < payload.length; i += 2)
+        out.push(u16le_at(payload, i));
+    return out;
+}
+/** Parse 8-byte debug event-log entries. */
+function parseEventLogPayload(payload) {
+    if (payload.length % 8 !== 0) {
+        throw new Error('parseEventLogPayload: payload length must be a multiple of 8');
+    }
+    const out = [];
+    for (let i = 0; i < payload.length; i += 8) {
+        const entry = payload.slice(i, i + 8);
+        const eventId = entry[7];
+        if (eventId === 0)
+            continue;
+        out.push({
+            index: i / 8,
+            eventId,
+            eventName: LOG_EVENT_NAMES[eventId] ?? `EVENT_${eventId}`,
+            timestampUnixSeconds: eventId === 20 ? null : asmRtcBytesToUnixSeconds(entry.slice(0, 7)),
+            batteryMilliVolts: eventId === 20 ? u24le(entry, 0) : null,
+        });
+    }
+    return out;
+}
+/** Parse record-buffer details payload (26-byte current layout, 19-byte legacy layout). */
+function parseRecordBufferDetailsPayload(payload) {
+    const bytesPerBuffer = payload.length % 26 === 0 ? 26 : payload.length % 19 === 0 ? 19 : 0;
+    if (!bytesPerBuffer) {
+        throw new Error('parseRecordBufferDetailsPayload: unsupported payload length');
+    }
+    const out = [];
+    for (let i = 0; i < payload.length; i += bytesPerBuffer) {
+        const row = payload.slice(i, i + bytesPerBuffer);
+        out.push({
+            bufferIndex: row[0],
+            bufferState: row[1],
+            packagedPayloadIndex: u16le_at(row, 2),
+            currentByteIndexForSensorData: u16le_at(row, 4),
+            usedBufferLength: u16le_at(row, 6),
+            fifoTicks: u16le_at(row, 8),
+            dataTimestampRwcMinutes: u32le_at(row, 10),
+            dataTimestampRwcTicks: u24le(row, 14),
+            temperatureData: u16le_at(row, 17),
+            dataTimestampUcClockMinutes: bytesPerBuffer >= 23 ? u32le_at(row, 19) : null,
+            dataTimestampUcClockTicks: bytesPerBuffer >= 26 ? u24le(row, 23) : null,
+        });
+    }
+    return out;
+}
+/**
+ * Parse lookup-table debug payload entries (3 bytes per bank), with optional
+ * 4-byte tail/head prefix present in older firmware debug responses.
+ */
+function parseLookupTablePayload(payload, totalBanks) {
+    const bytesPerBank = 3;
+    const expectedNoHeadTail = totalBanks * bytesPerBank;
+    const expectedWithHeadTail = expectedNoHeadTail + 4;
+    let data = payload;
+    let head = null;
+    let tail = null;
+    if (payload.length === expectedWithHeadTail) {
+        tail = u16le_at(payload, 0);
+        head = u16le_at(payload, 2);
+        data = payload.slice(4);
+    }
+    else if (payload.length !== expectedNoHeadTail) {
+        throw new Error(`parseLookupTablePayload: payload length ${payload.length} does not match expected ${expectedNoHeadTail} or ${expectedWithHeadTail}`);
+    }
+    const entries = [];
+    for (let bankIndex = 0; bankIndex < totalBanks; bankIndex++) {
+        const off = bankIndex * bytesPerBank;
+        const statusByte = data[off];
+        const pendingEepromWrite = (statusByte & 0x80) !== 0;
+        const statusCode = statusByte & 0x7f;
+        entries.push({
+            bankIndex,
+            statusCode,
+            statusName: LOOKUP_STATUS_NAMES[statusCode] ?? 'Unknown',
+            pendingEepromWrite,
+            payloadIndex: u16le_at(data, off + 1),
+        });
+    }
+    return { head, tail, entries };
 }
 /**
  * Parse the production config response payload into a structured object.
@@ -1410,6 +1930,154 @@ function parseProductionConfigPayload(response) {
         asmid: asmid.toUpperCase(),
         configHeader,
     };
+}
+
+/** Build a protocol header byte from command/property nibbles. */
+function buildHeader(command, property) {
+    return ((command & 0xf0) | (property & 0x0f)) & 0xff;
+}
+/** Decode a protocol header byte into command/property fields. */
+function parseHeader(header) {
+    return {
+        command: (header & 0xf0),
+        property: (header & 0x0f),
+    };
+}
+/** Build a complete protocol message (header + 16-bit LE payload length + payload bytes). */
+function buildMessage(command, property, payloadBytes = []) {
+    const payload = payloadBytes instanceof Uint8Array ? payloadBytes : new Uint8Array(payloadBytes);
+    const out = new Uint8Array(3 + payload.length);
+    out[0] = buildHeader(command, property);
+    out[1] = payload.length & 0xff;
+    out[2] = (payload.length >> 8) & 0xff;
+    out.set(payload, 3);
+    return out;
+}
+/** Parse a complete protocol message into structured fields. */
+function parseMessage(msg) {
+    if (msg.length < 3)
+        throw new Error('Invalid Verisense message: header is incomplete');
+    const header = msg[0];
+    const payloadLength = u16le(msg[1], msg[2]);
+    if (msg.length !== payloadLength + 3) {
+        throw new Error(`Invalid Verisense message: length=${payloadLength}, actualPayload=${Math.max(0, msg.length - 3)}`);
+    }
+    const { command, property } = parseHeader(header);
+    return {
+        header,
+        command,
+        property,
+        payloadLength,
+        payload: msg.slice(3),
+    };
+}
+function isAckCommand(command) {
+    return command === ASM_COMMAND.ACK || command === ASM_COMMAND.ACK_NEXT_STAGE;
+}
+function isNackCommand(command) {
+    return (command === ASM_COMMAND.NACK_BAD_HEADER_COMMAND ||
+        command === ASM_COMMAND.NACK_BAD_HEADER_PROPERTY ||
+        command === ASM_COMMAND.NACK_GENERIC);
+}
+/** Convert a pending-events payload (property IDs) into a typed array. */
+function parsePendingEvents(payload) {
+    const out = [];
+    for (let i = 0; i < payload.length; i++)
+        out.push((payload[i] & 0x0f));
+    return out;
+}
+
+function pad2(n) {
+    return Math.trunc(n).toString().padStart(2, '0');
+}
+function pad5(n) {
+    return Math.trunc(n).toString().padStart(5, '0');
+}
+function dateToYyMMddHHmmss(date) {
+    const yy = pad2(date.getUTCFullYear() % 100);
+    const mm = pad2(date.getUTCMonth() + 1);
+    const dd = pad2(date.getUTCDate());
+    const hh = pad2(date.getUTCHours());
+    const min = pad2(date.getUTCMinutes());
+    const ss = pad2(date.getUTCSeconds());
+    return `${yy}${mm}${dd}_${hh}${min}${ss}`;
+}
+/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
+function buildUploadBinaryFileName(uploadDate, firstPayloadIndex) {
+    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
+        throw new Error('buildUploadBinaryFileName: firstPayloadIndex must be in range 0..65535');
+    }
+    return `${dateToYyMMddHHmmss(uploadDate)}_${pad5(firstPayloadIndex)}.bin`;
+}
+/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
+function buildParsedCsvFileName(startDate, dataSource, firstPayloadIndex) {
+    if (!dataSource || !String(dataSource).trim()) {
+        throw new Error('buildParsedCsvFileName: dataSource must be a non-empty string');
+    }
+    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
+        throw new Error('buildParsedCsvFileName: firstPayloadIndex must be in range 0..65535');
+    }
+    return `${dateToYyMMddHHmmss(startDate)}_${String(dataSource).trim()}_${pad5(firstPayloadIndex)}.csv`;
+}
+/** Add duplicate suffix like " (2)" before extension. */
+function applyDuplicateSuffix(fileName, duplicateIndex) {
+    if (duplicateIndex < 2) {
+        throw new Error('applyDuplicateSuffix: duplicateIndex must be >= 2');
+    }
+    const idx = fileName.lastIndexOf('.');
+    if (idx <= 0)
+        return `${fileName} (${duplicateIndex})`;
+    const stem = fileName.slice(0, idx);
+    const ext = fileName.slice(idx);
+    return `${stem} (${duplicateIndex})${ext}`;
+}
+/** Return first non-colliding duplicate name for a target file name. */
+function nextAvailableDuplicateFileName(fileName, existingNames) {
+    const existing = new Set(existingNames);
+    if (!existing.has(fileName))
+        return fileName;
+    let i = 2;
+    while (true) {
+        const candidate = applyDuplicateSuffix(fileName, i);
+        if (!existing.has(candidate))
+            return candidate;
+        i++;
+    }
+}
+/** Parse first payload index (uint16 LE) from a payload byte array. */
+function getFirstPayloadIndex(payload) {
+    if (payload.length < 2) {
+        throw new Error('getFirstPayloadIndex: payload must contain at least 2 bytes');
+    }
+    return u16le_at(payload, 0);
+}
+/**
+ * Evaluate whether parsed CSV output should roll to a new file.
+ * Rules mirror ASM-DES08 split conditions.
+ */
+function evaluateParsedFileSplit(input) {
+    const reasons = [];
+    const prev = input.prevTimestampSec;
+    const curr = input.currTimestampSec;
+    // Split when crossing 12:00am or 12:00pm boundaries.
+    const prevHalfDay = Math.floor(prev / (12 * 60 * 60));
+    const currHalfDay = Math.floor(curr / (12 * 60 * 60));
+    if (currHalfDay !== prevHalfDay)
+        reasons.push('midday-midnight-boundary');
+    if ((input.prevConfigSignature ?? null) !== (input.currConfigSignature ?? null)) {
+        reasons.push('config-change');
+    }
+    if (input.expectedDeltaSec != null) {
+        const tol = Math.max(0, input.timestampToleranceSec ?? 0);
+        const delta = curr - prev;
+        if (Math.abs(delta - input.expectedDeltaSec) > tol) {
+            reasons.push('timestamp-discontinuity');
+        }
+    }
+    if (input.powerResetDetected) {
+        reasons.push('power-reset');
+    }
+    return { shouldSplit: reasons.length > 0, reasons };
 }
 
 /**
@@ -1499,15 +2167,16 @@ SensorBase.CLOCK_FREQ = 32768;
 SensorBase.TICKS_MAX_VALUE = 60 * 32768;
 
 /**
- * Decoder for the GSR (galvanic skin response) sensor (Verisense sensor id = 1).
+ * Decoder for grouped ADC channels (Verisense sensor id = 1).
  *
+ * Includes GSR plus battery/ADC channels carried in the same packet source.
  * Implements C# `SensorGSR.cs` including:
  * - Per-hardware reference resistor selection (SR68 vs Shimmer3 resistors).
  * - Auto-range decoding from the raw ADC value's upper bits.
  * - Range-3 clamping threshold that differs by hardware.
- * - Conductance (µS) output with connectivity detection.
+ * - Conductance (uS) output with connectivity detection.
  */
-class SensorGSR extends SensorBase {
+class SensorADC extends SensorBase {
     constructor() {
         super();
         this.LIMIT_MIN_VALID_USIEMENS = 0.03;
@@ -1517,7 +2186,7 @@ class SensorGSR extends SensorBase {
         this.SR68_REF_KOHMS = [21.0, 150.0, 562.0, 1740.0];
         this.gsrEnabled = true;
         this.battEnabled = false;
-        /** GSR range 0–3 (fixed) or 4 (auto-range). */
+        /** GSR range 0-3 (fixed) or 4 (auto-range). */
         this.gsrRangeSetting = 4;
         this.hardwareIdentifier = 'VERISENSE_PULSE_PLUS';
         // Decoded from opConfig for debug/display
@@ -1532,18 +2201,6 @@ class SensorGSR extends SensorBase {
     setGsrRangeSetting(v) {
         this.gsrRangeSetting = v;
     }
-    // Convenience aliases
-    setGSREnabled(enabled, opConfigBytes) {
-        return this.setEnabled(enabled, opConfigBytes);
-    }
-    setBattEnabled(enabled, opConfigBytes) {
-        return this.setEnabled({ batt: enabled }, opConfigBytes);
-    }
-    /**
-     * Dual-mode setter:
-     * - If `opConfigBytes` is provided: returns a new Uint8Array with the enable bits patched.
-     * - Otherwise: updates local decoder flags only.
-     */
     setEnabled(arg1, opConfigBytes) {
         if (opConfigBytes != null) {
             const desired = typeof arg1 === 'boolean' ? { gsr: arg1 } : arg1 && typeof arg1 === 'object' ? arg1 : {};
@@ -1569,7 +2226,6 @@ class SensorGSR extends SensorBase {
         }
         return out;
     }
-    // --- Operational config patch helpers ---
     patchGsrRange(rangeCfg, op) {
         const out = new Uint8Array(op);
         const i = OP_IDX.ADC_CHANNEL_SETTINGS_1;
@@ -1588,7 +2244,6 @@ class SensorGSR extends SensorBase {
         out[i] = (out[i] & 0b00001111) | ((overCfg & 0x0f) << 4);
         return out;
     }
-    // --- Calibration ---
     calibrateAdcToVolts(uncal12bit) {
         const adcRange = 2 ** 12 - 1;
         let refVoltage = 1.8 / 4.0;
@@ -1650,9 +2305,28 @@ class SensorGSR extends SensorBase {
                 gsr = { raw: gsrraw, adc12, range: currentRange, volts, kOhms, uS, connectivity };
             }
             if (this.battEnabled) {
-                const braw = i16le(sensorPayloadBytes, base) & 0x0fff;
-                const mv = this.calibrateAdcToVolts(braw) * 1000.0;
-                batt = { raw: braw, mV: mv };
+                const raw16 = i16le(sensorPayloadBytes, base) & 0xffff;
+                const adc12 = raw16 & 0x0fff;
+                const usbPluggedIn = ((raw16 >> 15) & 0x01) === 1;
+                const chargerStatusBits = (raw16 >> 13) & 0x03;
+                let mv = this.calibrateAdcToVolts(adc12) * 1000.0;
+                if (this.hardwareIdentifier === 'VERISENSE_GSR_PLUS') {
+                    mv *= 1.988;
+                }
+                const chargerStatusMap = {
+                    0: 'Power-Down/Suspended',
+                    1: 'Charging',
+                    2: 'Charging Complete',
+                    3: 'Bad Battery/LDO',
+                };
+                batt = {
+                    raw16,
+                    adc12,
+                    mV: mv,
+                    usbPluggedIn,
+                    chargerStatusBits,
+                    chargerStatus: chargerStatusMap[chargerStatusBits] ?? 'Unknown',
+                };
             }
             out.push({ gsr, batt });
         }
@@ -2028,6 +2702,39 @@ class SensorPPG extends SensorBase {
     }
 }
 
+function defaultAcceptedCommands(command) {
+    if (command === ASM_COMMAND.READ)
+        return new Set([ASM_COMMAND.RESPONSE]);
+    if (command === ASM_COMMAND.WRITE) {
+        return new Set([
+            ASM_COMMAND.ACK,
+            ASM_COMMAND.ACK_NEXT_STAGE,
+            ASM_COMMAND.RESPONSE,
+        ]);
+    }
+    return new Set([ASM_COMMAND.ACK, ASM_COMMAND.ACK_NEXT_STAGE, ASM_COMMAND.RESPONSE]);
+}
+function toCommandResponse(msg) {
+    return {
+        header: msg.header,
+        command: msg.command,
+        property: msg.property,
+        payload: msg.payload,
+    };
+}
+function validatePendingResponse(pending, msg) {
+    if (isNackCommand(msg.command)) {
+        return new Error(`Device returned NACK command=0x${msg.command.toString(16)} property=0x${msg.property.toString(16)}`);
+    }
+    if (msg.property !== pending.expectedProperty) {
+        return new Error(`Unexpected response property 0x${msg.property.toString(16)} (expected 0x${pending.expectedProperty.toString(16)})`);
+    }
+    if (!pending.acceptedCommands.has(msg.command)) {
+        return new Error(`Unexpected response command 0x${msg.command.toString(16)} for property 0x${msg.property.toString(16)}`);
+    }
+    return null;
+}
+
 // ---------------------------------------------------------------------------
 // VerisenseBleDevice
 // ---------------------------------------------------------------------------
@@ -2038,7 +2745,7 @@ class SensorPPG extends SensorBase {
  * (on/off/emit) for the richer event model the Verisense protocol needs.
  *
  * Supports:
- * - BLE streaming (accel, GSR, gyro, PPG)
+ * - BLE streaming (accel, ADC/GSR, gyro, PPG)
  * - Web Serial (USB COM port) as an alternative transport
  * - Logged-data download (`transferLoggedData`)
  * - Operational config read/write
@@ -2088,9 +2795,6 @@ class VerisenseBleDevice extends BaseShimmerClient {
         // Protocol state
         this._mode = 'idle';
         this._rxStreamBuf = new Uint8Array(0);
-        this._buf = new Uint8Array(0);
-        this._newPayload = true;
-        this._expectedLen = 0;
         this._pending = null;
         this._loggedChain = Promise.resolve();
         this._sync = null;
@@ -2105,7 +2809,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this.stripStreamCrc = opts.stripStreamCrc ?? true;
         this.verifyStreamCrc = opts.verifyStreamCrc ?? false;
         this.sensors = {
-            1: new SensorGSR(),
+            1: new SensorADC(),
             2: new SensorLIS2DW12(),
             3: new SensorLSM6DS3(),
             4: new SensorPPG(),
@@ -2116,8 +2820,8 @@ class VerisenseBleDevice extends BaseShimmerClient {
         if (this.debug)
             console.log('[Verisense]', ...args);
     }
-    // Quick access aliases
-    get gsr() {
+    // Quick accessors
+    get adc() {
         return this.sensors[1];
     }
     get accel1() {
@@ -2368,7 +3072,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
             }
         }
         else {
-            void this.writeBytes(DISCONNECT_REQ, { withResponse: false });
+            void this.writeBytes(buildMessage(ASM_COMMAND.WRITE, ASM_PROPERTY.DEVICE_DISCONNECT), {
+                withResponse: false,
+            });
             try {
                 if (this.rx)
                     await this.rx.stopNotifications?.();
@@ -2405,13 +3111,12 @@ class VerisenseBleDevice extends BaseShimmerClient {
     // Streaming
     // ---------------------------------------------------------------------------
     async startStreaming() {
+        await this.setStreamingMode(true);
         this._mode = 'streaming';
-        this._resetAssembler();
-        await this.writeBytes(this._makeReq(0x2a, [0x01]));
         this.emit('streaming', { on: true });
     }
     async stopStreaming() {
-        await this.writeBytes(this._makeReq(0x2a, [0x02]));
+        await this.setStreamingMode(false);
         this._mode = 'idle';
         this.emit('streaming', { on: false });
     }
@@ -2472,11 +3177,13 @@ class VerisenseBleDevice extends BaseShimmerClient {
                     return;
                 try {
                     if (this._sync.lastReply === 'NONE') {
-                        await this.writeBytes(READ_DATA_REQ, { withResponse: true });
+                        await this.writeBytes(buildMessage(ASM_COMMAND.READ, ASM_PROPERTY.DATA), {
+                            withResponse: true,
+                        });
                     }
                     else {
                         this._clearSyncRxBuffers('timeout-nack');
-                        await this.writeBytes(DATA_NACK);
+                        await this.writeBytes(buildMessage(ASM_COMMAND.NACK_GENERIC, ASM_PROPERTY.DATA));
                         this._sync.nackCount++;
                         this._sync.lastReply = 'NACK';
                         if (this._sync.nackCount >= this._sync.maxNack)
@@ -2493,7 +3200,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
             }
         }, Math.max(250, Math.floor(timeoutMs / 2)));
         try {
-            await this.writeBytes(READ_DATA_REQ, { withResponse: true });
+            await this.writeBytes(buildMessage(ASM_COMMAND.READ, ASM_PROPERTY.DATA), {
+                withResponse: true,
+            });
             const result = await donePromise;
             await (this._loggedChain ?? Promise.resolve());
             if (!fileHandle) {
@@ -2534,31 +3243,25 @@ class VerisenseBleDevice extends BaseShimmerClient {
             await this.tx.writeValue(toArrayBuffer(u8));
         }
     }
-    _makeReq(opcode, payloadBytes = []) {
-        const p = payloadBytes instanceof Uint8Array ? payloadBytes : new Uint8Array(payloadBytes);
-        const out = new Uint8Array(3 + p.length);
-        out[0] = opcode & 0xff;
-        out[1] = p.length & 0xff;
-        out[2] = (p.length >> 8) & 0xff;
-        out.set(p, 3);
-        return out;
-    }
-    async request(opcode, payloadBytes = [], timeoutMs = 3000) {
+    async _requestByCommand(command, property, payloadBytes = [], timeoutMs = 3000, acceptedCommands) {
         if (this._pending)
             throw new Error('A request is already pending');
         this._mode = 'command';
         this._resetAssembler();
-        const req = this._makeReq(opcode, payloadBytes);
-        const p = new Promise((resolve, reject) => {
+        const req = buildMessage(command, property, payloadBytes);
+        const accepted = acceptedCommands ?? defaultAcceptedCommands(command);
+        const pendingPromise = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
                 this._pending = null;
                 reject(new Error('Request timeout'));
             }, timeoutMs);
             this._pending = {
-                resolve: (x) => {
+                expectedProperty: property,
+                acceptedCommands: accepted,
+                resolve: (resp) => {
                     clearTimeout(t);
                     this._pending = null;
-                    resolve(x);
+                    resolve(resp);
                 },
                 reject: (e) => {
                     clearTimeout(t);
@@ -2568,29 +3271,207 @@ class VerisenseBleDevice extends BaseShimmerClient {
             };
         });
         await this.writeBytes(req);
-        return p;
+        return pendingPromise;
     }
-    // Convenience command methods
+    async readProperty(property, timeoutMs = 3000) {
+        return this._requestByCommand(ASM_COMMAND.READ, property, [], timeoutMs);
+    }
+    async writeProperty(property, payloadBytes = [], timeoutMs = 3000) {
+        return this._requestByCommand(ASM_COMMAND.WRITE, property, payloadBytes, timeoutMs);
+    }
+    async request(opcode, payloadBytes = [], timeoutMs = 3000) {
+        const { command, property } = parseHeader(opcode & 0xff);
+        const rsp = await this._requestByCommand(command, property, payloadBytes, timeoutMs);
+        return { payload: rsp.payload };
+    }
+    // Convenience command methods (all protocol properties)
     readStatus() {
-        return this.request(0x11);
+        return this.request(ASM_COMMAND.READ | ASM_PROPERTY.STATUS1);
+    }
+    async readStatusParsed() {
+        const { payload } = await this.readStatus();
+        return parseStatusPayload(payload, 'status1');
     }
     readStatus2() {
-        return this.request(0x1c);
+        return this.request(ASM_COMMAND.READ | ASM_PROPERTY.STATUS2);
+    }
+    async readStatus2Parsed() {
+        const { payload } = await this.readStatus2();
+        return parseStatusPayload(payload, 'status2');
+    }
+    readData() {
+        return this.request(ASM_COMMAND.READ | ASM_PROPERTY.DATA);
     }
     readProductionConfig() {
-        return this.request(0x13);
+        return this.request(ASM_COMMAND.READ | ASM_PROPERTY.PRODUCTION_CONFIGURATION);
     }
     readOperationalConfig() {
-        return this.request(0x14);
+        return this.request(ASM_COMMAND.READ | ASM_PROPERTY.OPERATIONAL_CONFIGURATION);
     }
     readTime() {
-        return this.request(0x15);
+        return this.request(ASM_COMMAND.READ | ASM_PROPERTY.TIME);
+    }
+    async readTimeUnixSeconds() {
+        const { payload } = await this.readTime();
+        return asmRtcBytesToUnixSeconds(payload);
     }
     readPendingEvents() {
-        return this.request(0x17);
+        return this.request(ASM_COMMAND.READ | ASM_PROPERTY.PENDING_EVENTS);
     }
-    disconnectRequest() {
-        return this.request(0x2b);
+    async readPendingEventsParsed() {
+        const { payload } = await this.readPendingEvents();
+        return parsePendingEvents(payload);
+    }
+    async writeProductionConfig(bytes) {
+        const payload = normalizeBytePayload(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+        if (!payload || payload.length < 11 || payload.length > 56) {
+            throw new Error('writeProductionConfig: payload length must be between 11 and 56 bytes');
+        }
+        await this.writeProperty(ASM_PROPERTY.PRODUCTION_CONFIGURATION, payload);
+    }
+    async writeOperationalConfig(bytes) {
+        const payload = normalizeBytePayload(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+        if (!payload || payload.length < 50) {
+            throw new Error('writeOperationalConfig: payload length must be at least 50 bytes');
+        }
+        await this.writeProperty(ASM_PROPERTY.OPERATIONAL_CONFIGURATION, payload);
+    }
+    async writeTime(rtc7) {
+        const payload = normalizeBytePayload(rtc7 instanceof Uint8Array ? rtc7 : new Uint8Array(rtc7));
+        if (!payload || payload.length !== 7) {
+            throw new Error('writeTime: payload must be exactly 7 bytes');
+        }
+        await this.writeProperty(ASM_PROPERTY.TIME, payload);
+    }
+    async writeTimeUnixSeconds(unixSeconds) {
+        await this.writeTime(unixSecondsToAsmRtcBytes(unixSeconds));
+    }
+    async enterDfuMode() {
+        await this.writeProperty(ASM_PROPERTY.DFU_MODE, []);
+    }
+    async runTestMode(testPayload) {
+        const payload = normalizeBytePayload(testPayload instanceof Uint8Array ? testPayload : new Uint8Array(testPayload));
+        if (!payload || payload.length < 2) {
+            throw new Error('runTestMode: payload must contain at least [testId, hwMajor]');
+        }
+        await this.writeProperty(ASM_PROPERTY.TEST_MODE, payload);
+    }
+    async runHardwareTest(testId, hwMajor, hwMinor = 0, hwInternal = 0) {
+        const payload = new Uint8Array([
+            testId & 0xff,
+            hwMajor & 0xff,
+            hwMinor & 0xff,
+            hwInternal & 0xff,
+            (hwInternal >> 8) & 0xff,
+        ]);
+        await this.runTestMode(payload);
+    }
+    _buildDebugPayload(debugId, args = []) {
+        const argBytes = args instanceof Uint8Array ? args : new Uint8Array(args);
+        const payload = new Uint8Array(1 + argBytes.length);
+        payload[0] = debugId & 0xff;
+        payload.set(argBytes, 1);
+        return payload;
+    }
+    async readDebugCommand(debugId, args = []) {
+        const rsp = await this._requestByCommand(ASM_COMMAND.READ, ASM_PROPERTY.DEBUG_COMMAND, this._buildDebugPayload(debugId, args));
+        return { payload: rsp.payload };
+    }
+    async sendDebugCommand(debugId, args = []) {
+        const rsp = await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildDebugPayload(debugId, args));
+        return { payload: rsp.payload };
+    }
+    async readFlashLookupTable(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.FLASH_LOOKUP_TABLE_READ, [index & 0xff]);
+    }
+    async readRealWorldClockScheduler(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.RWC_SCHEDULER_READ, [index & 0xff]);
+    }
+    async readRealWorldClockSchedulerParsed(index = 0) {
+        const { payload } = await this.readRealWorldClockScheduler(index);
+        return parseSchedulerDebugPayload(payload);
+    }
+    async loadTestLookupTable(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.LOAD_TEST_LOOKUP_TABLE, [index & 0xff]);
+    }
+    async checkPayloadCrcErrors(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.CHECK_PAYLOAD_CRC_ERRORS, [index & 0xff]);
+    }
+    async checkPayloadCrcErrorsParsed(index = 0) {
+        const { payload } = await this.checkPayloadCrcErrors(index);
+        return parsePayloadCrcErrorBankIndexes(payload);
+    }
+    async readEventLog(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_EVENT_LOG, [index & 0xff]);
+    }
+    async readEventLogParsed(index = 0) {
+        const { payload } = await this.readEventLog(index);
+        return parseEventLogPayload(payload);
+    }
+    async readRecordBufferDetails(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_RECORD_BUFFER_DETAILS, [index & 0xff]);
+    }
+    async readRecordBufferDetailsParsed(index = 0) {
+        const { payload } = await this.readRecordBufferDetails(index);
+        return parseRecordBufferDetailsPayload(payload);
+    }
+    async eraseOperationalConfig() {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.ERASE_OPERATIONAL_CONFIG);
+    }
+    async eraseProductionConfig() {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.ERASE_PRODUCTION_CONFIG);
+    }
+    async clearPendingEvents() {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.CLEAR_PENDING_EVENTS);
+    }
+    async eraseAllLoggedData() {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.ERASE_FLASH_AND_LOOKUP_TABLE);
+    }
+    async testDataTransferLoop(loopCount) {
+        const clamped = Math.max(0, Math.min(0xffff, Math.trunc(loopCount)));
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.TEST_DATA_TRANSFER_LOOP, [
+            clamped & 0xff,
+            (clamped >> 8) & 0xff,
+        ]);
+    }
+    async ledTest(ledIndex) {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.LED_TEST, [ledIndex & 0xff]);
+    }
+    async max86xxxLedTest(start) {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.MAX86XXX_LED_TEST, [start ? 0x01 : 0x00]);
+    }
+    async startPowerProfilerTest() {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.POWER_PROFILER_TEST);
+    }
+    async requestSystemReset() {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.SYSTEM_RESET);
+    }
+    async startIcPowerConsumptionTest(loopCount, stageIntervalMs) {
+        const clampedLoopCount = Math.max(0, Math.min(0xffff, Math.trunc(loopCount)));
+        const clampedStageInterval = Math.max(0, Math.min(0xffff, Math.trunc(stageIntervalMs)));
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.IC_POWER_CONSUMPTION_TEST, [
+            clampedLoopCount & 0xff,
+            (clampedLoopCount >> 8) & 0xff,
+            clampedStageInterval & 0xff,
+            (clampedStageInterval >> 8) & 0xff,
+        ]);
+    }
+    async deleteAllBonds() {
+        await this.sendDebugCommand(DEBUG_COMMAND_ID.DELETE_ALL_BONDS);
+    }
+    async setStreamingMode(enabled) {
+        await this.writeProperty(ASM_PROPERTY.STREAM_MODE, [enabled ? STREAM_MODE.ENABLE : STREAM_MODE.DISABLE], 3000);
+    }
+    async disconnectRequest() {
+        try {
+            return await this.request(ASM_COMMAND.WRITE | ASM_PROPERTY.DEVICE_DISCONNECT, [], 1500);
+        }
+        catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (/timeout/i.test(msg))
+                return { payload: new Uint8Array(0) };
+            throw e;
+        }
     }
     // ---------------------------------------------------------------------------
     // Operational config helpers
@@ -2619,7 +3500,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
         try {
             this.accel1.applyOperationalConfig(op);
             this.gyroAccel2.applyOperationalConfig(op);
-            this.gsr.applyOperationalConfig(op);
+            this.adc.applyOperationalConfig(op);
             this.ppg.applyOperationalConfig(op);
         }
         catch (e) {
@@ -2634,15 +3515,8 @@ class VerisenseBleDevice extends BaseShimmerClient {
             throw new Error('writeOpConfig: invalid opconfig');
         if (op[0] !== 0x5a)
             throw new Error('writeOpConfig: opconfig must start with 0x5A');
-        const req = this._makeReq(0x24, op);
-        await this.writeBytes(req, { withResponse: true });
+        await this.writeOperationalConfig(op);
         await this.readOpConfigFromDevice();
-    }
-    async getopconfig() {
-        return this.getOpConfig();
-    }
-    async writeopconfig(op) {
-        return this.writeOpConfig(op);
     }
     getSensor(name) {
         const k = String(name ?? '').toLowerCase();
@@ -2652,14 +3526,13 @@ class VerisenseBleDevice extends BaseShimmerClient {
             return this.accel1;
         if (k.includes('lsm6') || k.includes('gyro') || k.includes('accel2') || k === '3')
             return this.gyroAccel2;
+        if (k.includes('vbatt') || k.includes('batt') || k.includes('battery') || k.includes('adc'))
+            return this.adc;
         if (k.includes('gsr') || k === '1')
-            return this.gsr;
+            return this.adc;
         if (k.includes('ppg') || k === '4')
             return this.ppg;
         return null;
-    }
-    GetSensor(name) {
-        return this.getSensor(name);
     }
     // ---------------------------------------------------------------------------
     // RX assembly and dispatch
@@ -2700,7 +3573,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
             s.lastReply = 'NACK';
             s.nackCrcCount++;
             this._clearSyncRxBuffers('crc-nack');
-            await this.writeBytes(DATA_NACK);
+            await this.writeBytes(buildMessage(ASM_COMMAND.NACK_GENERIC, ASM_PROPERTY.DATA));
             if (s.nackCrcCount >= s.maxCrcNack)
                 this._abortSync(new Error('Too many CRC failures'));
             s.onProgress?.({ payloadIndex, bytesWritten: s.bytesWritten, crcOk: false });
@@ -2710,19 +3583,19 @@ class VerisenseBleDevice extends BaseShimmerClient {
             await s.writable.write(toArrayBuffer(payloadU8));
         }
         else {
-            s.chunks.push(payloadU8.slice());
+            s.chunks.push(new Uint8Array(payloadU8));
         }
         s.bytesWritten += payloadU8.length;
         s.lastReply = 'ACK';
         s.nackCount = 0;
         s.nackCrcCount = 0;
-        await this.writeBytes(DATA_ACK, { withResponse: true });
+        await this.writeBytes(buildMessage(ASM_COMMAND.ACK_NEXT_STAGE, ASM_PROPERTY.DATA), {
+            withResponse: true,
+        });
         s.onProgress?.({ payloadIndex, bytesWritten: s.bytesWritten, crcOk: true });
     }
     _resetAssembler() {
-        this._newPayload = true;
-        this._expectedLen = 0;
-        this._buf = new Uint8Array(0);
+        this._rxStreamBuf = new Uint8Array(0);
     }
     _appendStreamBuf(chunk) {
         const merged = new Uint8Array(this._rxStreamBuf.length + chunk.length);
@@ -2736,6 +3609,25 @@ class VerisenseBleDevice extends BaseShimmerClient {
         if (this.debugSync)
             console.warn('[sync] cleared RX buffers', { reason });
     }
+    _resolvePendingCommand(msg) {
+        const pending = this._pending;
+        this._pending = null;
+        if (this._mode === 'command')
+            this._mode = 'idle';
+        if (pending) {
+            const err = validatePendingResponse(pending, msg);
+            if (err)
+                pending.reject(err);
+            else
+                pending.resolve(toCommandResponse(msg));
+        }
+        this.emit('commandPayload', {
+            header: msg.header,
+            command: msg.command,
+            property: msg.property,
+            payload: msg.payload,
+        });
+    }
     _feedStreamBytes(chunk) {
         if (this._mode === 'logged' && this._sync)
             this._sync.lastRxAt = Date.now();
@@ -2746,11 +3638,24 @@ class VerisenseBleDevice extends BaseShimmerClient {
             const hdr = this._rxStreamBuf[0];
             const len = (this._rxStreamBuf[1] | (this._rxStreamBuf[2] << 8)) >>> 0;
             if (len === 0) {
+                const header = hdr & 0xff;
+                const decodedHeader = parseHeader(header);
+                const msg = {
+                    header,
+                    command: decodedHeader.command,
+                    property: decodedHeader.property,
+                    payloadLength: 0,
+                    payload: new Uint8Array(0),
+                };
                 this._rxStreamBuf = this._rxStreamBuf.slice(3);
-                if (this._mode === 'logged' && hdr === DATA_EOS_HDR) {
+                if (this._mode === 'logged' && hdr === buildHeader(ASM_COMMAND.ACK, ASM_PROPERTY.DATA)) {
                     if (this.debugSync)
                         console.log('[sync] EOS received. Finishing.');
                     this._finishSync();
+                    continue;
+                }
+                if (this._mode === 'command') {
+                    this._resolvePendingCommand(msg);
                 }
                 continue;
             }
@@ -2758,23 +3663,26 @@ class VerisenseBleDevice extends BaseShimmerClient {
                 return;
             const payload = this._rxStreamBuf.slice(3, 3 + len);
             this._rxStreamBuf = this._rxStreamBuf.slice(3 + len);
+            const header = hdr & 0xff;
+            const decodedHeader = parseHeader(header);
+            const msg = {
+                header,
+                command: decodedHeader.command,
+                property: decodedHeader.property,
+                payloadLength: payload.length,
+                payload,
+            };
             if (this._mode === 'logged') {
                 this._loggedChain = (this._loggedChain ?? Promise.resolve())
-                    .then(() => this._handleLoggedPayload(payload))
+                    .then(() => this._handleLoggedPayload(msg.payload))
                     .catch((e) => this._abortSync(e));
                 continue;
             }
             if (this._mode === 'streaming') {
-                this._handleStreamingPayload(payload);
+                this._handleStreamingPayload(msg.payload);
                 continue;
             }
-            const pending = this._pending;
-            this._pending = null;
-            if (this._mode === 'command')
-                this._mode = 'idle';
-            if (pending)
-                pending.resolve({ payload });
-            this.emit('commandPayload', { payload });
+            this._resolvePendingCommand(msg);
         }
     }
     _handleStreamingPayload(payload) {
@@ -2836,5 +3744,5 @@ VerisenseBleDevice.NUS_SERVICE = NUS_SERVICE;
 VerisenseBleDevice.NUS_TX = NUS_TX;
 VerisenseBleDevice.NUS_RX = NUS_RX;
 
-export { BaseShimmerClient, CHANNEL_FORMATS, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, SensorBase, SensorBitmapShimmer3, SensorGSR, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TIMESTAMP_FIELD, VerisenseBleDevice, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, crc16_ccitt_false, getOversamplingRatioADS1292R, normalizeOperationalConfig, nudgeGsrResistance, parseProductionConfigPayload };
+export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map
