@@ -18,6 +18,7 @@ video-ppg/           │
 spell-gyro/          │
 ShimmerCapture/      ┘
 Verisense/           ←  Verisense demo
+VerisenseCapture/    ←  Verisense full control console demo
 shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpacked in Chrome)
 sdk-source.json      ←  Single source-of-truth for SDK source mode/version
 update-local-sdk.ps1 ←  Build + sync local SDK artifacts
@@ -49,6 +50,7 @@ update-local-sdk.cmd ←  Windows CMD launcher for update script
 | Demo | Link |
 |---|---|
 | Wrist sensor (accel + GSR streaming) | [Verisense](https://shimmerresearch.github.io/webBLEDemos/Verisense/) |
+| Verisense control console (full SDK operations) | [VerisenseCapture](https://shimmerresearch.github.io/webBLEDemos/VerisenseCapture/) |
 
 ### Chrome Extension
 [Shimmer3R Chrome Extension](https://github.com/ShimmerResearch/webBLEDemos/tree/main/shimmer-extension) — source code only; load via **chrome://extensions → Developer mode → Load unpacked** when you are specifically developing or testing extension features.

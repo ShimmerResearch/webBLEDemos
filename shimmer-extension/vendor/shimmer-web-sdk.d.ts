@@ -862,6 +862,12 @@ interface VerisenseStatusPayload {
     memoryFreeKb: number;
     memoryCapacityKb: number | null;
     memoryUsedKb: number | null;
+    /** kB of FULL (ready-to-sync) flash banks. Only populated for payloads >= 57 bytes. */
+    memoryFullBanksKb: number | null;
+    /** kB of 2DEL (partially-deleted) flash banks. Only populated for payloads >= 57 bytes. */
+    memoryTwoDelBanksKb: number | null;
+    /** kB of BAD flash banks. Only populated for payloads >= 57 bytes. */
+    memoryBadBanksKb: number | null;
     statusFlags: VerisenseStatusFlags | null;
     batteryFallCounter: number | null;
 }
@@ -1292,6 +1298,8 @@ interface VerisenseCommandResponse {
  * - `"commandPayload"` — `{ payload: Uint8Array }`
  */
 declare class VerisenseBleDevice extends BaseShimmerClient {
+    private static readonly MAX_FRAME_PAYLOAD_LEN;
+    private static readonly MAX_DEBUG_FRAME_PAYLOAD_LEN;
     static readonly NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
@@ -1395,13 +1403,15 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     runTestMode(testPayload: Uint8Array | number[]): Promise<void>;
     runHardwareTest(testId: TestModeId, hwMajor: number, hwMinor?: number, hwInternal?: number): Promise<void>;
     private _buildDebugPayload;
-    readDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[]): Promise<{
+    private _debugIndexArgs;
+    private _waitForDebugResponse;
+    readDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[], timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
-    sendDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[]): Promise<{
+    sendDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[], timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
-    readFlashLookupTable(index?: number): Promise<{
+    readFlashLookupTable(index?: number, timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
     readRealWorldClockScheduler(index?: number): Promise<{
@@ -1426,7 +1436,7 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     eraseOperationalConfig(): Promise<void>;
     eraseProductionConfig(): Promise<void>;
     clearPendingEvents(): Promise<void>;
-    eraseAllLoggedData(): Promise<void>;
+    eraseAllLoggedData(timeoutMs?: number): Promise<void>;
     testDataTransferLoop(loopCount: number): Promise<void>;
     ledTest(ledIndex: number): Promise<void>;
     max86xxxLedTest(start: boolean): Promise<void>;
@@ -1449,6 +1459,8 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _resetAssembler;
     private _appendStreamBuf;
     private _clearSyncRxBuffers;
+    private _isPlausibleHeaderByte;
+    private _isPlausibleFrameStart;
     private _resolvePendingCommand;
     private _feedStreamBytes;
     private _handleStreamingPayload;
