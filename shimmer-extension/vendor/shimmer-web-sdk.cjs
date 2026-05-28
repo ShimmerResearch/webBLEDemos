@@ -1286,6 +1286,7 @@ const TEST_MODE_ID = Object.freeze({
     BIOZ_MAX30002: 0x0b,
     ACCEL2_GYRO_LSM6DSV: 0x0c,
     MAG_LIS2MDL: 0x0d,
+    TEST_REPORT: 0xfe,
     ALL_TESTS: 0xff,
 });
 /** Debug command IDs documented by Verisense firmware. */
@@ -1373,6 +1374,16 @@ const OP_IDX = Object.freeze({
     PPG_DAC3_CROSSTALK: 69,
     PPG_DAC4_CROSSTALK: 70,
     PROX_AGC_MODE: 71,
+});
+/**
+ * Factory test type selection byte sent as the last byte of a TEST_REPORT (0xFE) payload.
+ * Mirrors the firmware `factory_test_t` enum.
+ */
+const FACTORY_TEST = Object.freeze({
+    MAIN: 0,
+    LEDS: 1,
+    ICS: 2,
+    LED_STATES: 3,
 });
 
 /** Read a 16-bit unsigned integer, little-endian. */
@@ -2822,6 +2833,8 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._pending = null;
         this._loggedChain = Promise.resolve();
         this._sync = null;
+        this._testReportCapture = null;
+        this._testReportDecoder = new TextDecoder();
         // Cached configs
         this.operationalConfig = null;
         this.productionConfig = null;
@@ -2886,6 +2899,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._onGattDisconnected = () => {
             this._mode = 'idle';
             this._transportKind = null;
+            this._clearHardwareTestReportCapture(new Error('Disconnected'), null);
             this.emit('disconnected', { kind: 'ble' });
         };
         this.device.addEventListener('gattserverdisconnected', this._onGattDisconnected);
@@ -2986,6 +3000,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
                 this._serialReadLoopTask = null;
                 if (!signal.aborted) {
                     this._mode = 'idle';
+                    this._clearHardwareTestReportCapture(new Error('Disconnected'), null);
                     this.emit('disconnected', { kind: 'serial' });
                 }
             }
@@ -3087,6 +3102,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
                 /* ignore */
             }
         }
+        this._clearHardwareTestReportCapture(new Error(opts.reason ?? 'Disconnected'), null);
         if (this._transportKind === 'serial') {
             try {
                 await this._serialDisconnect(opts.reason ?? 'user');
@@ -3489,6 +3505,145 @@ class VerisenseBleDevice extends BaseShimmerClient {
         ]);
         await this.runTestMode(payload);
     }
+    _clearHardwareTestReportCapture(error, text) {
+        const cap = this._testReportCapture;
+        if (!cap)
+            return;
+        this._testReportCapture = null;
+        if (cap.timeout) {
+            clearTimeout(cap.timeout);
+            cap.timeout = null;
+        }
+        if (error) {
+            cap.reject?.(error);
+            return;
+        }
+        cap.resolve?.(text ?? '');
+    }
+    _captureHardwareTestReportChunk(chunk) {
+        const cap = this._testReportCapture;
+        if (!cap || !chunk?.length)
+            return;
+        const decoded = this._testReportDecoder.decode(chunk, { stream: true });
+        if (!decoded)
+            return;
+        cap.aggregateText += decoded;
+        if (!cap.started) {
+            const firstMarker = cap.aggregateText.indexOf(cap.marker);
+            if (firstMarker >= 0) {
+                cap.started = true;
+                if (firstMarker > 0) {
+                    cap.aggregateText = cap.aggregateText.slice(firstMarker);
+                    cap.emittedChars = 0;
+                }
+            }
+            else {
+                // Some firmware builds vary the star count around TEST START. Fall back
+                // to a fuzzy marker so we can still stream the report to the UI.
+                const hint = VerisenseBleDevice.TEST_REPORT_MARKER_HINT;
+                const hintIdx = cap.aggregateText.indexOf(hint);
+                if (hintIdx < 0) {
+                    const keep = Math.max(cap.marker.length * 2, 2048);
+                    if (cap.aggregateText.length > keep) {
+                        cap.aggregateText = cap.aggregateText.slice(-keep);
+                    }
+                    return;
+                }
+                const bannerStart = cap.aggregateText.lastIndexOf('//', hintIdx);
+                let lineStart = bannerStart >= 0 ? bannerStart : cap.aggregateText.lastIndexOf('\n', hintIdx);
+                lineStart = lineStart >= 0 ? lineStart + (bannerStart >= 0 ? 0 : 1) : 0;
+                cap.started = true;
+                if (lineStart > 0) {
+                    cap.aggregateText = cap.aggregateText.slice(lineStart);
+                    cap.emittedChars = 0;
+                }
+            }
+        }
+        const nextChunk = cap.aggregateText.slice(cap.emittedChars);
+        if (nextChunk) {
+            cap.onChunk?.(nextChunk, cap.aggregateText);
+            this.emit('hardwareTestReportChunk', {
+                chunkText: nextChunk,
+                aggregateText: cap.aggregateText,
+            });
+            cap.emittedChars = cap.aggregateText.length;
+        }
+        const endMarker = cap.aggregateText.indexOf(cap.marker, cap.marker.length);
+        let full = null;
+        if (endMarker >= 0) {
+            full = cap.aggregateText.slice(0, endMarker + cap.marker.length);
+        }
+        else {
+            const hint = VerisenseBleDevice.TEST_REPORT_MARKER_HINT;
+            const firstHint = cap.aggregateText.indexOf(hint);
+            if (firstHint >= 0) {
+                const secondHint = cap.aggregateText.indexOf(hint, firstHint + hint.length);
+                if (secondHint >= 0) {
+                    const endOfSecondLine = cap.aggregateText.indexOf('\n', secondHint);
+                    full = endOfSecondLine >= 0
+                        ? cap.aggregateText.slice(0, endOfSecondLine + 1)
+                        : cap.aggregateText;
+                }
+            }
+        }
+        if (full !== null) {
+            this.emit('hardwareTestReportComplete', { text: full });
+            this._clearHardwareTestReportCapture(null, full);
+            return;
+        }
+        if (cap.aggregateText.length > cap.maxChars) {
+            cap.aggregateText = cap.aggregateText.slice(-cap.maxChars);
+            cap.emittedChars = Math.min(cap.emittedChars, cap.aggregateText.length);
+        }
+    }
+    /**
+     * Runs TEST_REPORT (0xFE) and captures the rolling text report.
+     *
+     * The firmware ACKs the command first, then emits plain-text lines over the link.
+     * Capture starts on the first delimiter and completes on the second delimiter.
+     */
+    async runHardwareTestReport(hwMajor, hwMinor = 0, hwInternal = 0, opts = {}) {
+        const timeoutMs = Math.max(1000, Math.trunc(opts.timeoutMs ?? 120000));
+        const marker = typeof opts.marker === 'string' && opts.marker.length > 0
+            ? opts.marker
+            : VerisenseBleDevice.TEST_REPORT_DELIMITER;
+        const maxChars = Math.max(4096, Math.trunc(opts.maxChars ?? 2 * 1024 * 1024));
+        this._clearHardwareTestReportCapture(new Error('Hardware test report capture was replaced'), null);
+        this._testReportDecoder.decode();
+        const reportPromise = new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                this._clearHardwareTestReportCapture(new Error(`Hardware test report timeout after ${timeoutMs} ms`), null);
+            }, timeoutMs);
+            this._testReportCapture = {
+                marker,
+                maxChars,
+                started: false,
+                aggregateText: '',
+                emittedChars: 0,
+                resolve,
+                reject,
+                onChunk: opts.onChunk ?? null,
+                timeout,
+            };
+        });
+        try {
+            const factoryTestType = Math.max(0, Math.min(255, Math.trunc(opts.factoryTestType ?? 0)));
+            const payload = new Uint8Array([
+                VerisenseBleDevice.TEST_REPORT_MODE_ID & 0xff,
+                hwMajor & 0xff,
+                hwMinor & 0xff,
+                hwInternal & 0xff,
+                (hwInternal >> 8) & 0xff,
+                factoryTestType,
+            ]);
+            await this.runTestMode(payload);
+        }
+        catch (error) {
+            this._clearHardwareTestReportCapture(error, null);
+            throw error;
+        }
+        return reportPromise;
+    }
     _buildDebugPayload(debugId, args = []) {
         const argBytes = args instanceof Uint8Array ? args : new Uint8Array(args);
         const payload = new Uint8Array(1 + argBytes.length);
@@ -3857,6 +4012,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
     _feedStreamBytes(chunk) {
         if (this._mode === 'logged' && this._sync)
             this._sync.lastRxAt = Date.now();
+        if (this._testReportCapture) {
+            this._captureHardwareTestReportChunk(chunk);
+        }
         this._appendStreamBuf(chunk);
         for (;;) {
             if (this._rxStreamBuf.length < 3)
@@ -3988,6 +4146,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
 }
 VerisenseBleDevice.MAX_FRAME_PAYLOAD_LEN = 4096;
 VerisenseBleDevice.MAX_DEBUG_FRAME_PAYLOAD_LEN = 0xffff;
+VerisenseBleDevice.TEST_REPORT_MODE_ID = 0xfe;
+VerisenseBleDevice.TEST_REPORT_DELIMITER = '//**************************** TEST START ************************************\r\n';
+VerisenseBleDevice.TEST_REPORT_MARKER_HINT = 'TEST START';
 // Static NUS UUIDs
 VerisenseBleDevice.NUS_SERVICE = NUS_SERVICE;
 VerisenseBleDevice.NUS_TX = NUS_TX;
@@ -4000,6 +4161,7 @@ exports.ASM_PROPERTY = ASM_PROPERTY;
 exports.BaseShimmerClient = BaseShimmerClient;
 exports.CHANNEL_FORMATS = CHANNEL_FORMATS;
 exports.DEBUG_COMMAND_ID = DEBUG_COMMAND_ID;
+exports.FACTORY_TEST = FACTORY_TEST;
 exports.GSR_NAME = GSR_NAME;
 exports.NORDIC_DFU_BUTTONLESS_CHAR = NORDIC_DFU_BUTTONLESS_CHAR;
 exports.NORDIC_DFU_CONTROL_CHAR = NORDIC_DFU_CONTROL_CHAR;

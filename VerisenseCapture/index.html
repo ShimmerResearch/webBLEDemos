@@ -302,6 +302,52 @@
       color: var(--muted);
     }
 
+    .test-report-dialog {
+      width: min(920px, 96vw);
+      max-height: 88vh;
+      border: 1px solid #c8d7de;
+      border-radius: 12px;
+      padding: 0;
+    }
+
+    .test-report-dialog::backdrop {
+      background: rgba(12, 24, 32, 0.45);
+    }
+
+    .test-report-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid #dbe6ea;
+      background: #f5fafc;
+    }
+
+    .test-report-body {
+      margin: 0;
+      padding: 12px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: calc(88vh - 76px);
+      overflow: auto;
+      background: #0d1117;
+      color: #d2dee8;
+    }
+
+    .tr-pass {
+      color: #3ddc84;
+      font-weight: 700;
+    }
+
+    .tr-fail {
+      color: #ff6b6b;
+      font-weight: 700;
+    }
+
     .log-box {
       width: 100%;
       height: calc(68vh - 80px);
@@ -900,6 +946,34 @@
 
         <div id="tab-test" class="tab">
           <div class="section">
+            <h3>Test Report</h3>
+            <p class="muted" style="font-size: 13px; margin: 0 0 10px;">
+              Runs <strong>TEST_REPORT (0xFE)</strong> on the device. The device sends a rolling text report
+              delimited by the TEST START banner. PASS and FAIL results are highlighted.
+            </p>
+            <div class="row" style="align-items: center; gap: 12px;">
+              <label style="margin: 0;">Factory Test
+                <select id="testReportFactoryType">
+                  <option value="0">Test all (0)</option>
+                  <option value="1">LED's (1)</option>
+                  <option value="2">IC's (2)</option>
+                  <option value="3">LED States (3)</option>
+                </select>
+              </label>
+              <button data-action="runHardwareTestReport" id="btnRunTestReport" class="primary" disabled>Run Test
+                Report</button>
+              <div class="muted" id="testHwIdStatus">HW revision unavailable. Read production config first.</div>
+            </div>
+            <dialog id="testReportDialog" class="test-report-dialog">
+              <div class="test-report-head">
+                <strong>Hardware Test Report</strong>
+                <button id="btnTestReportClose" type="button">Close</button>
+              </div>
+              <div id="testReportPre" class="test-report-body"></div>
+            </dialog>
+          </div>
+
+          <div class="section">
             <h3>Hardware Test (deprecated)</h3>
             <div class="section-grid-2">
               <label>Test Mode
@@ -921,7 +995,6 @@
                   <option value="255" selected>ALL (0xFF)</option>
                 </select>
               </label>
-              <div class="muted" id="testHwIdStatus">HW revision unavailable. Read production config first.</div>
             </div>
             <div class="row">
               <button data-action="runHardwareTest" id="btnRunHardwareTest" disabled>Run Hardware Test</button>
@@ -1123,6 +1196,7 @@
     import {
       ASM_PROPERTY,
       NORDIC_DFU_SERVICE,
+      FACTORY_TEST,
       VerisenseBleDevice,
       OP_IDX,
       buildProductionConfigPayload,
@@ -1132,6 +1206,9 @@
     } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
     const $ = (id) => document.getElementById(id);
+    const TEST_REPORT_MODE_ID = 0xfe;
+    const TEST_REPORT_DELIMITER =
+      "//**************************** TEST START ************************************\r\n";
 
     const ui = {
       btnConnectBle: $("btnConnectBle"),
@@ -1177,7 +1254,12 @@
       opGsrOverCfg: $("opGsrOverCfg"),
       testModeSelect: $("testModeSelect"),
       btnRunHardwareTest: $("btnRunHardwareTest"),
+      testReportFactoryType: $("testReportFactoryType"),
+      btnRunTestReport: $("btnRunTestReport"),
       testHwIdStatus: $("testHwIdStatus"),
+      testReportDialog: $("testReportDialog"),
+      btnTestReportClose: $("btnTestReportClose"),
+      testReportPre: $("testReportPre"),
       testLedIndex: $("testLedIndex"),
       testLoopCount: $("testLoopCount"),
       prodMonHex: $("prodMonHex"),
@@ -1276,6 +1358,12 @@
         .map((v) => (typeof v === "string" ? v : JSON.stringify(v, null, 2)))
         .join(" ");
       ui.log.textContent += `${formatLogTime()} ${line}\n`;
+      ui.log.scrollTop = ui.log.scrollHeight;
+    }
+
+    function appendLogText(text) {
+      if (!text) return;
+      ui.log.textContent += text;
       ui.log.scrollTop = ui.log.scrollHeight;
     }
 
@@ -1501,11 +1589,26 @@
     function updateHardwareTestAvailability() {
       const hw = getProductionHwRevision();
       if (ui.btnRunHardwareTest) ui.btnRunHardwareTest.disabled = !hw;
+      if (ui.btnRunTestReport) ui.btnRunTestReport.disabled = !hw;
       if (ui.testHwIdStatus) {
         ui.testHwIdStatus.textContent = hw
           ? `HW revision from production config: ${hw.major}.${hw.minor}.${hw.internal}`
           : "HW revision unavailable. Read production config first.";
       }
+    }
+
+    function setTestReportDialogContent(text) {
+      if (!ui.testReportPre) return;
+      // Escape HTML then colour PASS/FAIL keywords
+      const escaped = text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      const coloured = escaped
+        .replace(/\bPASS\b/g, '<span class="tr-pass">PASS</span>')
+        .replace(/\bFAIL\b/g, '<span class="tr-fail">FAIL</span>');
+      ui.testReportPre.innerHTML = coloured;
+      ui.testReportPre.scrollTop = ui.testReportPre.scrollHeight;
     }
 
     function updateDfuUpdateToolState(connected) {
@@ -2166,6 +2269,42 @@
         case "disconnectRequest":
           log("disconnectRequest", await v.disconnectRequest());
           break;
+        case "runHardwareTestReport":
+          {
+            const hw = getProductionHwRevision();
+            if (!hw) throw new Error("Hardware revision unavailable in production config. Read production config first.");
+            if (typeof v.runHardwareTestReport !== "function") {
+              throw new Error("SDK does not expose runHardwareTestReport(). Rebuild/sync local SDK artifacts first.");
+            }
+            setTestReportDialogContent("Waiting for TEST_REPORT stream...\n");
+            log("[TEST_REPORT] stream started");
+            if (ui.testReportDialog && !ui.testReportDialog.open) {
+              if (typeof ui.testReportDialog.showModal === "function") {
+                ui.testReportDialog.showModal();
+              } else {
+                ui.testReportDialog.setAttribute("open", "open");
+              }
+            }
+            const factoryTestType = Math.max(0, Math.min(3, Number(ui.testReportFactoryType?.value ?? 0)));
+            const reportText = await v.runHardwareTestReport(hw.major, hw.minor, hw.internal, {
+              timeoutMs: 120000,
+              marker: TEST_REPORT_DELIMITER,
+              factoryTestType,
+              onChunk: (chunk, aggregate) => {
+                setTestReportDialogContent(aggregate);
+                appendLogText(chunk);
+              },
+            });
+            setTestReportDialogContent(reportText);
+            log("[TEST_REPORT] stream complete");
+            log("runHardwareTestReport", {
+              chars: reportText.length,
+              hwMajor: hw.major,
+              hwMinor: hw.minor,
+              hwInternal: hw.internal,
+            });
+          }
+          break;
         case "runHardwareTest":
           {
             const hw = getProductionHwRevision();
@@ -2341,6 +2480,12 @@
       ui.btnLogClear.addEventListener("click", () => {
         ui.log.textContent = "";
       });
+
+      if (ui.btnTestReportClose) {
+        ui.btnTestReportClose.addEventListener("click", () => {
+          if (ui.testReportDialog?.open) ui.testReportDialog.close();
+        });
+      }
 
       document.querySelectorAll("[data-action]").forEach((el) => {
         el.addEventListener("click", async () => {

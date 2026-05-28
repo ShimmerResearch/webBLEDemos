@@ -673,6 +673,7 @@ declare const TEST_MODE_ID: Readonly<{
     readonly BIOZ_MAX30002: 11;
     readonly ACCEL2_GYRO_LSM6DSV: 12;
     readonly MAG_LIS2MDL: 13;
+    readonly TEST_REPORT: 254;
     readonly ALL_TESTS: 255;
 }>;
 type TestModeId = (typeof TEST_MODE_ID)[keyof typeof TEST_MODE_ID];
@@ -761,6 +762,17 @@ declare const OP_IDX: Readonly<{
     readonly PROX_AGC_MODE: 71;
 }>;
 type OpIdx = keyof typeof OP_IDX;
+/**
+ * Factory test type selection byte sent as the last byte of a TEST_REPORT (0xFE) payload.
+ * Mirrors the firmware `factory_test_t` enum.
+ */
+declare const FACTORY_TEST: Readonly<{
+    readonly MAIN: 0;
+    readonly LEDS: 1;
+    readonly ICS: 2;
+    readonly LED_STATES: 3;
+}>;
+type FactoryTestType = (typeof FACTORY_TEST)[keyof typeof FACTORY_TEST];
 
 interface VerisenseMessage {
     header: number;
@@ -1282,6 +1294,14 @@ interface VerisenseCommandResponse {
     property: AsmProperty;
     payload: Uint8Array;
 }
+interface HardwareTestReportOptions {
+    timeoutMs?: number;
+    marker?: string;
+    maxChars?: number;
+    /** Factory test type byte (factory_test_t). Appended after the HW revision bytes in the TX payload. Defaults to 0 (MAIN). */
+    factoryTestType?: number;
+    onChunk?: ((chunkText: string, aggregateText: string) => void) | null;
+}
 
 /**
  * Web Bluetooth client for the Verisense sensor platform.
@@ -1308,6 +1328,9 @@ interface VerisenseCommandResponse {
 declare class VerisenseBleDevice extends BaseShimmerClient {
     private static readonly MAX_FRAME_PAYLOAD_LEN;
     private static readonly MAX_DEBUG_FRAME_PAYLOAD_LEN;
+    static readonly TEST_REPORT_MODE_ID = 254;
+    static readonly TEST_REPORT_DELIMITER = "//**************************** TEST START ************************************\r\n";
+    static readonly TEST_REPORT_MARKER_HINT = "TEST START";
     static readonly NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
@@ -1333,6 +1356,8 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _pending;
     private _loggedChain;
     private _sync;
+    private _testReportCapture;
+    private readonly _testReportDecoder;
     readonly stripStreamCrc: boolean;
     readonly verifyStreamCrc: boolean;
     readonly hardwareIdentifier: string;
@@ -1434,6 +1459,15 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     }): Promise<void>;
     runTestMode(testPayload: Uint8Array | number[]): Promise<void>;
     runHardwareTest(testId: TestModeId, hwMajor: number, hwMinor?: number, hwInternal?: number): Promise<void>;
+    private _clearHardwareTestReportCapture;
+    private _captureHardwareTestReportChunk;
+    /**
+     * Runs TEST_REPORT (0xFE) and captures the rolling text report.
+     *
+     * The firmware ACKs the command first, then emits plain-text lines over the link.
+     * Capture starts on the first delimiter and completes on the second delimiter.
+     */
+    runHardwareTestReport(hwMajor: number, hwMinor?: number, hwInternal?: number, opts?: HardwareTestReportOptions): Promise<string>;
     private _buildDebugPayload;
     private _debugIndexArgs;
     private _waitForDebugResponse;
@@ -1498,5 +1532,5 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _handleStreamingPayload;
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_CHAR, NORDIC_DFU_CONTROL_CHAR, NORDIC_DFU_PACKET_CHAR, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions, VerisenseCommandResponse, VerisenseEventLogEntry, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseStatusPayload };
+export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, FACTORY_TEST, GSR_NAME, NORDIC_DFU_BUTTONLESS_CHAR, NORDIC_DFU_CONTROL_CHAR, NORDIC_DFU_PACKET_CHAR, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FactoryTestType, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions, VerisenseCommandResponse, VerisenseEventLogEntry, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseStatusPayload };
