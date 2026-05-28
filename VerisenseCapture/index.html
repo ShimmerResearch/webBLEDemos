@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 
 <head>
@@ -1237,6 +1237,7 @@
     function setTransport(text) {
       ui.transportKind.textContent = text;
       updateBleLinkInfo(text);
+      updateDisconnectRequestButtonState();
     }
 
     function updateBleLinkInfo(transportKind = "none") {
@@ -1261,7 +1262,13 @@
       ui.btnConnectBle.disabled = connected;
       ui.btnConnectSerial.disabled = connected;
       ui.btnDisconnect.disabled = !connected;
-      ui.btnDisconnectRequest.disabled = !connected;
+      updateDisconnectRequestButtonState();
+    }
+
+    function updateDisconnectRequestButtonState() {
+      const connected = !ui.btnDisconnect.disabled;
+      const isBleTransport = ui.transportKind.textContent === "ble";
+      ui.btnDisconnectRequest.disabled = !(connected && isBleTransport);
     }
 
     function log(...args) {
