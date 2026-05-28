@@ -1,2518 +1,3066 @@
 ﻿<!doctype html>
 <html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Verisense Capture</title>
+    <link rel="icon" type="image/png" href="./assets/verisense-icon.png" />
+    <style>
+      :root {
+        --bg: #f2f5f7;
+        --card: #ffffff;
+        --ink: #1d2a2f;
+        --muted: #5d6a70;
+        --line: #d7e0e4;
+        --accent: #0d8f8b;
+        --accent-2: #165f89;
+        --log-bg: #0d1117;
+        --log-ink: #d2dee8;
+        --warn: #9a5d06;
+      }
 
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Verisense Capture</title>
-  <link rel="icon" type="image/png" href="./assets/verisense-icon.png" />
-  <style>
-    :root {
-      --bg: #f2f5f7;
-      --card: #ffffff;
-      --ink: #1d2a2f;
-      --muted: #5d6a70;
-      --line: #d7e0e4;
-      --accent: #0d8f8b;
-      --accent-2: #165f89;
-      --log-bg: #0d1117;
-      --log-ink: #d2dee8;
-      --warn: #9a5d06;
-    }
+      * {
+        box-sizing: border-box;
+      }
 
-    * {
-      box-sizing: border-box;
-    }
+      body {
+        margin: 0;
+        background: radial-gradient(
+          circle at 20% 10%,
+          #eef7f8 0%,
+          var(--bg) 45%,
+          #e9edf2 100%
+        );
+        color: var(--ink);
+        font:
+          14px/1.4 "Segoe UI",
+          "Trebuchet MS",
+          Arial,
+          sans-serif;
+        min-height: 100vh;
+      }
 
-    body {
-      margin: 0;
-      background: radial-gradient(circle at 20% 10%, #eef7f8 0%, var(--bg) 45%, #e9edf2 100%);
-      color: var(--ink);
-      font: 14px/1.4 "Segoe UI", "Trebuchet MS", Arial, sans-serif;
-      min-height: 100vh;
-    }
+      .page {
+        max-width: 1500px;
+        margin: 14px auto;
+        padding: 0 12px 18px;
+      }
 
-    .page {
-      max-width: 1500px;
-      margin: 14px auto;
-      padding: 0 12px 18px;
-    }
+      h1,
+      h2,
+      h3 {
+        margin: 0 0 10px;
+        letter-spacing: 0.2px;
+      }
 
-    h1,
-    h2,
-    h3 {
-      margin: 0 0 10px;
-      letter-spacing: 0.2px;
-    }
-
-    h1 {
-      font-size: 22px;
-      color: #0b3c4a;
-    }
-
-    .brand-header {
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 6px;
-    }
-
-    .brand-title {
-      min-width: 220px;
-    }
-
-    .brand-logos {
-      display: flex;
-      align-items: center;
-      justify-content: flex-end;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-
-    .brand-logo-link {
-      display: block;
-      line-height: 0;
-    }
-
-    .brand-logos img {
-      display: block;
-      border: 1px solid #d8e3e8;
-      background: #fff;
-      border-radius: 10px;
-      box-shadow: 0 1px 2px rgba(19, 34, 40, 0.08);
-    }
-
-    .logo-verisense {
-      width: 170px;
-      height: auto;
-      padding: 4px 8px;
-    }
-
-    h2 {
-      font-size: 16px;
-      color: #0f4c5d;
-    }
-
-    h3 {
-      font-size: 14px;
-      color: #23424d;
-    }
-
-    .muted {
-      color: var(--muted);
-    }
-
-    .top {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-top: 10px;
-    }
-
-    .main {
-      display: grid;
-      grid-template-columns: 2fr 1fr;
-      gap: 12px;
-      margin-top: 12px;
-      min-height: 68vh;
-    }
-
-    .card {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px;
-      box-shadow: 0 1px 2px rgba(19, 34, 40, 0.08);
-    }
-
-    .row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-      margin-bottom: 8px;
-    }
-
-    .row:last-child {
-      margin-bottom: 0;
-    }
-
-    button,
-    input,
-    select {
-      border: 1px solid #c4d0d5;
-      border-radius: 10px;
-      padding: 8px 10px;
-      font: inherit;
-      background: #fff;
-      color: var(--ink);
-    }
-
-    input[readonly] {
-      background: #eef2f4;
-      color: #6b7980;
-      border-color: #c9d4d9;
-      cursor: not-allowed;
-    }
-
-    button {
-      background: linear-gradient(180deg, #fff, #f3f7f8);
-      cursor: pointer;
-      font-weight: 600;
-    }
-
-    button.primary {
-      color: #fff;
-      border-color: #0a7d79;
-      background: linear-gradient(180deg, #12a9a4, #0a847f);
-    }
-
-    button.warn {
-      border-color: #d2b68b;
-      background: linear-gradient(180deg, #fff7e7, #f8ebd0);
-      color: var(--warn);
-    }
-
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    label {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .kv {
-      display: grid;
-      grid-template-columns: 125px 1fr;
-      gap: 5px 10px;
-      margin-top: 4px;
-    }
-
-    .tabs {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      border-bottom: 1px solid var(--line);
-      padding-bottom: 8px;
-      margin-bottom: 10px;
-    }
-
-    .tab-btn {
-      border-radius: 999px;
-      padding: 8px 12px;
-      border-color: #bcd0d7;
-      background: #eef5f7;
-      font-weight: 700;
-      color: #2f5564;
-    }
-
-    .tab-btn.active {
-      color: #fff;
-      border-color: #0d8f8b;
-      background: linear-gradient(180deg, #15a7a2, #0c8681);
-    }
-
-    .tab {
-      display: none;
-      gap: 10px;
-      align-content: start;
-    }
-
-    .tab.active {
-      display: block;
-    }
-
-    .section {
-      border: 1px solid #e1e8ec;
-      border-radius: 12px;
-      padding: 10px;
-      margin-bottom: 10px;
-      background: #fbfdfe;
-    }
-
-    .section:last-child {
-      margin-bottom: 0;
-    }
-
-    .section-grid-2 {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }
-
-    .section-grid-3 {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 8px;
-    }
-
-    .step-flow {
-      display: grid;
-      gap: 10px;
-    }
-
-    .step-card {
-      border: 1px solid #d8e5ea;
-      border-radius: 12px;
-      background: linear-gradient(180deg, #ffffff, #f7fbfc);
-      padding: 12px;
-    }
-
-    .step-title {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-bottom: 8px;
-      font-weight: 700;
-      color: #18495a;
-    }
-
-    .step-inline-status {
-      margin-left: auto;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 12px;
-      font-weight: 600;
-    }
-
-    .step-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 26px;
-      height: 26px;
-      padding: 0 8px;
-      border-radius: 999px;
-      background: #e2f3f2;
-      border: 1px solid #b7dfdc;
-      color: #0a6d69;
-      font-size: 12px;
-      line-height: 1;
-    }
-
-    .step-copy {
-      margin: 0 0 10px;
-      font-size: 13px;
-      color: var(--muted);
-    }
-
-    .test-report-dialog {
-      width: min(920px, 96vw);
-      max-height: 88vh;
-      border: 1px solid #c8d7de;
-      border-radius: 12px;
-      padding: 0;
-    }
-
-    .test-report-dialog::backdrop {
-      background: rgba(12, 24, 32, 0.45);
-    }
-
-    .test-report-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding: 10px 12px;
-      border-bottom: 1px solid #dbe6ea;
-      background: #f5fafc;
-    }
-
-    .test-report-body {
-      margin: 0;
-      padding: 12px;
-      font-family: Consolas, "Courier New", monospace;
-      font-size: 12px;
-      line-height: 1.35;
-      white-space: pre-wrap;
-      word-break: break-word;
-      max-height: calc(88vh - 76px);
-      overflow: auto;
-      background: #0d1117;
-      color: #d2dee8;
-    }
-
-    .tr-pass {
-      color: #3ddc84;
-      font-weight: 700;
-    }
-
-    .tr-fail {
-      color: #ff6b6b;
-      font-weight: 700;
-    }
-
-    .log-box {
-      width: 100%;
-      height: calc(68vh - 80px);
-      border-radius: 10px;
-      border: 1px solid #273444;
-      background: var(--log-bg);
-      color: var(--log-ink);
-      overflow: auto;
-      white-space: pre-wrap;
-      word-break: break-word;
-      padding: 10px;
-      font-family: Consolas, "Courier New", monospace;
-      font-size: 12px;
-      line-height: 1.35;
-    }
-
-    .mono {
-      font-family: Consolas, "Courier New", monospace;
-      font-size: 12px;
-    }
-
-    .lookup-table-wrap {
-      max-height: 340px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: #fff;
-    }
-
-    .lookup-table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 12px;
-      font-family: Consolas, "Courier New", monospace;
-    }
-
-    .lookup-table th,
-    .lookup-table td {
-      border-bottom: 1px solid #e4ecef;
-      padding: 6px 8px;
-      text-align: left;
-      white-space: nowrap;
-    }
-
-    .lookup-table thead th {
-      position: sticky;
-      top: 0;
-      background: #f3f8fa;
-      z-index: 1;
-    }
-
-    .status-badge {
-      padding: 4px 8px;
-      border-radius: 999px;
-      background: #e7f5f4;
-      color: #0b6f6b;
-      font-weight: 700;
-      border: 1px solid #b8e2e0;
-    }
-
-    .plot-wrap {
-      margin-top: 8px;
-    }
-
-    .plot-canvas {
-      width: 100%;
-      height: 170px;
-      background: #111;
-      border-radius: 12px;
-      display: block;
-      border: 1px solid #222;
-    }
-
-    @media (max-width: 1100px) {
-
-      .top,
-      .main,
-      .section-grid-2,
-      .section-grid-3 {
-        grid-template-columns: 1fr;
+      h1 {
+        font-size: 22px;
+        color: #0b3c4a;
       }
 
       .brand-header {
-        align-items: flex-start;
-        flex-direction: column;
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 6px;
+      }
+
+      .brand-title {
+        min-width: 220px;
       }
 
       .brand-logos {
-        justify-content: flex-start;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .brand-logo-link {
+        display: block;
+        line-height: 0;
+      }
+
+      .brand-logos img {
+        display: block;
+        border: 1px solid #d8e3e8;
+        background: #fff;
+        border-radius: 10px;
+        box-shadow: 0 1px 2px rgba(19, 34, 40, 0.08);
+      }
+
+      .logo-verisense {
+        width: 170px;
+        height: auto;
+        padding: 4px 8px;
+      }
+
+      h2 {
+        font-size: 16px;
+        color: #0f4c5d;
+      }
+
+      h3 {
+        font-size: 14px;
+        color: #23424d;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .top {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin-top: 10px;
+      }
+
+      .main {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 12px;
+        margin-top: 12px;
+        min-height: 68vh;
+      }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px;
+        box-shadow: 0 1px 2px rgba(19, 34, 40, 0.08);
+      }
+
+      .row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+      }
+
+      .row:last-child {
+        margin-bottom: 0;
+      }
+
+      button,
+      input,
+      select {
+        border: 1px solid #c4d0d5;
+        border-radius: 10px;
+        padding: 8px 10px;
+        font: inherit;
+        background: #fff;
+        color: var(--ink);
+      }
+
+      input[readonly] {
+        background: #eef2f4;
+        color: #6b7980;
+        border-color: #c9d4d9;
+        cursor: not-allowed;
+      }
+
+      button {
+        background: linear-gradient(180deg, #fff, #f3f7f8);
+        cursor: pointer;
+        font-weight: 600;
+      }
+
+      button.primary {
+        color: #fff;
+        border-color: #0a7d79;
+        background: linear-gradient(180deg, #12a9a4, #0a847f);
+      }
+
+      button.warn {
+        border-color: #d2b68b;
+        background: linear-gradient(180deg, #fff7e7, #f8ebd0);
+        color: var(--warn);
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      label {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .kv {
+        display: grid;
+        grid-template-columns: 125px 1fr;
+        gap: 5px 10px;
+        margin-top: 4px;
+      }
+
+      .tabs {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 8px;
+        margin-bottom: 10px;
+      }
+
+      .tab-btn {
+        border-radius: 999px;
+        padding: 8px 12px;
+        border-color: #bcd0d7;
+        background: #eef5f7;
+        font-weight: 700;
+        color: #2f5564;
+      }
+
+      .tab-btn.active {
+        color: #fff;
+        border-color: #0d8f8b;
+        background: linear-gradient(180deg, #15a7a2, #0c8681);
+      }
+
+      .tab {
+        display: none;
+        gap: 10px;
+        align-content: start;
+      }
+
+      .tab.active {
+        display: block;
+      }
+
+      .section {
+        border: 1px solid #e1e8ec;
+        border-radius: 12px;
+        padding: 10px;
+        margin-bottom: 10px;
+        background: #fbfdfe;
+      }
+
+      .section:last-child {
+        margin-bottom: 0;
+      }
+
+      .section-grid-2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      .section-grid-3 {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px;
+      }
+
+      .step-flow {
+        display: grid;
+        gap: 10px;
+      }
+
+      .step-card {
+        border: 1px solid #d8e5ea;
+        border-radius: 12px;
+        background: linear-gradient(180deg, #ffffff, #f7fbfc);
+        padding: 12px;
+      }
+
+      .step-title {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 8px;
+        font-weight: 700;
+        color: #18495a;
+      }
+
+      .step-inline-status {
+        margin-left: auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .step-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 26px;
+        height: 26px;
+        padding: 0 8px;
+        border-radius: 999px;
+        background: #e2f3f2;
+        border: 1px solid #b7dfdc;
+        color: #0a6d69;
+        font-size: 12px;
+        line-height: 1;
+      }
+
+      .step-copy {
+        margin: 0 0 10px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .test-report-dialog {
+        width: min(920px, 96vw);
+        max-height: 88vh;
+        border: 1px solid #c8d7de;
+        border-radius: 12px;
+        padding: 0;
+      }
+
+      .test-report-dialog::backdrop {
+        background: rgba(12, 24, 32, 0.45);
+      }
+
+      .test-report-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 10px 12px;
+        border-bottom: 1px solid #dbe6ea;
+        background: #f5fafc;
+      }
+
+      .test-report-body {
+        margin: 0;
+        padding: 12px;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.35;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: calc(88vh - 76px);
+        overflow: auto;
+        background: #0d1117;
+        color: #d2dee8;
+      }
+
+      .tr-pass {
+        color: #3ddc84;
+        font-weight: 700;
+      }
+
+      .tr-fail {
+        color: #ff6b6b;
+        font-weight: 700;
       }
 
       .log-box {
-        height: 300px;
+        width: 100%;
+        height: calc(68vh - 80px);
+        border-radius: 10px;
+        border: 1px solid #273444;
+        background: var(--log-bg);
+        color: var(--log-ink);
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-word;
+        padding: 10px;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.35;
       }
-    }
 
-    #dfu-drop {
-      border: 2px dashed var(--line);
-      border-radius: 6px;
-      padding: 24px 20px;
-      text-align: center;
-      cursor: pointer;
-      transition: background 0.15s, border-color 0.15s;
-      margin-bottom: 10px;
-    }
+      .mono {
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 12px;
+      }
 
-    #dfu-drop.hover {
-      background: rgba(13, 143, 139, 0.06);
-      border-color: var(--accent);
-    }
+      .lookup-table-wrap {
+        max-height: 340px;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+      }
 
-    #dfu-icon {
-      fill: var(--muted);
-      display: block;
-      margin: 0 auto 10px;
-    }
+      .lookup-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+        font-family: Consolas, "Courier New", monospace;
+      }
 
-    #dfu-label {
-      cursor: pointer;
-      display: block;
-    }
+      .lookup-table th,
+      .lookup-table td {
+        border-bottom: 1px solid #e4ecef;
+        padding: 6px 8px;
+        text-align: left;
+        white-space: nowrap;
+      }
 
-    #dfu-label span {
-      display: block;
-      font-size: 12px;
-      color: var(--muted);
-      margin-top: 4px;
-    }
+      .lookup-table thead th {
+        position: sticky;
+        top: 0;
+        background: #f3f8fa;
+        z-index: 1;
+      }
 
-    #dfu-select {
-      visibility: hidden;
-      margin-top: 12px;
-    }
+      .status-badge {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #e7f5f4;
+        color: #0b6f6b;
+        font-weight: 700;
+        border: 1px solid #b8e2e0;
+      }
 
-    #dfu-status-bar {
-      visibility: hidden;
-      height: 24px;
-      border: 1px solid var(--line);
-      position: relative;
-      margin-top: 10px;
-    }
+      .plot-wrap {
+        margin-top: 8px;
+      }
 
-    #dfu-bar {
-      background: var(--accent);
-      width: 0%;
-      height: 100%;
-    }
+      .plot-canvas {
+        width: 100%;
+        height: 170px;
+        background: #111;
+        border-radius: 12px;
+        display: block;
+        border: 1px solid #222;
+      }
 
-    #dfu-transfer {
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      text-align: center;
-      line-height: 24px;
-      font-size: 12px;
-    }
+      @media (max-width: 1100px) {
+        .top,
+        .main,
+        .section-grid-2,
+        .section-grid-3 {
+          grid-template-columns: 1fr;
+        }
 
-    #dfu-status-msg {
-      margin-top: 8px;
-      font-size: 13px;
-      min-height: 18px;
-    }
+        .brand-header {
+          align-items: flex-start;
+          flex-direction: column;
+        }
 
-    .dfu-badge-active {
-      color: #1e7a1e;
-      font-weight: 600;
-    }
+        .brand-logos {
+          justify-content: flex-start;
+        }
 
-    .dfu-badge-inactive {
-      color: #b93232;
-      font-weight: 600;
-    }
+        .log-box {
+          height: 300px;
+        }
+      }
 
-    #dfu-connected-notice {
-      display: none;
-      background: #fff8e7;
-      border: 1px solid #f0c060;
-      border-radius: 8px;
-      padding: 8px 12px;
-      font-size: 13px;
-      color: #7a4f00;
-      margin-bottom: 10px;
-    }
+      #dfu-drop {
+        border: 2px dashed var(--line);
+        border-radius: 6px;
+        padding: 24px 20px;
+        text-align: center;
+        cursor: pointer;
+        transition:
+          background 0.15s,
+          border-color 0.15s;
+        margin-bottom: 10px;
+      }
 
-    #dfu-update-body.dfu-disabled {
-      opacity: 0.4;
-      pointer-events: none;
-      user-select: none;
-    }
-  </style>
-</head>
+      #dfu-drop.hover {
+        background: rgba(13, 143, 139, 0.06);
+        border-color: var(--accent);
+      }
 
-<body>
-  <div class="page">
-    <div class="brand-header">
-      <div class="brand-title">
-        <h1>Verisense Capture</h1>
-        <div class="muted">Full-feature Verisense communication demo.</div>
+      #dfu-icon {
+        fill: var(--muted);
+        display: block;
+        margin: 0 auto 10px;
+      }
+
+      #dfu-label {
+        cursor: pointer;
+        display: block;
+      }
+
+      #dfu-label span {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 4px;
+      }
+
+      #dfu-select {
+        visibility: hidden;
+        margin-top: 12px;
+      }
+
+      #dfu-status-bar {
+        visibility: hidden;
+        height: 24px;
+        border: 1px solid var(--line);
+        position: relative;
+        margin-top: 10px;
+      }
+
+      #dfu-bar {
+        background: var(--accent);
+        width: 0%;
+        height: 100%;
+      }
+
+      #dfu-transfer {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        text-align: center;
+        line-height: 24px;
+        font-size: 12px;
+      }
+
+      #dfu-status-msg {
+        margin-top: 8px;
+        font-size: 13px;
+        min-height: 18px;
+      }
+
+      .dfu-badge-active {
+        color: #1e7a1e;
+        font-weight: 600;
+      }
+
+      .dfu-badge-inactive {
+        color: #b93232;
+        font-weight: 600;
+      }
+
+      #dfu-connected-notice {
+        display: none;
+        background: #fff8e7;
+        border: 1px solid #f0c060;
+        border-radius: 8px;
+        padding: 8px 12px;
+        font-size: 13px;
+        color: #7a4f00;
+        margin-bottom: 10px;
+      }
+
+      #dfu-update-body.dfu-disabled {
+        opacity: 0.4;
+        pointer-events: none;
+        user-select: none;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div class="page">
+      <div class="brand-header">
+        <div class="brand-title">
+          <h1>Verisense Capture</h1>
+          <div class="muted">Full-feature Verisense communication demo.</div>
+        </div>
+        <div class="brand-logos">
+          <a
+            class="brand-logo-link"
+            href="https://verisense.net/"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Open verisense.net"
+          >
+            <img
+              class="logo-verisense"
+              src="./assets/verisense-logo.jpg"
+              alt="Verisense logo"
+              title="Verisense logo"
+              loading="lazy"
+            />
+          </a>
+        </div>
       </div>
-      <div class="brand-logos">
-        <a class="brand-logo-link" href="https://verisense.net/" target="_blank" rel="noopener noreferrer"
-          title="Open verisense.net">
-          <img class="logo-verisense" src="./assets/verisense-logo.jpg" alt="Verisense logo" title="Verisense logo"
-            loading="lazy" />
-        </a>
+
+      <div class="top">
+        <section class="card">
+          <h2>Connection</h2>
+          <div class="row">
+            <button id="btnConnectBle" class="primary">Connect (BLE)</button>
+            <button id="btnConnectSerial">Connect (USB Serial)</button>
+            <button id="btnDisconnect" disabled>Disconnect</button>
+            <button id="btnDisconnectRequest" class="warn" disabled>
+              Disconnect (Sensor Request)
+            </button>
+          </div>
+          <div class="row">
+            <span>Transport:</span>
+            <strong id="transportKind">none</strong>
+            <span class="status-badge" id="statusBadge">idle</span>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Current Status</h2>
+          <div class="kv">
+            <div class="muted">Device Name</div>
+            <div id="metaName">-</div>
+            <div class="muted">Unique ID</div>
+            <div id="metaId" class="mono">-</div>
+            <div class="muted">HW</div>
+            <div id="metaHw">-</div>
+            <div class="muted">FW</div>
+            <div id="metaFw">-</div>
+            <div class="muted">Battery</div>
+            <div id="metaBatt">-</div>
+            <div class="muted">Flash</div>
+            <div id="metaFlash">-</div>
+            <div class="muted">Flash Banks</div>
+            <div id="metaFlashBanks" style="font-size: 0.85em">-</div>
+            <div class="muted">ATT MTU</div>
+            <div id="metaAttMtu">-</div>
+            <div class="muted">Conn Interval</div>
+            <div id="metaConnInterval">-</div>
+            <div class="muted">PHY</div>
+            <div id="metaPhy">-</div>
+          </div>
+        </section>
       </div>
-    </div>
 
-    <div class="top">
-      <section class="card">
-        <h2>Connection</h2>
-        <div class="row">
-          <button id="btnConnectBle" class="primary">Connect (BLE)</button>
-          <button id="btnConnectSerial">Connect (USB Serial)</button>
-          <button id="btnDisconnect" disabled>Disconnect</button>
-          <button id="btnDisconnectRequest" class="warn" disabled>Disconnect (Sensor Request)</button>
-        </div>
-        <div class="row">
-          <span>Transport:</span>
-          <strong id="transportKind">none</strong>
-          <span class="status-badge" id="statusBadge">idle</span>
-        </div>
-      </section>
+      <div class="main">
+        <section class="card">
+          <div class="tabs">
+            <button class="tab-btn active" data-tab="tab-console">
+              Console Ops
+            </button>
+            <button class="tab-btn" data-tab="tab-prodcfg">
+              Production Config
+            </button>
+            <button class="tab-btn" data-tab="tab-opcfg">
+              Operational Config
+            </button>
+            <button class="tab-btn" data-tab="tab-lookup">Logged Data</button>
+            <button class="tab-btn" data-tab="tab-stream">Streaming</button>
+            <button class="tab-btn" data-tab="tab-dfu">DFU</button>
+            <button class="tab-btn" data-tab="tab-eventlog">Event Log</button>
+            <button class="tab-btn" data-tab="tab-test">Test</button>
+          </div>
 
-      <section class="card">
-        <h2>Current Status</h2>
-        <div class="kv">
-          <div class="muted">Device Name</div>
-          <div id="metaName">-</div>
-          <div class="muted">Unique ID</div>
-          <div id="metaId" class="mono">-</div>
-          <div class="muted">HW</div>
-          <div id="metaHw">-</div>
-          <div class="muted">FW</div>
-          <div id="metaFw">-</div>
-          <div class="muted">Battery</div>
-          <div id="metaBatt">-</div>
-          <div class="muted">Flash</div>
-          <div id="metaFlash">-</div>
-          <div class="muted">Flash Banks</div>
-          <div id="metaFlashBanks" style="font-size:0.85em;">-</div>
-          <div class="muted">ATT MTU</div>
-          <div id="metaAttMtu">-</div>
-          <div class="muted">Conn Interval</div>
-          <div id="metaConnInterval">-</div>
-          <div class="muted">PHY</div>
-          <div id="metaPhy">-</div>
-        </div>
-      </section>
-    </div>
+          <div id="tab-console" class="tab active">
+            <div class="section">
+              <h3>Status Reads</h3>
+              <div class="row">
+                <button
+                  data-action="readStatus1"
+                  title="Reads STATUS1. Battery values are sampled once per connection and may not refresh on repeated requests."
+                >
+                  Read Status1
+                </button>
+                <button
+                  data-action="readStatus2"
+                  title="Reads STATUS2. This triggers a fresh battery voltage and percentage reading for each request."
+                >
+                  Read Status2
+                </button>
+              </div>
+            </div>
 
-    <div class="main">
-      <section class="card">
-        <div class="tabs">
-          <button class="tab-btn active" data-tab="tab-console">Console Ops</button>
-          <button class="tab-btn" data-tab="tab-prodcfg">Production Config</button>
-          <button class="tab-btn" data-tab="tab-opcfg">Operational Config</button>
-          <button class="tab-btn" data-tab="tab-lookup">Logged Data</button>
-          <button class="tab-btn" data-tab="tab-stream">Streaming</button>
-          <button class="tab-btn" data-tab="tab-dfu">DFU</button>
-          <button class="tab-btn" data-tab="tab-eventlog">Event Log</button>
-          <button class="tab-btn" data-tab="tab-test">Test</button>
-        </div>
+            <div class="section">
+              <h3>Timing</h3>
+              <div class="row">
+                <button data-action="readTime">Read Time</button>
+                <button data-action="writeTimeNow">Write Time = now</button>
+                <button data-action="readScheduler">Read RWC Scheduler</button>
+              </div>
+              <div class="row">
+                <button data-action="readPending">Read Pending Events</button>
+                <button class="warn" data-action="clearPendingEvents">
+                  Force Clear Pending Events
+                </button>
+              </div>
+            </div>
 
-        <div id="tab-console" class="tab active">
-          <div class="section">
-            <h3>Status Reads</h3>
-            <div class="row">
-              <button data-action="readStatus1"
-                title="Reads STATUS1. Battery values are sampled once per connection and may not refresh on repeated requests.">Read
-                Status1</button>
-              <button data-action="readStatus2"
-                title="Reads STATUS2. This triggers a fresh battery voltage and percentage reading for each request.">Read
-                Status2</button>
+            <div class="section">
+              <h3>Danger Zone</h3>
+              <div class="row">
+                <button class="warn" data-action="deleteAllBonds">
+                  Delete All Bonds
+                </button>
+                <button class="warn" data-action="systemReset">
+                  System Reset
+                </button>
+              </div>
             </div>
           </div>
 
-          <div class="section">
-            <h3>Timing</h3>
-            <div class="row">
-              <button data-action="readTime">Read Time</button>
-              <button data-action="writeTimeNow">Write Time = now</button>
-              <button data-action="readScheduler">Read RWC Scheduler</button>
+          <div id="tab-lookup" class="tab">
+            <div class="section">
+              <h3>Logged Data Transfer</h3>
+              <div class="row">
+                <button data-action="syncToFile" class="primary">
+                  Sync Logged Data to .bin
+                </button>
+                <span class="muted">Saves to file picker destination.</span>
+              </div>
             </div>
-            <div class="row">
-              <button data-action="readPending">Read Pending Events</button>
-              <button class="warn" data-action="clearPendingEvents">Force Clear Pending Events</button>
+
+            <div class="section">
+              <h3>Advanced</h3>
+              <div class="row">
+                <button data-action="readLookup" class="primary">
+                  Read Flash Lookup Table
+                </button>
+                <button data-action="readRecordBuffers">
+                  Read Record Buffer Details
+                </button>
+                <button data-action="checkPayloadCrc">
+                  Check Payload CRC Errors
+                </button>
+                <button class="warn" data-action="eraseAllLoggedData">
+                  Erase All Logged Data
+                </button>
+              </div>
+              <div class="muted" id="lookupSummary">No lookup data loaded.</div>
+            </div>
+
+            <div class="section">
+              <h3>Flash Lookup Entries</h3>
+              <div class="lookup-table-wrap">
+                <table class="lookup-table">
+                  <thead>
+                    <tr>
+                      <th>Bank</th>
+                      <th>Status</th>
+                      <th>Status Code</th>
+                      <th>Payload Index</th>
+                      <th>EEPROM Pending</th>
+                    </tr>
+                  </thead>
+                  <tbody id="lookupTableBody">
+                    <tr>
+                      <td colspan="5" class="muted">
+                        Run Read Flash Lookup Table to populate.
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
 
-          <div class="section">
-            <h3>Danger Zone</h3>
-            <div class="row">
-              <button class="warn" data-action="deleteAllBonds">Delete All Bonds</button>
-              <button class="warn" data-action="systemReset">System Reset</button>
-            </div>
-          </div>
-
-        </div>
-
-        <div id="tab-lookup" class="tab">
-          <div class="section">
-            <h3>Logged Data Transfer</h3>
-            <div class="row">
-              <button data-action="syncToFile" class="primary">Sync Logged Data to .bin</button>
-              <span class="muted">Saves to file picker destination.</span>
-            </div>
-          </div>
-
-          <div class="section">
-            <h3>Advanced</h3>
-            <div class="row">
-              <button data-action="readLookup" class="primary">Read Flash Lookup Table</button>
-              <button data-action="readRecordBuffers">Read Record Buffer Details</button>
-              <button data-action="checkPayloadCrc">Check Payload CRC Errors</button>
-              <button class="warn" data-action="eraseAllLoggedData">Erase All Logged Data</button>
-            </div>
-            <div class="muted" id="lookupSummary">No lookup data loaded.</div>
-          </div>
-
-          <div class="section">
-            <h3>Flash Lookup Entries</h3>
-            <div class="lookup-table-wrap">
-              <table class="lookup-table">
-                <thead>
-                  <tr>
-                    <th>Bank</th>
-                    <th>Status</th>
-                    <th>Status Code</th>
-                    <th>Payload Index</th>
-                    <th>EEPROM Pending</th>
-                  </tr>
-                </thead>
-                <tbody id="lookupTableBody">
-                  <tr>
-                    <td colspan="5" class="muted">Run Read Flash Lookup Table to populate.</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div id="tab-prodcfg" class="tab">
-          <div class="section">
-            <h3>Read/Write</h3>
-            <div class="row">
-              <button data-action="prodRead" class="primary">Read From Device</button>
-              <button data-action="prodWrite" class="primary">Write To Device</button>
-              <button data-action="eraseProductionConfig" class="warn">Erase Production Config</button>
-            </div>
-          </div>
-
-          <div class="section">
-            <h3>Production Fields</h3>
-            <div class="section-grid-3">
-              <label>Manufacturing Order (8 hex)
-                <input id="prodMonHex" value="26011401" maxlength="8" />
-              </label>
-              <label>MAC ID (4 hex)
-                <input id="prodMacHex" value="DE63" maxlength="4" readonly
-                  title="Firmware-managed field (overwritten by firmware)." />
-              </label>
-              <label>Advertising Prefix
-                <input id="prodAdvPrefix" value="Verisense" maxlength="32" />
-              </label>
+          <div id="tab-prodcfg" class="tab">
+            <div class="section">
+              <h3>Read/Write</h3>
+              <div class="row">
+                <button data-action="prodRead" class="primary">
+                  Read From Device
+                </button>
+                <button data-action="prodWrite" class="primary">
+                  Write To Device
+                </button>
+                <button data-action="eraseProductionConfig" class="warn">
+                  Erase Production Config
+                </button>
+              </div>
             </div>
 
-            <div class="section-grid-3">
-              <label>HW Major <input id="prodHwMajor" type="number" min="0" max="255" value="68" /></label>
-              <label>HW Minor <input id="prodHwMinor" type="number" min="0" max="255" value="0" /></label>
-              <label>HW Internal <input id="prodHwInternal" type="number" min="0" max="65535" value="0" /></label>
-            </div>
-
-            <div class="section-grid-3">
-              <label>FW Major <input id="prodFwMajor" type="number" min="0" max="255" value="1" readonly
-                  title="Firmware-managed field (overwritten by firmware)." /></label>
-              <label>FW Minor <input id="prodFwMinor" type="number" min="0" max="255" value="4" readonly
-                  title="Firmware-managed field (overwritten by firmware)." /></label>
-              <label>FW Internal <input id="prodFwInternal" type="number" min="0" max="65535" value="22" readonly
-                  title="Firmware-managed field (overwritten by firmware)." /></label>
-            </div>
-
-            <div class="section-grid-3">
-              <label>Passkey ID (2 chars)
-                <input id="prodPasskeyId" value="" maxlength="2" />
-              </label>
-              <label>Passkey (6 chars)
-                <input id="prodPasskey" value="" maxlength="6" />
-              </label>
-              <label><input id="prodDfuEnabled" type="checkbox" checked /> DFU Enabled</label>
-            </div>
-          </div>
-        </div>
-
-        <div id="tab-opcfg" class="tab">
-          <div class="section">
-            <h3>Read/Write</h3>
-            <div class="row">
-              <button data-action="opRead" class="primary">Read From Device</button>
-              <button data-action="opWrite" class="primary">Write To Device</button>
-              <button data-action="eraseOperationalConfig" class="warn">Erase Operational Config</button>
-            </div>
-          </div>
-
-          <div class="section">
-            <h3>Accel1</h3>
-            <div class="section-grid-3">
-              <label><input id="opAccelEnabled" type="checkbox" checked /> Enabled</label>
-              <label>Sampling Rate Cfg
-                <input id="opAccelRateCfg" type="number" min="0" max="63" value="9" />
-              </label>
-              <label>Range
-                <select id="opAccelRange">
-                  <option value="0">2G</option>
-                  <option value="1">4G</option>
-                  <option value="2">8G</option>
-                  <option value="3">16G</option>
-                </select>
-              </label>
-            </div>
-          </div>
-
-          <div class="section">
-            <h3>ADC / GSR / Battery</h3>
-            <div class="section-grid-3">
-              <label><input id="opGsrEnabled" type="checkbox" checked /> GSR Enabled</label>
-              <label><input id="opBattEnabled" type="checkbox" checked /> Battery Enabled</label>
-              <label>GSR Range
-                <select id="opGsrRange">
-                  <option value="0">0</option>
-                  <option value="1">1</option>
-                  <option value="2">2</option>
-                  <option value="3">3</option>
-                  <option value="4" selected>Auto (4)</option>
-                </select>
-              </label>
-            </div>
-            <div class="section-grid-2">
-              <label>GSR Rate Cfg <input id="opGsrRateCfg" type="number" min="0" max="63" value="23" /></label>
-              <label>GSR Oversampling Cfg <input id="opGsrOverCfg" type="number" min="0" max="15" value="0" /></label>
-            </div>
-          </div>
-
-          <div class="section">
-            <h3>Notes</h3>
-            <div class="muted">This editor currently patches fields with explicit SDK helpers (Accel1 + ADC/GSR/Batt).
-              Other sensor settings can be controlled from Console Ops and stream decoders.</div>
-          </div>
-        </div>
-
-        <div id="tab-stream" class="tab">
-          <div class="section">
-            <h3>Streaming Control</h3>
-            <div class="row">
-              <button id="btnStreamStart" class="primary" disabled>Start Streaming</button>
-              <button id="btnStreamStop" disabled>Stop Streaming</button>
-              <button id="btnStreamClear">Clear Counters</button>
-            </div>
-            <div class="kv" style="margin-top: 8px;">
-              <div class="muted">Accel Packets</div>
-              <div id="streamAccelCount">0</div>
-              <div class="muted">ADC/GSR Packets</div>
-              <div id="streamAdcCount">0</div>
-              <div class="muted">Last Sensor ID</div>
-              <div id="streamLastSensor">-</div>
-            </div>
-          </div>
-          <div class="section">
-            <h3>Accel Plot</h3>
-            <div class="plot-wrap">
-              <canvas id="plotAccel" class="plot-canvas" width="900" height="260"></canvas>
-            </div>
-            <small id="plotAccelInfo" class="muted"></small>
-          </div>
-          <div class="section">
-            <h3>GSR Plot</h3>
-            <div class="plot-wrap">
-              <canvas id="plotGsr" class="plot-canvas" width="900" height="260"></canvas>
-            </div>
-            <small id="plotGsrInfo" class="muted"></small>
-          </div>
-        </div>
-
-        <div id="tab-dfu" class="tab">
-          <div class="section">
-            <h3>DFU Flow</h3>
-            <div class="step-flow">
-              <div class="step-card">
-                <div class="step-title">
-                  <span class="step-badge">Step 1</span>
-                  <span>Enable DFU Service</span>
-                  <span class="step-inline-status">
-                    <span class="muted">Nordic DFU Service:</span>
-                    <span id="dfuServiceBadge" class="muted">— not connected —</span>
-                  </span>
-                </div>
-                <p class="step-copy">
-                  Use this once to enable Nordic DFU service advertisement after the next disconnect. This does not
-                  reboot the device immediately.
-                </p>
-                <div class="row" style="margin-bottom: 0; align-items: center; gap: 12px;">
-                  <button id="btnEnableDfuService" data-action="enableDfuServiceOnDisconnect">Enable DFU Service (next
-                    disconnect)</button>
-                  <span id="dfuEnterDfuNote" class="muted" style="font-size: 12px;"></span>
-                </div>
+            <div class="section">
+              <h3>Production Fields</h3>
+              <div class="section-grid-3">
+                <label
+                  >Manufacturing Order (8 hex)
+                  <input id="prodMonHex" value="26011401" maxlength="8" />
+                </label>
+                <label
+                  >MAC ID (4 hex)
+                  <input
+                    id="prodMacHex"
+                    value="DE63"
+                    maxlength="4"
+                    readonly
+                    title="Firmware-managed field (overwritten by firmware)."
+                  />
+                </label>
+                <label
+                  >Advertising Prefix
+                  <input id="prodAdvPrefix" value="Verisense" maxlength="32" />
+                </label>
               </div>
 
-              <div class="step-card">
-                <div class="step-title">
-                  <span class="step-badge">Step 2</span>
-                  <span>Reboot To DFU Bootloader Mode</span>
-                </div>
-                <p class="step-copy">
-                  After reconnecting with Nordic DFU service active, use the buttonless DFU command to reboot directly
-                  into bootloader mode.
-                </p>
-                <div class="row" style="margin-bottom: 0; align-items: center; gap: 12px;">
-                  <button id="btnRebootBootloader" data-action="rebootToDfuBootloader" class="warn">Reboot To DFU
-                    Bootloader (buttonless)</button>
-                </div>
+              <div class="section-grid-3">
+                <label
+                  >HW Major
+                  <input
+                    id="prodHwMajor"
+                    type="number"
+                    min="0"
+                    max="255"
+                    value="68"
+                /></label>
+                <label
+                  >HW Minor
+                  <input
+                    id="prodHwMinor"
+                    type="number"
+                    min="0"
+                    max="255"
+                    value="0"
+                /></label>
+                <label
+                  >HW Internal
+                  <input
+                    id="prodHwInternal"
+                    type="number"
+                    min="0"
+                    max="65535"
+                    value="0"
+                /></label>
               </div>
 
-              <div class="step-card">
-                <div class="step-title">
-                  <span class="step-badge">Step 3</span>
-                  <span>Perform Firmware Update</span>
+              <div class="section-grid-3">
+                <label
+                  >FW Major
+                  <input
+                    id="prodFwMajor"
+                    type="number"
+                    min="0"
+                    max="255"
+                    value="1"
+                    readonly
+                    title="Firmware-managed field (overwritten by firmware)."
+                /></label>
+                <label
+                  >FW Minor
+                  <input
+                    id="prodFwMinor"
+                    type="number"
+                    min="0"
+                    max="255"
+                    value="4"
+                    readonly
+                    title="Firmware-managed field (overwritten by firmware)."
+                /></label>
+                <label
+                  >FW Internal
+                  <input
+                    id="prodFwInternal"
+                    type="number"
+                    min="0"
+                    max="65535"
+                    value="22"
+                    readonly
+                    title="Firmware-managed field (overwritten by firmware)."
+                /></label>
+              </div>
+
+              <div class="section-grid-3">
+                <label
+                  >Passkey ID (2 chars)
+                  <input id="prodPasskeyId" value="" maxlength="2" />
+                </label>
+                <label
+                  >Passkey (6 chars)
+                  <input id="prodPasskey" value="" maxlength="6" />
+                </label>
+                <label
+                  ><input id="prodDfuEnabled" type="checkbox" checked /> DFU
+                  Enabled</label
+                >
+              </div>
+            </div>
+          </div>
+
+          <div id="tab-opcfg" class="tab">
+            <div class="section">
+              <h3>Read/Write</h3>
+              <div class="row">
+                <button data-action="opRead" class="primary">
+                  Read From Device
+                </button>
+                <button data-action="opWrite" class="primary">
+                  Write To Device
+                </button>
+                <button data-action="eraseOperationalConfig" class="warn">
+                  Erase Operational Config
+                </button>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3>Accel1</h3>
+              <div class="section-grid-3">
+                <label
+                  ><input id="opAccelEnabled" type="checkbox" checked />
+                  Enabled</label
+                >
+                <label
+                  >Sampling Rate Cfg
+                  <input
+                    id="opAccelRateCfg"
+                    type="number"
+                    min="0"
+                    max="63"
+                    value="9"
+                  />
+                </label>
+                <label
+                  >Range
+                  <select id="opAccelRange">
+                    <option value="0">2G</option>
+                    <option value="1">4G</option>
+                    <option value="2">8G</option>
+                    <option value="3">16G</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3>ADC / GSR / Battery</h3>
+              <div class="section-grid-3">
+                <label
+                  ><input id="opGsrEnabled" type="checkbox" checked /> GSR
+                  Enabled</label
+                >
+                <label
+                  ><input id="opBattEnabled" type="checkbox" checked /> Battery
+                  Enabled</label
+                >
+                <label
+                  >GSR Range
+                  <select id="opGsrRange">
+                    <option value="0">0</option>
+                    <option value="1">1</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4" selected>Auto (4)</option>
+                  </select>
+                </label>
+              </div>
+              <div class="section-grid-2">
+                <label
+                  >GSR Rate Cfg
+                  <input
+                    id="opGsrRateCfg"
+                    type="number"
+                    min="0"
+                    max="63"
+                    value="23"
+                /></label>
+                <label
+                  >GSR Oversampling Cfg
+                  <input
+                    id="opGsrOverCfg"
+                    type="number"
+                    min="0"
+                    max="15"
+                    value="0"
+                /></label>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3>Notes</h3>
+              <div class="muted">
+                This editor currently patches fields with explicit SDK helpers
+                (Accel1 + ADC/GSR/Batt). Other sensor settings can be controlled
+                from Console Ops and stream decoders.
+              </div>
+            </div>
+          </div>
+
+          <div id="tab-stream" class="tab">
+            <div class="section">
+              <h3>Streaming Control</h3>
+              <div class="row">
+                <button id="btnStreamStart" class="primary" disabled>
+                  Start Streaming
+                </button>
+                <button id="btnStreamStop" disabled>Stop Streaming</button>
+                <button id="btnStreamClear">Clear Counters</button>
+              </div>
+              <div class="kv" style="margin-top: 8px">
+                <div class="muted">Accel Packets</div>
+                <div id="streamAccelCount">0</div>
+                <div class="muted">ADC/GSR Packets</div>
+                <div id="streamAdcCount">0</div>
+                <div class="muted">Last Sensor ID</div>
+                <div id="streamLastSensor">-</div>
+              </div>
+            </div>
+            <div class="section">
+              <h3>Accel Plot</h3>
+              <div class="plot-wrap">
+                <canvas
+                  id="plotAccel"
+                  class="plot-canvas"
+                  width="900"
+                  height="260"
+                ></canvas>
+              </div>
+              <small id="plotAccelInfo" class="muted"></small>
+            </div>
+            <div class="section">
+              <h3>GSR Plot</h3>
+              <div class="plot-wrap">
+                <canvas
+                  id="plotGsr"
+                  class="plot-canvas"
+                  width="900"
+                  height="260"
+                ></canvas>
+              </div>
+              <small id="plotGsrInfo" class="muted"></small>
+            </div>
+          </div>
+
+          <div id="tab-dfu" class="tab">
+            <div class="section">
+              <h3>DFU Flow</h3>
+              <div class="step-flow">
+                <div class="step-card">
+                  <div class="step-title">
+                    <span class="step-badge">Step 1</span>
+                    <span>Enable DFU Service</span>
+                    <span class="step-inline-status">
+                      <span class="muted">Nordic DFU Service:</span>
+                      <span id="dfuServiceBadge" class="muted"
+                        >— not connected —</span
+                      >
+                    </span>
+                  </div>
+                  <p class="step-copy">
+                    Use this once to enable Nordic DFU service advertisement
+                    after the next disconnect. This does not reboot the device
+                    immediately.
+                  </p>
+                  <div
+                    class="row"
+                    style="margin-bottom: 0; align-items: center; gap: 12px"
+                  >
+                    <button
+                      id="btnEnableDfuService"
+                      data-action="enableDfuServiceOnDisconnect"
+                    >
+                      Enable DFU Service (next disconnect)
+                    </button>
+                    <span
+                      id="dfuEnterDfuNote"
+                      class="muted"
+                      style="font-size: 12px"
+                    ></span>
+                  </div>
                 </div>
-                <p class="step-copy">
-                  Select a firmware <code>.zip</code> package, then click <strong>Begin Update</strong>. A browser
-                  device
-                  picker will open and the DFU library will connect to the bootloader and flash the firmware.
-                </p>
-                <div id="dfu-connected-notice">
-                  &#9888;&#xFE0E; A device is currently connected &mdash; disconnect from it first before using the DFU
-                  Update Tool.
+
+                <div class="step-card">
+                  <div class="step-title">
+                    <span class="step-badge">Step 2</span>
+                    <span>Reboot To DFU Bootloader Mode</span>
+                  </div>
+                  <p class="step-copy">
+                    After reconnecting with Nordic DFU service active, use the
+                    buttonless DFU command to reboot directly into bootloader
+                    mode.
+                  </p>
+                  <div
+                    class="row"
+                    style="margin-bottom: 0; align-items: center; gap: 12px"
+                  >
+                    <button
+                      id="btnRebootBootloader"
+                      data-action="rebootToDfuBootloader"
+                      class="warn"
+                    >
+                      Reboot To DFU Bootloader (buttonless)
+                    </button>
+                  </div>
                 </div>
-                <div id="dfu-update-body">
-                  <div id="dfu-drop">
-                    <svg id="dfu-icon" xmlns="http://www.w3.org/2000/svg" width="36" height="31" viewBox="0 0 50 43">
-                      <path
-                        d="M48.4 26.5c-.9 0-1.7.7-1.7 1.7v11.6h-43.3v-11.6c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v13.2c0 .9.7 1.7 1.7 1.7h46.7c.9 0 1.7-.7 1.7-1.7v-13.2c0-1-.7-1.7-1.7-1.7zm-24.5 6.1c.3.3.8.5 1.2.5.4 0 .9-.2 1.2-.5l10-11.6c.7-.7.7-1.7 0-2.4s-1.7-.7-2.4 0l-7.1 8.3v-25.3c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v25.3l-7.1-8.3c-.7-.7-1.7-.7-2.4 0s-.7 1.7 0 2.4l10 11.6z" />
-                    </svg>
-                    <input id="dfu-file" type="file"
-                      style="width: 0.1px; height: 0.1px; opacity: 0; position: absolute; z-index: -1;" />
-                    <label id="dfu-label" for="dfu-file">
-                      <strong>Choose a firmware package (.zip)</strong>
-                      <span>or drag and drop here</span>
-                    </label>
-                    <div id="dfu-select">
-                      <button id="dfu-button" class="primary">Begin Update</button>
+
+                <div class="step-card">
+                  <div class="step-title">
+                    <span class="step-badge">Step 3</span>
+                    <span>Perform Firmware Update</span>
+                  </div>
+                  <p class="step-copy">
+                    Select a firmware <code>.zip</code> package, then click
+                    <strong>Begin Update</strong>. A browser device picker will
+                    open and the DFU library will connect to the bootloader and
+                    flash the firmware.
+                  </p>
+                  <div id="dfu-connected-notice">
+                    &#9888;&#xFE0E; A device is currently connected &mdash;
+                    disconnect from it first before using the DFU Update Tool.
+                  </div>
+                  <div id="dfu-update-body">
+                    <div id="dfu-drop">
+                      <svg
+                        id="dfu-icon"
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="36"
+                        height="31"
+                        viewBox="0 0 50 43"
+                      >
+                        <path
+                          d="M48.4 26.5c-.9 0-1.7.7-1.7 1.7v11.6h-43.3v-11.6c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v13.2c0 .9.7 1.7 1.7 1.7h46.7c.9 0 1.7-.7 1.7-1.7v-13.2c0-1-.7-1.7-1.7-1.7zm-24.5 6.1c.3.3.8.5 1.2.5.4 0 .9-.2 1.2-.5l10-11.6c.7-.7.7-1.7 0-2.4s-1.7-.7-2.4 0l-7.1 8.3v-25.3c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v25.3l-7.1-8.3c-.7-.7-1.7-.7-2.4 0s-.7 1.7 0 2.4l10 11.6z"
+                        />
+                      </svg>
+                      <input
+                        id="dfu-file"
+                        type="file"
+                        style="
+                          width: 0.1px;
+                          height: 0.1px;
+                          opacity: 0;
+                          position: absolute;
+                          z-index: -1;
+                        "
+                      />
+                      <label id="dfu-label" for="dfu-file">
+                        <strong>Choose a firmware package (.zip)</strong>
+                        <span>or drag and drop here</span>
+                      </label>
+                      <div id="dfu-select">
+                        <button id="dfu-button" class="primary">
+                          Begin Update
+                        </button>
+                      </div>
                     </div>
+                    <div id="dfu-status-bar">
+                      <div id="dfu-bar"></div>
+                      <div id="dfu-transfer"></div>
+                    </div>
+                    <div id="dfu-status-msg" class="muted"></div>
                   </div>
-                  <div id="dfu-status-bar">
-                    <div id="dfu-bar"></div>
-                    <div id="dfu-transfer"></div>
-                  </div>
-                  <div id="dfu-status-msg" class="muted"></div>
                 </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <div id="tab-eventlog" class="tab">
-          <div class="section">
-            <h3>Event Log Reader</h3>
-            <div class="row">
-              <button data-action="readEventLog" class="primary">Read Event Log</button>
-            </div>
-            <div class="muted" id="eventLogSummary">No event log data loaded.</div>
-          </div>
-          <div class="section">
-            <h3>Event Log Entries</h3>
-            <div class="lookup-table-wrap">
-              <table class="lookup-table">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>Event ID</th>
-                    <th>Event Name</th>
-                    <th>Timestamp</th>
-                    <th>Battery (mV)</th>
-                  </tr>
-                </thead>
-                <tbody id="eventLogTableBody">
-                  <tr>
-                    <td colspan="5" class="muted">Run Read Event Log to populate.</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div id="tab-test" class="tab">
-          <div class="section">
-            <h3>Test Report</h3>
-            <p class="muted" style="font-size: 13px; margin: 0 0 10px;">
-              Runs <strong>TEST_REPORT (0xFE)</strong> on the device. The device sends a rolling text report
-              delimited by the TEST START banner. PASS and FAIL results are highlighted.
-            </p>
-            <div class="row" style="align-items: center; gap: 12px;">
-              <label style="margin: 0;">Factory Test
-                <select id="testReportFactoryType">
-                  <option value="0">Test all (0)</option>
-                  <option value="1">LED's (1)</option>
-                  <option value="2">IC's (2)</option>
-                  <option value="3">LED States (3)</option>
-                </select>
-              </label>
-              <button data-action="runHardwareTestReport" id="btnRunTestReport" class="primary" disabled>Run Test
-                Report</button>
-              <div class="muted" id="testHwIdStatus">HW revision unavailable. Read production config first.</div>
-            </div>
-            <dialog id="testReportDialog" class="test-report-dialog">
-              <div class="test-report-head">
-                <strong>Hardware Test Report</strong>
-                <button id="btnTestReportClose" type="button">Close</button>
-              </div>
-              <div id="testReportPre" class="test-report-body"></div>
-            </dialog>
-          </div>
-
-          <div class="section">
-            <h3>Hardware Test (deprecated)</h3>
-            <div class="section-grid-2">
-              <label>Test Mode
-                <select id="testModeSelect">
-                  <option value="0">EXIT (0x00)</option>
-                  <option value="1">SHORT_TERM_FLASH1 (0x01)</option>
-                  <option value="2">SHORT_TERM_FLASH2 (0x02)</option>
-                  <option value="3">LONG_TERM_FLASH (0x03)</option>
-                  <option value="4">EEPROM (0x04)</option>
-                  <option value="5">ACCEL_1 (0x05)</option>
-                  <option value="6">BATT_VOLTAGE (0x06)</option>
-                  <option value="7">USB_POWER_GOOD (0x07)</option>
-                  <option value="8">ACCEL2 (0x08)</option>
-                  <option value="9">MAX86XXX (0x09)</option>
-                  <option value="10">UNUSED (0x0A)</option>
-                  <option value="11">MAX30002 (0x0B)</option>
-                  <option value="12">LSM6DSV (0x0C)</option>
-                  <option value="13">LIS2MDL (0x0D)</option>
-                  <option value="255" selected>ALL (0xFF)</option>
-                </select>
-              </label>
-            </div>
-            <div class="row">
-              <button data-action="runHardwareTest" id="btnRunHardwareTest" disabled>Run Hardware Test</button>
-            </div>
-          </div>
-
-          <div class="section">
-            <h3>Advanced</h3>
-            <div class="row">
-              <button data-action="loadTestLookup">Load Test Lookup</button>
-            </div>
-            <div class="section-grid-2">
-              <label>LED Index <input id="testLedIndex" type="number" value="0" min="0" max="255" /></label>
+          <div id="tab-eventlog" class="tab">
+            <div class="section">
+              <h3>Event Log Reader</h3>
               <div class="row">
-                <button data-action="ledTest">LED Test</button>
-                <button data-action="maxLedStart">MAX86xxx LED Test Start</button>
-                <button data-action="maxLedStop">MAX86xxx LED Test Stop</button>
+                <button data-action="readEventLog" class="primary">
+                  Read Event Log
+                </button>
+              </div>
+              <div class="muted" id="eventLogSummary">
+                No event log data loaded.
               </div>
             </div>
-            <div class="section-grid-2">
-              <label>Loop Count <input id="testLoopCount" type="number" value="10" min="0" max="65535" /></label>
-              <div class="row">
-                <button data-action="transferLoop">Data Transfer Loop Test</button>
-                <button data-action="icPowerTest">IC Power Consumption Test</button>
-                <button data-action="powerProfiler">Start Power Profiler</button>
+            <div class="section">
+              <h3>Event Log Entries</h3>
+              <div class="lookup-table-wrap">
+                <table class="lookup-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Event ID</th>
+                      <th>Event Name</th>
+                      <th>Timestamp</th>
+                      <th>Battery (mV)</th>
+                    </tr>
+                  </thead>
+                  <tbody id="eventLogTableBody">
+                    <tr>
+                      <td colspan="5" class="muted">
+                        Run Read Event Log to populate.
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>
-        </div>
-      </section>
 
-      <section class="card">
-        <h2>Log</h2>
-        <div class="row" style="margin-bottom: 10px;">
-          <label><input id="chkRawTxRx" type="checkbox" /> Log raw TX/RX bytes</label>
-          <button id="btnLogClear">Clear</button>
-        </div>
-        <pre id="log" class="log-box"></pre>
-      </section>
+          <div id="tab-test" class="tab">
+            <div class="section">
+              <h3>Test Report</h3>
+              <p class="muted" style="font-size: 13px; margin: 0 0 10px">
+                Runs <strong>TEST_REPORT (0xFE)</strong> on the device. The
+                device sends a rolling text report delimited by the TEST START
+                banner. PASS and FAIL results are highlighted.
+              </p>
+              <div class="row" style="align-items: center; gap: 12px">
+                <label style="margin: 0"
+                  >Factory Test
+                  <select id="testReportFactoryType">
+                    <option value="0">Test all (0)</option>
+                    <option value="1">LED's (1)</option>
+                    <option value="2">IC's (2)</option>
+                    <option value="3">LED States (3)</option>
+                  </select>
+                </label>
+                <button
+                  data-action="runHardwareTestReport"
+                  id="btnRunTestReport"
+                  class="primary"
+                  disabled
+                >
+                  Run Test Report
+                </button>
+                <div class="muted" id="testHwIdStatus">
+                  HW revision unavailable. Read production config first.
+                </div>
+              </div>
+              <dialog id="testReportDialog" class="test-report-dialog">
+                <div class="test-report-head">
+                  <strong>Hardware Test Report</strong>
+                  <button id="btnTestReportClose" type="button">Close</button>
+                </div>
+                <div id="testReportPre" class="test-report-body"></div>
+              </dialog>
+            </div>
+
+            <div class="section">
+              <h3>Hardware Test (deprecated)</h3>
+              <div class="section-grid-2">
+                <label
+                  >Test Mode
+                  <select id="testModeSelect">
+                    <option value="0">EXIT (0x00)</option>
+                    <option value="1">SHORT_TERM_FLASH1 (0x01)</option>
+                    <option value="2">SHORT_TERM_FLASH2 (0x02)</option>
+                    <option value="3">LONG_TERM_FLASH (0x03)</option>
+                    <option value="4">EEPROM (0x04)</option>
+                    <option value="5">ACCEL_1 (0x05)</option>
+                    <option value="6">BATT_VOLTAGE (0x06)</option>
+                    <option value="7">USB_POWER_GOOD (0x07)</option>
+                    <option value="8">ACCEL2 (0x08)</option>
+                    <option value="9">MAX86XXX (0x09)</option>
+                    <option value="10">UNUSED (0x0A)</option>
+                    <option value="11">MAX30002 (0x0B)</option>
+                    <option value="12">LSM6DSV (0x0C)</option>
+                    <option value="13">LIS2MDL (0x0D)</option>
+                    <option value="255" selected>ALL (0xFF)</option>
+                  </select>
+                </label>
+              </div>
+              <div class="row">
+                <button
+                  data-action="runHardwareTest"
+                  id="btnRunHardwareTest"
+                  disabled
+                >
+                  Run Hardware Test
+                </button>
+              </div>
+            </div>
+
+            <div class="section">
+              <h3>Advanced</h3>
+              <div class="row">
+                <button data-action="loadTestLookup">Load Test Lookup</button>
+              </div>
+              <div class="section-grid-2">
+                <label
+                  >LED Index
+                  <input
+                    id="testLedIndex"
+                    type="number"
+                    value="0"
+                    min="0"
+                    max="255"
+                /></label>
+                <div class="row">
+                  <button data-action="ledTest">LED Test</button>
+                  <button data-action="maxLedStart">
+                    MAX86xxx LED Test Start
+                  </button>
+                  <button data-action="maxLedStop">
+                    MAX86xxx LED Test Stop
+                  </button>
+                </div>
+              </div>
+              <div class="section-grid-2">
+                <label
+                  >Loop Count
+                  <input
+                    id="testLoopCount"
+                    type="number"
+                    value="10"
+                    min="0"
+                    max="65535"
+                /></label>
+                <div class="row">
+                  <button data-action="transferLoop">
+                    Data Transfer Loop Test
+                  </button>
+                  <button data-action="icPowerTest">
+                    IC Power Consumption Test
+                  </button>
+                  <button data-action="powerProfiler">
+                    Start Power Profiler
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Log</h2>
+          <div class="row" style="margin-bottom: 10px">
+            <label
+              ><input id="chkRawTxRx" type="checkbox" /> Log raw TX/RX
+              bytes</label
+            >
+            <button id="btnLogClear">Clear</button>
+          </div>
+          <pre id="log" class="log-box"></pre>
+        </section>
+      </div>
     </div>
-  </div>
 
-  <!-- Nordic Secure DFU library dependencies (thegecko/web-bluetooth-dfu) -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/crc-32/1.0.2/crc32.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.3/jszip.min.js"></script>
-  <script src="https://unpkg.com/web-bluetooth-dfu@1.2.1/examples/package.js"></script>
-  <script src="https://unpkg.com/web-bluetooth-dfu@1.2.1/dist/secure-dfu.js"></script>
-  <script>
-    (function () {
-      var dfuPackage = null;
+    <!-- Nordic Secure DFU library dependencies (thegecko/web-bluetooth-dfu) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crc-32/1.0.2/crc32.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.1.3/jszip.min.js"></script>
+    <script src="https://unpkg.com/web-bluetooth-dfu@1.2.1/examples/package.js"></script>
+    <script src="https://unpkg.com/web-bluetooth-dfu@1.2.1/dist/secure-dfu.js"></script>
+    <script>
+      (function () {
+        var dfuPackage = null;
 
-      function dfuSetStatus(msg) {
-        var el = document.getElementById('dfu-status-msg');
-        if (el) el.textContent = msg;
-      }
-
-      function dfuSetTransfer(progress) {
-        var statusBar = document.getElementById('dfu-status-bar');
-        var selectEl = document.getElementById('dfu-select');
-        var bar = document.getElementById('dfu-bar');
-        var transfer = document.getElementById('dfu-transfer');
-        if (!progress) {
-          if (statusBar) statusBar.style.visibility = 'hidden';
-          return;
-        }
-        if (selectEl) selectEl.style.visibility = 'hidden';
-        if (statusBar) statusBar.style.visibility = 'visible';
-        if (bar) bar.style.width = (progress.currentBytes / progress.totalBytes * 100) + '%';
-        if (transfer) transfer.textContent = progress.currentBytes + '/' + progress.totalBytes + ' ' + progress.object + ' bytes written';
-      }
-
-      function dfuSetDropLabel(strong, sub) {
-        var label = document.getElementById('dfu-label');
-        if (!label) return;
-        var strongEl = label.querySelector('strong');
-        var spanEl = label.querySelector('span');
-        if (strongEl) strongEl.textContent = strong;
-        if (spanEl) spanEl.textContent = sub;
-      }
-
-      function dfuSetPackage(file) {
-        if (!file) return;
-        if (typeof SecureDfuPackage === 'undefined') {
-          dfuSetStatus('DFU library not loaded — check internet connection.');
-          return;
-        }
-        dfuSetDropLabel('Loading ' + file.name + '…', '');
-        dfuPackage = new SecureDfuPackage(file);
-        dfuPackage.load()
-          .then(function () {
-            dfuSetDropLabel('\u2705 ' + file.name, 'Click or drag to swap firmware package');
-            dfuSetStatus('Ready — click Begin Update to start.');
-            var sel = document.getElementById('dfu-select');
-            if (sel) sel.style.visibility = 'visible';
-          })
-          .catch(function (error) {
-            dfuSetDropLabel('Choose a firmware package (.zip)', 'or drag and drop here');
-            var sel = document.getElementById('dfu-select');
-            if (sel) sel.style.visibility = 'hidden';
-            dfuSetTransfer(null);
-            dfuSetStatus(String(error));
-          });
-      }
-
-      function dfuUpdate(dfu, device) {
-        if (!dfuPackage) return;
-        Promise.resolve()
-          .then(function () { return dfuPackage.getBaseImage(); })
-          .then(function (image) {
-            if (image) {
-              dfuSetStatus('Updating ' + image.type + ': ' + image.imageFile + '...');
-              return dfu.update(device, image.initData, image.imageData);
-            }
-          })
-          .then(function () { return dfuPackage.getAppImage(); })
-          .then(function (image) {
-            if (image) {
-              dfuSetStatus('Updating ' + image.type + ': ' + image.imageFile + '...');
-              return dfu.update(device, image.initData, image.imageData);
-            }
-          })
-          .then(function () {
-            dfuSetStatus('Update complete!');
-            dfuSetTransfer(null);
-            var fileEl = document.getElementById('dfu-file');
-            if (fileEl) fileEl.value = '';
-          })
-          .catch(function (error) {
-            dfuSetTransfer(null);
-            dfuSetStatus(String(error));
-          });
-      }
-
-      function dfuBeginUpdate() {
-        if (!dfuPackage) {
-          dfuSetStatus('Choose a firmware package (.zip) first.');
-          return;
-        }
-        if (typeof SecureDfu === 'undefined' || typeof CRC32 === 'undefined') {
-          dfuSetStatus('DFU library not loaded — check internet/CDN access.');
-          return;
+        function dfuSetStatus(msg) {
+          var el = document.getElementById("dfu-status-msg");
+          if (el) el.textContent = msg;
         }
 
-        var dfu = new SecureDfu(CRC32.buf);
-        dfu.addEventListener('log', function (event) {
-          console.log('[DFU]', event.message);
-          dfuSetStatus(event.message);
-        });
-        dfu.addEventListener('progress', function (event) { dfuSetTransfer(event); });
+        function dfuSetTransfer(progress) {
+          var statusBar = document.getElementById("dfu-status-bar");
+          var selectEl = document.getElementById("dfu-select");
+          var bar = document.getElementById("dfu-bar");
+          var transfer = document.getElementById("dfu-transfer");
+          if (!progress) {
+            if (statusBar) statusBar.style.visibility = "hidden";
+            return;
+          }
+          if (selectEl) selectEl.style.visibility = "hidden";
+          if (statusBar) statusBar.style.visibility = "visible";
+          if (bar)
+            bar.style.width =
+              (progress.currentBytes / progress.totalBytes) * 100 + "%";
+          if (transfer)
+            transfer.textContent =
+              progress.currentBytes +
+              "/" +
+              progress.totalBytes +
+              " " +
+              progress.object +
+              " bytes written";
+        }
 
-        dfuSetStatus('Select the device from the browser picker (must be advertising the DFU service)...');
-        dfuSetTransfer(null);
+        function dfuSetDropLabel(strong, sub) {
+          var label = document.getElementById("dfu-label");
+          if (!label) return;
+          var strongEl = label.querySelector("strong");
+          var spanEl = label.querySelector("span");
+          if (strongEl) strongEl.textContent = strong;
+          if (spanEl) spanEl.textContent = sub;
+        }
 
-        // requestDevice(true) opens a picker filtered for the DFU service UUID and uses
-        // the buttonless DFU characteristic to trigger bootloader mode, then reconnects
-        // automatically. If DFU service is not active, use the DFU controls above first.
-        dfu.requestDevice(true)
-          .then(function (device) {
-            if (!device) {
-              dfuSetStatus('Buttonless reboot command sent. Device is rebooting into bootloader. Click Begin Update again to connect and flash.');
-              return;
-            }
-            dfuSetStatus('Device selected, starting transfer...');
-            return dfuUpdate(dfu, device);
-          })
-          .catch(function (error) {
-            dfuSetTransfer(null);
-            dfuSetStatus(String(error));
-          });
-      }
-
-      document.addEventListener('DOMContentLoaded', function () {
-        var dropEl = document.getElementById('dfu-drop');
-        var fileEl = document.getElementById('dfu-file');
-        var buttonEl = document.getElementById('dfu-button');
-
-        if (fileEl) fileEl.addEventListener('change', function (e) { dfuSetPackage(e.target.files[0]); });
-        if (buttonEl) buttonEl.addEventListener('click', dfuBeginUpdate);
-
-        if (dropEl) {
-          ['drag', 'dragstart', 'dragend', 'dragover', 'dragenter', 'dragleave', 'drop'].forEach(function (name) {
-            dropEl.addEventListener(name, function (e) { e.preventDefault(); e.stopPropagation(); });
-          });
-          ['dragover', 'dragenter'].forEach(function (name) {
-            dropEl.addEventListener(name, function () { dropEl.classList.add('hover'); });
-          });
-          ['dragleave', 'dragend', 'drop'].forEach(function (name) {
-            dropEl.addEventListener(name, function (e) {
-              dropEl.classList.remove('hover');
-              if (name === 'drop') dfuSetPackage(e.dataTransfer.files[0]);
+        function dfuSetPackage(file) {
+          if (!file) return;
+          if (typeof SecureDfuPackage === "undefined") {
+            dfuSetStatus("DFU library not loaded — check internet connection.");
+            return;
+          }
+          dfuSetDropLabel("Loading " + file.name + "…", "");
+          dfuPackage = new SecureDfuPackage(file);
+          dfuPackage
+            .load()
+            .then(function () {
+              dfuSetDropLabel(
+                "\u2705 " + file.name,
+                "Click or drag to swap firmware package",
+              );
+              dfuSetStatus("Ready — click Begin Update to start.");
+              var sel = document.getElementById("dfu-select");
+              if (sel) sel.style.visibility = "visible";
+            })
+            .catch(function (error) {
+              dfuSetDropLabel(
+                "Choose a firmware package (.zip)",
+                "or drag and drop here",
+              );
+              var sel = document.getElementById("dfu-select");
+              if (sel) sel.style.visibility = "hidden";
+              dfuSetTransfer(null);
+              dfuSetStatus(String(error));
             });
-          });
         }
-      });
-    })();
-  </script>
 
-  <script type="module">
-    import {
-      ASM_PROPERTY,
-      NORDIC_DFU_SERVICE,
-      FACTORY_TEST,
-      VerisenseBleDevice,
-      OP_IDX,
-      buildProductionConfigPayload,
-      parseLookupTablePayload,
-      parseProductionConfigPayloadFull,
-      parseStatusPayload,
-    } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+        function dfuUpdate(dfu, device) {
+          if (!dfuPackage) return;
+          Promise.resolve()
+            .then(function () {
+              return dfuPackage.getBaseImage();
+            })
+            .then(function (image) {
+              if (image) {
+                dfuSetStatus(
+                  "Updating " + image.type + ": " + image.imageFile + "...",
+                );
+                return dfu.update(device, image.initData, image.imageData);
+              }
+            })
+            .then(function () {
+              return dfuPackage.getAppImage();
+            })
+            .then(function (image) {
+              if (image) {
+                dfuSetStatus(
+                  "Updating " + image.type + ": " + image.imageFile + "...",
+                );
+                return dfu.update(device, image.initData, image.imageData);
+              }
+            })
+            .then(function () {
+              dfuSetStatus("Update complete!");
+              dfuSetTransfer(null);
+              var fileEl = document.getElementById("dfu-file");
+              if (fileEl) fileEl.value = "";
+            })
+            .catch(function (error) {
+              dfuSetTransfer(null);
+              dfuSetStatus(String(error));
+            });
+        }
 
-    const $ = (id) => document.getElementById(id);
-    const TEST_REPORT_MODE_ID = 0xfe;
-    const TEST_REPORT_DELIMITER =
-      "//**************************** TEST START ************************************\r\n";
+        function dfuBeginUpdate() {
+          if (!dfuPackage) {
+            dfuSetStatus("Choose a firmware package (.zip) first.");
+            return;
+          }
+          if (
+            typeof SecureDfu === "undefined" ||
+            typeof CRC32 === "undefined"
+          ) {
+            dfuSetStatus("DFU library not loaded — check internet/CDN access.");
+            return;
+          }
 
-    const ui = {
-      btnConnectBle: $("btnConnectBle"),
-      btnConnectSerial: $("btnConnectSerial"),
-      btnDisconnect: $("btnDisconnect"),
-      btnDisconnectRequest: $("btnDisconnectRequest"),
-      statusBadge: $("statusBadge"),
-      transportKind: $("transportKind"),
-      metaName: $("metaName"),
-      metaId: $("metaId"),
-      metaHw: $("metaHw"),
-      metaFw: $("metaFw"),
-      metaBatt: $("metaBatt"),
-      metaFlash: $("metaFlash"),
-      metaFlashBanks: $("metaFlashBanks"),
-      metaAttMtu: $("metaAttMtu"),
-      metaConnInterval: $("metaConnInterval"),
-      metaPhy: $("metaPhy"),
-      lookupSummary: $("lookupSummary"),
-      lookupTableBody: $("lookupTableBody"),
-      eventLogSummary: $("eventLogSummary"),
-      eventLogTableBody: $("eventLogTableBody"),
-      log: $("log"),
-      btnLogClear: $("btnLogClear"),
-      chkRawTxRx: $("chkRawTxRx"),
-      streamAccelCount: $("streamAccelCount"),
-      streamAdcCount: $("streamAdcCount"),
-      streamLastSensor: $("streamLastSensor"),
-      btnStreamStart: $("btnStreamStart"),
-      btnStreamStop: $("btnStreamStop"),
-      btnStreamClear: $("btnStreamClear"),
-      plotAccel: $("plotAccel"),
-      plotAccelInfo: $("plotAccelInfo"),
-      plotGsr: $("plotGsr"),
-      plotGsrInfo: $("plotGsrInfo"),
-      opAccelEnabled: $("opAccelEnabled"),
-      opAccelRateCfg: $("opAccelRateCfg"),
-      opAccelRange: $("opAccelRange"),
-      opGsrEnabled: $("opGsrEnabled"),
-      opBattEnabled: $("opBattEnabled"),
-      opGsrRange: $("opGsrRange"),
-      opGsrRateCfg: $("opGsrRateCfg"),
-      opGsrOverCfg: $("opGsrOverCfg"),
-      testModeSelect: $("testModeSelect"),
-      btnRunHardwareTest: $("btnRunHardwareTest"),
-      testReportFactoryType: $("testReportFactoryType"),
-      btnRunTestReport: $("btnRunTestReport"),
-      testHwIdStatus: $("testHwIdStatus"),
-      testReportDialog: $("testReportDialog"),
-      btnTestReportClose: $("btnTestReportClose"),
-      testReportPre: $("testReportPre"),
-      testLedIndex: $("testLedIndex"),
-      testLoopCount: $("testLoopCount"),
-      prodMonHex: $("prodMonHex"),
-      prodMacHex: $("prodMacHex"),
-      prodHwMajor: $("prodHwMajor"),
-      prodHwMinor: $("prodHwMinor"),
-      prodHwInternal: $("prodHwInternal"),
-      prodFwMajor: $("prodFwMajor"),
-      prodFwMinor: $("prodFwMinor"),
-      prodFwInternal: $("prodFwInternal"),
-      prodPasskeyId: $("prodPasskeyId"),
-      prodPasskey: $("prodPasskey"),
-      prodAdvPrefix: $("prodAdvPrefix"),
-      prodDfuEnabled: $("prodDfuEnabled"),
-      dfuServiceBadge: $("dfuServiceBadge"),
-      btnEnableDfuService: $("btnEnableDfuService"),
-      btnRebootBootloader: $("btnRebootBootloader"),
-    };
+          var dfu = new SecureDfu(CRC32.buf);
+          dfu.addEventListener("log", function (event) {
+            console.log("[DFU]", event.message);
+            dfuSetStatus(event.message);
+          });
+          dfu.addEventListener("progress", function (event) {
+            dfuSetTransfer(event);
+          });
 
-    const state = {
-      v: null,
-      isStreaming: false,
-      accelPackets: 0,
-      adcPackets: 0,
-      lastPacket: null,
-      lastStatusParsed: null,
-      lastLookupParsed: null,
-      lastProductionParsed: null,
-      dfuServiceActive: null,
-    };
+          dfuSetStatus(
+            "Select the device from the browser picker (must be advertising the DFU service)...",
+          );
+          dfuSetTransfer(null);
 
-    const accelCtx = ui.plotAccel?.getContext("2d");
-    const gsrCtx = ui.plotGsr?.getContext("2d");
+          // requestDevice(true) opens a picker filtered for the DFU service UUID and uses
+          // the buttonless DFU characteristic to trigger bootloader mode, then reconnects
+          // automatically. If DFU service is not active, use the DFU controls above first.
+          dfu
+            .requestDevice(true)
+            .then(function (device) {
+              if (!device) {
+                dfuSetStatus(
+                  "Buttonless reboot command sent. Device is rebooting into bootloader. Click Begin Update again to connect and flash.",
+                );
+                return;
+              }
+              dfuSetStatus("Device selected, starting transfer...");
+              return dfuUpdate(dfu, device);
+            })
+            .catch(function (error) {
+              dfuSetTransfer(null);
+              dfuSetStatus(String(error));
+            });
+        }
 
-    const PLOT_ACCEL_SECONDS = 8;
-    let accelHz = 51.2;
-    let accelMaxPoints = Math.ceil(PLOT_ACCEL_SECONDS * accelHz);
-    let accelX = new Float32Array(accelMaxPoints);
-    let accelY = new Float32Array(accelMaxPoints);
-    let accelZ = new Float32Array(accelMaxPoints);
-    let accelWrite = 0;
-    let accelCount = 0;
-    let accelRaf = null;
+        document.addEventListener("DOMContentLoaded", function () {
+          var dropEl = document.getElementById("dfu-drop");
+          var fileEl = document.getElementById("dfu-file");
+          var buttonEl = document.getElementById("dfu-button");
 
-    const PLOT_GSR_SECONDS = 20;
-    let gsrHz = 50;
-    let gsrMaxPoints = Math.ceil(PLOT_GSR_SECONDS * gsrHz);
-    let gsrVals = new Float32Array(gsrMaxPoints);
-    let gsrWrite = 0;
-    let gsrCount = 0;
-    let gsrRaf = null;
+          if (fileEl)
+            fileEl.addEventListener("change", function (e) {
+              dfuSetPackage(e.target.files[0]);
+            });
+          if (buttonEl) buttonEl.addEventListener("click", dfuBeginUpdate);
 
-    function setStatus(text) {
-      ui.statusBadge.textContent = text;
-    }
+          if (dropEl) {
+            [
+              "drag",
+              "dragstart",
+              "dragend",
+              "dragover",
+              "dragenter",
+              "dragleave",
+              "drop",
+            ].forEach(function (name) {
+              dropEl.addEventListener(name, function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+              });
+            });
+            ["dragover", "dragenter"].forEach(function (name) {
+              dropEl.addEventListener(name, function () {
+                dropEl.classList.add("hover");
+              });
+            });
+            ["dragleave", "dragend", "drop"].forEach(function (name) {
+              dropEl.addEventListener(name, function (e) {
+                dropEl.classList.remove("hover");
+                if (name === "drop") dfuSetPackage(e.dataTransfer.files[0]);
+              });
+            });
+          }
+        });
+      })();
+    </script>
 
-    function setTransport(text) {
-      ui.transportKind.textContent = text;
-      updateBleLinkInfo(text);
-      updateDisconnectRequestButtonState();
-    }
+    <script type="module">
+      import {
+        ASM_PROPERTY,
+        NORDIC_DFU_SERVICE,
+        FACTORY_TEST,
+        VerisenseBleDevice,
+        OP_IDX,
+        buildProductionConfigPayload,
+        parseLookupTablePayload,
+        parseProductionConfigPayloadFull,
+        parseStatusPayload,
+      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
-    function updateBleLinkInfo(transportKind = "none") {
-      if (transportKind === "ble") {
-        ui.metaAttMtu.textContent = "Not exposed by Web Bluetooth";
-        ui.metaConnInterval.textContent = "Not exposed by Web Bluetooth";
-        ui.metaPhy.textContent = "Not exposed by Web Bluetooth";
-        return;
-      }
-      if (transportKind === "serial") {
-        ui.metaAttMtu.textContent = "N/A (USB Serial)";
-        ui.metaConnInterval.textContent = "N/A (USB Serial)";
-        ui.metaPhy.textContent = "N/A (USB Serial)";
-        return;
-      }
-      ui.metaAttMtu.textContent = "-";
-      ui.metaConnInterval.textContent = "-";
-      ui.metaPhy.textContent = "-";
-    }
+      const $ = (id) => document.getElementById(id);
+      const TEST_REPORT_MODE_ID = 0xfe;
+      const TEST_REPORT_DELIMITER =
+        "//**************************** TEST START ************************************\r\n";
 
-    function setConnectionButtonsState({ connected }) {
-      ui.btnConnectBle.disabled = connected;
-      ui.btnConnectSerial.disabled = connected;
-      ui.btnDisconnect.disabled = !connected;
-      updateDisconnectRequestButtonState();
-    }
-
-    function updateDisconnectRequestButtonState() {
-      const connected = !ui.btnDisconnect.disabled;
-      const isBleTransport = ui.transportKind.textContent === "ble";
-      ui.btnDisconnectRequest.disabled = !(connected && isBleTransport);
-    }
-
-    function log(...args) {
-      const line = args
-        .map((v) => (typeof v === "string" ? v : JSON.stringify(v, null, 2)))
-        .join(" ");
-      ui.log.textContent += `${formatLogTime()} ${line}\n`;
-      ui.log.scrollTop = ui.log.scrollHeight;
-    }
-
-    function appendLogText(text) {
-      if (!text) return;
-      ui.log.textContent += text;
-      ui.log.scrollTop = ui.log.scrollHeight;
-    }
-
-    function formatLogTime(d = new Date()) {
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      const yyyy = d.getFullYear();
-      const HH = String(d.getHours()).padStart(2, "0");
-      const MM = String(d.getMinutes()).padStart(2, "0");
-      const SS = String(d.getSeconds()).padStart(2, "0");
-      return `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}:`;
-    }
-
-    function formatUnixAndHuman(unixSeconds) {
-      const unix = Number(unixSeconds);
-      if (!Number.isFinite(unix)) return { unix: unixSeconds, human: "invalid" };
-      if (unix <= 0) return { unix, human: "1970-01-01 00:00:00 (epoch)" };
-      if (unix > 4102444800) return { unix, human: "not-valid" };
-      const d = new Date(unix * 1000);
-      const yyyy = d.getFullYear();
-      const mm = String(d.getMonth() + 1).padStart(2, "0");
-      const dd = String(d.getDate()).padStart(2, "0");
-      const HH = String(d.getHours()).padStart(2, "0");
-      const MM = String(d.getMinutes()).padStart(2, "0");
-      const SS = String(d.getSeconds()).padStart(2, "0");
-      return {
-        unix,
-        human: `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`,
-      };
-    }
-
-    function formatStatusForLog(status) {
-      return {
-        ...status,
-        statusTimestamp: formatUnixAndHuman(status.statusTimestampSeconds),
-        lastOkTransfer: formatUnixAndHuman(status.lastOkTransferSeconds),
-        lastFailTransfer: formatUnixAndHuman(status.lastFailTransferSeconds),
-      };
-    }
-
-    function formatSchedulerForLog(parsed) {
-      const out = {
-        ...parsed,
-        currentTime: formatUnixAndHuman(parsed.currentTimeUnixSeconds),
-        pendingDataTransfer: formatUnixAndHuman(parsed.pendingDataTransferUnixSeconds),
-        pendingStatus1: formatUnixAndHuman(parsed.pendingStatus1UnixSeconds),
-        pendingRtcSync: formatUnixAndHuman(parsed.pendingRtcSyncUnixSeconds),
-        pendingRetry: formatUnixAndHuman(parsed.pendingRetryUnixSeconds),
+      const ui = {
+        btnConnectBle: $("btnConnectBle"),
+        btnConnectSerial: $("btnConnectSerial"),
+        btnDisconnect: $("btnDisconnect"),
+        btnDisconnectRequest: $("btnDisconnectRequest"),
+        statusBadge: $("statusBadge"),
+        transportKind: $("transportKind"),
+        metaName: $("metaName"),
+        metaId: $("metaId"),
+        metaHw: $("metaHw"),
+        metaFw: $("metaFw"),
+        metaBatt: $("metaBatt"),
+        metaFlash: $("metaFlash"),
+        metaFlashBanks: $("metaFlashBanks"),
+        metaAttMtu: $("metaAttMtu"),
+        metaConnInterval: $("metaConnInterval"),
+        metaPhy: $("metaPhy"),
+        lookupSummary: $("lookupSummary"),
+        lookupTableBody: $("lookupTableBody"),
+        eventLogSummary: $("eventLogSummary"),
+        eventLogTableBody: $("eventLogTableBody"),
+        log: $("log"),
+        btnLogClear: $("btnLogClear"),
+        chkRawTxRx: $("chkRawTxRx"),
+        streamAccelCount: $("streamAccelCount"),
+        streamAdcCount: $("streamAdcCount"),
+        streamLastSensor: $("streamLastSensor"),
+        btnStreamStart: $("btnStreamStart"),
+        btnStreamStop: $("btnStreamStop"),
+        btnStreamClear: $("btnStreamClear"),
+        plotAccel: $("plotAccel"),
+        plotAccelInfo: $("plotAccelInfo"),
+        plotGsr: $("plotGsr"),
+        plotGsrInfo: $("plotGsrInfo"),
+        opAccelEnabled: $("opAccelEnabled"),
+        opAccelRateCfg: $("opAccelRateCfg"),
+        opAccelRange: $("opAccelRange"),
+        opGsrEnabled: $("opGsrEnabled"),
+        opBattEnabled: $("opBattEnabled"),
+        opGsrRange: $("opGsrRange"),
+        opGsrRateCfg: $("opGsrRateCfg"),
+        opGsrOverCfg: $("opGsrOverCfg"),
+        testModeSelect: $("testModeSelect"),
+        btnRunHardwareTest: $("btnRunHardwareTest"),
+        testReportFactoryType: $("testReportFactoryType"),
+        btnRunTestReport: $("btnRunTestReport"),
+        testHwIdStatus: $("testHwIdStatus"),
+        testReportDialog: $("testReportDialog"),
+        btnTestReportClose: $("btnTestReportClose"),
+        testReportPre: $("testReportPre"),
+        testLedIndex: $("testLedIndex"),
+        testLoopCount: $("testLoopCount"),
+        prodMonHex: $("prodMonHex"),
+        prodMacHex: $("prodMacHex"),
+        prodHwMajor: $("prodHwMajor"),
+        prodHwMinor: $("prodHwMinor"),
+        prodHwInternal: $("prodHwInternal"),
+        prodFwMajor: $("prodFwMajor"),
+        prodFwMinor: $("prodFwMinor"),
+        prodFwInternal: $("prodFwInternal"),
+        prodPasskeyId: $("prodPasskeyId"),
+        prodPasskey: $("prodPasskey"),
+        prodAdvPrefix: $("prodAdvPrefix"),
+        prodDfuEnabled: $("prodDfuEnabled"),
+        dfuServiceBadge: $("dfuServiceBadge"),
+        btnEnableDfuService: $("btnEnableDfuService"),
+        btnRebootBootloader: $("btnRebootBootloader"),
       };
 
-      if (typeof parsed.pendingStatus2UnixSeconds === "number") {
-        out.pendingStatus2 = formatUnixAndHuman(parsed.pendingStatus2UnixSeconds);
+      const state = {
+        v: null,
+        isStreaming: false,
+        accelPackets: 0,
+        adcPackets: 0,
+        lastPacket: null,
+        lastStatusParsed: null,
+        lastLookupParsed: null,
+        lastProductionParsed: null,
+        dfuServiceActive: null,
+      };
+
+      const accelCtx = ui.plotAccel?.getContext("2d");
+      const gsrCtx = ui.plotGsr?.getContext("2d");
+
+      const PLOT_ACCEL_SECONDS = 8;
+      let accelHz = 51.2;
+      let accelMaxPoints = Math.ceil(PLOT_ACCEL_SECONDS * accelHz);
+      let accelX = new Float32Array(accelMaxPoints);
+      let accelY = new Float32Array(accelMaxPoints);
+      let accelZ = new Float32Array(accelMaxPoints);
+      let accelWrite = 0;
+      let accelCount = 0;
+      let accelRaf = null;
+
+      const PLOT_GSR_SECONDS = 20;
+      let gsrHz = 50;
+      let gsrMaxPoints = Math.ceil(PLOT_GSR_SECONDS * gsrHz);
+      let gsrVals = new Float32Array(gsrMaxPoints);
+      let gsrWrite = 0;
+      let gsrCount = 0;
+      let gsrRaf = null;
+
+      function setStatus(text) {
+        ui.statusBadge.textContent = text;
       }
-      if (typeof parsed.ppgMeasurementUnixSeconds === "number") {
-        out.ppgMeasurement = formatUnixAndHuman(parsed.ppgMeasurementUnixSeconds);
+
+      function setTransport(text) {
+        ui.transportKind.textContent = text;
+        updateBleLinkInfo(text);
+        updateDisconnectRequestButtonState();
       }
-      if (typeof parsed.stepCounterResetUnixSeconds === "number") {
-        out.stepCounterReset = formatUnixAndHuman(parsed.stepCounterResetUnixSeconds);
+
+      function updateBleLinkInfo(transportKind = "none") {
+        if (transportKind === "ble") {
+          ui.metaAttMtu.textContent = "Not exposed by Web Bluetooth";
+          ui.metaConnInterval.textContent = "Not exposed by Web Bluetooth";
+          ui.metaPhy.textContent = "Not exposed by Web Bluetooth";
+          return;
+        }
+        if (transportKind === "serial") {
+          ui.metaAttMtu.textContent = "N/A (USB Serial)";
+          ui.metaConnInterval.textContent = "N/A (USB Serial)";
+          ui.metaPhy.textContent = "N/A (USB Serial)";
+          return;
+        }
+        ui.metaAttMtu.textContent = "-";
+        ui.metaConnInterval.textContent = "-";
+        ui.metaPhy.textContent = "-";
       }
-      if (typeof parsed.sensorInactivityUnixSeconds === "number") {
-        out.sensorInactivity = formatUnixAndHuman(parsed.sensorInactivityUnixSeconds);
+
+      function setConnectionButtonsState({ connected }) {
+        ui.btnConnectBle.disabled = connected;
+        ui.btnConnectSerial.disabled = connected;
+        ui.btnDisconnect.disabled = !connected;
+        updateDisconnectRequestButtonState();
       }
-      if (parsed.adaptiveScheduler) {
-        out.adaptiveScheduler = {
-          ...parsed.adaptiveScheduler,
-          nextTime: formatUnixAndHuman(parsed.adaptiveScheduler.nextUnixSeconds),
+
+      function updateDisconnectRequestButtonState() {
+        const connected = !ui.btnDisconnect.disabled;
+        const isBleTransport = ui.transportKind.textContent === "ble";
+        ui.btnDisconnectRequest.disabled = !(connected && isBleTransport);
+      }
+
+      function log(...args) {
+        const line = args
+          .map((v) => (typeof v === "string" ? v : JSON.stringify(v, null, 2)))
+          .join(" ");
+        ui.log.textContent += `${formatLogTime()} ${line}\n`;
+        ui.log.scrollTop = ui.log.scrollHeight;
+      }
+
+      function appendLogText(text) {
+        if (!text) return;
+        ui.log.textContent += text;
+        ui.log.scrollTop = ui.log.scrollHeight;
+      }
+
+      function formatLogTime(d = new Date()) {
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        const yyyy = d.getFullYear();
+        const HH = String(d.getHours()).padStart(2, "0");
+        const MM = String(d.getMinutes()).padStart(2, "0");
+        const SS = String(d.getSeconds()).padStart(2, "0");
+        return `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}:`;
+      }
+
+      function formatUnixAndHuman(unixSeconds) {
+        const unix = Number(unixSeconds);
+        if (!Number.isFinite(unix))
+          return { unix: unixSeconds, human: "invalid" };
+        if (unix <= 0) return { unix, human: "1970-01-01 00:00:00 (epoch)" };
+        if (unix > 4102444800) return { unix, human: "not-valid" };
+        const d = new Date(unix * 1000);
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        const HH = String(d.getHours()).padStart(2, "0");
+        const MM = String(d.getMinutes()).padStart(2, "0");
+        const SS = String(d.getSeconds()).padStart(2, "0");
+        return {
+          unix,
+          human: `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`,
         };
       }
-      if (parsed.ltfRetry) {
-        out.ltfRetry = {
-          ...parsed.ltfRetry,
-          nextTime: formatUnixAndHuman(parsed.ltfRetry.nextUnixSeconds),
+
+      function formatStatusForLog(status) {
+        return {
+          ...status,
+          statusTimestamp: formatUnixAndHuman(status.statusTimestampSeconds),
+          lastOkTransfer: formatUnixAndHuman(status.lastOkTransferSeconds),
+          lastFailTransfer: formatUnixAndHuman(status.lastFailTransferSeconds),
         };
       }
 
-      return out;
-    }
+      function formatSchedulerForLog(parsed) {
+        const out = {
+          ...parsed,
+          currentTime: formatUnixAndHuman(parsed.currentTimeUnixSeconds),
+          pendingDataTransfer: formatUnixAndHuman(
+            parsed.pendingDataTransferUnixSeconds,
+          ),
+          pendingStatus1: formatUnixAndHuman(parsed.pendingStatus1UnixSeconds),
+          pendingRtcSync: formatUnixAndHuman(parsed.pendingRtcSyncUnixSeconds),
+          pendingRetry: formatUnixAndHuman(parsed.pendingRetryUnixSeconds),
+        };
 
-    function inferLookupBankCount(payloadLen) {
-      if (!Number.isFinite(payloadLen) || payloadLen <= 0) return 0;
-      if (payloadLen >= 4 && (payloadLen - 4) % 3 === 0) return Math.floor((payloadLen - 4) / 3);
-      if (payloadLen % 3 === 0) return Math.floor(payloadLen / 3);
-      return 0;
-    }
+        if (typeof parsed.pendingStatus2UnixSeconds === "number") {
+          out.pendingStatus2 = formatUnixAndHuman(
+            parsed.pendingStatus2UnixSeconds,
+          );
+        }
+        if (typeof parsed.ppgMeasurementUnixSeconds === "number") {
+          out.ppgMeasurement = formatUnixAndHuman(
+            parsed.ppgMeasurementUnixSeconds,
+          );
+        }
+        if (typeof parsed.stepCounterResetUnixSeconds === "number") {
+          out.stepCounterReset = formatUnixAndHuman(
+            parsed.stepCounterResetUnixSeconds,
+          );
+        }
+        if (typeof parsed.sensorInactivityUnixSeconds === "number") {
+          out.sensorInactivity = formatUnixAndHuman(
+            parsed.sensorInactivityUnixSeconds,
+          );
+        }
+        if (parsed.adaptiveScheduler) {
+          out.adaptiveScheduler = {
+            ...parsed.adaptiveScheduler,
+            nextTime: formatUnixAndHuman(
+              parsed.adaptiveScheduler.nextUnixSeconds,
+            ),
+          };
+        }
+        if (parsed.ltfRetry) {
+          out.ltfRetry = {
+            ...parsed.ltfRetry,
+            nextTime: formatUnixAndHuman(parsed.ltfRetry.nextUnixSeconds),
+          };
+        }
 
-    function renderLookupTable(parsed) {
-      state.lastLookupParsed = parsed;
-      if (!ui.lookupTableBody) return;
+        return out;
+      }
 
-      const entries = parsed?.entries ?? [];
-      if (!entries.length) {
-        ui.lookupTableBody.innerHTML = `<tr><td colspan="5" class="muted">No lookup entries returned.</td></tr>`;
-      } else {
-        ui.lookupTableBody.innerHTML = entries.map((e) => {
-          return `<tr>
+      function inferLookupBankCount(payloadLen) {
+        if (!Number.isFinite(payloadLen) || payloadLen <= 0) return 0;
+        if (payloadLen >= 4 && (payloadLen - 4) % 3 === 0)
+          return Math.floor((payloadLen - 4) / 3);
+        if (payloadLen % 3 === 0) return Math.floor(payloadLen / 3);
+        return 0;
+      }
+
+      function renderLookupTable(parsed) {
+        state.lastLookupParsed = parsed;
+        if (!ui.lookupTableBody) return;
+
+        const entries = parsed?.entries ?? [];
+        if (!entries.length) {
+          ui.lookupTableBody.innerHTML = `<tr><td colspan="5" class="muted">No lookup entries returned.</td></tr>`;
+        } else {
+          ui.lookupTableBody.innerHTML = entries
+            .map((e) => {
+              return `<tr>
             <td>${e.bankIndex}</td>
             <td>${e.statusName}</td>
             <td>${e.statusCode}</td>
             <td>${e.payloadIndex}</td>
             <td>${e.pendingEepromWrite ? "yes" : "no"}</td>
           </tr>`;
-        }).join("");
-      }
-
-      const counts = { Full: 0, "2Del": 0, Emty: 0, Bad: 0, NUse: 0, Zero: 0, Unknown: 0 };
-      for (const e of entries) counts[e.statusName] = (counts[e.statusName] ?? 0) + 1;
-      const summaryParts = [
-        `Banks: ${entries.length}`,
-        parsed?.head != null ? `Head: ${parsed.head}` : null,
-        parsed?.tail != null ? `Tail: ${parsed.tail}` : null,
-        `Full: ${counts.Full}`,
-        `2Del: ${counts["2Del"]}`,
-        `Bad: ${counts.Bad}`,
-        `Empty: ${counts.Emty}`,
-      ].filter(Boolean);
-      if (ui.lookupSummary) ui.lookupSummary.textContent = summaryParts.join(" | ");
-
-      log("lookup.table", {
-        banks: entries.length,
-        head: parsed?.head ?? null,
-        tail: parsed?.tail ?? null,
-        counts,
-      });
-    }
-
-    function renderEventLogTable(entries) {
-      if (!ui.eventLogTableBody) return;
-      if (!entries?.length) {
-        ui.eventLogTableBody.innerHTML = `<tr><td colspan="5" class="muted">No event log entries returned.</td></tr>`;
-        if (ui.eventLogSummary) ui.eventLogSummary.textContent = "No entries.";
-        return;
-      }
-      ui.eventLogTableBody.innerHTML = entries.map((e) => {
-        let tsCell;
-        if (e.timestampUnixSeconds !== null) {
-          const t = formatUnixAndHuman(e.timestampUnixSeconds);
-          tsCell = typeof t === "object" ? t.human : String(t);
-        } else {
-          tsCell = "-";
+            })
+            .join("");
         }
-        const battCell = e.batteryMilliVolts !== null ? `${e.batteryMilliVolts} mV` : "-";
-        return `<tr>
+
+        const counts = {
+          Full: 0,
+          "2Del": 0,
+          Emty: 0,
+          Bad: 0,
+          NUse: 0,
+          Zero: 0,
+          Unknown: 0,
+        };
+        for (const e of entries)
+          counts[e.statusName] = (counts[e.statusName] ?? 0) + 1;
+        const summaryParts = [
+          `Banks: ${entries.length}`,
+          parsed?.head != null ? `Head: ${parsed.head}` : null,
+          parsed?.tail != null ? `Tail: ${parsed.tail}` : null,
+          `Full: ${counts.Full}`,
+          `2Del: ${counts["2Del"]}`,
+          `Bad: ${counts.Bad}`,
+          `Empty: ${counts.Emty}`,
+        ].filter(Boolean);
+        if (ui.lookupSummary)
+          ui.lookupSummary.textContent = summaryParts.join(" | ");
+
+        log("lookup.table", {
+          banks: entries.length,
+          head: parsed?.head ?? null,
+          tail: parsed?.tail ?? null,
+          counts,
+        });
+      }
+
+      function renderEventLogTable(entries) {
+        if (!ui.eventLogTableBody) return;
+        if (!entries?.length) {
+          ui.eventLogTableBody.innerHTML = `<tr><td colspan="5" class="muted">No event log entries returned.</td></tr>`;
+          if (ui.eventLogSummary)
+            ui.eventLogSummary.textContent = "No entries.";
+          return;
+        }
+        ui.eventLogTableBody.innerHTML = entries
+          .map((e) => {
+            let tsCell;
+            if (e.timestampUnixSeconds !== null) {
+              const t = formatUnixAndHuman(e.timestampUnixSeconds);
+              tsCell = typeof t === "object" ? t.human : String(t);
+            } else {
+              tsCell = "-";
+            }
+            const battCell =
+              e.batteryMilliVolts !== null ? `${e.batteryMilliVolts} mV` : "-";
+            return `<tr>
           <td>${e.index}</td>
           <td>${e.eventId}</td>
           <td>${e.eventName}</td>
           <td>${tsCell}</td>
           <td>${battCell}</td>
         </tr>`;
-      }).join("");
-      if (ui.eventLogSummary) ui.eventLogSummary.textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"} received.`;
-    }
+          })
+          .join("");
+        if (ui.eventLogSummary)
+          ui.eventLogSummary.textContent = `${entries.length} entr${entries.length === 1 ? "y" : "ies"} received.`;
+      }
 
-    function toHexByte(v) {
-      return `0x${(v & 0xff).toString(16).toUpperCase().padStart(2, "0")}`;
-    }
+      function toHexByte(v) {
+        return `0x${(v & 0xff).toString(16).toUpperCase().padStart(2, "0")}`;
+      }
 
-    function toHexArray(bytes) {
-      const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
-      return `[${Array.from(u8, (b) => toHexByte(b)).join(", ")}]`;
-    }
+      function toHexArray(bytes) {
+        const u8 =
+          bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
+        return `[${Array.from(u8, (b) => toHexByte(b)).join(", ")}]`;
+      }
 
-    const ASM_PROPERTY_BY_VALUE = new Map(
-      Object.entries(ASM_PROPERTY).map(([name, value]) => [Number(value), name]),
-    );
+      const ASM_PROPERTY_BY_VALUE = new Map(
+        Object.entries(ASM_PROPERTY).map(([name, value]) => [
+          Number(value),
+          name,
+        ]),
+      );
 
-    function formatPendingEventsForLog(pendingProps) {
-      const list = Array.isArray(pendingProps) ? pendingProps : [];
-      return list.map((prop) => {
-        const value = Number(prop) & 0xff;
+      function formatPendingEventsForLog(pendingProps) {
+        const list = Array.isArray(pendingProps) ? pendingProps : [];
+        return list.map((prop) => {
+          const value = Number(prop) & 0xff;
+          return {
+            value,
+            hex: toHexByte(value),
+            property: ASM_PROPERTY_BY_VALUE.get(value) ?? "UNKNOWN_PROPERTY",
+          };
+        });
+      }
+
+      function isDebugHeaderNackError(err) {
+        const msg = String(err?.message ?? err ?? "");
+        return /NACK command=0x(?:50|60|70) property=0x9/i.test(msg);
+      }
+
+      function logRaw(prefix, bytes) {
+        ui.log.textContent += `${formatLogTime()} ${prefix}: ${toHexArray(bytes)}\r\n`;
+        ui.log.scrollTop = ui.log.scrollHeight;
+      }
+
+      function toCleanHex(text) {
+        return String(text ?? "")
+          .replace(/[^0-9a-fA-F]/g, "")
+          .toUpperCase();
+      }
+
+      function syncProdEditorFromParsed(parsed) {
+        if (!parsed) return;
+        ui.prodMonHex.value = toCleanHex(parsed.manufacturingOrderNumber ?? "");
+        ui.prodMacHex.value = toCleanHex(parsed.macId ?? "");
+        ui.prodHwMajor.value = String(parsed.revHwMajor ?? 0);
+        ui.prodHwMinor.value = String(parsed.revHwMinor ?? 0);
+        ui.prodHwInternal.value = String(parsed.revHwInternal ?? 0);
+        ui.prodFwMajor.value = String(parsed.revFwMajor ?? 0);
+        ui.prodFwMinor.value = String(parsed.revFwMinor ?? 0);
+        ui.prodFwInternal.value = String(parsed.revFwInternal ?? 0);
+        ui.prodPasskeyId.value = parsed.passkeyId ?? "";
+        ui.prodPasskey.value = parsed.passkey ?? "";
+        ui.prodAdvPrefix.value = parsed.advertisingNamePrefix ?? "";
+        ui.prodDfuEnabled.checked = !!parsed.dfuEnabled;
+      }
+
+      function getProductionHwRevision() {
+        const p = state.lastProductionParsed;
+        if (!p) return null;
+        const major = Number(p.revHwMajor);
+        const minor = Number(p.revHwMinor);
+        const internal = Number(p.revHwInternal);
+        if (
+          !Number.isFinite(major) ||
+          !Number.isFinite(minor) ||
+          !Number.isFinite(internal)
+        )
+          return null;
+        if (
+          major <= 0 ||
+          major > 255 ||
+          minor < 0 ||
+          minor > 255 ||
+          internal < 0 ||
+          internal > 65535
+        )
+          return null;
         return {
-          value,
-          hex: toHexByte(value),
-          property: ASM_PROPERTY_BY_VALUE.get(value) ?? "UNKNOWN_PROPERTY",
-        };
-      });
-    }
-
-    function isDebugHeaderNackError(err) {
-      const msg = String(err?.message ?? err ?? "");
-      return /NACK command=0x(?:50|60|70) property=0x9/i.test(msg);
-    }
-
-    function logRaw(prefix, bytes) {
-      ui.log.textContent += `${formatLogTime()} ${prefix}: ${toHexArray(bytes)}\r\n`;
-      ui.log.scrollTop = ui.log.scrollHeight;
-    }
-
-    function toCleanHex(text) {
-      return String(text ?? "").replace(/[^0-9a-fA-F]/g, "").toUpperCase();
-    }
-
-    function syncProdEditorFromParsed(parsed) {
-      if (!parsed) return;
-      ui.prodMonHex.value = toCleanHex(parsed.manufacturingOrderNumber ?? "");
-      ui.prodMacHex.value = toCleanHex(parsed.macId ?? "");
-      ui.prodHwMajor.value = String(parsed.revHwMajor ?? 0);
-      ui.prodHwMinor.value = String(parsed.revHwMinor ?? 0);
-      ui.prodHwInternal.value = String(parsed.revHwInternal ?? 0);
-      ui.prodFwMajor.value = String(parsed.revFwMajor ?? 0);
-      ui.prodFwMinor.value = String(parsed.revFwMinor ?? 0);
-      ui.prodFwInternal.value = String(parsed.revFwInternal ?? 0);
-      ui.prodPasskeyId.value = parsed.passkeyId ?? "";
-      ui.prodPasskey.value = parsed.passkey ?? "";
-      ui.prodAdvPrefix.value = parsed.advertisingNamePrefix ?? "";
-      ui.prodDfuEnabled.checked = !!parsed.dfuEnabled;
-    }
-
-    function getProductionHwRevision() {
-      const p = state.lastProductionParsed;
-      if (!p) return null;
-      const major = Number(p.revHwMajor);
-      const minor = Number(p.revHwMinor);
-      const internal = Number(p.revHwInternal);
-      if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(internal)) return null;
-      if (major <= 0 || major > 255 || minor < 0 || minor > 255 || internal < 0 || internal > 65535) return null;
-      return {
-        major: Math.trunc(major),
-        minor: Math.trunc(minor),
-        internal: Math.trunc(internal),
-      };
-    }
-
-    function updateHardwareTestAvailability() {
-      const hw = getProductionHwRevision();
-      if (ui.btnRunHardwareTest) ui.btnRunHardwareTest.disabled = !hw;
-      if (ui.btnRunTestReport) ui.btnRunTestReport.disabled = !hw;
-      if (ui.testHwIdStatus) {
-        ui.testHwIdStatus.textContent = hw
-          ? `HW revision from production config: ${hw.major}.${hw.minor}.${hw.internal}`
-          : "HW revision unavailable. Read production config first.";
-      }
-    }
-
-    function setTestReportDialogContent(text) {
-      if (!ui.testReportPre) return;
-      // Escape HTML then colour PASS/FAIL keywords
-      const escaped = text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-      const coloured = escaped
-        .replace(/\bPASS\b/g, '<span class="tr-pass">PASS</span>')
-        .replace(/\bFAIL\b/g, '<span class="tr-fail">FAIL</span>');
-      ui.testReportPre.innerHTML = coloured;
-      ui.testReportPre.scrollTop = ui.testReportPre.scrollHeight;
-    }
-
-    function updateDfuUpdateToolState(connected) {
-      var notice = document.getElementById('dfu-connected-notice');
-      var body = document.getElementById('dfu-update-body');
-      if (notice) notice.style.display = connected ? 'block' : 'none';
-      if (body) body.classList.toggle('dfu-disabled', !!connected);
-    }
-
-    function updateDfuServiceStatus(active) {
-      state.dfuServiceActive = active;
-      if (ui.dfuServiceBadge) {
-        if (active === null) {
-          ui.dfuServiceBadge.textContent = '\u2014 not connected \u2014';
-          ui.dfuServiceBadge.className = 'muted';
-        } else if (active) {
-          ui.dfuServiceBadge.textContent = 'Active \u2713';
-          ui.dfuServiceBadge.className = 'dfu-badge-active';
-        } else {
-          ui.dfuServiceBadge.textContent = 'Not active';
-          ui.dfuServiceBadge.className = 'dfu-badge-inactive';
-        }
-      }
-      if (ui.btnEnableDfuService) {
-        ui.btnEnableDfuService.disabled = active === true;
-        ui.btnEnableDfuService.title = active === true
-          ? 'DFU service is already active for this BLE session'
-          : '';
-      }
-      if (ui.btnRebootBootloader) {
-        const canReboot = active === true;
-        ui.btnRebootBootloader.disabled = !canReboot;
-        ui.btnRebootBootloader.title = canReboot
-          ? 'Writes 0x01 to Nordic buttonless DFU characteristic to reboot into bootloader'
-          : 'Requires Nordic DFU service to be active on this connection';
-      }
-      const noteEl = document.getElementById('dfuEnterDfuNote');
-      if (noteEl) {
-        noteEl.textContent = active === true
-          ? 'DFU service active. You can reboot into bootloader directly.'
-          : 'If not active, enable it first (takes effect after disconnect).';
-      }
-    }
-
-    function resetAccelPlotBuffers(hz = 51.2) {
-      accelHz = hz;
-      accelMaxPoints = Math.ceil(PLOT_ACCEL_SECONDS * accelHz);
-      accelX = new Float32Array(accelMaxPoints);
-      accelY = new Float32Array(accelMaxPoints);
-      accelZ = new Float32Array(accelMaxPoints);
-      accelWrite = 0;
-      accelCount = 0;
-      if (ui.plotAccelInfo) ui.plotAccelInfo.textContent = "";
-      if (accelCtx && ui.plotAccel) accelCtx.clearRect(0, 0, ui.plotAccel.width, ui.plotAccel.height);
-    }
-
-    function resetGsrPlotBuffers(hz = 50) {
-      gsrHz = hz;
-      gsrMaxPoints = Math.ceil(PLOT_GSR_SECONDS * gsrHz);
-      gsrVals = new Float32Array(gsrMaxPoints);
-      gsrWrite = 0;
-      gsrCount = 0;
-      if (ui.plotGsrInfo) ui.plotGsrInfo.textContent = "";
-      if (gsrCtx && ui.plotGsr) gsrCtx.clearRect(0, 0, ui.plotGsr.width, ui.plotGsr.height);
-    }
-
-    function pushAccelSample(cal3) {
-      if (!cal3 || cal3.length < 3) return;
-      accelX[accelWrite] = cal3[0];
-      accelY[accelWrite] = cal3[1];
-      accelZ[accelWrite] = cal3[2];
-      accelWrite = (accelWrite + 1) % accelMaxPoints;
-      accelCount = Math.min(accelCount + 1, accelMaxPoints);
-    }
-
-    function pushGsrSample(uS) {
-      gsrVals[gsrWrite] = uS;
-      gsrWrite = (gsrWrite + 1) % gsrMaxPoints;
-      gsrCount = Math.min(gsrCount + 1, gsrMaxPoints);
-    }
-
-    function drawSeries(ctx, series, count, write, maxPoints, minY, maxY, w, h, color) {
-      if (!ctx || count < 2) return;
-      const span = maxY - minY || 1;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      for (let i = 0; i < count; i++) {
-        const idx = (write - count + i + maxPoints) % maxPoints;
-        const x = (i / (count - 1)) * (w - 1);
-        const y = h - 1 - ((series[idx] - minY) / span) * (h - 1);
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
-
-    function requestAccelPlotRedraw() {
-      if (!accelCtx || !ui.plotAccel || accelRaf) return;
-      accelRaf = requestAnimationFrame(() => {
-        accelRaf = null;
-        const w = ui.plotAccel.width;
-        const h = ui.plotAccel.height;
-        accelCtx.clearRect(0, 0, w, h);
-        accelCtx.fillStyle = "#111";
-        accelCtx.fillRect(0, 0, w, h);
-        if (accelCount < 2) return;
-
-        let minY = Infinity;
-        let maxY = -Infinity;
-        for (let i = 0; i < accelCount; i++) {
-          const idx = (accelWrite - accelCount + i + accelMaxPoints) % accelMaxPoints;
-          minY = Math.min(minY, accelX[idx], accelY[idx], accelZ[idx]);
-          maxY = Math.max(maxY, accelX[idx], accelY[idx], accelZ[idx]);
-        }
-        const pad = (maxY - minY) * 0.05 || 0.1;
-        minY -= pad;
-        maxY += pad;
-
-        accelCtx.strokeStyle = "#333";
-        accelCtx.lineWidth = 1;
-        accelCtx.beginPath();
-        accelCtx.moveTo(0, h / 2);
-        accelCtx.lineTo(w, h / 2);
-        accelCtx.stroke();
-
-        drawSeries(accelCtx, accelX, accelCount, accelWrite, accelMaxPoints, minY, maxY, w, h, "#4cc9f0");
-        drawSeries(accelCtx, accelY, accelCount, accelWrite, accelMaxPoints, minY, maxY, w, h, "#f72585");
-        drawSeries(accelCtx, accelZ, accelCount, accelWrite, accelMaxPoints, minY, maxY, w, h, "#b8f2e6");
-
-        if (ui.plotAccelInfo) {
-          ui.plotAccelInfo.textContent = `points: ${accelCount}/${accelMaxPoints} | scale: ${minY.toFixed(2)} .. ${maxY.toFixed(2)} m/s²`;
-        }
-      });
-    }
-
-    function requestGsrPlotRedraw() {
-      if (!gsrCtx || !ui.plotGsr || gsrRaf) return;
-      gsrRaf = requestAnimationFrame(() => {
-        gsrRaf = null;
-        const w = ui.plotGsr.width;
-        const h = ui.plotGsr.height;
-        gsrCtx.clearRect(0, 0, w, h);
-        gsrCtx.fillStyle = "#111";
-        gsrCtx.fillRect(0, 0, w, h);
-        if (gsrCount < 2) return;
-
-        let minY = Infinity;
-        let maxY = -Infinity;
-        for (let i = 0; i < gsrCount; i++) {
-          const idx = (gsrWrite - gsrCount + i + gsrMaxPoints) % gsrMaxPoints;
-          minY = Math.min(minY, gsrVals[idx]);
-          maxY = Math.max(maxY, gsrVals[idx]);
-        }
-        const pad = (maxY - minY) * 0.05 || 0.1;
-        minY -= pad;
-        maxY += pad;
-
-        gsrCtx.strokeStyle = "#333";
-        gsrCtx.lineWidth = 1;
-        gsrCtx.beginPath();
-        gsrCtx.moveTo(0, h / 2);
-        gsrCtx.lineTo(w, h / 2);
-        gsrCtx.stroke();
-
-        drawSeries(gsrCtx, gsrVals, gsrCount, gsrWrite, gsrMaxPoints, minY, maxY, w, h, "#9ef01a");
-        if (ui.plotGsrInfo) {
-          ui.plotGsrInfo.textContent = `points: ${gsrCount}/${gsrMaxPoints} | scale: ${minY.toFixed(3)} .. ${maxY.toFixed(3)} µS`;
-        }
-      });
-    }
-
-    function requireConnected() {
-      if (!state.v) throw new Error("Not connected");
-      return state.v;
-    }
-
-    function requireAdc() {
-      const v = requireConnected();
-      if (!v.adc) throw new Error("SDK adc accessor unavailable");
-      return v.adc;
-    }
-
-    function installRawHooks(v) {
-      if (!v || v.__rawHooksInstalled) return;
-      const writeOrig = v.writeBytes.bind(v);
-      v.writeBytes = async (bytes, opts = {}) => {
-        if (ui.chkRawTxRx.checked) logRaw("TX", bytes);
-        return writeOrig(bytes, opts);
-      };
-      const feedOrig = v._feedStreamBytes?.bind(v);
-      if (typeof feedOrig === "function") {
-        v._feedStreamBytes = (chunk) => {
-          if (ui.chkRawTxRx.checked) logRaw("RX", chunk);
-          return feedOrig(chunk);
+          major: Math.trunc(major),
+          minor: Math.trunc(minor),
+          internal: Math.trunc(internal),
         };
       }
-      v.__rawHooksInstalled = true;
-    }
 
-    function wireEvents(v) {
-      v.on("disconnected", ({ kind }) => {
-        state.isStreaming = false;
-        state.v = null;
-        state.lastProductionParsed = null;
-        setStatus("disconnected");
-        setTransport(kind ?? "none");
-        setConnectionButtonsState({ connected: false });
-        ui.btnStreamStart.disabled = true;
+      function updateHardwareTestAvailability() {
+        const hw = getProductionHwRevision();
+        if (ui.btnRunHardwareTest) ui.btnRunHardwareTest.disabled = !hw;
+        if (ui.btnRunTestReport) ui.btnRunTestReport.disabled = !hw;
+        if (ui.testHwIdStatus) {
+          ui.testHwIdStatus.textContent = hw
+            ? `HW revision from production config: ${hw.major}.${hw.minor}.${hw.internal}`
+            : "HW revision unavailable. Read production config first.";
+        }
+      }
+
+      function setTestReportDialogContent(text) {
+        if (!ui.testReportPre) return;
+        // Escape HTML then colour PASS/FAIL keywords
+        const escaped = text
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+        const coloured = escaped
+          .replace(/\bPASS\b/g, '<span class="tr-pass">PASS</span>')
+          .replace(/\bFAIL\b/g, '<span class="tr-fail">FAIL</span>');
+        ui.testReportPre.innerHTML = coloured;
+        ui.testReportPre.scrollTop = ui.testReportPre.scrollHeight;
+      }
+
+      function updateDfuUpdateToolState(connected) {
+        var notice = document.getElementById("dfu-connected-notice");
+        var body = document.getElementById("dfu-update-body");
+        if (notice) notice.style.display = connected ? "block" : "none";
+        if (body) body.classList.toggle("dfu-disabled", !!connected);
+      }
+
+      function updateDfuServiceStatus(active) {
+        state.dfuServiceActive = active;
+        if (ui.dfuServiceBadge) {
+          if (active === null) {
+            ui.dfuServiceBadge.textContent = "\u2014 not connected \u2014";
+            ui.dfuServiceBadge.className = "muted";
+          } else if (active) {
+            ui.dfuServiceBadge.textContent = "Active \u2713";
+            ui.dfuServiceBadge.className = "dfu-badge-active";
+          } else {
+            ui.dfuServiceBadge.textContent = "Not active";
+            ui.dfuServiceBadge.className = "dfu-badge-inactive";
+          }
+        }
+        if (ui.btnEnableDfuService) {
+          ui.btnEnableDfuService.disabled = active === true;
+          ui.btnEnableDfuService.title =
+            active === true
+              ? "DFU service is already active for this BLE session"
+              : "";
+        }
+        if (ui.btnRebootBootloader) {
+          const canReboot = active === true;
+          ui.btnRebootBootloader.disabled = !canReboot;
+          ui.btnRebootBootloader.title = canReboot
+            ? "Writes 0x01 to Nordic buttonless DFU characteristic to reboot into bootloader"
+            : "Requires Nordic DFU service to be active on this connection";
+        }
+        const noteEl = document.getElementById("dfuEnterDfuNote");
+        if (noteEl) {
+          noteEl.textContent =
+            active === true
+              ? "DFU service active. You can reboot into bootloader directly."
+              : "If not active, enable it first (takes effect after disconnect).";
+        }
+      }
+
+      function resetAccelPlotBuffers(hz = 51.2) {
+        accelHz = hz;
+        accelMaxPoints = Math.ceil(PLOT_ACCEL_SECONDS * accelHz);
+        accelX = new Float32Array(accelMaxPoints);
+        accelY = new Float32Array(accelMaxPoints);
+        accelZ = new Float32Array(accelMaxPoints);
+        accelWrite = 0;
+        accelCount = 0;
+        if (ui.plotAccelInfo) ui.plotAccelInfo.textContent = "";
+        if (accelCtx && ui.plotAccel)
+          accelCtx.clearRect(0, 0, ui.plotAccel.width, ui.plotAccel.height);
+      }
+
+      function resetGsrPlotBuffers(hz = 50) {
+        gsrHz = hz;
+        gsrMaxPoints = Math.ceil(PLOT_GSR_SECONDS * gsrHz);
+        gsrVals = new Float32Array(gsrMaxPoints);
+        gsrWrite = 0;
+        gsrCount = 0;
+        if (ui.plotGsrInfo) ui.plotGsrInfo.textContent = "";
+        if (gsrCtx && ui.plotGsr)
+          gsrCtx.clearRect(0, 0, ui.plotGsr.width, ui.plotGsr.height);
+      }
+
+      function pushAccelSample(cal3) {
+        if (!cal3 || cal3.length < 3) return;
+        accelX[accelWrite] = cal3[0];
+        accelY[accelWrite] = cal3[1];
+        accelZ[accelWrite] = cal3[2];
+        accelWrite = (accelWrite + 1) % accelMaxPoints;
+        accelCount = Math.min(accelCount + 1, accelMaxPoints);
+      }
+
+      function pushGsrSample(uS) {
+        gsrVals[gsrWrite] = uS;
+        gsrWrite = (gsrWrite + 1) % gsrMaxPoints;
+        gsrCount = Math.min(gsrCount + 1, gsrMaxPoints);
+      }
+
+      function drawSeries(
+        ctx,
+        series,
+        count,
+        write,
+        maxPoints,
+        minY,
+        maxY,
+        w,
+        h,
+        color,
+      ) {
+        if (!ctx || count < 2) return;
+        const span = maxY - minY || 1;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for (let i = 0; i < count; i++) {
+          const idx = (write - count + i + maxPoints) % maxPoints;
+          const x = (i / (count - 1)) * (w - 1);
+          const y = h - 1 - ((series[idx] - minY) / span) * (h - 1);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+
+      function requestAccelPlotRedraw() {
+        if (!accelCtx || !ui.plotAccel || accelRaf) return;
+        accelRaf = requestAnimationFrame(() => {
+          accelRaf = null;
+          const w = ui.plotAccel.width;
+          const h = ui.plotAccel.height;
+          accelCtx.clearRect(0, 0, w, h);
+          accelCtx.fillStyle = "#111";
+          accelCtx.fillRect(0, 0, w, h);
+          if (accelCount < 2) return;
+
+          let minY = Infinity;
+          let maxY = -Infinity;
+          for (let i = 0; i < accelCount; i++) {
+            const idx =
+              (accelWrite - accelCount + i + accelMaxPoints) % accelMaxPoints;
+            minY = Math.min(minY, accelX[idx], accelY[idx], accelZ[idx]);
+            maxY = Math.max(maxY, accelX[idx], accelY[idx], accelZ[idx]);
+          }
+          const pad = (maxY - minY) * 0.05 || 0.1;
+          minY -= pad;
+          maxY += pad;
+
+          accelCtx.strokeStyle = "#333";
+          accelCtx.lineWidth = 1;
+          accelCtx.beginPath();
+          accelCtx.moveTo(0, h / 2);
+          accelCtx.lineTo(w, h / 2);
+          accelCtx.stroke();
+
+          drawSeries(
+            accelCtx,
+            accelX,
+            accelCount,
+            accelWrite,
+            accelMaxPoints,
+            minY,
+            maxY,
+            w,
+            h,
+            "#4cc9f0",
+          );
+          drawSeries(
+            accelCtx,
+            accelY,
+            accelCount,
+            accelWrite,
+            accelMaxPoints,
+            minY,
+            maxY,
+            w,
+            h,
+            "#f72585",
+          );
+          drawSeries(
+            accelCtx,
+            accelZ,
+            accelCount,
+            accelWrite,
+            accelMaxPoints,
+            minY,
+            maxY,
+            w,
+            h,
+            "#b8f2e6",
+          );
+
+          if (ui.plotAccelInfo) {
+            ui.plotAccelInfo.textContent = `points: ${accelCount}/${accelMaxPoints} | scale: ${minY.toFixed(2)} .. ${maxY.toFixed(2)} m/s²`;
+          }
+        });
+      }
+
+      function requestGsrPlotRedraw() {
+        if (!gsrCtx || !ui.plotGsr || gsrRaf) return;
+        gsrRaf = requestAnimationFrame(() => {
+          gsrRaf = null;
+          const w = ui.plotGsr.width;
+          const h = ui.plotGsr.height;
+          gsrCtx.clearRect(0, 0, w, h);
+          gsrCtx.fillStyle = "#111";
+          gsrCtx.fillRect(0, 0, w, h);
+          if (gsrCount < 2) return;
+
+          let minY = Infinity;
+          let maxY = -Infinity;
+          for (let i = 0; i < gsrCount; i++) {
+            const idx = (gsrWrite - gsrCount + i + gsrMaxPoints) % gsrMaxPoints;
+            minY = Math.min(minY, gsrVals[idx]);
+            maxY = Math.max(maxY, gsrVals[idx]);
+          }
+          const pad = (maxY - minY) * 0.05 || 0.1;
+          minY -= pad;
+          maxY += pad;
+
+          gsrCtx.strokeStyle = "#333";
+          gsrCtx.lineWidth = 1;
+          gsrCtx.beginPath();
+          gsrCtx.moveTo(0, h / 2);
+          gsrCtx.lineTo(w, h / 2);
+          gsrCtx.stroke();
+
+          drawSeries(
+            gsrCtx,
+            gsrVals,
+            gsrCount,
+            gsrWrite,
+            gsrMaxPoints,
+            minY,
+            maxY,
+            w,
+            h,
+            "#9ef01a",
+          );
+          if (ui.plotGsrInfo) {
+            ui.plotGsrInfo.textContent = `points: ${gsrCount}/${gsrMaxPoints} | scale: ${minY.toFixed(3)} .. ${maxY.toFixed(3)} µS`;
+          }
+        });
+      }
+
+      function requireConnected() {
+        if (!state.v) throw new Error("Not connected");
+        return state.v;
+      }
+
+      function requireAdc() {
+        const v = requireConnected();
+        if (!v.adc) throw new Error("SDK adc accessor unavailable");
+        return v.adc;
+      }
+
+      function installRawHooks(v) {
+        if (!v || v.__rawHooksInstalled) return;
+        const writeOrig = v.writeBytes.bind(v);
+        v.writeBytes = async (bytes, opts = {}) => {
+          if (ui.chkRawTxRx.checked) logRaw("TX", bytes);
+          return writeOrig(bytes, opts);
+        };
+        const feedOrig = v._feedStreamBytes?.bind(v);
+        if (typeof feedOrig === "function") {
+          v._feedStreamBytes = (chunk) => {
+            if (ui.chkRawTxRx.checked) logRaw("RX", chunk);
+            return feedOrig(chunk);
+          };
+        }
+        v.__rawHooksInstalled = true;
+      }
+
+      function wireEvents(v) {
+        v.on("disconnected", ({ kind }) => {
+          state.isStreaming = false;
+          state.v = null;
+          state.lastProductionParsed = null;
+          setStatus("disconnected");
+          setTransport(kind ?? "none");
+          setConnectionButtonsState({ connected: false });
+          ui.btnStreamStart.disabled = true;
+          ui.btnStreamStop.disabled = true;
+          updateHardwareTestAvailability();
+          updateDfuServiceStatus(null);
+          log("disconnected", { kind });
+          updateDfuUpdateToolState(false);
+        });
+
+        v.on("data", (pkt) => {
+          if (!pkt) return;
+          state.lastPacket = pkt;
+          ui.streamLastSensor.textContent = String(pkt.sensorId ?? "-");
+          if (pkt.sensorId === 2) state.accelPackets += 1;
+          if (pkt.sensorId === 1) state.adcPackets += 1;
+          ui.streamAccelCount.textContent = String(state.accelPackets);
+          ui.streamAdcCount.textContent = String(state.adcPackets);
+
+          if (pkt.sensorId === 2 && Array.isArray(pkt.decoded)) {
+            for (const s of pkt.decoded) {
+              if (s?.cal) pushAccelSample(s.cal);
+            }
+            requestAccelPlotRedraw();
+          }
+          if (pkt.sensorId === 1 && Array.isArray(pkt.decoded)) {
+            for (const s of pkt.decoded) {
+              const uS = s?.gsr?.uS;
+              if (typeof uS === "number" && Number.isFinite(uS))
+                pushGsrSample(uS);
+            }
+            requestGsrPlotRedraw();
+          }
+        });
+
+        v.on("opConfigError", (e) => log("opConfigError", e));
+      }
+
+      function updateTopMeta({
+        productionParsed,
+        statusParsed,
+        name = null,
+      } = {}) {
+        if (name != null) ui.metaName.textContent = name || "-";
+        if (productionParsed) {
+          state.lastProductionParsed = productionParsed;
+          ui.metaId.textContent =
+            productionParsed.uniqueIdentifier ?? productionParsed.asmid ?? "-";
+          ui.metaHw.textContent = `${productionParsed.revHwMajor ?? "?"}.${productionParsed.revHwMinor ?? "?"}.${productionParsed.revHwInternal ?? 0}`;
+          ui.metaFw.textContent = `${productionParsed.revFwMajor ?? "?"}.${productionParsed.revFwMinor ?? "?"}.${productionParsed.revFwInternal ?? 0}`;
+          updateHardwareTestAvailability();
+        }
+        if (statusParsed) {
+          ui.metaBatt.textContent = `${statusParsed.batteryMilliVolts} mV (${statusParsed.batteryPercent}%)`;
+          const used = statusParsed.memoryUsedKb;
+          const cap = statusParsed.memoryCapacityKb;
+          ui.metaFlash.textContent =
+            used != null && cap != null
+              ? `${used} / ${cap} kB used`
+              : `${statusParsed.memoryFreeKb} kB free`;
+
+          const full = statusParsed.memoryFullBanksKb;
+          if (full != null) {
+            const twodel = statusParsed.memoryTwoDelBanksKb ?? 0;
+            const bad = statusParsed.memoryBadBanksKb ?? 0;
+            const other = Math.max(0, (used ?? 0) - full - twodel - bad);
+            const syncable = full + twodel;
+            const parts = [
+              `FULL: ${full} kB`,
+              twodel > 0 ? `2DEL: ${twodel} kB` : null,
+              bad > 0 ? `BAD: ${bad} kB` : null,
+              other > 0 ? `Other: ${other} kB` : null,
+            ]
+              .filter(Boolean)
+              .join(" | ");
+            ui.metaFlashBanks.textContent = parts || "0 kB in all banks";
+            ui.metaFlashBanks.style.color = syncable === 0 ? "#f4a261" : "";
+          } else {
+            ui.metaFlashBanks.textContent = "-";
+          }
+        }
+      }
+
+      function summarizeOp(op, v) {
+        return {
+          len: op.length,
+          header: toHexByte(op[0] ?? 0),
+          accel1Enabled: !!v.accel1?.enabled,
+          accel1RateCfg: (op[OP_IDX.ACCEL1_CFG_0] ?? 0) & 0x0f,
+          accel1RangeCfg: (op[OP_IDX.ACCEL1_CFG_1] ?? 0) & 0x03,
+          adcGsrEnabled: !!v.adc?.gsrEnabled,
+          adcBattEnabled: !!v.adc?.battEnabled,
+          adcRateCfg: (op[OP_IDX.ADC_CHANNEL_SETTINGS_0] ?? 0) & 0x3f,
+          adcRangeCfg: (op[OP_IDX.ADC_CHANNEL_SETTINGS_1] ?? 0) & 0x07,
+          adcOverCfg: ((op[OP_IDX.ADC_CHANNEL_SETTINGS_1] ?? 0) >> 4) & 0x0f,
+        };
+      }
+
+      function syncOpEditorFromSensors() {
+        const v = requireConnected();
+        ui.opAccelEnabled.checked = !!v.accel1?.enabled;
+        ui.opGsrEnabled.checked = !!v.adc?.gsrEnabled;
+        ui.opBattEnabled.checked = !!v.adc?.battEnabled;
+        ui.opGsrRange.value = String(v.adc?.gsrRangeSetting ?? 4);
+      }
+
+      async function refreshSnapshot() {
+        const v = requireConnected();
+        const prodRsp = await v.readProductionConfig();
+        const prodRaw = new Uint8Array(prodRsp.payload ?? []);
+        const productionParsed = parseProductionConfigPayloadFull(prodRaw);
+        syncProdEditorFromParsed(productionParsed);
+
+        await v.readOpConfigFromDevice();
+        const opRaw = await v.getOpConfig();
+        const opParsed = summarizeOp(opRaw, v);
+
+        const status2Rsp = await v.readStatus2();
+        const status2Raw = new Uint8Array(status2Rsp.payload ?? []);
+        const status2Parsed = parseStatusPayload(status2Raw, "status2");
+
+        updateTopMeta({ productionParsed, statusParsed: status2Parsed });
+        state.lastStatusParsed = status2Parsed;
+        syncOpEditorFromSensors();
+
+        console.groupCollapsed("[Verisense Console] Snapshot");
+        console.log("Production raw", toHexArray(prodRaw));
+        console.log("Production parsed", productionParsed);
+        console.log("Operational raw", toHexArray(opRaw));
+        console.log("Operational parsed", opParsed);
+        console.log("Status2 raw", toHexArray(status2Raw));
+        console.log("Status2 parsed", status2Parsed);
+        console.groupEnd();
+
+        log("snapshot.production", productionParsed);
+        log("snapshot.op", opParsed);
+        log("snapshot.status2", status2Parsed);
+      }
+
+      async function connectBle() {
+        if (state.v)
+          throw new Error(
+            "Already connected. Disconnect before opening another connection.",
+          );
+        setConnectionButtonsState({ connected: true });
+        setStatus("scanning");
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [
+            { namePrefix: "Verisense" },
+            { services: [VerisenseBleDevice.NUS_SERVICE] },
+          ],
+          optionalServices: [
+            VerisenseBleDevice.NUS_SERVICE,
+            NORDIC_DFU_SERVICE,
+          ],
+        });
+
+        const v = new VerisenseBleDevice({
+          hardwareIdentifier: "VERISENSE_PULSE_PLUS",
+          stripStreamCrc: true,
+          verifyStreamCrc: false,
+        });
+        state.v = v;
+        installRawHooks(v);
+        wireEvents(v);
+
+        await v.connect({ device });
+        // Detect Nordic Secure DFU service
+        {
+          let dfuActive = false;
+          try {
+            await device.gatt.getPrimaryService(NORDIC_DFU_SERVICE);
+            dfuActive = true;
+          } catch (_) {
+            /* service not present on this device */
+          }
+          updateDfuServiceStatus(dfuActive);
+        }
+        setStatus("connected");
+        setTransport("ble");
+        ui.btnStreamStart.disabled = false;
+        updateDfuUpdateToolState(true);
         ui.btnStreamStop.disabled = true;
-        updateHardwareTestAvailability();
-        updateDfuServiceStatus(null);
-        log("disconnected", { kind });
-        updateDfuUpdateToolState(false);
-      });
 
-      v.on("data", (pkt) => {
-        if (!pkt) return;
-        state.lastPacket = pkt;
-        ui.streamLastSensor.textContent = String(pkt.sensorId ?? "-");
-        if (pkt.sensorId === 2) state.accelPackets += 1;
-        if (pkt.sensorId === 1) state.adcPackets += 1;
-        ui.streamAccelCount.textContent = String(state.accelPackets);
-        ui.streamAdcCount.textContent = String(state.adcPackets);
-
-        if (pkt.sensorId === 2 && Array.isArray(pkt.decoded)) {
-          for (const s of pkt.decoded) {
-            if (s?.cal) pushAccelSample(s.cal);
-          }
-          requestAccelPlotRedraw();
-        }
-        if (pkt.sensorId === 1 && Array.isArray(pkt.decoded)) {
-          for (const s of pkt.decoded) {
-            const uS = s?.gsr?.uS;
-            if (typeof uS === "number" && Number.isFinite(uS)) pushGsrSample(uS);
-          }
-          requestGsrPlotRedraw();
-        }
-      });
-
-      v.on("opConfigError", (e) => log("opConfigError", e));
-    }
-
-    function updateTopMeta({ productionParsed, statusParsed, name = null } = {}) {
-      if (name != null) ui.metaName.textContent = name || "-";
-      if (productionParsed) {
-        state.lastProductionParsed = productionParsed;
-        ui.metaId.textContent = productionParsed.uniqueIdentifier ?? productionParsed.asmid ?? "-";
-        ui.metaHw.textContent = `${productionParsed.revHwMajor ?? "?"}.${productionParsed.revHwMinor ?? "?"}.${productionParsed.revHwInternal ?? 0}`;
-        ui.metaFw.textContent = `${productionParsed.revFwMajor ?? "?"}.${productionParsed.revFwMinor ?? "?"}.${productionParsed.revFwInternal ?? 0}`;
-        updateHardwareTestAvailability();
+        updateTopMeta({ name: device?.name ?? "Verisense" });
+        resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
+        resetGsrPlotBuffers(v?.adc?.samplingRateHz ?? 50);
+        await refreshSnapshot();
+        log("connected", { name: device?.name, id: device?.id });
       }
-      if (statusParsed) {
-        ui.metaBatt.textContent = `${statusParsed.batteryMilliVolts} mV (${statusParsed.batteryPercent}%)`;
-        const used = statusParsed.memoryUsedKb;
-        const cap = statusParsed.memoryCapacityKb;
-        ui.metaFlash.textContent = used != null && cap != null ? `${used} / ${cap} kB used` : `${statusParsed.memoryFreeKb} kB free`;
 
-        const full = statusParsed.memoryFullBanksKb;
-        if (full != null) {
-          const twodel = statusParsed.memoryTwoDelBanksKb ?? 0;
-          const bad = statusParsed.memoryBadBanksKb ?? 0;
-          const other = Math.max(0, (used ?? 0) - full - twodel - bad);
-          const syncable = full + twodel;
-          const parts = [
-            `FULL: ${full} kB`,
-            twodel > 0 ? `2DEL: ${twodel} kB` : null,
-            bad > 0 ? `BAD: ${bad} kB` : null,
-            other > 0 ? `Other: ${other} kB` : null,
-          ].filter(Boolean).join(" | ");
-          ui.metaFlashBanks.textContent = parts || "0 kB in all banks";
-          ui.metaFlashBanks.style.color = syncable === 0 ? "#f4a261" : "";
-        } else {
-          ui.metaFlashBanks.textContent = "-";
-        }
+      async function connectSerial() {
+        if (state.v)
+          throw new Error(
+            "Already connected. Disconnect before opening another connection.",
+          );
+        setConnectionButtonsState({ connected: true });
+        const v = new VerisenseBleDevice({
+          hardwareIdentifier: "VERISENSE_PULSE_PLUS",
+          stripStreamCrc: true,
+          verifyStreamCrc: false,
+        });
+        state.v = v;
+        installRawHooks(v);
+        wireEvents(v);
+
+        setStatus("connecting-serial");
+        await v.connectSerial({ baudRate: 115200 });
+        setStatus("connected");
+        setTransport("serial");
+        updateDfuUpdateToolState(true);
+        ui.btnStreamStart.disabled = false;
+        ui.btnStreamStop.disabled = true;
+
+        updateTopMeta({ name: "USB Serial" });
+        resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
+        resetGsrPlotBuffers(v?.adc?.samplingRateHz ?? 50);
+        await refreshSnapshot();
+        log("connected", { kind: "serial" });
       }
-    }
 
-    function summarizeOp(op, v) {
-      return {
-        len: op.length,
-        header: toHexByte(op[0] ?? 0),
-        accel1Enabled: !!v.accel1?.enabled,
-        accel1RateCfg: (op[OP_IDX.ACCEL1_CFG_0] ?? 0) & 0x0f,
-        accel1RangeCfg: (op[OP_IDX.ACCEL1_CFG_1] ?? 0) & 0x03,
-        adcGsrEnabled: !!v.adc?.gsrEnabled,
-        adcBattEnabled: !!v.adc?.battEnabled,
-        adcRateCfg: (op[OP_IDX.ADC_CHANNEL_SETTINGS_0] ?? 0) & 0x3f,
-        adcRangeCfg: (op[OP_IDX.ADC_CHANNEL_SETTINGS_1] ?? 0) & 0x07,
-        adcOverCfg: ((op[OP_IDX.ADC_CHANNEL_SETTINGS_1] ?? 0) >> 4) & 0x0f,
-      };
-    }
-
-    function syncOpEditorFromSensors() {
-      const v = requireConnected();
-      ui.opAccelEnabled.checked = !!v.accel1?.enabled;
-      ui.opGsrEnabled.checked = !!v.adc?.gsrEnabled;
-      ui.opBattEnabled.checked = !!v.adc?.battEnabled;
-      ui.opGsrRange.value = String(v.adc?.gsrRangeSetting ?? 4);
-    }
-
-    async function refreshSnapshot() {
-      const v = requireConnected();
-      const prodRsp = await v.readProductionConfig();
-      const prodRaw = new Uint8Array(prodRsp.payload ?? []);
-      const productionParsed = parseProductionConfigPayloadFull(prodRaw);
-      syncProdEditorFromParsed(productionParsed);
-
-      await v.readOpConfigFromDevice();
-      const opRaw = await v.getOpConfig();
-      const opParsed = summarizeOp(opRaw, v);
-
-      const status2Rsp = await v.readStatus2();
-      const status2Raw = new Uint8Array(status2Rsp.payload ?? []);
-      const status2Parsed = parseStatusPayload(status2Raw, "status2");
-
-      updateTopMeta({ productionParsed, statusParsed: status2Parsed });
-      state.lastStatusParsed = status2Parsed;
-      syncOpEditorFromSensors();
-
-      console.groupCollapsed("[Verisense Console] Snapshot");
-      console.log("Production raw", toHexArray(prodRaw));
-      console.log("Production parsed", productionParsed);
-      console.log("Operational raw", toHexArray(opRaw));
-      console.log("Operational parsed", opParsed);
-      console.log("Status2 raw", toHexArray(status2Raw));
-      console.log("Status2 parsed", status2Parsed);
-      console.groupEnd();
-
-      log("snapshot.production", productionParsed);
-      log("snapshot.op", opParsed);
-      log("snapshot.status2", status2Parsed);
-    }
-
-    async function connectBle() {
-      if (state.v) throw new Error("Already connected. Disconnect before opening another connection.");
-      setConnectionButtonsState({ connected: true });
-      setStatus("scanning");
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [{ namePrefix: "Verisense" }, { services: [VerisenseBleDevice.NUS_SERVICE] }],
-        optionalServices: [VerisenseBleDevice.NUS_SERVICE, NORDIC_DFU_SERVICE],
-      });
-
-      const v = new VerisenseBleDevice({
-        hardwareIdentifier: "VERISENSE_PULSE_PLUS",
-        stripStreamCrc: true,
-        verifyStreamCrc: false,
-      });
-      state.v = v;
-      installRawHooks(v);
-      wireEvents(v);
-
-      await v.connect({ device });
-      // Detect Nordic Secure DFU service
-      {
-        let dfuActive = false;
-        try {
-          await device.gatt.getPrimaryService(NORDIC_DFU_SERVICE);
-          dfuActive = true;
-        } catch (_) { /* service not present on this device */ }
-        updateDfuServiceStatus(dfuActive);
+      async function disconnect() {
+        const v = requireConnected();
+        await v.disconnect({ reason: "ui" });
       }
-      setStatus("connected");
-      setTransport("ble");
-      ui.btnStreamStart.disabled = false;
-      updateDfuUpdateToolState(true);
-      ui.btnStreamStop.disabled = true;
 
-      updateTopMeta({ name: device?.name ?? "Verisense" });
-      resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
-      resetGsrPlotBuffers(v?.adc?.samplingRateHz ?? 50);
-      await refreshSnapshot();
-      log("connected", { name: device?.name, id: device?.id });
-    }
+      async function startStreaming() {
+        const v = requireConnected();
+        resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
+        resetGsrPlotBuffers(v?.adc?.samplingRateHz ?? 50);
+        await v.startStreaming();
+        state.isStreaming = true;
+        ui.btnStreamStart.disabled = true;
+        ui.btnStreamStop.disabled = false;
+        setStatus("streaming");
+      }
 
-    async function connectSerial() {
-      if (state.v) throw new Error("Already connected. Disconnect before opening another connection.");
-      setConnectionButtonsState({ connected: true });
-      const v = new VerisenseBleDevice({
-        hardwareIdentifier: "VERISENSE_PULSE_PLUS",
-        stripStreamCrc: true,
-        verifyStreamCrc: false,
-      });
-      state.v = v;
-      installRawHooks(v);
-      wireEvents(v);
+      async function stopStreaming() {
+        const v = requireConnected();
+        await v.stopStreaming();
+        state.isStreaming = false;
+        ui.btnStreamStart.disabled = false;
+        ui.btnStreamStop.disabled = true;
+        setStatus("connected");
+      }
 
-      setStatus("connecting-serial");
-      await v.connectSerial({ baudRate: 115200 });
-      setStatus("connected");
-      setTransport("serial");
-      updateDfuUpdateToolState(true);
-      ui.btnStreamStart.disabled = false;
-      ui.btnStreamStop.disabled = true;
+      async function opRead() {
+        const v = requireConnected();
+        await v.readOpConfigFromDevice();
+        syncOpEditorFromSensors();
+        log("opcfg read");
+      }
 
-      updateTopMeta({ name: "USB Serial" });
-      resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
-      resetGsrPlotBuffers(v?.adc?.samplingRateHz ?? 50);
-      await refreshSnapshot();
-      log("connected", { kind: "serial" });
-    }
+      async function opWrite() {
+        const v = requireConnected();
+        let op = await v.getOpConfig();
 
-    async function disconnect() {
-      const v = requireConnected();
-      await v.disconnect({ reason: "ui" });
-    }
+        op = v.accel1.setEnabled(ui.opAccelEnabled.checked, op);
+        op = v.accel1.patchAccelSamplingRate(
+          Number(ui.opAccelRateCfg.value) || 0,
+          op,
+        );
+        op = v.accel1.patchAccelRange(Number(ui.opAccelRange.value) || 0, op);
 
-    async function startStreaming() {
-      const v = requireConnected();
-      resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
-      resetGsrPlotBuffers(v?.adc?.samplingRateHz ?? 50);
-      await v.startStreaming();
-      state.isStreaming = true;
-      ui.btnStreamStart.disabled = true;
-      ui.btnStreamStop.disabled = false;
-      setStatus("streaming");
-    }
-
-    async function stopStreaming() {
-      const v = requireConnected();
-      await v.stopStreaming();
-      state.isStreaming = false;
-      ui.btnStreamStart.disabled = false;
-      ui.btnStreamStop.disabled = true;
-      setStatus("connected");
-    }
-
-    async function opRead() {
-      const v = requireConnected();
-      await v.readOpConfigFromDevice();
-      syncOpEditorFromSensors();
-      log("opcfg read");
-    }
-
-    async function opWrite() {
-      const v = requireConnected();
-      let op = await v.getOpConfig();
-
-      op = v.accel1.setEnabled(ui.opAccelEnabled.checked, op);
-      op = v.accel1.patchAccelSamplingRate(Number(ui.opAccelRateCfg.value) || 0, op);
-      op = v.accel1.patchAccelRange(Number(ui.opAccelRange.value) || 0, op);
-
-      const adc = requireAdc();
-      op = adc.setEnabled({
-        gsr: ui.opGsrEnabled.checked,
-        batt: ui.opBattEnabled.checked,
-      }, op);
-      op = adc.patchGsrSamplingRate(Number(ui.opGsrRateCfg.value) || 0, op);
-      op = adc.patchGsrRange(Number(ui.opGsrRange.value) || 0, op);
-      op = adc.patchGsrOversampling(Number(ui.opGsrOverCfg.value) || 0, op);
-
-      await v.writeOpConfig(op);
-      log("opcfg written", summarizeOp(await v.getOpConfig(), v));
-    }
-
-    async function prodRead() {
-      const v = requireConnected();
-      const rsp = await v.readProductionConfig();
-      const parsed = parseProductionConfigPayloadFull(new Uint8Array(rsp.payload ?? []));
-      syncProdEditorFromParsed(parsed);
-      updateTopMeta({ productionParsed: parsed });
-      log("productionConfig", parsed);
-    }
-
-    async function prodWrite() {
-      const v = requireConnected();
-      const payload = buildProductionConfigPayload({
-        manufacturingOrderNumberHex: toCleanHex(ui.prodMonHex.value),
-        macIdHex: toCleanHex(ui.prodMacHex.value),
-        revHwMajor: Number(ui.prodHwMajor.value) || 0,
-        revHwMinor: Number(ui.prodHwMinor.value) || 0,
-        revFwMajor: Number(ui.prodFwMajor.value) || 0,
-        revFwMinor: Number(ui.prodFwMinor.value) || 0,
-        revFwInternal: Number(ui.prodFwInternal.value) || 0,
-        revHwInternal: Number(ui.prodHwInternal.value) || 0,
-        passkeyId: (ui.prodPasskeyId.value || "").trim() || undefined,
-        passkey: (ui.prodPasskey.value || "").trim() || undefined,
-        advertisingNamePrefix: (ui.prodAdvPrefix.value || "").trim() || undefined,
-        dfuEnabled: !!ui.prodDfuEnabled.checked,
-      });
-      await v.writeProductionConfig(payload);
-      log("productionConfig written", { length: payload.length, head: Array.from(payload.slice(0, 16)) });
-      await prodRead();
-    }
-
-    async function runAction(action) {
-      const v = requireConnected();
-      const ledIndex = Number(ui.testLedIndex?.value) || 0;
-      const loopCount = Number(ui.testLoopCount?.value) || 0;
-
-      switch (action) {
-        case "readStatus1":
+        const adc = requireAdc();
+        op = adc.setEnabled(
           {
-            const status = await v.readStatusParsed();
-            updateTopMeta({ statusParsed: status });
-            state.lastStatusParsed = status;
-            log("status1", formatStatusForLog(status));
-          }
-          break;
-        case "readStatus2":
-          {
-            const status = await v.readStatus2Parsed();
-            updateTopMeta({ statusParsed: status });
-            state.lastStatusParsed = status;
-            log("status2", formatStatusForLog(status));
-          }
-          break;
-        case "readPending":
-          {
-            const pending = await v.readPendingEventsParsed();
-            log("pending", {
-              count: pending?.length ?? 0,
-              entries: formatPendingEventsForLog(pending),
+            gsr: ui.opGsrEnabled.checked,
+            batt: ui.opBattEnabled.checked,
+          },
+          op,
+        );
+        op = adc.patchGsrSamplingRate(Number(ui.opGsrRateCfg.value) || 0, op);
+        op = adc.patchGsrRange(Number(ui.opGsrRange.value) || 0, op);
+        op = adc.patchGsrOversampling(Number(ui.opGsrOverCfg.value) || 0, op);
+
+        await v.writeOpConfig(op);
+        log("opcfg written", summarizeOp(await v.getOpConfig(), v));
+      }
+
+      async function prodRead() {
+        const v = requireConnected();
+        const rsp = await v.readProductionConfig();
+        const parsed = parseProductionConfigPayloadFull(
+          new Uint8Array(rsp.payload ?? []),
+        );
+        syncProdEditorFromParsed(parsed);
+        updateTopMeta({ productionParsed: parsed });
+        log("productionConfig", parsed);
+      }
+
+      async function prodWrite() {
+        const v = requireConnected();
+        const payload = buildProductionConfigPayload({
+          manufacturingOrderNumberHex: toCleanHex(ui.prodMonHex.value),
+          macIdHex: toCleanHex(ui.prodMacHex.value),
+          revHwMajor: Number(ui.prodHwMajor.value) || 0,
+          revHwMinor: Number(ui.prodHwMinor.value) || 0,
+          revFwMajor: Number(ui.prodFwMajor.value) || 0,
+          revFwMinor: Number(ui.prodFwMinor.value) || 0,
+          revFwInternal: Number(ui.prodFwInternal.value) || 0,
+          revHwInternal: Number(ui.prodHwInternal.value) || 0,
+          passkeyId: (ui.prodPasskeyId.value || "").trim() || undefined,
+          passkey: (ui.prodPasskey.value || "").trim() || undefined,
+          advertisingNamePrefix:
+            (ui.prodAdvPrefix.value || "").trim() || undefined,
+          dfuEnabled: !!ui.prodDfuEnabled.checked,
+        });
+        await v.writeProductionConfig(payload);
+        log("productionConfig written", {
+          length: payload.length,
+          head: Array.from(payload.slice(0, 16)),
+        });
+        await prodRead();
+      }
+
+      async function runAction(action) {
+        const v = requireConnected();
+        const ledIndex = Number(ui.testLedIndex?.value) || 0;
+        const loopCount = Number(ui.testLoopCount?.value) || 0;
+
+        switch (action) {
+          case "readStatus1":
+            {
+              const status = await v.readStatusParsed();
+              updateTopMeta({ statusParsed: status });
+              state.lastStatusParsed = status;
+              log("status1", formatStatusForLog(status));
+            }
+            break;
+          case "readStatus2":
+            {
+              const status = await v.readStatus2Parsed();
+              updateTopMeta({ statusParsed: status });
+              state.lastStatusParsed = status;
+              log("status2", formatStatusForLog(status));
+            }
+            break;
+          case "readPending":
+            {
+              const pending = await v.readPendingEventsParsed();
+              log("pending", {
+                count: pending?.length ?? 0,
+                entries: formatPendingEventsForLog(pending),
+              });
+            }
+            break;
+          case "readTime":
+            {
+              const unix = await v.readTimeUnixSeconds();
+              log(
+                "timeUnixSeconds",
+                unix,
+                "->",
+                formatLogTime(new Date(unix * 1000)),
+              );
+            }
+            break;
+          case "writeTimeNow":
+            await v.writeTimeUnixSeconds(Math.floor(Date.now() / 1000));
+            log("time written", "now");
+            break;
+          case "readLookup":
+            {
+              const prevStatus = ui.statusBadge.textContent || "connected";
+              try {
+                setStatus("lookup-reading");
+                if (ui.lookupSummary)
+                  ui.lookupSummary.textContent = "Reading lookup table...";
+                log("lookup.read.start", { timeoutMs: 30000, retries: 2 });
+
+                let attempt = 0;
+                let rsp = null;
+                let lastErr = null;
+                while (attempt < 3 && !rsp) {
+                  attempt += 1;
+                  try {
+                    log("lookup.read.attempt", { attempt });
+                    rsp = await v.readFlashLookupTable(0, 30000);
+                  } catch (e) {
+                    lastErr = e;
+                    log("lookup.read.retry", {
+                      attempt,
+                      error: String(e?.message ?? e),
+                    });
+                  }
+                }
+
+                if (!rsp) {
+                  if (ui.lookupSummary)
+                    ui.lookupSummary.textContent =
+                      "Lookup read failed (timeout or NACK).";
+                  throw lastErr ?? new Error("Lookup read failed");
+                }
+
+                const payload = new Uint8Array(rsp.payload ?? []);
+                const bankCount = inferLookupBankCount(payload.length);
+                if (!bankCount) {
+                  if (ui.lookupSummary)
+                    ui.lookupSummary.textContent = `Lookup payload length unsupported: ${payload.length}`;
+                  throw new Error(
+                    `Unexpected lookup payload length: ${payload.length}`,
+                  );
+                }
+
+                const parsed = parseLookupTablePayload(payload, bankCount);
+                renderLookupTable(parsed);
+                if (ui.lookupSummary) {
+                  ui.lookupSummary.textContent = `${ui.lookupSummary.textContent} | payload=${payload.length} bytes`;
+                }
+
+                log("lookup.response", {
+                  payloadLength: payload.length,
+                  head: parsed.head,
+                  tail: parsed.tail,
+                  banks: parsed.entries.length,
+                  sample: parsed.entries.slice(0, 8),
+                });
+              } finally {
+                setStatus(prevStatus);
+              }
+            }
+            break;
+          case "readScheduler":
+            {
+              log("scheduler.read", {});
+              const parsed = await v.readRealWorldClockSchedulerParsed();
+              log("scheduler.response", {
+                parsed: formatSchedulerForLog(parsed),
+              });
+            }
+            break;
+          case "loadTestLookup":
+            log("loadTestLookup", await v.loadTestLookupTable());
+            break;
+          case "checkPayloadCrc":
+            log("crcErrors", await v.checkPayloadCrcErrorsParsed());
+            break;
+          case "readEventLog":
+            {
+              log("eventLog.read", {});
+              const parsed = await v.readEventLogParsed();
+              log("eventLog.response", {
+                entries: parsed?.length ?? 0,
+                parsed,
+              });
+              renderEventLogTable(parsed);
+            }
+            break;
+          case "readRecordBuffers":
+            {
+              log("recordBuffers.read", {});
+              const parsed = await v.readRecordBufferDetailsParsed();
+              log("recordBuffers.response", {
+                entries: parsed?.length ?? 0,
+                parsed,
+              });
+            }
+            break;
+          case "ledTest":
+            await v.ledTest(ledIndex);
+            log("ledTest", { ledIndex });
+            break;
+          case "maxLedStart":
+            await v.max86xxxLedTest(true);
+            log("max86xxxLedTest", true);
+            break;
+          case "maxLedStop":
+            await v.max86xxxLedTest(false);
+            log("max86xxxLedTest", false);
+            break;
+          case "transferLoop":
+            await v.testDataTransferLoop(loopCount);
+            log("testDataTransferLoop", { loopCount });
+            break;
+          case "powerProfiler":
+            await v.startPowerProfilerTest();
+            log("startPowerProfilerTest", "ok");
+            break;
+          case "icPowerTest":
+            await v.startIcPowerConsumptionTest(loopCount, 500);
+            log("startIcPowerConsumptionTest", {
+              loopCount,
+              stageIntervalMs: 500,
             });
-          }
-          break;
-        case "readTime":
-          {
-            const unix = await v.readTimeUnixSeconds();
-            log("timeUnixSeconds", unix, "->", formatLogTime(new Date(unix * 1000)));
-          }
-          break;
-        case "writeTimeNow":
-          await v.writeTimeUnixSeconds(Math.floor(Date.now() / 1000));
-          log("time written", "now");
-          break;
-        case "readLookup":
-          {
-            const prevStatus = ui.statusBadge.textContent || "connected";
-            try {
-              setStatus("lookup-reading");
-              if (ui.lookupSummary) ui.lookupSummary.textContent = "Reading lookup table...";
-              log("lookup.read.start", { timeoutMs: 30000, retries: 2 });
-
-              let attempt = 0;
-              let rsp = null;
-              let lastErr = null;
-              while (attempt < 3 && !rsp) {
-                attempt += 1;
-                try {
-                  log("lookup.read.attempt", { attempt });
-                  rsp = await v.readFlashLookupTable(0, 30000);
-                } catch (e) {
-                  lastErr = e;
-                  log("lookup.read.retry", { attempt, error: String(e?.message ?? e) });
+            break;
+          case "clearPendingEvents":
+            await v.clearPendingEvents();
+            log("clearPendingEvents", "ok");
+            break;
+          case "eraseOperationalConfig":
+            if (
+              !window.confirm(
+                "Erase Operational Config on device? This cannot be undone.",
+              )
+            )
+              break;
+            await v.eraseOperationalConfig();
+            log("eraseOperationalConfig", "ok");
+            break;
+          case "eraseProductionConfig":
+            if (
+              !window.confirm(
+                "Erase Production Config on device? This cannot be undone.",
+              )
+            )
+              break;
+            await v.eraseProductionConfig();
+            log("eraseProductionConfig", "ok");
+            break;
+          case "eraseAllLoggedData":
+            log("eraseAllLoggedData.start", { timeoutMs: 15000 });
+            await v.eraseAllLoggedData(15000);
+            log("eraseAllLoggedData", "ok");
+            break;
+          case "deleteAllBonds":
+            await v.deleteAllBonds();
+            log("deleteAllBonds", "ok");
+            break;
+          case "systemReset":
+            await v.requestSystemReset();
+            log("requestSystemReset", "ok");
+            break;
+          case "disconnectRequest":
+            log("disconnectRequest", await v.disconnectRequest());
+            break;
+          case "runHardwareTestReport":
+            {
+              const hw = getProductionHwRevision();
+              if (!hw)
+                throw new Error(
+                  "Hardware revision unavailable in production config. Read production config first.",
+                );
+              if (typeof v.runHardwareTestReport !== "function") {
+                throw new Error(
+                  "SDK does not expose runHardwareTestReport(). Rebuild/sync local SDK artifacts first.",
+                );
+              }
+              setTestReportDialogContent("Waiting for TEST_REPORT stream...\n");
+              log("[TEST_REPORT] stream started");
+              if (ui.testReportDialog && !ui.testReportDialog.open) {
+                if (typeof ui.testReportDialog.showModal === "function") {
+                  ui.testReportDialog.showModal();
+                } else {
+                  ui.testReportDialog.setAttribute("open", "open");
                 }
               }
-
-              if (!rsp) {
-                if (ui.lookupSummary) ui.lookupSummary.textContent = "Lookup read failed (timeout or NACK).";
-                throw lastErr ?? new Error("Lookup read failed");
-              }
-
-              const payload = new Uint8Array(rsp.payload ?? []);
-              const bankCount = inferLookupBankCount(payload.length);
-              if (!bankCount) {
-                if (ui.lookupSummary) ui.lookupSummary.textContent = `Lookup payload length unsupported: ${payload.length}`;
-                throw new Error(`Unexpected lookup payload length: ${payload.length}`);
-              }
-
-              const parsed = parseLookupTablePayload(payload, bankCount);
-              renderLookupTable(parsed);
-              if (ui.lookupSummary) {
-                ui.lookupSummary.textContent = `${ui.lookupSummary.textContent} | payload=${payload.length} bytes`;
-              }
-
-              log("lookup.response", {
-                payloadLength: payload.length,
-                head: parsed.head,
-                tail: parsed.tail,
-                banks: parsed.entries.length,
-                sample: parsed.entries.slice(0, 8),
+              const factoryTestType = Math.max(
+                0,
+                Math.min(3, Number(ui.testReportFactoryType?.value ?? 0)),
+              );
+              const reportText = await v.runHardwareTestReport(
+                hw.major,
+                hw.minor,
+                hw.internal,
+                {
+                  timeoutMs: 120000,
+                  marker: TEST_REPORT_DELIMITER,
+                  factoryTestType,
+                  onChunk: (chunk, aggregate) => {
+                    setTestReportDialogContent(aggregate);
+                    appendLogText(chunk);
+                  },
+                },
+              );
+              setTestReportDialogContent(reportText);
+              log("[TEST_REPORT] stream complete");
+              log("runHardwareTestReport", {
+                chars: reportText.length,
+                hwMajor: hw.major,
+                hwMinor: hw.minor,
+                hwInternal: hw.internal,
               });
-            } finally {
-              setStatus(prevStatus);
             }
-          }
-          break;
-        case "readScheduler":
-          {
-            log("scheduler.read", {});
-            const parsed = await v.readRealWorldClockSchedulerParsed();
-            log("scheduler.response", { parsed: formatSchedulerForLog(parsed) });
-          }
-          break;
-        case "loadTestLookup":
-          log("loadTestLookup", await v.loadTestLookupTable());
-          break;
-        case "checkPayloadCrc":
-          log("crcErrors", await v.checkPayloadCrcErrorsParsed());
-          break;
-        case "readEventLog":
-          {
-            log("eventLog.read", {});
-            const parsed = await v.readEventLogParsed();
-            log("eventLog.response", { entries: parsed?.length ?? 0, parsed });
-            renderEventLogTable(parsed);
-          }
-          break;
-        case "readRecordBuffers":
-          {
-            log("recordBuffers.read", {});
-            const parsed = await v.readRecordBufferDetailsParsed();
-            log("recordBuffers.response", { entries: parsed?.length ?? 0, parsed });
-          }
-          break;
-        case "ledTest":
-          await v.ledTest(ledIndex);
-          log("ledTest", { ledIndex });
-          break;
-        case "maxLedStart":
-          await v.max86xxxLedTest(true);
-          log("max86xxxLedTest", true);
-          break;
-        case "maxLedStop":
-          await v.max86xxxLedTest(false);
-          log("max86xxxLedTest", false);
-          break;
-        case "transferLoop":
-          await v.testDataTransferLoop(loopCount);
-          log("testDataTransferLoop", { loopCount });
-          break;
-        case "powerProfiler":
-          await v.startPowerProfilerTest();
-          log("startPowerProfilerTest", "ok");
-          break;
-        case "icPowerTest":
-          await v.startIcPowerConsumptionTest(loopCount, 500);
-          log("startIcPowerConsumptionTest", { loopCount, stageIntervalMs: 500 });
-          break;
-        case "clearPendingEvents":
-          await v.clearPendingEvents();
-          log("clearPendingEvents", "ok");
-          break;
-        case "eraseOperationalConfig":
-          if (!window.confirm("Erase Operational Config on device? This cannot be undone.")) break;
-          await v.eraseOperationalConfig();
-          log("eraseOperationalConfig", "ok");
-          break;
-        case "eraseProductionConfig":
-          if (!window.confirm("Erase Production Config on device? This cannot be undone.")) break;
-          await v.eraseProductionConfig();
-          log("eraseProductionConfig", "ok");
-          break;
-        case "eraseAllLoggedData":
-          log("eraseAllLoggedData.start", { timeoutMs: 15000 });
-          await v.eraseAllLoggedData(15000);
-          log("eraseAllLoggedData", "ok");
-          break;
-        case "deleteAllBonds":
-          await v.deleteAllBonds();
-          log("deleteAllBonds", "ok");
-          break;
-        case "systemReset":
-          await v.requestSystemReset();
-          log("requestSystemReset", "ok");
-          break;
-        case "disconnectRequest":
-          log("disconnectRequest", await v.disconnectRequest());
-          break;
-        case "runHardwareTestReport":
-          {
-            const hw = getProductionHwRevision();
-            if (!hw) throw new Error("Hardware revision unavailable in production config. Read production config first.");
-            if (typeof v.runHardwareTestReport !== "function") {
-              throw new Error("SDK does not expose runHardwareTestReport(). Rebuild/sync local SDK artifacts first.");
+            break;
+          case "runHardwareTest":
+            {
+              const hw = getProductionHwRevision();
+              if (!hw)
+                throw new Error(
+                  "Hardware revision unavailable in production config. Read production config first.",
+                );
+              const selectedTestMode = Number(ui.testModeSelect?.value);
+              const testId = Number.isFinite(selectedTestMode)
+                ? Math.max(0, Math.min(255, Math.trunc(selectedTestMode)))
+                : 255;
+              await v.runHardwareTest(testId, hw.major, hw.minor, hw.internal);
+              log("runHardwareTest", {
+                testId,
+                hwMajor: hw.major,
+                hwMinor: hw.minor,
+                hwInternal: hw.internal,
+              });
             }
-            setTestReportDialogContent("Waiting for TEST_REPORT stream...\n");
-            log("[TEST_REPORT] stream started");
-            if (ui.testReportDialog && !ui.testReportDialog.open) {
-              if (typeof ui.testReportDialog.showModal === "function") {
-                ui.testReportDialog.showModal();
-              } else {
-                ui.testReportDialog.setAttribute("open", "open");
-              }
-            }
-            const factoryTestType = Math.max(0, Math.min(3, Number(ui.testReportFactoryType?.value ?? 0)));
-            const reportText = await v.runHardwareTestReport(hw.major, hw.minor, hw.internal, {
-              timeoutMs: 120000,
-              marker: TEST_REPORT_DELIMITER,
-              factoryTestType,
-              onChunk: (chunk, aggregate) => {
-                setTestReportDialogContent(aggregate);
-                appendLogText(chunk);
-              },
-            });
-            setTestReportDialogContent(reportText);
-            log("[TEST_REPORT] stream complete");
-            log("runHardwareTestReport", {
-              chars: reportText.length,
-              hwMajor: hw.major,
-              hwMinor: hw.minor,
-              hwInternal: hw.internal,
-            });
-          }
-          break;
-        case "runHardwareTest":
-          {
-            const hw = getProductionHwRevision();
-            if (!hw) throw new Error("Hardware revision unavailable in production config. Read production config first.");
-            const selectedTestMode = Number(ui.testModeSelect?.value);
-            const testId = Number.isFinite(selectedTestMode) ? Math.max(0, Math.min(255, Math.trunc(selectedTestMode))) : 255;
-            await v.runHardwareTest(testId, hw.major, hw.minor, hw.internal);
-            log("runHardwareTest", {
-              testId,
-              hwMajor: hw.major,
-              hwMinor: hw.minor,
-              hwInternal: hw.internal,
-            });
-          }
-          break;
-        case "syncToFile": {
-          if (state.isStreaming) await stopStreaming();
+            break;
+          case "syncToFile": {
+            if (state.isStreaming) await stopStreaming();
 
-          // Warn if there are no FULL/2DEL banks to sync (e.g. only BAD banks).
-          const _full = state.lastStatusParsed?.memoryFullBanksKb ?? null;
-          const _twodel = state.lastStatusParsed?.memoryTwoDelBanksKb ?? 0;
-          if (_full != null && _full + _twodel === 0) {
-            const proceed = window.confirm(
-              `Device reports 0 kB of FULL/syncable data (memory used is likely bad banks).\nSync anyway?`
-            );
-            if (!proceed) break;
-          }
+            // Warn if there are no FULL/2DEL banks to sync (e.g. only BAD banks).
+            const _full = state.lastStatusParsed?.memoryFullBanksKb ?? null;
+            const _twodel = state.lastStatusParsed?.memoryTwoDelBanksKb ?? 0;
+            if (_full != null && _full + _twodel === 0) {
+              const proceed = window.confirm(
+                `Device reports 0 kB of FULL/syncable data (memory used is likely bad banks).\nSync anyway?`,
+              );
+              if (!proceed) break;
+            }
 
-          setStatus("syncing");
-          v.debugSync = true;
-          const uid = (ui.metaId.textContent || "unknown")
-            .replace(/[^0-9A-Za-z]/g, "")
-            .slice(-12) || "unknown";
-          const ts = new Date();
-          const tsName = `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, "0")}${String(ts.getDate()).padStart(2, "0")}_${String(ts.getHours()).padStart(2, "0")}${String(ts.getMinutes()).padStart(2, "0")}${String(ts.getSeconds()).padStart(2, "0")}`;
-          const handle = await window.showSaveFilePicker({
-            suggestedName: `verisense_${uid}_${tsName}.bin`,
-            types: [{ description: "Verisense binary", accept: { "application/octet-stream": [".bin"] } }],
-          });
-          const result = await v.transferLoggedData({
-            fileHandle: handle,
-            timeoutMs: 5000,
-            maxNack: 5,
-            maxCrcNack: 5,
-            onProgress: (p) => log("sync progress", p),
-          });
-          setStatus("connected");
-          log("transferLoggedData", result);
-          if (!result?.bytesWritten) {
-            log("transferLoggedData warning", "0 bytes received from device. Verify device has logged records and remains in idle mode before sync.");
-          }
-          break;
-        }
-        case "enableDfuServiceOnDisconnect":
-          if (state.dfuServiceActive === true) {
-            log("enableDfuServiceOnDisconnect skipped", "DFU service is already active on this BLE session");
+            setStatus("syncing");
+            v.debugSync = true;
+            const uid =
+              (ui.metaId.textContent || "unknown")
+                .replace(/[^0-9A-Za-z]/g, "")
+                .slice(-12) || "unknown";
+            const ts = new Date();
+            const tsName = `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, "0")}${String(ts.getDate()).padStart(2, "0")}_${String(ts.getHours()).padStart(2, "0")}${String(ts.getMinutes()).padStart(2, "0")}${String(ts.getSeconds()).padStart(2, "0")}`;
+            const handle = await window.showSaveFilePicker({
+              suggestedName: `verisense_${uid}_${tsName}.bin`,
+              types: [
+                {
+                  description: "Verisense binary",
+                  accept: { "application/octet-stream": [".bin"] },
+                },
+              ],
+            });
+            const result = await v.transferLoggedData({
+              fileHandle: handle,
+              timeoutMs: 5000,
+              maxNack: 5,
+              maxCrcNack: 5,
+              onProgress: (p) => log("sync progress", p),
+            });
+            setStatus("connected");
+            log("transferLoggedData", result);
+            if (!result?.bytesWritten) {
+              log(
+                "transferLoggedData warning",
+                "0 bytes received from device. Verify device has logged records and remains in idle mode before sync.",
+              );
+            }
             break;
           }
-          if (!window.confirm(
-            "Enable DFU Service On Next Disconnect?\n\n" +
-            "This sends ASM DFU_MODE ([0x26, 0x00, 0x00]).\n" +
-            "It does NOT reboot immediately.\n\n" +
-            "After clicking OK:\n" +
-            "1. The command will be sent to the device\n" +
-            "2. Disconnect from the device\n" +
-            "3. On next BLE session, Nordic DFU service should be active\n" +
-            "4. Use Reboot To DFU Bootloader to switch immediately"
-          )) break;
-          await v.enableDfuServiceOnNextDisconnect();
-          log("enableDfuServiceOnDisconnect", "ok");
-          break;
-        case "rebootToDfuBootloader":
-          if (state.dfuServiceActive !== true) {
-            throw new Error("Nordic DFU service is not active on this BLE session. Enable DFU service first and reconnect.");
-          }
-          if (!window.confirm(
-            "Confirm reboot device into Bootloader now?"
-          )) break;
-          setStatus("dfu-rebooting");
-          await v.rebootToDfuBootloader({ waitForDisconnect: true, disconnectAfterCommand: true, timeoutMs: 10000 });
-          log("rebootToDfuBootloader", "command sent; device disconnected for bootloader reboot");
-          break;
-        case "prodRead":
-          await prodRead();
-          break;
-        case "prodWrite":
-          await prodWrite();
-          break;
-        case "opRead":
-          await opRead();
-          break;
-        case "opWrite":
-          await opWrite();
-          break;
-        default:
-          log("Unknown action", action);
-      }
-    }
-
-    function attachEvents() {
-      document.querySelectorAll(".tab-btn").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const target = btn.getAttribute("data-tab");
-          document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-          document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-          btn.classList.add("active");
-          document.getElementById(target)?.classList.add("active");
-        });
-      });
-
-      ui.btnConnectBle.addEventListener("click", async () => {
-        try {
-          await connectBle();
-        } catch (e) {
-          setConnectionButtonsState({ connected: !!state.v });
-          log("connect BLE error", String(e?.message ?? e));
-          setStatus("error");
-        }
-      });
-
-      ui.btnConnectSerial.addEventListener("click", async () => {
-        try {
-          await connectSerial();
-        } catch (e) {
-          setConnectionButtonsState({ connected: !!state.v });
-          log("connect serial error", String(e?.message ?? e));
-          setStatus("error");
-        }
-      });
-
-      ui.btnDisconnect.addEventListener("click", async () => {
-        try {
-          await disconnect();
-        } catch (e) {
-          log("disconnect error", String(e?.message ?? e));
-        }
-      });
-
-      ui.btnDisconnectRequest.addEventListener("click", async () => {
-        try {
-          await runAction("disconnectRequest");
-        } catch (e) {
-          log("disconnect request error", String(e?.message ?? e));
-        }
-      });
-
-      ui.btnStreamStart.addEventListener("click", async () => {
-        try {
-          await startStreaming();
-        } catch (e) {
-          log("start stream error", String(e?.message ?? e));
-        }
-      });
-
-      ui.btnStreamStop.addEventListener("click", async () => {
-        try {
-          await stopStreaming();
-        } catch (e) {
-          log("stop stream error", String(e?.message ?? e));
-        }
-      });
-
-      ui.btnStreamClear.addEventListener("click", () => {
-        state.accelPackets = 0;
-        state.adcPackets = 0;
-        ui.streamAccelCount.textContent = "0";
-        ui.streamAdcCount.textContent = "0";
-        ui.streamLastSensor.textContent = "-";
-        resetAccelPlotBuffers(state.v?.accel1?.samplingRateHz ?? 51.2);
-        resetGsrPlotBuffers(state.v?.adc?.samplingRateHz ?? 50);
-      });
-
-      ui.btnLogClear.addEventListener("click", () => {
-        ui.log.textContent = "";
-      });
-
-      if (ui.btnTestReportClose) {
-        ui.btnTestReportClose.addEventListener("click", () => {
-          if (ui.testReportDialog?.open) ui.testReportDialog.close();
-        });
-      }
-
-      document.querySelectorAll("[data-action]").forEach((el) => {
-        el.addEventListener("click", async () => {
-          const action = el.getAttribute("data-action");
-          try {
-            await runAction(action);
-          } catch (e) {
-            if (isDebugHeaderNackError(e)) {
-              log(`${action} unavailable on this firmware`, String(e?.message ?? e));
-              return;
+          case "enableDfuServiceOnDisconnect":
+            if (state.dfuServiceActive === true) {
+              log(
+                "enableDfuServiceOnDisconnect skipped",
+                "DFU service is already active on this BLE session",
+              );
+              break;
             }
-            log(`${action} error`, String(e?.message ?? e));
-            console.warn(e);
+            if (
+              !window.confirm(
+                "Enable DFU Service On Next Disconnect?\n\n" +
+                  "This sends ASM DFU_MODE ([0x26, 0x00, 0x00]).\n" +
+                  "It does NOT reboot immediately.\n\n" +
+                  "After clicking OK:\n" +
+                  "1. The command will be sent to the device\n" +
+                  "2. Disconnect from the device\n" +
+                  "3. On next BLE session, Nordic DFU service should be active\n" +
+                  "4. Use Reboot To DFU Bootloader to switch immediately",
+              )
+            )
+              break;
+            await v.enableDfuServiceOnNextDisconnect();
+            log("enableDfuServiceOnDisconnect", "ok");
+            break;
+          case "rebootToDfuBootloader":
+            if (state.dfuServiceActive !== true) {
+              throw new Error(
+                "Nordic DFU service is not active on this BLE session. Enable DFU service first and reconnect.",
+              );
+            }
+            if (!window.confirm("Confirm reboot device into Bootloader now?"))
+              break;
+            setStatus("dfu-rebooting");
+            await v.rebootToDfuBootloader({
+              waitForDisconnect: true,
+              disconnectAfterCommand: true,
+              timeoutMs: 10000,
+            });
+            log(
+              "rebootToDfuBootloader",
+              "command sent; device disconnected for bootloader reboot",
+            );
+            break;
+          case "prodRead":
+            await prodRead();
+            break;
+          case "prodWrite":
+            await prodWrite();
+            break;
+          case "opRead":
+            await opRead();
+            break;
+          case "opWrite":
+            await opWrite();
+            break;
+          default:
+            log("Unknown action", action);
+        }
+      }
+
+      function attachEvents() {
+        document.querySelectorAll(".tab-btn").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const target = btn.getAttribute("data-tab");
+            document
+              .querySelectorAll(".tab-btn")
+              .forEach((b) => b.classList.remove("active"));
+            document
+              .querySelectorAll(".tab")
+              .forEach((t) => t.classList.remove("active"));
+            btn.classList.add("active");
+            document.getElementById(target)?.classList.add("active");
+          });
+        });
+
+        ui.btnConnectBle.addEventListener("click", async () => {
+          try {
+            await connectBle();
+          } catch (e) {
+            setConnectionButtonsState({ connected: !!state.v });
+            log("connect BLE error", String(e?.message ?? e));
+            setStatus("error");
           }
         });
-      });
-    }
 
-    attachEvents();
-    setConnectionButtonsState({ connected: false });
-    updateBleLinkInfo("none");
-    updateDfuUpdateToolState(false);
-    updateHardwareTestAvailability();
-    resetAccelPlotBuffers(51.2);
-    resetGsrPlotBuffers(50);
-    log("Verisense Capture ready.");
-  </script>
-</body>
+        ui.btnConnectSerial.addEventListener("click", async () => {
+          try {
+            await connectSerial();
+          } catch (e) {
+            setConnectionButtonsState({ connected: !!state.v });
+            log("connect serial error", String(e?.message ?? e));
+            setStatus("error");
+          }
+        });
 
+        ui.btnDisconnect.addEventListener("click", async () => {
+          try {
+            await disconnect();
+          } catch (e) {
+            log("disconnect error", String(e?.message ?? e));
+          }
+        });
+
+        ui.btnDisconnectRequest.addEventListener("click", async () => {
+          try {
+            await runAction("disconnectRequest");
+          } catch (e) {
+            log("disconnect request error", String(e?.message ?? e));
+          }
+        });
+
+        ui.btnStreamStart.addEventListener("click", async () => {
+          try {
+            await startStreaming();
+          } catch (e) {
+            log("start stream error", String(e?.message ?? e));
+          }
+        });
+
+        ui.btnStreamStop.addEventListener("click", async () => {
+          try {
+            await stopStreaming();
+          } catch (e) {
+            log("stop stream error", String(e?.message ?? e));
+          }
+        });
+
+        ui.btnStreamClear.addEventListener("click", () => {
+          state.accelPackets = 0;
+          state.adcPackets = 0;
+          ui.streamAccelCount.textContent = "0";
+          ui.streamAdcCount.textContent = "0";
+          ui.streamLastSensor.textContent = "-";
+          resetAccelPlotBuffers(state.v?.accel1?.samplingRateHz ?? 51.2);
+          resetGsrPlotBuffers(state.v?.adc?.samplingRateHz ?? 50);
+        });
+
+        ui.btnLogClear.addEventListener("click", () => {
+          ui.log.textContent = "";
+        });
+
+        if (ui.btnTestReportClose) {
+          ui.btnTestReportClose.addEventListener("click", () => {
+            if (ui.testReportDialog?.open) ui.testReportDialog.close();
+          });
+        }
+
+        document.querySelectorAll("[data-action]").forEach((el) => {
+          el.addEventListener("click", async () => {
+            const action = el.getAttribute("data-action");
+            try {
+              await runAction(action);
+            } catch (e) {
+              if (isDebugHeaderNackError(e)) {
+                log(
+                  `${action} unavailable on this firmware`,
+                  String(e?.message ?? e),
+                );
+                return;
+              }
+              log(`${action} error`, String(e?.message ?? e));
+              console.warn(e);
+            }
+          });
+        });
+      }
+
+      attachEvents();
+      setConnectionButtonsState({ connected: false });
+      updateBleLinkInfo("none");
+      updateDfuUpdateToolState(false);
+      updateHardwareTestAvailability();
+      resetAccelPlotBuffers(51.2);
+      resetGsrPlotBuffers(50);
+      log("Verisense Capture ready.");
+    </script>
+  </body>
 </html>
