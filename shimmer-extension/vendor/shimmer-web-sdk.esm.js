@@ -1227,6 +1227,14 @@ const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 /** NUS RX characteristic UUID (host subscribes to notifications from this). */
 const NUS_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+/** Nordic Secure DFU primary service UUID (0xFE59). */
+const NORDIC_DFU_SERVICE = '0000fe59-0000-1000-8000-00805f9b34fb';
+/** Nordic DFU control-point characteristic UUID. */
+const NORDIC_DFU_CONTROL_CHAR = '8ec90001-f315-4f60-9fb8-838830daea50';
+/** Nordic DFU packet characteristic UUID. */
+const NORDIC_DFU_PACKET_CHAR = '8ec90002-f315-4f60-9fb8-838830daea50';
+/** Nordic buttonless DFU characteristic UUID (write 0x01 to reboot to bootloader). */
+const NORDIC_DFU_BUTTONLESS_CHAR = '8ec90003-f315-4f60-9fb8-838830daea50';
 // ---------------------------------------------------------------------------
 // Verisense protocol command/property constants
 // ---------------------------------------------------------------------------
@@ -3364,8 +3372,105 @@ class VerisenseBleDevice extends BaseShimmerClient {
     async writeTimeUnixSeconds(unixSeconds) {
         await this.writeTime(unixSecondsToAsmRtcBytes(unixSeconds));
     }
-    async enterDfuMode() {
+    /**
+     * Enables Nordic Secure DFU service advertisement after the next disconnect.
+     *
+     * This sends ASM DFU_MODE property write (equivalent to [0x26, 0x00, 0x00]).
+     * It does not immediately reboot into bootloader mode.
+     */
+    async enableDfuServiceOnNextDisconnect() {
         await this.writeProperty(ASM_PROPERTY.DFU_MODE, []);
+    }
+    /**
+     * @deprecated Use enableDfuServiceOnNextDisconnect() for clearer semantics.
+     */
+    async enterDfuMode() {
+        await this.enableDfuServiceOnNextDisconnect();
+    }
+    /**
+     * Uses Nordic buttonless DFU characteristic to reboot the connected device into bootloader mode.
+     *
+     * Requirements:
+     * - BLE transport must be connected
+     * - Nordic Secure DFU service and buttonless characteristic must be present
+     */
+    async rebootToDfuBootloader(opts = {}) {
+        if (this._transportKind !== 'ble' || !this.device?.gatt?.connected || !this.server) {
+            throw new Error('rebootToDfuBootloader: requires an active BLE connection');
+        }
+        const waitForDisconnect = opts.waitForDisconnect ?? true;
+        const disconnectAfterCommand = opts.disconnectAfterCommand ?? true;
+        const timeoutMs = Math.max(500, Math.trunc(opts.timeoutMs ?? 8000));
+        const dfuService = await this.server.getPrimaryService(NORDIC_DFU_SERVICE);
+        let buttonlessChar;
+        try {
+            buttonlessChar = await dfuService.getCharacteristic(NORDIC_DFU_BUTTONLESS_CHAR);
+        }
+        catch {
+            const hasControl = await dfuService
+                .getCharacteristic(NORDIC_DFU_CONTROL_CHAR)
+                .then(() => true)
+                .catch(() => false);
+            const hasPacket = await dfuService
+                .getCharacteristic(NORDIC_DFU_PACKET_CHAR)
+                .then(() => true)
+                .catch(() => false);
+            if (hasControl && hasPacket) {
+                throw new Error('Device already appears to be in DFU bootloader mode');
+            }
+            throw new Error('Nordic buttonless DFU characteristic not found');
+        }
+        if (buttonlessChar.properties.notify || buttonlessChar.properties.indicate) {
+            try {
+                await buttonlessChar.startNotifications();
+            }
+            catch {
+                /* some stacks may still allow write without notifications */
+            }
+        }
+        const device = this.device;
+        let disconnectPromise = null;
+        if (waitForDisconnect) {
+            let offDisconnect = null;
+            disconnectPromise = new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    if (offDisconnect)
+                        offDisconnect();
+                    reject(new Error(`Timed out waiting for reboot/disconnect (${timeoutMs} ms)`));
+                }, timeoutMs);
+                const onDisconnect = () => {
+                    clearTimeout(timer);
+                    if (offDisconnect)
+                        offDisconnect();
+                    resolve();
+                };
+                device.addEventListener('gattserverdisconnected', onDisconnect, { once: true });
+                offDisconnect = () => {
+                    try {
+                        device.removeEventListener('gattserverdisconnected', onDisconnect);
+                    }
+                    catch {
+                        /* ignore */
+                    }
+                };
+            });
+        }
+        const cmd = new Uint8Array([0x01]);
+        await buttonlessChar.writeValue(cmd);
+        if (disconnectAfterCommand && device.gatt?.connected) {
+            try {
+                device.gatt.disconnect();
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        if (waitForDisconnect) {
+            if (!device.gatt?.connected)
+                return;
+            if (disconnectPromise)
+                await disconnectPromise;
+        }
     }
     async runTestMode(testPayload) {
         const payload = normalizeBytePayload(testPayload instanceof Uint8Array ? testPayload : new Uint8Array(testPayload));
@@ -3887,6 +3992,8 @@ VerisenseBleDevice.MAX_DEBUG_FRAME_PAYLOAD_LEN = 0xffff;
 VerisenseBleDevice.NUS_SERVICE = NUS_SERVICE;
 VerisenseBleDevice.NUS_TX = NUS_TX;
 VerisenseBleDevice.NUS_RX = NUS_RX;
+VerisenseBleDevice.NORDIC_DFU_SERVICE = NORDIC_DFU_SERVICE;
+VerisenseBleDevice.NORDIC_DFU_BUTTONLESS_CHAR = NORDIC_DFU_BUTTONLESS_CHAR;
 
-export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
+export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_CHAR, NORDIC_DFU_CONTROL_CHAR, NORDIC_DFU_PACKET_CHAR, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

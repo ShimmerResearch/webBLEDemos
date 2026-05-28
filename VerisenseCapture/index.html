@@ -250,6 +250,58 @@
       gap: 8px;
     }
 
+    .step-flow {
+      display: grid;
+      gap: 10px;
+    }
+
+    .step-card {
+      border: 1px solid #d8e5ea;
+      border-radius: 12px;
+      background: linear-gradient(180deg, #ffffff, #f7fbfc);
+      padding: 12px;
+    }
+
+    .step-title {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-weight: 700;
+      color: #18495a;
+    }
+
+    .step-inline-status {
+      margin-left: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .step-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 26px;
+      height: 26px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: #e2f3f2;
+      border: 1px solid #b7dfdc;
+      color: #0a6d69;
+      font-size: 12px;
+      line-height: 1;
+    }
+
+    .step-copy {
+      margin: 0 0 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
     .log-box {
       width: 100%;
       height: calc(68vh - 80px);
@@ -737,54 +789,80 @@
 
         <div id="tab-dfu" class="tab">
           <div class="section">
-            <h3>DFU Mode Control</h3>
-            <div class="kv" style="margin-bottom: 12px;">
-              <div class="muted">Nordic DFU Service</div>
-              <div id="dfuServiceBadge" class="muted">— not connected —</div>
-            </div>
-            <div class="row" style="align-items: center; gap: 12px;">
-              <button id="btnEnterDfu" data-action="enterDfuMode" class="warn">Enter DFU Mode</button>
-              <span id="dfuEnterDfuNote" class="muted" style="font-size: 12px;"></span>
-            </div>
-            <p class="muted" style="font-size: 12px; margin: 8px 0 0;">
-              Sends the DFU mode command to the device. The device will restart and advertise the Nordic Secure DFU
-              service. Disconnect and reconnect to the device to access it for firmware updates.
-            </p>
-          </div>
-          <div class="section">
-            <h3>DFU Update Tool</h3>
-            <div id="dfu-connected-notice">
-              &#9888;&#xFE0E; A device is currently connected &mdash; disconnect from it first before using the DFU
-              Update Tool.
-            </div>
-            <div id="dfu-update-body">
-              <p class="muted" style="margin: 0 0 12px; font-size: 13px;">
-                First use <strong>Enter DFU Mode</strong> above, then <strong>disconnect</strong> from the device.
-                The device will re-advertise with the Nordic Secure DFU service active.
-                Select a firmware <code>.zip</code> package, then click <strong>Begin Update</strong> —
-                a browser device picker will open, and the library will handle switching the device into bootloader mode
-                and flashing automatically.
-              </p>
-              <div id="dfu-drop">
-                <svg id="dfu-icon" xmlns="http://www.w3.org/2000/svg" width="36" height="31" viewBox="0 0 50 43">
-                  <path
-                    d="M48.4 26.5c-.9 0-1.7.7-1.7 1.7v11.6h-43.3v-11.6c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v13.2c0 .9.7 1.7 1.7 1.7h46.7c.9 0 1.7-.7 1.7-1.7v-13.2c0-1-.7-1.7-1.7-1.7zm-24.5 6.1c.3.3.8.5 1.2.5.4 0 .9-.2 1.2-.5l10-11.6c.7-.7.7-1.7 0-2.4s-1.7-.7-2.4 0l-7.1 8.3v-25.3c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v25.3l-7.1-8.3c-.7-.7-1.7-.7-2.4 0s-.7 1.7 0 2.4l10 11.6z" />
-                </svg>
-                <input id="dfu-file" type="file"
-                  style="width: 0.1px; height: 0.1px; opacity: 0; position: absolute; z-index: -1;" />
-                <label id="dfu-label" for="dfu-file">
-                  <strong>Choose a firmware package (.zip)</strong>
-                  <span>or drag and drop here</span>
-                </label>
-                <div id="dfu-select">
-                  <button id="dfu-button" class="primary">Begin Update</button>
+            <h3>DFU Flow</h3>
+            <div class="step-flow">
+              <div class="step-card">
+                <div class="step-title">
+                  <span class="step-badge">Step 1</span>
+                  <span>Enable DFU Service</span>
+                  <span class="step-inline-status">
+                    <span class="muted">Nordic DFU Service:</span>
+                    <span id="dfuServiceBadge" class="muted">— not connected —</span>
+                  </span>
+                </div>
+                <p class="step-copy">
+                  Use this once to enable Nordic DFU service advertisement after the next disconnect. This does not
+                  reboot the device immediately.
+                </p>
+                <div class="row" style="margin-bottom: 0; align-items: center; gap: 12px;">
+                  <button id="btnEnableDfuService" data-action="enableDfuServiceOnDisconnect">Enable DFU Service (next
+                    disconnect)</button>
+                  <span id="dfuEnterDfuNote" class="muted" style="font-size: 12px;"></span>
                 </div>
               </div>
-              <div id="dfu-status-bar">
-                <div id="dfu-bar"></div>
-                <div id="dfu-transfer"></div>
+
+              <div class="step-card">
+                <div class="step-title">
+                  <span class="step-badge">Step 2</span>
+                  <span>Reboot To DFU Bootloader Mode</span>
+                </div>
+                <p class="step-copy">
+                  After reconnecting with Nordic DFU service active, use the buttonless DFU command to reboot directly
+                  into bootloader mode.
+                </p>
+                <div class="row" style="margin-bottom: 0; align-items: center; gap: 12px;">
+                  <button id="btnRebootBootloader" data-action="rebootToDfuBootloader" class="warn">Reboot To DFU
+                    Bootloader (buttonless)</button>
+                </div>
               </div>
-              <div id="dfu-status-msg" class="muted"></div>
+
+              <div class="step-card">
+                <div class="step-title">
+                  <span class="step-badge">Step 3</span>
+                  <span>Perform Firmware Update</span>
+                </div>
+                <p class="step-copy">
+                  Select a firmware <code>.zip</code> package, then click <strong>Begin Update</strong>. A browser
+                  device
+                  picker will open and the DFU library will connect to the bootloader and flash the firmware.
+                </p>
+                <div id="dfu-connected-notice">
+                  &#9888;&#xFE0E; A device is currently connected &mdash; disconnect from it first before using the DFU
+                  Update Tool.
+                </div>
+                <div id="dfu-update-body">
+                  <div id="dfu-drop">
+                    <svg id="dfu-icon" xmlns="http://www.w3.org/2000/svg" width="36" height="31" viewBox="0 0 50 43">
+                      <path
+                        d="M48.4 26.5c-.9 0-1.7.7-1.7 1.7v11.6h-43.3v-11.6c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v13.2c0 .9.7 1.7 1.7 1.7h46.7c.9 0 1.7-.7 1.7-1.7v-13.2c0-1-.7-1.7-1.7-1.7zm-24.5 6.1c.3.3.8.5 1.2.5.4 0 .9-.2 1.2-.5l10-11.6c.7-.7.7-1.7 0-2.4s-1.7-.7-2.4 0l-7.1 8.3v-25.3c0-.9-.7-1.7-1.7-1.7s-1.7.7-1.7 1.7v25.3l-7.1-8.3c-.7-.7-1.7-.7-2.4 0s-.7 1.7 0 2.4l10 11.6z" />
+                    </svg>
+                    <input id="dfu-file" type="file"
+                      style="width: 0.1px; height: 0.1px; opacity: 0; position: absolute; z-index: -1;" />
+                    <label id="dfu-label" for="dfu-file">
+                      <strong>Choose a firmware package (.zip)</strong>
+                      <span>or drag and drop here</span>
+                    </label>
+                    <div id="dfu-select">
+                      <button id="dfu-button" class="primary">Begin Update</button>
+                    </div>
+                  </div>
+                  <div id="dfu-status-bar">
+                    <div id="dfu-bar"></div>
+                    <div id="dfu-transfer"></div>
+                  </div>
+                  <div id="dfu-status-msg" class="muted"></div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -999,12 +1077,11 @@
 
         // requestDevice(true) opens a picker filtered for the DFU service UUID and uses
         // the buttonless DFU characteristic to trigger bootloader mode, then reconnects
-        // automatically. The device must have the DFU service active (use Enter DFU Mode
-        // above then disconnect first).
+        // automatically. If DFU service is not active, use the DFU controls above first.
         dfu.requestDevice(true)
           .then(function (device) {
             if (!device) {
-              dfuSetStatus('DFU mode set \u2014 device is rebooting into bootloader. Click Begin Update again to connect and flash.');
+              dfuSetStatus('Buttonless reboot command sent. Device is rebooting into bootloader. Click Begin Update again to connect and flash.');
               return;
             }
             dfuSetStatus('Device selected, starting transfer...');
@@ -1045,6 +1122,7 @@
   <script type="module">
     import {
       ASM_PROPERTY,
+      NORDIC_DFU_SERVICE,
       VerisenseBleDevice,
       OP_IDX,
       buildProductionConfigPayload,
@@ -1054,7 +1132,6 @@
     } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
     const $ = (id) => document.getElementById(id);
-    const NORDIC_DFU_SERVICE = '0000fe59-0000-1000-8000-00805f9b34fb';
 
     const ui = {
       btnConnectBle: $("btnConnectBle"),
@@ -1116,7 +1193,8 @@
       prodAdvPrefix: $("prodAdvPrefix"),
       prodDfuEnabled: $("prodDfuEnabled"),
       dfuServiceBadge: $("dfuServiceBadge"),
-      btnEnterDfu: $("btnEnterDfu"),
+      btnEnableDfuService: $("btnEnableDfuService"),
+      btnRebootBootloader: $("btnRebootBootloader"),
     };
 
     const state = {
@@ -1444,17 +1522,24 @@
           ui.dfuServiceBadge.className = 'dfu-badge-inactive';
         }
       }
-      if (ui.btnEnterDfu) {
-        ui.btnEnterDfu.disabled = active === true;
-        ui.btnEnterDfu.title = active === true
-          ? 'DFU service is already active \u2014 use the update tool below to flash firmware'
+      if (ui.btnEnableDfuService) {
+        ui.btnEnableDfuService.disabled = active === true;
+        ui.btnEnableDfuService.title = active === true
+          ? 'DFU service is already active for this BLE session'
           : '';
+      }
+      if (ui.btnRebootBootloader) {
+        const canReboot = active === true;
+        ui.btnRebootBootloader.disabled = !canReboot;
+        ui.btnRebootBootloader.title = canReboot
+          ? 'Writes 0x01 to Nordic buttonless DFU characteristic to reboot into bootloader'
+          : 'Requires Nordic DFU service to be active on this connection';
       }
       const noteEl = document.getElementById('dfuEnterDfuNote');
       if (noteEl) {
         noteEl.textContent = active === true
-          ? 'DFU service is already active \u2014 use the update tool below.'
-          : '';
+          ? 'DFU service active. You can reboot into bootloader directly.'
+          : 'If not active, enable it first (takes effect after disconnect).';
       }
     }
 
@@ -2127,22 +2212,34 @@
           }
           break;
         }
-        case "enterDfuMode":
+        case "enableDfuServiceOnDisconnect":
           if (state.dfuServiceActive === true) {
-            log("enterDfuMode skipped", "DFU service is already active \u2014 use the update tool below");
+            log("enableDfuServiceOnDisconnect skipped", "DFU service is already active on this BLE session");
             break;
           }
           if (!window.confirm(
-            "Enter DFU Mode?\n\n" +
-            "The device will restart and begin advertising the Nordic Secure DFU service.\n\n" +
+            "Enable DFU Service On Next Disconnect?\n\n" +
+            "This sends ASM DFU_MODE ([0x26, 0x00, 0x00]).\n" +
+            "It does NOT reboot immediately.\n\n" +
             "After clicking OK:\n" +
             "1. The command will be sent to the device\n" +
             "2. Disconnect from the device\n" +
-            "3. The device will re-advertise with the Nordic DFU service active\n" +
-            "4. Select a firmware .zip, then click Begin Update \u2014 the picker and bootloader switch are handled automatically"
+            "3. On next BLE session, Nordic DFU service should be active\n" +
+            "4. Use Reboot To DFU Bootloader to switch immediately"
           )) break;
-          await v.enterDfuMode();
-          log("enterDfuMode", "ok");
+          await v.enableDfuServiceOnNextDisconnect();
+          log("enableDfuServiceOnDisconnect", "ok");
+          break;
+        case "rebootToDfuBootloader":
+          if (state.dfuServiceActive !== true) {
+            throw new Error("Nordic DFU service is not active on this BLE session. Enable DFU service first and reconnect.");
+          }
+          if (!window.confirm(
+            "Confirm reboot device into Bootloader now?"
+          )) break;
+          setStatus("dfu-rebooting");
+          await v.rebootToDfuBootloader({ waitForDisconnect: true, disconnectAfterCommand: true, timeoutMs: 10000 });
+          log("rebootToDfuBootloader", "command sent; device disconnected for bootloader reboot");
           break;
         case "prodRead":
           await prodRead();

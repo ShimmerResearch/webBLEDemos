@@ -617,6 +617,14 @@ declare const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 declare const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 /** NUS RX characteristic UUID (host subscribes to notifications from this). */
 declare const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+/** Nordic Secure DFU primary service UUID (0xFE59). */
+declare const NORDIC_DFU_SERVICE = "0000fe59-0000-1000-8000-00805f9b34fb";
+/** Nordic DFU control-point characteristic UUID. */
+declare const NORDIC_DFU_CONTROL_CHAR = "8ec90001-f315-4f60-9fb8-838830daea50";
+/** Nordic DFU packet characteristic UUID. */
+declare const NORDIC_DFU_PACKET_CHAR = "8ec90002-f315-4f60-9fb8-838830daea50";
+/** Nordic buttonless DFU characteristic UUID (write 0x01 to reboot to bootloader). */
+declare const NORDIC_DFU_BUTTONLESS_CHAR = "8ec90003-f315-4f60-9fb8-838830daea50";
 /** Upper-nibble command classes used in protocol headers. */
 declare const ASM_COMMAND: Readonly<{
     readonly READ: 16;
@@ -1303,6 +1311,8 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     static readonly NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+    static readonly NORDIC_DFU_SERVICE = "0000fe59-0000-1000-8000-00805f9b34fb";
+    static readonly NORDIC_DFU_BUTTONLESS_CHAR = "8ec90003-f315-4f60-9fb8-838830daea50";
     private readonly _evMap;
     on<T = unknown>(ev: string, fn: (data: T) => void): () => void;
     off(ev: string, fn: (data: unknown) => void): void;
@@ -1399,7 +1409,29 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     writeOperationalConfig(bytes: Uint8Array | number[]): Promise<void>;
     writeTime(rtc7: Uint8Array | number[]): Promise<void>;
     writeTimeUnixSeconds(unixSeconds: number): Promise<void>;
+    /**
+     * Enables Nordic Secure DFU service advertisement after the next disconnect.
+     *
+     * This sends ASM DFU_MODE property write (equivalent to [0x26, 0x00, 0x00]).
+     * It does not immediately reboot into bootloader mode.
+     */
+    enableDfuServiceOnNextDisconnect(): Promise<void>;
+    /**
+     * @deprecated Use enableDfuServiceOnNextDisconnect() for clearer semantics.
+     */
     enterDfuMode(): Promise<void>;
+    /**
+     * Uses Nordic buttonless DFU characteristic to reboot the connected device into bootloader mode.
+     *
+     * Requirements:
+     * - BLE transport must be connected
+     * - Nordic Secure DFU service and buttonless characteristic must be present
+     */
+    rebootToDfuBootloader(opts?: {
+        waitForDisconnect?: boolean;
+        disconnectAfterCommand?: boolean;
+        timeoutMs?: number;
+    }): Promise<void>;
     runTestMode(testPayload: Uint8Array | number[]): Promise<void>;
     runHardwareTest(testId: TestModeId, hwMajor: number, hwMinor?: number, hwInternal?: number): Promise<void>;
     private _buildDebugPayload;
@@ -1466,5 +1498,5 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _handleStreamingPayload;
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
+export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_CHAR, NORDIC_DFU_CONTROL_CHAR, NORDIC_DFU_PACKET_CHAR, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
 export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions, VerisenseCommandResponse, VerisenseEventLogEntry, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseStatusPayload };
