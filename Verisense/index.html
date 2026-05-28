@@ -211,11 +211,16 @@
         if (!gsrOn) chkBattEnable.checked = false;
       }
 
+      function getGsrSensor(dev) {
+        return dev?.gsr ?? dev?.adc ?? null;
+      }
+
       function syncOpCfgUIFromDeviceState() {
         if (!v) return;
+        const gsrSensor = getGsrSensor(v);
         chkAccelEnable.checked = !!v?.accel1?.enabled;
-        chkGsrEnable.checked = !!v?.gsr?.gsrEnabled;
-        chkBattEnable.checked = !!v?.gsr?.battEnabled;
+        chkGsrEnable.checked = !!gsrSensor?.gsrEnabled;
+        chkBattEnable.checked = !!gsrSensor?.battEnabled;
         enforceGsrBattUI();
       }
 
@@ -500,13 +505,14 @@
         // Decoder toggles (affects parsing/plotting only)
         if (v.accel1) v.accel1.enabled = !!chkAccelEnable?.checked;
 
-        if (v.gsr?.setEnabled) {
+        const gsrSensor = getGsrSensor(v);
+        if (gsrSensor?.setEnabled) {
           const gsrOn = !!chkGsrEnable?.checked;
           const battOn = !!chkBattEnable?.checked;
-          v.gsr.setEnabled({ gsr: gsrOn, batt: battOn && gsrOn });
-        } else if (v.gsr) {
-          v.gsr.gsrEnabled = !!chkGsrEnable?.checked;
-          v.gsr.battEnabled = !!chkBattEnable?.checked;
+          gsrSensor.setEnabled({ gsr: gsrOn, batt: battOn && gsrOn });
+        } else if (gsrSensor) {
+          gsrSensor.gsrEnabled = !!chkGsrEnable?.checked;
+          gsrSensor.battEnabled = !!chkBattEnable?.checked;
         }
       }
 
@@ -545,13 +551,14 @@
           next = v.accel1.setEnabled(!!chkAccelEnable.checked, next);
           next = v.accel1.patchAccelSamplingRate(9, next);
         }
-        if (v.gsr?.setEnabled) {
-          next = v.gsr.setEnabled(
+        const gsrSensor = getGsrSensor(v);
+        if (gsrSensor?.setEnabled) {
+          next = gsrSensor.setEnabled(
             { gsr: !!chkGsrEnable.checked, batt: !!chkBattEnable.checked },
             next,
           );
-          next = v.gsr.patchGsrRange(4, next);
-          next = v.gsr.patchGsrSamplingRate(23, next);
+          next = gsrSensor.patchGsrRange(4, next);
+          next = gsrSensor.patchGsrSamplingRate(23, next);
         }
 
         const confirmed = await v.writeOpConfig(next, { verify: true });
@@ -571,8 +578,9 @@
         dev.accel1.samplingRateHz = 51.2;
 
         // Enable GSR decoder (sensorId = 1)
-        dev.gsr.setEnabled({ gsr: true, batt: true });
-        dev.gsr.samplingRateHz = 50;
+        const gsrSensor = getGsrSensor(dev);
+        gsrSensor?.setEnabled?.({ gsr: true, batt: true });
+        if (gsrSensor) gsrSensor.samplingRateHz = 50;
 
         // Optional: turn off other decoders
         dev.gyroAccel2.setAccelEnabled(false);
@@ -636,7 +644,7 @@
         <div>packets: ${gsrPackets}</div>
         <div>tick_u24: ${pkt.tick_u24 ?? "—"}</div>
         <div>gsr: raw=${rawStr} | R=${rStr} Ω | ${uSStr} µS</div>
-        <div>batt: ${batt ? `${batt.mv} mV` : "—"}</div>
+        <div>batt: ${batt ? `${batt.mV ?? batt.mv} mV` : "—"}</div>
         <div><small>timestamp: ${ts} | crcOk: ${pkt.crcOk ?? "n/a"}</small></div>
       `;
       }
@@ -887,7 +895,7 @@
         try {
           // clear charts each time Start is pressed
           resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
-          resetGsrPlotBuffers(v?.gsr?.samplingRateHz ?? 50);
+          resetGsrPlotBuffers(getGsrSensor(v)?.samplingRateHz ?? 50);
 
           accelPackets = 0;
           gsrPackets = 0;
@@ -933,10 +941,11 @@
         try {
           if (!v) throw new Error("Not connected");
           await applyOpConfigToDevice();
+          const gsrSensor = getGsrSensor(v);
           log("opcfg applied:", {
             accelEnabled: v?.accel1?.enabled,
-            gsrEnabled: v?.gsr?.gsrEnabled,
-            battEnabled: v?.gsr?.battEnabled,
+            gsrEnabled: gsrSensor?.gsrEnabled,
+            battEnabled: gsrSensor?.battEnabled,
           });
         } catch (e) {
           log("opcfg apply error:", String(e?.message ?? e));

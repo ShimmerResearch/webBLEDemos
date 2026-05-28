@@ -611,6 +611,172 @@ declare function nudgeGsrResistance(gsrResistanceKOhms: number, gsrRangeSetting:
  */
 declare function getOversamplingRatioADS1292R(samplingRate: number): number;
 
+/** NUS primary service UUID. */
+declare const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+/** NUS TX characteristic UUID (host writes to this). */
+declare const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+/** NUS RX characteristic UUID (host subscribes to notifications from this). */
+declare const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+/** Upper-nibble command classes used in protocol headers. */
+declare const ASM_COMMAND: Readonly<{
+    readonly READ: 16;
+    readonly WRITE: 32;
+    readonly RESPONSE: 48;
+    readonly ACK: 64;
+    readonly NACK_BAD_HEADER_COMMAND: 80;
+    readonly NACK_BAD_HEADER_PROPERTY: 96;
+    readonly NACK_GENERIC: 112;
+    readonly ACK_NEXT_STAGE: 128;
+}>;
+type AsmCommand = (typeof ASM_COMMAND)[keyof typeof ASM_COMMAND];
+/** Lower-nibble property IDs used in protocol headers. */
+declare const ASM_PROPERTY: Readonly<{
+    readonly STATUS1: 1;
+    readonly DATA: 2;
+    readonly PRODUCTION_CONFIGURATION: 3;
+    readonly OPERATIONAL_CONFIGURATION: 4;
+    readonly TIME: 5;
+    readonly DFU_MODE: 6;
+    readonly PENDING_EVENTS: 7;
+    readonly TEST_MODE: 8;
+    readonly DEBUG_COMMAND: 9;
+    readonly STREAM_MODE: 10;
+    readonly DEVICE_DISCONNECT: 11;
+    readonly STATUS2: 12;
+}>;
+type AsmProperty = (typeof ASM_PROPERTY)[keyof typeof ASM_PROPERTY];
+/** Stream mode payload values. */
+declare const STREAM_MODE: Readonly<{
+    readonly ENABLE: 1;
+    readonly DISABLE: 2;
+}>;
+/** Test mode IDs documented by Verisense firmware. */
+declare const TEST_MODE_ID: Readonly<{
+    readonly STOP: 0;
+    readonly FLASH_8MB_1: 1;
+    readonly FLASH_8MB_2: 2;
+    readonly FLASH_128MB_512MB: 3;
+    readonly EEPROM: 4;
+    readonly ACCEL1_LIS2DW12: 5;
+    readonly BATTERY_VOLTAGE: 6;
+    readonly USB_POWER: 7;
+    readonly ACCEL2_GYRO_LSM6DS3: 8;
+    readonly PPG_MAX86XXX: 9;
+    readonly BIOZ_MAX30002: 11;
+    readonly ACCEL2_GYRO_LSM6DSV: 12;
+    readonly MAG_LIS2MDL: 13;
+    readonly ALL_TESTS: 255;
+}>;
+type TestModeId = (typeof TEST_MODE_ID)[keyof typeof TEST_MODE_ID];
+/** Debug command IDs documented by Verisense firmware. */
+declare const DEBUG_COMMAND_ID: Readonly<{
+    readonly FLASH_LOOKUP_TABLE_READ: 1;
+    readonly FLASH_LOOKUP_TABLE_ERASE: 2;
+    readonly RWC_SCHEDULER_READ: 3;
+    readonly ERASE_128MB_512MB_FLASH: 4;
+    readonly ERASE_8MB_FLASH_1: 5;
+    readonly ERASE_8MB_FLASH_2: 6;
+    readonly ERASE_OPERATIONAL_CONFIG: 7;
+    readonly ERASE_PRODUCTION_CONFIG: 8;
+    readonly CLEAR_PENDING_EVENTS: 9;
+    readonly ERASE_FLASH_AND_LOOKUP_TABLE: 10;
+    readonly TEST_DATA_TRANSFER_LOOP: 11;
+    readonly LOAD_TEST_LOOKUP_TABLE: 12;
+    readonly LED_TEST: 13;
+    readonly MAX86XXX_LED_TEST: 14;
+    readonly CHECK_PAYLOAD_CRC_ERRORS: 15;
+    readonly READ_EVENT_LOG: 16;
+    readonly POWER_PROFILER_TEST: 17;
+    readonly READ_RECORD_BUFFER_DETAILS: 18;
+    readonly SYSTEM_RESET: 19;
+    readonly IC_POWER_CONSUMPTION_TEST: 20;
+    readonly DELETE_ALL_BONDS: 21;
+}>;
+type DebugCommandId = (typeof DEBUG_COMMAND_ID)[keyof typeof DEBUG_COMMAND_ID];
+/**
+ * Byte indices into the Verisense operational config blob (`op[OP_IDX.xxx]`).
+ * Index 0 is the config version byte (must be 0x5A for a valid config).
+ */
+declare const OP_IDX: Readonly<{
+    readonly GEN_CFG_0: 1;
+    readonly GEN_CFG_1: 2;
+    readonly GEN_CFG_2: 3;
+    readonly GEN_CFG_3: 4;
+    readonly ACCEL1_CFG_0: 5;
+    readonly ACCEL1_CFG_1: 6;
+    readonly ACCEL1_CFG_2: 7;
+    readonly ACCEL1_CFG_3: 8;
+    readonly GYRO_ACCEL2_CFG_0: 10;
+    readonly GYRO_ACCEL2_CFG_1: 11;
+    readonly GYRO_ACCEL2_CFG_2: 12;
+    readonly GYRO_ACCEL2_CFG_3: 13;
+    readonly GYRO_ACCEL2_CFG_4: 14;
+    readonly GYRO_ACCEL2_CFG_5: 15;
+    readonly GYRO_ACCEL2_CFG_6: 16;
+    readonly GYRO_ACCEL2_CFG_7: 17;
+    readonly START_TIME: 21;
+    readonly END_TIME: 25;
+    readonly INACTIVE_TIMEOUT: 29;
+    readonly BLE_RETRY_COUNT: 30;
+    readonly BLE_TX_POWER: 31;
+    readonly BLE_DATA_TRANS_WKUP_INT_HRS: 32;
+    readonly BLE_DATA_TRANS_WKUP_TIME: 33;
+    readonly BLE_DATA_TRANS_WKUP_DUR: 35;
+    readonly BLE_DATA_TRANS_RETRY_INT: 36;
+    readonly BLE_STATUS_WKUP_INT_HRS: 38;
+    readonly BLE_STATUS_WKUP_TIME: 39;
+    readonly BLE_STATUS_WKUP_DUR: 41;
+    readonly BLE_STATUS_RETRY_INT: 42;
+    readonly BLE_RTC_SYNC_WKUP_INT_HRS: 44;
+    readonly BLE_RTC_SYNC_WKUP_TIME: 45;
+    readonly BLE_RTC_SYNC_WKUP_DUR: 47;
+    readonly BLE_RTC_SYNC_RETRY_INT: 48;
+    readonly ADC_CHANNEL_SETTINGS_0: 50;
+    readonly ADC_CHANNEL_SETTINGS_1: 51;
+    readonly ADAPTIVE_SCHEDULER_INT: 52;
+    readonly ADAPTIVE_SCHEDULER_FAILCOUNT_MAX: 54;
+    readonly PPG_REC_DUR_SECS_LSB: 55;
+    readonly PPG_REC_DUR_SECS_MSB: 56;
+    readonly PPG_REC_INT_MINS_LSB: 57;
+    readonly PPG_REC_INT_MINS_MSB: 58;
+    readonly PPG_FIFO_CONFIG: 59;
+    readonly PPG_MODE_CONFIG2: 60;
+    readonly PPG_MA_DEFAULT: 61;
+    readonly PPG_MA_MAX_RED_IR: 62;
+    readonly PPG_MA_MAX_GREEN_BLUE: 63;
+    readonly PPG_AGC_TARGET_PERCENT_OF_RANGE: 64;
+    readonly PPG_MA_LED_PILOT: 66;
+    readonly PPG_DAC1_CROSSTALK: 67;
+    readonly PPG_DAC2_CROSSTALK: 68;
+    readonly PPG_DAC3_CROSSTALK: 69;
+    readonly PPG_DAC4_CROSSTALK: 70;
+    readonly PROX_AGC_MODE: 71;
+}>;
+type OpIdx = keyof typeof OP_IDX;
+
+interface VerisenseMessage {
+    header: number;
+    command: AsmCommand;
+    property: AsmProperty;
+    payloadLength: number;
+    payload: Uint8Array;
+}
+/** Build a protocol header byte from command/property nibbles. */
+declare function buildHeader(command: AsmCommand, property: AsmProperty): number;
+/** Decode a protocol header byte into command/property fields. */
+declare function parseHeader(header: number): {
+    command: AsmCommand;
+    property: AsmProperty;
+};
+/** Build a complete protocol message (header + 16-bit LE payload length + payload bytes). */
+declare function buildMessage(command: AsmCommand, property: AsmProperty, payloadBytes?: Uint8Array | number[]): Uint8Array;
+/** Parse a complete protocol message into structured fields. */
+declare function parseMessage(msg: Uint8Array): VerisenseMessage;
+declare function isAckCommand(command: AsmCommand): boolean;
+declare function isNackCommand(command: AsmCommand): boolean;
+/** Convert a pending-events payload (property IDs) into a typed array. */
+declare function parsePendingEvents(payload: Uint8Array): AsmProperty[];
+
 /**
  * Compute CRC-16/CCITT-FALSE over `bytes`.
  *
@@ -620,23 +786,214 @@ declare function getOversamplingRatioADS1292R(samplingRate: number): number;
 declare function crc16_ccitt_false(bytes: Uint8Array): number;
 /**
  * Convert any reasonable representation of an operational config to a
- * `Uint8Array`.  Throws if the input type is unrecognised.
+ * `Uint8Array`. Throws if the input type is unrecognised.
  */
 declare function normalizeOperationalConfig(payload: Uint8Array | ArrayBuffer | number[] | {
     buffer: ArrayBuffer;
     byteOffset?: number;
     byteLength?: number;
 } | null | undefined): Uint8Array | null;
+/** Alias for arbitrary protocol byte payload normalization. */
+declare function normalizeBytePayload(payload: Uint8Array | ArrayBuffer | number[] | {
+    buffer: ArrayBuffer;
+    byteOffset?: number;
+    byteLength?: number;
+} | null | undefined): Uint8Array | null;
+/**
+ * Derive the 6-digit pairing PIN from a Verisense unique identifier.
+ *
+ * The PIN is built from digits 2, 4 and 6 (1-based) of the identifier,
+ * followed by the decimal value of the final byte padded to 3 digits.
+ */
+declare function computeVerisensePairingPin(uniqueId: string): string;
 interface ProductionConfig {
     hardware: string;
     firmware: string;
     asmid: string;
     configHeader: number;
 }
+interface ProductionConfigBuildOptions {
+    manufacturingOrderNumberHex: string;
+    macIdHex: string;
+    revHwMajor: number;
+    revHwMinor: number;
+    revFwMajor: number;
+    revFwMinor: number;
+    revFwInternal?: number;
+    revHwInternal?: number;
+    passkeyId?: string;
+    passkey?: string;
+    advertisingNamePrefix?: string;
+    dfuEnabled?: boolean;
+}
+interface ProductionConfigFull extends ProductionConfig {
+    manufacturingOrderNumber: string;
+    macId: string;
+    uniqueIdentifier: string;
+    revHwMajor: number;
+    revHwMinor: number;
+    revHwInternal: number;
+    revFwMajor: number;
+    revFwMinor: number;
+    revFwInternal: number;
+    passkeyId: string;
+    passkey: string;
+    advertisingNamePrefix: string;
+    dfuEnabled: boolean;
+}
+interface VerisenseStatusFlags {
+    usbPluggedIn: boolean;
+    recordingPaused: boolean;
+    flashIsFull: boolean;
+    powerIsGood: boolean;
+    adaptiveSchedulerOn: boolean;
+    dfuServiceOn: boolean;
+    firstBoot: boolean;
+    repeatedBatteryMeasurement: boolean;
+}
+interface VerisenseStatusPayload {
+    uniqueIdentifier: string;
+    sourceStatusProperty: 'status1' | 'status2';
+    statusTimestampSeconds: number;
+    batteryMilliVolts: number;
+    batteryPercent: number;
+    lastOkTransferSeconds: number;
+    lastFailTransferSeconds: number;
+    memoryFreeKb: number;
+    memoryCapacityKb: number | null;
+    memoryUsedKb: number | null;
+    /** kB of FULL (ready-to-sync) flash banks. Only populated for payloads >= 57 bytes. */
+    memoryFullBanksKb: number | null;
+    /** kB of 2DEL (partially-deleted) flash banks. Only populated for payloads >= 57 bytes. */
+    memoryTwoDelBanksKb: number | null;
+    /** kB of BAD flash banks. Only populated for payloads >= 57 bytes. */
+    memoryBadBanksKb: number | null;
+    statusFlags: VerisenseStatusFlags | null;
+    batteryFallCounter: number | null;
+}
+interface VerisenseSchedulerDebugPayload {
+    currentTimeUnixSeconds: number;
+    bleControlCounter: 'data-transfer' | 'status1' | 'rtc-sync' | 'status2' | 'never' | 'unknown';
+    pendingDataTransferUnixSeconds: number;
+    pendingStatus1UnixSeconds: number;
+    pendingRtcSyncUnixSeconds: number;
+    pendingRetryUnixSeconds: number;
+    retryCount: number;
+    retryOperation: 'ble-off' | 'ble-on' | 'unknown';
+    adaptiveScheduler?: {
+        nextUnixSeconds: number;
+        enabled: boolean;
+        syncFailCounter: number;
+    };
+    ltfRetry?: {
+        nextUnixSeconds: number;
+        currentOperation: 'flash-write-retry-inactive' | 'short-flash-write-retry' | 'attempt-flash-write' | 'long-flash-write-retry' | 'sensor-paused-until-usb-plug-in' | 'unknown';
+        failCounterShort: number;
+        failCounterLong: number;
+    };
+    pendingStatus2UnixSeconds?: number;
+    ppgMeasurementUnixSeconds?: number;
+    stepCounterResetUnixSeconds?: number;
+    sensorInactivityUnixSeconds?: number;
+}
+interface VerisenseEventLogEntry {
+    index: number;
+    eventId: number;
+    eventName: string;
+    timestampUnixSeconds: number | null;
+    batteryMilliVolts: number | null;
+}
+interface VerisenseRecordBufferDetails {
+    bufferIndex: number;
+    bufferState: number;
+    packagedPayloadIndex: number;
+    currentByteIndexForSensorData: number;
+    usedBufferLength: number;
+    fifoTicks: number;
+    dataTimestampRwcMinutes: number;
+    dataTimestampRwcTicks: number;
+    temperatureData: number;
+    dataTimestampUcClockMinutes: number | null;
+    dataTimestampUcClockTicks: number | null;
+}
+interface VerisenseLookupTableEntry {
+    bankIndex: number;
+    statusCode: number;
+    statusName: 'Full' | '2Del' | 'Emty' | 'Bad' | 'NUse' | 'Zero' | 'Unknown';
+    pendingEepromWrite: boolean;
+    payloadIndex: number;
+}
+interface VerisenseLookupTablePayload {
+    head: number | null;
+    tail: number | null;
+    entries: VerisenseLookupTableEntry[];
+}
+/** Convert unix seconds into Verisense 7-byte RTC payload (4-byte minutes + 3-byte ticks). */
+declare function unixSecondsToAsmRtcBytes(unixSeconds: number): Uint8Array;
+/** Convert Verisense 7-byte RTC payload into unix seconds. */
+declare function asmRtcBytesToUnixSeconds(rtc7: Uint8Array): number;
+/** Convert Verisense 8-byte minute counter payload into unix seconds. */
+declare function asmRtcMinutesBytesToUnixSeconds(minutes8: Uint8Array): number;
+/**
+ * Build a production configuration payload (56 bytes) from structured options.
+ * This matches the Python tooling layout used by ASM_BLE.py / ASM_Device.py.
+ */
+declare function buildProductionConfigPayload(opts: ProductionConfigBuildOptions): Uint8Array;
+/** Parse production configuration with optional passkey/name/flag fields. */
+declare function parseProductionConfigPayloadFull(response: Uint8Array): ProductionConfigFull;
+/**
+ * Parse STATUS1/STATUS2 payload into a typed object.
+ *
+ * This ports the core byte parsing from ASM_Device.parse_status while keeping
+ * the output concise and UI-friendly.
+ */
+declare function parseStatusPayload(response: Uint8Array, sourceStatusProperty?: 'status1' | 'status2'): VerisenseStatusPayload;
+/** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
+declare function parseSchedulerDebugPayload(payload: Uint8Array): VerisenseSchedulerDebugPayload;
+/** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
+declare function parsePayloadCrcErrorBankIndexes(payload: Uint8Array): number[];
+/** Parse 8-byte debug event-log entries. */
+declare function parseEventLogPayload(payload: Uint8Array): VerisenseEventLogEntry[];
+/** Parse record-buffer details payload (26-byte current layout, 19-byte legacy layout). */
+declare function parseRecordBufferDetailsPayload(payload: Uint8Array): VerisenseRecordBufferDetails[];
+/**
+ * Parse lookup-table debug payload entries (3 bytes per bank), with optional
+ * 4-byte tail/head prefix present in older firmware debug responses.
+ */
+declare function parseLookupTablePayload(payload: Uint8Array, totalBanks: number): VerisenseLookupTablePayload;
 /**
  * Parse the production config response payload into a structured object.
  */
 declare function parseProductionConfigPayload(response: Uint8Array): ProductionConfig;
+
+type ParsedSplitReason = 'midday-midnight-boundary' | 'config-change' | 'timestamp-discontinuity' | 'power-reset';
+interface EvaluateParsedSplitInput {
+    prevTimestampSec: number;
+    currTimestampSec: number;
+    expectedDeltaSec?: number;
+    timestampToleranceSec?: number;
+    prevConfigSignature?: string | null;
+    currConfigSignature?: string | null;
+    powerResetDetected?: boolean;
+}
+/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
+declare function buildUploadBinaryFileName(uploadDate: Date, firstPayloadIndex: number): string;
+/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
+declare function buildParsedCsvFileName(startDate: Date, dataSource: string, firstPayloadIndex: number): string;
+/** Add duplicate suffix like " (2)" before extension. */
+declare function applyDuplicateSuffix(fileName: string, duplicateIndex: number): string;
+/** Return first non-colliding duplicate name for a target file name. */
+declare function nextAvailableDuplicateFileName(fileName: string, existingNames: Iterable<string>): string;
+/** Parse first payload index (uint16 LE) from a payload byte array. */
+declare function getFirstPayloadIndex(payload: Uint8Array): number;
+/**
+ * Evaluate whether parsed CSV output should roll to a new file.
+ * Rules mirror ASM-DES08 split conditions.
+ */
+declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
+    shouldSplit: boolean;
+    reasons: ParsedSplitReason[];
+};
 
 /**
  * Abstract base class for all Verisense sensor decoders.
@@ -702,7 +1059,7 @@ declare abstract class SensorBase {
     abstract applyOperationalConfig(op: Uint8Array): void;
 }
 
-interface GSRSample {
+interface ADCGSRSample {
     raw: number;
     adc12: number;
     range: number;
@@ -711,25 +1068,32 @@ interface GSRSample {
     uS: number;
     connectivity: 'Connected' | 'Disconnected';
 }
-interface GSRBatterySample {
-    raw: number;
+interface ADCBatterySample {
+    /** Full 16-bit packed ADC/flags word from payload. */
+    raw16: number;
+    /** 12-bit ADC value extracted from `raw16`. */
+    adc12: number;
     mV: number;
+    usbPluggedIn: boolean;
+    chargerStatusBits: number;
+    chargerStatus: string;
 }
-interface GSRPayloadSample {
-    gsr: GSRSample | null;
-    batt: GSRBatterySample | null;
+interface ADCPayloadSample {
+    gsr: ADCGSRSample | null;
+    batt: ADCBatterySample | null;
 }
 type HardwareIdentifier = 'VERISENSE_PULSE_PLUS' | 'VERISENSE_GSR_PLUS' | string;
 /**
- * Decoder for the GSR (galvanic skin response) sensor (Verisense sensor id = 1).
+ * Decoder for grouped ADC channels (Verisense sensor id = 1).
  *
+ * Includes GSR plus battery/ADC channels carried in the same packet source.
  * Implements C# `SensorGSR.cs` including:
  * - Per-hardware reference resistor selection (SR68 vs Shimmer3 resistors).
  * - Auto-range decoding from the raw ADC value's upper bits.
  * - Range-3 clamping threshold that differs by hardware.
- * - Conductance (µS) output with connectivity detection.
+ * - Conductance (uS) output with connectivity detection.
  */
-declare class SensorGSR extends SensorBase {
+declare class SensorADC extends SensorBase {
     readonly LIMIT_MIN_VALID_USIEMENS = 0.03;
     readonly GSR_UNCAL_LIMIT_RANGE3_SR68 = 1134;
     readonly GSR_UNCAL_LIMIT_RANGE3_SR62 = 683;
@@ -737,7 +1101,7 @@ declare class SensorGSR extends SensorBase {
     private readonly SR68_REF_KOHMS;
     gsrEnabled: boolean;
     battEnabled: boolean;
-    /** GSR range 0–3 (fixed) or 4 (auto-range). */
+    /** GSR range 0-3 (fixed) or 4 (auto-range). */
     gsrRangeSetting: number;
     hardwareIdentifier: HardwareIdentifier;
     gsrRateSettingRaw: number;
@@ -746,13 +1110,6 @@ declare class SensorGSR extends SensorBase {
     constructor();
     setHardwareIdentifier(idStr: HardwareIdentifier): void;
     setGsrRangeSetting(v: number): void;
-    setGSREnabled(enabled: boolean, opConfigBytes?: Uint8Array | null): Uint8Array | Record<string, boolean>;
-    setBattEnabled(enabled: boolean, opConfigBytes?: Uint8Array | null): Uint8Array | Record<string, boolean>;
-    /**
-     * Dual-mode setter:
-     * - If `opConfigBytes` is provided: returns a new Uint8Array with the enable bits patched.
-     * - Otherwise: updates local decoder flags only.
-     */
     setEnabled(arg1: boolean | {
         gsr?: boolean;
         batt?: boolean;
@@ -765,7 +1122,7 @@ declare class SensorGSR extends SensorBase {
     calibrateGsrToKOhmsUsingAmplifierEq(volts: number, range: number): number;
     nudgeGsrResistance(kOhms: number): number;
     kOhmToUSiemens(kOhms: number): number;
-    parsePayload(sensorPayloadBytes: Uint8Array): GSRPayloadSample[];
+    parsePayload(sensorPayloadBytes: Uint8Array): ADCPayloadSample[];
     applyOperationalConfig(op: Uint8Array): void;
 }
 
@@ -876,7 +1233,7 @@ declare class SensorPPG extends SensorBase {
 type TransportKind = 'ble' | 'serial' | null;
 type DeviceMode = 'idle' | 'streaming' | 'command' | 'logged';
 interface SensorMap {
-    1: SensorGSR;
+    1: SensorADC;
     2: SensorLIS2DW12;
     3: SensorLSM6DS3;
     4: SensorPPG;
@@ -888,20 +1245,22 @@ interface StreamPacket {
     rawPayload: Uint8Array;
     crcOk: boolean | null;
 }
+interface LoggedTransferProgressInfo {
+    payloadIndex: number;
+    bytesWritten: number;
+    crcOk: boolean;
+}
 interface TransferLoggedDataOptions {
     fileHandle?: FileSystemFileHandle | null;
     timeoutMs?: number;
     maxNack?: number;
     maxCrcNack?: number;
-    onProgress?: ((info: {
-        payloadIndex: number;
-        bytesWritten: number;
-        crcOk: boolean;
-    }) => void) | null;
+    onProgress?: ((info: LoggedTransferProgressInfo) => void) | null;
 }
 interface TransferLoggedDataResult {
     ok: boolean;
     bytesWritten: number;
+    payloadIndex?: number;
     blob?: Blob;
 }
 interface VerisenseClientOptions {
@@ -910,6 +1269,13 @@ interface VerisenseClientOptions {
     verifyStreamCrc?: boolean;
     debug?: boolean;
 }
+interface VerisenseCommandResponse {
+    header: number;
+    command: AsmCommand;
+    property: AsmProperty;
+    payload: Uint8Array;
+}
+
 /**
  * Web Bluetooth client for the Verisense sensor platform.
  *
@@ -917,7 +1283,7 @@ interface VerisenseClientOptions {
  * (on/off/emit) for the richer event model the Verisense protocol needs.
  *
  * Supports:
- * - BLE streaming (accel, GSR, gyro, PPG)
+ * - BLE streaming (accel, ADC/GSR, gyro, PPG)
  * - Web Serial (USB COM port) as an alternative transport
  * - Logged-data download (`transferLoggedData`)
  * - Operational config read/write
@@ -933,6 +1299,8 @@ interface VerisenseClientOptions {
  * - `"commandPayload"` — `{ payload: Uint8Array }`
  */
 declare class VerisenseBleDevice extends BaseShimmerClient {
+    private static readonly MAX_FRAME_PAYLOAD_LEN;
+    private static readonly MAX_DEBUG_FRAME_PAYLOAD_LEN;
     static readonly NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
@@ -953,9 +1321,6 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _onGattDisconnected;
     private _mode;
     private _rxStreamBuf;
-    private _buf;
-    private _newPayload;
-    private _expectedLen;
     private _pending;
     private _loggedChain;
     private _sync;
@@ -970,7 +1335,7 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _syncPayloadCount;
     constructor(opts?: VerisenseClientOptions);
     protected _log(...args: unknown[]): void;
-    get gsr(): SensorGSR;
+    get adc(): SensorADC;
     get accel1(): SensorLIS2DW12;
     get gyroAccel2(): SensorLSM6DS3;
     get ppg(): SensorPPG;
@@ -1000,14 +1365,21 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     writeBytes(bytes: Uint8Array | number[], opts?: {
         withResponse?: boolean;
     }): Promise<void>;
-    private _makeReq;
+    private _requestByCommand;
+    readProperty(property: AsmProperty, timeoutMs?: number): Promise<VerisenseCommandResponse>;
+    writeProperty(property: AsmProperty, payloadBytes?: number[] | Uint8Array, timeoutMs?: number): Promise<VerisenseCommandResponse>;
     request(opcode: number, payloadBytes?: number[] | Uint8Array, timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
     readStatus(): Promise<{
         payload: Uint8Array;
     }>;
+    readStatusParsed(): Promise<VerisenseStatusPayload>;
     readStatus2(): Promise<{
+        payload: Uint8Array;
+    }>;
+    readStatus2Parsed(): Promise<VerisenseStatusPayload>;
+    readData(): Promise<{
         payload: Uint8Array;
     }>;
     readProductionConfig(): Promise<{
@@ -1019,9 +1391,61 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     readTime(): Promise<{
         payload: Uint8Array;
     }>;
+    readTimeUnixSeconds(): Promise<number>;
     readPendingEvents(): Promise<{
         payload: Uint8Array;
     }>;
+    readPendingEventsParsed(): Promise<AsmProperty[]>;
+    writeProductionConfig(bytes: Uint8Array | number[]): Promise<void>;
+    writeOperationalConfig(bytes: Uint8Array | number[]): Promise<void>;
+    writeTime(rtc7: Uint8Array | number[]): Promise<void>;
+    writeTimeUnixSeconds(unixSeconds: number): Promise<void>;
+    enterDfuMode(): Promise<void>;
+    runTestMode(testPayload: Uint8Array | number[]): Promise<void>;
+    runHardwareTest(testId: TestModeId, hwMajor: number, hwMinor?: number, hwInternal?: number): Promise<void>;
+    private _buildDebugPayload;
+    private _debugIndexArgs;
+    private _waitForDebugResponse;
+    readDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[], timeoutMs?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    sendDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[], timeoutMs?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    readFlashLookupTable(index?: number, timeoutMs?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    readRealWorldClockScheduler(index?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    readRealWorldClockSchedulerParsed(index?: number): Promise<VerisenseSchedulerDebugPayload>;
+    loadTestLookupTable(index?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    checkPayloadCrcErrors(index?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    checkPayloadCrcErrorsParsed(index?: number): Promise<number[]>;
+    readEventLog(index?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    readEventLogParsed(index?: number): Promise<VerisenseEventLogEntry[]>;
+    readRecordBufferDetails(index?: number): Promise<{
+        payload: Uint8Array;
+    }>;
+    readRecordBufferDetailsParsed(index?: number): Promise<VerisenseRecordBufferDetails[]>;
+    eraseOperationalConfig(): Promise<void>;
+    eraseProductionConfig(): Promise<void>;
+    clearPendingEvents(): Promise<void>;
+    eraseAllLoggedData(timeoutMs?: number): Promise<void>;
+    testDataTransferLoop(loopCount: number): Promise<void>;
+    ledTest(ledIndex: number): Promise<void>;
+    max86xxxLedTest(start: boolean): Promise<void>;
+    startPowerProfilerTest(): Promise<void>;
+    requestSystemReset(): Promise<void>;
+    startIcPowerConsumptionTest(loopCount: number, stageIntervalMs: number): Promise<void>;
+    deleteAllBonds(): Promise<void>;
+    setStreamingMode(enabled: boolean): Promise<void>;
     disconnectRequest(): Promise<{
         payload: Uint8Array;
     }>;
@@ -1029,86 +1453,19 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     readProductionConfigFromDevice(): Promise<ProductionConfig>;
     readOpConfigFromDevice(): Promise<Uint8Array>;
     writeOpConfig(opConfigBytes: Uint8Array | number[]): Promise<void>;
-    getopconfig(): Promise<Uint8Array>;
-    writeopconfig(op: Uint8Array | number[]): Promise<void>;
     getSensor(name: string | number): SensorBase | null;
-    GetSensor(name: string | number): SensorBase | null;
     private _abortSync;
     private _finishSync;
     private _handleLoggedPayload;
     private _resetAssembler;
     private _appendStreamBuf;
     private _clearSyncRxBuffers;
+    private _isPlausibleHeaderByte;
+    private _isPlausibleFrameStart;
+    private _resolvePendingCommand;
     private _feedStreamBytes;
     private _handleStreamingPayload;
 }
 
-/** NUS primary service UUID. */
-declare const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-/** NUS TX characteristic UUID (host writes to this). */
-declare const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
-/** NUS RX characteristic UUID (host subscribes to notifications from this). */
-declare const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-/**
- * Byte indices into the Verisense operational config blob (`op[OP_IDX.xxx]`).
- * Index 0 is the config version byte (must be 0x5A for a valid config).
- */
-declare const OP_IDX: Readonly<{
-    readonly GEN_CFG_0: 1;
-    readonly GEN_CFG_1: 2;
-    readonly GEN_CFG_2: 3;
-    readonly GEN_CFG_3: 4;
-    readonly ACCEL1_CFG_0: 5;
-    readonly ACCEL1_CFG_1: 6;
-    readonly ACCEL1_CFG_2: 7;
-    readonly ACCEL1_CFG_3: 8;
-    readonly GYRO_ACCEL2_CFG_0: 10;
-    readonly GYRO_ACCEL2_CFG_1: 11;
-    readonly GYRO_ACCEL2_CFG_2: 12;
-    readonly GYRO_ACCEL2_CFG_3: 13;
-    readonly GYRO_ACCEL2_CFG_4: 14;
-    readonly GYRO_ACCEL2_CFG_5: 15;
-    readonly GYRO_ACCEL2_CFG_6: 16;
-    readonly GYRO_ACCEL2_CFG_7: 17;
-    readonly START_TIME: 21;
-    readonly END_TIME: 25;
-    readonly INACTIVE_TIMEOUT: 29;
-    readonly BLE_RETRY_COUNT: 30;
-    readonly BLE_TX_POWER: 31;
-    readonly BLE_DATA_TRANS_WKUP_INT_HRS: 32;
-    readonly BLE_DATA_TRANS_WKUP_TIME: 33;
-    readonly BLE_DATA_TRANS_WKUP_DUR: 35;
-    readonly BLE_DATA_TRANS_RETRY_INT: 36;
-    readonly BLE_STATUS_WKUP_INT_HRS: 38;
-    readonly BLE_STATUS_WKUP_TIME: 39;
-    readonly BLE_STATUS_WKUP_DUR: 41;
-    readonly BLE_STATUS_RETRY_INT: 42;
-    readonly BLE_RTC_SYNC_WKUP_INT_HRS: 44;
-    readonly BLE_RTC_SYNC_WKUP_TIME: 45;
-    readonly BLE_RTC_SYNC_WKUP_DUR: 47;
-    readonly BLE_RTC_SYNC_RETRY_INT: 48;
-    readonly ADC_CHANNEL_SETTINGS_0: 50;
-    readonly ADC_CHANNEL_SETTINGS_1: 51;
-    readonly ADAPTIVE_SCHEDULER_INT: 52;
-    readonly ADAPTIVE_SCHEDULER_FAILCOUNT_MAX: 54;
-    readonly PPG_REC_DUR_SECS_LSB: 55;
-    readonly PPG_REC_DUR_SECS_MSB: 56;
-    readonly PPG_REC_INT_MINS_LSB: 57;
-    readonly PPG_REC_INT_MINS_MSB: 58;
-    readonly PPG_FIFO_CONFIG: 59;
-    readonly PPG_MODE_CONFIG2: 60;
-    readonly PPG_MA_DEFAULT: 61;
-    readonly PPG_MA_MAX_RED_IR: 62;
-    readonly PPG_MA_MAX_GREEN_BLUE: 63;
-    readonly PPG_AGC_TARGET_PERCENT_OF_RANGE: 64;
-    readonly PPG_MA_LED_PILOT: 66;
-    readonly PPG_DAC1_CROSSTALK: 67;
-    readonly PPG_DAC2_CROSSTALK: 68;
-    readonly PPG_DAC3_CROSSTALK: 69;
-    readonly PPG_DAC4_CROSSTALK: 70;
-    readonly PROX_AGC_MODE: 71;
-}>;
-type OpIdx = keyof typeof OP_IDX;
-
-export { BaseShimmerClient, CHANNEL_FORMATS, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, SensorBase, SensorBitmapShimmer3, SensorGSR, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TIMESTAMP_FIELD, VerisenseBleDevice, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, crc16_ccitt_false, getOversamplingRatioADS1292R, normalizeOperationalConfig, nudgeGsrResistance, parseProductionConfigPayload };
-export type { ChannelFormat, DeviceMode, FieldKind, GSRBatterySample, GSRPayloadSample, GSRSample, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ProductionConfig, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions };
+export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions, VerisenseCommandResponse, VerisenseEventLogEntry, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseStatusPayload };
