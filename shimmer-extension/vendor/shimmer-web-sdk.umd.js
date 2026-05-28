@@ -1461,7 +1461,9 @@
      * followed by the decimal value of the final byte padded to 3 digits.
      */
     function computeVerisensePairingPin(uniqueId) {
-        const normalized = String(uniqueId ?? '').trim().replace(/^Verisense-/i, '');
+        const normalized = String(uniqueId ?? '')
+            .trim()
+            .replace(/^Verisense-/i, '');
         if (!/^[0-9a-fA-F]{8,}$/.test(normalized)) {
             throw new Error('computeVerisensePairingPin: uniqueId must be a hex identifier string');
         }
@@ -1714,8 +1716,8 @@
             ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(17, 21), ...response.slice(40, 43)]))
             : u32le_at(response, 17) * 60;
         const memoryFreeKb = hasExtendedCapacity
-            ? ((response[21] | (response[22] << 8) | (response[23] << 16) | (response[57] << 24)) >>> 0)
-            : ((response[21] | (response[22] << 8) | (response[23] << 16)) >>> 0);
+            ? (response[21] | (response[22] << 8) | (response[23] << 16) | (response[57] << 24)) >>> 0
+            : (response[21] | (response[22] << 8) | (response[23] << 16)) >>> 0;
         const memoryCapacityKb = hasExtendedCapacity ? u32le_at(response, 60) : null;
         const memoryUsedKb = memoryCapacityKb == null ? null : Math.max(0, memoryCapacityKb - memoryFreeKb);
         // Bank breakdown: FULL=syncable data, 2DEL=partially-deleted, BAD=unusable flash.
@@ -2729,11 +2731,7 @@
         if (command === ASM_COMMAND.READ)
             return new Set([ASM_COMMAND.RESPONSE]);
         if (command === ASM_COMMAND.WRITE) {
-            return new Set([
-                ASM_COMMAND.ACK,
-                ASM_COMMAND.ACK_NEXT_STAGE,
-                ASM_COMMAND.RESPONSE,
-            ]);
+            return new Set([ASM_COMMAND.ACK, ASM_COMMAND.ACK_NEXT_STAGE, ASM_COMMAND.RESPONSE]);
         }
         return new Set([ASM_COMMAND.ACK, ASM_COMMAND.ACK_NEXT_STAGE, ASM_COMMAND.RESPONSE]);
     }
@@ -3829,7 +3827,9 @@
             if (pending) {
                 // Some firmware/transport paths emit a transient empty 0x00/0x00 frame
                 // immediately before the real command response; ignore and keep waiting.
-                if (msg.command === 0 && msg.property === 0 && msg.payload.length === 0) {
+                if (msg.command === 0 &&
+                    msg.property === 0 &&
+                    msg.payload.length === 0) {
                     return;
                 }
                 const err = validatePendingResponse(pending, msg);
@@ -3895,11 +3895,9 @@
                             s.emptyAckCount++;
                             if (this.debugSync)
                                 console.log('[sync] empty ACK before payload; requesting next DATA chunk.');
-                            void this
-                                .writeBytes(buildMessage(ASM_COMMAND.READ, ASM_PROPERTY.DATA), {
+                            void this.writeBytes(buildMessage(ASM_COMMAND.READ, ASM_PROPERTY.DATA), {
                                 withResponse: true,
-                            })
-                                .catch((e) => this._abortSync(e));
+                            }).catch((e) => this._abortSync(e));
                             continue;
                         }
                         if (this.debugSync)
