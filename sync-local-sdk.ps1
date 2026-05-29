@@ -5,7 +5,10 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$vendorDir = Join-Path $repoRoot "shimmer-extension\vendor"
+$vendorTargets = @(
+    Join-Path $repoRoot "shimmer-extension\vendor",
+    Join-Path $repoRoot "Verisense\vendor"
+)
 $sdkSourceConfigPath = Join-Path $repoRoot "sdk-source.json"
 
 if (-not (Test-Path $sdkSourceConfigPath)) {
@@ -23,8 +26,10 @@ if ($sourceMode -notin @("local-repo", "local-version", "local-latest")) {
     throw "Unsupported sourceMode '$sourceMode' in sdk-source.json. Supported: local-repo, local-version, local-latest"
 }
 
-if (-not (Test-Path $vendorDir)) {
-    throw "Vendor folder not found: $vendorDir"
+foreach ($vendorDir in $vendorTargets) {
+    if (-not (Test-Path $vendorDir)) {
+        New-Item -ItemType Directory -Path $vendorDir -Force | Out-Null
+    }
 }
 
 $files = @(
@@ -46,13 +51,16 @@ if (-not (Test-Path $distDir)) {
 
 foreach ($name in $files) {
     $src = Join-Path $distDir $name
-    $dst = Join-Path $vendorDir $name
 
     if (-not (Test-Path $src)) {
         throw "Missing SDK artifact: $src"
     }
 
-    Copy-Item -Path $src -Destination $dst -Force
+    foreach ($vendorDir in $vendorTargets) {
+        $dst = Join-Path $vendorDir $name
+        Copy-Item -Path $src -Destination $dst -Force
+    }
 }
 
-Write-Host "Synced SDK artifacts from '$distDir' to '$vendorDir' (sourceMode=$sourceMode)."
+$targetList = $vendorTargets -join ", "
+Write-Host "Synced SDK artifacts from '$distDir' to [$targetList] (sourceMode=$sourceMode)."
