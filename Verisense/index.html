@@ -86,12 +86,17 @@
         <button id="btnConnect" disabled>Connect (BLE)</button>
         <button id="btnConnectSerial">Connect USB (Serial)</button>
         <button id="btnDisconnect" disabled>Disconnect</button>
+        <label
+          ><input type="checkbox" id="chkRawTxRx" /> Log raw TX/RX bytes</label
+        >
       </div>
 
       <div class="row">
         <button id="btnStart" disabled>Start streaming</button>
         <button id="btnStop" disabled>Stop streaming</button>
         <button id="btnSync" disabled>Sync logged data (.bin)</button>
+        <button id="btnPending" disabled>Read pending events</button>
+        <button id="btnClearPending" disabled>Clear pending events</button>
         <span id="status">Status: idle</span>
       </div>
     </div>
@@ -164,25 +169,13 @@
         </div>
       </div>
     </div>
-    <div class="dfu-link-container" style="margin: 10px 0">
-      <a
-        href="https://shimmerengineering.github.io/ASM_web-bluetooth-dfu/examples/web.html"
-        target="_blank"
-        style="
-          background-color: #007bff;
-          color: white;
-          padding: 10px 15px;
-          text-decoration: none;
-          border-radius: 5px;
-          font-family: sans-serif;
-          display: inline-block;
-        "
-      >
-        🔗 Open DFU Update Tool
-      </a>
-    </div>
     <script type="module">
-      import { VerisenseBleDevice } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+      import {
+        VerisenseBleDevice,
+        OP_IDX,
+        parseProductionConfigPayloadFull,
+        parseStatusPayload,
+      } from "./vendor/shimmer-web-sdk.esm.js";
 
       const $ = (id) => document.getElementById(id);
 
@@ -199,28 +192,41 @@
       const btnStop = $("btnStop");
       const btnClear = $("btnClear");
       const btnSync = $("btnSync");
+      const btnPending = $("btnPending");
+      const btnClearPending = $("btnClearPending");
 
       const chkAccelEnable = $("chkAccelEnable");
       const chkGsrEnable = $("chkGsrEnable");
       const chkBattEnable = $("chkBattEnable");
+      const chkRawTxRx = $("chkRawTxRx");
 
       // --- OpConfig UI helpers ---
+      function getAdcDecoder(dev = v) {
+        if (!dev) return null;
+        return dev.adc ?? null;
+      }
+
+      function requireAdcDecoder(dev = v) {
+        const adc = getAdcDecoder(dev);
+        if (!adc) {
+          throw new Error(
+            "Missing adc sensor on VerisenseBleDevice. Update synced SDK artifacts.",
+          );
+        }
+        return adc;
+      }
       function enforceGsrBattUI() {
         const gsrOn = !!chkGsrEnable.checked;
         chkBattEnable.disabled = !gsrOn;
         if (!gsrOn) chkBattEnable.checked = false;
       }
 
-      function getGsrSensor(dev) {
-        return dev?.gsr ?? dev?.adc ?? null;
-      }
-
       function syncOpCfgUIFromDeviceState() {
         if (!v) return;
-        const gsrSensor = getGsrSensor(v);
+        const adc = getAdcDecoder(v);
         chkAccelEnable.checked = !!v?.accel1?.enabled;
-        chkGsrEnable.checked = !!gsrSensor?.gsrEnabled;
-        chkBattEnable.checked = !!gsrSensor?.battEnabled;
+        chkGsrEnable.checked = !!adc?.gsrEnabled;
+        chkBattEnable.checked = !!adc?.battEnabled;
         enforceGsrBattUI();
       }
 
@@ -444,6 +450,112 @@
         logEl.scrollTop = logEl.scrollHeight;
       }
 
+      function formatHexByte(b) {
+        return `0x${Number(b & 0xff)
+          .toString(16)
+          .toUpperCase()
+          .padStart(2, "0")}`;
+      }
+
+      function formatHexArray(bytes) {
+        const u8 =
+          bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
+        return `[${Array.from(u8, (b) => formatHexByte(b)).join(", ")}]`;
+      }
+
+      function logRawBytes(prefix, bytes) {
+        logEl.textContent += `${prefix}: ${formatHexArray(bytes)}\r\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function installRawByteHooks(dev) {
+        if (!dev || dev.__rawByteHooksInstalled) return;
+
+        const originalWriteBytes = dev.writeBytes?.bind(dev);
+        if (typeof originalWriteBytes === "function") {
+          dev.writeBytes = async (bytes, opts = {}) => {
+            if (chkRawTxRx?.checked) logRawBytes("TX", bytes);
+            return originalWriteBytes(bytes, opts);
+          };
+        }
+
+        const originalFeedBytes = dev._feedStreamBytes?.bind(dev);
+        if (typeof originalFeedBytes === "function") {
+          dev._feedStreamBytes = (chunk) => {
+            if (chkRawTxRx?.checked) logRawBytes("RX", chunk);
+            return originalFeedBytes(chunk);
+          };
+        }
+
+        dev.__rawByteHooksInstalled = true;
+      }
+
+      function u16leAt(bytes, idx) {
+        const lo = bytes[idx] ?? 0;
+        const hi = bytes[idx + 1] ?? 0;
+        return (lo | (hi << 8)) >>> 0;
+      }
+
+      function summarizeOperationalConfig(op, dev) {
+        const adc = requireAdcDecoder(dev);
+        return {
+          length: op?.length ?? 0,
+          header: formatHexByte(op?.[0] ?? 0),
+          accel1: {
+            enabled: !!dev?.accel1?.enabled,
+            samplingRateHz: dev?.accel1?.samplingRateHz ?? null,
+          },
+          adc: {
+            gsrEnabled: !!adc?.gsrEnabled,
+            battEnabled: !!adc?.battEnabled,
+            samplingRateHz: adc?.samplingRateHz ?? null,
+            gsrRangeSetting: adc?.gsrRangeSetting ?? null,
+            rateRaw: (op?.[OP_IDX.ADC_CHANNEL_SETTINGS_0] ?? 0) & 0x3f,
+            rangeRaw: (op?.[OP_IDX.ADC_CHANNEL_SETTINGS_1] ?? 0) & 0x07,
+            oversamplingRaw:
+              ((op?.[OP_IDX.ADC_CHANNEL_SETTINGS_1] ?? 0) >> 4) & 0x0f,
+          },
+          gyroAccel2: {
+            accelEnabled: !!dev?.gyroAccel2?.accelEnabled,
+            gyroEnabled: !!dev?.gyroAccel2?.gyroEnabled,
+          },
+          ble: {
+            retryCount: op?.[OP_IDX.BLE_RETRY_COUNT] ?? null,
+            txPower: op?.[OP_IDX.BLE_TX_POWER] ?? null,
+          },
+          scheduler: {
+            inactiveTimeout: op?.[OP_IDX.INACTIVE_TIMEOUT] ?? null,
+            adaptiveIntervalMins: u16leAt(op, OP_IDX.ADAPTIVE_SCHEDULER_INT),
+            adaptiveFailCountMax: u16leAt(
+              op,
+              OP_IDX.ADAPTIVE_SCHEDULER_FAILCOUNT_MAX,
+            ),
+          },
+        };
+      }
+
+      function printConnectReadouts({
+        productionRaw,
+        productionParsed,
+        operationalRaw,
+        operationalParsed,
+        status2Raw,
+        status2Parsed,
+      }) {
+        console.groupCollapsed("[Verisense] Parsed connect snapshot");
+        console.log("Production config raw", formatHexArray(productionRaw));
+        console.log("Production config parsed", productionParsed);
+        console.log("Operational config raw", formatHexArray(operationalRaw));
+        console.log("Operational config parsed", operationalParsed);
+        console.log("Status2 raw", formatHexArray(status2Raw));
+        console.log("Status2 parsed", status2Parsed);
+        console.groupEnd();
+
+        log("productionConfig parsed", productionParsed);
+        log("opConfig parsed", operationalParsed);
+        log("status2 parsed", status2Parsed);
+      }
+
       function fmtFixed(v, digits) {
         // Safe number formatting for optional/undefined fields
         if (typeof v === "number" && Number.isFinite(v))
@@ -501,35 +613,56 @@
 
       function applyDecoderEnablesFromUI() {
         if (!v) return;
+        const adc = requireAdcDecoder(v);
 
         // Decoder toggles (affects parsing/plotting only)
         if (v.accel1) v.accel1.enabled = !!chkAccelEnable?.checked;
 
-        const gsrSensor = getGsrSensor(v);
-        if (gsrSensor?.setEnabled) {
+        if (adc?.setEnabled) {
           const gsrOn = !!chkGsrEnable?.checked;
           const battOn = !!chkBattEnable?.checked;
-          gsrSensor.setEnabled({ gsr: gsrOn, batt: battOn && gsrOn });
-        } else if (gsrSensor) {
-          gsrSensor.gsrEnabled = !!chkGsrEnable?.checked;
-          gsrSensor.battEnabled = !!chkBattEnable?.checked;
+          adc.setEnabled({ gsr: gsrOn, batt: battOn && gsrOn });
+        } else if (adc) {
+          adc.gsrEnabled = !!chkGsrEnable?.checked;
+          adc.battEnabled = !!chkBattEnable?.checked;
         }
       }
 
-      async function refreshOpConfigFromDevice({ refresh = true } = {}) {
+      async function refreshDeviceStateFromConnection() {
         if (!v) throw new Error("Not connected");
-        if (typeof v.getOpConfig !== "function") {
-          throw new Error(
-            "Missing getOpConfig(); use verisense_opcfg_patch_api.js",
-          );
-        }
 
-        const op = await v.getOpConfig({ refresh });
+        const productionRsp = await v.readProductionConfig();
+        const productionRaw = new Uint8Array(productionRsp?.payload ?? []);
+        const productionParsed =
+          parseProductionConfigPayloadFull(productionRaw);
+
+        await v.readOpConfigFromDevice();
+        const operationalRaw = await v.getOpConfig();
+        const operationalParsed = summarizeOperationalConfig(operationalRaw, v);
+
+        const status2Rsp = await v.readStatus2();
+        const status2Raw = new Uint8Array(status2Rsp?.payload ?? []);
+        const status2Parsed = parseStatusPayload(status2Raw, "status2");
+
+        printConnectReadouts({
+          productionRaw,
+          productionParsed,
+          operationalRaw,
+          operationalParsed,
+          status2Raw,
+          status2Parsed,
+        });
 
         // applyOperationalConfig updates sensor state; reflect it into the UI
         syncOpCfgUIFromDeviceState();
         applyDecoderEnablesFromUI();
-        return op;
+
+        return {
+          productionParsed,
+          operationalRaw,
+          operationalParsed,
+          status2Parsed,
+        };
       }
 
       async function applyOpConfigToDevice() {
@@ -537,35 +670,36 @@
         if (isStreaming)
           throw new Error("Stop streaming before applying opconfig");
         if (typeof v.writeOpConfig !== "function") {
-          throw new Error(
-            "Missing writeOpConfig(); use verisense_opcfg_patch_api.js",
-          );
+          throw new Error("Missing writeOpConfig() in SDK build");
         }
 
         // Always patch against a fresh opcfg (prevents writing stale bytes)
-        const current = await v.getOpConfig({ refresh: true });
+        if (typeof v.readOpConfigFromDevice === "function") {
+          await v.readOpConfigFromDevice();
+        }
+        const current = await v.getOpConfig();
         let next = current;
+        const adc = requireAdcDecoder(v);
 
         // Patch enable bits
         if (v.accel1?.setEnabled) {
           next = v.accel1.setEnabled(!!chkAccelEnable.checked, next);
           next = v.accel1.patchAccelSamplingRate(9, next);
         }
-        const gsrSensor = getGsrSensor(v);
-        if (gsrSensor?.setEnabled) {
-          next = gsrSensor.setEnabled(
+        if (adc?.setEnabled) {
+          next = adc.setEnabled(
             { gsr: !!chkGsrEnable.checked, batt: !!chkBattEnable.checked },
             next,
           );
-          next = gsrSensor.patchGsrRange(4, next);
-          next = gsrSensor.patchGsrSamplingRate(23, next);
+          next = adc.patchGsrRange(4, next);
+          next = adc.patchGsrSamplingRate(23, next);
         }
 
-        const confirmed = await v.writeOpConfig(next, { verify: true });
+        await v.writeOpConfig(next);
 
         // writeOpConfig() reads back + applies; update UI from device state now
         syncOpCfgUIFromDeviceState();
-        return confirmed;
+        return next;
       }
 
       // packet counters
@@ -573,14 +707,15 @@
       let gsrPackets = 0;
 
       function configureAccelAndGsr(dev) {
+        const adc = requireAdcDecoder(dev);
+
         // Decoder settings (device-side streaming config is separate)
         dev.accel1.setRange("2G");
         dev.accel1.samplingRateHz = 51.2;
 
         // Enable GSR decoder (sensorId = 1)
-        const gsrSensor = getGsrSensor(dev);
-        gsrSensor?.setEnabled?.({ gsr: true, batt: true });
-        if (gsrSensor) gsrSensor.samplingRateHz = 50;
+        adc.setEnabled({ gsr: true, batt: true });
+        adc.samplingRateHz = 50;
 
         // Optional: turn off other decoders
         dev.gyroAccel2.setAccelEnabled(false);
@@ -628,7 +763,7 @@
         }
 
         const rawStr = gsr.raw ?? "—";
-        const rStr = fmtFixed(gsr.ohms, 2);
+        const rStr = fmtFixed(gsr.kOhms, 2);
         const uSStr = fmtFixed(gsr.uS, 4);
 
         const t = first.timestamps;
@@ -643,8 +778,8 @@
         <div><b>GSR (sensorId=1)</b></div>
         <div>packets: ${gsrPackets}</div>
         <div>tick_u24: ${pkt.tick_u24 ?? "—"}</div>
-        <div>gsr: raw=${rawStr} | R=${rStr} Ω | ${uSStr} µS</div>
-        <div>batt: ${batt ? `${batt.mV ?? batt.mv} mV` : "—"}</div>
+        <div>gsr: raw=${rawStr} | R=${rStr} kΩ | ${uSStr} µS</div>
+        <div>batt: ${batt ? `${fmtFixed(batt.mV, 0)} mV` : "—"}</div>
         <div><small>timestamp: ${ts} | crcOk: ${pkt.crcOk ?? "n/a"}</small></div>
       `;
       }
@@ -739,20 +874,6 @@
           }
         });
 
-        // Optional: surface op-config logs on page
-        dev.on("Production Config", (config) => {
-          log("Production Config received", {
-            hw: config.hardware,
-            fw: config.firmware,
-            id: config.asmid,
-          });
-        });
-        dev.on("opConfig", ({ op }) =>
-          log("opConfig received", {
-            len: op?.length,
-            head: Array.from(op?.slice?.(0, 16) ?? []),
-          }),
-        );
         dev.on("opConfigError", (e) => log("opConfigError", e));
       }
 
@@ -785,6 +906,7 @@
             stripStreamCrc: true,
             verifyStreamCrc: false,
           });
+          installRawByteHooks(v);
           configureAccelAndGsr(v);
           wireStreamingHandlers(v);
 
@@ -797,6 +919,8 @@
             btnConnect.disabled = false;
             btnSync.disabled = true;
             btnApplyOpCfg.disabled = true;
+            btnPending.disabled = true;
+            btnClearPending.disabled = true;
             setOpCfgStatus("");
           });
 
@@ -817,7 +941,9 @@
           btnConnect.disabled = true;
           btnSync.disabled = false;
           btnApplyOpCfg.disabled = false;
-          await refreshOpConfigFromDevice({ refresh: true });
+          btnPending.disabled = false;
+          btnClearPending.disabled = false;
+          await refreshDeviceStateFromConnection();
         } catch (e) {
           log("connect error:", String(e?.message ?? e));
           console.warn(e);
@@ -833,6 +959,7 @@
             stripStreamCrc: true,
             verifyStreamCrc: false,
           });
+          installRawByteHooks(v);
           configureAccelAndGsr(v);
           wireStreamingHandlers(v);
 
@@ -844,6 +971,8 @@
             btnStop.disabled = true;
             btnConnect.disabled = false;
             btnApplyOpCfg.disabled = true;
+            btnPending.disabled = true;
+            btnClearPending.disabled = true;
             setOpCfgStatus("");
           });
 
@@ -863,7 +992,9 @@
           btnConnect.disabled = false; // BLE connect can remain available
           btnSync.disabled = false;
           btnApplyOpCfg.disabled = false;
-          await refreshOpConfigFromDevice({ refresh: true });
+          btnPending.disabled = false;
+          btnClearPending.disabled = false;
+          await refreshDeviceStateFromConnection();
         } catch (e) {
           log("serial connect error:", String(e?.message ?? e));
           console.warn(e);
@@ -884,6 +1015,8 @@
           btnConnect.disabled = false;
           btnSync.disabled = false;
           btnApplyOpCfg.disabled = true;
+          btnPending.disabled = true;
+          btnClearPending.disabled = true;
           setOpCfgStatus("");
         } catch (e) {
           log("disconnect error:", String(e?.message ?? e));
@@ -895,7 +1028,7 @@
         try {
           // clear charts each time Start is pressed
           resetAccelPlotBuffers(v?.accel1?.samplingRateHz ?? 51.2);
-          resetGsrPlotBuffers(getGsrSensor(v)?.samplingRateHz ?? 50);
+          resetGsrPlotBuffers(requireAdcDecoder(v).samplingRateHz ?? 50);
 
           accelPackets = 0;
           gsrPackets = 0;
@@ -911,6 +1044,8 @@
           btnStop.disabled = false;
           btnSync.disabled = true;
           btnApplyOpCfg.disabled = true;
+          btnPending.disabled = true;
+          btnClearPending.disabled = true;
         } catch (e) {
           log("start error:", String(e?.message ?? e));
           setStatus("error");
@@ -927,6 +1062,8 @@
           btnStop.disabled = true;
           btnSync.disabled = false;
           btnApplyOpCfg.disabled = false;
+          btnPending.disabled = false;
+          btnClearPending.disabled = false;
         } catch (e) {
           log("stop error:", String(e?.message ?? e));
           setStatus("error");
@@ -937,15 +1074,41 @@
         logEl.textContent = "";
       };
 
+      btnPending.onclick = async () => {
+        try {
+          if (!v) throw new Error("Not connected");
+          const pending = await v.readPendingEventsParsed();
+          if (!pending?.length) {
+            log("pending events: none");
+            return;
+          }
+
+          const names = pending.map((p) => `0x${Number(p).toString(16)}`);
+          log("pending events:", names.join(", "));
+        } catch (e) {
+          log("pending-events error:", String(e?.message ?? e));
+        }
+      };
+
+      btnClearPending.onclick = async () => {
+        try {
+          if (!v) throw new Error("Not connected");
+          await v.clearPendingEvents();
+          log("pending events cleared");
+        } catch (e) {
+          log("clear-pending error:", String(e?.message ?? e));
+        }
+      };
+
       btnApplyOpCfg.onclick = async () => {
         try {
           if (!v) throw new Error("Not connected");
           await applyOpConfigToDevice();
-          const gsrSensor = getGsrSensor(v);
+          const adc = requireAdcDecoder(v);
           log("opcfg applied:", {
             accelEnabled: v?.accel1?.enabled,
-            gsrEnabled: gsrSensor?.gsrEnabled,
-            battEnabled: gsrSensor?.battEnabled,
+            gsrEnabled: adc?.gsrEnabled,
+            battEnabled: adc?.battEnabled,
           });
         } catch (e) {
           log("opcfg apply error:", String(e?.message ?? e));

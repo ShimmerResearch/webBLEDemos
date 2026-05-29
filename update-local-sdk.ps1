@@ -78,7 +78,7 @@ if (-not (Test-Path $syncScript)) {
     throw "Sync script not found: $syncScript"
 }
 
-Write-Host "Syncing built SDK artifacts into webBLEDemos..."
+Write-Host "Syncing built SDK artifacts into webBLEDemos vendor targets..."
 powershell -ExecutionPolicy Bypass -File $syncScript -SdkRepoPath $SdkRepoPath
 if ($LASTEXITCODE -ne 0) {
     throw "sync-local-sdk.ps1 failed with exit code $LASTEXITCODE"

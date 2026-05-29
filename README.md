@@ -25,6 +25,10 @@ sync-local-sdk.ps1   ←  Sync-only local SDK artifacts
 update-local-sdk.cmd ←  Windows CMD launcher for update script
 ```
 
+The full Verisense control console now lives in a dedicated repository:
+
+- [ShimmerResearch/verisense-device-console](https://github.com/ShimmerResearch/verisense-device-console)
+
 ---
 
 ## Live Demos
@@ -49,6 +53,7 @@ update-local-sdk.cmd ←  Windows CMD launcher for update script
 | Demo | Link |
 |---|---|
 | Wrist sensor (accel + GSR streaming) | [Verisense](https://shimmerresearch.github.io/webBLEDemos/Verisense/) |
+| Verisense Device Console (full SDK operations) | [verisense-device-console](https://shimmerresearch.github.io/verisense-device-console/) |
 
 ### Chrome Extension
 [Shimmer3R Chrome Extension](https://github.com/ShimmerResearch/webBLEDemos/tree/main/shimmer-extension) — source code only; load via **chrome://extensions → Developer mode → Load unpacked** when you are specifically developing or testing extension features.
@@ -82,7 +87,8 @@ powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1 -SdkRepoPath "C:
 
 ### SDK source selection (single location)
 
-All demos import from `../shimmer-extension/vendor/shimmer-web-sdk.esm.js`.
+Most demos import from `../shimmer-extension/vendor/shimmer-web-sdk.esm.js`.
+The `Verisense` demo imports from `./vendor/shimmer-web-sdk.esm.js`.
 The file that controls where vendor artifacts come from is `sdk-source.json`:
 
 ```json
@@ -97,6 +103,8 @@ Supported `sourceMode` values:
 - `local-repo`: build/sync using the current local `shimmer-web-sdk` checkout
 - `local-version`: build/sync from a specific local SDK git tag using `version` (for example `0.1.7` resolves to `v0.1.7`)
 - `local-latest`: build/sync from the latest local SDK `v*` git tag
+
+In all modes, demos still import from the same vendored files already in this repo; `sourceMode` only changes which SDK source is used to generate those vendored files before sync.
 
 How `version` is used:
 
@@ -173,7 +181,7 @@ Use the localhost URL opened by Live Server (commonly `http://localhost:5500/...
 
 ## `@shimmerresearch/shimmer-web-sdk` SDK
 
-All demos now import the SDK from this repository, using a relative path that works both on localhost and on GitHub Pages:
+The demos import the SDK from vendored files in this repository, using relative paths that work both on localhost and on GitHub Pages:
 
 ```js
 import { Shimmer3RClient } from '../shimmer-extension/vendor/shimmer-web-sdk.esm.js';
@@ -183,7 +191,13 @@ This means:
 
 - Local development uses the vendored SDK file without external CDN dependency.
 - GitHub Pages deployments also resolve the same path under the published `webBLEDemos` site.
-- The demos work on GitHub Pages as long as `shimmer-extension/vendor/*` is committed with the site.
+- The demos work on GitHub Pages as long as vendored SDK files are committed with the site.
+
+For the Verisense demo in this repository:
+
+```js
+import { VerisenseBleDevice } from './vendor/shimmer-web-sdk.esm.js';
+```
 
 ### Update vendored SDK from local source
 
@@ -199,10 +213,13 @@ Windows CMD alternative:
 update-local-sdk.cmd
 ```
 
-The sync script uses `sdk-source.json` to copy built artifacts from `shimmer-web-sdk/dist` into `webBLEDemos/shimmer-extension/vendor`.
+The sync script uses `sdk-source.json` to copy built artifacts from `shimmer-web-sdk/dist` into both:
+
+- `webBLEDemos/shimmer-extension/vendor`
+- `webBLEDemos/Verisense/vendor`
 
 Build logic is centralized in `shimmer-web-sdk/build-local-sdk.ps1` and invoked by `update-local-sdk.ps1`.
 
-Manual copying into `webBLEDemos/shimmer-extension/vendor` is no longer required when you use `update-local-sdk.ps1` or `sync-local-sdk.ps1`.
+Manual copying into vendor folders is no longer required when you use `update-local-sdk.ps1` or `sync-local-sdk.ps1`.
 
 The SDK source lives at [ShimmerResearch/shimmer-web-sdk](https://github.com/ShimmerResearch/shimmer-web-sdk).
