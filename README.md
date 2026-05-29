@@ -2,6 +2,10 @@
 This examples are Pre-Alpha Releases, what that implies from a support perspective can be found [here](https://shimmersensing.com/wp-content/uploads/2022/04/Shimmer-Support-Policy_27.04.2022.pdf). If you encounter any technical issues, or would like to express interest in shaping future development, please reach out to our support team.
 If sufficient interest is registered, we may prioritize building a more fully scoped and robust API.
 
+## Migration notice
+In the next 4–8 weeks, we plan to migrate to [`shimmer-web-sdk`](https://github.com/ShimmerResearch/shimmer-web-sdk) as a replacement for `shimmer3r.js` and `verisense.js`.
+Migration work has already started on the [`copilot/restructure-repo-for-api-support`](https://github.com/ShimmerResearch/webBLEDemos/tree/copilot/restructure-repo-for-api-support) branch.
+
 # Requirements
 - Shimmer3R
 - FW Version >= v1.0.22
@@ -28,4 +32,3 @@ If sufficient interest is registered, we may prioritize building a more fully sc
 - Verisense
 
 [Wrist Sensor Example](https://shimmerresearch.github.io/webBLEDemos/Verisense/)
-
