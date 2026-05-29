@@ -2,6 +2,8 @@
 
 Web Bluetooth demos for Shimmer sensor devices, running entirely in the browser with no native app required.
 
+> **Migration note** — this branch replaces the local `shimmer3r.js` / `verisense.js` files with the published [`shimmer-web-sdk`](https://github.com/ShimmerResearch/shimmer-web-sdk) package. If you need the pre-migration setup, check out the [v0.0.1](https://github.com/ShimmerResearch/webBLEDemos/releases/tag/v0.0.1) release tag.
+
 > **Pre-Alpha Release** — these demos and the SDK are early-stage software. What that means from a support perspective is described [here](https://shimmersensing.com/wp-content/uploads/2022/04/Shimmer-Support-Policy_27.04.2022.pdf). If you encounter technical issues, or would like to express interest in shaping future development, please reach out to the Shimmer support team. If sufficient interest is registered, we may prioritise building a more fully scoped and robust API.
 
 ---
