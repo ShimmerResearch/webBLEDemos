@@ -3580,9 +3580,10 @@ class VerisenseBleDevice extends BaseShimmerClient {
                 const secondHint = cap.aggregateText.indexOf(hint, firstHint + hint.length);
                 if (secondHint >= 0) {
                     const endOfSecondLine = cap.aggregateText.indexOf('\n', secondHint);
-                    full = endOfSecondLine >= 0
-                        ? cap.aggregateText.slice(0, endOfSecondLine + 1)
-                        : cap.aggregateText;
+                    full =
+                        endOfSecondLine >= 0
+                            ? cap.aggregateText.slice(0, endOfSecondLine + 1)
+                            : cap.aggregateText;
                 }
             }
         }
