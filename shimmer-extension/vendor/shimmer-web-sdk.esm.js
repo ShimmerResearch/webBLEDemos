@@ -1227,14 +1227,6 @@ const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 /** NUS RX characteristic UUID (host subscribes to notifications from this). */
 const NUS_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-/** Nordic Secure DFU primary service UUID (0xFE59). */
-const NORDIC_DFU_SERVICE = '0000fe59-0000-1000-8000-00805f9b34fb';
-/** Nordic DFU control-point characteristic UUID. */
-const NORDIC_DFU_CONTROL_CHAR = '8ec90001-f315-4f60-9fb8-838830daea50';
-/** Nordic DFU packet characteristic UUID. */
-const NORDIC_DFU_PACKET_CHAR = '8ec90002-f315-4f60-9fb8-838830daea50';
-/** Nordic buttonless DFU characteristic UUID (write 0x01 to reboot to bootloader). */
-const NORDIC_DFU_BUTTONLESS_CHAR = '8ec90003-f315-4f60-9fb8-838830daea50';
 // ---------------------------------------------------------------------------
 // Verisense protocol command/property constants
 // ---------------------------------------------------------------------------
@@ -1284,7 +1276,6 @@ const TEST_MODE_ID = Object.freeze({
     BIOZ_MAX30002: 0x0b,
     ACCEL2_GYRO_LSM6DSV: 0x0c,
     MAG_LIS2MDL: 0x0d,
-    TEST_REPORT: 0xfe,
     ALL_TESTS: 0xff,
 });
 /** Debug command IDs documented by Verisense firmware. */
@@ -1373,20 +1364,44 @@ const OP_IDX = Object.freeze({
     PPG_DAC4_CROSSTALK: 70,
     PROX_AGC_MODE: 71,
 });
-/**
- * Factory test type selection byte sent as the last byte of a TEST_REPORT (0xFE) payload.
- * Mirrors the firmware `factory_test_t` enum.
- */
-const FACTORY_TEST = Object.freeze({
-    MAIN: 0,
-    LEDS: 1,
-    ICS: 2,
-    LED_STATES: 3,
-});
 
 /** Read a 16-bit unsigned integer, little-endian. */
 function u16le(b0, b1) {
     return (b1 << 8) | b0;
+}
+/** Format a single byte as an uppercase `0xNN` string. */
+function formatByteAsHex(v) {
+    return `0x${(v & 0xff).toString(16).toUpperCase().padStart(2, '0')}`;
+}
+/** Format bytes as `[0xAA, 0xBB, ...]`. */
+function formatByteArrayAsHex(bytes) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
+    return `[${Array.from(u8, (b) => formatByteAsHex(Number(b))).join(', ')}]`;
+}
+/** Parse text containing hex bytes like `0x5A, 00 12` into a Uint8Array. */
+function parseHexByteString(text) {
+    const matches = String(text ?? '').match(/[0-9a-fA-F]{2}/g) ?? [];
+    if (!matches.length) {
+        throw new Error('No hex bytes found. Example: 0x5A, 0x00, 0x12');
+    }
+    return new Uint8Array(matches.map((h) => Number.parseInt(h, 16)));
+}
+const ASM_PROPERTY_BY_VALUE = new Map(Object.entries(ASM_PROPERTY).map(([name, value]) => [Number(value), name]));
+/** Label pending-event property values with both enum name and hex representation. */
+function formatPendingEventProperties(pendingProps) {
+    const list = Array.isArray(pendingProps)
+        ? pendingProps
+        : pendingProps == null
+            ? []
+            : Array.from(pendingProps);
+    return list.map((prop) => {
+        const value = Number(prop) & 0xff;
+        return {
+            value,
+            hex: formatByteAsHex(value),
+            property: ASM_PROPERTY_BY_VALUE.get(value) ?? 'UNKNOWN_PROPERTY',
+        };
+    });
 }
 /** Read a signed 16-bit integer at byte offset `off`, little-endian. */
 function i16le(bytes, off) {
@@ -1479,6 +1494,77 @@ function computeVerisensePairingPin(uniqueId) {
     const suffixHex = normalized.slice(-2);
     const suffixDec = Number.parseInt(suffixHex, 16);
     return `${prefix}${suffixDec.toString().padStart(3, '0')}`;
+}
+/** Format unix seconds as raw + human-readable local datetime for logging. */
+function formatVerisenseUnixAndHuman(unixSeconds) {
+    const unix = Number(unixSeconds);
+    if (!Number.isFinite(unix)) {
+        return { unix, human: 'invalid' };
+    }
+    if (unix <= 0) {
+        return { unix, human: '1970-01-01 00:00:00 (epoch)' };
+    }
+    if (unix > 4102444800) {
+        return { unix, human: 'not-valid' };
+    }
+    const d = new Date(unix * 1000);
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const HH = String(d.getHours()).padStart(2, '0');
+    const MM = String(d.getMinutes()).padStart(2, '0');
+    const SS = String(d.getSeconds()).padStart(2, '0');
+    return {
+        unix,
+        human: `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`,
+    };
+}
+/** Convert parsed status payload into an object with human-readable timestamps for logs. */
+function formatStatusPayloadForLog(status) {
+    return {
+        ...status,
+        statusTimestamp: formatVerisenseUnixAndHuman(status.statusTimestampSeconds),
+        lastOkTransfer: formatVerisenseUnixAndHuman(status.lastOkTransferSeconds),
+        lastFailTransfer: formatVerisenseUnixAndHuman(status.lastFailTransferSeconds),
+    };
+}
+/** Convert parsed scheduler payload into an object with human-readable timestamps for logs. */
+function formatSchedulerPayloadForLog(parsed) {
+    const out = {
+        ...parsed,
+        adaptiveScheduler: undefined,
+        ltfRetry: undefined,
+        currentTime: formatVerisenseUnixAndHuman(parsed.currentTimeUnixSeconds),
+        pendingDataTransfer: formatVerisenseUnixAndHuman(parsed.pendingDataTransferUnixSeconds),
+        pendingStatus1: formatVerisenseUnixAndHuman(parsed.pendingStatus1UnixSeconds),
+        pendingRtcSync: formatVerisenseUnixAndHuman(parsed.pendingRtcSyncUnixSeconds),
+        pendingRetry: formatVerisenseUnixAndHuman(parsed.pendingRetryUnixSeconds),
+    };
+    if (typeof parsed.pendingStatus2UnixSeconds === 'number') {
+        out.pendingStatus2 = formatVerisenseUnixAndHuman(parsed.pendingStatus2UnixSeconds);
+    }
+    if (typeof parsed.ppgMeasurementUnixSeconds === 'number') {
+        out.ppgMeasurement = formatVerisenseUnixAndHuman(parsed.ppgMeasurementUnixSeconds);
+    }
+    if (typeof parsed.stepCounterResetUnixSeconds === 'number') {
+        out.stepCounterReset = formatVerisenseUnixAndHuman(parsed.stepCounterResetUnixSeconds);
+    }
+    if (typeof parsed.sensorInactivityUnixSeconds === 'number') {
+        out.sensorInactivity = formatVerisenseUnixAndHuman(parsed.sensorInactivityUnixSeconds);
+    }
+    if (parsed.adaptiveScheduler) {
+        out.adaptiveScheduler = {
+            ...parsed.adaptiveScheduler,
+            nextTime: formatVerisenseUnixAndHuman(parsed.adaptiveScheduler.nextUnixSeconds),
+        };
+    }
+    if (parsed.ltfRetry) {
+        out.ltfRetry = {
+            ...parsed.ltfRetry,
+            nextTime: formatVerisenseUnixAndHuman(parsed.ltfRetry.nextUnixSeconds),
+        };
+    }
+    return out;
 }
 const PROD_CONFIG_FLAG_DFU_ENABLED = 1 << 0;
 const LOG_EVENT_NAMES = {
@@ -1959,6 +2045,12 @@ function parseProductionConfigPayload(response) {
         firmware: `${revFwMajor}.${revFwMinor}.${revFwInternal}`,
         asmid: asmid.toUpperCase(),
         configHeader,
+        revHwMajor,
+        revHwMinor,
+        revHwInternal,
+        revFwMajor,
+        revFwMinor,
+        revFwInternal,
     };
 }
 
@@ -2110,6 +2202,1376 @@ function evaluateParsedFileSplit(input) {
     return { shouldSplit: reasons.length > 0, reasons };
 }
 
+const VERISENSE_HW_MAJOR_FRIENDLY_NAMES = {
+    61: 'IMU',
+    62: 'GSR+',
+    64: 'SDK',
+    68: 'Pulse+',
+};
+function getVerisenseHardwareFriendlyName(revHwMajor) {
+    return VERISENSE_HW_MAJOR_FRIENDLY_NAMES[revHwMajor] ?? null;
+}
+function formatVerisenseHardwareRevision(revHwMajor, revHwMinor, revHwInternal = 0, opts = {}) {
+    const prefix = opts.prefix ?? 'SR';
+    const base = `${prefix}${revHwMajor}.${revHwMinor}.${revHwInternal}`;
+    if (!opts.includeFriendlyName)
+        return base;
+    const friendly = getVerisenseHardwareFriendlyName(revHwMajor);
+    return friendly ? `${base} (${friendly})` : base;
+}
+/**
+ * Battery voltage scaling for streamed ADC battery samples.
+ * Status responses already contain firmware-scaled battery values and should not use this helper.
+ */
+function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor, revHwMinor) {
+    // SR62
+    if (revHwMajor === 62)
+        return 2.0;
+    // SR61.5 and >= SR68.9
+    if ((revHwMajor === 61 && revHwMinor === 5) || revHwMajor > 68 || (revHwMajor === 68 && revHwMinor >= 9)) {
+        return 2.469;
+    }
+    return 1.0;
+}
+
+const VERISENSE_OPERATIONAL_FIELD_SCHEMA = [
+    // GEN_CFG_0
+    {
+        key: "BLUETOOTH_EN",
+        label: "Bluetooth",
+        desc: "Enable BLE",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_0,
+        shift: 4,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "USB_EN",
+        label: "USB",
+        desc: "Enable USB interface",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_0,
+        shift: 3,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "PRIORITISE_LONG_TERM_FLASH",
+        label: "Prioritise Long-Term Flash",
+        desc: "Prioritise long-term flash behavior",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_0,
+        shift: 2,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "DEVICE_EN",
+        label: "Device",
+        desc: "Master device enable",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_0,
+        shift: 1,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "RECORDING_EN",
+        label: "Recording",
+        desc: "Enable recording",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_0,
+        shift: 0,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    // GEN_CFG_1
+    {
+        key: "DATA_COMPRESSION_MODE",
+        label: "Data Compression",
+        desc: "0: Off, 1: ZLIB (future), 2: XZ (future), 3: Reserved",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_1,
+        shift: 0,
+        width: 2,
+        options: [
+            [0, "Off"],
+            [1, "ZLIB (future)"],
+            [2, "XZ (future)"],
+            [3, "Reserved"],
+        ],
+    },
+    // GEN_CFG_2/3
+    {
+        key: "HR_PPG_CHANNEL",
+        label: "HR PPG Channel",
+        desc: "Default HR channel",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_2,
+        shift: 6,
+        width: 2,
+        options: [
+            [0, "IR"],
+            [1, "RED"],
+            [2, "GREEN"],
+            [3, "BLUE"],
+        ],
+    },
+    {
+        key: "STEP_COUNT_EN",
+        label: "Step Counter",
+        desc: "Enable step counter",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_2,
+        shift: 5,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "PENDING_EVENTS_SCHEDULER_DISABLED",
+        label: "Pending Events Scheduler",
+        desc: "1 = disabled",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_2,
+        shift: 4,
+        width: 1,
+        options: [
+            [0, "Enabled"],
+            [1, "Disabled"],
+        ],
+    },
+    {
+        key: "BATT_TYPE",
+        label: "Battery Type",
+        desc: "Battery chemistry",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_2,
+        shift: 0,
+        width: 1,
+        options: [
+            [0, "Zinc-Air"],
+            [1, "NiMH"],
+        ],
+    },
+    {
+        key: "LED_MODE",
+        label: "LED Mode",
+        desc: "0 Off, 1 On, 2 Low-power",
+        kind: "bit",
+        index: OP_IDX.GEN_CFG_3,
+        shift: 0,
+        width: 2,
+        options: [
+            [0, "Off"],
+            [1, "On"],
+            [2, "Low-power"],
+            [3, "Reserved"],
+        ],
+    },
+    // ACCEL1
+    {
+        key: "ODR",
+        label: "Accel1 ODR",
+        desc: "Accel1 sampling rate mode",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_0,
+        shift: 4,
+        width: 4,
+        options: [
+            [0, "Power-down"],
+            [1, "12.5/1.6 Hz"],
+            [2, "12.5 Hz"],
+            [3, "25 Hz"],
+            [4, "50 Hz"],
+            [5, "100 Hz"],
+            [6, "200 Hz"],
+            [7, "400/200 Hz"],
+            [8, "800/200 Hz"],
+            [9, "1600/200 Hz"],
+        ],
+    },
+    {
+        key: "MODE",
+        label: "Accel1 Mode",
+        desc: "Operating mode",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_0,
+        shift: 2,
+        width: 2,
+        options: [
+            [0, "Low-Power"],
+            [1, "High-Performance"],
+            [2, "Single conversion"],
+            [3, "Reserved"],
+        ],
+    },
+    {
+        key: "LP_MODE",
+        label: "Accel1 LP Mode",
+        desc: "Low-power sub-mode",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_0,
+        shift: 0,
+        width: 2,
+        options: [
+            [0, "LP1"],
+            [1, "LP2"],
+            [2, "LP3"],
+            [3, "LP4"],
+        ],
+    },
+    {
+        key: "BW_FILT",
+        label: "Accel1 BW Filter",
+        desc: "00 ODR/2, 01 ODR/4, 10 ODR/10, 11 ODR/20",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_1,
+        shift: 6,
+        width: 2,
+        options: [
+            [0, "ODR/2"],
+            [1, "ODR/4"],
+            [2, "ODR/10"],
+            [3, "ODR/20"],
+        ],
+    },
+    {
+        key: "FS",
+        label: "Accel1 Range",
+        desc: "Full-scale range",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_1,
+        shift: 4,
+        width: 2,
+        options: [
+            [0, "+-2g"],
+            [1, "+-4g"],
+            [2, "+-8g"],
+            [3, "+-16g"],
+        ],
+    },
+    {
+        key: "FDS",
+        label: "Accel1 FDS",
+        desc: "Filtered data selection",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_1,
+        shift: 3,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "LOW_NOISE",
+        label: "Accel1 Low Noise",
+        desc: "Low-noise mode",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_1,
+        shift: 2,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "HP_REF_MODE",
+        label: "Accel1 HP Ref Mode",
+        desc: "High-pass reference mode",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_2,
+        shift: 1,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "FMode",
+        label: "Accel1 FIFO Mode",
+        desc: "LIS2DW12 FIFO mode",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_3,
+        shift: 5,
+        width: 3,
+        options: [
+            [0, "Bypass"],
+            [1, "FIFO"],
+            [2, "Reserved"],
+            [3, "Continuous-to-FIFO"],
+            [4, "Bypass-to-Continuous"],
+            [5, "Reserved"],
+            [6, "Continuous"],
+            [7, "Reserved"],
+        ],
+    },
+    {
+        key: "FTH",
+        label: "Accel1 FIFO Threshold",
+        desc: "5-bit threshold (0-31)",
+        kind: "bit",
+        index: OP_IDX.ACCEL1_CFG_3,
+        shift: 0,
+        width: 5,
+        min: 0,
+        max: 31,
+    },
+    // ACCEL2/GYRO
+    {
+        key: "FTH_LSB",
+        label: "LSM FIFO Threshold LSB",
+        desc: "Lower 8 bits of LSM FIFO threshold",
+        kind: "u8",
+        index: OP_IDX.GYRO_ACCEL2_CFG_0,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "TIMER_PEDO_FIFDO_EN",
+        label: "Timer/Pedo FIFO Dataset",
+        desc: "Include step/timestamp as 4th dataset",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_1,
+        shift: 7,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "TIMER_PEDO_FIFO_DRDY",
+        label: "Timer/Pedo FIFO DRDY",
+        desc: "0 write by DRDY, 1 disable write at each step",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_1,
+        shift: 6,
+        width: 1,
+        options: [
+            [0, "DRDY"],
+            [1, "Step detect"],
+        ],
+    },
+    {
+        key: "FTH_MSB",
+        label: "LSM FIFO Threshold MSB",
+        desc: "Upper 4 bits of LSM FIFO threshold",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_1,
+        shift: 0,
+        width: 4,
+        min: 0,
+        max: 15,
+    },
+    {
+        key: "DEC_FIFO_GYRO",
+        label: "Gyro FIFO Decimation",
+        desc: "Decimation factor for gyro",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_2,
+        shift: 3,
+        width: 3,
+        options: [
+            [0, "Not in FIFO"],
+            [1, "No decimation"],
+            [2, "x2"],
+            [3, "x3"],
+            [4, "x4"],
+            [5, "x8"],
+            [6, "x16"],
+            [7, "x32"],
+        ],
+    },
+    {
+        key: "DEC_FIFO_XL",
+        label: "Accel2 FIFO Decimation",
+        desc: "Decimation factor for accel2",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_2,
+        shift: 0,
+        width: 3,
+        options: [
+            [0, "Not in FIFO"],
+            [1, "No decimation"],
+            [2, "x2"],
+            [3, "x3"],
+            [4, "x4"],
+            [5, "x8"],
+            [6, "x16"],
+            [7, "x32"],
+        ],
+    },
+    {
+        key: "ODR_FIFO",
+        label: "LSM FIFO ODR",
+        desc: "FIFO sampling rate",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_3,
+        shift: 3,
+        width: 4,
+        options: [
+            [0, "Disabled"],
+            [1, "12.5 Hz"],
+            [2, "26 Hz"],
+            [3, "52 Hz"],
+            [4, "104 Hz"],
+            [5, "208 Hz"],
+            [6, "416 Hz"],
+            [7, "833 Hz"],
+            [8, "1.66 kHz"],
+            [9, "3.33 kHz"],
+            [10, "6.66 kHz"],
+        ],
+    },
+    {
+        key: "FIFO_MODE",
+        label: "LSM FIFO Mode",
+        desc: "FIFO behavior",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_3,
+        shift: 0,
+        width: 3,
+        options: [
+            [0, "Bypass"],
+            [1, "FIFO"],
+            [2, "Reserved"],
+            [3, "Continuous-to-FIFO"],
+            [4, "Bypass-to-Continuous"],
+            [5, "Reserved"],
+            [6, "Continuous"],
+            [7, "Reserved"],
+        ],
+    },
+    {
+        key: "ODR_XL",
+        label: "Accel2 ODR",
+        desc: "Accel2 sampling rate",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_4,
+        shift: 4,
+        width: 4,
+        options: [
+            [0, "Power-down"],
+            [1, "12.5 Hz"],
+            [2, "26 Hz"],
+            [3, "52 Hz"],
+            [4, "104 Hz"],
+            [5, "208 Hz"],
+            [6, "416 Hz"],
+            [7, "833 Hz"],
+            [8, "1.66 kHz"],
+            [9, "3.33 kHz"],
+            [10, "6.66 kHz"],
+        ],
+    },
+    {
+        key: "FS_XL",
+        label: "Accel2 Range",
+        desc: "00 +-2g, 01 +-16g, 10 +-4g, 11 +-8g",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_4,
+        shift: 2,
+        width: 2,
+        options: [
+            [0, "+-2g"],
+            [1, "+-16g"],
+            [2, "+-4g"],
+            [3, "+-8g"],
+        ],
+    },
+    {
+        key: "BW_XL",
+        label: "Accel2 BW",
+        desc: "Anti-alias filter bandwidth",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_4,
+        shift: 0,
+        width: 2,
+        options: [
+            [0, "400 Hz"],
+            [1, "200 Hz"],
+            [2, "100 Hz"],
+            [3, "50 Hz"],
+        ],
+    },
+    {
+        key: "ODR_G",
+        label: "Gyro ODR",
+        desc: "Gyro sampling rate",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_5,
+        shift: 4,
+        width: 4,
+        options: [
+            [0, "Power-down"],
+            [1, "12.5 Hz"],
+            [2, "26 Hz"],
+            [3, "52 Hz"],
+            [4, "104 Hz"],
+            [5, "208 Hz"],
+            [6, "416 Hz"],
+            [7, "833 Hz"],
+            [8, "1.66 kHz"],
+        ],
+    },
+    {
+        key: "FS_G",
+        label: "Gyro Range",
+        desc: "Gyro full-scale",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_5,
+        shift: 2,
+        width: 2,
+        options: [
+            [0, "250 dps"],
+            [1, "500 dps"],
+            [2, "1000 dps"],
+            [3, "2000 dps"],
+        ],
+    },
+    {
+        key: "FS_125",
+        label: "Gyro 125 dps",
+        desc: "Enable 125 dps full-scale",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_5,
+        shift: 1,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "G_HM_MODE",
+        label: "Gyro High-Performance Mode",
+        desc: "0 HP enabled, 1 HP disabled",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_6,
+        shift: 7,
+        width: 1,
+        options: [
+            [0, "Enabled"],
+            [1, "Disabled"],
+        ],
+    },
+    {
+        key: "HP_G_EN",
+        label: "Gyro HPF",
+        desc: "Gyro high-pass filter",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_6,
+        shift: 6,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "HPCF_G",
+        label: "Gyro HPF Cutoff",
+        desc: "Gyro HPF cutoff frequency",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_6,
+        shift: 4,
+        width: 2,
+        options: [
+            [0, "0.0081 Hz"],
+            [1, "0.0324 Hz"],
+            [2, "2.07 Hz"],
+            [3, "16.32 Hz"],
+        ],
+    },
+    {
+        key: "HP_G_RST",
+        label: "Gyro HPF Reset",
+        desc: "Reset digital HPF",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_6,
+        shift: 3,
+        width: 1,
+        options: [
+            [0, "Off"],
+            [1, "On"],
+        ],
+    },
+    {
+        key: "ROUNDING_STATUS",
+        label: "Rounding Status",
+        desc: "Source register rounding",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_6,
+        shift: 2,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "LPF2_XL_EN",
+        label: "Accel2 LPF2",
+        desc: "LPF2 selection",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_7,
+        shift: 7,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "HPCF_XL",
+        label: "Accel2 HP/Slope Cutoff",
+        desc: "HPCF_XL bits",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_7,
+        shift: 5,
+        width: 2,
+        min: 0,
+        max: 3,
+    },
+    {
+        key: "HP_SLOPE_XL_EN",
+        label: "Accel2 HP/Slope Enable",
+        desc: "HP/slope filter selection",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_7,
+        shift: 2,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "LOW_PASS_ON_6D",
+        label: "Low-pass on 6D",
+        desc: "Low-pass filter on 6D function",
+        kind: "bit",
+        index: OP_IDX.GYRO_ACCEL2_CFG_7,
+        shift: 0,
+        width: 1,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    // Timing and BLE scheduler
+    {
+        key: "START_TIME",
+        label: "Start Time",
+        desc: "32-bit start time",
+        kind: "u32",
+        index: OP_IDX.START_TIME,
+        min: 0,
+        max: 4294967295,
+    },
+    {
+        key: "END_TIME",
+        label: "End Time",
+        desc: "32-bit end time",
+        kind: "u32",
+        index: OP_IDX.END_TIME,
+        min: 0,
+        max: 4294967295,
+    },
+    {
+        key: "RESUME_REC_ON_ACTIVITY",
+        label: "Resume Rec On Activity",
+        desc: "INACTIVE_TIMEOUT bit 6",
+        kind: "inactiveResume",
+        index: OP_IDX.INACTIVE_TIMEOUT,
+        options: [
+            [0, "Disabled"],
+            [1, "Enabled"],
+        ],
+    },
+    {
+        key: "INACTIVE_TIMEOUT_MINUTES",
+        label: "Inactive Timeout (min)",
+        desc: "INACTIVE_TIMEOUT bits [5:0]",
+        kind: "inactiveMinutes",
+        index: OP_IDX.INACTIVE_TIMEOUT,
+        min: 0,
+        max: 63,
+    },
+    {
+        key: "BLE_CONNECTION_TRIES_PER_DAY",
+        label: "BLE Retry Count",
+        desc: "BLE connection tries per day",
+        kind: "u8",
+        index: OP_IDX.BLE_RETRY_COUNT,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "BLE_TX_POWER",
+        label: "BLE TX Power",
+        desc: "Radio TX power",
+        kind: "u8",
+        index: OP_IDX.BLE_TX_POWER,
+        options: [
+            [0x08, "+8 dBm"],
+            [0x07, "+7 dBm"],
+            [0x06, "+6 dBm"],
+            [0x05, "+5 dBm"],
+            [0x04, "+4 dBm"],
+            [0x03, "+3 dBm"],
+            [0x02, "+2 dBm"],
+            [0x00, "+0 dBm"],
+            [0xfc, "-4 dBm"],
+            [0xf8, "-8 dBm"],
+            [0xf4, "-12 dBm"],
+            [0xf0, "-16 dBm"],
+            [0xec, "-20 dBm"],
+            [0xff, "-40 dBm"],
+            [0xd8, "-40 dBm"],
+        ],
+    },
+    {
+        key: "BLE_DATA_TRANS_WKUP_INT_HOURS",
+        label: "BLE Data Wakeup Interval (h)",
+        desc: "Data transfer wake interval",
+        kind: "u8",
+        index: OP_IDX.BLE_DATA_TRANS_WKUP_INT_HRS,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "BLE_DATA_TRANS_WKUP_TIME",
+        label: "BLE Data Wakeup Time",
+        desc: "LSB/MSB 16-bit value",
+        kind: "u16",
+        index: OP_IDX.BLE_DATA_TRANS_WKUP_TIME,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "BLE_DATA_TRANS_WKUP_DUR",
+        label: "BLE Data Wakeup Duration",
+        desc: "Duration in units used by firmware",
+        kind: "u8",
+        index: OP_IDX.BLE_DATA_TRANS_WKUP_DUR,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "BLE_DATA_TRANS_RETRY_INT",
+        label: "BLE Data Retry Interval",
+        desc: "LSB/MSB 16-bit value",
+        kind: "u16",
+        index: OP_IDX.BLE_DATA_TRANS_RETRY_INT,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "BLE_STATUS_WKUP_INT_HOURS",
+        label: "BLE Status Wakeup Interval (h)",
+        desc: "Status wake interval",
+        kind: "u8",
+        index: OP_IDX.BLE_STATUS_WKUP_INT_HRS,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "BLE_STATUS_WKUP_TIME",
+        label: "BLE Status Wakeup Time",
+        desc: "LSB/MSB 16-bit value",
+        kind: "u16",
+        index: OP_IDX.BLE_STATUS_WKUP_TIME,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "BLE_STATUS_WKUP_DUR",
+        label: "BLE Status Wakeup Duration",
+        desc: "Duration in units used by firmware",
+        kind: "u8",
+        index: OP_IDX.BLE_STATUS_WKUP_DUR,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "BLE_STATUS_RETRY_INT",
+        label: "BLE Status Retry Interval",
+        desc: "LSB/MSB 16-bit value",
+        kind: "u16",
+        index: OP_IDX.BLE_STATUS_RETRY_INT,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "BLE_RTC_SYNC_WKUP_INT_HOURS",
+        label: "BLE RTC Sync Wakeup Interval (h)",
+        desc: "RTC sync wake interval",
+        kind: "u8",
+        index: OP_IDX.BLE_RTC_SYNC_WKUP_INT_HRS,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "BLE_RTC_SYNC_WKUP_TIME",
+        label: "BLE RTC Sync Wakeup Time",
+        desc: "LSB/MSB 16-bit value",
+        kind: "u16",
+        index: OP_IDX.BLE_RTC_SYNC_WKUP_TIME,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "BLE_RTC_SYNC_WKUP_DUR",
+        label: "BLE RTC Sync Wakeup Duration",
+        desc: "Duration in units used by firmware",
+        kind: "u8",
+        index: OP_IDX.BLE_RTC_SYNC_WKUP_DUR,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "BLE_RTC_SYNC_RETRY_INT",
+        label: "BLE RTC Sync Retry Interval",
+        desc: "LSB/MSB 16-bit value",
+        kind: "u16",
+        index: OP_IDX.BLE_RTC_SYNC_RETRY_INT,
+        min: 0,
+        max: 65535,
+    },
+    // ADC/PPG
+    {
+        key: "ADC_SAMPLE_RATE",
+        label: "ADC Sample Rate",
+        desc: "ADC sample rate code",
+        kind: "bit",
+        index: OP_IDX.ADC_CHANNEL_SETTINGS_0,
+        shift: 0,
+        width: 6,
+        options: [
+            [0, "Off"],
+            [1, "32768.0 Hz"],
+            [2, "16384.0 Hz"],
+            [3, "8192.0 Hz"],
+            [4, "6553.6 Hz"],
+            [5, "4096.0 Hz"],
+            [6, "3276.8 Hz"],
+            [7, "2048.0 Hz"],
+            [8, "1638.4 Hz"],
+            [9, "1310.72 Hz"],
+            [10, "1024.0 Hz"],
+            [11, "819.2 Hz"],
+            [12, "655.36 Hz"],
+            [13, "512.0 Hz"],
+            [14, "409.6 Hz"],
+            [15, "327.68 Hz"],
+            [16, "256.0 Hz"],
+            [17, "204.8 Hz"],
+            [18, "163.84 Hz"],
+            [19, "128.0 Hz"],
+            [20, "102.4 Hz"],
+            [21, "81.92 Hz"],
+            [22, "64.0 Hz"],
+            [23, "51.2 Hz"],
+            [24, "40.96 Hz"],
+            [25, "32.0 Hz"],
+            [26, "25.6 Hz"],
+            [27, "20.48 Hz"],
+            [28, "16.0 Hz"],
+            [29, "12.8 Hz"],
+            [30, "10.24 Hz"],
+            [31, "8.0 Hz"],
+            [32, "6.4 Hz"],
+            [33, "5.12 Hz"],
+            [34, "4.0 Hz"],
+            [35, "3.2 Hz"],
+            [36, "2.56 Hz"],
+            [37, "2.0 Hz"],
+            [38, "1.6 Hz"],
+            [39, "1.28 Hz"],
+            [40, "1.0 Hz"],
+            [41, "0.8 Hz"],
+            [42, "0.64 Hz"],
+        ],
+    },
+    {
+        key: "ADC_OVERSAMPLE_RATE",
+        label: "ADC Oversample",
+        desc: "ADC oversampling",
+        kind: "bit",
+        index: OP_IDX.ADC_CHANNEL_SETTINGS_1,
+        shift: 4,
+        width: 4,
+        options: [
+            [0, "Disabled"],
+            [1, "2x"],
+            [2, "4x"],
+            [3, "8x"],
+            [4, "16x"],
+            [5, "32x"],
+            [6, "64x"],
+            [7, "128x"],
+            [8, "256x"],
+        ],
+    },
+    {
+        key: "GSR_RANGE_SETTING",
+        label: "GSR Range",
+        desc: "0:40k, 1:287k, 2:1M, 3:3.3M, 4:Auto",
+        kind: "bit",
+        index: OP_IDX.ADC_CHANNEL_SETTINGS_1,
+        shift: 0,
+        width: 3,
+        options: [
+            [0, "Range 0 (40k)"],
+            [1, "Range 1 (287k)"],
+            [2, "Range 2 (1M)"],
+            [3, "Range 3 (3.3M)"],
+            [4, "Auto"],
+        ],
+    },
+    {
+        key: "ADAPTIVE_SCHEDULER_INTERVAL",
+        label: "Adaptive Scheduler Interval",
+        desc: "16-bit adaptive scheduler interval",
+        kind: "u16",
+        index: OP_IDX.ADAPTIVE_SCHEDULER_INT,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "ADAPTIVE_SCHEDULER_FAILCOUNT_MAX",
+        label: "Adaptive Scheduler Failcount Max",
+        desc: "Maximum failed attempts",
+        kind: "u8",
+        index: OP_IDX.ADAPTIVE_SCHEDULER_FAILCOUNT_MAX,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "PPG_REC_DUR_SECS",
+        label: "PPG Record Duration (s)",
+        desc: "0 = always on",
+        kind: "u16",
+        index: OP_IDX.PPG_REC_DUR_SECS_LSB,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "PPG_REC_INT_MINS",
+        label: "PPG Record Interval (min)",
+        desc: "0 = always on",
+        kind: "u16",
+        index: OP_IDX.PPG_REC_INT_MINS_LSB,
+        min: 0,
+        max: 65535,
+    },
+    {
+        key: "SMP_AVE",
+        label: "PPG Sample Averaging",
+        desc: "FIFO sample averaging",
+        kind: "bit",
+        index: OP_IDX.PPG_FIFO_CONFIG,
+        shift: 5,
+        width: 3,
+        options: [
+            [0, "1"],
+            [1, "2"],
+            [2, "4"],
+            [3, "8"],
+            [4, "16"],
+            [5, "32"],
+            [6, "32"],
+            [7, "32"],
+        ],
+    },
+    {
+        key: "PPG_ADC_RGE",
+        label: "PPG ADC Range",
+        desc: "ADC range / full-scale",
+        kind: "bit",
+        index: OP_IDX.PPG_MODE_CONFIG2,
+        shift: 5,
+        width: 2,
+        options: [
+            [0, "7.8125 / 4096"],
+            [1, "15.625 / 8192"],
+            [2, "31.25 / 16384"],
+            [3, "62.5 / 32768"],
+        ],
+    },
+    {
+        key: "PPG_SR",
+        label: "PPG Sample Rate",
+        desc: "PPG sample rate",
+        kind: "bit",
+        index: OP_IDX.PPG_MODE_CONFIG2,
+        shift: 2,
+        width: 3,
+        options: [
+            [0, "50 Hz"],
+            [1, "100 Hz"],
+            [2, "200 Hz"],
+            [3, "400 Hz"],
+            [4, "800 Hz"],
+            [5, "1000 Hz"],
+            [6, "1600 Hz"],
+            [7, "3200 Hz"],
+        ],
+    },
+    {
+        key: "PPG_LED_PW",
+        label: "PPG LED Pulse Width",
+        desc: "50/100/200/400 us",
+        kind: "bit",
+        index: OP_IDX.PPG_MODE_CONFIG2,
+        shift: 0,
+        width: 2,
+        options: [
+            [0, "50 us"],
+            [1, "100 us"],
+            [2, "200 us"],
+            [3, "400 us"],
+        ],
+    },
+    {
+        key: "PPG_MA_DEFAULT",
+        label: "PPG MA Default",
+        desc: "Default LED current (mA)",
+        kind: "u8",
+        index: OP_IDX.PPG_MA_DEFAULT,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "PPG_MA_MAX_RED_IR",
+        label: "PPG MA Max Red/IR",
+        desc: "Max current for Red/IR (mA)",
+        kind: "u8",
+        index: OP_IDX.PPG_MA_MAX_RED_IR,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "PPG_MA_MAX_GREEN_BLUE",
+        label: "PPG MA Max Green/Blue",
+        desc: "Max current for Green/Blue (mA)",
+        kind: "u8",
+        index: OP_IDX.PPG_MA_MAX_GREEN_BLUE,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "PPG_AGC_TARGET_PERCENT_OF_RANGE",
+        label: "PPG AGC Target %",
+        desc: "AGC target percent of range",
+        kind: "u8",
+        index: OP_IDX.PPG_AGC_TARGET_PERCENT_OF_RANGE,
+        min: 0,
+        max: 100,
+    },
+    {
+        key: "PPG_UNUSED_BYTE",
+        label: "PPG Unused Byte",
+        desc: "Reserved byte 65",
+        kind: "u8",
+        index: 65,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "PPG_MA_LED_PILOT",
+        label: "PPG MA LED Pilot",
+        desc: "Pilot/proximity LED current",
+        kind: "u8",
+        index: OP_IDX.PPG_MA_LED_PILOT,
+        min: 0,
+        max: 255,
+    },
+    {
+        key: "XTALK_DAC1",
+        label: "PPG DAC1 Crosstalk",
+        desc: "5-bit value",
+        kind: "u8",
+        index: OP_IDX.PPG_DAC1_CROSSTALK,
+        min: 0,
+        max: 31,
+    },
+    {
+        key: "XTALK_DAC2",
+        label: "PPG DAC2 Crosstalk",
+        desc: "5-bit value",
+        kind: "u8",
+        index: OP_IDX.PPG_DAC2_CROSSTALK,
+        min: 0,
+        max: 31,
+    },
+    {
+        key: "XTALK_DAC3",
+        label: "PPG DAC3 Crosstalk",
+        desc: "5-bit value",
+        kind: "u8",
+        index: OP_IDX.PPG_DAC3_CROSSTALK,
+        min: 0,
+        max: 31,
+    },
+    {
+        key: "XTALK_DAC4",
+        label: "PPG DAC4 Crosstalk",
+        desc: "5-bit value",
+        kind: "u8",
+        index: OP_IDX.PPG_DAC4_CROSSTALK,
+        min: 0,
+        max: 31,
+    },
+    {
+        key: "PROX_AGC_MODE",
+        label: "Proximity/AGC Mode",
+        desc: "0 Disabled, 1 Driver approach, 2 Hybrid",
+        kind: "u8",
+        index: OP_IDX.PROX_AGC_MODE,
+        options: [
+            [0, "AGC Off / Prox Off"],
+            [1, "AGC On / Driver Prox"],
+            [2, "AGC On / Hybrid Prox"],
+        ],
+    },
+];
+const VERISENSE_OP_CONFIG_BYTE_SIZE = 72;
+function createBlankVerisenseOperationalConfig(byteSize = VERISENSE_OP_CONFIG_BYTE_SIZE) {
+    const blank = new Uint8Array(byteSize);
+    blank[0] = 0x5a;
+    return blank;
+}
+function clampInt(v, min, max) {
+    const n = Math.trunc(Number(v));
+    if (!Number.isFinite(n))
+        return min;
+    return Math.max(min, Math.min(max, n));
+}
+function readVerisenseOperationalFieldValue(op, field) {
+    if (field.kind === 'bit') {
+        const width = field.width ?? 1;
+        const shift = field.shift ?? 0;
+        const mask = (1 << width) - 1;
+        return (op[field.index] >> shift) & mask;
+    }
+    if (field.kind === 'u8')
+        return op[field.index] & 0xff;
+    if (field.kind === 'u16') {
+        return (op[field.index] & 0xff) | ((op[field.index + 1] & 0xff) << 8);
+    }
+    if (field.kind === 'u32') {
+        return (((op[field.index] & 0xff) |
+            ((op[field.index + 1] & 0xff) << 8) |
+            ((op[field.index + 2] & 0xff) << 16) |
+            ((op[field.index + 3] & 0xff) << 24)) >>>
+            0);
+    }
+    if (field.kind === 'inactiveResume') {
+        return op[field.index] & (0x01 << 6) ? 1 : 0;
+    }
+    if (field.kind === 'inactiveMinutes') {
+        return op[field.index] & 0x3f;
+    }
+    return 0;
+}
+function writeVerisenseOperationalFieldValue(op, field, rawValue) {
+    if (field.kind === 'bit') {
+        const width = field.width ?? 1;
+        const shift = field.shift ?? 0;
+        const mask = (1 << width) - 1;
+        const value = clampInt(rawValue, 0, mask);
+        op[field.index] = (op[field.index] & ~(mask << shift)) | ((value & mask) << shift);
+        return;
+    }
+    if (field.kind === 'u8') {
+        op[field.index] = clampInt(rawValue, field.min ?? 0, field.max ?? 255) & 0xff;
+        return;
+    }
+    if (field.kind === 'u16') {
+        const value = clampInt(rawValue, field.min ?? 0, field.max ?? 65535);
+        op[field.index] = value & 0xff;
+        op[field.index + 1] = (value >> 8) & 0xff;
+        return;
+    }
+    if (field.kind === 'u32') {
+        const value = clampInt(rawValue, field.min ?? 0, field.max ?? 4294967295) >>> 0;
+        op[field.index] = value & 0xff;
+        op[field.index + 1] = (value >> 8) & 0xff;
+        op[field.index + 2] = (value >> 16) & 0xff;
+        op[field.index + 3] = (value >> 24) & 0xff;
+        return;
+    }
+    if (field.kind === 'inactiveResume') {
+        const enabled = clampInt(rawValue, 0, 1) === 1;
+        op[field.index] = enabled ? op[field.index] | (0x01 << 6) : op[field.index] & -65;
+        return;
+    }
+    if (field.kind === 'inactiveMinutes') {
+        const minutes = clampInt(rawValue, field.min ?? 0, field.max ?? 63) & 0x3f;
+        op[field.index] = (op[field.index] & 0xc0) | minutes;
+    }
+}
+function setVerisenseOperationalBitRange(op, index, shift, width, rawValue) {
+    const mask = (1 << width) - 1;
+    const value = clampInt(rawValue, 0, mask);
+    op[index] = (op[index] & ~(mask << shift)) | ((value & mask) << shift);
+}
+const VERISENSE_SENSOR_ENABLE_FIELDS = [
+    { key: 'ACCEL_1_EN', index: OP_IDX.GEN_CFG_0, shift: 7 },
+    { key: 'ACCEL_2_EN', index: OP_IDX.GEN_CFG_0, shift: 6 },
+    { key: 'GYRO_EN', index: OP_IDX.GEN_CFG_0, shift: 5 },
+    { key: 'GSR_EN', index: OP_IDX.GEN_CFG_1, shift: 7 },
+    { key: 'PPG_GREEN_EN', index: OP_IDX.GEN_CFG_1, shift: 6 },
+    { key: 'PPG_RED_EN', index: OP_IDX.GEN_CFG_1, shift: 5 },
+    { key: 'PPG_IR_EN', index: OP_IDX.GEN_CFG_1, shift: 4 },
+    { key: 'ECG_EN', index: OP_IDX.GEN_CFG_1, shift: 3 },
+    { key: 'PPG_BLUE_EN', index: OP_IDX.GEN_CFG_1, shift: 2 },
+    { key: 'VPROG_EN', index: OP_IDX.GEN_CFG_2, shift: 2 },
+    { key: 'VBATT_EN', index: OP_IDX.GEN_CFG_2, shift: 1 },
+];
+const VERISENSE_OPERATIONAL_FIELD_GROUPS = [
+    {
+        id: 'gen',
+        title: 'General / Sensors',
+        openByDefault: false,
+        keys: [
+            'BLUETOOTH_EN',
+            'USB_EN',
+            'PRIORITISE_LONG_TERM_FLASH',
+            'DEVICE_EN',
+            'RECORDING_EN',
+            'DATA_COMPRESSION_MODE',
+            'HR_PPG_CHANNEL',
+            'STEP_COUNT_EN',
+            'PENDING_EVENTS_SCHEDULER_DISABLED',
+            'BATT_TYPE',
+            'LED_MODE',
+        ],
+    },
+    {
+        id: 'accel1',
+        title: 'Accel1',
+        openByDefault: false,
+        keys: ['ODR', 'MODE', 'LP_MODE', 'BW_FILT', 'FS', 'FDS', 'LOW_NOISE', 'HP_REF_MODE', 'FMode', 'FTH'],
+    },
+    {
+        id: 'gyro_accel2',
+        title: 'Gyro / Accel2',
+        openByDefault: false,
+        keys: [
+            'FTH_LSB',
+            'TIMER_PEDO_FIFDO_EN',
+            'TIMER_PEDO_FIFO_DRDY',
+            'FTH_MSB',
+            'DEC_FIFO_GYRO',
+            'DEC_FIFO_XL',
+            'ODR_FIFO',
+            'FIFO_MODE',
+            'ODR_XL',
+            'FS_XL',
+            'BW_XL',
+            'ODR_G',
+            'FS_G',
+            'FS_125',
+            'G_HM_MODE',
+            'HP_G_EN',
+            'HPCF_G',
+            'HP_G_RST',
+            'ROUNDING_STATUS',
+            'LPF2_XL_EN',
+            'HPCF_XL',
+            'HP_SLOPE_XL_EN',
+            'LOW_PASS_ON_6D',
+        ],
+    },
+    {
+        id: 'scheduler_ble',
+        title: 'Schedule / BLE Wake',
+        openByDefault: false,
+        keys: [
+            'START_TIME',
+            'END_TIME',
+            'RESUME_REC_ON_ACTIVITY',
+            'INACTIVE_TIMEOUT_MINUTES',
+            'BLE_CONNECTION_TRIES_PER_DAY',
+            'BLE_TX_POWER',
+            'BLE_DATA_TRANS_WKUP_INT_HOURS',
+            'BLE_DATA_TRANS_WKUP_TIME',
+            'BLE_DATA_TRANS_WKUP_DUR',
+            'BLE_DATA_TRANS_RETRY_INT',
+            'BLE_STATUS_WKUP_INT_HOURS',
+            'BLE_STATUS_WKUP_TIME',
+            'BLE_STATUS_WKUP_DUR',
+            'BLE_STATUS_RETRY_INT',
+            'BLE_RTC_SYNC_WKUP_INT_HOURS',
+            'BLE_RTC_SYNC_WKUP_TIME',
+            'BLE_RTC_SYNC_WKUP_DUR',
+            'BLE_RTC_SYNC_RETRY_INT',
+        ],
+    },
+    {
+        id: 'adc_gsr',
+        title: 'ADC / GSR',
+        openByDefault: false,
+        keys: [
+            'ADC_SAMPLE_RATE',
+            'ADC_OVERSAMPLE_RATE',
+            'GSR_RANGE_SETTING',
+            'ADAPTIVE_SCHEDULER_INTERVAL',
+            'ADAPTIVE_SCHEDULER_FAILCOUNT_MAX',
+        ],
+    },
+    {
+        id: 'ppg',
+        title: 'PPG',
+        openByDefault: false,
+        keys: [
+            'PPG_REC_DUR_SECS',
+            'PPG_REC_INT_MINS',
+            'SMP_AVE',
+            'PPG_ADC_RGE',
+            'PPG_SR',
+            'PPG_LED_PW',
+            'PPG_MA_DEFAULT',
+            'PPG_MA_MAX_RED_IR',
+            'PPG_MA_MAX_GREEN_BLUE',
+            'PPG_AGC_TARGET_PERCENT_OF_RANGE',
+            'PPG_UNUSED_BYTE',
+            'PPG_MA_LED_PILOT',
+            'XTALK_DAC1',
+            'XTALK_DAC2',
+            'XTALK_DAC3',
+            'XTALK_DAC4',
+            'PROX_AGC_MODE',
+        ],
+    },
+];
+const VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID = 'gen';
+
 /**
  * Abstract base class for all Verisense sensor decoders.
  *
@@ -2219,6 +3681,9 @@ class SensorADC extends SensorBase {
         /** GSR range 0-3 (fixed) or 4 (auto-range). */
         this.gsrRangeSetting = 4;
         this.hardwareIdentifier = 'VERISENSE_PULSE_PLUS';
+        this.hwRevisionMajor = null;
+        this.hwRevisionMinor = null;
+        this.hwRevisionInternal = null;
         // Decoded from opConfig for debug/display
         this.gsrRateSettingRaw = 0;
         this.gsrRangeSettingRaw = 0;
@@ -2228,8 +3693,22 @@ class SensorADC extends SensorBase {
     setHardwareIdentifier(idStr) {
         this.hardwareIdentifier = idStr;
     }
+    setHardwareRevision(revHwMajor, revHwMinor, revHwInternal = 0) {
+        this.hwRevisionMajor = Number.isFinite(revHwMajor) ? Math.trunc(revHwMajor) : null;
+        this.hwRevisionMinor = Number.isFinite(revHwMinor) ? Math.trunc(revHwMinor) : null;
+        this.hwRevisionInternal = Number.isFinite(revHwInternal) ? Math.trunc(revHwInternal) : null;
+    }
     setGsrRangeSetting(v) {
         this.gsrRangeSetting = v;
+    }
+    getBatteryVoltageMultiplier() {
+        if (this.hwRevisionMajor != null && this.hwRevisionMinor != null) {
+            return getVerisenseStreamingBatteryVoltageMultiplier(this.hwRevisionMajor, this.hwRevisionMinor);
+        }
+        // Backward-compatible fallback when production config revision is unavailable.
+        if (this.hardwareIdentifier === 'VERISENSE_GSR_PLUS')
+            return 2.0;
+        return 1.0;
     }
     setEnabled(arg1, opConfigBytes) {
         if (opConfigBytes != null) {
@@ -2340,9 +3819,7 @@ class SensorADC extends SensorBase {
                 const usbPluggedIn = ((raw16 >> 15) & 0x01) === 1;
                 const chargerStatusBits = (raw16 >> 13) & 0x03;
                 let mv = this.calibrateAdcToVolts(adc12) * 1000.0;
-                if (this.hardwareIdentifier === 'VERISENSE_GSR_PLUS') {
-                    mv *= 1.988;
-                }
+                mv *= this.getBatteryVoltageMultiplier();
                 const chargerStatusMap = {
                     0: 'Power-Down/Suspended',
                     1: 'Charging',
@@ -2831,8 +4308,6 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._pending = null;
         this._loggedChain = Promise.resolve();
         this._sync = null;
-        this._testReportCapture = null;
-        this._testReportDecoder = new TextDecoder();
         // Cached configs
         this.operationalConfig = null;
         this.productionConfig = null;
@@ -2897,7 +4372,6 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._onGattDisconnected = () => {
             this._mode = 'idle';
             this._transportKind = null;
-            this._clearHardwareTestReportCapture(new Error('Disconnected'), null);
             this.emit('disconnected', { kind: 'ble' });
         };
         this.device.addEventListener('gattserverdisconnected', this._onGattDisconnected);
@@ -2949,6 +4423,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._startSerialReadLoop(this._serialAbort.signal);
         this._emitStatus('Connected via USB Serial');
         this.emit('connected', { kind: 'serial' });
+        await this.readProductionConfigFromDevice();
         await this.readOpConfigFromDevice();
         return true;
     }
@@ -2998,7 +4473,6 @@ class VerisenseBleDevice extends BaseShimmerClient {
                 this._serialReadLoopTask = null;
                 if (!signal.aborted) {
                     this._mode = 'idle';
-                    this._clearHardwareTestReportCapture(new Error('Disconnected'), null);
                     this.emit('disconnected', { kind: 'serial' });
                 }
             }
@@ -3100,7 +4574,6 @@ class VerisenseBleDevice extends BaseShimmerClient {
                 /* ignore */
             }
         }
-        this._clearHardwareTestReportCapture(new Error(opts.reason ?? 'Disconnected'), null);
         if (this._transportKind === 'serial') {
             try {
                 await this._serialDisconnect(opts.reason ?? 'user');
@@ -3191,6 +4664,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
             lastRxAt: Date.now(),
             timeoutMs,
             bytesWritten: 0,
+            lastPayloadIndex: 0,
             resolve: null,
             reject: null,
             timer: null,
@@ -3386,105 +4860,8 @@ class VerisenseBleDevice extends BaseShimmerClient {
     async writeTimeUnixSeconds(unixSeconds) {
         await this.writeTime(unixSecondsToAsmRtcBytes(unixSeconds));
     }
-    /**
-     * Enables Nordic Secure DFU service advertisement after the next disconnect.
-     *
-     * This sends ASM DFU_MODE property write (equivalent to [0x26, 0x00, 0x00]).
-     * It does not immediately reboot into bootloader mode.
-     */
-    async enableDfuServiceOnNextDisconnect() {
-        await this.writeProperty(ASM_PROPERTY.DFU_MODE, []);
-    }
-    /**
-     * @deprecated Use enableDfuServiceOnNextDisconnect() for clearer semantics.
-     */
     async enterDfuMode() {
-        await this.enableDfuServiceOnNextDisconnect();
-    }
-    /**
-     * Uses Nordic buttonless DFU characteristic to reboot the connected device into bootloader mode.
-     *
-     * Requirements:
-     * - BLE transport must be connected
-     * - Nordic Secure DFU service and buttonless characteristic must be present
-     */
-    async rebootToDfuBootloader(opts = {}) {
-        if (this._transportKind !== 'ble' || !this.device?.gatt?.connected || !this.server) {
-            throw new Error('rebootToDfuBootloader: requires an active BLE connection');
-        }
-        const waitForDisconnect = opts.waitForDisconnect ?? true;
-        const disconnectAfterCommand = opts.disconnectAfterCommand ?? true;
-        const timeoutMs = Math.max(500, Math.trunc(opts.timeoutMs ?? 8000));
-        const dfuService = await this.server.getPrimaryService(NORDIC_DFU_SERVICE);
-        let buttonlessChar;
-        try {
-            buttonlessChar = await dfuService.getCharacteristic(NORDIC_DFU_BUTTONLESS_CHAR);
-        }
-        catch {
-            const hasControl = await dfuService
-                .getCharacteristic(NORDIC_DFU_CONTROL_CHAR)
-                .then(() => true)
-                .catch(() => false);
-            const hasPacket = await dfuService
-                .getCharacteristic(NORDIC_DFU_PACKET_CHAR)
-                .then(() => true)
-                .catch(() => false);
-            if (hasControl && hasPacket) {
-                throw new Error('Device already appears to be in DFU bootloader mode');
-            }
-            throw new Error('Nordic buttonless DFU characteristic not found');
-        }
-        if (buttonlessChar.properties.notify || buttonlessChar.properties.indicate) {
-            try {
-                await buttonlessChar.startNotifications();
-            }
-            catch {
-                /* some stacks may still allow write without notifications */
-            }
-        }
-        const device = this.device;
-        let disconnectPromise = null;
-        if (waitForDisconnect) {
-            let offDisconnect = null;
-            disconnectPromise = new Promise((resolve, reject) => {
-                const timer = setTimeout(() => {
-                    if (offDisconnect)
-                        offDisconnect();
-                    reject(new Error(`Timed out waiting for reboot/disconnect (${timeoutMs} ms)`));
-                }, timeoutMs);
-                const onDisconnect = () => {
-                    clearTimeout(timer);
-                    if (offDisconnect)
-                        offDisconnect();
-                    resolve();
-                };
-                device.addEventListener('gattserverdisconnected', onDisconnect, { once: true });
-                offDisconnect = () => {
-                    try {
-                        device.removeEventListener('gattserverdisconnected', onDisconnect);
-                    }
-                    catch {
-                        /* ignore */
-                    }
-                };
-            });
-        }
-        const cmd = new Uint8Array([0x01]);
-        await buttonlessChar.writeValue(cmd);
-        if (disconnectAfterCommand && device.gatt?.connected) {
-            try {
-                device.gatt.disconnect();
-            }
-            catch {
-                /* ignore */
-            }
-        }
-        if (waitForDisconnect) {
-            if (!device.gatt?.connected)
-                return;
-            if (disconnectPromise)
-                await disconnectPromise;
-        }
+        await this.writeProperty(ASM_PROPERTY.DFU_MODE, []);
     }
     async runTestMode(testPayload) {
         const payload = normalizeBytePayload(testPayload instanceof Uint8Array ? testPayload : new Uint8Array(testPayload));
@@ -3502,146 +4879,6 @@ class VerisenseBleDevice extends BaseShimmerClient {
             (hwInternal >> 8) & 0xff,
         ]);
         await this.runTestMode(payload);
-    }
-    _clearHardwareTestReportCapture(error, text) {
-        const cap = this._testReportCapture;
-        if (!cap)
-            return;
-        this._testReportCapture = null;
-        if (cap.timeout) {
-            clearTimeout(cap.timeout);
-            cap.timeout = null;
-        }
-        if (error) {
-            cap.reject?.(error);
-            return;
-        }
-        cap.resolve?.(text ?? '');
-    }
-    _captureHardwareTestReportChunk(chunk) {
-        const cap = this._testReportCapture;
-        if (!cap || !chunk?.length)
-            return;
-        const decoded = this._testReportDecoder.decode(chunk, { stream: true });
-        if (!decoded)
-            return;
-        cap.aggregateText += decoded;
-        if (!cap.started) {
-            const firstMarker = cap.aggregateText.indexOf(cap.marker);
-            if (firstMarker >= 0) {
-                cap.started = true;
-                if (firstMarker > 0) {
-                    cap.aggregateText = cap.aggregateText.slice(firstMarker);
-                    cap.emittedChars = 0;
-                }
-            }
-            else {
-                // Some firmware builds vary the star count around TEST START. Fall back
-                // to a fuzzy marker so we can still stream the report to the UI.
-                const hint = VerisenseBleDevice.TEST_REPORT_MARKER_HINT;
-                const hintIdx = cap.aggregateText.indexOf(hint);
-                if (hintIdx < 0) {
-                    const keep = Math.max(cap.marker.length * 2, 2048);
-                    if (cap.aggregateText.length > keep) {
-                        cap.aggregateText = cap.aggregateText.slice(-keep);
-                    }
-                    return;
-                }
-                const bannerStart = cap.aggregateText.lastIndexOf('//', hintIdx);
-                let lineStart = bannerStart >= 0 ? bannerStart : cap.aggregateText.lastIndexOf('\n', hintIdx);
-                lineStart = lineStart >= 0 ? lineStart + (bannerStart >= 0 ? 0 : 1) : 0;
-                cap.started = true;
-                if (lineStart > 0) {
-                    cap.aggregateText = cap.aggregateText.slice(lineStart);
-                    cap.emittedChars = 0;
-                }
-            }
-        }
-        const nextChunk = cap.aggregateText.slice(cap.emittedChars);
-        if (nextChunk) {
-            cap.onChunk?.(nextChunk, cap.aggregateText);
-            this.emit('hardwareTestReportChunk', {
-                chunkText: nextChunk,
-                aggregateText: cap.aggregateText,
-            });
-            cap.emittedChars = cap.aggregateText.length;
-        }
-        const endMarker = cap.aggregateText.indexOf(cap.marker, cap.marker.length);
-        let full = null;
-        if (endMarker >= 0) {
-            full = cap.aggregateText.slice(0, endMarker + cap.marker.length);
-        }
-        else {
-            const hint = VerisenseBleDevice.TEST_REPORT_MARKER_HINT;
-            const firstHint = cap.aggregateText.indexOf(hint);
-            if (firstHint >= 0) {
-                const secondHint = cap.aggregateText.indexOf(hint, firstHint + hint.length);
-                if (secondHint >= 0) {
-                    const endOfSecondLine = cap.aggregateText.indexOf('\n', secondHint);
-                    full =
-                        endOfSecondLine >= 0
-                            ? cap.aggregateText.slice(0, endOfSecondLine + 1)
-                            : cap.aggregateText;
-                }
-            }
-        }
-        if (full !== null) {
-            this.emit('hardwareTestReportComplete', { text: full });
-            this._clearHardwareTestReportCapture(null, full);
-            return;
-        }
-        if (cap.aggregateText.length > cap.maxChars) {
-            cap.aggregateText = cap.aggregateText.slice(-cap.maxChars);
-            cap.emittedChars = Math.min(cap.emittedChars, cap.aggregateText.length);
-        }
-    }
-    /**
-     * Runs TEST_REPORT (0xFE) and captures the rolling text report.
-     *
-     * The firmware ACKs the command first, then emits plain-text lines over the link.
-     * Capture starts on the first delimiter and completes on the second delimiter.
-     */
-    async runHardwareTestReport(hwMajor, hwMinor = 0, hwInternal = 0, opts = {}) {
-        const timeoutMs = Math.max(1000, Math.trunc(opts.timeoutMs ?? 120000));
-        const marker = typeof opts.marker === 'string' && opts.marker.length > 0
-            ? opts.marker
-            : VerisenseBleDevice.TEST_REPORT_DELIMITER;
-        const maxChars = Math.max(4096, Math.trunc(opts.maxChars ?? 2 * 1024 * 1024));
-        this._clearHardwareTestReportCapture(new Error('Hardware test report capture was replaced'), null);
-        this._testReportDecoder.decode();
-        const reportPromise = new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                this._clearHardwareTestReportCapture(new Error(`Hardware test report timeout after ${timeoutMs} ms`), null);
-            }, timeoutMs);
-            this._testReportCapture = {
-                marker,
-                maxChars,
-                started: false,
-                aggregateText: '',
-                emittedChars: 0,
-                resolve,
-                reject,
-                onChunk: opts.onChunk ?? null,
-                timeout,
-            };
-        });
-        try {
-            const factoryTestType = Math.max(0, Math.min(255, Math.trunc(opts.factoryTestType ?? 0)));
-            const payload = new Uint8Array([
-                VerisenseBleDevice.TEST_REPORT_MODE_ID & 0xff,
-                hwMajor & 0xff,
-                hwMinor & 0xff,
-                hwInternal & 0xff,
-                (hwInternal >> 8) & 0xff,
-                factoryTestType,
-            ]);
-            await this.runTestMode(payload);
-        }
-        catch (error) {
-            this._clearHardwareTestReportCapture(error, null);
-            throw error;
-        }
-        return reportPromise;
     }
     _buildDebugPayload(debugId, args = []) {
         const argBytes = args instanceof Uint8Array ? args : new Uint8Array(args);
@@ -3706,45 +4943,45 @@ class VerisenseBleDevice extends BaseShimmerClient {
             const msg = e instanceof Error ? e.message : String(e);
             const isDebugNack = /NACK command=0x(?:50|60|70) property=0x9/i.test(msg);
             const isDebugAckPropertyZero = /Unexpected response property 0x0 \(expected 0x9\)/i.test(msg);
-            if (!isDebugNack && !isDebugAckPropertyZero)
-                throw e;
-            const rsp = await this._requestByCommand(ASM_COMMAND.READ, ASM_PROPERTY.DEBUG_COMMAND, payload, timeoutMs);
-            return { payload: rsp.payload };
+            if (isDebugNack || isDebugAckPropertyZero) {
+                return this._waitForDebugResponse(timeoutMs);
+            }
+            throw e;
         }
     }
     async sendDebugCommand(debugId, args = [], timeoutMs = 3000) {
         const rsp = await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildDebugPayload(debugId, args), timeoutMs);
         return { payload: rsp.payload };
     }
-    async readFlashLookupTable(_index = 0, timeoutMs = 12000) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.FLASH_LOOKUP_TABLE_READ, [], timeoutMs);
+    async readFlashLookupTable(index = 0, timeoutMs = 12000) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.FLASH_LOOKUP_TABLE_READ, this._debugIndexArgs(index), timeoutMs);
     }
-    async readRealWorldClockScheduler(_index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.RWC_SCHEDULER_READ);
+    async readRealWorldClockScheduler(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.RWC_SCHEDULER_READ, this._debugIndexArgs(index));
     }
     async readRealWorldClockSchedulerParsed(index = 0) {
         const { payload } = await this.readRealWorldClockScheduler(index);
         return parseSchedulerDebugPayload(payload);
     }
-    async loadTestLookupTable(_index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.LOAD_TEST_LOOKUP_TABLE);
+    async loadTestLookupTable(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.LOAD_TEST_LOOKUP_TABLE, this._debugIndexArgs(index));
     }
-    async checkPayloadCrcErrors(_index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.CHECK_PAYLOAD_CRC_ERRORS);
+    async checkPayloadCrcErrors(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.CHECK_PAYLOAD_CRC_ERRORS, this._debugIndexArgs(index));
     }
     async checkPayloadCrcErrorsParsed(index = 0) {
         const { payload } = await this.checkPayloadCrcErrors(index);
         return parsePayloadCrcErrorBankIndexes(payload);
     }
-    async readEventLog(_index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_EVENT_LOG);
+    async readEventLog(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_EVENT_LOG, this._debugIndexArgs(index));
     }
     async readEventLogParsed(index = 0) {
         const { payload } = await this.readEventLog(index);
         return parseEventLogPayload(payload);
     }
-    async readRecordBufferDetails(_index = 0) {
-        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_RECORD_BUFFER_DETAILS);
+    async readRecordBufferDetails(index = 0) {
+        return this.readDebugCommand(DEBUG_COMMAND_ID.READ_RECORD_BUFFER_DETAILS, this._debugIndexArgs(index));
     }
     async readRecordBufferDetailsParsed(index = 0) {
         const { payload } = await this.readRecordBufferDetails(index);
@@ -3823,6 +5060,11 @@ class VerisenseBleDevice extends BaseShimmerClient {
             throw new Error('Invalid production config returned from device');
         this.productionConfig = prod;
         const parsed = parseProductionConfigPayload(prod);
+        if (typeof parsed.revHwMajor === 'number' && typeof parsed.revHwMinor === 'number') {
+            const hwIdentifier = parsed.revHwMajor === 62 ? 'VERISENSE_GSR_PLUS' : 'VERISENSE_PULSE_PLUS';
+            this.adc.setHardwareIdentifier(hwIdentifier);
+            this.adc.setHardwareRevision(parsed.revHwMajor, parsed.revHwMinor, typeof parsed.revHwInternal === 'number' ? parsed.revHwInternal : 0);
+        }
         this.emit('productionConfig', parsed);
         return parsed;
     }
@@ -3891,9 +5133,10 @@ class VerisenseBleDevice extends BaseShimmerClient {
         if (s.timer)
             clearInterval(s.timer);
         const bytesWritten = s.bytesWritten;
+        const payloadIndex = s.lastPayloadIndex;
         this._sync = null;
         this._mode = 'idle';
-        s.resolve({ ok: true, bytesWritten });
+        s.resolve({ ok: true, bytesWritten, payloadIndex });
     }
     async _handleLoggedPayload(payloadU8) {
         this._syncPayloadCount++;
@@ -3914,6 +5157,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
             s.onProgress?.({ payloadIndex, bytesWritten: s.bytesWritten, crcOk: false });
             return;
         }
+        s.lastPayloadIndex = payloadIndex;
         if (s.writable) {
             await s.writable.write(toArrayBuffer(payloadU8));
         }
@@ -3962,6 +5206,10 @@ class VerisenseBleDevice extends BaseShimmerClient {
         return property === 0 || (property >= ASM_PROPERTY.STATUS1 && property <= ASM_PROPERTY.STATUS2);
     }
     _isPlausibleFrameStart(hdr, len) {
+        // Logged sync frames can be large and should be length-gated like the working single-file implementation.
+        if (this._mode === 'logged') {
+            return len <= VerisenseBleDevice.MAX_FRAME_PAYLOAD_LEN;
+        }
         if (!this._isPlausibleHeaderByte(hdr))
             return false;
         // Debug responses may carry large blobs (for example flash lookup tables),
@@ -4011,9 +5259,6 @@ class VerisenseBleDevice extends BaseShimmerClient {
     _feedStreamBytes(chunk) {
         if (this._mode === 'logged' && this._sync)
             this._sync.lastRxAt = Date.now();
-        if (this._testReportCapture) {
-            this._captureHardwareTestReportChunk(chunk);
-        }
         this._appendStreamBuf(chunk);
         for (;;) {
             if (this._rxStreamBuf.length < 3)
@@ -4143,17 +5388,12 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this.emit('data', packet);
     }
 }
-VerisenseBleDevice.MAX_FRAME_PAYLOAD_LEN = 4096;
+VerisenseBleDevice.MAX_FRAME_PAYLOAD_LEN = 40000;
 VerisenseBleDevice.MAX_DEBUG_FRAME_PAYLOAD_LEN = 0xffff;
-VerisenseBleDevice.TEST_REPORT_MODE_ID = 0xfe;
-VerisenseBleDevice.TEST_REPORT_DELIMITER = '//**************************** TEST START ************************************\r\n';
-VerisenseBleDevice.TEST_REPORT_MARKER_HINT = 'TEST START';
 // Static NUS UUIDs
 VerisenseBleDevice.NUS_SERVICE = NUS_SERVICE;
 VerisenseBleDevice.NUS_TX = NUS_TX;
 VerisenseBleDevice.NUS_RX = NUS_RX;
-VerisenseBleDevice.NORDIC_DFU_SERVICE = NORDIC_DFU_SERVICE;
-VerisenseBleDevice.NORDIC_DFU_BUTTONLESS_CHAR = NORDIC_DFU_BUTTONLESS_CHAR;
 
-export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, FACTORY_TEST, GSR_NAME, NORDIC_DFU_BUTTONLESS_CHAR, NORDIC_DFU_CONTROL_CHAR, NORDIC_DFU_PACKET_CHAR, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
+export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseHardwareFriendlyName, getVerisenseStreamingBatteryVoltageMultiplier, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, setVerisenseOperationalBitRange, unixSecondsToAsmRtcBytes, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

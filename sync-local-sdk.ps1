@@ -6,8 +6,8 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $vendorTargets = @(
-    Join-Path $repoRoot "shimmer-extension\vendor",
-    Join-Path $repoRoot "Verisense\vendor"
+    (Join-Path $repoRoot "shimmer-extension\vendor"),
+    (Join-Path $repoRoot "Verisense\vendor")
 )
 $sdkSourceConfigPath = Join-Path $repoRoot "sdk-source.json"
 

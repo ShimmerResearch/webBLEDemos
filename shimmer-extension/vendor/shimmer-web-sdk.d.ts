@@ -617,14 +617,6 @@ declare const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 declare const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 /** NUS RX characteristic UUID (host subscribes to notifications from this). */
 declare const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-/** Nordic Secure DFU primary service UUID (0xFE59). */
-declare const NORDIC_DFU_SERVICE = "0000fe59-0000-1000-8000-00805f9b34fb";
-/** Nordic DFU control-point characteristic UUID. */
-declare const NORDIC_DFU_CONTROL_CHAR = "8ec90001-f315-4f60-9fb8-838830daea50";
-/** Nordic DFU packet characteristic UUID. */
-declare const NORDIC_DFU_PACKET_CHAR = "8ec90002-f315-4f60-9fb8-838830daea50";
-/** Nordic buttonless DFU characteristic UUID (write 0x01 to reboot to bootloader). */
-declare const NORDIC_DFU_BUTTONLESS_CHAR = "8ec90003-f315-4f60-9fb8-838830daea50";
 /** Upper-nibble command classes used in protocol headers. */
 declare const ASM_COMMAND: Readonly<{
     readonly READ: 16;
@@ -673,7 +665,6 @@ declare const TEST_MODE_ID: Readonly<{
     readonly BIOZ_MAX30002: 11;
     readonly ACCEL2_GYRO_LSM6DSV: 12;
     readonly MAG_LIS2MDL: 13;
-    readonly TEST_REPORT: 254;
     readonly ALL_TESTS: 255;
 }>;
 type TestModeId = (typeof TEST_MODE_ID)[keyof typeof TEST_MODE_ID];
@@ -762,17 +753,6 @@ declare const OP_IDX: Readonly<{
     readonly PROX_AGC_MODE: 71;
 }>;
 type OpIdx = keyof typeof OP_IDX;
-/**
- * Factory test type selection byte sent as the last byte of a TEST_REPORT (0xFE) payload.
- * Mirrors the firmware `factory_test_t` enum.
- */
-declare const FACTORY_TEST: Readonly<{
-    readonly MAIN: 0;
-    readonly LEDS: 1;
-    readonly ICS: 2;
-    readonly LED_STATES: 3;
-}>;
-type FactoryTestType = (typeof FACTORY_TEST)[keyof typeof FACTORY_TEST];
 
 interface VerisenseMessage {
     header: number;
@@ -797,6 +777,19 @@ declare function isNackCommand(command: AsmCommand): boolean;
 /** Convert a pending-events payload (property IDs) into a typed array. */
 declare function parsePendingEvents(payload: Uint8Array): AsmProperty[];
 
+/** Format a single byte as an uppercase `0xNN` string. */
+declare function formatByteAsHex(v: number): string;
+/** Format bytes as `[0xAA, 0xBB, ...]`. */
+declare function formatByteArrayAsHex(bytes: ArrayLike<number> | ArrayBuffer | null | undefined): string;
+/** Parse text containing hex bytes like `0x5A, 00 12` into a Uint8Array. */
+declare function parseHexByteString(text: string): Uint8Array;
+interface PendingEventPropertyLabel {
+    value: number;
+    hex: string;
+    property: string;
+}
+/** Label pending-event property values with both enum name and hex representation. */
+declare function formatPendingEventProperties(pendingProps: ArrayLike<number> | null | undefined): PendingEventPropertyLabel[];
 /**
  * Compute CRC-16/CCITT-FALSE over `bytes`.
  *
@@ -831,6 +824,12 @@ interface ProductionConfig {
     firmware: string;
     asmid: string;
     configHeader: number;
+    revHwMajor?: number;
+    revHwMinor?: number;
+    revHwInternal?: number;
+    revFwMajor?: number;
+    revFwMinor?: number;
+    revFwInternal?: number;
 }
 interface ProductionConfigBuildOptions {
     manufacturingOrderNumberHex: string;
@@ -891,6 +890,15 @@ interface VerisenseStatusPayload {
     statusFlags: VerisenseStatusFlags | null;
     batteryFallCounter: number | null;
 }
+interface VerisenseUnixAndHumanTimestamp {
+    unix: number;
+    human: string;
+}
+interface VerisenseStatusPayloadForLog extends VerisenseStatusPayload {
+    statusTimestamp: VerisenseUnixAndHumanTimestamp;
+    lastOkTransfer: VerisenseUnixAndHumanTimestamp;
+    lastFailTransfer: VerisenseUnixAndHumanTimestamp;
+}
 interface VerisenseSchedulerDebugPayload {
     currentTimeUnixSeconds: number;
     bleControlCounter: 'data-transfer' | 'status1' | 'rtc-sync' | 'status2' | 'never' | 'unknown';
@@ -916,6 +924,23 @@ interface VerisenseSchedulerDebugPayload {
     stepCounterResetUnixSeconds?: number;
     sensorInactivityUnixSeconds?: number;
 }
+interface VerisenseSchedulerDebugPayloadForLog extends VerisenseSchedulerDebugPayload {
+    currentTime: VerisenseUnixAndHumanTimestamp;
+    pendingDataTransfer: VerisenseUnixAndHumanTimestamp;
+    pendingStatus1: VerisenseUnixAndHumanTimestamp;
+    pendingRtcSync: VerisenseUnixAndHumanTimestamp;
+    pendingRetry: VerisenseUnixAndHumanTimestamp;
+    pendingStatus2?: VerisenseUnixAndHumanTimestamp;
+    ppgMeasurement?: VerisenseUnixAndHumanTimestamp;
+    stepCounterReset?: VerisenseUnixAndHumanTimestamp;
+    sensorInactivity?: VerisenseUnixAndHumanTimestamp;
+    adaptiveScheduler?: VerisenseSchedulerDebugPayload['adaptiveScheduler'] & {
+        nextTime: VerisenseUnixAndHumanTimestamp;
+    };
+    ltfRetry?: VerisenseSchedulerDebugPayload['ltfRetry'] & {
+        nextTime: VerisenseUnixAndHumanTimestamp;
+    };
+}
 interface VerisenseEventLogEntry {
     index: number;
     eventId: number;
@@ -923,6 +948,12 @@ interface VerisenseEventLogEntry {
     timestampUnixSeconds: number | null;
     batteryMilliVolts: number | null;
 }
+/** Format unix seconds as raw + human-readable local datetime for logging. */
+declare function formatVerisenseUnixAndHuman(unixSeconds: number): VerisenseUnixAndHumanTimestamp;
+/** Convert parsed status payload into an object with human-readable timestamps for logs. */
+declare function formatStatusPayloadForLog(status: VerisenseStatusPayload): VerisenseStatusPayloadForLog;
+/** Convert parsed scheduler payload into an object with human-readable timestamps for logs. */
+declare function formatSchedulerPayloadForLog(parsed: VerisenseSchedulerDebugPayload): VerisenseSchedulerDebugPayloadForLog;
 interface VerisenseRecordBufferDetails {
     bufferIndex: number;
     bufferState: number;
@@ -1014,6 +1045,341 @@ declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
     shouldSplit: boolean;
     reasons: ParsedSplitReason[];
 };
+
+type VerisenseHardwareFriendlyName = 'IMU' | 'GSR+' | 'SDK' | 'Pulse+';
+declare const VERISENSE_HW_MAJOR_FRIENDLY_NAMES: Readonly<Record<number, VerisenseHardwareFriendlyName>>;
+declare function getVerisenseHardwareFriendlyName(revHwMajor: number): VerisenseHardwareFriendlyName | null;
+declare function formatVerisenseHardwareRevision(revHwMajor: number, revHwMinor: number, revHwInternal?: number, opts?: {
+    prefix?: string;
+    includeFriendlyName?: boolean;
+}): string;
+/**
+ * Battery voltage scaling for streamed ADC battery samples.
+ * Status responses already contain firmware-scaled battery values and should not use this helper.
+ */
+declare function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor: number, revHwMinor: number): number;
+
+type VerisenseOperationalFieldKind = 'bit' | 'u8' | 'u16' | 'u32' | 'inactiveResume' | 'inactiveMinutes';
+type VerisenseOperationalFieldOption = readonly [number, string];
+interface VerisenseOperationalFieldDefinition {
+    readonly key: string;
+    readonly label: string;
+    readonly desc: string;
+    readonly kind: VerisenseOperationalFieldKind;
+    readonly index: number;
+    readonly shift?: number;
+    readonly width?: number;
+    readonly min?: number;
+    readonly max?: number;
+    readonly options?: readonly VerisenseOperationalFieldOption[];
+}
+declare const VERISENSE_OPERATIONAL_FIELD_SCHEMA: ({
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 1;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 2;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 3;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 4;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 5;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 6;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 7;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 8;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 8;
+    shift: number;
+    width: number;
+    min: number;
+    max: number;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 11;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 11;
+    shift: number;
+    width: number;
+    min: number;
+    max: number;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 12;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 13;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 14;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 15;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 16;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 17;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 17;
+    shift: number;
+    width: number;
+    min: number;
+    max: number;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 29;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 31;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 50;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 51;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 59;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 60;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: number;
+    min: number;
+    max: number;
+    shift?: undefined;
+    width?: undefined;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 71;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+    min?: undefined;
+    max?: undefined;
+})[];
+declare const VERISENSE_OP_CONFIG_BYTE_SIZE = 72;
+type VerisenseOperationalField = VerisenseOperationalFieldDefinition;
+declare function createBlankVerisenseOperationalConfig(byteSize?: number): Uint8Array;
+declare function readVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField): number;
+declare function writeVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField, rawValue: unknown): void;
+declare function setVerisenseOperationalBitRange(op: Uint8Array, index: number, shift: number, width: number, rawValue: unknown): void;
+interface VerisenseOperationalSensorEnableField {
+    readonly key: string;
+    readonly index: number;
+    readonly shift: number;
+}
+declare const VERISENSE_SENSOR_ENABLE_FIELDS: readonly VerisenseOperationalSensorEnableField[];
+interface VerisenseOperationalFieldGroupDefinition {
+    readonly id: string;
+    readonly title: string;
+    readonly openByDefault: boolean;
+    readonly keys: readonly string[];
+}
+declare const VERISENSE_OPERATIONAL_FIELD_GROUPS: readonly VerisenseOperationalFieldGroupDefinition[];
+declare const VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID = "gen";
 
 /**
  * Abstract base class for all Verisense sensor decoders.
@@ -1124,12 +1490,17 @@ declare class SensorADC extends SensorBase {
     /** GSR range 0-3 (fixed) or 4 (auto-range). */
     gsrRangeSetting: number;
     hardwareIdentifier: HardwareIdentifier;
+    hwRevisionMajor: number | null;
+    hwRevisionMinor: number | null;
+    hwRevisionInternal: number | null;
     gsrRateSettingRaw: number;
     gsrRangeSettingRaw: number;
     gsrOversamplingRateSettingRaw: number;
     constructor();
     setHardwareIdentifier(idStr: HardwareIdentifier): void;
+    setHardwareRevision(revHwMajor: number, revHwMinor: number, revHwInternal?: number): void;
     setGsrRangeSetting(v: number): void;
+    private getBatteryVoltageMultiplier;
     setEnabled(arg1: boolean | {
         gsr?: boolean;
         batt?: boolean;
@@ -1280,6 +1651,7 @@ interface TransferLoggedDataOptions {
 interface TransferLoggedDataResult {
     ok: boolean;
     bytesWritten: number;
+    payloadIndex?: number;
     blob?: Blob;
 }
 interface VerisenseClientOptions {
@@ -1293,14 +1665,6 @@ interface VerisenseCommandResponse {
     command: AsmCommand;
     property: AsmProperty;
     payload: Uint8Array;
-}
-interface HardwareTestReportOptions {
-    timeoutMs?: number;
-    marker?: string;
-    maxChars?: number;
-    /** Factory test type byte (factory_test_t). Appended after the HW revision bytes in the TX payload. Defaults to 0 (MAIN). */
-    factoryTestType?: number;
-    onChunk?: ((chunkText: string, aggregateText: string) => void) | null;
 }
 
 /**
@@ -1328,14 +1692,9 @@ interface HardwareTestReportOptions {
 declare class VerisenseBleDevice extends BaseShimmerClient {
     private static readonly MAX_FRAME_PAYLOAD_LEN;
     private static readonly MAX_DEBUG_FRAME_PAYLOAD_LEN;
-    static readonly TEST_REPORT_MODE_ID = 254;
-    static readonly TEST_REPORT_DELIMITER = "//**************************** TEST START ************************************\r\n";
-    static readonly TEST_REPORT_MARKER_HINT = "TEST START";
     static readonly NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
     static readonly NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-    static readonly NORDIC_DFU_SERVICE = "0000fe59-0000-1000-8000-00805f9b34fb";
-    static readonly NORDIC_DFU_BUTTONLESS_CHAR = "8ec90003-f315-4f60-9fb8-838830daea50";
     private readonly _evMap;
     on<T = unknown>(ev: string, fn: (data: T) => void): () => void;
     off(ev: string, fn: (data: unknown) => void): void;
@@ -1356,8 +1715,6 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _pending;
     private _loggedChain;
     private _sync;
-    private _testReportCapture;
-    private readonly _testReportDecoder;
     readonly stripStreamCrc: boolean;
     readonly verifyStreamCrc: boolean;
     readonly hardwareIdentifier: string;
@@ -1434,40 +1791,9 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     writeOperationalConfig(bytes: Uint8Array | number[]): Promise<void>;
     writeTime(rtc7: Uint8Array | number[]): Promise<void>;
     writeTimeUnixSeconds(unixSeconds: number): Promise<void>;
-    /**
-     * Enables Nordic Secure DFU service advertisement after the next disconnect.
-     *
-     * This sends ASM DFU_MODE property write (equivalent to [0x26, 0x00, 0x00]).
-     * It does not immediately reboot into bootloader mode.
-     */
-    enableDfuServiceOnNextDisconnect(): Promise<void>;
-    /**
-     * @deprecated Use enableDfuServiceOnNextDisconnect() for clearer semantics.
-     */
     enterDfuMode(): Promise<void>;
-    /**
-     * Uses Nordic buttonless DFU characteristic to reboot the connected device into bootloader mode.
-     *
-     * Requirements:
-     * - BLE transport must be connected
-     * - Nordic Secure DFU service and buttonless characteristic must be present
-     */
-    rebootToDfuBootloader(opts?: {
-        waitForDisconnect?: boolean;
-        disconnectAfterCommand?: boolean;
-        timeoutMs?: number;
-    }): Promise<void>;
     runTestMode(testPayload: Uint8Array | number[]): Promise<void>;
     runHardwareTest(testId: TestModeId, hwMajor: number, hwMinor?: number, hwInternal?: number): Promise<void>;
-    private _clearHardwareTestReportCapture;
-    private _captureHardwareTestReportChunk;
-    /**
-     * Runs TEST_REPORT (0xFE) and captures the rolling text report.
-     *
-     * The firmware ACKs the command first, then emits plain-text lines over the link.
-     * Capture starts on the first delimiter and completes on the second delimiter.
-     */
-    runHardwareTestReport(hwMajor: number, hwMinor?: number, hwInternal?: number, opts?: HardwareTestReportOptions): Promise<string>;
     private _buildDebugPayload;
     private _debugIndexArgs;
     private _waitForDebugResponse;
@@ -1477,25 +1803,25 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     sendDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[], timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
-    readFlashLookupTable(_index?: number, timeoutMs?: number): Promise<{
+    readFlashLookupTable(index?: number, timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
-    readRealWorldClockScheduler(_index?: number): Promise<{
+    readRealWorldClockScheduler(index?: number): Promise<{
         payload: Uint8Array;
     }>;
     readRealWorldClockSchedulerParsed(index?: number): Promise<VerisenseSchedulerDebugPayload>;
-    loadTestLookupTable(_index?: number): Promise<{
+    loadTestLookupTable(index?: number): Promise<{
         payload: Uint8Array;
     }>;
-    checkPayloadCrcErrors(_index?: number): Promise<{
+    checkPayloadCrcErrors(index?: number): Promise<{
         payload: Uint8Array;
     }>;
     checkPayloadCrcErrorsParsed(index?: number): Promise<number[]>;
-    readEventLog(_index?: number): Promise<{
+    readEventLog(index?: number): Promise<{
         payload: Uint8Array;
     }>;
     readEventLogParsed(index?: number): Promise<VerisenseEventLogEntry[]>;
-    readRecordBufferDetails(_index?: number): Promise<{
+    readRecordBufferDetails(index?: number): Promise<{
         payload: Uint8Array;
     }>;
     readRecordBufferDetailsParsed(index?: number): Promise<VerisenseRecordBufferDetails[]>;
@@ -1532,5 +1858,5 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _handleStreamingPayload;
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, FACTORY_TEST, GSR_NAME, NORDIC_DFU_BUTTONLESS_CHAR, NORDIC_DFU_CONTROL_CHAR, NORDIC_DFU_PACKET_CHAR, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, evaluateParsedFileSplit, getFirstPayloadIndex, getOversamplingRatioADS1292R, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, unixSecondsToAsmRtcBytes };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FactoryTestType, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions, VerisenseCommandResponse, VerisenseEventLogEntry, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseStatusPayload };
+export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseHardwareFriendlyName, getVerisenseStreamingBatteryVoltageMultiplier, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, setVerisenseOperationalBitRange, unixSecondsToAsmRtcBytes, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions, VerisenseCommandResponse, VerisenseEventLogEntry, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseUnixAndHumanTimestamp };
