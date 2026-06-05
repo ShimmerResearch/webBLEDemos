@@ -226,6 +226,106 @@
       }
     };
 
+    // For Upload CSV
+    const csvFileInput = document.createElement('input');
+    csvFileInput.type = 'file';
+    csvFileInput.accept = '.csv,text/csv';
+    csvFileInput.style.display = 'none';
+    document.body.appendChild(csvFileInput);
+
+    const apiBaseUrlInput = document.getElementById('apiBaseUrlInput');
+    const API_BASE_URL_KEY = 'shimmerApiBaseUrl';
+    apiBaseUrlInput.value = localStorage.getItem(API_BASE_URL_KEY) || '';
+
+    function getApiBaseUrl() {
+      return apiBaseUrlInput.value.trim().replace(/\/$/, '');
+    }
+
+    async function uploadCsvFile(file) {
+      if (!file) return;
+
+      try {
+        document.getElementById('status').textContent = 'Getting upload URL...';
+        const apiBaseUrl = getApiBaseUrl();
+        if (!apiBaseUrl) {
+          throw new Error('Enter the Shimmer API base URL first.');
+        }
+        localStorage.setItem(API_BASE_URL_KEY, apiBaseUrl);
+        
+        const customPath = document.getElementById('s3FilePathInput')?.value.trim();
+        let s3FilePath;
+        if (customPath) {
+          s3FilePath = customPath.endsWith('.csv') ? customPath : `${customPath}/${file.name}`;
+        } else {
+          s3FilePath = file.name || `shimmer_${Date.now()}.csv`;
+        }
+
+        const response = await fetch(`${apiBaseUrl}/api/trial/s3/presigned_url_upload`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ S3FilePath: s3FilePath })
+        });
+
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+          let errText = data?.Error || data?.error;
+          if (!errText && data?.errors && typeof data.errors === 'object') {
+            errText = Object.entries(data.errors)
+              .map(([k, v]) => `${k}: ${(Array.isArray(v) ? v.join(', ') : v)}`)
+              .join(' | ');
+          }
+          if (!errText && data?.title) errText = data.title;
+          if (!errText) errText = `HTTP ${response.status}`;
+          throw new Error(`Failed to get pre-signed URL: ${errText}`);
+        }
+
+        console.log('Presigned response:', data);
+        const isSuccess = data?.IsSuccess ?? data?.isSuccess;
+        const entity = data?.Entity ?? data?.entity;
+        const uploadUrl = entity?.UploadUrl ?? entity?.uploadUrl;
+
+        if (isSuccess === false) {
+          throw new Error(data?.Error || data?.error || 'API returned failure');
+        }
+        if (!uploadUrl) {
+          throw new Error('No upload URL returned from API');
+        }
+
+        document.getElementById('status').textContent = 'Uploading...';
+
+        const upload = await fetch(uploadUrl, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': file.type || 'text/csv'
+          },
+          body: file
+        });
+
+        if (!upload.ok) {
+          throw new Error('Upload failed');
+        }
+
+        document.getElementById('status').textContent = 'Upload success';
+      } catch (err) {
+        console.error(err);
+        document.getElementById('status').textContent = 'Upload failed';
+        alert(err.message);
+      }
+    }
+
+    csvFileInput.onchange = async () => {
+      const [file] = csvFileInput.files || [];
+      csvFileInput.value = '';
+      if (!file) return;
+      await uploadCsvFile(file);
+    };
+
+    document.getElementById('uploadBtn').onclick = () => {
+      csvFileInput.click();
+    };
+
     // -------- Build signal list --------
     
 // -------- Build signal list (name + kind) --------
@@ -397,6 +497,11 @@ if (!isStreaming || !chart) return;
       <button id="exgTestBtn" disabled>EXG Test (16‑bit)</button>
       <button id="emg16Btn" disabled>Enable EMG 16‑bit</button>
       <button id="ecg16Btn" disabled>Enable ECG 16‑bit</button>
+      
+      <!-- Upload File -->      
+      <input id="apiBaseUrlInput" type="text" placeholder="ShimmerAPI Base URL (e.g, http://localhost:5002)" style="margin-left:10px; width:320px;">      
+      <input id="s3FilePathInput" type="text" placeholder="S3 FilePath (e.g, 'Test-Folder')" style="margin-left:10px; width:280px;">      
+      <button id="uploadBtn">Upload CSV File</button>
 
       <!-- Expansion power checkbox -->
       <label class="exp"><input id="expPowerChk" type="checkbox"> Expansion Power</label>
