@@ -244,6 +244,12 @@
     async function uploadCsvFile(file) {
       if (!file) return;
 
+      const maxUploadBytes = 5 * 1024 * 1024;
+      if (file.size > maxUploadBytes) {
+        document.getElementById('status').textContent = 'File too large to upload! (>5MB)';
+        return;
+      }
+
       try {
         document.getElementById('status').textContent = 'Getting upload URL...';
         const apiBaseUrl = getApiBaseUrl();
@@ -466,15 +472,48 @@ if (!isStreaming || !chart) return;
   chart.update();
 
 }
-
-
-
     shimmer.onStatus = (msg) => document.getElementById('log').textContent = msg;
   </script>
 
   <style>
     body { font-family: sans-serif; margin: 20px; }
     #toolbar { margin-bottom: 10px; }
+    #uploadSection {
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      border: 1px solid #d8d8d8;
+      border-radius: 8px;
+      background: #fafafa;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 10px 12px;
+    }
+    .uploadField {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 260px;
+    }
+    .uploadField label {
+      font-size: 0.85em;
+      color: #444;
+    }
+    .uploadField input {
+      padding: 6px 8px;
+    }
+    .uploadStatus {
+      flex: 1 1 100%;
+      min-width: 100%;
+    }
+    #status {
+      min-height: 20px;
+      padding: 6px 8px;
+      border: 1px solid #e1e1e1;
+      border-radius: 6px;
+      background: #fff;
+      color: #333;
+    }
     #chart { width: 100%; height: 400px; }
     button { margin-right: 6px; }
     #signalList { margin-top: 8px; }
@@ -497,17 +536,27 @@ if (!isStreaming || !chart) return;
       <button id="exgTestBtn" disabled>EXG Test (16‑bit)</button>
       <button id="emg16Btn" disabled>Enable EMG 16‑bit</button>
       <button id="ecg16Btn" disabled>Enable ECG 16‑bit</button>
-      
-      <!-- Upload File -->      
-      <input id="apiBaseUrlInput" type="text" placeholder="ShimmerAPI Base URL (e.g, http://localhost:5002)" style="margin-left:10px; width:320px;">      
-      <input id="s3FilePathInput" type="text" placeholder="S3 FilePath (e.g, 'Test-Folder')" style="margin-left:10px; width:280px;">      
-      <button id="uploadBtn">Upload CSV File</button>
 
       <!-- Expansion power checkbox -->
       <label class="exp"><input id="expPowerChk" type="checkbox"> Expansion Power</label>
   </div>
 
-  <div id="status"></div>
+  <div id="uploadSection">
+      <div class="uploadField">
+        <label for="apiBaseUrlInput">ShimmerAPI Base URL</label>
+        <input id="apiBaseUrlInput" type="text" placeholder="e.g. localhost:5002">
+      </div>
+      <div class="uploadField">
+        <label for="s3FilePathInput">S3 File Path (Optional)</label>
+        <input id="s3FilePathInput" type="text" placeholder="e.g. Test-folder">
+      </div>
+      <button id="uploadBtn">Upload CSV File</button>
+      <div class="uploadField uploadStatus">
+        <label for="status">Status: </label>
+        <div id="status"></div>
+      </div>
+  </div>
+
   <div id="signalList"></div>
   <small id="signalNote" style="color:#666"></small>
   <canvas id="chart"></canvas>
