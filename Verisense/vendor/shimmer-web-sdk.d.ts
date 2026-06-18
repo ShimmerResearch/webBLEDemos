@@ -149,6 +149,158 @@ declare abstract class BaseShimmerClient implements IShimmerClient {
 }
 
 /**
+ * True if `bytes` is non-empty and every byte equals `value` (0–255). Useful for
+ * detecting uniform blobs such as erased flash (all `0xFF`) or zeroed regions.
+ * Returns false for empty or nullish input.
+ */
+declare function isUniformByteArray(bytes: ArrayLike<number> | ArrayBuffer | null | undefined, value: number): boolean;
+
+/**
+ * Device-agnostic live stream statistics: throughput, packet rate and
+ * sample-gap-derived packet loss for a real-time sensor stream.
+ *
+ * The tracker is fed one call per received packet ({@link StreamStatsTracker.recordPacket})
+ * and produces a {@link StreamStatsSnapshot} on demand ({@link StreamStatsTracker.snapshot}).
+ *
+ * Loss is derived from gaps in each sub-stream's *monotonic device clock*
+ * (`lastSampleMillis`), NOT host receive time — host BLE buffering bunches
+ * packets together and would otherwise create false gaps. Throughput and packet
+ * rate, by contrast, are measured over a sliding window of host receive time
+ * (`recvMillis`), which is what "bytes per wall-clock second" means.
+ */
+/**
+ * One sub-stream's contribution from a single decoded packet. A sensor that
+ * carries a single stream emits one of these per packet; a sensor whose FIFO
+ * interleaves multiple streams (e.g. the LSM6DSV accel/gyro/mag) emits one per
+ * active sub-stream.
+ */
+interface StreamContribution {
+    /** Unique key per sub-stream, e.g. `"2"` or `"6:accel"`. */
+    key: string;
+    /** Human label, e.g. `"Accel"`. */
+    label: string;
+    /** Configured/expected rate for this sub-stream, or null if unknown. */
+    samplingRateHz: number | null;
+    /** Number of samples of this sub-stream in this packet. */
+    sampleCount: number;
+    /** Min `tsMillis` (monotonic device clock) of this sub-stream in this packet. */
+    firstSampleMillis: number | null;
+    /** Max `tsMillis` (monotonic device clock) of this sub-stream in this packet. */
+    lastSampleMillis: number | null;
+}
+/** Per-sub-stream loss/rate accounting in a snapshot. */
+interface StreamLossStats {
+    key: string;
+    sensorId: number;
+    label: string;
+    samplingRateHz: number | null;
+    samples: number;
+    expectedSamples: number;
+    lostSamples: number;
+    lossPct: number;
+    /** Achieved sample rate over the sliding window (samples/sec). */
+    windowSampleRateHz: number;
+    lastSampleMillis: number | null;
+}
+/** Per-sensor rollup in a snapshot. */
+interface SensorStreamStats {
+    sensorId: number;
+    packets: number;
+    bytes: number;
+    crcFails: number;
+    /** Windowed throughput for this sensor's frames (bytes/sec). */
+    windowThroughputBps: number;
+    /** Windowed packet rate for this sensor (packets/sec). */
+    windowPacketRateHz: number;
+    streams: StreamLossStats[];
+}
+/** Full snapshot of stream statistics at a point in time. */
+interface StreamStatsSnapshot {
+    durationMillis: number;
+    totalPackets: number;
+    totalSamples: number;
+    totalBytes: number;
+    totalCrcFails: number;
+    /**
+     * Bytes discarded while re-locking onto frame boundaries after the stream lost
+     * sync (e.g. dropped bytes on a weak BLE link). 0 on a healthy stream; a rising
+     * count means data was lost on the wire but the parser is recovering cleanly.
+     */
+    resyncDroppedBytes: number;
+    /** Overall windowed bytes/sec across all sensors. */
+    throughputBps: number;
+    /** Aggregate lostSamples / expectedSamples * 100. */
+    lossPct: number;
+    perSensor: Record<number, SensorStreamStats>;
+}
+/**
+ * Accumulates live statistics for one streaming session. Call {@link reset} on
+ * (re)start, {@link recordPacket} for every decoded packet, {@link recordCrcFail}
+ * for CRC failures, and {@link snapshot} to read the current numbers.
+ */
+declare class StreamStatsTracker {
+    private readonly windowMillis;
+    private sessionStartMillis;
+    private resyncDroppedBytes;
+    private readonly sensors;
+    private readonly streams;
+    constructor(opts?: {
+        windowMillis?: number;
+    });
+    /** Clear all state. Call when streaming (re)starts. */
+    reset(): void;
+    private getSensor;
+    private getStream;
+    /** Record one received (and decoded) streaming packet. */
+    recordPacket(p: {
+        sensorId: number;
+        byteLength: number;
+        crcOk: boolean | null;
+        recvMillis: number;
+        contributions: StreamContribution[];
+    }): void;
+    /** Record a CRC failure for a (possibly unknown) sensor. */
+    recordCrcFail(sensorId?: number): void;
+    /**
+     * Record bytes discarded while re-synchronising the frame parser after the
+     * stream lost alignment (typically a flaky link dropping bytes mid-stream).
+     */
+    recordResyncDrop(byteCount?: number): void;
+    private prune;
+    /**
+     * Cadence-relative stall test: a stream is "stalled" only if its newest packet
+     * is older than a multiple of its own observed packet interval (floored at the
+     * window). This keeps a stalled stream reading 0 while NOT zeroing a healthy
+     * stream that simply delivers less often than the window (big FIFO reads, slow
+     * sensors). Events carry a receive time `t`.
+     */
+    private isStalled;
+    /**
+     * Achieved sample rate for a sub-stream's windowed events.
+     *
+     * Measured over the *device-clock* span of the samples — from the first
+     * sample of the oldest packet to the last sample of the newest packet (their
+     * tsMillis), not the host receive-time window. This is robust to bursty BLE
+     * delivery AND to large packets: one packet can carry hundreds of samples
+     * spanning several seconds (e.g. a high FIFO watermark), so dividing its count
+     * by the fixed receive window would over-report. Using the samples' own
+     * device-time span gives the true rate even from a single packet. A stream
+     * whose newest packet is older than a cadence-relative threshold reads 0 (see
+     * {@link isStalled}).
+     */
+    private windowRateHz;
+    /**
+     * Windowed throughput (bytes/sec) and packet rate over the *actual* receive
+     * span of the retained events, robust to packets that arrive less often than
+     * the window. Bytes/packets are counted after the oldest event (the span's
+     * start point). Returns 0 if the stream is stalled (see {@link isStalled}).
+     */
+    private windowThroughput;
+    /** Produce a snapshot of all statistics as of `nowMillis`. */
+    snapshot(nowMillis: number): StreamStatsSnapshot;
+}
+
+/**
  * Shimmer3R BLE protocol opcodes.
  * Values taken directly from the Shimmer3 firmware header.
  */
@@ -617,6 +769,14 @@ declare const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 declare const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 /** NUS RX characteristic UUID (host subscribes to notifications from this). */
 declare const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+/** Nordic Secure DFU service UUID (buttonless DFU). */
+declare const NORDIC_DFU_SERVICE = "0000fe59-0000-1000-8000-00805f9b34fb";
+/** Nordic buttonless DFU control-point characteristic (without bond sharing). */
+declare const NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = "8ec90003-f315-4f60-9fb8-838830daea50";
+/** Nordic buttonless DFU control-point characteristic (with bond sharing). */
+declare const NORDIC_DFU_BUTTONLESS_WITH_BONDS = "8ec90004-f315-4f60-9fb8-838830daea50";
+/** Buttonless DFU control-point op-code that reboots the device into the bootloader. */
+declare const NORDIC_DFU_OP_ENTER_BOOTLOADER = 1;
 /** Upper-nibble command classes used in protocol headers. */
 declare const ASM_COMMAND: Readonly<{
     readonly READ: 16;
@@ -691,6 +851,8 @@ declare const DEBUG_COMMAND_ID: Readonly<{
     readonly SYSTEM_RESET: 19;
     readonly IC_POWER_CONSUMPTION_TEST: 20;
     readonly DELETE_ALL_BONDS: 21;
+    readonly BLE_LINK_PARAMS_READ: 22;
+    readonly BLE_LINK_OPTIMIZE: 23;
 }>;
 type DebugCommandId = (typeof DEBUG_COMMAND_ID)[keyof typeof DEBUG_COMMAND_ID];
 /**
@@ -714,6 +876,9 @@ declare const OP_IDX: Readonly<{
     readonly GYRO_ACCEL2_CFG_5: 15;
     readonly GYRO_ACCEL2_CFG_6: 16;
     readonly GYRO_ACCEL2_CFG_7: 17;
+    readonly LSM6DSV_CFG_0: 18;
+    readonly LSM6DSV_CFG_1: 19;
+    readonly LSM6DSV_CFG_2: 20;
     readonly START_TIME: 21;
     readonly END_TIME: 25;
     readonly INACTIVE_TIMEOUT: 29;
@@ -751,8 +916,42 @@ declare const OP_IDX: Readonly<{
     readonly PPG_DAC3_CROSSTALK: 69;
     readonly PPG_DAC4_CROSSTALK: 70;
     readonly PROX_AGC_MODE: 71;
+    readonly OP_CONFIG_VERSION: 9;
+    readonly LIGHT_GAIN_INDEX: 72;
+    readonly LIGHT_EXPOSURE_INDEX: 73;
+    readonly LIGHT_CONFIG: 74;
+    readonly LIGHT_SAMPLE_RATE_INDEX: 75;
+    readonly SKIN_TEMP_CONFIG: 76;
+    readonly SKIN_TEMP_SAMPLE_RATE_INDEX: 77;
+    readonly ALGO_OP_MODE: 78;
+    readonly ALGO_REPORT_MODE_RATE: 79;
+    readonly ALGO_CONTROL: 80;
+    readonly ALGO_INITIAL_HR: 81;
+    readonly LED_AUTO_BRIGHTNESS_CFG: 82;
+    readonly LED_MAX_BRIGHTNESS: 83;
+    readonly LED_LUX_THRESHOLD: 84;
 }>;
 type OpIdx = keyof typeof OP_IDX;
+/** Minimum firmware version that supports the BLE-link debug commands
+ * (read/optimize connection parameters). */
+declare const BLE_LINK_MIN_FW: Readonly<{
+    major: 1;
+    minor: 4;
+    internal: 23;
+}>;
+/** Human-readable labels for Verisense stream-packet sensor IDs. Each ID maps to
+ * the device part(s) that produce that stream (some streams interleave several
+ * physical sensors, e.g. id 6 = LSM6DSV accel + gyro + mag). */
+declare const VERISENSE_STREAM_SENSOR_LABELS: Readonly<{
+    readonly 1: "ADC (GSR / Battery)";
+    readonly 2: "Accel 1 (LIS2DW12)";
+    readonly 3: "Accel 2 + Gyro (LSM6DS3)";
+    readonly 4: "PPG (MAX86xxx)";
+    readonly 6: "Accel 2 + Gyro + Mag (LSM6DSV + LIS2MDL)";
+    readonly 7: "Ambient Light (VD6283)";
+    readonly 8: "Algo Hub (MAX32674 — HR + raw PPG)";
+    readonly 9: "Skin Temperature (MLX90632)";
+}>;
 
 interface VerisenseMessage {
     header: number;
@@ -783,6 +982,24 @@ declare function formatByteAsHex(v: number): string;
 declare function formatByteArrayAsHex(bytes: ArrayLike<number> | ArrayBuffer | null | undefined): string;
 /** Parse text containing hex bytes like `0x5A, 00 12` into a Uint8Array. */
 declare function parseHexByteString(text: string): Uint8Array;
+/** A Verisense firmware version triple (major.minor.internal). */
+interface VerisenseFirmwareVersion {
+    major: number;
+    minor: number;
+    internal: number;
+}
+/**
+ * Compare two firmware version triples. Returns a negative number if `a < b`,
+ * positive if `a > b`, and 0 if equal. Missing or non-numeric components are
+ * treated as 0.
+ */
+declare function compareVerisenseFirmwareVersion(a: Partial<VerisenseFirmwareVersion> | null | undefined, b: Partial<VerisenseFirmwareVersion> | null | undefined): number;
+/** Format a firmware version triple as `"major.minor.internal"`, or `"unknown"`
+ * when the version is null/undefined. */
+declare function formatVerisenseFirmwareVersion(v: Partial<VerisenseFirmwareVersion> | null | undefined): string;
+/** Human-readable label for a Verisense stream-packet sensor ID, with a
+ * `"Sensor 0xNN"` hex fallback for unknown IDs. */
+declare function getVerisenseStreamSensorLabel(sensorId: number): string;
 interface PendingEventPropertyLabel {
     value: number;
     hex: string;
@@ -889,6 +1106,12 @@ interface VerisenseStatusPayload {
     memoryBadBanksKb: number | null;
     statusFlags: VerisenseStatusFlags | null;
     batteryFallCounter: number | null;
+    /** Byte 64 bit0 (charger chip present). Null for legacy payloads (<65 bytes). */
+    chargerPresent: boolean | null;
+    /** Byte 64 bits1..3 (BatteryChargerStatus_t). Null for legacy payloads (<65 bytes). */
+    chargerStatusCode: number | null;
+    /** Decoded charger status enum label from chargerStatusCode. */
+    chargerStatusName: 'CHARGER_STATUS_BAD_BATTERY' | 'CHARGER_STATUS_CHARGING' | 'CHARGER_STATUS_CHARGING_COMPLETE' | 'CHARGER_STATUS_POWER_DOWN' | 'CHARGER_STATUS_TRICKLE_CHARGING' | 'CHARGER_STATUS_NOT_READ' | 'CHARGER_STATUS_UNKNOWN' | null;
 }
 interface VerisenseUnixAndHumanTimestamp {
     unix: number;
@@ -899,6 +1122,17 @@ interface VerisenseStatusPayloadForLog extends VerisenseStatusPayload {
     lastOkTransfer: VerisenseUnixAndHumanTimestamp;
     lastFailTransfer: VerisenseUnixAndHumanTimestamp;
 }
+type VerisenseChargerChipFamily = 'LM3658D' | 'LTC4123' | 'XC6803' | 'UNKNOWN';
+/** Infer charger chip family from hardware revision fields in production config. */
+declare function inferVerisenseChargerChipFamily(revHwMajor: number, revHwMinor: number, revHwInternal: number): VerisenseChargerChipFamily;
+/** Return chip-specific charger status text for a parsed 3-bit status code. */
+declare function describeVerisenseChargerStatus(chipFamily: VerisenseChargerChipFamily, statusCode: number): string;
+/** Format charger summary text for UIs, e.g. "XC6803: Charge completed". */
+declare function formatVerisenseChargerStatus(status: Pick<VerisenseStatusPayload, 'chargerPresent' | 'chargerStatusCode' | 'chargerStatusName'>, hw?: {
+    revHwMajor?: number;
+    revHwMinor?: number;
+    revHwInternal?: number;
+}): string;
 interface VerisenseSchedulerDebugPayload {
     currentTimeUnixSeconds: number;
     bleControlCounter: 'data-transfer' | 'status1' | 'rtc-sync' | 'status2' | 'never' | 'unknown';
@@ -940,6 +1174,16 @@ interface VerisenseSchedulerDebugPayloadForLog extends VerisenseSchedulerDebugPa
     ltfRetry?: VerisenseSchedulerDebugPayload['ltfRetry'] & {
         nextTime: VerisenseUnixAndHumanTimestamp;
     };
+}
+interface VerisenseBleLinkDebugPayload {
+    attMtu: number;
+    maxDataLength: number;
+    connectionIntervalUnits: number;
+    connectionIntervalMs: number;
+    txPhy: number;
+    rxPhy: number;
+    optimizationResult: number;
+    isConnected: boolean;
 }
 interface VerisenseEventLogEntry {
     index: number;
@@ -1001,6 +1245,8 @@ declare function parseProductionConfigPayloadFull(response: Uint8Array): Product
 declare function parseStatusPayload(response: Uint8Array, sourceStatusProperty?: 'status1' | 'status2'): VerisenseStatusPayload;
 /** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
 declare function parseSchedulerDebugPayload(payload: Uint8Array): VerisenseSchedulerDebugPayload;
+/** Parse debug payload from BLE link read/optimize commands. */
+declare function parseBleLinkDebugPayload(payload: Uint8Array): VerisenseBleLinkDebugPayload;
 /** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
 declare function parsePayloadCrcErrorBankIndexes(payload: Uint8Array): number[];
 /** Parse 8-byte debug event-log entries. */
@@ -1008,10 +1254,18 @@ declare function parseEventLogPayload(payload: Uint8Array): VerisenseEventLogEnt
 /** Parse record-buffer details payload (26-byte current layout, 19-byte legacy layout). */
 declare function parseRecordBufferDetailsPayload(payload: Uint8Array): VerisenseRecordBufferDetails[];
 /**
- * Parse lookup-table debug payload entries (3 bytes per bank), with optional
- * 4-byte tail/head prefix present in older firmware debug responses.
+ * Infer the lookup-table bank count from a raw debug payload length. The payload
+ * is 3 bytes per bank, optionally prefixed with a 4-byte head/tail block.
+ * Returns 0 if the length matches neither layout.
  */
-declare function parseLookupTablePayload(payload: Uint8Array, totalBanks: number): VerisenseLookupTablePayload;
+declare function inferVerisenseLookupBankCount(payloadLen: number): number;
+/**
+ * Parse lookup-table debug payload entries (3 bytes per bank), with optional
+ * 4-byte tail/head prefix present in older firmware debug responses. When
+ * `totalBanks` is omitted it is inferred from the payload length via
+ * {@link inferVerisenseLookupBankCount}.
+ */
+declare function parseLookupTablePayload(payload: Uint8Array, totalBanks?: number): VerisenseLookupTablePayload;
 /**
  * Parse the production config response payload into a structured object.
  */
@@ -1047,8 +1301,71 @@ declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
 };
 
 type VerisenseHardwareFriendlyName = 'IMU' | 'GSR+' | 'SDK' | 'Pulse+';
+interface VerisenseHardwareCapabilities {
+    readonly secondGeneration: boolean;
+    readonly supportsMagnetometer: boolean;
+}
+interface VerisenseHardwareRevision {
+    readonly major: number;
+    readonly minor: number;
+    readonly internal: number;
+}
+interface VerisenseHardwareRevisionSource {
+    readonly revHwMajor?: number | null;
+    readonly revHwMinor?: number | null;
+    readonly revHwInternal?: number | null;
+}
 declare const VERISENSE_HW_MAJOR_FRIENDLY_NAMES: Readonly<Record<number, VerisenseHardwareFriendlyName>>;
 declare function getVerisenseHardwareFriendlyName(revHwMajor: number): VerisenseHardwareFriendlyName | null;
+/**
+ * Second-generation Verisense hardware is currently defined as:
+ * - SR61.5+
+ * - SR68.9+
+ * - Any future major revision above SR68
+ */
+declare function isVerisenseSecondGenerationHardware(revHwMajor: number, revHwMinor: number): boolean;
+declare function getVerisenseHardwareCapabilities(revHwMajor: number, revHwMinor: number): VerisenseHardwareCapabilities;
+/**
+ * Which physical sensor blocks a Verisense board carries. Each flag lines up
+ * with an operational-config field group (see
+ * `getVerisenseSupportedOperationalFieldGroupIds`), so callers can decide which
+ * config groups are meaningful for the connected hardware.
+ *
+ * Derived from the firmware Model IC matrix
+ * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
+ */
+interface VerisenseHardwareSensorSupport {
+    /** 1st-gen low-power accel, LIS2DW12 (`accel1` group). */
+    readonly accel1: boolean;
+    /** 1st-gen gyro + accel2, LSM6DS3 (`gyro_accel2` group). */
+    readonly gyroAccel2: boolean;
+    /** 2nd-gen IMU + magnetometer, LSM6DSV + LIS2MDL (`lsm6dsv` group). */
+    readonly imuGen2: boolean;
+    /** Galvanic skin response front-end (`adc_gsr` group). */
+    readonly gsr: boolean;
+    /** Photoplethysmography front-end (`ppg` group). */
+    readonly ppg: boolean;
+    /** Ambient light sensor, VD6283 (`light` group). */
+    readonly ambientLight: boolean;
+    /** Skin temperature sensor, MLX90632 (`skin_temp` group). */
+    readonly skinTemperature: boolean;
+    /** Algorithm hub, MAX32674 (`algo` group). */
+    readonly algorithmHub: boolean;
+    /** 2xRGB status LEDs with auto-brightness (`led` group). */
+    readonly ledAutoBrightness: boolean;
+}
+/**
+ * Resolves which sensor blocks a given Verisense hardware revision carries,
+ * derived from the firmware Model IC matrix
+ * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
+ *
+ * Unknown / development hardware (e.g. SR64, or any unrecognised major
+ * revision) reports every block as present so consumers never hide a setting
+ * they cannot confidently rule out.
+ */
+declare function getVerisenseHardwareSensorSupport(revHwMajor: number, revHwMinor: number): VerisenseHardwareSensorSupport;
+declare function getVerisenseHardwareRevision(source: VerisenseHardwareRevisionSource | null | undefined): VerisenseHardwareRevision | null;
+declare function supportsVerisenseMagnetometer(source: VerisenseHardwareRevisionSource | null | undefined): boolean;
 declare function formatVerisenseHardwareRevision(revHwMajor: number, revHwMinor: number, revHwInternal?: number, opts?: {
     prefix?: string;
     includeFriendlyName?: boolean;
@@ -1276,6 +1593,39 @@ declare const VERISENSE_OPERATIONAL_FIELD_SCHEMA: ({
     label: string;
     desc: string;
     kind: string;
+    index: 18;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 19;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 20;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
     index: 29;
     options: (string | number)[][];
     shift?: undefined;
@@ -1359,8 +1709,118 @@ declare const VERISENSE_OPERATIONAL_FIELD_SCHEMA: ({
     width?: undefined;
     min?: undefined;
     max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 72;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 73;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 74;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 75;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 76;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 78;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 79;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 79;
+    shift: number;
+    width: number;
+    options?: undefined;
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 80;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 82;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
 })[];
-declare const VERISENSE_OP_CONFIG_BYTE_SIZE = 72;
+declare const VERISENSE_OP_CONFIG_BYTE_SIZE = 86;
 type VerisenseOperationalField = VerisenseOperationalFieldDefinition;
 declare function createBlankVerisenseOperationalConfig(byteSize?: number): Uint8Array;
 declare function readVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField): number;
@@ -1380,6 +1840,27 @@ interface VerisenseOperationalFieldGroupDefinition {
 }
 declare const VERISENSE_OPERATIONAL_FIELD_GROUPS: readonly VerisenseOperationalFieldGroupDefinition[];
 declare const VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID = "gen";
+/**
+ * Maps each hardware-gated operational-config group id to the sensor block that
+ * gates it (see {@link VerisenseHardwareSensorSupport}). Group ids absent from
+ * this map (e.g. `gen`, `scheduler_ble`) configure behaviour that applies to
+ * every board and are always considered supported.
+ */
+declare const VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR: Readonly<Record<string, keyof VerisenseHardwareSensorSupport>>;
+/**
+ * Returns the set of operational-config group ids (from
+ * {@link VERISENSE_OPERATIONAL_FIELD_GROUPS}) whose underlying sensor is present
+ * on the given hardware revision. A group is supported when it is not gated by a
+ * sensor block, or when its gating sensor is present.
+ *
+ * Returns `null` when the hardware revision is unknown so callers can fall back
+ * to showing every group.
+ */
+declare function getVerisenseSupportedOperationalFieldGroupIds(source: VerisenseHardwareRevisionSource | null | undefined): ReadonlySet<string> | null;
+/** LIGHT_CONFIG bit 1 is the VD6283 dark-channel select: when set, the shared
+ * visible/clear slot carries the dark (covered-photodiode) baseline instead of
+ * the visible reading. Returns false for empty/nullish config. */
+declare function isVerisenseLightDarkChannelEnabled(op: Uint8Array | null | undefined): boolean;
 
 /**
  * Abstract base class for all Verisense sensor decoders.
@@ -1439,6 +1920,39 @@ declare abstract class SensorBase {
         systemTsMillis: number;
         systemTsPlotMillis: number;
     };
+    /**
+     * Compute per-sample timestamps for a whole decoded burst.
+     *
+     * The base implementation treats every decoded sample as one evenly-spaced
+     * time step at `samplingRateHz` (correct when each decoded sample is a single
+     * combined time step). Sensors whose decoded array *interleaves* multiple
+     * streams at different cadences (e.g. the LSM6DSV tagged FIFO, which mixes
+     * accel / gyro / mag entries) override this to timestamp each stream on its
+     * own rate — otherwise the shared rate spreads each stream's samples too far
+     * back and consecutive blocks overlap on the time axis.
+     */
+    computeSampleTimestamps(decodedSamples: unknown[], block: {
+        tsLastSampleMillis: number;
+        systemTsLastSampleMillis: number;
+        systemOffsetFirstTime?: number | null;
+    }): Array<{
+        tsMillis: number;
+        systemTsMillis: number;
+        systemTsPlotMillis: number;
+    }>;
+    /**
+     * Turn a decoded + timestamped burst into one or more stream contributions
+     * for live throughput / packet-loss tracking. The default treats the sensor
+     * as a single stream; sensors whose decoded array interleaves several
+     * sub-streams at different cadences (e.g. the LSM6DSV tagged FIFO) override
+     * this to report one contribution per sub-stream so loss is tracked
+     * independently.
+     */
+    getStreamContributions(samplesWithTime: Array<{
+        timestamps?: {
+            tsMillis: number;
+        };
+    }>, sensorId: number): StreamContribution[];
     /** Parse a raw sensor payload byte array into decoded samples. */
     abstract parsePayload(sensorPayloadBytes: Uint8Array): unknown[];
     /** Apply the Verisense operational config blob to update decoder settings. */
@@ -1485,6 +1999,14 @@ declare class SensorADC extends SensorBase {
     readonly GSR_UNCAL_LIMIT_RANGE3_SR62 = 683;
     private readonly SHIMMER3_REF_KOHMS;
     private readonly SR68_REF_KOHMS;
+    /**
+     * ADC sample-rate code → divisor of the 32768 Hz clock. Mirrors the firmware
+     * `samplingRateInTicksArray` (hal_adc.c): the sampling timer fires every
+     * `divisor` ticks, producing one sample set per fire, so the streamed output
+     * rate = 32768 / divisor. Oversampling uses SAADC burst mode and therefore
+     * does NOT divide the output rate. Index 0 = "Off".
+     */
+    private static readonly ADC_RATE_DIVISORS;
     gsrEnabled: boolean;
     battEnabled: boolean;
     /** GSR range 0-3 (fixed) or 4 (auto-range). */
@@ -1513,6 +2035,11 @@ declare class SensorADC extends SensorBase {
     calibrateGsrToKOhmsUsingAmplifierEq(volts: number, range: number): number;
     nudgeGsrResistance(kOhms: number): number;
     kOhmToUSiemens(kOhms: number): number;
+    /**
+     * Convert the 6-bit ADC sample-rate code to the streamed output rate in Hz,
+     * or null for "Off"/unknown codes. Used for per-sample timestamp spacing.
+     */
+    decodeAdcSampleRateHz(rateCode: number): number | null;
     parsePayload(sensorPayloadBytes: Uint8Array): ADCPayloadSample[];
     applyOperationalConfig(op: Uint8Array): void;
 }
@@ -1585,6 +2112,85 @@ declare class SensorLSM6DS3 extends SensorBase {
     applyOperationalConfig(op: Uint8Array): void;
 }
 
+interface LSM6DSVSample {
+    tag: number;
+    cnt: number;
+    accel: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+    gyro: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+    mag: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+}
+declare class SensorLSM6DSV extends SensorBase {
+    private static readonly TAG_GYRO;
+    private static readonly TAG_ACCEL;
+    private static readonly TAG_SENSORHUB_SLAVE0;
+    accEnabled: boolean;
+    gyroEnabled: boolean;
+    magEnabled: boolean;
+    private accelFsG;
+    private gyroFsDps;
+    accelHz: number;
+    gyroHz: number;
+    magHz: number;
+    constructor();
+    private decodeAccelFsG;
+    private decodeGyroFsDps;
+    private decodeOdrHz;
+    private decodeMagOutputRateHz;
+    private calibrateAccel;
+    private calibrateGyro;
+    private calibrateMag;
+    parsePayload(sensorPayloadBytes: Uint8Array): LSM6DSVSample[];
+    applyOperationalConfig(op: Uint8Array): void;
+    /**
+     * Timestamp each stream (accel / gyro / mag) so all three cover the same block
+     * time window. The tagged FIFO interleaves the streams, so the generic
+     * global-index spacing spreads each stream by (#interleaved-streams)x too far
+     * back and makes consecutive blocks overlap on the time axis.
+     *
+     * Each stream's effective rate is derived from *this block*: the block's
+     * covered duration is taken from a directly-sampled reference stream (accel,
+     * else gyro) at its known ODR, and every stream is then spread evenly over
+     * that same duration by its own sample count. This is important for the mag
+     * (LIS2MDL), which is read via the LSM6DSV sensor hub — its entries land in
+     * the FIFO at the hub batch rate, NOT the LIS2MDL ODR, so a fixed mag ODR
+     * would mis-spread it (the zig-zag). Deriving the rate from the block keeps it
+     * aligned regardless of the hub rate.
+     */
+    computeSampleTimestamps(decodedSamples: unknown[], block: {
+        tsLastSampleMillis: number;
+        systemTsLastSampleMillis: number;
+        systemOffsetFirstTime?: number | null;
+    }): Array<{
+        tsMillis: number;
+        systemTsMillis: number;
+        systemTsPlotMillis: number;
+    }>;
+    /**
+     * Report up to three independent sub-streams (accel / gyro / mag) so loss is
+     * tracked per stream. Each sub-stream's expected rate is its configured rate
+     * (ODR for accel/gyro, output rate for mag); loss is measured against that, so
+     * the mag's hub-trigger bound — or any rate the firmware/link can't keep up
+     * with — surfaces as loss when a configured rate exceeds what's delivered.
+     */
+    getStreamContributions(samplesWithTime: Array<{
+        timestamps?: {
+            tsMillis: number;
+        };
+    }>, sensorId: number): StreamContribution[];
+}
+
 interface PPGChannelSample {
     raw: number;
     cal: number;
@@ -1598,6 +2204,14 @@ interface PPGSample {
     IR?: PPGChannelSample;
     GREEN?: PPGChannelSample;
     BLUE?: PPGChannelSample;
+    /**
+     * 2nd-generation hub PPG: 3 raw MAX86176 LED channel counts (24-bit), in the
+     * order [green, IR, red] (LED1=green, LED2=IR, LED3=red per the board's LED
+     * driver wiring). The MAX86176 is reached only via the MAX32674 algorithm hub
+     * and measures these 3 LEDs on photodiode PD1 (its PD2 copies are not
+     * forwarded).
+     */
+    leds?: [number, number, number];
 }
 type PPGChannel = 'RED' | 'IR' | 'GREEN' | 'BLUE';
 /**
@@ -1610,15 +2224,144 @@ declare class SensorPPG extends SensorBase {
     ir: boolean;
     green: boolean;
     blue: boolean;
+    /**
+     * 2nd-gen hub mode: PPG arrives via the MAX32674 hub as a fixed block of 6 raw
+     * MAX86176 LED channels (6 x u24), independent of the RED/IR/GREEN/BLUE enable
+     * bits. Set from the connected device's hardware generation (see
+     * VerisenseClient). When false, the 1st-gen named-channel layout is used.
+     */
+    hubMode: boolean;
     private readonly adcLsb;
     private readonly adcBitShift;
     adcResolutionIndex: number;
+    /** PPG_SR code → base sampling rate in Hz (op byte PPG_MODE_CONFIG2 bits 4:2). */
+    private readonly PPG_SR_HZ;
+    /** SMP_AVE code → FIFO sample-averaging factor (op byte PPG_FIFO_CONFIG bits 7:5). */
+    private readonly SMP_AVE_FACTOR;
     constructor();
     setChannels(channels: Partial<Record<PPGChannel, boolean>>): void;
+    setHubMode(enabled: boolean): void;
     setAdcResolutionIndex(i: number): void;
     calibrateValue(uncalValue: number): number;
+    /**
+     * 2nd-gen hub PPG block: N samples x (3 x u24 LED channels = green, IR, red),
+     * no count prefix (sample count derived from the block length, matching the
+     * firmware packer).
+     */
+    private parseHubPayload;
     parsePayload(sensorPayloadBytes: Uint8Array): PPGSample[];
-    applyOperationalConfig(_op: Uint8Array): void;
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+/** Per-channel raw ambient-light counts (24-bit) plus the derived illuminance
+ * (lux) and correlated colour temperature (CCT, Kelvin). Channel order matches
+ * the firmware VD6283 AlsResults block: RED, VISIBLE, BLUE, GREEN, IR, CLEAR.
+ *
+ * The second slot is shared: the VD6283 routes EITHER the visible/clear reading
+ * OR the dark (covered-photodiode) baseline onto it, selected by the op-config
+ * dark-channel bit. They are mutually exclusive, so exactly one of `VISIBLE` /
+ * `DARK` is a number per sample and the other is `null`. */
+interface VD6283Sample {
+    RED: number;
+    /** Visible/clear channel count, or `null` when the dark channel is enabled
+     * (the chip then routes the dark baseline onto this slot — see `DARK`). */
+    VISIBLE: number | null;
+    BLUE: number;
+    GREEN: number;
+    IR: number;
+    CLEAR: number;
+    /** Dark/covered-photodiode baseline count, or `null` when the dark channel is
+     * disabled (the slot then carries the visible reading — see `VISIBLE`). */
+    DARK: number | null;
+    /** Illuminance in lux (XYZ Y component; clamped to >= 0). */
+    lux: number;
+    /** Correlated colour temperature in Kelvin (0 if undefined). */
+    cct: number;
+}
+/**
+ * Decoder for the VD6283TX45 ambient light sensor (Verisense sensor id = 7).
+ *
+ * Data block payload = N samples x 18 bytes (6 channels x 24-bit LE counts).
+ * In addition to the raw channel counts, each sample carries the derived lux
+ * and CCT, computed from the RED/GREEN/BLUE channels with the configured gain
+ * and exposure (ported from firmware App_vd6283tx.c).
+ */
+declare class SensorVD6283 extends SensorBase {
+    static readonly NUM_CHANNELS = 6;
+    static readonly BYTES_PER_SAMPLE = 18;
+    private exposureUs;
+    private gain8p8;
+    /** Op-config dark-channel bit (LIGHT_CONFIG bit 1): when set the shared second
+     * slot carries the dark baseline (`DARK`) instead of the visible reading. */
+    private darkEnabled;
+    constructor();
+    /** Normalise a raw channel count for the XYZ transform (gain + exposure). */
+    private normalizeForXyz;
+    /** Compute illuminance (lux) and CCT (K) from RED/GREEN/BLUE counts. */
+    private computeLuxCct;
+    parsePayload(sensorPayloadBytes: Uint8Array): VD6283Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+/**
+ * One algorithm-hub sample: accel + WHRM algorithm output. The raw MAX86176 PPG
+ * is no longer carried here - it streams separately under the PPG sensor id (4),
+ * see SensorPPG hub mode.
+ */
+interface MAX32674Sample {
+    accel: {
+        raw: [number, number, number];
+    };
+    /** Heart rate (bpm) and confidence (0-100). */
+    hr: number;
+    hrConfidence: number;
+    /** SpO2 (%) and confidence; 0 until SpO2 mode is enabled. */
+    spo2: number;
+    spo2Confidence: number;
+    activityClass: number;
+    scdContactState: number;
+}
+/**
+ * Decoder for the MAX32674 algorithm hub (Verisense sensor id = 8).
+ *
+ * Data block payload = [sampleCount:1] then sampleCount x 14 bytes:
+ *   accel x,y,z : 3 x i16 (6) | hr u16 (2) | hr_conf u8 (1) |
+ *   spo2 u16 (2) | spo2_conf u8 (1) | activity u8 (1) | scd_contact u8 (1)
+ *
+ * Raw PPG is reported separately under the PPG sensor id (4).
+ */
+declare class SensorMAX32674 extends SensorBase {
+    static readonly BYTES_PER_SAMPLE = 14;
+    constructor();
+    parsePayload(sensorPayloadBytes: Uint8Array): MAX32674Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+/** One skin-temperature sample. Object = skin temperature, ambient = sensor
+ * ambient, both in degrees Celsius. */
+interface MLX90632Sample {
+    object: {
+        raw: number;
+        cal: number;
+        units: string;
+    };
+    ambient: {
+        raw: number;
+        cal: number;
+        units: string;
+    };
+}
+/**
+ * Decoder for the MLX90632 skin temperature sensor (Verisense sensor id = 9).
+ *
+ * Data block payload = N samples x 4 bytes: object int16 then ambient int16,
+ * each in centi-degrees Celsius (value / 100 = degrees C).
+ */
+declare class SensorMLX90632 extends SensorBase {
+    static readonly BYTES_PER_SAMPLE = 4;
+    constructor();
+    parsePayload(sensorPayloadBytes: Uint8Array): MLX90632Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
 }
 
 type TransportKind = 'ble' | 'serial' | null;
@@ -1628,6 +2371,10 @@ interface SensorMap {
     2: SensorLIS2DW12;
     3: SensorLSM6DS3;
     4: SensorPPG;
+    6: SensorLSM6DSV;
+    7: SensorVD6283;
+    8: SensorMAX32674;
+    9: SensorMLX90632;
 }
 interface StreamPacket {
     sensorId: number;
@@ -1654,17 +2401,114 @@ interface TransferLoggedDataResult {
     payloadIndex?: number;
     blob?: Blob;
 }
+interface RunHardwareTestReportOptions {
+    timeoutMs?: number;
+    marker?: string;
+    endMarker?: string;
+    completionIdleMs?: number;
+    factoryTestType?: number;
+    signal?: AbortSignal | null;
+    onChunk?: ((chunk: string, aggregate: string) => void) | null;
+}
 interface VerisenseClientOptions {
     hardwareIdentifier?: string;
+    /**
+     * Streaming frames carry a 2-byte CRC-16 trailer. When `true` (default) the
+     * trailer is used to lock onto frame boundaries — the parser accepts a frame
+     * only when its CRC validates, so a flaky link that drops bytes recovers
+     * cleanly instead of emitting misaligned packets — and is then stripped before
+     * decoding. Set to `false` only for legacy firmware that streams without a CRC
+     * trailer (falls back to length-only framing).
+     */
     stripStreamCrc?: boolean;
-    verifyStreamCrc?: boolean;
     debug?: boolean;
+}
+interface BleThroughputTestOptions {
+    /** How long the device should saturate the link, in milliseconds. Clamped to [100, 60000]. Default 5000. */
+    durationMs?: number;
+    /**
+     * Finish the measurement once no data has been received for this many
+     * milliseconds (the device falls silent when the blast ends). Default 600.
+     */
+    idleMs?: number;
+    /** Overall safety timeout, in milliseconds. Defaults to `durationMs + 5000`. */
+    timeoutMs?: number;
+    /** Abort the test early. */
+    signal?: AbortSignal | null;
+    /** Called on every received chunk with the running result so far. */
+    onProgress?: ((partial: BleThroughputTestResult) => void) | null;
+}
+interface BleThroughputTestResult {
+    /** Total bytes received from the device during the measurement window. */
+    bytesReceived: number;
+    /** Number of BLE notification chunks received. */
+    packetsReceived: number;
+    /** Duration requested of the device, in milliseconds. */
+    durationRequestedMs: number;
+    /** Measured window from first to last received byte, in milliseconds. */
+    elapsedMs: number;
+    /** Received goodput in bytes per second. */
+    throughputBytesPerSec: number;
+    /** Received goodput in kilobytes per second (bytes/sec ÷ 1000). */
+    throughputKBps: number;
+    /** Received goodput in kilobits per second (bytes/sec × 8 ÷ 1000). */
+    throughputKbps: number;
+}
+type VerisenseConnectRetryReason = 'request-timeout' | 'gatt-disconnected' | 'unexpected-response-property';
+interface VerisenseConnectWithRetryOptions {
+    device?: BluetoothDevice | null;
+    filters?: BluetoothLEScanFilter[];
+    optionalServices?: BluetoothServiceUUID[];
+    bootstrapTimeoutMs?: number;
+    pairingBootstrapTimeoutMs?: number;
+    maxRetries?: number;
+    retrySettleMs?: number;
+    retryOnUnexpectedProperty?: boolean;
+    onRetry?: ((info: VerisenseConnectRetryInfo) => void) | null;
+}
+interface VerisenseConnectRetryInfo {
+    attempt: number;
+    maxRetries: number;
+    bootstrapTimeoutMs: number;
+    nextBootstrapTimeoutMs?: number;
+    reason: VerisenseConnectRetryReason;
+    error: string;
 }
 interface VerisenseCommandResponse {
     header: number;
     command: AsmCommand;
     property: AsmProperty;
     payload: Uint8Array;
+}
+type BleLinkAutoOptimizeStopReason = 'stabilized' | 'timeout' | 'aborted' | 'unsupported' | 'not-ble';
+interface BleLinkAutoOptimizeOptions {
+    pollIntervalMs?: number;
+    stableReadCount?: number;
+    maxDurationMs?: number;
+    settleMode?: 'target-and-stability' | 'stability';
+    minSettleTimeMs?: number;
+    forceOptimizeAttempts?: number;
+    targetConnectionIntervalUnits?: number;
+    targetPhy?: number;
+    minDataLength?: number;
+    signal?: AbortSignal | null;
+    onSample?: ((sample: BleLinkAutoOptimizeSample) => void) | null;
+}
+interface BleLinkAutoOptimizeSample {
+    source: 'read' | 'optimize';
+    iteration: number;
+    stableCount: number;
+    parsed: VerisenseBleLinkDebugPayload;
+    signature: string;
+    optimizedEnough: boolean;
+}
+interface BleLinkAutoOptimizeResult {
+    reason: BleLinkAutoOptimizeStopReason;
+    iterations: number;
+    optimizeAttempts: number;
+    stableCount: number;
+    lastParsed: VerisenseBleLinkDebugPayload | null;
+    durationMs: number;
 }
 
 /**
@@ -1684,7 +2528,7 @@ interface VerisenseCommandResponse {
  * - `"disconnected"` — `{ kind: TransportKind }`
  * - `"streaming"` — `{ on: boolean }`
  * - `"streamPacket"` / `"data"` — `StreamPacket`
- * - `"streamCrcFail"` — `{ claimed: number; body: Uint8Array }`
+ * - `"streamStats"` — `StreamStatsSnapshot` (throttled ~3 Hz live throughput/loss)
  * - `"opConfig"` — `{ op: Uint8Array }`
  * - `"productionConfig"` — `ProductionConfig`
  * - `"commandPayload"` — `{ payload: Uint8Array }`
@@ -1710,13 +2554,19 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _serialReader;
     private _serialReadLoopTask;
     private _onGattDisconnected;
+    private _suppressDisconnectedEvent;
     private _mode;
     private _rxStreamBuf;
     private _pending;
     private _loggedChain;
     private _sync;
+    private _testReportMode;
+    private _throughputTestMode;
+    private _bootstrapRequestTimeoutOverrideMs;
+    private _isSecondGenerationHw;
+    private readonly _streamStats;
+    private _lastStreamStatsEmitMillis;
     readonly stripStreamCrc: boolean;
-    readonly verifyStreamCrc: boolean;
     readonly hardwareIdentifier: string;
     readonly sensors: SensorMap;
     operationalConfig: Uint8Array | null;
@@ -1728,13 +2578,20 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     protected _log(...args: unknown[]): void;
     get adc(): SensorADC;
     get accel1(): SensorLIS2DW12;
-    get gyroAccel2(): SensorLSM6DS3;
+    get gyroAccel2(): SensorLSM6DS3 | SensorLSM6DSV;
+    get gyroAccel2Lsm6ds3(): SensorLSM6DS3;
+    get gyroAccel2Lsm6dsv(): SensorLSM6DSV;
     get ppg(): SensorPPG;
+    private _setOperationalConfigErasedFallback;
+    private _bootstrapConfigsAfterConnect;
     connect(opts?: {
         device?: BluetoothDevice | null;
         filters?: BluetoothLEScanFilter[];
         optionalServices?: BluetoothServiceUUID[];
     }): Promise<boolean>;
+    private _cleanupFailedBleConnectAttempt;
+    private _retryBootstrapInPlaceWithBudget;
+    connectWithRetry(opts?: VerisenseConnectWithRetryOptions): Promise<boolean>;
     connectSerial(opts?: {
         port?: SerialPort | null;
         baudRate?: number;
@@ -1791,9 +2648,54 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     writeOperationalConfig(bytes: Uint8Array | number[]): Promise<void>;
     writeTime(rtc7: Uint8Array | number[]): Promise<void>;
     writeTimeUnixSeconds(unixSeconds: number): Promise<void>;
-    enterDfuMode(): Promise<void>;
+    /**
+     * Request the Verisense firmware to expose the Nordic Secure DFU service.
+     *
+     * Writes the ASM `DFU_MODE` property. The firmware treats this as a request
+     * to enable the buttonless DFU service but does NOT reboot or expose the
+     * service immediately — it enables it on the next BLE disconnect. The host
+     * must therefore disconnect and reconnect before the Nordic DFU service (and
+     * {@link rebootToDfuBootloader}) become available on the connection.
+     */
+    enableDfuServiceOnNextDisconnect(): Promise<void>;
+    /**
+     * Reboot the device straight into the Nordic Secure DFU bootloader using the
+     * buttonless DFU service.
+     *
+     * Requires the Nordic DFU service to already be active on the current BLE
+     * connection — call {@link enableDfuServiceOnNextDisconnect}, then disconnect
+     * and reconnect first. Writes the "Enter Bootloader" op-code (0x01) to the
+     * buttonless DFU control-point characteristic; the device acknowledges via an
+     * indication, then disconnects and resets into the bootloader.
+     *
+     * @param options.waitForDisconnect      Resolve only once the device drops the
+     *   link (i.e. has begun rebooting). Default `true`.
+     * @param options.disconnectAfterCommand Force a local GATT disconnect if the
+     *   device has not dropped the link itself. Default `true`.
+     * @param options.timeoutMs              Max time to wait for the device to
+     *   disconnect after the command. Default `10000`.
+     */
+    rebootToDfuBootloader(options?: {
+        waitForDisconnect?: boolean;
+        disconnectAfterCommand?: boolean;
+        timeoutMs?: number;
+    }): Promise<void>;
+    /**
+     * Resolve when the BLE link drops (`gattserverdisconnected`), or after
+     * `timeoutMs`. Resolves `true` if the device disconnected, `false` on timeout.
+     */
+    private _waitForGattDisconnect;
     runTestMode(testPayload: Uint8Array | number[]): Promise<void>;
     runHardwareTest(testId: TestModeId, hwMajor: number, hwMinor?: number, hwInternal?: number): Promise<void>;
+    /**
+     * Ask the device to stop/exit any running test, including an in-progress
+     * hardware test report (TEST_MODE "exit", id 0x00). The firmware acts on this
+     * from interrupt context, so it aborts the blocking report promptly instead of
+     * running it to completion against a connection no one is reading. Best-effort
+     * and safe to call when no test is running.
+     */
+    stopTestMode(hwMajor?: number, hwMinor?: number, hwInternal?: number): Promise<void>;
+    runHardwareTestReport(hwMajor: number, hwMinor?: number, hwInternal?: number, opts?: RunHardwareTestReportOptions): Promise<string>;
     private _buildDebugPayload;
     private _debugIndexArgs;
     private _waitForDebugResponse;
@@ -1829,18 +2731,62 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     eraseProductionConfig(): Promise<void>;
     clearPendingEvents(): Promise<void>;
     eraseAllLoggedData(timeoutMs?: number): Promise<void>;
-    testDataTransferLoop(loopCount: number): Promise<void>;
+    /**
+     * Low-level: ask the device to saturate the BLE link with dummy data for
+     * `durationMs` milliseconds (debug command 0x0B). The device ACKs immediately
+     * and then blasts a fixed 244-byte buffer as fast as the link will accept it.
+     *
+     * This only starts the blast; it does not measure anything. Prefer
+     * {@link runBleThroughputTest}, which sends this command and measures the
+     * throughput actually received at the host.
+     *
+     * @param durationMs Blast duration in milliseconds (clamped to the protocol's 0..65535 range).
+     */
+    testDataTransferLoop(durationMs: number): Promise<void>;
+    /**
+     * Measure the maximum BLE link throughput, independent of sensor
+     * configuration. Asks the device to blast dummy data for `durationMs`
+     * (see {@link testDataTransferLoop}) and measures the goodput actually
+     * received at the host.
+     *
+     * The reported rate reflects device→host (notification) throughput and is
+     * governed by the negotiated PHY, connection interval, MTU and packets per
+     * connection interval — i.e. the real link, not any sensor's sample rate.
+     *
+     * The measurement finishes when the device falls silent for `idleMs` after
+     * the blast (or when the overall safety timeout elapses).
+     *
+     * @returns received byte/packet counts and the computed throughput.
+     */
+    runBleThroughputTest(opts?: BleThroughputTestOptions): Promise<BleThroughputTestResult>;
     ledTest(ledIndex: number): Promise<void>;
     max86xxxLedTest(start: boolean): Promise<void>;
     startPowerProfilerTest(): Promise<void>;
     requestSystemReset(): Promise<void>;
     startIcPowerConsumptionTest(loopCount: number, stageIntervalMs: number): Promise<void>;
     deleteAllBonds(): Promise<void>;
+    private _assertBleLinkDebugSupported;
+    readBleLinkParams(): Promise<{
+        payload: Uint8Array;
+    }>;
+    readBleLinkParamsParsed(): Promise<VerisenseBleLinkDebugPayload>;
+    optimizeBleLink(): Promise<{
+        payload: Uint8Array;
+    }>;
+    optimizeBleLinkParsed(): Promise<VerisenseBleLinkDebugPayload>;
+    private _bleLinkSignature;
+    private _bleLinkOptimizedEnough;
+    private _isAbortError;
+    private _waitWithAbort;
+    autoOptimizeBleLink(opts?: BleLinkAutoOptimizeOptions): Promise<BleLinkAutoOptimizeResult>;
     setStreamingMode(enabled: boolean): Promise<void>;
     disconnectRequest(): Promise<{
         payload: Uint8Array;
     }>;
     getOpConfig(): Promise<Uint8Array>;
+    private _isErasedBlob;
+    private _isZeroBlob;
+    private _isUninitializedBlob;
     readProductionConfigFromDevice(): Promise<ProductionConfig>;
     readOpConfigFromDevice(): Promise<Uint8Array>;
     writeOpConfig(opConfigBytes: Uint8Array | number[]): Promise<void>;
@@ -1856,7 +2802,9 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _resolvePendingCommand;
     private _feedStreamBytes;
     private _handleStreamingPayload;
+    /** Snapshot of live stream statistics (throughput / packet-loss). */
+    getStreamStats(): StreamStatsSnapshot;
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorPPG, Shimmer3RClient, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseHardwareFriendlyName, getVerisenseStreamingBatteryVoltageMultiplier, isAckCommand, isNackCommand, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, setVerisenseOperationalBitRange, unixSecondsToAsmRtcBytes, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, SensorBitmapShimmer3Key, SensorField, SensorMap, Shimmer3RClientOptions, ShimmerClientOptions, StreamPacket, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VerisenseClientOptions, VerisenseCommandResponse, VerisenseEventLogEntry, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseUnixAndHumanTimestamp };
+export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, setVerisenseOperationalBitRange, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RunHardwareTestReportOptions, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, Shimmer3RClientOptions, ShimmerClientOptions, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VD6283Sample, VerisenseBleLinkDebugPayload, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseEventLogEntry, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseUnixAndHumanTimestamp };

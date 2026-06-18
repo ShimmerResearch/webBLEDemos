@@ -718,9 +718,17 @@
         adc.setEnabled({ gsr: true, batt: true });
         adc.samplingRateHz = 50;
 
-        // Optional: turn off other decoders
-        dev.gyroAccel2.setAccelEnabled(false);
-        dev.gyroAccel2.setGyroEnabled(false);
+        // Optional: turn off other decoders. The IMU accessor resolves to the
+        // 1st-gen LSM6DS3 or the 2nd-gen LSM6DSV depending on hardware: the
+        // former exposes setter methods, the latter plain enable flags.
+        const imu = dev.gyroAccel2;
+        if (typeof imu.setAccelEnabled === "function") {
+          imu.setAccelEnabled(false);
+          imu.setGyroEnabled(false);
+        } else {
+          imu.accEnabled = false;
+          imu.gyroEnabled = false;
+        }
         dev.ppg.setChannels({
           red: false,
           ir: false,
