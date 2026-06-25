@@ -1556,6 +1556,7 @@ const ASM_PROPERTY = Object.freeze({
     STREAM_MODE: 0x0a,
     DEVICE_DISCONNECT: 0x0b,
     STATUS2: 0x0c,
+    CALIBRATION: 0x0d,
 });
 /** Stream mode payload values. */
 const STREAM_MODE = Object.freeze({
@@ -1604,6 +1605,26 @@ const DEBUG_COMMAND_ID = Object.freeze({
     DELETE_ALL_BONDS: 0x15,
     BLE_LINK_PARAMS_READ: 0x16,
     BLE_LINK_OPTIMIZE: 0x17,
+    /** Streamed MAX32674C algorithm-hub firmware (.msbl) upload (factory). The
+     * byte after this id is a HUB_FW_UPLOAD_STAGE sub-stage. */
+    HUB_FW_UPLOAD: 0x18,
+});
+/** Sub-stages for the streamed MAX32674C hub firmware upload, carried in the
+ * payload byte immediately after DEBUG_COMMAND_ID.HUB_FW_UPLOAD. */
+const HUB_FW_UPLOAD_STAGE = Object.freeze({
+    BEGIN: 0x00,
+    PAGE_CHUNK: 0x01,
+    END: 0x02,
+    ABORT: 0x03,
+});
+/** MAX32674C .msbl image geometry (mirrors firmware flashUpdater.h). A page on
+ * the wire is PAGE_PAYLOAD + PAGE_CRC bytes; HEADER_SIZE bytes precede page 0. */
+const MSBL = Object.freeze({
+    HEADER_SIZE: 0x4c,
+    OFF_NUMPAGES: 0x44,
+    PAGE_PAYLOAD: 8192,
+    PAGE_CRC: 16,
+    PAGE_FILE_BYTES: 8208,
 });
 // ---------------------------------------------------------------------------
 // Operational config byte offsets
@@ -1684,6 +1705,11 @@ const OP_IDX = Object.freeze({
     LED_AUTO_BRIGHTNESS_CFG: 82,
     LED_MAX_BRIGHTNESS: 83,
     LED_LUX_THRESHOLD: 84,
+    // MAX32674 algorithm-suite subject parameters (bytes 86-91)
+    PERSON_HEIGHT_CM: 86, // u16 LE, cm
+    PERSON_WEIGHT_KG: 88, // u16 LE, kg
+    PERSON_AGE: 90, // u8, years
+    PERSON_GENDER: 91, // u8, 0=Male, 1=Female
 });
 /** Operational config layout version stored at OP_IDX.OP_CONFIG_VERSION (byte 9).
  * 0 = legacy 72-byte layout; 9 = v9 layout with second-generation sensor settings. */
@@ -1790,6 +1816,10 @@ function u24le(bytes, off) {
 /** Read a 16-bit unsigned integer at byte offset `off`, little-endian (full-array form). */
 function u16le_at(bytes, off) {
     return (bytes[off] | (bytes[off + 1] << 8)) >>> 0;
+}
+/** Read a 32-bit IEEE-754 float at byte offset `off`, little-endian. */
+function f32le(bytes, off) {
+    return new DataView(bytes.buffer, bytes.byteOffset + off, 4).getFloat32(0, true);
 }
 /** Return current time in milliseconds. */
 function nowMillis() {
@@ -2075,6 +2105,12 @@ const LOG_EVENT_NAMES = {
     50: 'LTC4123_RECOVERY_ATTEMPT',
     51: 'LTC4123_RECOVERY_GAVE_UP',
     52: 'LTC4123_CHRG_COMPLETE_OVERRIDDEN_BAD_BATT',
+    // DEV-790 USB enumeration debug events
+    53: 'USB_POWER_READY_EVT',
+    54: 'USB_USBD_ENABLE_CALLED',
+    55: 'USB_USBD_START_CALLED',
+    56: 'USB_COM_PORT_DISABLED_ON_DETECT',
+    57: 'USB_USBD_STOPPED_EVT',
 };
 const LOOKUP_STATUS_NAMES = {
     0: 'Zero',
@@ -2270,11 +2306,28 @@ function parseStatusPayload(response, sourceStatusProperty = 'status1') {
     const memoryCapacityKb = hasExtendedCapacity ? u32le_at(response, 60) : null;
     const memoryUsedKb = memoryCapacityKb == null ? null : Math.max(0, memoryCapacityKb - memoryFreeKb);
     // Bank breakdown: FULL=syncable data, 2DEL=partially-deleted, BAD=unusable flash.
-    // Present in payloads >= 57 bytes (tick-capable extended format).
-    const hasBankData = response.length >= 57;
-    const memoryFullBanksKb = hasBankData ? u32le_at(response, 45) : null;
-    const memoryTwoDelBanksKb = hasBankData ? u32le_at(response, 49) : null;
-    const memoryBadBanksKb = hasBankData ? u32le_at(response, 53) : null;
+    // Ported from ASM_Device.parse_status. Present in payloads >= 56 bytes. In the
+    // extended (fw v1.02.102+, payload >= 65 bytes) format the FULL and 2DEL totals
+    // are split: 3 low bytes at 47-49 / 50-52 plus a high byte appended at offset
+    // 58 / 59 respectively (mirroring the free-memory split to byte 57).
+    const hasBankData = response.length >= 56;
+    let memoryFullBanksKb = null;
+    let memoryTwoDelBanksKb = null;
+    let memoryBadBanksKb = null;
+    if (hasBankData) {
+        if (hasExtendedCapacity) {
+            memoryFullBanksKb =
+                (response[47] | (response[48] << 8) | (response[49] << 16) | (response[58] << 24)) >>> 0;
+            memoryTwoDelBanksKb =
+                (response[50] | (response[51] << 8) | (response[52] << 16) | (response[59] << 24)) >>> 0;
+            memoryBadBanksKb = u32le_at(response, 53); // bytes 53-56
+        }
+        else {
+            memoryFullBanksKb = (response[47] | (response[48] << 8) | (response[49] << 16)) >>> 0;
+            memoryTwoDelBanksKb = (response[50] | (response[51] << 8) | (response[52] << 16)) >>> 0;
+            memoryBadBanksKb = (response[53] | (response[54] << 8) | (response[55] << 16)) >>> 0;
+        }
+    }
     const batteryFallCounter = response.length >= 26 ? u16le_at(response, 24) : null;
     let statusFlags = null;
     if (response.length >= 34) {
@@ -2570,6 +2623,238 @@ function parseProductionConfigPayload(response) {
     };
 }
 
+/**
+ * Verisense sensor-calibration TLV codec.
+ *
+ * Mirrors the firmware `asm_calibration.{c,h}` byte format. A calibration "blob"
+ * is a self-describing block of per-sensor calibration that the device persists,
+ * exposes over the `CALIBRATION` command, and stamps into every logged payload
+ * header via a CRC-16 version tag.
+ *
+ * Layout (all little-endian):
+ *
+ *   Global header (12 bytes)
+ *     0  u16  totalLen          (= blob.length - 2)
+ *     2  u8   calibFormatVersion
+ *     3  u8   hwVerMajor
+ *     4  u8   hwVerMinor
+ *     5  u8   fwVerMajor
+ *     6  u8   fwVerMinor
+ *     7  u16  fwVerPatch
+ *     9  u8   sensorBlockCount
+ *    10  u16  reserved
+ *
+ *   Per-sensor block (12-byte header + payload)
+ *     0  u16  sensorId          (calibration-domain id, see {@link CalibSensorId})
+ *     2  u8   range/quality     (bits[5:0] full-scale index; bits[7:6] calib quality)
+ *     3  u8   dataLen
+ *     4  u8[8] ts               (0 = default/seeded; RTC time = real per-unit cal)
+ *    12  payload[dataLen]
+ *
+ *   IMU payload (60 bytes, float32): bias[3] · sens[3] · align[9] (row-major 3x3)
+ *
+ * Calibration math (ASM-DES04 §8): output = K·R·physical + b, so the host
+ * recovers physical = R⁻¹·K⁻¹·(raw − b). K is the diagonal sensitivity, R the
+ * rotation into the common ASM axes, b the offset bias.
+ */
+const SC_CALIB_FORMAT_VERSION = 1;
+const SC_GLOBAL_HEADER_BYTES = 12;
+const SC_BLOCK_HEADER_BYTES = 12;
+const SC_TS_BYTES = 8;
+const SC_DATA_LEN_IMU = 60;
+/**
+ * The per-block `range` byte packs the full-scale index in bits [5:0] and a 2-bit
+ * calibration-quality indicator in bits [7:6]. Lookups/comparisons must use only
+ * the index (`range & SC_CAL_RANGE_MASK`). Quality has no producer yet (always 0),
+ * so it is reserved without growing the blob or bumping the format version.
+ */
+const SC_CAL_RANGE_MASK = 0x3f;
+const SC_CAL_QUALITY_SHIFT = 6;
+const SC_CAL_QUALITY_MASK = 0x03;
+/** Calibration-quality indicator (ST MotionAC / Android sensor-accuracy convention). */
+const CalibQuality = {
+    UNKNOWN: 0,
+    POOR: 1,
+    OK: 2,
+    GOOD: 3,
+};
+/**
+ * Calibration-domain sensor IDs. Distinct from the data-stream sensor IDs
+ * (1=ADC, 2=LIS2DW12, 3=LSM6DS3, 4=PPG, 6=LSM6DSV, 7=VD6283, 8=MAX32674,
+ * 9=MLX90632). These reuse the Shimmer3 `SC_SENSOR_*` values where they exist,
+ * so accel/gyro/mag can each carry their own calibration even though one
+ * data-stream id (6) covers all three.
+ *
+ * Data-stream → calibration mapping: 6 → {37, 38, 42}, 2 → {39}, 3 → {40, 41}.
+ */
+const CalibSensorId = {
+    LSM6DSV_ACCEL: 37,
+    LSM6DSV_GYRO: 38,
+    LIS2DW12_ACCEL: 39,
+    /** 1st-gen LSM6DS3 accel (data-stream id 3). */
+    LSM6DS3_ACCEL: 40,
+    /** 1st-gen LSM6DS3 gyro (data-stream id 3). */
+    LSM6DS3_GYRO: 41,
+    LIS2MDL_MAG: 42,
+};
+function parseImuPayload(p) {
+    return {
+        bias: [f32le(p, 0), f32le(p, 4), f32le(p, 8)],
+        sens: [f32le(p, 12), f32le(p, 16), f32le(p, 20)],
+        align: [
+            f32le(p, 24),
+            f32le(p, 28),
+            f32le(p, 32),
+            f32le(p, 36),
+            f32le(p, 40),
+            f32le(p, 44),
+            f32le(p, 48),
+            f32le(p, 52),
+            f32le(p, 56),
+        ],
+    };
+}
+/** Parse a calibration blob into a typed, indexable {@link CalibrationSet}. */
+function parseCalibrationBlob(blob) {
+    if (blob.length < SC_GLOBAL_HEADER_BYTES) {
+        throw new Error(`parseCalibrationBlob: blob too short (${blob.length} < ${SC_GLOBAL_HEADER_BYTES})`);
+    }
+    const totalLen = u16le_at(blob, 0);
+    if (totalLen + 2 !== blob.length) {
+        throw new Error(`parseCalibrationBlob: totalLen ${totalLen} does not match blob.length-2 ${blob.length - 2}`);
+    }
+    const formatVersion = blob[2];
+    const hwVerMajor = blob[3];
+    const hwVerMinor = blob[4];
+    const fwVerMajor = blob[5];
+    const fwVerMinor = blob[6];
+    const fwVerPatch = u16le_at(blob, 7);
+    const blockCount = blob[9];
+    const reserved = u16le_at(blob, 10);
+    const blocks = [];
+    let off = SC_GLOBAL_HEADER_BYTES;
+    for (let i = 0; i < blockCount; i++) {
+        if (off + SC_BLOCK_HEADER_BYTES > blob.length) {
+            throw new Error(`parseCalibrationBlob: block ${i} header out of range`);
+        }
+        const sensorId = u16le_at(blob, off);
+        const rangeByte = blob[off + 2];
+        const range = rangeByte & SC_CAL_RANGE_MASK;
+        const quality = (rangeByte >> SC_CAL_QUALITY_SHIFT) & SC_CAL_QUALITY_MASK;
+        const dataLen = blob[off + 3];
+        const ts = blob.slice(off + 4, off + 4 + SC_TS_BYTES);
+        const payloadStart = off + SC_BLOCK_HEADER_BYTES;
+        if (payloadStart + dataLen > blob.length) {
+            throw new Error(`parseCalibrationBlob: block ${i} payload out of range`);
+        }
+        const payload = blob.slice(payloadStart, payloadStart + dataLen);
+        const isDefault = ts.every((b) => b === 0);
+        const block = { sensorId, range, quality, dataLen, ts, isDefault, payload };
+        if (dataLen === SC_DATA_LEN_IMU) {
+            block.imu = parseImuPayload(payload);
+        }
+        blocks.push(block);
+        off = payloadStart + dataLen;
+    }
+    const crc16 = crc16_ccitt_false(blob);
+    return {
+        formatVersion,
+        hwVerMajor,
+        hwVerMinor,
+        fwVerMajor,
+        fwVerMinor,
+        fwVerPatch,
+        reserved,
+        blocks,
+        crc16,
+        getImu(sensorId, range) {
+            const b = blocks.find((x) => x.sensorId === sensorId && x.range === range && x.imu);
+            return b?.imu ?? null;
+        },
+    };
+}
+function serializeImuPayload(imu) {
+    const out = new Uint8Array(SC_DATA_LEN_IMU);
+    const dv = new DataView(out.buffer);
+    for (let i = 0; i < 3; i++)
+        dv.setFloat32(i * 4, imu.bias[i] ?? 0, true);
+    for (let i = 0; i < 3; i++)
+        dv.setFloat32(12 + i * 4, imu.sens[i] ?? 0, true);
+    for (let i = 0; i < 9; i++)
+        dv.setFloat32(24 + i * 4, imu.align[i] ?? 0, true);
+    return out;
+}
+/** Serialize a calibration set into a blob (inverse of {@link parseCalibrationBlob}). */
+function serializeCalibrationBlob(input) {
+    const payloads = input.blocks.map((b) => {
+        if (b.payload)
+            return b.payload;
+        if (b.imu)
+            return serializeImuPayload(b.imu);
+        throw new Error('serializeCalibrationBlob: each block needs imu or payload');
+    });
+    let total = SC_GLOBAL_HEADER_BYTES;
+    for (const p of payloads)
+        total += SC_BLOCK_HEADER_BYTES + p.length;
+    const out = new Uint8Array(total);
+    const dv = new DataView(out.buffer);
+    dv.setUint16(0, total - 2, true);
+    out[2] = input.formatVersion ?? SC_CALIB_FORMAT_VERSION;
+    out[3] = input.hwVerMajor & 0xff;
+    out[4] = input.hwVerMinor & 0xff;
+    out[5] = input.fwVerMajor & 0xff;
+    out[6] = input.fwVerMinor & 0xff;
+    dv.setUint16(7, input.fwVerPatch & 0xffff, true);
+    out[9] = input.blocks.length & 0xff;
+    dv.setUint16(10, (input.reserved ?? 0) & 0xffff, true);
+    let off = SC_GLOBAL_HEADER_BYTES;
+    input.blocks.forEach((b, i) => {
+        const payload = payloads[i];
+        dv.setUint16(off, b.sensorId & 0xffff, true);
+        out[off + 2] =
+            (b.range & SC_CAL_RANGE_MASK) |
+                (((b.quality ?? 0) & SC_CAL_QUALITY_MASK) << SC_CAL_QUALITY_SHIFT);
+        out[off + 3] = payload.length & 0xff;
+        if (b.ts)
+            out.set(b.ts.subarray(0, SC_TS_BYTES), off + 4); // else leave zero (default)
+        out.set(payload, off + SC_BLOCK_HEADER_BYTES);
+        off += SC_BLOCK_HEADER_BYTES + payload.length;
+    });
+    return out;
+}
+/** CRC-16/CCITT-FALSE over a serialized blob — the value stamped into payload headers. */
+function calibrationBlobCrc(blob) {
+    return crc16_ccitt_false(blob);
+}
+/**
+ * Apply IMU calibration to a raw tri-axial sample.
+ *
+ *   physical = align · (K⁻¹ · (raw − bias))
+ *
+ * `bias` (b) is subtracted and `sens` (K, diagonal) divided per axis, then the
+ * `align` matrix (row-major 3x3) is applied directly to rotate the sensor frame
+ * into the common ASM frame. With identity `align` and zero `bias` this reduces
+ * to `raw / sens`.
+ *
+ * Convention note: `align` is the directly-applied sensor-frame → ASM-frame
+ * matrix (= R⁻¹ in ASM-DES04 §8's `output = K·R·physical + b` notation). This
+ * matches the cloud calibration CSV `rotation_*` columns one-to-one — the CSV
+ * stores the same applied matrix, row-major — so the sensor-calibration parser
+ * maps blob → CSV with NO transpose. (Confirmed against a LIS2DW12 sample CSV:
+ * offset→bias, sensitivity→sens, rotation→align.)
+ */
+function applyImuCalibration(raw, cal) {
+    const v0 = (raw[0] - cal.bias[0]) / cal.sens[0];
+    const v1 = (raw[1] - cal.bias[1]) / cal.sens[1];
+    const v2 = (raw[2] - cal.bias[2]) / cal.sens[2];
+    const a = cal.align;
+    return [
+        a[0] * v0 + a[1] * v1 + a[2] * v2,
+        a[3] * v0 + a[4] * v1 + a[5] * v2,
+        a[6] * v0 + a[7] * v1 + a[8] * v2,
+    ];
+}
+
 /** Build a protocol header byte from command/property nibbles. */
 function buildHeader(command, property) {
     return ((command & 0xf0) | (property & 0x0f)) & 0xff;
@@ -2602,13 +2887,21 @@ const STREAM_FRAME_HEADER = buildHeader(ASM_COMMAND.RESPONSE, ASM_PROPERTY.STREA
 /** Smallest valid streaming payload: sensorId(1) + tick(3) + CRC16(2). */
 const STREAM_FRAME_MIN_PAYLOAD = 6;
 /**
- * Largest streaming payload we will accept. The firmware emits each streaming
- * frame as a single BLE notification, so it can never exceed the BLE5 MTU
- * (244 bytes) minus the 3-byte frame header. The ceiling is deliberately
- * generous so a genuine frame is never rejected, while still bounding how far a
- * corrupt length field can run before the CRC rejects it during resync.
+ * Largest streaming payload we will accept. The firmware packages multi-sample
+ * sensor records into a single logical frame that is frequently much larger
+ * than one BLE notification (e.g. ~1.8 kB for an LSM6DSV accel/gyro/mag burst)
+ * and fragments it across several notifications; the host reassembles them in
+ * its receive buffer before this scanner runs. The ceiling must therefore cover
+ * the firmware's largest packaged payload — it mirrors the length-only path's
+ * `MAX_FRAME_PAYLOAD_LEN` (see VerisenseClient) — not the BLE MTU. It still
+ * bounds how far a corrupt length field can run before the CRC rejects it
+ * during resync.
+ *
+ * WARNING: do NOT shrink this to an MTU-sized value. A small ceiling silently
+ * drops every large frame (accel/gyro/mag), because their length exceeds the
+ * cap and the CRC trailer is never reached — the stream just looks dead.
  */
-const STREAM_FRAME_MAX_PAYLOAD = 512;
+const STREAM_FRAME_MAX_PAYLOAD = 40000;
 const STREAM_SCAN_NEED_MORE = { status: 'need-more' };
 const STREAM_SCAN_INVALID = { status: 'invalid' };
 /**
@@ -4444,14 +4737,63 @@ const VERISENSE_OPERATIONAL_FIELD_SCHEMA = [
         min: 0,
         max: 65535,
     },
+    {
+        key: 'PERSON_HEIGHT_CM',
+        label: 'Height',
+        desc: 'Subject height for the MAX32674 algorithm suite (cm)',
+        kind: 'u16',
+        index: OP_IDX.PERSON_HEIGHT_CM,
+        min: 50,
+        max: 250,
+    },
+    {
+        key: 'PERSON_WEIGHT_KG',
+        label: 'Weight',
+        desc: 'Subject weight for the MAX32674 algorithm suite (kg)',
+        kind: 'u16',
+        index: OP_IDX.PERSON_WEIGHT_KG,
+        min: 10,
+        max: 300,
+    },
+    {
+        key: 'PERSON_AGE',
+        label: 'Age',
+        desc: 'Subject age for the MAX32674 algorithm suite (years)',
+        kind: 'u8',
+        index: OP_IDX.PERSON_AGE,
+        min: 0,
+        max: 120,
+    },
+    {
+        key: 'PERSON_GENDER',
+        label: 'Gender',
+        desc: 'Subject gender for the MAX32674 algorithm suite',
+        kind: 'u8',
+        index: OP_IDX.PERSON_GENDER,
+        min: 0,
+        max: 1,
+        options: [
+            [0, 'Male'],
+            [1, 'Female'],
+        ],
+    },
 ];
-const VERISENSE_OP_CONFIG_BYTE_SIZE = 86;
+const VERISENSE_OP_CONFIG_BYTE_SIZE = 92;
 function createBlankVerisenseOperationalConfig(byteSize = VERISENSE_OP_CONFIG_BYTE_SIZE) {
     const blank = new Uint8Array(byteSize);
     blank[0] = 0x5a;
     // Stamp the layout version so v9-sized configs are recognised as second-gen.
     if (byteSize >= VERISENSE_OP_CONFIG_BYTE_SIZE) {
         blank[OP_IDX.OP_CONFIG_VERSION] = OP_CONFIG_VERSION_V9;
+        // Seed the MAX32674 subject parameters with the Maxim algorithm defaults
+        // (height 175 cm, weight 78 kg, age 30 yr, gender Male) so the UI shows
+        // sane values rather than blanks. u16 fields are little-endian.
+        blank[OP_IDX.PERSON_HEIGHT_CM] = 175 & 0xff;
+        blank[OP_IDX.PERSON_HEIGHT_CM + 1] = (175 >> 8) & 0xff;
+        blank[OP_IDX.PERSON_WEIGHT_KG] = 78 & 0xff;
+        blank[OP_IDX.PERSON_WEIGHT_KG + 1] = (78 >> 8) & 0xff;
+        blank[OP_IDX.PERSON_AGE] = 30;
+        blank[OP_IDX.PERSON_GENDER] = 0;
     }
     return blank;
 }
@@ -4716,6 +5058,12 @@ const VERISENSE_OPERATIONAL_FIELD_GROUPS = [
         ],
     },
     {
+        id: 'person',
+        title: 'Subject / Person Parameters',
+        openByDefault: false,
+        keys: ['PERSON_AGE', 'PERSON_HEIGHT_CM', 'PERSON_WEIGHT_KG', 'PERSON_GENDER'],
+    },
+    {
         id: 'led',
         title: 'LED Auto-Brightness',
         openByDefault: false,
@@ -4738,6 +5086,7 @@ const VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR = {
     light: 'ambientLight',
     skin_temp: 'skinTemperature',
     algo: 'algorithmHub',
+    person: 'algorithmHub',
     led: 'ledAutoBrightness',
 };
 /**
@@ -4789,6 +5138,16 @@ class SensorBase {
         this.samplingRateHz = null;
         /** Whether this sensor is enabled in the operational config. */
         this.enabled = true;
+        /**
+         * Per-device calibration read from the sensor, or null when none is available
+         * (decoders then fall back to nominal full-scale/datasheet scaling). Set via
+         * {@link applyCalibration}; subclasses read it in their calibrate routines.
+         */
+        this.calibration = null;
+    }
+    /** Supply (or clear) the device calibration set used by this decoder. */
+    applyCalibration(set) {
+        this.calibration = set;
     }
     /** Reset all timestamp state (call on (re)connect or when streaming restarts). */
     resetTimestamps() {
@@ -5164,6 +5523,8 @@ class SensorLIS2DW12 extends SensorBase {
             '16G': [208.958240364, 208.958240364, 208.958240364],
         };
         this.range = '2G';
+        /** Numeric full-scale index (0=2G..3=16G) used to select the device calibration block. */
+        this.rangeIndex = 0;
         this.samplingRateHz = 50;
     }
     setRange(rangeStr) {
@@ -5198,6 +5559,11 @@ class SensorLIS2DW12 extends SensorBase {
         return out;
     }
     _calibrate(raw) {
+        // Prefer per-device calibration from the sensor when available for this range.
+        const dev = this.calibration?.getImu(CalibSensorId.LIS2DW12_ACCEL, this.rangeIndex);
+        if (dev)
+            return applyImuCalibration(raw, dev);
+        // Fallback: nominal offset / alignment / datasheet sensitivity.
         const v = [
             raw[0] - this.offset[0],
             raw[1] - this.offset[1],
@@ -5242,6 +5608,7 @@ class SensorLIS2DW12 extends SensorBase {
         const rateSetting = (cfg0 >> 4) & 0x0f;
         const rangeMap = { 0: '2G', 1: '4G', 2: '8G', 3: '16G' };
         this.setRange(rangeMap[rangeSetting] ?? '2G');
+        this.rangeIndex = rangeSetting & 0x03;
         const lowPowerHzByCfg = {
             1: 1.6,
             2: 12.5,
@@ -5276,10 +5643,15 @@ class SensorLSM6DS3 extends SensorBase {
     constructor() {
         super();
         this.offset = [0, 0, 0];
+        // Applied directly as `physical = align · (raw − offset)` (no inversion), so this
+        // must be the *inverse* alignment R⁻¹ = Rᵀ — matching the Shimmer Java reference
+        // `UtilCalibration` (C = R⁻¹·K⁻¹·(U−B)) and the gen-1 calibration doc's R, which
+        // is the forward §8 rotation. (Previously stored the un-transposed R, which
+        // applied R instead of R⁻¹.)
         this.align = [
-            [0, 0, 1],
-            [-1, 0, 0],
             [0, -1, 0],
+            [0, 0, -1],
+            [1, 0, 0],
         ];
         this.accSensByRange = {
             '2G': [1671.665922915, 1671.665922915, 1671.665922915],
@@ -5326,6 +5698,22 @@ class SensorLSM6DS3 extends SensorBase {
             a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2],
         ];
     }
+    _calibrateAccel(raw) {
+        const dev = this.calibration?.getImu(CalibSensorId.LSM6DS3_ACCEL, SensorLSM6DS3.ACC_RANGE_CODE[this.accRange]);
+        if (dev)
+            return applyImuCalibration(raw, dev);
+        const aligned = this._applyAlignAndOffset(raw);
+        const s = this.accSensByRange[this.accRange];
+        return [aligned[0] / s[0], aligned[1] / s[1], aligned[2] / s[2]];
+    }
+    _calibrateGyro(raw) {
+        const dev = this.calibration?.getImu(CalibSensorId.LSM6DS3_GYRO, SensorLSM6DS3.GYRO_RANGE_CODE[this.gyroRange]);
+        if (dev)
+            return applyImuCalibration(raw, dev);
+        const aligned = this._applyAlignAndOffset(raw);
+        const s = this.gyroSensByRange[this.gyroRange];
+        return [aligned[0] / s[0], aligned[1] / s[1], aligned[2] / s[2]];
+    }
     parsePayload(sensorPayloadBytes) {
         let bytesPerSample = 6;
         if (this.gyroEnabled && this.accEnabled)
@@ -5365,14 +5753,10 @@ class SensorLSM6DS3 extends SensorBase {
             let accCal = null;
             let gyroCal = null;
             if (accRaw) {
-                const aligned = this._applyAlignAndOffset(accRaw);
-                const s = this.accSensByRange[this.accRange];
-                accCal = [aligned[0] / s[0], aligned[1] / s[1], aligned[2] / s[2]];
+                accCal = this._calibrateAccel(accRaw);
             }
             if (gyroRaw) {
-                const aligned = this._applyAlignAndOffset(gyroRaw);
-                const s = this.gyroSensByRange[this.gyroRange];
-                gyroCal = [aligned[0] / s[0], aligned[1] / s[1], aligned[2] / s[2]];
+                gyroCal = this._calibrateGyro(gyroRaw);
             }
             out.push({
                 accel: accRaw && accCal ? { raw: accRaw, cal: accCal, units: 'm/s^2' } : null,
@@ -5414,6 +5798,19 @@ class SensorLSM6DS3 extends SensorBase {
             this.samplingRateHz = hz;
     }
 }
+// Calibration-block range codes (must match getVerisenseCalibrationSensors gen-1).
+SensorLSM6DS3.ACC_RANGE_CODE = {
+    '2G': 0,
+    '4G': 1,
+    '8G': 2,
+    '16G': 3,
+};
+SensorLSM6DS3.GYRO_RANGE_CODE = {
+    '250DPS': 0,
+    '500DPS': 1,
+    '1000DPS': 2,
+    '2000DPS': 3,
+};
 
 class SensorLSM6DSV extends SensorBase {
     constructor() {
@@ -5423,6 +5820,10 @@ class SensorLSM6DSV extends SensorBase {
         this.magEnabled = true;
         this.accelFsG = 2;
         this.gyroFsDps = 2000;
+        // Numeric full-scale codes (register values) used to select the device
+        // calibration block: accel 0..3 (2/4/8/16 g), gyro 0..4 (125..2000 dps).
+        this.fsXlCode = 0;
+        this.fsGCode = 4;
         // Configured per-stream rates (the FIFO interleaves accel/gyro/mag, so each
         // stream is timestamped on its own rate — see computeSampleTimestamps). Public
         // so the per-sub-stream loss tracking (getStreamContributions) can read each.
@@ -5518,14 +5919,23 @@ class SensorLSM6DSV extends SensorBase {
         }
     }
     calibrateAccel(raw) {
+        const dev = this.calibration?.getImu(CalibSensorId.LSM6DSV_ACCEL, this.fsXlCode);
+        if (dev)
+            return applyImuCalibration(raw, dev);
         const scale = (this.accelFsG / 32768) * 9.80665;
         return [raw[0] * scale, raw[1] * scale, raw[2] * scale];
     }
     calibrateGyro(raw) {
+        const dev = this.calibration?.getImu(CalibSensorId.LSM6DSV_GYRO, this.fsGCode);
+        if (dev)
+            return applyImuCalibration(raw, dev);
         const scale = this.gyroFsDps / 32768;
         return [raw[0] * scale, raw[1] * scale, raw[2] * scale];
     }
     calibrateMag(raw) {
+        const dev = this.calibration?.getImu(CalibSensorId.LIS2MDL_MAG, 0);
+        if (dev)
+            return applyImuCalibration(raw, dev);
         // LIS2MDL nominal sensitivity is 1.5 mGauss/LSB (0.15 uT/LSB).
         const scale = 0.15;
         return [raw[0] * scale, raw[1] * scale, raw[2] * scale];
@@ -5581,6 +5991,8 @@ class SensorLSM6DSV extends SensorBase {
         const odrMag = cfg2 & 0x03;
         this.accelFsG = this.decodeAccelFsG(fsXl);
         this.gyroFsDps = this.decodeGyroFsDps(fsG);
+        this.fsXlCode = fsXl;
+        this.fsGCode = fsG;
         this.accelHz = this.accEnabled ? this.decodeOdrHz(odrXl) : 0;
         this.gyroHz = this.gyroEnabled ? this.decodeOdrHz(odrG) : 0;
         // Configured mag output rate (NOT capped at the accel/gyro trigger). Loss is
@@ -6164,6 +6576,8 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this.debugSync = false;
         this._syncRxCount = 0;
         this._syncPayloadCount = 0;
+        /** Per-device calibration last read from the device, or null. */
+        this._calibration = null;
         this.hardwareIdentifier = opts.hardwareIdentifier ?? 'VERISENSE_PULSE_PLUS';
         this.stripStreamCrc = opts.stripStreamCrc ?? true;
         this.sensors = {
@@ -6640,9 +7054,26 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this.emit('streaming', { on: true });
     }
     async stopStreaming() {
-        await this.setStreamingMode(false);
-        this._mode = 'idle';
-        this.emit('streaming', { on: false });
+        // Stop is best-effort. The application-level ACK for STREAM_MODE-disable rides
+        // on BLE notifications, which are unacknowledged and can be dropped under
+        // high-throughput streaming; the in-flight stream tail is also parsed by the
+        // command path (not the CRC-gated stream scanner) once we leave streaming
+        // mode, so the small ACK frame is easily lost or mis-framed. We confirm
+        // delivery of the disable command via a write-with-response, then reconcile
+        // local state regardless — a missing ACK must never leave the client wedged
+        // in 'streaming' (which locks the UI). This mirrors the best-effort stop used
+        // by Shimmer3RClient and the DEVICE_DISCONNECT path in disconnect().
+        try {
+            await this.writeBytes(buildMessage(ASM_COMMAND.WRITE, ASM_PROPERTY.STREAM_MODE, [STREAM_MODE.DISABLE]), { withResponse: true });
+        }
+        catch (e) {
+            this._log('stopStreaming: disable write failed; reconciling state anyway:', e);
+        }
+        finally {
+            this._mode = 'idle';
+            this._resetAssembler();
+            this.emit('streaming', { on: false });
+        }
     }
     // ---------------------------------------------------------------------------
     // Logged data transfer
@@ -7250,6 +7681,103 @@ class VerisenseBleDevice extends BaseShimmerClient {
         const rsp = await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildDebugPayload(debugId, args), timeoutMs);
         return { payload: rsp.payload };
     }
+    /**
+     * Stream a MAX32674C algorithm-hub firmware image (.msbl) to the device and
+     * flash it into the hub via the Maxim bootloader. This is a one-time factory
+     * operation: it blocks the device for ~1-2 minutes while the hub flash is
+     * erased and each page is written. Only SR68 Pulse+ hardware (the only board
+     * carrying the hub) accepts it — other hardware NACKs the BEGIN stage.
+     *
+     * @param msbl       raw .msbl file bytes
+     * @param onProgress optional progress callback (pagesDone, totalPages)
+     * @returns the hub application firmware version string read back after flashing
+     */
+    async uploadHubFirmware(msbl, onProgress) {
+        const img = msbl instanceof Uint8Array ? msbl : new Uint8Array(msbl);
+        if (img.length < MSBL.HEADER_SIZE) {
+            throw new Error('uploadHubFirmware: file is too small to be a valid .msbl');
+        }
+        const numPages = img[MSBL.OFF_NUMPAGES] | (img[MSBL.OFF_NUMPAGES + 1] << 8);
+        const expectedLen = MSBL.HEADER_SIZE + numPages * MSBL.PAGE_FILE_BYTES;
+        if (numPages === 0 || img.length < expectedLen) {
+            throw new Error(`uploadHubFirmware: invalid .msbl (pages=${numPages}, length=${img.length}, expected>=${expectedLen})`);
+        }
+        // BEGIN: device enters bootloader, programs IV/auth/page-count, erases flash.
+        try {
+            await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildHubUploadPayload(HUB_FW_UPLOAD_STAGE.BEGIN, img.subarray(0, MSBL.HEADER_SIZE)), 15000);
+        }
+        catch (e) {
+            throw new Error(`Hub FW upload BEGIN failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        // Pages: stream each page in order, awaiting ACK_NEXT_STAGE (page flashed).
+        const MAX_PAGE_RETRIES = 5;
+        for (let page = 0; page < numPages; page++) {
+            const base = MSBL.HEADER_SIZE + page * MSBL.PAGE_FILE_BYTES;
+            const pageBytes = img.subarray(base, base + MSBL.PAGE_FILE_BYTES);
+            let attempt = 0;
+            for (;;) {
+                try {
+                    await this._sendHubPage(page, pageBytes);
+                    break;
+                }
+                catch (e) {
+                    if (++attempt >= MAX_PAGE_RETRIES) {
+                        await this._abortHubUpload();
+                        throw new Error(`Hub FW upload failed at page ${page + 1}/${numPages} after ${attempt} attempts: ${e instanceof Error ? e.message : String(e)}`);
+                    }
+                }
+            }
+            onProgress?.(page + 1, numPages);
+        }
+        // END: device resets the hub to application mode and returns its FW version.
+        const endRsp = await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildHubUploadPayload(HUB_FW_UPLOAD_STAGE.END), 8000);
+        return new TextDecoder().decode(endRsp.payload).replace(/\0+$/, '').trim();
+    }
+    /** Build a debug payload `[HUB_FW_UPLOAD, stage, ...stageArgs]`. */
+    _buildHubUploadPayload(stage, stageArgs = []) {
+        const a = stageArgs instanceof Uint8Array ? stageArgs : new Uint8Array(stageArgs);
+        const staged = new Uint8Array(1 + a.length);
+        staged[0] = stage & 0xff;
+        staged.set(a, 1);
+        return this._buildDebugPayload(DEBUG_COMMAND_ID.HUB_FW_UPLOAD, staged);
+    }
+    /** Send one 8208-byte page as in-order <=64-byte chunks; await ACK_NEXT_STAGE. */
+    async _sendHubPage(page, pageBytes) {
+        const CHUNK = 64; // keep each packet within the device's ~96-byte RX buffer
+        const total = pageBytes.length;
+        for (let off = 0; off < total; off += CHUNK) {
+            const end = Math.min(off + CHUNK, total);
+            const isFinal = end >= total;
+            const args = new Uint8Array(4 + (end - off));
+            args[0] = page & 0xff;
+            args[1] = (page >> 8) & 0xff;
+            args[2] = off & 0xff;
+            args[3] = (off >> 8) & 0xff;
+            args.set(pageBytes.subarray(off, end), 4);
+            const payload = this._buildHubUploadPayload(HUB_FW_UPLOAD_STAGE.PAGE_CHUNK, args);
+            if (isFinal) {
+                // Final chunk completes the page; the device flashes it (~0.7 s) and
+                // replies ACK_NEXT_STAGE (or NACK on failure -> throws -> page retry).
+                await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, payload, 6000);
+            }
+            else {
+                // Mid-page chunk: reliable, in-order delivery via write-with-response,
+                // with no application-level reply from the device.
+                await this.writeBytes(buildMessage(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, payload), {
+                    withResponse: true,
+                });
+            }
+        }
+    }
+    /** Best-effort abort: tell the device to reset the hub back to application mode. */
+    async _abortHubUpload() {
+        try {
+            await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildHubUploadPayload(HUB_FW_UPLOAD_STAGE.ABORT), 5000);
+        }
+        catch {
+            /* best effort */
+        }
+    }
     async readFlashLookupTable(index = 0, timeoutMs = 12000) {
         return this.readDebugCommand(DEBUG_COMMAND_ID.FLASH_LOOKUP_TABLE_READ, this._debugIndexArgs(index), timeoutMs);
     }
@@ -7783,6 +8311,61 @@ class VerisenseBleDevice extends BaseShimmerClient {
         await this.writeOperationalConfig(op);
         await this.readOpConfigFromDevice();
     }
+    /** The parsed calibration set last read via {@link readCalibrationParsed}, or null. */
+    getCalibration() {
+        return this._calibration;
+    }
+    /**
+     * Read the raw calibration blob from the device (CMD_AR_CFG_CALIB). The whole
+     * blob (~1 KB) arrives in one response, reassembled across BLE/USB fragments.
+     * Requires FW v2.0.4+; older firmware NACKs or times out.
+     */
+    async readCalibration(timeoutMs = 8000) {
+        const rsp = await this.readProperty(ASM_PROPERTY.CALIBRATION, timeoutMs);
+        const blob = rsp.payload;
+        if (!blob || blob.length < SC_GLOBAL_HEADER_BYTES) {
+            throw new Error('readCalibration: device returned no/short calibration blob');
+        }
+        return new Uint8Array(blob);
+    }
+    /**
+     * Read + parse the calibration set, cache it, and push it into the IMU
+     * decoders so subsequent samples calibrate from per-device values. Call before
+     * a logged-data transfer and/or after connect (no-op on FW that lacks it —
+     * the call rejects and the decoders keep their full-scale fallback).
+     */
+    async readCalibrationParsed() {
+        const blob = await this.readCalibration();
+        const set = parseCalibrationBlob(blob);
+        this._calibration = set;
+        try {
+            this.accel1.applyCalibration(set);
+            this.sensors[6].applyCalibration(set);
+        }
+        catch (e) {
+            console.warn('[calib] apply after read failed:', e);
+        }
+        return set;
+    }
+    /**
+     * Write a calibration blob to the device (CMD_AR_CFG_CALIB), chunked in
+     * <=128-byte pieces as [offset_lo, offset_hi, ...chunk]. The device reassembles
+     * and commits on the final chunk. Requires FW v2.0.4+.
+     */
+    async writeCalibration(blob, chunkSize = 128) {
+        if (!blob || blob.length < SC_GLOBAL_HEADER_BYTES) {
+            throw new Error('writeCalibration: invalid calibration blob');
+        }
+        const step = Math.max(1, Math.min(chunkSize, 128)); // firmware ramWrite caps chunks at 128
+        for (let offset = 0; offset < blob.length; offset += step) {
+            const chunk = blob.subarray(offset, Math.min(offset + step, blob.length));
+            const payload = new Uint8Array(2 + chunk.length);
+            payload[0] = offset & 0xff;
+            payload[1] = (offset >> 8) & 0xff;
+            payload.set(chunk, 2);
+            await this.writeProperty(ASM_PROPERTY.CALIBRATION, payload);
+        }
+    }
     getSensor(name) {
         const k = String(name ?? '').toLowerCase();
         if (!k)
@@ -7892,8 +8475,8 @@ class VerisenseBleDevice extends BaseShimmerClient {
             command === ASM_COMMAND.ACK_NEXT_STAGE;
         if (!validCommand)
             return false;
-        // Known properties are 0x01..0x0C; keep 0x00 permissive for transient frames.
-        return property === 0 || (property >= ASM_PROPERTY.STATUS1 && property <= ASM_PROPERTY.STATUS2);
+        // Known properties are 0x01..0x0D; keep 0x00 permissive for transient frames.
+        return (property === 0 || (property >= ASM_PROPERTY.STATUS1 && property <= ASM_PROPERTY.CALIBRATION));
     }
     _isPlausibleFrameStart(hdr, len) {
         // Logged sync frames can be large and should be length-gated like the working single-file implementation.
@@ -7904,8 +8487,12 @@ class VerisenseBleDevice extends BaseShimmerClient {
             return false;
         // Debug responses may carry large blobs (for example flash lookup tables),
         // while normal properties and streaming/logged payloads should stay bounded.
-        const isPendingDebugCommand = this._mode === 'command' && this._pending?.expectedProperty === ASM_PROPERTY.DEBUG_COMMAND;
-        const maxLen = isPendingDebugCommand
+        // DEBUG and CALIBRATION responses can be large (lookup tables / the ~1 KB
+        // calibration blob) and arrive across multiple fragments.
+        const expectsLargeResponse = this._mode === 'command' &&
+            (this._pending?.expectedProperty === ASM_PROPERTY.DEBUG_COMMAND ||
+                this._pending?.expectedProperty === ASM_PROPERTY.CALIBRATION);
+        const maxLen = expectsLargeResponse
             ? VerisenseBleDevice.MAX_DEBUG_FRAME_PAYLOAD_LEN
             : VerisenseBleDevice.MAX_FRAME_PAYLOAD_LEN;
         return len <= maxLen;
@@ -8133,12 +8720,231 @@ class VerisenseBleDevice extends BaseShimmerClient {
         return this._streamStats.snapshot(nowMillis());
     }
 }
-VerisenseBleDevice.MAX_FRAME_PAYLOAD_LEN = 40000;
+// Single source of truth for the max frame size, shared with the CRC-gated
+// streaming scanner so both framing paths accept the same large (fragmented)
+// payloads. See STREAM_FRAME_MAX_PAYLOAD.
+VerisenseBleDevice.MAX_FRAME_PAYLOAD_LEN = STREAM_FRAME_MAX_PAYLOAD;
 VerisenseBleDevice.MAX_DEBUG_FRAME_PAYLOAD_LEN = 0xffff;
 // Static NUS UUIDs
 VerisenseBleDevice.NUS_SERVICE = NUS_SERVICE;
 VerisenseBleDevice.NUS_TX = NUS_TX;
 VerisenseBleDevice.NUS_RX = NUS_RX;
 
-export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, setVerisenseOperationalBitRange, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, writeVerisenseOperationalFieldValue };
+/**
+ * Verisense calibration defaults, hardware/firmware gating, and timestamp helpers.
+ *
+ * The byte-level codec lives in `calibration.ts`; this module is the host-side
+ * single source of truth for the *default* calibration (the mirror of the
+ * firmware `AsmCalib_seedDefaults`) plus the small amount of domain logic the UI
+ * used to carry: which calibration blocks a board has, the minimum firmware that
+ * supports `CMD_AR_CFG_CALIB`, and the 8-byte timestamp encode/decode.
+ */
+/** Minimum firmware that implements the `CMD_AR_CFG_CALIB` (0x0D) command. */
+const VERISENSE_CALIBRATION_MIN_FW = {
+    major: 2,
+    minor: 0,
+    internal: 4,
+};
+/** Whether the given firmware version supports the calibration command. */
+function supportsVerisenseCalibration(fw) {
+    if (!fw)
+        return false;
+    return compareVerisenseFirmwareVersion(fw, VERISENSE_CALIBRATION_MIN_FW) >= 0;
+}
+// ---------------------------------------------------------------------------
+// 8-byte little-endian Unix-epoch-seconds timestamp (block header `ts` field).
+// ---------------------------------------------------------------------------
+/** Encode Unix-epoch seconds into the 8-byte little-endian calibration `ts`. */
+function unixSecondsToCalibTsBytes(unixSeconds) {
+    const out = new Uint8Array(SC_TS_BYTES);
+    let v = Math.max(0, Math.floor(Number(unixSeconds) || 0));
+    for (let i = 0; i < SC_TS_BYTES; i++) {
+        out[i] = v & 0xff;
+        v = Math.floor(v / 256);
+    }
+    return out;
+}
+/** Decode the 8-byte little-endian calibration `ts` back to Unix-epoch seconds
+ * (0 = default/seeded). */
+function calibTsBytesToUnixSeconds(ts) {
+    if (!ts || ts.length < SC_TS_BYTES)
+        return 0;
+    let secs = 0;
+    for (let i = SC_TS_BYTES - 1; i >= 0; i--)
+        secs = secs * 256 + (ts[i] & 0xff);
+    return secs;
+}
+const ACCEL_RANGES = [
+    { code: 0, label: '±2g', sens: 1671.665922915 },
+    { code: 1, label: '±4g', sens: 835.832961457 },
+    { code: 2, label: '±8g', sens: 417.916480729 },
+    { code: 3, label: '±16g', sens: 208.958240364 },
+];
+// LSM6DSV gyro full-scale codes 0..4 (125/250/500/1000/2000 dps).
+const GYRO_RANGES = [
+    { code: 0, label: '±125dps', sens: 228.571428571 },
+    { code: 1, label: '±250dps', sens: 114.285714286 },
+    { code: 2, label: '±500dps', sens: 57.142857143 },
+    { code: 3, label: '±1000dps', sens: 28.571428571 },
+    { code: 4, label: '±2000dps', sens: 14.285714286 },
+];
+// LSM6DS3 gyro full-scale codes 0..3 (250/500/1000/2000 dps) — the gen-1 op-config
+// gyro field is 2 bits, so 125 dps is not selectable via the standard range (see
+// SensorLSM6DS3). Codes here match that field and the decoder lookup.
+const LSM6DS3_GYRO_RANGES = [
+    { code: 0, label: '±250dps', sens: 114.285714286 },
+    { code: 1, label: '±500dps', sens: 57.142857143 },
+    { code: 2, label: '±1000dps', sens: 28.571428571 },
+    { code: 3, label: '±2000dps', sens: 14.285714286 },
+];
+/**
+ * 2nd-generation catalog (LSM6DSV accel+gyro, LIS2DW12, LIS2MDL). Alignment
+ * matrices derived from the ST datasheet axis figures + the SR68-10 pin-1
+ * placement; common frame +X=strap, +Y=out of face, +Z=toward hand. LSM6DSV /
+ * LIS2DW12 are proper rotations (det +1); the LIS2MDL frame is left-handed
+ * (det −1, a reflection). Kept byte-for-byte in sync with the firmware seed
+ * (asm_calibration.c) and VERISENSE_CALIBRATION.md §4.
+ */
+const CALIBRATION_SENSORS_GEN2 = [
+    {
+        id: CalibSensorId.LSM6DSV_ACCEL,
+        label: 'Accelerometer (LSM6DSV)',
+        unit: 'LSB/(m/s²)',
+        align: [0, -1, 0, 0, 0, 1, -1, 0, 0],
+        ranges: ACCEL_RANGES,
+    },
+    {
+        id: CalibSensorId.LSM6DSV_GYRO,
+        label: 'Gyroscope (LSM6DSV)',
+        unit: 'LSB/dps',
+        align: [0, -1, 0, 0, 0, 1, -1, 0, 0],
+        ranges: GYRO_RANGES,
+    },
+    {
+        id: CalibSensorId.LIS2DW12_ACCEL,
+        label: 'Accelerometer 2 (LIS2DW12)',
+        unit: 'LSB/(m/s²)',
+        align: [1, 0, 0, 0, 0, 1, 0, -1, 0],
+        ranges: ACCEL_RANGES,
+    },
+    {
+        id: CalibSensorId.LIS2MDL_MAG,
+        label: 'Magnetometer (LIS2MDL)',
+        unit: 'LSB/Gauss',
+        align: [0, 1, 0, 0, 0, 1, -1, 0, 0],
+        ranges: [{ code: 0, label: '±49.152Ga', sens: 667 }],
+    },
+];
+/**
+ * 1st-generation catalog (LIS2DW12 + LSM6DS3 accel/gyro). Sensitivities and
+ * alignment from the gen-1 calibration document (ASM-DES §8). The doc states the
+ * forward rotation `R` (output = K·R·physical); the stored `align` is the applied
+ * sensor→common map = Rᵀ. Note the LIS2DW12 mounting differs from gen-2, so its
+ * alignment (id 39) is generation-specific. All proper rotations (det +1).
+ */
+const CALIBRATION_SENSORS_GEN1 = [
+    {
+        id: CalibSensorId.LIS2DW12_ACCEL,
+        label: 'Accelerometer 1 (LIS2DW12)',
+        unit: 'LSB/(m/s²)',
+        align: [0, 1, 0, 0, 0, 1, 1, 0, 0],
+        ranges: ACCEL_RANGES,
+    },
+    {
+        id: CalibSensorId.LSM6DS3_ACCEL,
+        label: 'Accelerometer 2 (LSM6DS3)',
+        unit: 'LSB/(m/s²)',
+        align: [0, -1, 0, 0, 0, -1, 1, 0, 0],
+        ranges: ACCEL_RANGES,
+    },
+    {
+        id: CalibSensorId.LSM6DS3_GYRO,
+        label: 'Gyroscope (LSM6DS3)',
+        unit: 'LSB/dps',
+        align: [0, -1, 0, 0, 0, -1, 1, 0, 0],
+        ranges: LSM6DS3_GYRO_RANGES,
+    },
+];
+/**
+ * The calibration sensor catalog for a board: the 1st-generation set
+ * (LIS2DW12 + LSM6DS3) for 1st-gen hardware, otherwise the 2nd-generation set
+ * (LSM6DSV + LIS2DW12 + LIS2MDL). Unknown/offline (no revision) defaults to
+ * 2nd-gen. Note id 39 (LIS2DW12) appears in both with a generation-specific
+ * alignment, so the catalog must be resolved per hardware revision.
+ */
+function getVerisenseCalibrationSensors(revHwMajor, revHwMinor) {
+    if (revHwMajor != null &&
+        revHwMinor != null &&
+        !isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor)) {
+        return CALIBRATION_SENSORS_GEN1;
+    }
+    return CALIBRATION_SENSORS_GEN2;
+}
+/**
+ * Build the default calibration set for a board (bias=0, default sensitivity,
+ * default alignment, ts=0). Host-side mirror of `AsmCalib_seedDefaults`; useful
+ * for "reset to defaults" and round-trip tests.
+ */
+function buildDefaultVerisenseCalibrationSet(opts) {
+    const sensors = getVerisenseCalibrationSensors(opts.hwVerMajor, opts.hwVerMinor);
+    const blocks = sensors.flatMap((s) => s.ranges.map((r) => ({
+        sensorId: s.id,
+        range: r.code,
+        imu: {
+            bias: [0, 0, 0],
+            sens: [r.sens, r.sens, r.sens],
+            align: s.align.slice(),
+        },
+    })));
+    return {
+        hwVerMajor: opts.hwVerMajor,
+        hwVerMinor: opts.hwVerMinor,
+        fwVerMajor: opts.fwVerMajor,
+        fwVerMinor: opts.fwVerMinor,
+        fwVerPatch: opts.fwVerPatch,
+        blocks,
+    };
+}
+/**
+ * Map each calibration-domain sensor id to whether it is present and usable on
+ * the connected hardware:
+ *  - `enabled`  — present and recorded from; show + allow edit.
+ *  - `disabled` — physically present but not recorded from (LIS2DW12 routed to
+ *    the algorithm hub on 2nd-gen SR68); show greyed.
+ *  - `hidden`   — not fitted on this hardware.
+ *
+ * `support` is the result of `getVerisenseHardwareSensorSupport`. A null/absent
+ * support object (offline / unknown hardware) reports every sensor `enabled`.
+ */
+function getVerisenseCalibrationSensorAvailability(support) {
+    const all = (v) => ({
+        [CalibSensorId.LSM6DSV_ACCEL]: v,
+        [CalibSensorId.LSM6DSV_GYRO]: v,
+        [CalibSensorId.LIS2DW12_ACCEL]: v,
+        [CalibSensorId.LSM6DS3_ACCEL]: v,
+        [CalibSensorId.LSM6DS3_GYRO]: v,
+        [CalibSensorId.LIS2MDL_MAG]: v,
+    });
+    if (!support)
+        return all('enabled');
+    const imuGen2 = support.imuGen2 ? 'enabled' : 'hidden';
+    const gen1Imu = support.gyroAccel2 ? 'enabled' : 'hidden';
+    // LIS2DW12: recorded directly on 1st-gen (accel1); present-but-algo-hub-routed
+    // on 2nd-gen (imuGen2) so shown disabled; otherwise not fitted.
+    const lis2dw12 = support.accel1
+        ? 'enabled'
+        : support.imuGen2
+            ? 'disabled'
+            : 'hidden';
+    return {
+        [CalibSensorId.LSM6DSV_ACCEL]: imuGen2,
+        [CalibSensorId.LSM6DSV_GYRO]: imuGen2,
+        [CalibSensorId.LIS2MDL_MAG]: imuGen2,
+        [CalibSensorId.LIS2DW12_ACCEL]: lis2dw12,
+        [CalibSensorId.LSM6DS3_ACCEL]: gen1Imu,
+        [CalibSensorId.LSM6DS3_GYRO]: gen1Imu,
+    };
+}
+
+export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildDefaultVerisenseCalibrationSet, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrationBlobCrc, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseCalibrationBlob, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, serializeCalibrationBlob, setVerisenseOperationalBitRange, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

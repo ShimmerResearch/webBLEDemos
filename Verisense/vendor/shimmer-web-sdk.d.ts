@@ -803,6 +803,7 @@ declare const ASM_PROPERTY: Readonly<{
     readonly STREAM_MODE: 10;
     readonly DEVICE_DISCONNECT: 11;
     readonly STATUS2: 12;
+    readonly CALIBRATION: 13;
 }>;
 type AsmProperty = (typeof ASM_PROPERTY)[keyof typeof ASM_PROPERTY];
 /** Stream mode payload values. */
@@ -853,6 +854,9 @@ declare const DEBUG_COMMAND_ID: Readonly<{
     readonly DELETE_ALL_BONDS: 21;
     readonly BLE_LINK_PARAMS_READ: 22;
     readonly BLE_LINK_OPTIMIZE: 23;
+    /** Streamed MAX32674C algorithm-hub firmware (.msbl) upload (factory). The
+     * byte after this id is a HUB_FW_UPLOAD_STAGE sub-stage. */
+    readonly HUB_FW_UPLOAD: 24;
 }>;
 type DebugCommandId = (typeof DEBUG_COMMAND_ID)[keyof typeof DEBUG_COMMAND_ID];
 /**
@@ -930,6 +934,10 @@ declare const OP_IDX: Readonly<{
     readonly LED_AUTO_BRIGHTNESS_CFG: 82;
     readonly LED_MAX_BRIGHTNESS: 83;
     readonly LED_LUX_THRESHOLD: 84;
+    readonly PERSON_HEIGHT_CM: 86;
+    readonly PERSON_WEIGHT_KG: 88;
+    readonly PERSON_AGE: 90;
+    readonly PERSON_GENDER: 91;
 }>;
 type OpIdx = keyof typeof OP_IDX;
 /** Minimum firmware version that supports the BLE-link debug commands
@@ -952,6 +960,164 @@ declare const VERISENSE_STREAM_SENSOR_LABELS: Readonly<{
     readonly 8: "Algo Hub (MAX32674 — HR + raw PPG)";
     readonly 9: "Skin Temperature (MLX90632)";
 }>;
+
+/**
+ * Verisense sensor-calibration TLV codec.
+ *
+ * Mirrors the firmware `asm_calibration.{c,h}` byte format. A calibration "blob"
+ * is a self-describing block of per-sensor calibration that the device persists,
+ * exposes over the `CALIBRATION` command, and stamps into every logged payload
+ * header via a CRC-16 version tag.
+ *
+ * Layout (all little-endian):
+ *
+ *   Global header (12 bytes)
+ *     0  u16  totalLen          (= blob.length - 2)
+ *     2  u8   calibFormatVersion
+ *     3  u8   hwVerMajor
+ *     4  u8   hwVerMinor
+ *     5  u8   fwVerMajor
+ *     6  u8   fwVerMinor
+ *     7  u16  fwVerPatch
+ *     9  u8   sensorBlockCount
+ *    10  u16  reserved
+ *
+ *   Per-sensor block (12-byte header + payload)
+ *     0  u16  sensorId          (calibration-domain id, see {@link CalibSensorId})
+ *     2  u8   range/quality     (bits[5:0] full-scale index; bits[7:6] calib quality)
+ *     3  u8   dataLen
+ *     4  u8[8] ts               (0 = default/seeded; RTC time = real per-unit cal)
+ *    12  payload[dataLen]
+ *
+ *   IMU payload (60 bytes, float32): bias[3] · sens[3] · align[9] (row-major 3x3)
+ *
+ * Calibration math (ASM-DES04 §8): output = K·R·physical + b, so the host
+ * recovers physical = R⁻¹·K⁻¹·(raw − b). K is the diagonal sensitivity, R the
+ * rotation into the common ASM axes, b the offset bias.
+ */
+declare const SC_CALIB_FORMAT_VERSION = 1;
+declare const SC_GLOBAL_HEADER_BYTES = 12;
+declare const SC_DATA_LEN_IMU = 60;
+/**
+ * The per-block `range` byte packs the full-scale index in bits [5:0] and a 2-bit
+ * calibration-quality indicator in bits [7:6]. Lookups/comparisons must use only
+ * the index (`range & SC_CAL_RANGE_MASK`). Quality has no producer yet (always 0),
+ * so it is reserved without growing the blob or bumping the format version.
+ */
+declare const SC_CAL_RANGE_MASK = 63;
+declare const SC_CAL_QUALITY_SHIFT = 6;
+declare const SC_CAL_QUALITY_MASK = 3;
+/** Calibration-quality indicator (ST MotionAC / Android sensor-accuracy convention). */
+declare const CalibQuality: {
+    readonly UNKNOWN: 0;
+    readonly POOR: 1;
+    readonly OK: 2;
+    readonly GOOD: 3;
+};
+type CalibQuality = (typeof CalibQuality)[keyof typeof CalibQuality];
+/**
+ * Calibration-domain sensor IDs. Distinct from the data-stream sensor IDs
+ * (1=ADC, 2=LIS2DW12, 3=LSM6DS3, 4=PPG, 6=LSM6DSV, 7=VD6283, 8=MAX32674,
+ * 9=MLX90632). These reuse the Shimmer3 `SC_SENSOR_*` values where they exist,
+ * so accel/gyro/mag can each carry their own calibration even though one
+ * data-stream id (6) covers all three.
+ *
+ * Data-stream → calibration mapping: 6 → {37, 38, 42}, 2 → {39}, 3 → {40, 41}.
+ */
+declare const CalibSensorId: {
+    readonly LSM6DSV_ACCEL: 37;
+    readonly LSM6DSV_GYRO: 38;
+    readonly LIS2DW12_ACCEL: 39;
+    /** 1st-gen LSM6DS3 accel (data-stream id 3). */
+    readonly LSM6DS3_ACCEL: 40;
+    /** 1st-gen LSM6DS3 gyro (data-stream id 3). */
+    readonly LSM6DS3_GYRO: 41;
+    readonly LIS2MDL_MAG: 42;
+};
+type CalibSensorId = (typeof CalibSensorId)[keyof typeof CalibSensorId];
+/** Per-unit IMU calibration: offset bias, diagonal sensitivity, and 3x3 rotation. */
+interface ImuCalibration {
+    /** Offset bias `b`, per axis (sensor LSB). */
+    bias: [number, number, number];
+    /** Diagonal sensitivity `K`, per axis (LSB per physical unit). */
+    sens: [number, number, number];
+    /** Rotation `R`, row-major 3x3 (length 9), mapping sensor axes to ASM axes. */
+    align: number[];
+}
+interface CalibrationBlock {
+    sensorId: number;
+    /** Full-scale index (the low 6 bits of the wire `range` byte). */
+    range: number;
+    /** Calibration quality, bits [7:6] of the wire `range` byte (0 = unknown today). */
+    quality: number;
+    dataLen: number;
+    /** 8-byte calibration timestamp; all-zero means default/seeded. */
+    ts: Uint8Array;
+    isDefault: boolean;
+    payload: Uint8Array;
+    /** Decoded IMU calibration when the block is a 60-byte IMU payload. */
+    imu?: ImuCalibration;
+}
+interface CalibrationSet {
+    formatVersion: number;
+    hwVerMajor: number;
+    hwVerMinor: number;
+    fwVerMajor: number;
+    fwVerMinor: number;
+    fwVerPatch: number;
+    reserved: number;
+    blocks: CalibrationBlock[];
+    /** CRC-16/CCITT-FALSE over the whole blob — equals the payload-header version tag. */
+    crc16: number;
+    /** Find the IMU calibration for a calibration-domain sensor id + range, else null. */
+    getImu(sensorId: number, range: number): ImuCalibration | null;
+}
+/** Parse a calibration blob into a typed, indexable {@link CalibrationSet}. */
+declare function parseCalibrationBlob(blob: Uint8Array): CalibrationSet;
+interface CalibrationBlockInput {
+    sensorId: number;
+    /** Full-scale index (only the low 6 bits are used). */
+    range: number;
+    /** Calibration quality (0-3); defaults to 0 (unknown). Packed into range byte bits [7:6]. */
+    quality?: number;
+    /** 8-byte timestamp; defaults to all-zero (a "default/seeded" marker). */
+    ts?: Uint8Array | null;
+    imu?: ImuCalibration;
+    /** Raw payload override (used when `imu` is not supplied). */
+    payload?: Uint8Array;
+}
+interface CalibrationSetInput {
+    formatVersion?: number;
+    hwVerMajor: number;
+    hwVerMinor: number;
+    fwVerMajor: number;
+    fwVerMinor: number;
+    fwVerPatch: number;
+    reserved?: number;
+    blocks: CalibrationBlockInput[];
+}
+/** Serialize a calibration set into a blob (inverse of {@link parseCalibrationBlob}). */
+declare function serializeCalibrationBlob(input: CalibrationSetInput): Uint8Array;
+/** CRC-16/CCITT-FALSE over a serialized blob — the value stamped into payload headers. */
+declare function calibrationBlobCrc(blob: Uint8Array): number;
+/**
+ * Apply IMU calibration to a raw tri-axial sample.
+ *
+ *   physical = align · (K⁻¹ · (raw − bias))
+ *
+ * `bias` (b) is subtracted and `sens` (K, diagonal) divided per axis, then the
+ * `align` matrix (row-major 3x3) is applied directly to rotate the sensor frame
+ * into the common ASM frame. With identity `align` and zero `bias` this reduces
+ * to `raw / sens`.
+ *
+ * Convention note: `align` is the directly-applied sensor-frame → ASM-frame
+ * matrix (= R⁻¹ in ASM-DES04 §8's `output = K·R·physical + b` notation). This
+ * matches the cloud calibration CSV `rotation_*` columns one-to-one — the CSV
+ * stores the same applied matrix, row-major — so the sensor-calibration parser
+ * maps blob → CSV with NO transpose. (Confirmed against a LIS2DW12 sample CSV:
+ * offset→bias, sensitivity→sens, rotation→align.)
+ */
+declare function applyImuCalibration(raw: readonly [number, number, number], cal: ImuCalibration): [number, number, number];
 
 interface VerisenseMessage {
     header: number;
@@ -1819,8 +1985,19 @@ declare const VERISENSE_OPERATIONAL_FIELD_SCHEMA: ({
     options: (string | number)[][];
     min?: undefined;
     max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 91;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
 })[];
-declare const VERISENSE_OP_CONFIG_BYTE_SIZE = 86;
+declare const VERISENSE_OP_CONFIG_BYTE_SIZE = 92;
 type VerisenseOperationalField = VerisenseOperationalFieldDefinition;
 declare function createBlankVerisenseOperationalConfig(byteSize?: number): Uint8Array;
 declare function readVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField): number;
@@ -1883,6 +2060,14 @@ declare abstract class SensorBase {
     samplingRateHz: number | null;
     /** Whether this sensor is enabled in the operational config. */
     enabled: boolean;
+    /**
+     * Per-device calibration read from the sensor, or null when none is available
+     * (decoders then fall back to nominal full-scale/datasheet scaling). Set via
+     * {@link applyCalibration}; subclasses read it in their calibrate routines.
+     */
+    protected calibration: CalibrationSet | null;
+    /** Supply (or clear) the device calibration set used by this decoder. */
+    applyCalibration(set: CalibrationSet | null): void;
     /** Reset all timestamp state (call on (re)connect or when streaming restarts). */
     resetTimestamps(): void;
     /**
@@ -2063,6 +2248,8 @@ declare class SensorLIS2DW12 extends SensorBase {
     align: [[number, number, number], [number, number, number], [number, number, number]];
     private readonly sensitivityByRange;
     range: AccelRange$1;
+    /** Numeric full-scale index (0=2G..3=16G) used to select the device calibration block. */
+    private rangeIndex;
     constructor();
     setRange(rangeStr: AccelRange$1): void;
     setEnabled(enabled: boolean, opConfigBytes?: Uint8Array | null): Uint8Array | boolean;
@@ -2108,6 +2295,10 @@ declare class SensorLSM6DS3 extends SensorBase {
     setAccelRange(r: AccelRange): void;
     setGyroRange(r: GyroRange): void;
     private _applyAlignAndOffset;
+    private static readonly ACC_RANGE_CODE;
+    private static readonly GYRO_RANGE_CODE;
+    private _calibrateAccel;
+    private _calibrateGyro;
     parsePayload(sensorPayloadBytes: Uint8Array): LSM6DS3Sample[];
     applyOperationalConfig(op: Uint8Array): void;
 }
@@ -2140,6 +2331,8 @@ declare class SensorLSM6DSV extends SensorBase {
     magEnabled: boolean;
     private accelFsG;
     private gyroFsDps;
+    private fsXlCode;
+    private fsGCode;
     accelHz: number;
     gyroHz: number;
     magHz: number;
@@ -2705,6 +2898,24 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     sendDebugCommand(debugId: DebugCommandId, args?: Uint8Array | number[], timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
+    /**
+     * Stream a MAX32674C algorithm-hub firmware image (.msbl) to the device and
+     * flash it into the hub via the Maxim bootloader. This is a one-time factory
+     * operation: it blocks the device for ~1-2 minutes while the hub flash is
+     * erased and each page is written. Only SR68 Pulse+ hardware (the only board
+     * carrying the hub) accepts it — other hardware NACKs the BEGIN stage.
+     *
+     * @param msbl       raw .msbl file bytes
+     * @param onProgress optional progress callback (pagesDone, totalPages)
+     * @returns the hub application firmware version string read back after flashing
+     */
+    uploadHubFirmware(msbl: Uint8Array | number[], onProgress?: (pagesDone: number, totalPages: number) => void): Promise<string>;
+    /** Build a debug payload `[HUB_FW_UPLOAD, stage, ...stageArgs]`. */
+    private _buildHubUploadPayload;
+    /** Send one 8208-byte page as in-order <=64-byte chunks; await ACK_NEXT_STAGE. */
+    private _sendHubPage;
+    /** Best-effort abort: tell the device to reset the hub back to application mode. */
+    private _abortHubUpload;
     readFlashLookupTable(index?: number, timeoutMs?: number): Promise<{
         payload: Uint8Array;
     }>;
@@ -2790,6 +3001,29 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     readProductionConfigFromDevice(): Promise<ProductionConfig>;
     readOpConfigFromDevice(): Promise<Uint8Array>;
     writeOpConfig(opConfigBytes: Uint8Array | number[]): Promise<void>;
+    /** Per-device calibration last read from the device, or null. */
+    private _calibration;
+    /** The parsed calibration set last read via {@link readCalibrationParsed}, or null. */
+    getCalibration(): CalibrationSet | null;
+    /**
+     * Read the raw calibration blob from the device (CMD_AR_CFG_CALIB). The whole
+     * blob (~1 KB) arrives in one response, reassembled across BLE/USB fragments.
+     * Requires FW v2.0.4+; older firmware NACKs or times out.
+     */
+    readCalibration(timeoutMs?: number): Promise<Uint8Array>;
+    /**
+     * Read + parse the calibration set, cache it, and push it into the IMU
+     * decoders so subsequent samples calibrate from per-device values. Call before
+     * a logged-data transfer and/or after connect (no-op on FW that lacks it —
+     * the call rejects and the decoders keep their full-scale fallback).
+     */
+    readCalibrationParsed(): Promise<CalibrationSet>;
+    /**
+     * Write a calibration blob to the device (CMD_AR_CFG_CALIB), chunked in
+     * <=128-byte pieces as [offset_lo, offset_hi, ...chunk]. The device reassembles
+     * and commits on the final chunk. Requires FW v2.0.4+.
+     */
+    writeCalibration(blob: Uint8Array, chunkSize?: number): Promise<void>;
     getSensor(name: string | number): SensorBase | null;
     private _abortSync;
     private _finishSync;
@@ -2806,5 +3040,78 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     getStreamStats(): StreamStatsSnapshot;
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, setVerisenseOperationalBitRange, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RunHardwareTestReportOptions, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, Shimmer3RClientOptions, ShimmerClientOptions, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VD6283Sample, VerisenseBleLinkDebugPayload, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseEventLogEntry, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseUnixAndHumanTimestamp };
+/**
+ * Verisense calibration defaults, hardware/firmware gating, and timestamp helpers.
+ *
+ * The byte-level codec lives in `calibration.ts`; this module is the host-side
+ * single source of truth for the *default* calibration (the mirror of the
+ * firmware `AsmCalib_seedDefaults`) plus the small amount of domain logic the UI
+ * used to carry: which calibration blocks a board has, the minimum firmware that
+ * supports `CMD_AR_CFG_CALIB`, and the 8-byte timestamp encode/decode.
+ */
+
+/** Minimum firmware that implements the `CMD_AR_CFG_CALIB` (0x0D) command. */
+declare const VERISENSE_CALIBRATION_MIN_FW: VerisenseFirmwareVersion;
+/** Whether the given firmware version supports the calibration command. */
+declare function supportsVerisenseCalibration(fw: Partial<VerisenseFirmwareVersion> | null | undefined): boolean;
+/** Encode Unix-epoch seconds into the 8-byte little-endian calibration `ts`. */
+declare function unixSecondsToCalibTsBytes(unixSeconds: number): Uint8Array;
+/** Decode the 8-byte little-endian calibration `ts` back to Unix-epoch seconds
+ * (0 = default/seeded). */
+declare function calibTsBytesToUnixSeconds(ts: ArrayLike<number> | null | undefined): number;
+interface VerisenseCalibrationRange {
+    /** Full-scale index as stored in the block `range` byte (low 6 bits). */
+    code: number;
+    /** Display label, e.g. "±2g" / "±250dps". */
+    label: string;
+    /** Default sensitivity `K` (LSB per physical unit) for this range. */
+    sens: number;
+}
+interface VerisenseCalibrationSensor {
+    /** Calibration-domain sensor id (see {@link CalibSensorId}). */
+    id: number;
+    /** Display label, e.g. "Accelerometer (LSM6DSV)". */
+    label: string;
+    /** Physical unit of the calibrated output. */
+    unit: string;
+    /** Default sensor->ASM alignment `R` (row-major 3x3, applied as
+     * physical = align · sensor). See VERISENSE_CALIBRATION.md §4. */
+    align: number[];
+    ranges: VerisenseCalibrationRange[];
+}
+/**
+ * The calibration sensor catalog for a board: the 1st-generation set
+ * (LIS2DW12 + LSM6DS3) for 1st-gen hardware, otherwise the 2nd-generation set
+ * (LSM6DSV + LIS2DW12 + LIS2MDL). Unknown/offline (no revision) defaults to
+ * 2nd-gen. Note id 39 (LIS2DW12) appears in both with a generation-specific
+ * alignment, so the catalog must be resolved per hardware revision.
+ */
+declare function getVerisenseCalibrationSensors(revHwMajor?: number, revHwMinor?: number): VerisenseCalibrationSensor[];
+/**
+ * Build the default calibration set for a board (bias=0, default sensitivity,
+ * default alignment, ts=0). Host-side mirror of `AsmCalib_seedDefaults`; useful
+ * for "reset to defaults" and round-trip tests.
+ */
+declare function buildDefaultVerisenseCalibrationSet(opts: {
+    hwVerMajor: number;
+    hwVerMinor: number;
+    fwVerMajor: number;
+    fwVerMinor: number;
+    fwVerPatch: number;
+}): CalibrationSetInput;
+type VerisenseCalibrationAvailability = 'enabled' | 'disabled' | 'hidden';
+/**
+ * Map each calibration-domain sensor id to whether it is present and usable on
+ * the connected hardware:
+ *  - `enabled`  — present and recorded from; show + allow edit.
+ *  - `disabled` — physically present but not recorded from (LIS2DW12 routed to
+ *    the algorithm hub on 2nd-gen SR68); show greyed.
+ *  - `hidden`   — not fitted on this hardware.
+ *
+ * `support` is the result of `getVerisenseHardwareSensorSupport`. A null/absent
+ * support object (offline / unknown hardware) reports every sensor `enabled`.
+ */
+declare function getVerisenseCalibrationSensorAvailability(support: VerisenseHardwareSensorSupport | null | undefined): Record<number, VerisenseCalibrationAvailability>;
+
+export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildDefaultVerisenseCalibrationSet, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrationBlobCrc, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseCalibrationBlob, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, serializeCalibrationBlob, setVerisenseOperationalBitRange, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, ImuCalibration, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RunHardwareTestReportOptions, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, Shimmer3RClientOptions, ShimmerClientOptions, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VD6283Sample, VerisenseBleLinkDebugPayload, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseEventLogEntry, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseUnixAndHumanTimestamp };
