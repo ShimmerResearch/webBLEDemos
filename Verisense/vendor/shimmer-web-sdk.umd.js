@@ -3280,7 +3280,7 @@
                 [1, 'Enabled'],
             ],
         },
-        // GEN_CFG_0 bit 2 is reserved (was PRIORITISE_LONG_TERM_FLASH, removed in
+        // GEN_CFG_0 bit 2 is unused (was PRIORITISE_LONG_TERM_FLASH, removed in
         // DEV-806): never used and never read by the firmware. The bit is left unused
         // in the byte layout (free to repurpose); older configs that set it are simply
         // ignored.
