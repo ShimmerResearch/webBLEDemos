@@ -4878,6 +4878,36 @@
         const value = clampInt(rawValue, 0, mask);
         op[index] = (op[index] & ~(mask << shift)) | ((value & mask) << shift);
     }
+    /** GEN_CFG_0 bit masks for the two host comms channels (see byte map / firmware
+     * ASM_definitions.h). */
+    const GEN_CFG_0_BLUETOOTH_EN_MASK = 1 << 4;
+    const GEN_CFG_0_USB_EN_MASK = 1 << 3;
+    /**
+     * Enforce the USB/Bluetooth comms-channel interlock on an operational-config
+     * buffer.
+     *
+     * A Verisense must never be configured with BOTH Bluetooth and USB disabled, or
+     * it becomes unreachable for reconfiguration (the radio is the only wireless way
+     * back in, and disabling USB removes the wired fallback). If a config has both
+     * `BLUETOOTH_EN` and `USB_EN` cleared, this forces BOTH back on.
+     *
+     * This mirrors the firmware safeguard (`enforceCommsChannelInterlock` in
+     * `ASM_Production/main.c`, applied on config write and parse). Enforcing it here
+     * in the SDK means any consuming application is protected — a device can't be
+     * stranded by a third-party tool writing 0/0.
+     *
+     * Mutates `op` in place. Returns `true` if a correction was applied.
+     */
+    function enforceVerisenseCommsChannelInterlock(op) {
+        if (!op || op.length <= OP_IDX.GEN_CFG_0)
+            return false;
+        const genCfg0 = op[OP_IDX.GEN_CFG_0];
+        const bothDisabled = (genCfg0 & GEN_CFG_0_BLUETOOTH_EN_MASK) === 0 && (genCfg0 & GEN_CFG_0_USB_EN_MASK) === 0;
+        if (!bothDisabled)
+            return false;
+        op[OP_IDX.GEN_CFG_0] = genCfg0 | GEN_CFG_0_BLUETOOTH_EN_MASK | GEN_CFG_0_USB_EN_MASK;
+        return true;
+    }
     const VERISENSE_SENSOR_ENABLE_FIELDS = [
         { key: 'ACCEL_1_EN', index: OP_IDX.GEN_CFG_0, shift: 7 },
         { key: 'ACCEL_2_EN', index: OP_IDX.GEN_CFG_0, shift: 6 },
@@ -7301,7 +7331,13 @@
             if (!payload || payload.length < 50) {
                 throw new Error('writeOperationalConfig: payload length must be at least 50 bytes');
             }
-            await this.writeProperty(ASM_PROPERTY.OPERATIONAL_CONFIGURATION, payload);
+            // Safety interlock (mirrors firmware): never write a config with both
+            // Bluetooth and USB disabled, or the device becomes unreachable for
+            // reconfiguration. Apply to a copy so the caller's buffer is left untouched
+            // (normalizeBytePayload returns the input reference for a Uint8Array).
+            const corrected = new Uint8Array(payload);
+            enforceVerisenseCommsChannelInterlock(corrected);
+            await this.writeProperty(ASM_PROPERTY.OPERATIONAL_CONFIGURATION, corrected);
         }
         async writeTime(rtc7) {
             const payload = normalizeBytePayload(rtc7 instanceof Uint8Array ? rtc7 : new Uint8Array(rtc7));
@@ -9023,6 +9059,7 @@
     exports.crc16_ccitt_false = crc16_ccitt_false;
     exports.createBlankVerisenseOperationalConfig = createBlankVerisenseOperationalConfig;
     exports.describeVerisenseChargerStatus = describeVerisenseChargerStatus;
+    exports.enforceVerisenseCommsChannelInterlock = enforceVerisenseCommsChannelInterlock;
     exports.evaluateParsedFileSplit = evaluateParsedFileSplit;
     exports.formatByteArrayAsHex = formatByteArrayAsHex;
     exports.formatByteAsHex = formatByteAsHex;

@@ -4872,6 +4872,36 @@ function setVerisenseOperationalBitRange(op, index, shift, width, rawValue) {
     const value = clampInt(rawValue, 0, mask);
     op[index] = (op[index] & ~(mask << shift)) | ((value & mask) << shift);
 }
+/** GEN_CFG_0 bit masks for the two host comms channels (see byte map / firmware
+ * ASM_definitions.h). */
+const GEN_CFG_0_BLUETOOTH_EN_MASK = 1 << 4;
+const GEN_CFG_0_USB_EN_MASK = 1 << 3;
+/**
+ * Enforce the USB/Bluetooth comms-channel interlock on an operational-config
+ * buffer.
+ *
+ * A Verisense must never be configured with BOTH Bluetooth and USB disabled, or
+ * it becomes unreachable for reconfiguration (the radio is the only wireless way
+ * back in, and disabling USB removes the wired fallback). If a config has both
+ * `BLUETOOTH_EN` and `USB_EN` cleared, this forces BOTH back on.
+ *
+ * This mirrors the firmware safeguard (`enforceCommsChannelInterlock` in
+ * `ASM_Production/main.c`, applied on config write and parse). Enforcing it here
+ * in the SDK means any consuming application is protected — a device can't be
+ * stranded by a third-party tool writing 0/0.
+ *
+ * Mutates `op` in place. Returns `true` if a correction was applied.
+ */
+function enforceVerisenseCommsChannelInterlock(op) {
+    if (!op || op.length <= OP_IDX.GEN_CFG_0)
+        return false;
+    const genCfg0 = op[OP_IDX.GEN_CFG_0];
+    const bothDisabled = (genCfg0 & GEN_CFG_0_BLUETOOTH_EN_MASK) === 0 && (genCfg0 & GEN_CFG_0_USB_EN_MASK) === 0;
+    if (!bothDisabled)
+        return false;
+    op[OP_IDX.GEN_CFG_0] = genCfg0 | GEN_CFG_0_BLUETOOTH_EN_MASK | GEN_CFG_0_USB_EN_MASK;
+    return true;
+}
 const VERISENSE_SENSOR_ENABLE_FIELDS = [
     { key: 'ACCEL_1_EN', index: OP_IDX.GEN_CFG_0, shift: 7 },
     { key: 'ACCEL_2_EN', index: OP_IDX.GEN_CFG_0, shift: 6 },
@@ -7295,7 +7325,13 @@ class VerisenseBleDevice extends BaseShimmerClient {
         if (!payload || payload.length < 50) {
             throw new Error('writeOperationalConfig: payload length must be at least 50 bytes');
         }
-        await this.writeProperty(ASM_PROPERTY.OPERATIONAL_CONFIGURATION, payload);
+        // Safety interlock (mirrors firmware): never write a config with both
+        // Bluetooth and USB disabled, or the device becomes unreachable for
+        // reconfiguration. Apply to a copy so the caller's buffer is left untouched
+        // (normalizeBytePayload returns the input reference for a Uint8Array).
+        const corrected = new Uint8Array(payload);
+        enforceVerisenseCommsChannelInterlock(corrected);
+        await this.writeProperty(ASM_PROPERTY.OPERATIONAL_CONFIGURATION, corrected);
     }
     async writeTime(rtc7) {
         const payload = normalizeBytePayload(rtc7 instanceof Uint8Array ? rtc7 : new Uint8Array(rtc7));
@@ -8946,5 +8982,5 @@ function getVerisenseCalibrationSensorAvailability(support) {
     };
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildDefaultVerisenseCalibrationSet, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrationBlobCrc, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseCalibrationBlob, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, serializeCalibrationBlob, setVerisenseOperationalBitRange, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, writeVerisenseOperationalFieldValue };
+export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildDefaultVerisenseCalibrationSet, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrationBlobCrc, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseCalibrationBlob, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, serializeCalibrationBlob, setVerisenseOperationalBitRange, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map
