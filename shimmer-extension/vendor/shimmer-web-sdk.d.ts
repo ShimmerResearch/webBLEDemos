@@ -2026,18 +2026,31 @@ interface VerisenseOperationalSensorEnableField {
     readonly shift: number;
 }
 declare const VERISENSE_SENSOR_ENABLE_FIELDS: readonly VerisenseOperationalSensorEnableField[];
+interface VerisenseOperationalFieldSubgroupDefinition {
+    readonly id: string;
+    readonly title: string;
+    readonly keys: readonly string[];
+}
 interface VerisenseOperationalFieldGroupDefinition {
     readonly id: string;
     readonly title: string;
     readonly openByDefault: boolean;
     readonly keys: readonly string[];
+    /**
+     * Optional presentational partition of {@link keys} into labelled subpanels
+     * rendered inside the group. Purely for layout: group membership, hardware
+     * support detection and field resolution all continue to use {@link keys}.
+     * Subgroups need not be exhaustive — any key in {@link keys} not covered by a
+     * subgroup is rendered above the subpanels, so nothing is ever hidden.
+     */
+    readonly subgroups?: readonly VerisenseOperationalFieldSubgroupDefinition[];
 }
 declare const VERISENSE_OPERATIONAL_FIELD_GROUPS: readonly VerisenseOperationalFieldGroupDefinition[];
 declare const VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID = "gen";
 /**
  * Maps each hardware-gated operational-config group id to the sensor block that
  * gates it (see {@link VerisenseHardwareSensorSupport}). Group ids absent from
- * this map (e.g. `gen`, `scheduler_ble`) configure behaviour that applies to
+ * this map (e.g. `gen`, `ble_wake`) configure behaviour that applies to
  * every board and are always considered supported.
  */
 declare const VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR: Readonly<Record<string, keyof VerisenseHardwareSensorSupport>>;
