@@ -6566,6 +6566,11 @@ function validatePendingResponse(pending, msg) {
     return null;
 }
 
+// Thrown by connectWithRetry() when disconnect() is called while a connect
+// attempt is in flight. Must NOT match any of the retryable-error patterns
+// (request timeout / gatt server is disconnected / unexpected response
+// property) so it always aborts the retry loop.
+const CONNECT_CANCELLED_MESSAGE = 'Connect cancelled: disconnect requested during connect attempt.';
 // ---------------------------------------------------------------------------
 // VerisenseBleDevice
 // ---------------------------------------------------------------------------
@@ -6633,6 +6638,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._testReportMode = false; // Flag to capture raw streaming bytes for test reports
         this._throughputTestMode = false; // Flag to count raw bytes during a BLE throughput test
         this._bootstrapRequestTimeoutOverrideMs = null;
+        // Set by disconnect() so an in-flight connectWithRetry() loop stops instead
+        // of treating the resulting GATT teardown as a transient link drop.
+        this._connectCancelRequested = false;
         this._isSecondGenerationHw = false;
         // Live stream statistics (throughput / packet-loss). Reset on stream start.
         this._streamStats = new StreamStatsTracker();
@@ -6722,6 +6730,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
             }
         }
         this._transportKind = 'ble';
+        // A previous session's disconnect (including the internal teardown above)
+        // must not cancel this fresh connect attempt.
+        this._connectCancelRequested = false;
         const requestOpts = {
             filters: opts.filters ?? [{ services: [NUS_SERVICE] }],
             // NORDIC_DFU_SERVICE must be granted at requestDevice() time so the
@@ -6795,6 +6806,9 @@ class VerisenseBleDevice extends BaseShimmerClient {
         const attemptTimeoutBaseMs = Math.max(1000, Math.trunc(perAttemptTimeoutMs));
         const deadline = Date.now() + budgetMs;
         while (Date.now() < deadline) {
+            if (this._connectCancelRequested) {
+                throw new Error(CONNECT_CANCELLED_MESSAGE);
+            }
             const remainingMs = Math.max(1000, deadline - Date.now());
             this._bootstrapRequestTimeoutOverrideMs = Math.min(attemptTimeoutBaseMs, remainingMs);
             try {
@@ -6822,7 +6836,11 @@ class VerisenseBleDevice extends BaseShimmerClient {
         const clampedPairingTimeoutMs = Math.max(clampedDefaultTimeoutMs, Math.trunc(pairingBootstrapTimeoutMs));
         const clampedMaxRetries = Math.max(0, Math.trunc(maxRetries));
         let lastError = null;
+        this._connectCancelRequested = false;
         for (let attempt = 0; attempt <= clampedMaxRetries; attempt += 1) {
+            if (this._connectCancelRequested) {
+                throw new Error(CONNECT_CANCELLED_MESSAGE);
+            }
             const attemptTimeoutMs = clampedDefaultTimeoutMs;
             this._bootstrapRequestTimeoutOverrideMs = attemptTimeoutMs;
             try {
@@ -6830,6 +6848,12 @@ class VerisenseBleDevice extends BaseShimmerClient {
             }
             catch (e) {
                 lastError = e;
+                // An explicit disconnect() during the attempt is a user cancel, not a
+                // transient link drop — tear down and stop retrying.
+                if (this._connectCancelRequested) {
+                    await this._cleanupFailedBleConnectAttempt(retrySettleMs);
+                    throw new Error(CONNECT_CANCELLED_MESSAGE, { cause: e });
+                }
                 const msg = e instanceof Error ? e.message : String(e);
                 const isRequestTimeout = /request timeout/i.test(msg);
                 const isGattDisconnected = /gatt server is disconnected/i.test(msg);
@@ -6857,6 +6881,10 @@ class VerisenseBleDevice extends BaseShimmerClient {
                         return true;
                     }
                     catch (bootstrapRetryError) {
+                        if (this._connectCancelRequested) {
+                            await this._cleanupFailedBleConnectAttempt(retrySettleMs);
+                            throw new Error(CONNECT_CANCELLED_MESSAGE, { cause: bootstrapRetryError });
+                        }
                         lastError = bootstrapRetryError;
                     }
                 }
@@ -7049,6 +7077,10 @@ class VerisenseBleDevice extends BaseShimmerClient {
         console.warn(`[serial] disconnect done reason=${reason}`);
     }
     async disconnect(opts = {}) {
+        // If a connectWithRetry() loop is mid-attempt, this explicit disconnect
+        // must stop it from retrying with the same device. connect() clears the
+        // flag when the next fresh connect starts.
+        this._connectCancelRequested = true;
         const kind = this._transportKind === 'serial' ? 'serial' : 'ble';
         if (this._mode === 'streaming') {
             try {
@@ -7075,9 +7107,11 @@ class VerisenseBleDevice extends BaseShimmerClient {
             }
         }
         else {
+            // Best-effort courtesy notification; swallow the rejection when the BLE
+            // transport is not up (e.g. disconnect clicked mid-connect, tx not set).
             void this.writeBytes(buildMessage(ASM_COMMAND.WRITE, ASM_PROPERTY.DEVICE_DISCONNECT), {
                 withResponse: false,
-            });
+            }).catch(() => { });
             try {
                 if (this.rx)
                     await this.rx.stopNotifications?.();

@@ -2786,6 +2786,7 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _testReportMode;
     private _throughputTestMode;
     private _bootstrapRequestTimeoutOverrideMs;
+    private _connectCancelRequested;
     private _isSecondGenerationHw;
     private readonly _streamStats;
     private _lastStreamStatsEmitMillis;
