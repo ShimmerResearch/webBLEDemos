@@ -5073,11 +5073,7 @@
             id: 'adc_gsr',
             title: 'ADC / GSR',
             openByDefault: false,
-            keys: [
-                'ADC_SAMPLE_RATE',
-                'ADC_OVERSAMPLE_RATE',
-                'GSR_RANGE_SETTING',
-            ],
+            keys: ['ADC_SAMPLE_RATE', 'ADC_OVERSAMPLE_RATE', 'GSR_RANGE_SETTING'],
         },
         {
             id: 'ppg',
@@ -7586,6 +7582,7 @@
                 const sanitizeChunk = (text) => {
                     // Drop control bytes that occasionally appear in factory stream noise
                     // while preserving CR/LF/TAB for report formatting.
+                    // eslint-disable-next-line no-control-regex -- intentionally strips binary control bytes
                     return text.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '');
                 };
                 const cleanup = () => {
@@ -7791,7 +7788,9 @@
                 await this._requestByCommand(ASM_COMMAND.WRITE, ASM_PROPERTY.DEBUG_COMMAND, this._buildHubUploadPayload(HUB_FW_UPLOAD_STAGE.BEGIN, img.subarray(0, MSBL.HEADER_SIZE)), 15000);
             }
             catch (e) {
-                throw new Error(`Hub FW upload BEGIN failed: ${e instanceof Error ? e.message : String(e)}`);
+                throw new Error(`Hub FW upload BEGIN failed: ${e instanceof Error ? e.message : String(e)}`, {
+                    cause: e,
+                });
             }
             // Pages: stream each page in order, awaiting ACK_NEXT_STAGE (page flashed).
             const MAX_PAGE_RETRIES = 5;
@@ -7807,7 +7806,7 @@
                     catch (e) {
                         if (++attempt >= MAX_PAGE_RETRIES) {
                             await this._abortHubUpload();
-                            throw new Error(`Hub FW upload failed at page ${page + 1}/${numPages} after ${attempt} attempts: ${e instanceof Error ? e.message : String(e)}`);
+                            throw new Error(`Hub FW upload failed at page ${page + 1}/${numPages} after ${attempt} attempts: ${e instanceof Error ? e.message : String(e)}`, { cause: e });
                         }
                     }
                 }
@@ -8084,7 +8083,7 @@
             await this.sendDebugCommand(DEBUG_COMMAND_ID.DELETE_ALL_BONDS);
         }
         async _assertBleLinkDebugSupported() {
-            let parsed = null;
+            let parsed;
             if (this.productionConfig?.length) {
                 if (this._isErasedBlob(this.productionConfig)) {
                     throw new Error('BLE link debug commands require firmware >= 1.4.23, but production config is erased.');
@@ -8350,7 +8349,7 @@
         }
         async readOpConfigFromDevice() {
             const rsp = await this.readOperationalConfig();
-            let op = normalizeOperationalConfig(rsp?.payload);
+            const op = normalizeOperationalConfig(rsp?.payload);
             // Some firmware erase flows can return an empty payload for operational config.
             // Treat this as erased (all 0xFF) instead of invalid.
             if (!op?.length) {
