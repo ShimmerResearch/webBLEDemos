@@ -123,6 +123,7 @@
   .lg { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-2); }
   .lg .line { width: 16px; height: 0; border-top: 2.5px solid; border-radius: 2px; }
   .lg .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .lg .ring { width: 7px; height: 7px; border-radius: 50%; border: 2px solid; }
   .lg-sep { width: 1px; align-self: stretch; background: var(--border); }
 
   .chart-holder { position: relative; padding: 6px 6px 10px; }
@@ -200,6 +201,31 @@
   }
   .lightbox.open { display: flex; }
   .lightbox img { max-width: 100%; max-height: calc(100% - 52px); border-radius: 10px; cursor: default; }
+  /* before/after comparison for click + settled pairs */
+  .lb-stage { position: relative; display: flex; max-width: 100%; max-height: calc(100% - 52px); }
+  .lb-stage img { max-height: 100%; }
+  .lb-stage.comparing { cursor: ew-resize; }
+  #lbTopImg {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    max-width: none; max-height: none; pointer-events: none;
+  }
+  .lb-divider {
+    position: absolute; top: 0; bottom: 0; left: 50%; width: 2px; margin-left: -1px;
+    background: #fff; box-shadow: 0 0 8px rgba(0,0,0,0.6); cursor: ew-resize;
+  }
+  .lb-divider::after {
+    content: '◂ ▸'; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    width: 28px; height: 28px; border-radius: 50%; background: #fff; color: #222;
+    font-size: 10px; letter-spacing: 1px; display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  }
+  .lb-tag {
+    position: absolute; top: 10px; left: 10px; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.6px; color: #fff;
+    background: rgba(0,0,0,0.55); border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 999px; padding: 2px 9px; pointer-events: none;
+  }
+  .lb-tag-r { left: auto; right: 10px; }
   .lb-cap {
     display: flex; align-items: center; gap: 12px; color: #e8e8e8; font-size: 13px;
     background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.14);
@@ -277,7 +303,13 @@
   <div class="ev-meta"><span class="badge" id="evPopBadge"><i></i><span></span></span><span class="ev-t" id="evPopT"></span></div>
 </div>
 <div class="lightbox" id="lightbox">
-  <img id="lbImg" alt="Snapshot" />
+  <div class="lb-stage" id="lbStage">
+    <img id="lbImg" alt="Snapshot" />
+    <img id="lbTopImg" alt="" hidden />
+    <div class="lb-divider" id="lbDivider" hidden></div>
+    <span class="lb-tag" id="lbTagL" hidden>click</span>
+    <span class="lb-tag lb-tag-r" id="lbTagR" hidden>settled</span>
+  </div>
   <div class="lb-cap" id="lbCap"></div>
 </div>
 
@@ -290,6 +322,8 @@ const $ = (id) => document.getElementById(id);
 const cssVar = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const REASONS = ["click", "navigation", "periodic"];
 const evColor = (r) => cssVar(REASONS.includes(r) ? `--ev-${r}` : "--muted");
+// snapshot taken noticeably later than the click that triggered it (delayed capture)
+const wasDelayed = (ev) => ev.clickT != null && ev.t - ev.clickT >= 0.75;
 
 function fmtClock(s, dec = 0) {
   if (!isFinite(s)) return "—";
@@ -316,7 +350,23 @@ const fmtTick = (v) => Math.abs(v) >= 1000 ? fmtNum(Math.round(v)) : +v.toFixed(
 const T = SESSION.t, GSR = SESSION.gsr, PPG = SESSION.ppg || [];
 const N = T.length;
 const hasPpg = PPG.some(v => v != null);
-const EVENTS = (SESSION.events || []).slice().sort((a, b) => a.t - b.t);
+const IMAGES = (SESSION.events || []).slice().sort((a, b) => a.t - b.t);
+// Pair each settled shot with its click onset → one logical event per click.
+// A settled shot whose onset is missing (capture failed) stays standalone.
+const EVENTS = [];
+{
+  const onsets = new Map();
+  for (const im of IMAGES) {
+    if (im.kind === "settled" && im.event != null && onsets.has(im.event)) {
+      onsets.get(im.event).settled = im;
+      continue;
+    }
+    const ev = Object.assign({ settled: null }, im);
+    if (im.kind === "onset" && im.event != null) onsets.set(im.event, ev);
+    EVENTS.push(ev);
+  }
+}
+const anySettled = EVENTS.some(e => e.settled);
 const t0 = N ? T[0] : 0, t1 = N ? T[N - 1] : 1;
 const durationS = Math.max(0.001, t1 - t0);
 // A gap in the recording (stream stopped/restarted): break the line there.
@@ -355,7 +405,7 @@ const GAP = Math.max(1, medianDt * 20);
   const tiles = [
     ["Duration", fmtClock(durationS), ""],
     ["Samples", fmtNum(N), ""],
-    ["Snapshots", fmtNum(EVENTS.length), ""],
+    ["Snapshots", fmtNum(IMAGES.length), ""],
     ["Mean GSR", cnt ? mean.toFixed(2) : "—", "µS"],
     ["Peak GSR", cnt ? peak.toFixed(2) : "—", "µS"],
   ];
@@ -376,7 +426,8 @@ function buildLegend() {
   const lg = $("legend"); lg.textContent = "";
   const add = (kind, color, label) => {
     const s = document.createElement("span"); s.className = "lg";
-    const k = document.createElement("i"); k.className = kind; k.style[kind === "line" ? "borderTopColor" : "background"] = color;
+    const k = document.createElement("i"); k.className = kind;
+    k.style[kind === "line" ? "borderTopColor" : kind === "ring" ? "borderColor" : "background"] = color;
     s.appendChild(k); s.appendChild(document.createTextNode(label));
     lg.appendChild(s);
   };
@@ -386,6 +437,7 @@ function buildLegend() {
   if (present.length) { const sep = document.createElement("span"); sep.className = "lg-sep"; lg.appendChild(sep); }
   const NAMES = { click: "Click", navigation: "Navigation", periodic: "Periodic" };
   present.forEach(r => add("dot", evColor(r), NAMES[r]));
+  if (anySettled) add("ring", evColor("click"), "Settled view");
 }
 
 /* ================= Chart ================= */
@@ -622,9 +674,43 @@ function draw() {
   // event markers: hairline through the plots + dot in the lane
   const laneMid = layout.lane.y + layout.lane.h / 2;
   for (const ev of EVENTS) {
+    const c = evColor(ev.reason);
+    // dashed hairline at the click itself (stimulus onset) when the shot was delayed
+    if (wasDelayed(ev) && ev.clickT >= domain[0] && ev.clickT <= domain[1]) {
+      const cx2 = Math.round(tx(ev.clickT)) + 0.5;
+      ctx.save();
+      ctx.globalAlpha = 0.3;
+      ctx.strokeStyle = c;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(cx2, layout.gsr.y); ctx.lineTo(cx2, layout.gsr.y + layout.gsr.h);
+      if (hasPpg) { ctx.moveTo(cx2, layout.ppg.y); ctx.lineTo(cx2, layout.ppg.y + layout.ppg.h); }
+      ctx.stroke();
+      ctx.restore();
+    }
+    // settled companion: faint hairline + lane connector + hollow ring
+    if (ev.settled && ev.settled.t >= domain[0] && ev.settled.t <= domain[1]) {
+      const sx = Math.round(tx(ev.settled.t)) + 0.5;
+      ctx.save();
+      ctx.globalAlpha = 0.22;
+      ctx.strokeStyle = c;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(sx, layout.gsr.y); ctx.lineTo(sx, layout.gsr.y + layout.gsr.h);
+      if (hasPpg) { ctx.moveTo(sx, layout.ppg.y); ctx.lineTo(sx, layout.ppg.y + layout.ppg.h); }
+      ctx.stroke();
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath();
+      ctx.moveTo(Math.max(layout.x, tx(ev.t)), laneMid); ctx.lineTo(sx, laneMid);
+      ctx.stroke();
+      ctx.restore();
+      const rr = (hoverEv && hoverEv.img === ev.settled) ? 6.5 : 5;
+      ctx.beginPath(); ctx.arc(sx, laneMid, rr + 2, 0, Math.PI * 2); ctx.fillStyle = cssVar("--surface"); ctx.fill();
+      ctx.beginPath(); ctx.arc(sx, laneMid, rr - 1, 0, Math.PI * 2); ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.stroke();
+    }
     if (ev.t < domain[0] || ev.t > domain[1]) continue;
     const x = Math.round(tx(ev.t)) + 0.5;
-    const c = evColor(ev.reason);
     ctx.save();
     ctx.globalAlpha = 0.32;
     ctx.strokeStyle = c;
@@ -635,7 +721,7 @@ function draw() {
     ctx.stroke();
     ctx.restore();
     if (EVENTS.length) {
-      const r = (hoverEv === ev) ? 7 : 5;
+      const r = (hoverEv && hoverEv.img === ev) ? 7 : 5;
       ctx.beginPath(); ctx.arc(x, laneMid, r + 2, 0, Math.PI * 2); ctx.fillStyle = cssVar("--surface"); ctx.fill();
       ctx.beginPath(); ctx.arc(x, laneMid, r, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill();
     }
@@ -680,14 +766,20 @@ function nearestIndex(t) {
   return i;
 }
 function eventAt(px, py) {
+  // returns {ev, img}: img is the specific marker under the cursor
+  // (the event's onset shot, or its settled companion)
   if (!EVENTS.length || !layout) return null;
   const laneMid = layout.lane.y + layout.lane.h / 2;
   if (Math.abs(py - laneMid) > layout.lane.h / 2 + 4) return null;
   let best = null, bestD = 14; // generous hit target, wider than the dot
+  const consider = (t, ev, img) => {
+    if (t < domain[0] || t > domain[1]) return;
+    const d = Math.abs(tx(t) - px);
+    if (d < bestD) { bestD = d; best = { ev, img }; }
+  };
   for (const ev of EVENTS) {
-    if (ev.t < domain[0] || ev.t > domain[1]) continue;
-    const d = Math.abs(tx(ev.t) - px);
-    if (d < bestD) { bestD = d; best = ev; }
+    consider(ev.t, ev, ev);
+    if (ev.settled) consider(ev.settled.t, ev, ev.settled);
   }
   return best;
 }
@@ -720,13 +812,16 @@ function showTip(clientX, clientY, i) {
   positionFloat(tip, clientX, clientY);
 }
 
-function showEvPop(ev, clientX, clientY) {
-  const img = $("evPopImg");
-  img.src = "screenshots/" + ev.file;
+function showEvPop(hit, clientX, clientY) {
+  const im = hit.img;
+  $("evPopImg").src = "screenshots/" + im.file;
   const badge = $("evPopBadge");
-  badge.querySelector("i").style.background = evColor(ev.reason);
-  badge.querySelector("span").textContent = ev.reason;
-  $("evPopT").textContent = fmtClock(ev.t - t0, 1) + (ev.videoTime ? ` · media ${ev.videoTime}s` : "");
+  badge.querySelector("i").style.background = evColor(hit.ev.reason);
+  badge.querySelector("span").textContent = im.kind === "settled" ? "settled" : im.reason;
+  $("evPopT").textContent = fmtClock(im.t - t0, 1) +
+    (hit.ev.settled === im ? ` · clicked ${fmtClock(hit.ev.t - t0, 1)}`
+      : (wasDelayed(im) ? ` · clicked ${fmtClock(im.clickT - t0, 1)}` : "")) +
+    (im.videoTime ? ` · media ${im.videoTime}s` : "");
   positionFloat(evPop, clientX, clientY);
 }
 
@@ -737,12 +832,12 @@ canvas.addEventListener("mousemove", (e) => {
 
   if (brush) { brush.x1 = Math.min(Math.max(px, layout.x), layout.x + layout.cw); draw(); return; }
 
-  const ev = eventAt(px, py);
-  if (ev) {
-    if (hoverEv !== ev) { hoverEv = ev; draw(); }
+  const hit = eventAt(px, py);
+  if (hit) {
+    if (!hoverEv || hoverEv.img !== hit.img) { hoverEv = hit; draw(); }
     hover = null; tip.style.display = "none";
     canvas.style.cursor = "pointer";
-    showEvPop(ev, e.clientX, e.clientY);
+    showEvPop(hit, e.clientX, e.clientY);
     return;
   }
   if (hoverEv) { hoverEv = null; evPop.style.display = "none"; draw(); }
@@ -780,8 +875,8 @@ window.addEventListener("mouseup", () => {
 });
 canvas.addEventListener("click", (e) => {
   const rect = canvas.getBoundingClientRect();
-  const ev = eventAt(e.clientX - rect.left, e.clientY - rect.top);
-  if (ev) openLightbox(ev);
+  const hit = eventAt(e.clientX - rect.left, e.clientY - rect.top);
+  if (hit) openLightbox(hit.ev);
 });
 function resetZoom() { domain = [t0, t1]; $("resetZoom").classList.remove("show"); draw(); }
 canvas.addEventListener("dblclick", resetZoom);
@@ -802,6 +897,15 @@ function makeBadge(reason) {
   b.appendChild(i); b.appendChild(s);
   return b;
 }
+function makeSettledBadge(reason) {
+  const b = document.createElement("span"); b.className = "badge";
+  const i = document.createElement("i");
+  i.style.background = "transparent"; i.style.border = `2px solid ${evColor(reason)}`;
+  i.style.width = "5px"; i.style.height = "5px";
+  const s = document.createElement("span"); s.textContent = "settled";
+  b.appendChild(i); b.appendChild(s);
+  return b;
+}
 function buildTableAndGallery() {
   if (!EVENTS.length) {
     for (const id of ["tableCard", "galleryCard"]) {
@@ -818,7 +922,7 @@ function buildTableAndGallery() {
     const tr = document.createElement("tr");
     const cells = [
       String(idx + 1),
-      fmtClock(ev.t - t0, 1),
+      fmtClock(ev.t - t0, 1) + (ev.settled ? ` → ${fmtClock(ev.settled.t - t0, 1)}` : ""),
       ev.videoTime ? ev.videoTime + "s" : "—",
       null, // badge
       ev.title || "—",
@@ -827,13 +931,21 @@ function buildTableAndGallery() {
     cells.forEach((c, ci) => {
       const td = document.createElement("td");
       if (ci === 0 || ci === 1 || ci === 2) td.className = "num";
-      if (ci === 3) td.appendChild(makeBadge(ev.reason));
+      if (ci === 1 && wasDelayed(ev)) td.title = `clicked at ${fmtClock(ev.clickT - t0, 1)}`;
+      if (ci === 3) {
+        td.appendChild(makeBadge(ev.reason));
+        if (ev.settled) { td.appendChild(document.createTextNode(" ")); td.appendChild(makeSettledBadge(ev.reason)); }
+      }
       else if (ci === 4) { td.className = "pg"; td.textContent = c; td.title = c; }
       else if (ci === 5) {
-        const a = document.createElement("a");
-        a.className = "file"; a.href = "screenshots/" + ev.file; a.target = "_blank";
-        a.textContent = ev.file; a.addEventListener("click", (e) => e.stopPropagation());
-        td.appendChild(a);
+        const addLink = (file) => {
+          const a = document.createElement("a");
+          a.className = "file"; a.href = "screenshots/" + file; a.target = "_blank";
+          a.textContent = file; a.addEventListener("click", (e) => e.stopPropagation());
+          td.appendChild(a);
+        };
+        addLink(ev.file);
+        if (ev.settled) { td.appendChild(document.createElement("br")); addLink(ev.settled.file); }
       }
       else td.textContent = c;
       tr.appendChild(td);
@@ -846,7 +958,9 @@ function buildTableAndGallery() {
   EVENTS.forEach((ev) => {
     const item = document.createElement("div"); item.className = "g-item";
     const img = document.createElement("img");
-    img.loading = "lazy"; img.src = "screenshots/" + ev.file; img.alt = ev.reason + " snapshot";
+    // a pair's card shows the settled view (the payoff) — the comparison lives in the lightbox
+    img.loading = "lazy"; img.src = "screenshots/" + (ev.settled ? ev.settled.file : ev.file);
+    img.alt = ev.reason + " snapshot";
     img.addEventListener("error", () => {
       markImgFailed();
       const miss = document.createElement("div"); miss.className = "g-missing";
@@ -854,8 +968,10 @@ function buildTableAndGallery() {
       img.replaceWith(miss);
     });
     const cap = document.createElement("div"); cap.className = "g-cap";
-    const t = document.createElement("span"); t.className = "g-t"; t.textContent = fmtClock(ev.t - t0, 1);
-    cap.appendChild(makeBadge(ev.reason)); cap.appendChild(t);
+    const t = document.createElement("span"); t.className = "g-t";
+    t.textContent = fmtClock(ev.t - t0, 1) + (ev.settled ? ` → ${fmtClock(ev.settled.t - t0, 1)}` : "");
+    cap.appendChild(makeBadge(ev.reason));
+    cap.appendChild(t);
     item.appendChild(img); item.appendChild(cap);
     item.addEventListener("click", () => openLightbox(ev));
     g.appendChild(item);
@@ -864,18 +980,50 @@ function buildTableAndGallery() {
 
 /* ================= Lightbox ================= */
 const lightbox = $("lightbox"), lbImg = $("lbImg"), lbCap = $("lbCap");
+const lbStage = $("lbStage"), lbTopImg = $("lbTopImg"), lbDivider = $("lbDivider");
+const lbTagL = $("lbTagL"), lbTagR = $("lbTagR");
+
+// click + settled pairs open as a before/after comparison: settled underneath,
+// the click view on top clipped to the left of a draggable divider
+let lbDragging = false;
+function lbSetSplit(pct) {
+  pct = Math.max(0, Math.min(100, pct));
+  lbTopImg.style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
+  lbDivider.style.left = pct + "%";
+}
+function lbSplitFromEvent(e) {
+  const r = lbStage.getBoundingClientRect();
+  return ((e.clientX - r.left) / r.width) * 100;
+}
+lbStage.addEventListener("mousedown", (e) => {
+  if (lbTopImg.hidden) return;
+  e.preventDefault();
+  lbDragging = true;
+  lbSetSplit(lbSplitFromEvent(e));
+});
+window.addEventListener("mousemove", (e) => { if (lbDragging) lbSetSplit(lbSplitFromEvent(e)); });
+window.addEventListener("mouseup", () => { lbDragging = false; });
+
 function openLightbox(ev) {
-  lbImg.src = "screenshots/" + ev.file;
+  const compare = !!ev.settled;
+  lbImg.src = "screenshots/" + (compare ? ev.settled.file : ev.file);
+  lbTopImg.hidden = lbDivider.hidden = lbTagL.hidden = lbTagR.hidden = !compare;
+  lbStage.classList.toggle("comparing", compare);
+  if (compare) { lbTopImg.src = "screenshots/" + ev.file; lbSetSplit(50); }
   lbCap.textContent = "";
   lbCap.appendChild(makeBadge(ev.reason));
+  if (compare) lbCap.appendChild(makeSettledBadge(ev.reason));
   const meta = document.createElement("span");
   meta.textContent = fmtClock(ev.t - t0, 1) +
+    (compare ? ` → ${fmtClock(ev.settled.t - t0, 1)} · drag to compare` : "") +
+    (!compare && wasDelayed(ev) ? ` · clicked ${fmtClock(ev.clickT - t0, 1)}` : "") +
     (ev.videoTime ? ` · media ${ev.videoTime}s` : "") +
     (ev.title ? ` · ${ev.title}` : "");
   lbCap.appendChild(meta);
   lightbox.classList.add("open");
 }
 lbImg.addEventListener("error", markImgFailed);
+lbTopImg.addEventListener("error", markImgFailed);
 lightbox.addEventListener("click", (e) => { if (e.target === lightbox) lightbox.classList.remove("open"); });
 window.addEventListener("keydown", (e) => { if (e.key === "Escape") lightbox.classList.remove("open"); });
 
@@ -892,7 +1040,9 @@ function rebuildBadges() {
   document.querySelectorAll(".badge").forEach(b => {
     const label = b.querySelector("span:last-child")?.textContent;
     const i = b.querySelector("i");
-    if (i && label) i.style.background = evColor(label);
+    if (!i || !label) return;
+    if (label === "settled") i.style.borderColor = evColor("click"); // hollow ring badge
+    else i.style.background = evColor(label);
   });
 }
 

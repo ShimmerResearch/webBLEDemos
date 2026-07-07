@@ -29,6 +29,8 @@ let currentVideoTime = null; // null when the page has no <video> (e.g. virtual 
 const videoTimeStr = (digits) => currentVideoTime == null ? "" : currentVideoTime.toFixed(digits);
 let csvRows = [];
 let screenshots = [];
+let shotSeq = 0;  // image numbering; a settled shot reuses its click's number
+let eventSeq = 0; // one id per click event, shared by its onset + settled shots
 let screenshotInterval = null;
 let lastVideoTitle = "";
 
@@ -53,12 +55,16 @@ const dragHeader = $("dragHeader"), dragHeaderMin = $("dragHeaderMin");
 const minimizedTimeText = $("minimizedTimeText"), minStopBtn = $("minStopBtn");
 
 const capPeriodic = $("capPeriodic"), capInterval = $("capInterval"), capClick = $("capClick"), capNav = $("capNav");
+const capSettled = $("capSettled"), settledRow = $("settledRow");
+const capClickDelay = $("capClickDelay"), capClickDelayVal = $("capClickDelayVal");
 
 const tabLive = $("tabLive"), tabShots = $("tabShots");
 const shotCount = $("shotCount"), shotsGrid = $("shotsGrid"), shotsEmpty = $("shotsEmpty");
 const clearBtn = $("clearBtn"), downloadBtn = $("downloadBtn");
 const lightbox = $("lightbox"), lightboxImg = $("lightboxImg"), lightboxClose = $("lightboxClose");
 const lightboxMeta = $("lightboxMeta");
+const lbStage = $("lbStage"), lbTopImg = $("lbTopImg"), lbDivider = $("lbDivider");
+const lbTagL = $("lbTagL"), lbTagR = $("lbTagR");
 
 // ===== Session timeline (whole-session GSR trend + snapshot markers) =====
 // Colors validated for CVD separation and contrast on the overlay surface.
@@ -160,6 +166,8 @@ function drawTimeline() {
   }
 
   // snapshot markers: hairline through the trend + dot in the lane
+  // (settled shots draw as hollow rings tied back to their click)
+  const laneMid = laneH / 2 + 1;
   for (const s of screenshots) {
     if (s.tMs == null) continue;
     const x = tlXFor(s.tMs, w, spanMs);
@@ -174,8 +182,22 @@ function drawTimeline() {
     tlCtx.stroke();
     tlCtx.restore();
     const r = tlHoverShot === s ? 6 : 4.5;
-    tlCtx.beginPath(); tlCtx.arc(x, laneH / 2 + 1, r + 2, 0, Math.PI * 2); tlCtx.fillStyle = "#1C1F26"; tlCtx.fill();
-    tlCtx.beginPath(); tlCtx.arc(x, laneH / 2 + 1, r, 0, Math.PI * 2); tlCtx.fillStyle = c; tlCtx.fill();
+    if (s.kind === 'settled') {
+      if (s.clickTMs != null) { // lane connector back to the click
+        const x0 = tlXFor(s.clickTMs, w, spanMs);
+        tlCtx.save();
+        tlCtx.globalAlpha = 0.35;
+        tlCtx.strokeStyle = c;
+        tlCtx.lineWidth = 1;
+        tlCtx.beginPath(); tlCtx.moveTo(x0, laneMid); tlCtx.lineTo(x, laneMid); tlCtx.stroke();
+        tlCtx.restore();
+      }
+      tlCtx.beginPath(); tlCtx.arc(x, laneMid, r + 2, 0, Math.PI * 2); tlCtx.fillStyle = "#1C1F26"; tlCtx.fill();
+      tlCtx.beginPath(); tlCtx.arc(x, laneMid, r - 1, 0, Math.PI * 2); tlCtx.strokeStyle = c; tlCtx.lineWidth = 2; tlCtx.stroke();
+    } else {
+      tlCtx.beginPath(); tlCtx.arc(x, laneMid, r + 2, 0, Math.PI * 2); tlCtx.fillStyle = "#1C1F26"; tlCtx.fill();
+      tlCtx.beginPath(); tlCtx.arc(x, laneMid, r, 0, Math.PI * 2); tlCtx.fillStyle = c; tlCtx.fill();
+    }
   }
 
   tlRange.textContent = fmtElapsed((Date.now() - sessionStartMs) / 1000);
@@ -206,8 +228,12 @@ tlCanvas.addEventListener("mousemove", (e) => {
   tlCanvas.style.cursor = "pointer";
   evPopImg.src = s.dataUrl;
   evPopReason.querySelector("i").style.background = REASON_COLORS[s.reason] || "#9BA4B5";
-  evPopReason.querySelector("span").textContent = s.reason;
-  evPopTime.textContent = fmtElapsed((s.tMs - sessionStartMs) / 1000) + (s.videoTime ? ` · ${s.videoTime}s` : "");
+  evPopReason.querySelector("span").textContent = s.kind === 'settled' ? 'settled' : s.reason;
+  let tStr = fmtElapsed((s.tMs - sessionStartMs) / 1000);
+  if (s.clickTMs != null && s.tMs - s.clickTMs >= 1000) {
+    tStr += ` (clicked ${fmtElapsed((s.clickTMs - sessionStartMs) / 1000)})`;
+  }
+  evPopTime.textContent = tStr + (s.videoTime ? ` · ${s.videoTime}s` : "");
   evPopover.style.display = "block";
   const pw = 190, ph = evPopover.offsetHeight || 150;
   let x = e.clientX + 12;
@@ -283,28 +309,60 @@ tabLive.onclick = () => activateTab(tabLive);
 tabShots.onclick = () => activateTab(tabShots);
 
 // ===== Screenshots =====
-function captureScreenshot(reason) {
+// Chrome throttles captureVisibleTab (~2 calls/s), so captures are serialized
+// with spacing and one retry — click bursts don't silently drop shots.
+const captureQueue = [];
+let captureBusy = false;
+
+function captureScreenshot(reason, meta = {}) {
+  // meta: { clickTMs, eventId, kind } — kind 'onset' | 'settled' for click events
   if (!isStreaming) return;
+  captureQueue.push({ reason, meta, retried: false });
+  pumpCaptureQueue();
+}
+
+function pumpCaptureQueue() {
+  if (captureBusy) return;
+  const job = captureQueue.shift();
+  if (!job) return;
+  captureBusy = true;
   chrome.runtime.sendMessage({ type: "TAKE_SCREENSHOT" }, (response) => {
-    if (chrome.runtime.lastError || !response || !response.ok) {
-      console.error("Screenshot failed:", chrome.runtime.lastError?.message || response?.error);
-      return;
-    }
-    if (!response.dataUrl) return;
-    const now = new Date();
-    const shot = {
-      timestamp: now.toISOString(),
-      tMs: now.getTime(),
-      videoTime: videoTimeStr(3),
-      title: ($("videoTitleLabel").textContent || "").trim(),
-      reason,
-      file: `shot_${String(screenshots.length + 1).padStart(3, "0")}_${reason}.jpg`,
-      dataUrl: response.dataUrl
-    };
-    screenshots.push(shot);
-    appendShot(shot);
-    drawTimeline();
+    const ok = !chrome.runtime.lastError && response?.ok && response.dataUrl;
+    if (ok && isStreaming) recordShot(job, response.dataUrl);
+    else if (!ok && !job.retried) { job.retried = true; captureQueue.unshift(job); }
+    else if (!ok) console.error("Screenshot failed:", chrome.runtime.lastError?.message || response?.error);
+    setTimeout(() => { captureBusy = false; pumpCaptureQueue(); }, 600);
   });
+}
+
+function pairOf(shot, kind) {
+  if (shot.eventId == null) return null;
+  return screenshots.find(s => s !== shot && s.eventId === shot.eventId && s.kind === kind) || null;
+}
+
+function recordShot(job, dataUrl) {
+  const { reason, meta } = job;
+  const now = new Date();
+  const onset = meta.kind === 'settled'
+    ? screenshots.find(s => s.eventId === meta.eventId && s.kind === 'onset')
+    : null;
+  const num = onset ? onset.num : ++shotSeq;
+  const shot = {
+    timestamp: now.toISOString(),
+    tMs: now.getTime(),
+    clickTMs: meta.clickTMs ?? null, // stimulus onset; ~tMs unless the shot was deferred
+    eventId: meta.eventId ?? null,
+    kind: meta.kind ?? null,
+    num,
+    videoTime: videoTimeStr(3),
+    title: ($("videoTitleLabel").textContent || "").trim(),
+    reason,
+    file: `shot_${String(num).padStart(3, "0")}_${reason}${meta.kind === 'settled' ? '_settled' : ''}.jpg`,
+    dataUrl
+  };
+  screenshots.push(shot);
+  appendShot(shot);
+  drawTimeline();
 }
 
 function appendShot(shot) {
@@ -324,6 +382,12 @@ function appendShot(shot) {
   timeEl.textContent = shot.videoTime ? shot.videoTime + 's'
     : (sessionStartMs != null && shot.tMs != null ? fmtElapsed((shot.tMs - sessionStartMs) / 1000) : '');
   meta.appendChild(reasonEl);
+  if (shot.kind === 'settled') {
+    const chip = document.createElement('span');
+    chip.className = 'settle-chip';
+    chip.textContent = shot.clickTMs != null ? `+${((shot.tMs - shot.clickTMs) / 1000).toFixed(1)}s` : 'settled';
+    meta.appendChild(chip);
+  }
   meta.appendChild(timeEl);
   el.appendChild(img);
   el.appendChild(meta);
@@ -332,16 +396,60 @@ function appendShot(shot) {
   shotCount.textContent = String(screenshots.length);
 }
 
+// Click + settled pairs open as a before/after comparison: the settled view
+// underneath, the click view on top clipped to the left of a draggable divider.
+let lbDragging = false;
+
+function lbSetSplit(pct) {
+  pct = Math.max(0, Math.min(100, pct));
+  lbTopImg.style.clipPath = `inset(0 ${100 - pct}% 0 0)`;
+  lbDivider.style.left = pct + "%";
+}
+function lbSplitFromEvent(e) {
+  const r = lbStage.getBoundingClientRect();
+  return ((e.clientX - r.left) / r.width) * 100;
+}
+lbStage.addEventListener('mousedown', (e) => {
+  if (lbTopImg.hidden) return;
+  e.preventDefault();
+  lbDragging = true;
+  lbSetSplit(lbSplitFromEvent(e));
+});
+window.addEventListener('mousemove', (e) => { if (lbDragging) lbSetSplit(lbSplitFromEvent(e)); });
+window.addEventListener('mouseup', () => { lbDragging = false; });
+
 function openLightbox(shot) {
-  lightboxImg.src = shot.dataUrl;
+  const onset = shot.kind === 'settled' ? pairOf(shot, 'onset') : (shot.kind === 'onset' ? shot : null);
+  const settled = shot.kind === 'onset' ? pairOf(shot, 'settled') : (shot.kind === 'settled' ? shot : null);
+  const compare = !!(onset && settled);
+
+  lightboxImg.src = compare ? settled.dataUrl : shot.dataUrl;
+  lbTopImg.hidden = lbDivider.hidden = lbTagL.hidden = lbTagR.hidden = !compare;
+  lbStage.classList.toggle('comparing', compare);
+  if (compare) { lbTopImg.src = onset.dataUrl; lbSetSplit(50); }
+
   lightboxMeta.hidden = false;
   lightboxMeta.textContent = '';
   const dot = document.createElement('i');
   dot.style.background = REASON_COLORS[shot.reason] || '#9BA4B5';
   lightboxMeta.appendChild(dot);
-  const parts = [shot.reason];
-  if (sessionStartMs != null && shot.tMs != null) parts.push(fmtElapsed((shot.tMs - sessionStartMs) / 1000));
-  if (shot.videoTime) parts.push(`media ${shot.videoTime}s`);
+  const el = (ms) => fmtElapsed((ms - sessionStartMs) / 1000);
+  const parts = [];
+  if (compare) {
+    parts.push('click');
+    if (sessionStartMs != null) {
+      parts.push(`clicked ${el(onset.tMs)}`);
+      parts.push(`settled ${el(settled.tMs)}`);
+    }
+    if (shot.videoTime) parts.push(`media ${shot.videoTime}s`);
+  } else {
+    parts.push(shot.kind === 'settled' ? 'settled' : shot.reason);
+    if (sessionStartMs != null && shot.tMs != null) parts.push(el(shot.tMs));
+    if (sessionStartMs != null && shot.clickTMs != null && shot.tMs - shot.clickTMs >= 1000) {
+      parts.push(`clicked ${el(shot.clickTMs)}`);
+    }
+    if (shot.videoTime) parts.push(`media ${shot.videoTime}s`);
+  }
   lightboxMeta.appendChild(document.createTextNode(parts.join(' · ')));
   lightbox.classList.add('open');
 }
@@ -382,11 +490,49 @@ chrome.runtime.onMessage.addListener((message) => {
   titleEl.textContent = newTitle;
 });
 
-// capture-on-click relayed from content script
+// ===== Capture-on-click (relayed from content script) =====
+// Every click captures immediately (stimulus onset, as always). Optionally a
+// second "settled" shot fires after the view stops moving (gallery fly-to
+// animations, texture loads). Rapid clicks restart the settle timer, so one
+// settled shot is taken, paired to the LAST click.
+let settleTimer = null;
+let pendingSettle = null; // { eventId, clickTMs } for the deferred settled shot
+
+function settleDelayMs() {
+  const s = parseFloat(capClickDelay.value);
+  return isNaN(s) ? 3000 : s * 1000;
+}
+
+function updateSettleUI() {
+  capClickDelayVal.textContent = (settleDelayMs() / 1000).toFixed(1) + " s";
+  settledRow.classList.toggle('disabled', !capClick.checked);
+  capClickDelay.disabled = !(capClick.checked && capSettled.checked);
+}
+capClickDelay.oninput = updateSettleUI;
+updateSettleUI();
+
+function cancelPendingSettle() {
+  if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; }
+  pendingSettle = null;
+  shotCount.classList.remove('pending');
+}
+capClick.onchange = () => { if (!capClick.checked) cancelPendingSettle(); updateSettleUI(); };
+capSettled.onchange = () => { if (!capSettled.checked) cancelPendingSettle(); updateSettleUI(); };
+
 window.addEventListener('message', (event) => {
-  if (event.data?.type === 'PAGE_CLICK' && isStreaming && capClick.checked) {
-    captureScreenshot("click");
-  }
+  if (event.data?.type !== 'PAGE_CLICK' || !isStreaming || !capClick.checked) return;
+  const eventId = ++eventSeq;
+  const clickTMs = Date.now();
+  captureScreenshot("click", { clickTMs, eventId, kind: 'onset' });
+  if (!capSettled.checked) return;
+  if (settleTimer) clearTimeout(settleTimer);
+  pendingSettle = { eventId, clickTMs };
+  shotCount.classList.add('pending');
+  settleTimer = setTimeout(() => {
+    const p = pendingSettle;
+    cancelPendingSettle();
+    captureScreenshot("click", { clickTMs: p.clickTMs, eventId: p.eventId, kind: 'settled' });
+  }, settleDelayMs());
 });
 
 // ===== Connect / Disconnect =====
@@ -468,6 +614,8 @@ async function stopStreaming() {
 
 function stopStreamingUI() {
   isStreaming = false;
+  cancelPendingSettle(); // don't fire a deferred shot after the session ended
+  captureQueue.length = 0;
   body.classList.remove('is-recording');
   streamBtnText.textContent = "Start Recording";
   if (shimmer.device?.gatt?.connected) setConn('online', 'Online');
@@ -549,6 +697,10 @@ clearBtn.onclick = () => {
   latestGsr = latestPpg = null;
   gsrValLabel.textContent = "—";
   ppgValLabel.textContent = "—";
+  cancelPendingSettle();
+  captureQueue.length = 0;
+  shotSeq = 0;
+  eventSeq = 0;
   tlReset();
   if (!isStreaming) {
     body.classList.remove('has-shots');
@@ -569,6 +721,9 @@ async function buildReport(t0ms) {
     ppg: csvRows.map(r => (typeof r.ppg === "number" ? r.ppg : null)),
     events: screenshots.map(s => ({
       t: round3(((s.tMs ?? t0ms) - t0ms) / 1000),
+      clickT: s.clickTMs != null ? round3((s.clickTMs - t0ms) / 1000) : null,
+      event: s.eventId ?? null,
+      kind: s.kind ?? null,
       iso: s.timestamp,
       reason: s.reason,
       videoTime: s.videoTime || "",
@@ -596,11 +751,11 @@ downloadBtn.onclick = async () => {
     const zip = new JSZip();
     zip.file("results.csv", csvContent);
     if (screenshots.length > 0) {
-      const evHeader = ["Timestamp", "Elapsed (s)", "Video Time (s)", "Reason", "Page Title", "Filename"];
+      const evHeader = ["Timestamp", "Elapsed (s)", "Click Elapsed (s)", "Event", "Kind", "Video Time (s)", "Reason", "Page Title", "Filename"];
       const eventsCsv = [
         evHeader.join(","),
         ...screenshots.map(s =>
-          `${s.timestamp},${(((s.tMs ?? t0ms) - t0ms) / 1000).toFixed(3)},${s.videoTime},${s.reason},${(s.title || "").replace(/,/g, "")},${s.file}`)
+          `${s.timestamp},${(((s.tMs ?? t0ms) - t0ms) / 1000).toFixed(3)},${s.clickTMs != null ? ((s.clickTMs - t0ms) / 1000).toFixed(3) : ""},${s.eventId ?? ""},${s.kind ?? ""},${s.videoTime},${s.reason},${(s.title || "").replace(/,/g, "")},${s.file}`)
       ].join("\n");
       zip.file("events.csv", eventsCsv);
       const folder = zip.folder("screenshots");
