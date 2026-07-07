@@ -62,27 +62,33 @@ function broadcastData() {
   const video = document.querySelector('video');
   const isAdShowing = document.querySelector('.ad-showing, .ad-interrupting') !== null;
 
-  if (video) {
-    try {
-      chrome.runtime.sendMessage({
-        type: "VIDEO_UPDATE",
-        time: video.currentTime,
-        title: getTitle(),
-        isPaused: video.paused,
-        isAd: isAdShowing
-      });
-    } catch (err) {
-      // Ignore extension context invalidated error which happens when extension reloads
-      // without refreshing the tab.
-    }
+  try {
+    chrome.runtime.sendMessage({
+      type: "VIDEO_UPDATE",
+      // Pages without a <video> (e.g. virtual tours) still report their title;
+      // time is null so the companion knows there is no playback position.
+      time: video ? video.currentTime : null,
+      title: getTitle(),
+      isPaused: video ? video.paused : true,
+      isAd: isAdShowing
+    });
+  } catch (err) {
+    // Ignore extension context invalidated error which happens when extension reloads
+    // without refreshing the tab.
   }
 }
 
 
-setInterval(broadcastData, 200);
-
-const observer = new MutationObserver(broadcastData);
-observer.observe(document.documentElement, { childList: true, subtree: true });
+// The content script is injected on every page, so stay idle until the
+// companion overlay is first opened — no polling or DOM observation before then.
+let broadcasting = false;
+function startBroadcasting() {
+  if (broadcasting) return;
+  broadcasting = true;
+  setInterval(broadcastData, 200);
+  const observer = new MutationObserver(broadcastData);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+}
 
 // === OVERLAY INJECTION ===
 let overlayIframe = null;
@@ -92,6 +98,7 @@ const DEFAULT_W = 360, DEFAULT_H = 640;
 const MIN_W = 300, MIN_H = 200, MINIMIZED_H = 52;
 
 function createOverlay() {
+  startBroadcasting();
   overlayIframe = document.createElement('iframe');
   overlayIframe.src = chrome.runtime.getURL('shimmercompanion.html');
   const top = 20;

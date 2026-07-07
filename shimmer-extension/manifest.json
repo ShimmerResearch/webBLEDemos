@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Shimmer Companion",
-  "version": "1.3",
+  "version": "1.4",
   "permissions": ["tabs", "scripting", "storage", "activeTab"],
   "host_permissions": [
     "<all_urls>"
@@ -10,8 +10,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://www.youtube.com/*",
-        "https://www.netflix.com/*"
+        "http://*/*",
+        "https://*/*"
       ],
       "js": ["content.js"],
       "run_at": "document_start"
@@ -22,8 +22,8 @@
     {
       "resources": ["shimmercompanion.html", "shimmercompanion.js", "chart.min.js", "shimmer3r.js"],
       "matches": [
-        "https://www.youtube.com/*",
-        "https://www.netflix.com/*"
+        "http://*/*",
+        "https://*/*"
       ]
     }
   ]

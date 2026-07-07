@@ -25,7 +25,8 @@ const shimmer = new Shimmer3RClient({ debug: false });
 // ===== State =====
 let isStreaming = false;
 let intentionalDisconnect = false;
-let currentVideoTime = 0;
+let currentVideoTime = null; // null when the page has no <video> (e.g. virtual tours)
+const videoTimeStr = (digits) => currentVideoTime == null ? "" : currentVideoTime.toFixed(digits);
 let csvRows = [];
 let screenshots = [];
 let screenshotInterval = null;
@@ -122,7 +123,7 @@ function captureScreenshot(reason) {
     if (!response.dataUrl) return;
     const shot = {
       timestamp: new Date().toISOString(),
-      videoTime: currentVideoTime.toFixed(3),
+      videoTime: videoTimeStr(3),
       reason,
       dataUrl: response.dataUrl
     };
@@ -144,7 +145,7 @@ function appendShot(shot) {
   reasonEl.className = 'shot-reason';
   reasonEl.textContent = shot.reason;
   const timeEl = document.createElement('span');
-  timeEl.textContent = shot.videoTime + 's';
+  timeEl.textContent = shot.videoTime ? shot.videoTime + 's' : '';
   meta.appendChild(reasonEl);
   meta.appendChild(timeEl);
   el.appendChild(img);
@@ -178,9 +179,9 @@ chrome.runtime.onMessage.addListener((message) => {
   } else {
     videoTimeLabel.style.color = "var(--brand)";
     currentVideoTime = message.time;
-    videoTimeLabel.textContent = currentVideoTime.toFixed(2);
-    minimizedTimeText.textContent = currentVideoTime.toFixed(2) + "s";
-    recTime.textContent = currentVideoTime.toFixed(2) + "s";
+    videoTimeLabel.textContent = videoTimeStr(2) || "—";
+    minimizedTimeText.textContent = videoTimeStr(2) ? videoTimeStr(2) + "s" : "—";
+    recTime.textContent = videoTimeStr(2) ? videoTimeStr(2) + "s" : "—";
   }
 
   const titleEl = $("videoTitleLabel");
@@ -307,7 +308,7 @@ function onFrame(oc) {
   csvRows.push({
     timestamp: new Date().toISOString(),
     videoTitle: ($("videoTitleLabel").textContent || "").replace(/,/g, ""),
-    videoTime: currentVideoTime.toFixed(3),
+    videoTime: videoTimeStr(3),
     gsr, ppg
   });
 
