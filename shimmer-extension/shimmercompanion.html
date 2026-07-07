@@ -217,6 +217,26 @@
     .chart-container { margin-top: 8px; height: 64px; width: 100%; position: relative; }
     canvas { width: 100% !important; height: 100% !important; }
 
+    /* ====== Session timeline ====== */
+    .timeline-card { padding: 12px 14px 10px; }
+    #timelineCanvas { display: block; width: 100%; height: 76px; }
+    .tl-legend { display: flex; align-items: center; gap: 12px; margin-top: 8px; font-size: 10px; color: var(--text-muted); }
+    .tl-key { display: inline-flex; align-items: center; gap: 5px; }
+    .tl-key i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+    .tl-range { margin-left: auto; font-family: var(--font-mono); color: var(--text-dim); font-variant-numeric: tabular-nums; }
+
+    /* Event popover (hover preview on timeline markers) */
+    .ev-popover {
+      position: fixed; z-index: 300; display: none; pointer-events: none; width: 190px;
+      background: var(--surface-raised); border: 1px solid var(--border-hover);
+      border-radius: 12px; padding: 5px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .ev-popover img { display: block; width: 100%; aspect-ratio: 16/10; object-fit: cover; border-radius: 8px; background: var(--surface); }
+    .ev-pop-meta { display: flex; justify-content: space-between; align-items: center; padding: 6px 4px 2px; font-size: 10px; }
+    .ev-pop-reason { font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; display: inline-flex; align-items: center; gap: 5px; }
+    .ev-pop-reason i { width: 7px; height: 7px; border-radius: 50%; }
+    #evPopTime { font-family: var(--font-mono); color: var(--text-muted); }
+
     /* ====== Toggles ====== */
     .setting-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
     .setting-row + .setting-row { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
@@ -276,8 +296,14 @@
       display: none; position: absolute; inset: 0; z-index: 200;
       background: rgba(0,0,0,0.85); align-items: center; justify-content: center; padding: 20px;
     }
-    .lightbox.open { display: flex; }
-    .lightbox img { max-width: 100%; max-height: 100%; border-radius: 10px; }
+    .lightbox.open { display: flex; flex-direction: column; gap: 10px; }
+    .lightbox img { max-width: 100%; max-height: calc(100% - 40px); border-radius: 10px; }
+    .lb-meta {
+      display: flex; align-items: center; gap: 7px; font-size: 11px; color: #fff;
+      background: rgba(0,0,0,0.55); border: 1px solid var(--border);
+      border-radius: 20px; padding: 4px 12px; font-family: var(--font-mono);
+    }
+    .lb-meta i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
     .lightbox-close {
       position: absolute; top: 12px; right: 12px; background: rgba(0,0,0,0.5);
       border: 1px solid var(--border); color: #fff; border-radius: 8px; padding: 6px; cursor: pointer;
@@ -446,6 +472,20 @@
         </div>
       </div>
 
+      <!-- SESSION TIMELINE -->
+      <div id="timelineSection" hidden>
+        <div class="section-title">Session Timeline</div>
+        <div class="card timeline-card">
+          <canvas id="timelineCanvas"></canvas>
+          <div class="tl-legend">
+            <span class="tl-key"><i style="background:#9085e9"></i>Click</span>
+            <span class="tl-key"><i style="background:#199e70"></i>Nav</span>
+            <span class="tl-key"><i style="background:#c98500"></i>Periodic</span>
+            <span class="tl-range" id="tlRange">0:00</span>
+          </div>
+        </div>
+      </div>
+
       <!-- SETTINGS -->
       <div>
         <div class="section-title">Screenshot Capture</div>
@@ -499,10 +539,20 @@
     <button class="btn" id="downloadBtn">Export ZIP</button>
   </div>
 
+  <!-- EVENT POPOVER -->
+  <div class="ev-popover" id="evPopover">
+    <img id="evPopImg" alt="" />
+    <div class="ev-pop-meta">
+      <span class="ev-pop-reason" id="evPopReason"><i></i><span></span></span>
+      <span id="evPopTime"></span>
+    </div>
+  </div>
+
   <!-- LIGHTBOX -->
   <div class="lightbox" id="lightbox">
     <button class="lightbox-close" id="lightboxClose"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     <img id="lightboxImg" src="" alt="" />
+    <div class="lb-meta" id="lightboxMeta" hidden></div>
   </div>
 
   <!-- RESIZE HANDLES -->

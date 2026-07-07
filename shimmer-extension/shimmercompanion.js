@@ -58,6 +58,176 @@ const tabLive = $("tabLive"), tabShots = $("tabShots");
 const shotCount = $("shotCount"), shotsGrid = $("shotsGrid"), shotsEmpty = $("shotsEmpty");
 const clearBtn = $("clearBtn"), downloadBtn = $("downloadBtn");
 const lightbox = $("lightbox"), lightboxImg = $("lightboxImg"), lightboxClose = $("lightboxClose");
+const lightboxMeta = $("lightboxMeta");
+
+// ===== Session timeline (whole-session GSR trend + snapshot markers) =====
+// Colors validated for CVD separation and contrast on the overlay surface.
+const REASON_COLORS = { click: "#9085e9", navigation: "#199e70", periodic: "#c98500" };
+const timelineSection = $("timelineSection"), tlRange = $("tlRange");
+const tlCanvas = $("timelineCanvas"), tlCtx = tlCanvas.getContext("2d");
+const evPopover = $("evPopover"), evPopImg = $("evPopImg");
+const evPopReason = $("evPopReason"), evPopTime = $("evPopTime");
+
+const TL_BINS = 480;
+let sessionStartMs = null;
+let tlBinMs = 250; // doubles whenever the session outgrows the bin array
+let tlSum = new Float64Array(TL_BINS), tlCount = new Uint32Array(TL_BINS);
+let tlHoverShot = null;
+
+function fmtElapsed(s) {
+  s = Math.max(0, s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+           : `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function tlReset() {
+  sessionStartMs = null;
+  tlBinMs = 250;
+  tlSum = new Float64Array(TL_BINS);
+  tlCount = new Uint32Array(TL_BINS);
+  tlHoverShot = null;
+  timelineSection.hidden = true;
+  evPopover.style.display = "none";
+}
+
+function tlFeed(tMs, gsr) {
+  if (sessionStartMs === null) { sessionStartMs = tMs; timelineSection.hidden = false; }
+  let idx = Math.floor((tMs - sessionStartMs) / tlBinMs);
+  while (idx >= TL_BINS) {
+    for (let i = 0; i < TL_BINS / 2; i++) {
+      tlSum[i] = tlSum[2 * i] + tlSum[2 * i + 1];
+      tlCount[i] = tlCount[2 * i] + tlCount[2 * i + 1];
+    }
+    tlSum.fill(0, TL_BINS / 2);
+    tlCount.fill(0, TL_BINS / 2);
+    tlBinMs *= 2;
+    idx = Math.floor((tMs - sessionStartMs) / tlBinMs);
+  }
+  tlSum[idx] += gsr;
+  tlCount[idx]++;
+}
+
+function tlXFor(tMs, width, spanMs) {
+  return ((tMs - sessionStartMs) / spanMs) * (width - 2) + 1;
+}
+
+function drawTimeline() {
+  if (sessionStartMs === null) return;
+  const w = tlCanvas.clientWidth, h = tlCanvas.clientHeight;
+  if (!w || !h) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (tlCanvas.width !== Math.round(w * dpr) || tlCanvas.height !== Math.round(h * dpr)) {
+    tlCanvas.width = Math.round(w * dpr);
+    tlCanvas.height = Math.round(h * dpr);
+  }
+  tlCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  tlCtx.clearRect(0, 0, w, h);
+
+  const spanMs = Math.max(30000, Date.now() - sessionStartMs);
+  const laneH = 16; // marker lane at the top; the trend renders below it
+  const plotY = laneH + 3, plotH = h - plotY - 3;
+
+  // GSR trend — context only, deliberately de-emphasized under the markers
+  let mn = Infinity, mx = -Infinity;
+  for (let i = 0; i < TL_BINS; i++) {
+    if (!tlCount[i]) continue;
+    const v = tlSum[i] / tlCount[i];
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  if (isFinite(mn)) {
+    if (mn === mx) { mn -= 1; mx += 1; }
+    const pad = (mx - mn) * 0.12;
+    mn -= pad; mx += pad;
+    tlCtx.save();
+    tlCtx.globalAlpha = 0.55;
+    tlCtx.strokeStyle = "#4FC3F7";
+    tlCtx.lineWidth = 1.5;
+    tlCtx.lineJoin = "round";
+    tlCtx.beginPath();
+    let started = false;
+    for (let i = 0; i < TL_BINS; i++) {
+      if (!tlCount[i]) { started = false; continue; } // gap = recording paused
+      const v = tlSum[i] / tlCount[i];
+      const x = tlXFor(sessionStartMs + (i + 0.5) * tlBinMs, w, spanMs);
+      const y = plotY + plotH - ((v - mn) / (mx - mn)) * plotH;
+      if (!started) { tlCtx.moveTo(x, y); started = true; }
+      else tlCtx.lineTo(x, y);
+    }
+    tlCtx.stroke();
+    tlCtx.restore();
+  }
+
+  // snapshot markers: hairline through the trend + dot in the lane
+  for (const s of screenshots) {
+    if (s.tMs == null) continue;
+    const x = tlXFor(s.tMs, w, spanMs);
+    const c = REASON_COLORS[s.reason] || "#9BA4B5";
+    tlCtx.save();
+    tlCtx.globalAlpha = 0.3;
+    tlCtx.strokeStyle = c;
+    tlCtx.lineWidth = 1;
+    tlCtx.beginPath();
+    tlCtx.moveTo(x, plotY);
+    tlCtx.lineTo(x, h - 2);
+    tlCtx.stroke();
+    tlCtx.restore();
+    const r = tlHoverShot === s ? 6 : 4.5;
+    tlCtx.beginPath(); tlCtx.arc(x, laneH / 2 + 1, r + 2, 0, Math.PI * 2); tlCtx.fillStyle = "#1C1F26"; tlCtx.fill();
+    tlCtx.beginPath(); tlCtx.arc(x, laneH / 2 + 1, r, 0, Math.PI * 2); tlCtx.fillStyle = c; tlCtx.fill();
+  }
+
+  tlRange.textContent = fmtElapsed((Date.now() - sessionStartMs) / 1000);
+}
+
+function tlShotAt(e) {
+  if (sessionStartMs === null || screenshots.length === 0) return null;
+  const rect = tlCanvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const spanMs = Math.max(30000, Date.now() - sessionStartMs);
+  let best = null, bestD = 14; // hit target well beyond the dot itself
+  for (const s of screenshots) {
+    if (s.tMs == null) continue;
+    const d = Math.abs(px - tlXFor(s.tMs, rect.width, spanMs));
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  return best;
+}
+
+tlCanvas.addEventListener("mousemove", (e) => {
+  const s = tlShotAt(e);
+  if (s !== tlHoverShot) { tlHoverShot = s; drawTimeline(); }
+  if (!s) {
+    tlCanvas.style.cursor = "default";
+    evPopover.style.display = "none";
+    return;
+  }
+  tlCanvas.style.cursor = "pointer";
+  evPopImg.src = s.dataUrl;
+  evPopReason.querySelector("i").style.background = REASON_COLORS[s.reason] || "#9BA4B5";
+  evPopReason.querySelector("span").textContent = s.reason;
+  evPopTime.textContent = fmtElapsed((s.tMs - sessionStartMs) / 1000) + (s.videoTime ? ` · ${s.videoTime}s` : "");
+  evPopover.style.display = "block";
+  const pw = 190, ph = evPopover.offsetHeight || 150;
+  let x = e.clientX + 12;
+  if (x + pw > window.innerWidth - 6) x = e.clientX - pw - 12;
+  x = Math.max(6, x);
+  let y = e.clientY - ph - 10;
+  if (y < 6) y = Math.min(e.clientY + 14, window.innerHeight - ph - 6);
+  evPopover.style.left = x + "px";
+  evPopover.style.top = y + "px";
+});
+tlCanvas.addEventListener("mouseleave", () => {
+  tlHoverShot = null;
+  evPopover.style.display = "none";
+  drawTimeline();
+});
+tlCanvas.addEventListener("click", (e) => {
+  const s = tlShotAt(e);
+  if (s) openLightbox(s);
+});
+new ResizeObserver(() => drawTimeline()).observe(tlCanvas);
 
 // ===== Connection state machine =====
 function setConn(state, label) {
@@ -121,14 +291,19 @@ function captureScreenshot(reason) {
       return;
     }
     if (!response.dataUrl) return;
+    const now = new Date();
     const shot = {
-      timestamp: new Date().toISOString(),
+      timestamp: now.toISOString(),
+      tMs: now.getTime(),
       videoTime: videoTimeStr(3),
+      title: ($("videoTitleLabel").textContent || "").trim(),
       reason,
+      file: `shot_${String(screenshots.length + 1).padStart(3, "0")}_${reason}.jpg`,
       dataUrl: response.dataUrl
     };
     screenshots.push(shot);
     appendShot(shot);
+    drawTimeline();
   });
 }
 
@@ -144,18 +319,32 @@ function appendShot(shot) {
   const reasonEl = document.createElement('span');
   reasonEl.className = 'shot-reason';
   reasonEl.textContent = shot.reason;
+  reasonEl.style.color = REASON_COLORS[shot.reason] || 'var(--brand-hover)';
   const timeEl = document.createElement('span');
-  timeEl.textContent = shot.videoTime ? shot.videoTime + 's' : '';
+  timeEl.textContent = shot.videoTime ? shot.videoTime + 's'
+    : (sessionStartMs != null && shot.tMs != null ? fmtElapsed((shot.tMs - sessionStartMs) / 1000) : '');
   meta.appendChild(reasonEl);
   meta.appendChild(timeEl);
   el.appendChild(img);
   el.appendChild(meta);
-  el.onclick = () => openLightbox(shot.dataUrl);
+  el.onclick = () => openLightbox(shot);
   shotsGrid.appendChild(el);
   shotCount.textContent = String(screenshots.length);
 }
 
-function openLightbox(src) { lightboxImg.src = src; lightbox.classList.add('open'); }
+function openLightbox(shot) {
+  lightboxImg.src = shot.dataUrl;
+  lightboxMeta.hidden = false;
+  lightboxMeta.textContent = '';
+  const dot = document.createElement('i');
+  dot.style.background = REASON_COLORS[shot.reason] || '#9BA4B5';
+  lightboxMeta.appendChild(dot);
+  const parts = [shot.reason];
+  if (sessionStartMs != null && shot.tMs != null) parts.push(fmtElapsed((shot.tMs - sessionStartMs) / 1000));
+  if (shot.videoTime) parts.push(`media ${shot.videoTime}s`);
+  lightboxMeta.appendChild(document.createTextNode(parts.join(' · ')));
+  lightbox.classList.add('open');
+}
 lightboxClose.onclick = () => lightbox.classList.remove('open');
 lightbox.onclick = (e) => { if (e.target === lightbox) lightbox.classList.remove('open'); };
 
@@ -305,12 +494,15 @@ function onFrame(oc) {
 
   const ppg = oc.get('PPG', 'raw')?.value;
 
+  const now = new Date();
   csvRows.push({
-    timestamp: new Date().toISOString(),
+    timestamp: now.toISOString(),
+    tMs: now.getTime(),
     videoTitle: ($("videoTitleLabel").textContent || "").replace(/,/g, ""),
     videoTime: videoTimeStr(3),
     gsr, ppg
   });
+  tlFeed(now.getTime(), gsr);
 
   latestGsr = gsr;
   if (ppg !== undefined) latestPpg = ppg;
@@ -338,6 +530,7 @@ function scheduleDisplay() {
     ppgValLabel.textContent = latestPpg != null ? latestPpg.toFixed(0) : "—";
     gsrChart.update('none');
     ppgChart.update('none');
+    drawTimeline();
   });
 }
 
@@ -356,6 +549,7 @@ clearBtn.onclick = () => {
   latestGsr = latestPpg = null;
   gsrValLabel.textContent = "—";
   ppgValLabel.textContent = "—";
+  tlReset();
   if (!isStreaming) {
     body.classList.remove('has-shots');
     activateTab(tabLive); // Shots tab is now hidden; don't strand its panel
@@ -363,26 +557,56 @@ clearBtn.onclick = () => {
 };
 
 // ===== Export =====
+async function buildReport(t0ms) {
+  const round3 = (x) => Math.round(x * 1000) / 1000;
+  const titles = [...new Set(csvRows.map(r => r.videoTitle).filter(t => t && t !== "Waiting for media…" && t !== "Unknown"))];
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    device: shimmer.device?.name || null,
+    titles,
+    t: csvRows.map(r => round3((r.tMs - t0ms) / 1000)),
+    gsr: csvRows.map(r => (typeof r.gsr === "number" ? round3(r.gsr) : null)),
+    ppg: csvRows.map(r => (typeof r.ppg === "number" ? r.ppg : null)),
+    events: screenshots.map(s => ({
+      t: round3(((s.tMs ?? t0ms) - t0ms) / 1000),
+      iso: s.timestamp,
+      reason: s.reason,
+      videoTime: s.videoTime || "",
+      title: s.title || "",
+      file: s.file,
+    })),
+  };
+  const tpl = await fetch(chrome.runtime.getURL("report_template.html")).then(r => r.text());
+  // <-escape so titles containing "</script>" can't break out of the inline block
+  const json = JSON.stringify(payload).replace(/</g, "\\u003c");
+  return tpl.replace('"__SHIMMER_SESSION_DATA__"', json);
+}
+
 downloadBtn.onclick = async () => {
   if (csvRows.length === 0) { alert("No data recorded yet."); return; }
 
-  const header = ["Timestamp", "Video Title", "Video Time (s)", "GSR (uS)", "PPG (Raw)"];
+  const t0ms = csvRows[0].tMs;
+  const header = ["Timestamp", "Elapsed (s)", "Video Title", "Video Time (s)", "GSR (uS)", "PPG (Raw)"];
   const csvContent = [
     header.join(","),
-    ...csvRows.map(r => `${r.timestamp},${r.videoTitle},${r.videoTime},${r.gsr},${r.ppg}`)
+    ...csvRows.map(r => `${r.timestamp},${((r.tMs - t0ms) / 1000).toFixed(3)},${r.videoTitle},${r.videoTime},${r.gsr},${r.ppg ?? ""}`)
   ].join("\n");
 
   try {
     const zip = new JSZip();
     zip.file("results.csv", csvContent);
     if (screenshots.length > 0) {
+      const evHeader = ["Timestamp", "Elapsed (s)", "Video Time (s)", "Reason", "Page Title", "Filename"];
+      const eventsCsv = [
+        evHeader.join(","),
+        ...screenshots.map(s =>
+          `${s.timestamp},${(((s.tMs ?? t0ms) - t0ms) / 1000).toFixed(3)},${s.videoTime},${s.reason},${(s.title || "").replace(/,/g, "")},${s.file}`)
+      ].join("\n");
+      zip.file("events.csv", eventsCsv);
       const folder = zip.folder("screenshots");
-      screenshots.forEach((s) => {
-        const base64 = s.dataUrl.split(',')[1];
-        const name = `shot_${s.timestamp.replace(/[:.]/g, '-')}_${s.videoTime}s_${s.reason}.jpg`;
-        folder.file(name, base64, { base64: true });
-      });
+      screenshots.forEach((s) => folder.file(s.file, s.dataUrl.split(',')[1], { base64: true }));
     }
+    zip.file("report.html", await buildReport(t0ms));
     const blob = await zip.generateAsync({ type: "blob" });
     triggerDownload(blob, `shimmer_session_${Date.now()}.zip`);
   } catch (e) {
