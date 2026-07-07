@@ -699,12 +699,12 @@ export class Shimmer3RClient {
             gsrkOhm = nudgeGsrResistance(gsrkOhm, this.gsrRangeSetting);
             let gsrConductanceUSiemens = (1.0 / gsrkOhm) * 1000;
             //console.log('uSiemens: ' + gsrConductanceUSiemens + ' ' + this.gsrRangeSetting + ' ' + currentRange);
-            oc.add(GSR_NAME, gsrConductanceUSiemens, 'uSiemens', CAL);	
-            //oc.add(GSR_NAME, gsr, 'kOhm', CAL);	
+            oc.add(GSR_NAME, gsrConductanceUSiemens, 'uSiemens', CAL);
+            //oc.add(GSR_NAME, gsr, 'kOhm', CAL);
 
 		}
 	}
-  }	  
+  }
 
   _parseBySchema() {
     const sch = this.schema;
