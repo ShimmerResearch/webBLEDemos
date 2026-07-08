@@ -23,7 +23,8 @@ const ppgChart = new Chart(ppgCtx, chartConfig('#FF6B6B'));
 const shimmer = new Shimmer3RClient({ debug: false });
 
 // ===== State =====
-let isStreaming = false;
+let isStreaming = false; // device is streaming (live preview) — on from connect to disconnect
+let isRecording = false; // logging to CSV/timeline/screenshots — toggled by the record button
 let intentionalDisconnect = false;
 let currentVideoTime = null; // null when the page has no <video> (e.g. virtual tours)
 const videoTimeStr = (digits) => currentVideoTime == null ? "" : currentVideoTime.toFixed(digits);
@@ -32,7 +33,6 @@ let screenshots = [];
 let shotSeq = 0;  // image numbering; a settled shot reuses its click's number
 let eventSeq = 0; // one id per click event, shared by its onset + settled shots
 let screenshotInterval = null;
-let lastVideoTitle = "";
 
 // throttled display buffers
 let latestGsr = null, latestPpg = null;
@@ -54,7 +54,7 @@ const closeBtn = $("closeBtn"), minBtn = $("minBtn"), expandBtn = $("expandBtn")
 const dragHeader = $("dragHeader"), dragHeaderMin = $("dragHeaderMin");
 const minimizedTimeText = $("minimizedTimeText"), minStopBtn = $("minStopBtn");
 
-const capPeriodic = $("capPeriodic"), capInterval = $("capInterval"), capClick = $("capClick"), capNav = $("capNav");
+const capPeriodic = $("capPeriodic"), capInterval = $("capInterval"), capClick = $("capClick");
 const capSettled = $("capSettled"), settledRow = $("settledRow");
 const capClickDelay = $("capClickDelay"), capClickDelayVal = $("capClickDelayVal");
 
@@ -316,7 +316,7 @@ let captureBusy = false;
 
 function captureScreenshot(reason, meta = {}) {
   // meta: { clickTMs, eventId, kind } — kind 'onset' | 'settled' for click events
-  if (!isStreaming) return;
+  if (!isRecording) return;
   captureQueue.push({ reason, meta, retried: false });
   pumpCaptureQueue();
 }
@@ -328,7 +328,7 @@ function pumpCaptureQueue() {
   captureBusy = true;
   chrome.runtime.sendMessage({ type: "TAKE_SCREENSHOT" }, (response) => {
     const ok = !chrome.runtime.lastError && response?.ok && response.dataUrl;
-    if (ok && isStreaming) recordShot(job, response.dataUrl);
+    if (ok && isRecording) recordShot(job, response.dataUrl);
     else if (!ok && !job.retried) { job.retried = true; captureQueue.unshift(job); }
     else if (!ok) console.error("Screenshot failed:", chrome.runtime.lastError?.message || response?.error);
     setTimeout(() => { captureBusy = false; pumpCaptureQueue(); }, 600);
@@ -458,7 +458,7 @@ lightbox.onclick = (e) => { if (e.target === lightbox) lightbox.classList.remove
 
 function manageInterval() {
   if (screenshotInterval) { clearInterval(screenshotInterval); screenshotInterval = null; }
-  if (isStreaming && capPeriodic.checked) {
+  if (isRecording && capPeriodic.checked) {
     let ms = parseInt(capInterval.value) * 1000;
     if (isNaN(ms) || ms < 1000) ms = 1000;
     screenshotInterval = setInterval(() => captureScreenshot("periodic"), ms);
@@ -482,12 +482,7 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 
   const titleEl = $("videoTitleLabel");
-  const newTitle = message.isAd ? "Advertisement Playing" : message.title;
-  if (capNav.checked && lastVideoTitle && lastVideoTitle !== newTitle && !message.isAd) {
-    captureScreenshot("navigation");
-  }
-  lastVideoTitle = newTitle;
-  titleEl.textContent = newTitle;
+  titleEl.textContent = message.isAd ? "Advertisement Playing" : message.title;
 });
 
 // ===== Capture-on-click (relayed from content script) =====
@@ -520,7 +515,7 @@ capClick.onchange = () => { if (!capClick.checked) cancelPendingSettle(); update
 capSettled.onchange = () => { if (!capSettled.checked) cancelPendingSettle(); updateSettleUI(); };
 
 window.addEventListener('message', (event) => {
-  if (event.data?.type !== 'PAGE_CLICK' || !isStreaming || !capClick.checked) return;
+  if (event.data?.type !== 'PAGE_CLICK' || !isRecording || !capClick.checked) return;
   const eventId = ++eventSeq;
   const clickTMs = Date.now();
   captureScreenshot("click", { clickTMs, eventId, kind: 'onset' });
@@ -541,7 +536,8 @@ scanBtn.onclick = async () => {
   if (connected) {
     // Disconnect WITHOUT re-opening the pairing chooser.
     intentionalDisconnect = true;
-    if (isStreaming) await stopStreaming().catch(() => {});
+    if (isRecording) stopRecording();
+    if (isStreaming) { isStreaming = false; await shimmer.stopStreaming().catch(() => {}); }
     await shimmer.disconnect().catch(() => {});
     resetToOffline();
     return;
@@ -559,6 +555,9 @@ scanBtn.onclick = async () => {
     if (shimmer.device?.name) deviceNameLabel.textContent = shimmer.device.name;
     shimmer.device?.addEventListener('gattserverdisconnected', onUnexpectedDisconnect);
 
+    // live preview begins immediately; logging waits for the record button
+    await startStreaming();
+
     setConn('online', 'Online');
     deviceStatusText.textContent = "Connected";
     scanBtn.textContent = "Disconnect";
@@ -575,7 +574,8 @@ scanBtn.onclick = async () => {
 
 function onUnexpectedDisconnect() {
   if (intentionalDisconnect) return;
-  if (isStreaming) stopStreamingUI();
+  if (isRecording) stopRecording();
+  isStreaming = false;
   setConn('error', 'Disconnected');
   deviceStatusText.textContent = "Connection lost";
   scanBtn.textContent = "Reconnect";
@@ -590,7 +590,7 @@ function resetToOffline() {
   streamBtn.disabled = true;
 }
 
-// ===== Streaming =====
+// ===== Streaming (live preview; runs from connect to disconnect) =====
 async function startStreaming() {
   await shimmer.setSamplingRate(128);
   await shimmer.setInternalExpPower(1);
@@ -599,21 +599,20 @@ async function startStreaming() {
   await shimmer.setSensors(SensorBitmapShimmer3.SENSOR_GSR | SensorBitmapShimmer3.SENSOR_INT_A1);
   await shimmer.startStreaming();
   shimmer.onStreamFrame = onFrame;
-
   isStreaming = true;
+}
+
+// ===== Recording (logging to CSV/timeline/screenshots) =====
+function startRecording() {
+  isRecording = true;
   body.classList.add('is-recording', 'has-shots');
   streamBtnText.textContent = "Stop Recording";
   setConn('online', 'Recording');
   manageInterval();
 }
 
-async function stopStreaming() {
-  await shimmer.stopStreaming();
-  stopStreamingUI();
-}
-
-function stopStreamingUI() {
-  isStreaming = false;
+function stopRecording() {
+  isRecording = false;
   cancelPendingSettle(); // don't fire a deferred shot after the session ended
   captureQueue.length = 0;
   body.classList.remove('is-recording');
@@ -622,15 +621,10 @@ function stopStreamingUI() {
   manageInterval();
 }
 
-streamBtn.onclick = async () => {
-  if (!shimmer.device?.gatt?.connected) return;
-  try {
-    if (!isStreaming) await startStreaming();
-    else await stopStreaming();
-  } catch (err) {
-    console.error("Stream error:", err);
-    setConn('error', 'Stream error');
-  }
+streamBtn.onclick = () => {
+  if (!isStreaming) return;
+  if (!isRecording) startRecording();
+  else stopRecording();
 };
 
 // ===== Frame handling =====
@@ -642,15 +636,18 @@ function onFrame(oc) {
 
   const ppg = oc.get('PPG', 'raw')?.value;
 
-  const now = new Date();
-  csvRows.push({
-    timestamp: now.toISOString(),
-    tMs: now.getTime(),
-    videoTitle: ($("videoTitleLabel").textContent || "").replace(/,/g, ""),
-    videoTime: videoTimeStr(3),
-    gsr, ppg
-  });
-  tlFeed(now.getTime(), gsr);
+  // live preview always updates; the session log only grows while recording
+  if (isRecording) {
+    const now = new Date();
+    csvRows.push({
+      timestamp: now.toISOString(),
+      tMs: now.getTime(),
+      videoTitle: ($("videoTitleLabel").textContent || "").replace(/,/g, ""),
+      videoTime: videoTimeStr(3),
+      gsr, ppg
+    });
+    tlFeed(now.getTime(), gsr);
+  }
 
   latestGsr = gsr;
   if (ppg !== undefined) latestPpg = ppg;
@@ -702,7 +699,7 @@ clearBtn.onclick = () => {
   shotSeq = 0;
   eventSeq = 0;
   tlReset();
-  if (!isStreaming) {
+  if (!isRecording) {
     body.classList.remove('has-shots');
     activateTab(tabLive); // Shots tab is now hidden; don't strand its panel
   }
