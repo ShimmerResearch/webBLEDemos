@@ -3,7 +3,7 @@
 // Your note: "timestamp is u24, so layout is: 0x00  [u24 timestamp]  <channel samples...>"
 // This build defaults to u24, and you can also pass { timestampFmt: 'u24' } in the constructor.
 
-const OPCODES = { DATA: 0x00, INQUIRY_CMD: 0x01, INQUIRY_RSP: 0x02, START_STREAM: 0x07, STOP_STREAM: 0x20, ACK: 0xFF, SAMPLING_RATE: 0x05, SET_SENSORS_CMD: 0x08, SET_GSR_RANGE: 0x21, SET_INTERNAL_EXP_POWER_ENABLE_CMD: 0x5E, START_BT_STEAM_SD_Logging: 0x70, STOP_BT_STEAM_SD_Logging: 0x97};
+const OPCODES = { DATA: 0x00, INQUIRY_CMD: 0x01, INQUIRY_RSP: 0x02, START_STREAM: 0x07, STOP_STREAM: 0x20, ACK: 0xFF, SAMPLING_RATE: 0x05, SET_SENSORS_CMD: 0x08, SET_ACCEL_RANGE: 0x09, SET_GYRO_RANGE: 0x49, SET_GSR_RANGE: 0x21, SET_INTERNAL_EXP_POWER_ENABLE_CMD: 0x5E, START_BT_STEAM_SD_Logging: 0x70, STOP_BT_STEAM_SD_Logging: 0x97};
 
 const DEFAULTS = {
   SERVICE_UUID: '65333333-a115-11e2-9e9a-0800200ca100',
@@ -340,6 +340,37 @@ export class Shimmer3RClient {
     }
 
     return { sensors, ackRemainder, enabledSensors: this.enabledSensors };
+  }
+
+  /**
+   * Set the wide-range accelerometer range (Shimmer3R: LIS2DW12).
+   * Flow: write [0x09, range] → wait for ACK (0xFF).
+   * @param {number} range - 0 = ±2g, 1 = ±4g, 2 = ±8g, 3 = ±16g
+   */
+  async setAccelRange(range) {
+    if (!this.rx) throw new Error('Not connected (RX missing)');
+    range = range & 0xFF;
+    const cmd = new Uint8Array([OPCODES.SET_ACCEL_RANGE, range]);
+    this._emitStatus(`SET_ACCEL_RANGE → ${range} waiting for ACK…`);
+    const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+    this._emitStatus(`Accel range ACKed. Range ${range} applied.`);
+    return { range, ackRemainder };
+  }
+
+  /**
+   * Set the gyroscope range (Shimmer3R: LSM6DSV).
+   * Flow: write [0x49, range] → wait for ACK (0xFF).
+   * @param {number} range - 0 = 125dps, 1 = 250dps, 2 = 500dps,
+   *                         3 = 1000dps, 4 = 2000dps, 5 = 4000dps
+   */
+  async setGyroRange(range) {
+    if (!this.rx) throw new Error('Not connected (RX missing)');
+    range = range & 0xFF;
+    const cmd = new Uint8Array([OPCODES.SET_GYRO_RANGE, range]);
+    this._emitStatus(`SET_GYRO_RANGE → ${range} waiting for ACK…`);
+    const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+    this._emitStatus(`Gyro range ACKed. Range ${range} applied.`);
+    return { range, ackRemainder };
   }
 
   /**
