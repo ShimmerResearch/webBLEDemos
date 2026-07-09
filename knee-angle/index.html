@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Knee Angle — Dual-IMU Physio Demo</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: #161b22;
+      --panel-2: #1c2430;
+      --border: #2a3441;
+      --text: #e6edf3;
+      --muted: #8b98a8;
+      --accent: #2dd4bf;
+      --accent-dim: #0f766e;
+      --flex: #f59e0b;
+      --good: #34d399;
+      --bad: #f87171;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: var(--font); line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    header {
+      padding: 20px 24px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    }
+    header h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+    header .tag {
+      font-size: 12px; color: var(--accent); border: 1px solid var(--accent-dim);
+      padding: 2px 8px; border-radius: 999px;
+    }
+    header .req { font-size: 12px; color: var(--muted); margin-left: auto; }
+    main {
+      max-width: 1100px; margin: 0 auto; padding: 24px;
+      display: grid; gap: 20px; grid-template-columns: 1fr 1fr;
+    }
+    @media (max-width: 820px) { main { grid-template-columns: 1fr; } }
+
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 14px; padding: 18px;
+    }
+    .card h2 {
+      font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--muted); margin: 0 0 14px; font-weight: 600;
+    }
+    .span-2 { grid-column: 1 / -1; }
+
+    /* Sensor connection rows */
+    .sensor {
+      display: flex; align-items: center; gap: 12px; padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .sensor:last-child { border-bottom: none; }
+    .led {
+      width: 12px; height: 12px; border-radius: 50%; background: #3b4654;
+      flex: none; transition: background .2s, box-shadow .2s;
+    }
+    .led.on { background: var(--good); box-shadow: 0 0 10px var(--good); }
+    .led.streaming { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+    .sensor .info { flex: 1; min-width: 0; }
+    .sensor .role { font-weight: 600; }
+    .sensor .name { font-size: 12px; color: var(--muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    button {
+      font-family: var(--font); font-size: 14px; font-weight: 600;
+      border: 1px solid var(--border); background: var(--panel-2);
+      color: var(--text); padding: 9px 16px; border-radius: 9px; cursor: pointer;
+      transition: background .15s, border-color .15s, opacity .15s;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.primary { background: var(--accent-dim); border-color: var(--accent-dim); }
+    button.primary:hover:not(:disabled) { background: var(--accent); color: #04201c; }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .field input, .field select {
+      width: 74px; background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); border-radius: 7px; padding: 7px 9px; font-size: 14px; font-family: var(--font);
+    }
+    .field select { width: auto; min-width: 88px; }
+
+    /* Mounting (experimental) */
+    .exp-tag {
+      font-size: 10px; color: var(--flex); border: 1px solid var(--flex);
+      border-radius: 999px; padding: 1px 8px; margin-left: 8px;
+      text-transform: none; letter-spacing: 0; vertical-align: middle;
+    }
+    .mount-row {
+      display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
+      padding: 8px 0; border-bottom: 1px solid var(--border);
+    }
+    .mount-row:last-of-type { border-bottom: none; }
+    .mount-label { font-weight: 600; min-width: 150px; padding-bottom: 8px; }
+
+    /* Exercise visual / readout */
+    .readout-wrap { display: flex; align-items: center; gap: 28px; flex-wrap: wrap; justify-content: center; }
+    #leg { width: 420px; max-width: 100%; height: auto; flex: 0 1 auto; transition: opacity .3s; }
+    .readout-wrap .big { flex: none; }
+    .phase-prompt {
+      font-size: 24px; font-weight: 750; letter-spacing: .05em; text-transform: uppercase;
+      margin-bottom: 10px; color: var(--muted); transition: color .2s; min-height: 1.2em;
+    }
+    .phase-prompt.flex { color: var(--flex); }
+    .phase-prompt.extend { color: var(--accent); }
+    .phase-prompt.done { color: var(--good); }
+    .togo {
+      font-size: 14px; color: var(--muted); margin-top: 8px; min-height: 1.4em;
+      font-variant-numeric: tabular-nums;
+    }
+    .big { text-align: center; min-width: 150px; }
+    .big .val { font-size: 64px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+    .big .val span { font-size: 26px; color: var(--muted); font-weight: 600; }
+    .big .lbl { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-top: 4px; }
+    .status-pill {
+      display: inline-block; margin-top: 10px; font-size: 12px; padding: 4px 12px; border-radius: 999px;
+      background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+    }
+    .status-pill.in { background: rgba(52,211,153,.12); color: var(--good); border-color: var(--good); }
+    .status-pill.out { background: rgba(248,113,113,.12); color: var(--bad); border-color: var(--bad); }
+
+    /* Reps */
+    .reps { display: flex; align-items: baseline; gap: 10px; }
+    .reps .n { font-size: 44px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .reps .of { font-size: 16px; color: var(--muted); }
+    .repbar { height: 8px; background: var(--panel-2); border-radius: 999px; overflow: hidden; margin-top: 12px; }
+    .repbar > div { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+
+    #plot { width: 100%; height: 200px; display: block; border-radius: 10px; background: var(--bg); }
+
+    .dbg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 820px) { .dbg-grid { grid-template-columns: 1fr; } }
+    .scope { width: 100%; height: 120px; display: block; border-radius: 8px; background: var(--bg); }
+    .dbg-title {
+      font-size: 12px; color: var(--muted); margin-bottom: 4px;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    }
+
+    .console {
+      grid-column: 1 / -1; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px; color: var(--muted); background: var(--bg);
+      border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+      max-height: 90px; overflow-y: auto; white-space: pre-wrap;
+    }
+    .hint { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Knee Angle</h1>
+    <span class="tag">Dual-IMU · Web Bluetooth</span>
+    <span class="req">Requires 2× Shimmer3R · FW ≥ v1.0.22</span>
+  </header>
+
+  <main>
+    <!-- Connection -->
+    <section class="card">
+      <h2>Sensors</h2>
+      <div class="sensor">
+        <div class="led" id="ledUpper"></div>
+        <div class="info">
+          <div class="role">Upper thigh</div>
+          <div class="name" id="nameUpper">Not connected</div>
+        </div>
+        <button id="connUpper" class="primary">Connect</button>
+      </div>
+      <div class="sensor">
+        <div class="led" id="ledLower"></div>
+        <div class="info">
+          <div class="role">Lower thigh (shank)</div>
+          <div class="name" id="nameLower">Not connected</div>
+        </div>
+        <button id="connLower" class="primary">Connect</button>
+      </div>
+      <p class="hint">Mount one sensor above and one below the knee. Connect both, stand with a
+        straight leg, then press <strong>Zero</strong> — the straight leg reads <strong>180°</strong>;
+        flexing to a right angle reads 90°.</p>
+    </section>
+
+    <!-- Controls -->
+    <section class="card">
+      <h2>Session</h2>
+      <div class="controls">
+        <button id="zeroBtn" disabled>⦿ Zero (straight = 180°)</button>
+        <div class="field">
+          <label for="minAngle">Flex to ≤ °</label>
+          <input type="number" id="minAngle" value="90" />
+        </div>
+        <div class="field">
+          <label for="maxAngle">Extend to ≥ °</label>
+          <input type="number" id="maxAngle" value="175" />
+        </div>
+        <div class="field">
+          <label for="targetReps">Target reps</label>
+          <input type="number" id="targetReps" value="10" />
+        </div>
+      </div>
+      <div class="reps" style="margin-top:18px;">
+        <span class="n" id="repCount">0</span>
+        <span class="of">/ <span id="repTarget">10</span> reps</span>
+        <button id="resetReps" style="margin-left:auto;">Reset</button>
+      </div>
+      <div class="repbar"><div id="repFill"></div></div>
+    </section>
+
+    <!-- Mounting (experimental) -->
+    <section class="card span-2">
+      <h2>Mounting <span class="exp-tag">experimental</span></h2>
+      <div class="mount-row">
+        <span class="mount-label">Upper thigh</span>
+        <div class="field"><label for="uAxis">Rotation axis</label>
+          <select id="uAxis"><option>X</option><option>Y</option><option>Z</option></select></div>
+        <div class="field"><label for="uRef">Up at zero pose</label>
+          <select id="uRef"></select></div>
+        <div class="field"><label for="uPol">Direction</label>
+          <select id="uPol"><option value="1">Normal</option><option value="-1">Inverted</option></select></div>
+      </div>
+      <div class="mount-row">
+        <span class="mount-label">Lower thigh (shank)</span>
+        <div class="field"><label for="lAxis">Rotation axis</label>
+          <select id="lAxis"><option>X</option><option>Y</option><option>Z</option></select></div>
+        <div class="field"><label for="lRef">Up at zero pose</label>
+          <select id="lRef"></select></div>
+        <div class="field"><label for="lPol">Direction</label>
+          <select id="lPol"><option value="1">Normal</option><option value="-1">Inverted</option></select></div>
+      </div>
+      <p class="hint">Per-sensor strapping: which device axis points <strong>up</strong> in the zero pose,
+        the axis the knee rotates about, and the rotation direction. Changing any of these resets
+        calibration — press <strong>Zero</strong> again. If flexing reads 270° instead of 90°, flip
+        <strong>Direction</strong> on one sensor. Settings are remembered on this browser.</p>
+    </section>
+
+    <!-- Exercise visual -->
+    <section class="card span-2">
+      <h2>Exercise</h2>
+      <div class="readout-wrap">
+        <svg id="leg" viewBox="0 0 460 350"></svg>
+        <div class="big">
+          <div class="phase-prompt" id="phasePrompt">connect sensors</div>
+          <div class="val"><span id="angleVal">––</span><span>°</span></div>
+          <div class="lbl">knee angle</div>
+          <div class="togo" id="toGo">&nbsp;</div>
+          <div class="status-pill" id="rangePill">waiting for sensors</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Live plot -->
+    <section class="card span-2">
+      <h2>Live trace</h2>
+      <canvas id="plot"></canvas>
+    </section>
+
+    <!-- Debug: raw signal chain -->
+    <section class="card span-2">
+      <h2>Debug — device-frame signals (input to fusion)</h2>
+      <div class="dbg-grid">
+        <div>
+          <div class="dbg-title">Upper accel (g) · <span id="hzUpper">0</span> Hz · <span id="valUA">–</span></div>
+          <canvas class="scope" id="scopeUA"></canvas>
+        </div>
+        <div>
+          <div class="dbg-title">Upper gyro (deg/s) · <span id="valUG">–</span></div>
+          <canvas class="scope" id="scopeUG"></canvas>
+        </div>
+        <div>
+          <div class="dbg-title">Lower accel (g) · <span id="hzLower">0</span> Hz · <span id="valLA">–</span></div>
+          <canvas class="scope" id="scopeLA"></canvas>
+        </div>
+        <div>
+          <div class="dbg-title">Lower gyro (deg/s) · <span id="valLG">–</span></div>
+          <canvas class="scope" id="scopeLG"></canvas>
+        </div>
+      </div>
+      <p class="hint" style="font-family: ui-monospace, Menlo, monospace;">
+        <span style="color:#f87171;">— X</span>&nbsp;
+        <span style="color:#34d399;">— Y</span>&nbsp;
+        <span style="color:#60a5fa;">— Z</span>&nbsp;&nbsp;
+        segment angles → upper: <span id="segU">–</span>&nbsp; lower: <span id="segL">–</span>
+        &nbsp;(fused° / accel-only°)
+      </p>
+    </section>
+
+    <div class="console" id="console"></div>
+  </main>
+
+  <script type="module">
+    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js';
+    import { KneeTracker } from './kinematics.js';
+
+    // --- config ---------------------------------------------------------
+    const SAMPLING_HZ = 128;
+    const DT = 1 / SAMPLING_HZ;
+    // Wide-range (digital) accelerometer + gyroscope, matching Sirona's 4g/500dps setup.
+    const SENSOR_MASK = (SensorBitmapShimmer3.SENSOR_D_ACCEL |
+                         SensorBitmapShimmer3.SENSOR_GYRO) >>> 0;
+
+    const tracker = new KneeTracker({
+      // Both sensors rotate about their X axis for sagittal (flexion) motion.
+      upper: { commonAxis: 'X', refAxis: '+Y', accelRange: '4G', gyroRange: '500DPS' },
+      lower: { commonAxis: 'X', refAxis: '+Y', accelRange: '4G', gyroRange: '500DPS' },
+    });
+
+    // --- console --------------------------------------------------------
+    const consoleEl = document.getElementById('console');
+    const log = (t) => {
+      consoleEl.textContent += t + '\n';
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    };
+
+    // --- a single sensor link ------------------------------------------
+    class SensorLink {
+      constructor(role, feed, els) {
+        this.role = role;
+        this.feed = feed;                 // (accelRaw, gyroRaw, dt) => void
+        this.els = els;
+        this.client = new Shimmer3RClient({ timestampFmt: 'u24', debug: false });
+        this.client.onStatus = (m) => log(`[${role}] ${m}`);
+        this.client.onStreamFrame = (oc) => {
+          const ax = oc.get('WR_ACCEL_X')?.value, ay = oc.get('WR_ACCEL_Y')?.value, az = oc.get('WR_ACCEL_Z')?.value;
+          const gx = oc.get('GYRO_X')?.value, gy = oc.get('GYRO_Y')?.value, gz = oc.get('GYRO_Z')?.value;
+          if ([ax, ay, az, gx, gy, gz].some(v => v === undefined)) return;
+          this.feed({ x: ax, y: ay, z: az }, { x: gx, y: gy, z: gz }, DT);
+        };
+      }
+      async connectAndStream() {
+        this.els.led.className = 'led';
+        await this.client.connect();
+        this.els.name.textContent = this.client.device?.name || 'Shimmer3R';
+        this.els.led.className = 'led on';
+        await this.client.setSamplingRate(SAMPLING_HZ);
+        await this.client.setSensors(SENSOR_MASK);   // performs inquiry internally
+        // Debug: report the actual channel schema so missing/renamed channels are obvious.
+        const chans = this.client.schema?.fields?.map(f => f.name) ?? [];
+        log(`[${this.role}] channels: ${chans.join(', ') || '(schema unavailable)'}`);
+        log(`[${this.role}] applied rate: ${this.client.samplingRateHz?.toFixed?.(2) ?? '?'} Hz`);
+        await this.client.startStreaming();
+        this.els.led.className = 'led streaming';
+        log(`[${this.role}] streaming`);
+      }
+    }
+
+    // --- debug scopes (device-frame accel/gyro, i.e. the fusion inputs) -----
+    function makeScope(id, { minSpan = 1, unit = '' } = {}) {
+      const c = document.getElementById(id);
+      const ctx = c.getContext('2d');
+      const buf = [];               // { t, v: [x,y,z] }
+      const WIN = 8;                // seconds shown
+      const resize = () => {
+        const r = c.getBoundingClientRect();
+        c.width = r.width * devicePixelRatio; c.height = r.height * devicePixelRatio;
+        ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+      };
+      window.addEventListener('resize', resize); resize();
+      return {
+        push(t, v) { buf.push({ t, v }); while (buf.length && buf[0].t < t - WIN - 1) buf.shift(); },
+        draw(now) {
+          const w = c.clientWidth, h = c.clientHeight;
+          ctx.clearRect(0, 0, w, h);
+          let span = minSpan;
+          for (const p of buf) if (p.t >= now - WIN)
+            span = Math.max(span, Math.abs(p.v[0]), Math.abs(p.v[1]), Math.abs(p.v[2]));
+          span *= 1.1;
+          const yOf = (v) => h / 2 - (v / span) * (h / 2 - 4);
+          const xOf = (t) => ((t - (now - WIN)) / WIN) * w;
+          ctx.strokeStyle = 'rgba(255,255,255,.12)';
+          ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+          ['#f87171', '#34d399', '#60a5fa'].forEach((col, i) => {
+            ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath();
+            let started = false;
+            for (const p of buf) {
+              if (p.t < now - WIN) continue;
+              const x = xOf(p.t), y = yOf(p.v[i]);
+              started ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), started = true);
+            }
+            ctx.stroke();
+          });
+          ctx.fillStyle = '#8b98a8'; ctx.font = '10px monospace';
+          ctx.fillText(`±${span < 10 ? span.toFixed(2) : span.toFixed(0)} ${unit}`, 4, 12);
+        },
+      };
+    }
+    const scopes = {
+      UA: makeScope('scopeUA', { minSpan: 1.2, unit: 'g' }),
+      UG: makeScope('scopeUG', { minSpan: 50, unit: 'dps' }),
+      LA: makeScope('scopeLA', { minSpan: 1.2, unit: 'g' }),
+      LG: makeScope('scopeLG', { minSpan: 50, unit: 'dps' }),
+    };
+    const dbgClock = () => performance.now() / 1000;
+    const frameCounts = { upper: 0, lower: 0 };
+
+    function dbgPush(side) {
+      const seg = side === 'upper' ? tracker.upper : tracker.lower;
+      if (!seg.accel) return;
+      const t = dbgClock();
+      const a = seg.accel, g = seg.gyro;
+      if (side === 'upper') {
+        scopes.UA.push(t, [a.x, a.y, a.z]); scopes.UG.push(t, [g.x, g.y, g.z]);
+      } else {
+        scopes.LA.push(t, [a.x, a.y, a.z]); scopes.LG.push(t, [g.x, g.y, g.z]);
+      }
+      frameCounts[side]++;
+    }
+
+    const upper = new SensorLink('upper', (a, g, dt) => { tracker.updateUpper(a, g, dt); dbgPush('upper'); }, {
+      led: document.getElementById('ledUpper'), name: document.getElementById('nameUpper'),
+    });
+    const lower = new SensorLink('lower', (a, g, dt) => { tracker.updateLower(a, g, dt); dbgPush('lower'); }, {
+      led: document.getElementById('ledLower'), name: document.getElementById('nameLower'),
+    });
+
+    const zeroBtn = document.getElementById('zeroBtn');
+    async function wireConnect(btn, link) {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await link.connectAndStream();
+          btn.textContent = 'Connected';
+          if (upper.els.led.classList.contains('streaming') &&
+              lower.els.led.classList.contains('streaming')) {
+            zeroBtn.disabled = false;
+          }
+        } catch (e) {
+          log(`[${link.role}] ❌ ${e.message}`);
+          link.els.led.className = 'led';
+          btn.disabled = false;
+        }
+      });
+    }
+    wireConnect(document.getElementById('connUpper'), upper);
+    wireConnect(document.getElementById('connLower'), lower);
+
+    // --- session controls ----------------------------------------------
+    const minAngleEl = document.getElementById('minAngle');
+    const maxAngleEl = document.getElementById('maxAngle');
+    const targetRepsEl = document.getElementById('targetReps');
+    const repCountEl = document.getElementById('repCount');
+    const repTargetEl = document.getElementById('repTarget');
+    const repFillEl = document.getElementById('repFill');
+
+    zeroBtn.addEventListener('click', () => {
+      tracker.zero();
+      zeroed = true;
+      leg.style.opacity = 1;
+      log('Zeroed: straight-leg pose = 180°.');
+    });
+    document.getElementById('resetReps').addEventListener('click', () => tracker.resetReps());
+    const syncThresholds = () => {
+      // Rep = flex down to the flex target, then extend back up to the extension target.
+      // 5° of slack so reps register without demanding pixel-perfect angles.
+      tracker.flexThreshold = Number(minAngleEl.value) + 5;
+      tracker.extThreshold = Number(maxAngleEl.value) - 5;
+      repTargetEl.textContent = targetRepsEl.value;
+    };
+    [minAngleEl, maxAngleEl, targetRepsEl].forEach(el => el.addEventListener('input', syncThresholds));
+    syncThresholds();
+
+    // --- animated leg (side view; figure faces right) --------------------
+    const ANGLE_MAX = 180;             // plot scale ceiling (180 = straight leg)
+    const NS = 'http://www.w3.org/2000/svg';
+    const mk = (tag, attrs) => {
+      const e = document.createElementNS(NS, tag);
+      for (const k in attrs) e.setAttribute(k, attrs[k]);
+      return e;
+    };
+    const leg = document.getElementById('leg');
+    // Hip placed so every pose stays inside the 460x350 viewBox:
+    // standing (leg straight down), seated fully extended (~225px forward reach),
+    // and heel-back flexion (~95px behind).
+    const HIP = { x: 130, y: 110 };
+    const L_THIGH = 100, L_SHANK = 95, L_FOOT = 26, R_ARC = 62;
+    const D2R = Math.PI / 180;
+    // segment angle measured from straight-down; forward (+x, figure faces right) positive
+    const dir = (deg) => ({ x: Math.sin(deg * D2R), y: Math.cos(deg * D2R) });
+    const at = (p, d, len) => ({ x: p.x + d.x * len, y: p.y + d.y * len });
+    const setLine = (el, p0, p1) => {
+      el.setAttribute('x1', p0.x); el.setAttribute('y1', p0.y);
+      el.setAttribute('x2', p1.x); el.setAttribute('y2', p1.y);
+    };
+
+    // static body context: torso + head
+    leg.append(
+      mk('line', { x1: HIP.x, y1: HIP.y, x2: HIP.x, y2: HIP.y - 60, stroke: '#3b4654', 'stroke-width': 12, 'stroke-linecap': 'round' }),
+      mk('circle', { cx: HIP.x, cy: HIP.y - 84, r: 13, fill: 'none', stroke: '#3b4654', 'stroke-width': 6 }),
+    );
+    const wedge = mk('path', { fill: 'rgba(52,211,153,.10)' });                 // full target range
+    const remainArc = mk('path', { fill: 'none', 'stroke-width': 6, 'stroke-linecap': 'round' }); // sweep left to target
+    const ghostFlex = mk('line', { stroke: 'var(--flex)', 'stroke-width': 4, 'stroke-dasharray': '6 7', 'stroke-linecap': 'round' });
+    const ghostExt = mk('line', { stroke: 'var(--accent)', 'stroke-width': 4, 'stroke-dasharray': '6 7', 'stroke-linecap': 'round' });
+    const thighEl = mk('line', { stroke: '#8b98a8', 'stroke-width': 15, 'stroke-linecap': 'round' });
+    const shankEl = mk('line', { stroke: '#e6edf3', 'stroke-width': 13, 'stroke-linecap': 'round' });
+    const footEl = mk('line', { stroke: '#e6edf3', 'stroke-width': 8, 'stroke-linecap': 'round' });
+    const pulseRing = mk('circle', { fill: 'none', stroke: 'var(--good)', 'stroke-width': 3, opacity: 0 });
+    const kneeDot = mk('circle', { r: 7, fill: 'var(--accent)' });
+    const hipDot = mk('circle', { cx: HIP.x, cy: HIP.y, r: 7, fill: '#8b98a8' });
+    leg.append(wedge, ghostFlex, ghostExt, remainArc, thighEl, shankEl, footEl, pulseRing, kneeDot, hipDot);
+
+    let pulse = 0;   // rep-completion ring animation state (1 -> 0)
+    function updateLeg(kneeAngle, thighTilt, flexTo, extendTo, phase) {
+      const t = thighTilt ?? 0;
+      const f = 180 - kneeAngle;             // flexion: 0 = straight
+      const knee = at(HIP, dir(t), L_THIGH);
+      const sCur = t - f;                    // shank angle from vertical (heel swings back)
+      const sd = dir(sCur);
+      const ankle = at(knee, sd, L_SHANK);
+      const foot = { x: ankle.x + sd.y * L_FOOT, y: ankle.y - sd.x * L_FOOT }; // perpendicular, forward
+
+      setLine(thighEl, HIP, knee);
+      setLine(shankEl, knee, ankle);
+      setLine(footEl, ankle, foot);
+      kneeDot.setAttribute('cx', knee.x); kneeDot.setAttribute('cy', knee.y);
+      pulseRing.setAttribute('cx', knee.x); pulseRing.setAttribute('cy', knee.y);
+
+      // ghost shanks at the two targets; the active one (current goal) is emphasized
+      const sFlex = t - (180 - flexTo), sExt = t - (180 - extendTo);
+      setLine(ghostFlex, knee, at(knee, dir(sFlex), L_SHANK));
+      setLine(ghostExt, knee, at(knee, dir(sExt), L_SHANK));
+      const flexActive = phase === 'extended';   // next goal is the flex target
+      ghostFlex.setAttribute('opacity', flexActive ? 0.9 : 0.2);
+      ghostExt.setAttribute('opacity', flexActive ? 0.2 : 0.9);
+
+      // shaded wedge spanning the full target range
+      const pE = at(knee, dir(sExt), R_ARC), pF = at(knee, dir(sFlex), R_ARC);
+      wedge.setAttribute('d', `M ${knee.x} ${knee.y} L ${pE.x} ${pE.y} A ${R_ARC} ${R_ARC} 0 0 1 ${pF.x} ${pF.y} Z`);
+
+      // remaining sweep: current shank -> active target (shrinks as they approach)
+      const sT = flexActive ? sFlex : sExt;
+      const a0 = at(knee, dir(sCur), R_ARC), a1 = at(knee, dir(sT), R_ARC);
+      remainArc.setAttribute('d', `M ${a0.x} ${a0.y} A ${R_ARC} ${R_ARC} 0 0 ${sT < sCur ? 1 : 0} ${a1.x} ${a1.y}`);
+      remainArc.setAttribute('stroke', flexActive ? 'var(--flex)' : 'var(--accent)');
+      remainArc.setAttribute('opacity', Math.abs(sT - sCur) < 2 ? 0 : 0.9);
+
+      // rep-completion pulse ring
+      if (pulse > 0) {
+        pulse = Math.max(0, pulse - 0.03);
+        pulseRing.setAttribute('r', 10 + (1 - pulse) * 28);
+        pulseRing.setAttribute('opacity', pulse * 0.9);
+      }
+    }
+    updateLeg(180, 0, 90, 175, 'extended');   // initial: standing straight
+    leg.style.opacity = 0.45;                 // dimmed until zeroed
+
+    const angleValEl = document.getElementById('angleVal');
+    const rangePill = document.getElementById('rangePill');
+    const phasePromptEl = document.getElementById('phasePrompt');
+    const toGoEl = document.getElementById('toGo');
+    let zeroed = false;
+
+    // --- mounting (experimental) ------------------------------------------
+    // Per-sensor strapping config: rotation axis, up-reference axis, polarity.
+    // refAxis must be orthogonal to the rotation axis, hence the paired options.
+    const REF_OPTIONS = { X: ['+Y', '-Y', '+Z', '-Z'], Y: ['+X', '-X', '+Z', '-Z'], Z: ['+X', '-X', '+Y', '-Y'] };
+    const MOUNT_KEY = 'kneeAngle.mounting.v1';
+    const byId = (id) => document.getElementById(id);
+    const mountEls = {
+      upper: { axis: byId('uAxis'), ref: byId('uRef'), pol: byId('uPol'), seg: tracker.upper },
+      lower: { axis: byId('lAxis'), ref: byId('lRef'), pol: byId('lPol'), seg: tracker.lower },
+    };
+
+    function fillRefOptions(sel, axis, keep) {
+      sel.innerHTML = '';
+      for (const o of REF_OPTIONS[axis]) {
+        const opt = document.createElement('option');
+        opt.value = o; opt.textContent = o;
+        sel.appendChild(opt);
+      }
+      sel.value = REF_OPTIONS[axis].includes(keep) ? keep : REF_OPTIONS[axis][0];
+    }
+
+    function applyMounting(requireRezero = true) {
+      for (const side of ['upper', 'lower']) {
+        const m = mountEls[side];
+        m.seg.commonAxis = m.axis.value;
+        m.seg.refAxis = m.ref.value;
+        m.seg.axisSign = Number(m.pol.value);
+        m.seg.reset();
+      }
+      localStorage.setItem(MOUNT_KEY, JSON.stringify({
+        upper: { axis: mountEls.upper.axis.value, ref: mountEls.upper.ref.value, pol: mountEls.upper.pol.value },
+        lower: { axis: mountEls.lower.axis.value, ref: mountEls.lower.ref.value, pol: mountEls.lower.pol.value },
+      }));
+      if (requireRezero) {
+        tracker.offset = 0; tracker.upperZero = null; tracker.resetReps();
+        zeroed = false; leg.style.opacity = 0.45;
+        log('Mounting changed — stand straight and press Zero again.');
+      }
+    }
+
+    // Defaults match the standard strapping: shank sensor rotation is inverted.
+    const MOUNT_DEFAULTS = {
+      upper: { axis: 'X', ref: '+Y', pol: '1' },
+      lower: { axis: 'X', ref: '+Y', pol: '-1' },
+    };
+    {
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(MOUNT_KEY)); } catch { /* corrupt config: use defaults */ }
+      for (const side of ['upper', 'lower']) {
+        const m = mountEls[side], s = saved?.[side], d = MOUNT_DEFAULTS[side];
+        m.axis.value = s?.axis ?? d.axis;
+        fillRefOptions(m.ref, m.axis.value, s?.ref ?? d.ref);
+        m.pol.value = s?.pol ?? d.pol;
+        m.axis.addEventListener('change', () => { fillRefOptions(m.ref, m.axis.value, m.ref.value); applyMounting(); });
+        m.ref.addEventListener('change', () => applyMounting());
+        m.pol.addEventListener('change', () => applyMounting());
+      }
+      applyMounting(false);   // apply loaded/default config without the re-zero warning
+    }
+
+    // --- live plot ------------------------------------------------------
+    const plot = document.getElementById('plot');
+    const pctx = plot.getContext('2d');
+    const WINDOW_S = 15;
+    const history = [];   // { t, angle }
+    let t0 = null;
+    function resizePlot() {
+      const r = plot.getBoundingClientRect();
+      plot.width = r.width * devicePixelRatio;
+      plot.height = r.height * devicePixelRatio;
+      pctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    }
+    window.addEventListener('resize', resizePlot);
+
+    function drawPlot(now) {
+      const w = plot.clientWidth, h = plot.clientHeight;
+      pctx.clearRect(0, 0, w, h);
+      const lo = 0, hi = ANGLE_MAX;
+      const yOf = (a) => h - ((Math.min(Math.max(a, lo), hi) - lo) / (hi - lo)) * (h - 16) - 8;
+      const tMin = now - WINDOW_S, tMax = now;
+      const xOf = (t) => ((t - tMin) / WINDOW_S) * w;
+
+      // target band
+      const yTop = yOf(Number(maxAngleEl.value)), yBot = yOf(Number(minAngleEl.value));
+      pctx.fillStyle = 'rgba(52,211,153,.10)';
+      pctx.fillRect(0, yTop, w, yBot - yTop);
+      pctx.strokeStyle = 'rgba(52,211,153,.4)'; pctx.lineWidth = 1;
+      pctx.beginPath(); pctx.moveTo(0, yTop); pctx.lineTo(w, yTop);
+      pctx.moveTo(0, yBot); pctx.lineTo(w, yBot); pctx.stroke();
+
+      // gridlines
+      pctx.strokeStyle = 'rgba(255,255,255,.05)';
+      for (let g = 0; g <= hi; g += 30) {
+        const y = yOf(g); pctx.beginPath(); pctx.moveTo(0, y); pctx.lineTo(w, y); pctx.stroke();
+      }
+
+      // trace
+      pctx.strokeStyle = '#2dd4bf'; pctx.lineWidth = 2; pctx.beginPath();
+      let started = false;
+      for (const pt of history) {
+        if (pt.t < tMin) continue;
+        const x = xOf(pt.t), y = yOf(pt.angle);
+        if (!started) { pctx.moveTo(x, y); started = true; } else pctx.lineTo(x, y);
+      }
+      pctx.stroke();
+    }
+
+    // --- render loop ----------------------------------------------------
+    resizePlot();
+    function frame(ts) {
+      if (t0 === null) t0 = ts;
+      const now = (ts - t0) / 1000;
+
+      const a = tracker.angle;
+      if (a !== null) {
+        const shown = Math.round(a);
+        angleValEl.textContent = shown;
+
+        const min = Number(minAngleEl.value), max = Number(maxAngleEl.value);
+        const target = Number(targetRepsEl.value) || 1;
+
+        // reps (before drawing, so a completed rep pulses this frame)
+        if (tracker.tickRepCounter()) pulse = 1;
+        repCountEl.textContent = tracker.reps;
+        repFillEl.style.width = `${Math.min(100, (tracker.reps / target) * 100)}%`;
+
+        // animated leg: live pose after zeroing, standing reference before
+        if (zeroed) {
+          updateLeg(Math.min(Math.max(a, 40), 185), tracker.thighTilt, min, max, tracker.phase);
+        } else {
+          updateLeg(180, 0, min, max, 'extended');
+        }
+
+        // phase prompt + distance to the active target
+        if (!zeroed) {
+          phasePromptEl.textContent = 'stand straight · press zero';
+          phasePromptEl.className = 'phase-prompt';
+          toGoEl.innerHTML = '&nbsp;';
+        } else if (tracker.reps >= target) {
+          phasePromptEl.textContent = '✓ session complete';
+          phasePromptEl.className = 'phase-prompt done';
+          toGoEl.textContent = `deepest flexion this session: ${Math.round(tracker.minAngle)}°`;
+        } else if (tracker.phase === 'extended') {
+          phasePromptEl.textContent = 'flex ⤵';
+          phasePromptEl.className = 'phase-prompt flex';
+          const togo = Math.max(0, a - min);
+          toGoEl.textContent = togo > 1 ? `${Math.round(togo)}° to go` : '✓ target reached';
+        } else {
+          phasePromptEl.textContent = 'extend ⤴';
+          phasePromptEl.className = 'phase-prompt extend';
+          const togo = Math.max(0, max - a);
+          toGoEl.textContent = togo > 1 ? `${Math.round(togo)}° to go` : '✓ target reached';
+        }
+
+        // status pill: hitting either end of the target range is success
+        if (a <= min) { rangePill.textContent = '✓ flex target reached'; rangePill.className = 'status-pill in'; }
+        else if (a >= max) { rangePill.textContent = '✓ fully extended'; rangePill.className = 'status-pill in'; }
+        else { rangePill.textContent = 'between targets'; rangePill.className = 'status-pill'; }
+
+        // history for plot
+        history.push({ t: now, angle: a });
+        while (history.length && history[0].t < now - WINDOW_S - 1) history.shift();
+      }
+      drawPlot(now);
+      drawDebug();
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    // --- debug panel rendering -------------------------------------------
+    const fmtV = (v) => v ? `${v.x.toFixed(2)}, ${v.y.toFixed(2)}, ${v.z.toFixed(2)}` : '–';
+    const fmtSeg = (s) => (s.angle !== null && s.angle !== undefined)
+      ? `${s.angle.toFixed(1)}° / ${s.accelAngle?.toFixed(1)}°` : '–';
+    let lastHzT = dbgClock();
+    function drawDebug() {
+      const t = dbgClock();
+      for (const k in scopes) scopes[k].draw(t);
+      document.getElementById('valUA').textContent = fmtV(tracker.upper.accel);
+      document.getElementById('valUG').textContent = fmtV(tracker.upper.gyro);
+      document.getElementById('valLA').textContent = fmtV(tracker.lower.accel);
+      document.getElementById('valLG').textContent = fmtV(tracker.lower.gyro);
+      document.getElementById('segU').textContent = fmtSeg(tracker.upper);
+      document.getElementById('segL').textContent = fmtSeg(tracker.lower);
+      if (t - lastHzT >= 1) {
+        document.getElementById('hzUpper').textContent = Math.round(frameCounts.upper / (t - lastHzT));
+        document.getElementById('hzLower').textContent = Math.round(frameCounts.lower / (t - lastHzT));
+        frameCounts.upper = 0; frameCounts.lower = 0;
+        lastHzT = t;
+      }
+    }
+
+    window.addEventListener('beforeunload', () => {
+      upper.client.disconnect?.(); lower.client.disconnect?.();
+    });
+  </script>
+</body>
+</html>
