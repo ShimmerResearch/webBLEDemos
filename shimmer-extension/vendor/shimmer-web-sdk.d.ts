@@ -156,6 +156,116 @@ declare abstract class BaseShimmerClient implements IShimmerClient {
 declare function isUniformByteArray(bytes: ArrayLike<number> | ArrayBuffer | null | undefined, value: number): boolean;
 
 /**
+ * Escape a value for a CSV cell (RFC 4180 style): whitespace runs — including
+ * newlines — collapse to a single space, then cells containing a quote or
+ * comma are quoted with internal quotes doubled. Null/undefined become the
+ * empty cell.
+ */
+declare function csvCell(text: unknown): string;
+
+/**
+ * Device RTC drift estimation over a live connection (DEV-844).
+ *
+ * Sample the device clock periodically against the host clock and fit a
+ * least-squares slope of (device − host) offset vs host time: the
+ * dimensionless slope × 1e6 is directly the crystal error in ppm, giving a
+ * usable estimate in hours instead of waiting days between connections.
+ * Device time resolves to 1/32768 s, so per-sample noise is just transport
+ * round-trip jitter (~tens of ms); the fit averages it out. Host timestamps
+ * should be taken at the midpoint of the read round-trip, bounding transport
+ * latency to ±rtt/2.
+ *
+ * Host clock steps (NTP corrections) are a measurement hazard: the wall
+ * clock jumping mid-series pollutes the least-squares slope while looking
+ * like device drift (seen live on DEV-844: a −1.4 s Windows NTP step bent
+ * the fit from 1020 to 1077 ppm). Each sample therefore also records a
+ * monotonic timestamp (`performance.now()`): wall-vs-monotonic divergence
+ * between samples attributes a jump to the HOST, which resets the fit
+ * baseline instead of counting as a device step.
+ *
+ * This class is pure bookkeeping — the caller owns the sampling timer, the
+ * device read, and any UI. Feed it one {@link RtcDriftSampleInput} per read.
+ */
+interface RtcDriftSampleInput {
+    /** Host wall-clock unix seconds at the midpoint of the device-time read. */
+    hostSec: number;
+    /** Device clock in unix seconds, as read from the device. */
+    devSec: number;
+    /** Read round-trip in ms (kept per sample so outliers are explainable). */
+    rttMs: number;
+    /** Host monotonic clock (e.g. `performance.now()`) in ms at the read. */
+    perfMs: number;
+}
+interface RtcDriftSample extends RtcDriftSampleInput {
+    /** Device-minus-host clock offset in seconds. */
+    offsetSec: number;
+}
+/** What {@link RtcDriftMonitor.addSample} concluded about a new sample. */
+type RtcDriftSampleEvent = {
+    kind: 'sample';
+    sample: RtcDriftSample;
+}
+/** The HOST wall clock stepped (NTP): the fit baseline was reset and the
+ * series restarted from this sample. */
+ | {
+    kind: 'host-step';
+    sample: RtcDriftSample;
+    hostStepSec: number;
+}
+/** The DEVICE clock stepped between samples. */
+ | {
+    kind: 'device-step';
+    sample: RtcDriftSample;
+    deltaSec: number;
+};
+interface RtcDriftMonitorOptions {
+    /** Offset jump treated as a device clock step (default 1 s). */
+    deviceStepThresholdSeconds?: number;
+    /** Wall-vs-monotonic divergence treated as a host clock step (default 0.5 s). */
+    hostStepThresholdSeconds?: number;
+}
+declare class RtcDriftMonitor {
+    readonly samples: RtcDriftSample[];
+    /** Device clock steps detected across the whole run (survives rebaselines). */
+    deviceSteps: number;
+    /** Host (NTP) clock steps detected; each one rebaselines the fit. */
+    hostSteps: number;
+    private readonly deviceStepThresholdSeconds;
+    private readonly hostStepThresholdSeconds;
+    constructor(options?: RtcDriftMonitorOptions);
+    /** Drop all samples and step counts (e.g. when starting a new run). */
+    reset(): void;
+    /**
+     * Drop the samples but keep the step counters. Call when the device time is
+     * written: a time write moves the offset baseline, so every prior sample is
+     * invalid and the fit must not straddle the discontinuity.
+     */
+    rebaseline(): void;
+    /**
+     * Record one device-time reading. Attributes any offset jump before
+     * recording it: wall-clock elapsed minus monotonic elapsed isolates host
+     * clock steps (NTP) from device steps. A host step resets the fit baseline
+     * (the fit must not straddle the discontinuity); a device step is counted
+     * and kept in-series.
+     */
+    addSample(input: RtcDriftSampleInput): RtcDriftSampleEvent;
+    /**
+     * Least-squares slope of offset vs host time, in ppm (offset and time are
+     * both in seconds, so the dimensionless slope × 1e6 is directly ppm).
+     * Null until two samples spanning a non-zero interval exist.
+     */
+    ppmFit(): number | null;
+    /** Elapsed span of the current sample series in minutes (0 when empty). */
+    elapsedMinutes(): number;
+    /**
+     * CSV rows (header first) of the current series, matching the DEV-844
+     * export format: host ISO time, host/device unix seconds, offset, rtt,
+     * monotonic seconds.
+     */
+    toCsvRows(): string[];
+}
+
+/**
  * Device-agnostic live stream statistics: throughput, packet rate and
  * sample-gap-derived packet loss for a real-time sensor stream.
  *
@@ -1358,6 +1468,9 @@ interface VerisenseEventLogEntry {
     timestampUnixSeconds: number | null;
     batteryMilliVolts: number | null;
 }
+/** Upper bound for a plausible device timestamp (2100-01-01 UTC in unix
+ * seconds). Values beyond this are uninitialised/garbage bytes, not dates. */
+declare const VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS = 4102444800;
 /** Format unix seconds as raw + human-readable local datetime for logging. */
 declare function formatVerisenseUnixAndHuman(unixSeconds: number): VerisenseUnixAndHumanTimestamp;
 /** Convert parsed status payload into an object with human-readable timestamps for logs. */
@@ -1411,6 +1524,21 @@ declare function parseProductionConfigPayloadFull(response: Uint8Array): Product
 declare function parseStatusPayload(response: Uint8Array, sourceStatusProperty?: 'status1' | 'status2'): VerisenseStatusPayload;
 /** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
 declare function parseSchedulerDebugPayload(payload: Uint8Array): VerisenseSchedulerDebugPayload;
+/** Decoded view of the BLE-link `optimizationResult` byte returned by the
+ * optimize debug command: bit 7 = device reports "not connected" (the other
+ * bits are then meaningless), bit 0 = a PHY change was requested, bit 1 = a
+ * connection-interval change was requested, bit 2 = a data-length change was
+ * requested. */
+interface VerisenseBleOptimizationResult {
+    notConnected: boolean;
+    phyRequested: boolean;
+    connIntervalRequested: boolean;
+    dataLengthRequested: boolean;
+    resultMask: number;
+}
+/** Decode the `optimizationResult` byte from {@link parseBleLinkDebugPayload}
+ * (see {@link VerisenseBleOptimizationResult} for the bit meanings). */
+declare function decodeVerisenseBleOptimizationResult(resultByte: number): VerisenseBleOptimizationResult;
 /** Parse debug payload from BLE link read/optimize commands. */
 declare function parseBleLinkDebugPayload(payload: Uint8Array): VerisenseBleLinkDebugPayload;
 /** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
@@ -1436,6 +1564,51 @@ declare function parseLookupTablePayload(payload: Uint8Array, totalBanks?: numbe
  * Parse the production config response payload into a structured object.
  */
 declare function parseProductionConfigPayload(response: Uint8Array): ProductionConfig;
+/**
+ * Firmware default passkeys by passkey ID: a production config programmed
+ * with passkey ID "01" pairs with the fixed PIN "123456". Other IDs have no
+ * fixed default (ID "00" uses the per-device derived PIN — see
+ * {@link computeVerisensePairingPin}).
+ */
+declare const VERISENSE_DEFAULT_PASSKEY_BY_ID: Readonly<Record<string, string>>;
+/** The fixed passkey for a passkey ID, or undefined when the ID has none
+ * (leave the passkey bytes unset in the production config). */
+declare function defaultVerisensePasskeyForId(passkeyId: string | null | undefined): string | undefined;
+/** Component parts of a Verisense advertised BLE name. */
+interface VerisenseAdvertisedNameParts {
+    /** Name prefix from the production config (normally "Verisense"). */
+    prefix: string;
+    /** 2-char passkey ID from the production config. */
+    passkeyId: string;
+    /** 12-hex unique identifier (8-hex manufacturing order + 4-hex MAC ID). */
+    uniqueId: string;
+}
+/**
+ * Build the name a Verisense sensor advertises over BLE:
+ * `<prefix>-<passkeyId>-<uniqueId>` (e.g. "Verisense-01-25112101B10F").
+ * Returns null when any part is missing — matches how apps derive the name
+ * from a parsed production config that may be blank/erased.
+ */
+declare function buildVerisenseAdvertisedName(parts: Partial<VerisenseAdvertisedNameParts>): string | null;
+/**
+ * Split a Verisense advertised name back into its parts. The unique ID is the
+ * final `-`-separated token; the passkey ID the token before it; anything
+ * earlier (which may itself contain `-`) is the prefix. Returns null when the
+ * name does not have at least three tokens.
+ */
+declare function parseVerisenseAdvertisedName(name: string | null | undefined): VerisenseAdvertisedNameParts | null;
+/**
+ * The 4-hex MAC ID from a Verisense advertised name (the advertised name ends
+ * with the unique ID = manufacturing order + MAC; its last 4 hex chars are
+ * the MAC ID). Returns null when the tail is not valid hex.
+ */
+declare function deriveVerisenseMacIdFromName(name: string | null | undefined): string | null;
+/**
+ * Short device tag for file names (e.g. "…-B10F-…"): the last 4 hex chars of
+ * a device unique ID or advertised name. Returns "" when unknown so callers
+ * can omit it cleanly.
+ */
+declare function verisenseDeviceFileTag(idOrName: string | null | undefined): string;
 
 type ParsedSplitReason = 'midday-midnight-boundary' | 'config-change' | 'timestamp-discontinuity' | 'power-reset';
 interface EvaluateParsedSplitInput {
@@ -2068,6 +2241,140 @@ declare function getVerisenseSupportedOperationalFieldGroupIds(source: Verisense
  * visible/clear slot carries the dark (covered-photodiode) baseline instead of
  * the visible reading. Returns false for empty/nullish config. */
 declare function isVerisenseLightDarkChannelEnabled(op: Uint8Array | null | undefined): boolean;
+/**
+ * Pad an operational config authored at a legacy/shorter length onto a blank
+ * full-size (v9, {@link VERISENSE_OP_CONFIG_BYTE_SIZE}-byte) image so the
+ * working config is always canonical size — otherwise trailing v9 fields
+ * (e.g. the person-parameter bytes) would be absent. Configs already at or
+ * beyond full size are returned as-is.
+ */
+declare function padVerisenseOperationalConfig(bytes: Uint8Array | ArrayLike<number>): Uint8Array;
+/** Which IMU generation an op-config field key targets: 'ds3' = first-gen
+ * LSM6DS3, 'dsv' = second-gen LSM6DSV (+LIS2MDL mag). */
+type VerisenseImuGeneration = 'ds3' | 'dsv';
+interface VerisenseSensorRateDefaultField {
+    /** Field key in {@link VERISENSE_OPERATIONAL_FIELD_SCHEMA}, when the field
+     * is the same on both IMU generations. */
+    readonly key?: string;
+    /** Generation-specific field keys (accel2/gyro ODR live in different
+     * fields on LSM6DS3 vs LSM6DSV configs). */
+    readonly keyByGen?: Readonly<Record<VerisenseImuGeneration, string>>;
+    /** Default rate/mode code to seed when the sensor is enabled. */
+    readonly on: number;
+    /** Power-down code to write when every enable in the group is off. */
+    readonly off: number;
+}
+interface VerisenseSensorRateDefaultGroup {
+    /** Sensor-enable field keys (see {@link VERISENSE_SENSOR_ENABLE_FIELDS})
+     * that share the rate/mode field(s) below. */
+    readonly enableKeys: readonly string[];
+    readonly fields: readonly VerisenseSensorRateDefaultField[];
+}
+/**
+ * Firmware default rate/mode codes per sensor group, for config editors that
+ * auto-seed a rate when a sensor is first enabled and power it down when all
+ * of its enables are cleared. Editors should only seed the `on` default when
+ * the field currently holds the `off` (power-down) code, so a user-chosen
+ * rate is never clobbered. Sensors whose rate field has no power-down value
+ * (magnetometer LIS2MDL_ODR, PPG_SR) are omitted — their enable bit / channel
+ * toggles are the on/off control. Default ODR codes mirror the standard
+ * customer template (Accel1 = 50 Hz, ADC = 128 Hz).
+ */
+declare const VERISENSE_SENSOR_RATE_DEFAULT_GROUPS: readonly VerisenseSensorRateDefaultGroup[];
+/** Resolve a rate-default field to its concrete schema key for the given IMU
+ * generation, or null when the field has no key for that generation. */
+declare function resolveVerisenseSensorRateFieldKey(field: VerisenseSensorRateDefaultField, generation: VerisenseImuGeneration): string | null;
+/** One of the three firmware BLE wake/sync schedules and its four op-config
+ * field keys (see the BLE Wake Schedule field group). */
+interface VerisenseBleSyncSchedule {
+    readonly id: 'data' | 'status' | 'rtcSync';
+    /** Field-group subgroup id used by the operational field schema. */
+    readonly subgroupId: string;
+    readonly intervalKey: string;
+    readonly timeKey: string;
+    readonly durKey: string;
+    readonly retryKey: string;
+}
+/**
+ * The three firmware sync schedules (data transfer, status, RTC sync), each
+ * with wake-interval-hours / wake-time / active-duration / retry-interval
+ * fields. Interval semantics (from firmware `hal_rtc.c`): 0 = off, 24 = once
+ * daily at the wake time, 1-23 = every N hours. Wake time is
+ * minutes-since-midnight (device local time), duration is minutes 0-255,
+ * retry interval is minutes 0-1439. The number of connection attempts per
+ * window is the separate global `BLE_CONNECTION_TRIES_PER_DAY` field.
+ */
+declare const VERISENSE_BLE_SYNC_SCHEDULES: readonly VerisenseBleSyncSchedule[];
+/** Value ranges for the BLE sync-schedule fields (clamp editor input to
+ * these before writing). */
+declare const VERISENSE_BLE_SCHEDULE_RANGES: Readonly<{
+    intervalHours: Readonly<{
+        min: 0;
+        max: 24;
+    }>;
+    timeMins: Readonly<{
+        min: 0;
+        max: 1439;
+    }>;
+    durMin: Readonly<{
+        min: 0;
+        max: 255;
+    }>;
+    retryIntMin: Readonly<{
+        min: 0;
+        max: 1439;
+    }>;
+}>;
+/**
+ * Canonical schedule defaults: 01:00 daily, 10-minute window, 15-minute
+ * retry, 5 connection attempts per wake. Also the "reset" values applied
+ * when the pending-events scheduler is disabled, so a disabled config lands
+ * in a clean known state.
+ */
+declare const VERISENSE_BLE_SCHEDULE_DEFAULTS: Readonly<{
+    intervalHours: 24;
+    timeMins: 60;
+    durMin: 10;
+    retryIntMin: 15;
+    connectionTries: 5;
+}>;
+/** Format minutes-since-midnight as `"HH:MM"`, or null when out of range.
+ * Fractional input is rounded to the nearest whole minute first, so the
+ * minutes component always stays in 0–59. */
+declare function minutesSinceMidnightToHHMM(mins: number | null | undefined): string | null;
+/** Parse `"HH:MM"` (or `"H:MM"`) into minutes-since-midnight, or null when
+ * malformed / out of range. */
+declare function hhmmToMinutesSinceMidnight(text: string | null | undefined): number | null;
+/** Boolean sensor enables used to predict which stream sensor IDs a config
+ * will produce (see {@link expectedVerisenseStreamSensorIds}). */
+interface VerisenseStreamSensorEnables {
+    gsr?: boolean;
+    vbatt?: boolean;
+    vprog?: boolean;
+    accel1?: boolean;
+    accel2?: boolean;
+    gyro?: boolean;
+    mag?: boolean;
+    ppg?: boolean;
+    ambientLight?: boolean;
+    skinTemp?: boolean;
+    algoHub?: boolean;
+}
+/**
+ * The stream-packet sensor IDs a device will emit for a given set of sensor
+ * enables (see `VERISENSE_STREAM_SENSOR_LABELS` for the ID meanings). The
+ * IMU block splits by hardware generation: first-gen streams accel2+gyro as
+ * ID 3 (LSM6DS3); second-gen streams accel2+gyro+mag as ID 6 (LSM6DSV +
+ * LIS2MDL). Any enabled PPG channel produces the single PPG stream (ID 4).
+ */
+declare function expectedVerisenseStreamSensorIds(enables: VerisenseStreamSensorEnables, opts: {
+    secondGeneration: boolean;
+}): Set<number>;
+/** {@link expectedVerisenseStreamSensorIds} computed straight from op-config
+ * bytes via the sensor-enable bit schema. */
+declare function expectedVerisenseStreamSensorIdsFromConfig(op: Uint8Array | null | undefined, opts: {
+    secondGeneration: boolean;
+}): Set<number>;
 
 /**
  * Abstract base class for all Verisense sensor decoders.
@@ -2947,7 +3254,11 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _sendHubPage;
     /** Best-effort abort: tell the device to reset the hub back to application mode. */
     private _abortHubUpload;
-    readFlashLookupTable(index?: number, timeoutMs?: number): Promise<{
+    /** Read the flash lookup table. The read walks the whole flash on-device
+     * and can time out on busy sensors, so `retries` re-issues the command
+     * (total attempts = retries + 1) before giving up. Non-finite or negative
+     * `retries` is treated as 0; rejections are always `Error` instances. */
+    readFlashLookupTable(index?: number, timeoutMs?: number, retries?: number): Promise<{
         payload: Uint8Array;
     }>;
     readRealWorldClockScheduler(index?: number): Promise<{
@@ -3031,6 +3342,13 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _isUninitializedBlob;
     readProductionConfigFromDevice(): Promise<ProductionConfig>;
     readOpConfigFromDevice(): Promise<Uint8Array>;
+    /**
+     * Push an operational config into every sensor decoder (rates, ranges,
+     * channel enables) and cache it as the client's working config. Used
+     * automatically after {@link readOpConfigFromDevice}; call it directly when
+     * loading a config from a template/file without a device round-trip.
+     */
+    applyOperationalConfig(opConfigBytes: Uint8Array | number[]): void;
     writeOpConfig(opConfigBytes: Uint8Array | number[]): Promise<void>;
     /** Per-device calibration last read from the device, or null. */
     private _calibration;
@@ -3070,6 +3388,248 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     /** Snapshot of live stream statistics (throughput / packet-loss). */
     getStreamStats(): StreamStatsSnapshot;
 }
+
+/**
+ * Verisense Nordic Secure-DFU flow helpers (DEV-845).
+ *
+ * The byte transport is Nordic's `web-bluetooth-dfu` library (`SecureDfu` +
+ * `SecureDfuPackage`, vendored by consuming apps); this module owns everything
+ * learned about running that library reliably against Verisense sensors over
+ * desktop Chrome/Edge Web Bluetooth:
+ *
+ * - classification of transient BLE-stack errors vs DFU protocol errors
+ * - a fix for the library's swallowed-rejection hang in `sendOperation`
+ * - bounded + retried `setDfuMode` (with a full GATT reset between attempts)
+ * - the two-phase combined-package update (SoftDevice/bootloader then
+ *   application), including resume of an interrupted combined update
+ * - the bootloader device-picker filter and packet-pacing defaults
+ *
+ * The library objects are injected (structurally typed), so this module has no
+ * build-time dependency on the vendored scripts. All user-visible progress is
+ * reported through an `onStatus` callback; no DOM access happens here.
+ */
+/**
+ * Transient connection/BLE-stack errors worth retrying. "unknown reason"
+ * (NotSupportedError) is Chrome-on-Windows' generic wrapper for any GATT
+ * operation the OS stack fails without an ATT error code (DEV-845) —
+ * typically a startNotifications/write right after a (re)connect, or a
+ * link being torn down mid-encryption. Recoverable on retry; DFU protocol
+ * errors (wrong image, version too low, ...) never match.
+ */
+declare const VERISENSE_DFU_TRANSIENT_ERROR_REGEX: RegExp;
+/** Total attempts (first try + retries) for the DFU connection-retry helpers. */
+declare const VERISENSE_DFU_CONNECT_ATTEMPTS = 3;
+/** Delay between DFU connection retries, letting the device finish rebooting. */
+declare const VERISENSE_DFU_RETRY_DELAY_MS = 2000;
+/** Time allowed for the base image's post-install reboot back into the bootloader. */
+declare const VERISENSE_DFU_REBOOT_DELAY_MS = 3000;
+/** Bound on `setDfuMode` (connect + notifications + one write): the happy path
+ * completes in seconds, so a hit means a genuine stall — including the vendored
+ * library's swallowed-rejection case that {@link patchSecureDfuSendOperation}
+ * and {@link promiseWithTimeout} exist to catch. */
+declare const VERISENSE_DFU_SET_MODE_TIMEOUT_MS = 30000;
+/**
+ * Per-packet pacing for the firmware transfer, in ms. The packet
+ * characteristic is written without response; over Web Bluetooth, Chrome
+ * drops packets if it outruns the device, so at 0 ms the first pass can fail
+ * object CRC validation and the library silently retries the WHOLE transfer
+ * at ~10 ms (the pass that succeeds). Pacing at 10 ms makes the first pass
+ * succeed outright. Pass 0 ("fast") for full speed on a known-clean link.
+ * (nRF Connect sidesteps this via a wired connectivity dongle rather than
+ * the OS BLE stack.)
+ */
+declare const VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS = 10;
+declare const VERISENSE_DFU_FAST_PACKET_DELAY_MS = 0;
+/**
+ * The Verisense bootloader advertises as "Verisense-BL..."; app-mode sensors
+ * ("Verisense-..." without the -BL) are deliberately excluded from DFU device
+ * pickers to keep them unambiguous. The DFU service UUID is not advertised in
+ * app mode, so it cannot be used to widen the filter; it still needs to be
+ * granted via `optionalServices` for the GATT connection.
+ */
+declare const VERISENSE_DFU_BOOTLOADER_NAME_PREFIX = "Verisense-BL";
+/**
+ * The library's routine object-retransmission notices (e.g. "object failed to
+ * validate"). Over Web Bluetooth, firmware packets are written without
+ * response and Chrome can drop one if it outruns the device; that makes a
+ * 4 KB object's CRC mismatch, so the library transparently re-creates and
+ * re-sends that object. The transfer still completes correctly (every object
+ * is CRC-checked before Execute, and the bootloader CRC/signature-checks the
+ * whole image), so these are non-issues that only alarm users. Real failures
+ * still surface via the promise rejection paths.
+ */
+declare const VERISENSE_DFU_ROUTINE_LOG_REGEX: RegExp;
+/** True for library log messages that are routine retransmission noise and
+ * should not be surfaced to end users (see {@link VERISENSE_DFU_ROUTINE_LOG_REGEX}). */
+declare function isRoutineVerisenseDfuLogMessage(message: string): boolean;
+/** "attempt N of M" wording for retry status lines. The retry helpers count
+ * attempts DOWN (remaining, including the one that just failed), so the
+ * attempt about to start is total - remaining + 2. */
+declare function verisenseDfuAttemptLabel(attemptsRemaining: number, totalAttempts?: number): string;
+/** A firmware image entry from a Nordic DFU package (`SecureDfuPackage`). */
+interface VerisenseDfuImage {
+    type?: string;
+    initFile?: string;
+    imageFile?: string;
+    initData: ArrayBuffer;
+    imageData: ArrayBuffer;
+}
+/** Structural view of Nordic's `SecureDfuPackage` (base = SoftDevice /
+ * bootloader / both; app = application image). */
+interface VerisenseDfuPackage {
+    getBaseImage(): Promise<VerisenseDfuImage | null | undefined>;
+    getAppImage(): Promise<VerisenseDfuImage | null | undefined>;
+}
+/** Structural view of the `SecureDfu` instance methods this module drives. */
+interface SecureDfuLike {
+    /** Resolves with the device when it is already in bootloader mode, or
+     * null/undefined after the buttonless reboot command has been sent. */
+    setDfuMode(device: BluetoothDevice): Promise<BluetoothDevice | null | undefined>;
+    update(device: BluetoothDevice, init: ArrayBuffer, image: ArrayBuffer): Promise<unknown>;
+}
+interface SecureDfuSendOperationInternals {
+    notifyFns: Record<number, {
+        resolve: (value: unknown) => void;
+        reject: (reason?: unknown) => void;
+    }>;
+    log(message: unknown): void;
+    delayPromise(ms: number): Promise<unknown>;
+}
+type SecureDfuSendOperation = (this: SecureDfuSendOperationInternals, characteristic: {
+    writeValue(value: BufferSource): Promise<unknown>;
+}, operation: ArrayLike<number>, buffer?: ArrayBuffer) => Promise<unknown>;
+/**
+ * Fix the swallowed-rejection hang in `web-bluetooth-dfu` v1.2.1 (DEV-845):
+ * upstream `SecureDfu.sendOperation` retries a failed control-point write once
+ * after 500 ms, but if the retry ALSO fails the rejection is dropped and the
+ * returned promise never settles — the transfer hangs forever. This replaces
+ * the method with the same logic as upstream, plus: a second write failure
+ * rejects the pending operation.
+ *
+ * Call once per page load with the vendored `SecureDfu` constructor before
+ * creating instances. Safe to call repeatedly (idempotent).
+ */
+declare function patchSecureDfuSendOperation(SecureDfuCtor: {
+    prototype: SecureDfuSendOperationInternals & {
+        sendOperation: SecureDfuSendOperation;
+    };
+}): void;
+/** How a DFU-flow error should be presented / handled. */
+type VerisenseDfuErrorCategory = 'device-disconnected' | 'stack-operation-failed';
+interface VerisenseDfuErrorInfo {
+    /** Known Bluetooth-stack failure signature, or null for anything else
+     * (including genuine DFU protocol errors, which pass through untouched). */
+    category: VerisenseDfuErrorCategory | null;
+    /** Plain-language, platform-neutral description for the category, or null.
+     * Apps typically append their own platform-specific remediation hint (e.g.
+     * "remove the sensor in Windows Bluetooth settings, then retry"). */
+    friendlyMessage: string | null;
+    /** True when the error matches {@link VERISENSE_DFU_TRANSIENT_ERROR_REGEX}
+     * and is worth retrying. */
+    transient: boolean;
+    /** DOMException/Error name when available, else "GATT error". */
+    name: string;
+    rawMessage: string;
+}
+/**
+ * Classify known Bluetooth-stack failures seen during Verisense DFU (DEV-845).
+ * Two signatures of the same Windows pairing/GATT-cache failure loop:
+ * "unknown reason" (NotSupportedError) is the stack failing an operation on a
+ * live link, and "GATT Server is disconnected" (NetworkError) is the sensor
+ * tearing the link down mid-operation — on units without the firmware fix,
+ * typically its ~400 ms security request colliding with a stale pairing key.
+ * Unrecognised errors return `category: null` so their raw text passes
+ * through unchanged.
+ */
+declare function classifyVerisenseDfuError(error: unknown): VerisenseDfuErrorInfo;
+/**
+ * Reject a promise that hasn't settled within `ms`. Used to guard
+ * `SecureDfu.setDfuMode()`: the library builds its buttonless branch as
+ * `new Promise((resolve, reject) => { startNotifications().then(
+ * ...sendOperation...).then(resolve) })` with NO `.catch(reject)`, so if
+ * startNotifications() or the button-command write fails the promise never
+ * settles. (The {@link patchSecureDfuSendOperation} override makes that write
+ * reject rather than hang, which this same missing catch would swallow.)
+ * The timeout message deliberately includes "connection" so it matches
+ * {@link VERISENSE_DFU_TRANSIENT_ERROR_REGEX} and drives the retry helpers.
+ * Kept as a timeout rather than re-implementing setDfuMode so the buttonless
+ * reboot logic isn't duplicated, and so it defends against any stall cause.
+ */
+declare function promiseWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T>;
+/** A bundled firmware name must be a plain `.zip` filename — no path
+ * separators or traversal — so a malformed/hostile manifest can't make an app
+ * fetch outside its firmware folder. */
+declare function isSafeFirmwareArchiveName(name: unknown): name is string;
+/**
+ * `navigator.bluetooth.requestDevice()` options for picking a Verisense
+ * bootloader (replaces the DFU library's `acceptAllDevices`; see
+ * {@link VERISENSE_DFU_BOOTLOADER_NAME_PREFIX} for why name-prefix only).
+ * Pass the vendored library's `SecureDfu.SERVICE_UUID`.
+ */
+declare function buildVerisenseDfuRequestDeviceOptions(dfuServiceUuid: string | number): {
+    filters: {
+        namePrefix: string;
+    }[];
+    optionalServices: (string | number)[];
+};
+interface VerisenseDfuRetryInfo {
+    stage: 'set-dfu-mode' | 'update';
+    /** Attempts left including the retry about to run. */
+    attemptsRemaining: number;
+    /** Ready-made "attempt N of M" wording for status lines. */
+    attemptLabel: string;
+    error: unknown;
+}
+interface VerisenseDfuFlowOptions {
+    /** Total attempts for connection-level retries (default
+     * {@link VERISENSE_DFU_CONNECT_ATTEMPTS}). */
+    attempts?: number;
+    /** Delay between retries (default {@link VERISENSE_DFU_RETRY_DELAY_MS}). */
+    retryDelayMs?: number;
+    /** Bound on setDfuMode (default {@link VERISENSE_DFU_SET_MODE_TIMEOUT_MS}). */
+    setDfuModeTimeoutMs?: number;
+    /** Wait after the base image installs, for the reboot back into the
+     * bootloader (default {@link VERISENSE_DFU_REBOOT_DELAY_MS}). */
+    rebootDelayMs?: number;
+    /** User-facing progress text (the same strings the Verisense console shows). */
+    onStatus?: (message: string) => void;
+    /** Called before each connection-level retry; protocol errors never retry. */
+    onRetry?: (info: VerisenseDfuRetryInfo) => void;
+}
+/**
+ * `SecureDfu.update()` with retries on connection-level errors. Combined
+ * (SoftDevice+bootloader+application) packages transfer in two parts with a
+ * device reset in between; the reconnect for part 2 can fail while the device
+ * is still rebooting, so transient errors retry after a settle delay. DFU
+ * protocol errors are not retried.
+ */
+declare function updateVerisenseDfuImageWithRetry(dfu: SecureDfuLike, device: BluetoothDevice, image: VerisenseDfuImage, options?: VerisenseDfuFlowOptions): Promise<void>;
+/**
+ * `SecureDfu.setDfuMode()` bounded by a timeout and retried on transient
+ * errors (DEV-845). setDfuMode (connect + find the buttonless characteristic
+ * + startNotifications + write) is where Windows' BLE stack intermittently
+ * fails with "GATT operation failed for unknown reason", typically on the
+ * first GATT operation after a connect that follows a disconnect. Before each
+ * retry the GATT connection is fully torn down so the next attempt starts
+ * from a clean link. Protocol errors (e.g. "Unsupported device") are not
+ * retried. Resolves like setDfuMode: the device when it is already in
+ * bootloader mode, or null after the buttonless reboot command has been sent.
+ */
+declare function setVerisenseDfuModeWithRetry(dfu: SecureDfuLike, device: BluetoothDevice, options?: VerisenseDfuFlowOptions): Promise<BluetoothDevice | null>;
+/**
+ * Run a full Verisense DFU transfer from a loaded Nordic DFU package: base
+ * image (SoftDevice/bootloader) first when present, then the application
+ * image. Resumes interrupted combined updates: a bootloader only installs
+ * once per version number, so if a previous (interrupted) attempt already
+ * installed this base image the target rejects it with a firmware-version
+ * error — that is swallowed and the flow continues to the application image.
+ *
+ * Progress text is reported via `options.onStatus`; transfer byte progress
+ * comes from the `SecureDfu` instance's own "progress" events, which the app
+ * subscribes to directly. Rejects with the raw library error on failure (run
+ * it through {@link classifyVerisenseDfuError} for display).
+ */
+declare function runVerisenseDfuUpdate(dfu: SecureDfuLike, device: BluetoothDevice, dfuPackage: VerisenseDfuPackage, options?: VerisenseDfuFlowOptions): Promise<void>;
 
 /**
  * Verisense calibration defaults, hardware/firmware gating, and timestamp helpers.
@@ -3144,5 +3704,5 @@ type VerisenseCalibrationAvailability = 'enabled' | 'disabled' | 'hidden';
  */
 declare function getVerisenseCalibrationSensorAvailability(support: VerisenseHardwareSensorSupport | null | undefined): Record<number, VerisenseCalibrationAvailability>;
 
-export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildDefaultVerisenseCalibrationSet, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrationBlobCrc, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, describeVerisenseChargerStatus, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, parseBleLinkDebugPayload, parseCalibrationBlob, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, readVerisenseOperationalFieldValue, serializeCalibrationBlob, setVerisenseOperationalBitRange, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, ImuCalibration, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RunHardwareTestReportOptions, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, Shimmer3RClientOptions, ShimmerClientOptions, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VD6283Sample, VerisenseBleLinkDebugPayload, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseEventLogEntry, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseUnixAndHumanTimestamp };
+export { ASM_COMMAND, ASM_PROPERTY, BLE_LINK_MIN_FW, BaseShimmerClient, CHANNEL_FORMATS, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, GSR_NAME, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SHIMMER3R_DEFAULTS, STREAM_MODE, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3RClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, buildDefaultVerisenseCalibrationSet, buildHeader, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrationBlobCrc, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, csvCell, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, getFirstPayloadIndex, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, isAckCommand, isNackCommand, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isUniformByteArray, isVerisenseLightDarkChannelEnabled, isVerisenseSecondGenerationHardware, minutesSinceMidnightToHHMM, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseBleLinkDebugPayload, parseCalibrationBlob, parseEventLogPayload, parseHeader, parseHexByteString, parseLookupTablePayload, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseStatusPayload, parseVerisenseAdvertisedName, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, verisenseDeviceFileTag, verisenseDfuAttemptLabel, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, DebugCommandId, DeviceMode, EvaluateParsedSplitInput, FieldKind, IShimmerClient, ImuCalibration, InertialCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, Shimmer3RClientOptions, ShimmerClientOptions, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportKind, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp };
