@@ -294,8 +294,9 @@
   </main>
 
   <script type="module">
-    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js';
-    import { KneeTracker } from './kinematics.js';
+    // ?v= busts stale HTTP caches — bump it whenever these modules change
+    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js?v=2';
+    import { KneeTracker } from './kinematics.js?v=2';
 
     // --- config ---------------------------------------------------------
     const SAMPLING_HZ = 128;

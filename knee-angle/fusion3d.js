@@ -17,7 +17,7 @@
 //     over demo timescales.
 // ---------------------------------------------------------------------------
 
-import { calibrate, ACCEL_SENS, GYRO_SENS, ALIGN_WR_ACCEL_3R, ALIGN_GYRO_3R } from './kinematics.js';
+import { calibrate, ACCEL_SENS, GYRO_SENS, ALIGN_WR_ACCEL_3R, ALIGN_GYRO_3R } from './kinematics.js?v=2';
 
 const D2R = Math.PI / 180;
 
@@ -148,12 +148,59 @@ export class ArmImu {
   get calibrating() { return this._cal !== null; }
   get ready() { return this.qRef !== null; }
 
+  /** Progress of the hold-still capture (0..1), or null when not capturing. */
+  get calProgress() { return this._cal ? this._cal.count / this._cal.n : null; }
+
+  /** Abort any in-progress hold-still or swing capture. */
+  cancelCalibration() { this._cal = null; this._swing = null; }
+
+  /**
+   * Functional calibration, phase 2: while the user swings the straight arm
+   * about one physical axis (e.g. forward/back at the shoulder), collect the
+   * rotation axis in THIS filter's earth frame. Both sensors move rigidly
+   * together, so the same physical axis measured in each earth frame exposes
+   * the yaw offset between the frames — mounting differences included.
+   */
+  startSwingCapture() {
+    this._swing = { sum: { x: 0, y: 0, z: 0 }, count: 0 };
+  }
+
+  get swingCount() { return this._swing ? this._swing.count : 0; }
+
+  /**
+   * End swing capture. Returns the unit rotation axis in this filter's earth
+   * frame (sign seeded by the FIRST swing direction), or null if there was
+   * not enough rotation or the axis is too vertical to define a heading.
+   */
+  finishSwingCapture(minSamples = 50) {
+    const s = this._swing;
+    this._swing = null;
+    if (!s || s.count < minSamples) return null;
+    const n = Math.hypot(s.sum.x, s.sum.y, s.sum.z) || 1;
+    const axis = { x: s.sum.x / n, y: s.sum.y / n, z: s.sum.z / n };
+    if (Math.hypot(axis.x, axis.y) < 0.4) return null;   // near-vertical: no heading info
+    return axis;
+  }
+
+  /**
+   * Align this filter's earth frame so `axis` (from finishSwingCapture) maps
+   * to the shared heading datum. Default target -X: with a forward-first
+   * swing this makes "forward" consistent across devices AND the scene.
+   * Overrides the body-X default datum from _computeYawFix.
+   */
+  setYawFix(axis, targetYawRad = Math.PI) {
+    const yaw = Math.atan2(axis.y, axis.x);
+    this.qYawFix = qFromAxisAngle(0, 0, 1, targetYawRad - yaw);
+  }
+
   /** Feed one sample of raw sensor counts. */
   update(accelRaw, gyroRaw, dt) {
     const accel = calibrate(accelRaw, this.accelSens, ALIGN_WR_ACCEL_3R);
     const gyro = calibrate(gyroRaw, this.gyroSens, ALIGN_GYRO_3R);
     this.accel = accel;
     this.gyro = gyro;
+    // bias-corrected rotation speed (deg/s) — used for swing/quiet detection
+    this.gyroMag = Math.hypot(gyro.x - this.bias.x, gyro.y - this.bias.y, gyro.z - this.bias.z);
     this.sampleCount++;
 
     if (this._cal) {
@@ -165,6 +212,18 @@ export class ArmImu {
         this.qRef = { ...this.filter.q };
         this._computeYawFix();
         this.onCalibrated?.(this);
+      }
+    }
+
+    if (this._swing) {
+      const gb = { x: gyro.x - this.bias.x, y: gyro.y - this.bias.y, z: gyro.z - this.bias.z };
+      if (Math.hypot(gb.x, gb.y, gb.z) > 40) {   // deg/s: only count real swinging
+        const ge = qRotate(this.filter.q, gb);   // rotation axis in this earth frame
+        const s = this._swing;
+        const dot = ge.x * s.sum.x + ge.y * s.sum.y + ge.z * s.sum.z;
+        const sign = (s.count === 0 || dot >= 0) ? 1 : -1;   // sign seeded by first swing
+        s.sum.x += sign * ge.x; s.sum.y += sign * ge.y; s.sum.z += sign * ge.z;
+        s.count++;
       }
     }
 

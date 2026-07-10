@@ -154,7 +154,8 @@
 
     <div class="panel">
       <h2>Calibration</h2>
-      <button id="refBtn" class="wide" disabled>⦿ Set reference — hold arm still at your side</button>
+      <button id="demoBtn" class="wide">▶ Demo the calibration</button>
+      <button id="calBtn" class="wide primary" disabled style="margin-top: 8px;">⦿ Calibrate — hold still, then swing</button>
     </div>
 
     <div class="panel">
@@ -191,8 +192,9 @@
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import * as CANNON from 'cannon-es';
-    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js';
-    import { ArmImu } from './fusion3d.js';
+    // ?v= busts stale HTTP caches — bump it whenever these modules change
+    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js?v=2';
+    import { ArmImu } from './fusion3d.js?v=2';
 
     // --- config -----------------------------------------------------------
     const SAMPLING_HZ = 128;
@@ -259,14 +261,15 @@
       led: document.getElementById('ledWrist'), name: document.getElementById('nameWrist'),
     });
 
-    const refBtn = document.getElementById('refBtn');
+    const calBtn = document.getElementById('calBtn');
+    const demoBtn = document.getElementById('demoBtn');
     function wireConnect(btn, link) {
       btn.addEventListener('click', async () => {
         btn.disabled = true;
         try {
           await link.connectAndStream();
           btn.textContent = 'Connected';
-          if (upper.streaming && wrist.streaming) refBtn.disabled = false;
+          if (upper.streaming && wrist.streaming) calBtn.disabled = false;
         } catch (e) {
           log(`[${link.role}] ❌ ${e.message}`);
           link.els.led.className = 'led';
@@ -278,19 +281,44 @@
     wireConnect(document.getElementById('connWrist'), wrist);
 
     // --- calibration flow ---------------------------------------------------
-    // "Set reference": hold still ~1.25s -> gyro bias + reference pose captured.
-    // Re-running it at any time re-aligns heading (heals slow yaw drift).
+    // Two-phase FUNCTIONAL calibration:
+    //   1. hold still           -> gyro bias + reference pose per device
+    //   2. swing the straight arm forward & back at the shoulder ×3
+    //      -> both sensors rotate about the same physical axis; measuring that
+    //         axis in each filter's earth frame yields the yaw offset between
+    //         the frames (strapping differences included) and defines
+    //         scene-forward. Re-run anytime to heal slow yaw drift.
     const promptEl = document.getElementById('prompt');
+    const CAL_BTN_LABEL = '⦿ Calibrate — hold still, then swing';
     let live = false;
+    let calPhase = 'idle';   // idle | still | swing
     let calPending = 0;
+    let stillDeadline = 0;   // backstop: a stalled sensor stream must not hang the flow
+    let swingDeadline = 0;
+    let quietSince = null;   // swing phase ends on "enough swing, then hold still"
 
-    refBtn.addEventListener('click', () => {
-      refBtn.disabled = true;
-      refBtn.textContent = 'Hold still…';
+    function setPrompt(text, cls = '') {
+      promptEl.style.transition = 'none';
       promptEl.style.opacity = '1';
-      promptEl.textContent = 'hold still — capturing reference';
-      promptEl.className = 'overlay hold';
+      promptEl.textContent = text;
+      promptEl.className = 'overlay' + (cls ? ' ' + cls : '');
+    }
+    function fadePrompt(delayMs = 2500) {
+      setTimeout(() => {
+        promptEl.style.transition = 'opacity 1s';
+        promptEl.style.opacity = '0';
+      }, delayMs);
+    }
+
+    calBtn.addEventListener('click', () => {
+      if (calPhase !== 'idle') return;
+      stopAnim();   // in case the demo animation is playing
+      calPhase = 'still';
+      calBtn.disabled = true;
+      calBtn.textContent = 'Hold still…';
+      setPrompt('1/2 — hold the arm still at your side', 'hold');
       calPending = 2;
+      stillDeadline = performance.now() / 1000 + 6.0;
       imuUpper.startCalibration(Math.round(1.25 * SAMPLING_HZ));
       imuWrist.startCalibration(Math.round(1.25 * SAMPLING_HZ));
     });
@@ -298,22 +326,128 @@
     const fmtBias = (b) => `${b.x.toFixed(1)},${b.y.toFixed(1)},${b.z.toFixed(1)}`;
     function onImuCalibrated() {
       if (--calPending > 0) return;
+      calPhase = 'swing';
+      calBtn.textContent = 'Swing forward & back ×3…';
+      swingDeadline = performance.now() / 1000 + 15;   // generous backstop only
+      quietSince = null;
+      imuUpper.startSwingCapture();
+      imuWrist.startSwingCapture();
+      startGuide();   // the mannequin demonstrates the swing to mimic
+    }
+    imuUpper.onCalibrated = onImuCalibrated;
+    imuWrist.onCalibrated = onImuCalibrated;
+
+    // Called every frame: drives progress display, timeouts, and phase exits.
+    const SWING_TARGET = 160;   // ~1.25s of >40deg/s rotation per device
+    function checkCalPhases() {
+      const t = performance.now() / 1000;
+
+      if (calPhase === 'still') {
+        const pU = imuUpper.calProgress, pW = imuWrist.calProgress;
+        const pct = Math.round(Math.min(pU ?? 1, pW ?? 1) * 100);
+        setPrompt(`1/2 — hold the arm still at your side · ${pct}%`, 'hold');
+        if (t > stillDeadline) {   // a sensor stopped delivering samples
+          imuUpper.cancelCalibration(); imuWrist.cancelCalibration();
+          calPhase = 'idle'; calPending = 0;
+          calBtn.disabled = false; calBtn.textContent = CAL_BTN_LABEL;
+          setPrompt('calibration timed out — a sensor may have stopped streaming');
+          const p = (v) => v === null ? 'done' : `${Math.round(v * 100)}%`;
+          log(`still-phase timeout — progress upper: ${p(pU)}, wrist: ${p(pW)}. Check both LEDs are teal / reconnect.`);
+        }
+        return;
+      }
+
+      if (calPhase !== 'swing') return;
+      const cU = imuUpper.swingCount, cW = imuWrist.swingCount;
+      const pct = Math.min(100, Math.round(Math.min(cU, cW) / SWING_TARGET * 100));
+      setPrompt(`2/2 — swing forward & back ×3, then hold still · ${pct}%`, 'hold');
+      // exit: enough swing collected on BOTH devices, then ~0.7s of stillness
+      const quiet = (imuUpper.gyroMag ?? 99) < 25 && (imuWrist.gyroMag ?? 99) < 25;
+      if (!quiet) quietSince = null;
+      else if (quietSince === null) quietSince = t;
+      const settled = cU >= SWING_TARGET && cW >= SWING_TARGET
+                      && quietSince !== null && (t - quietSince) > 0.7;
+      if (!settled && t < swingDeadline) return;
+
+      calPhase = 'idle';
+      stopAnim();
+      const aU = imuUpper.finishSwingCapture();
+      const aW = imuWrist.finishSwingCapture();
+      calBtn.disabled = false;
+      if (!aU || !aW) {
+        calBtn.textContent = CAL_BTN_LABEL;
+        setPrompt('not enough swing detected — press Calibrate to retry');
+        log(`functional calibration failed: swing samples upper ${cU}, wrist ${cW} (need ${SWING_TARGET} each)`);
+        return;
+      }
+      imuUpper.setYawFix(aU);
+      imuWrist.setYawFix(aW);
+      const yaw = (a) => Math.atan2(a.y, a.x) * 180 / Math.PI;
+      const off = ((yaw(aU) - yaw(aW)) % 360 + 540) % 360 - 180;
       live = true;
       imuUpper.filter.beta = BETA_RUN;
       imuWrist.filter.beta = BETA_RUN;
       setArmDim(false);
-      refBtn.disabled = false;
-      refBtn.textContent = '⦿ Re-set reference';
-      promptEl.textContent = 'live — move your arm';
-      promptEl.className = 'overlay live';
-      log(`reference captured (gyro bias U: ${fmtBias(imuUpper.bias)} · W: ${fmtBias(imuWrist.bias)} deg/s)`);
-      setTimeout(() => {
-        promptEl.style.transition = 'opacity 1s';
-        promptEl.style.opacity = '0';
-      }, 2500);
+      calBtn.textContent = '⦿ Re-calibrate';
+      setPrompt('live — move your arm', 'live');
+      fadePrompt();
+      log(`calibrated: frame yaw offset ${off.toFixed(1)}° corrected`
+        + ` (gyro bias U: ${fmtBias(imuUpper.bias)} · W: ${fmtBias(imuWrist.bias)} deg/s)`);
     }
-    imuUpper.onCalibrated = onImuCalibrated;
-    imuWrist.onCalibrated = onImuCalibrated;
+
+    // --- calibration animation (mannequin demonstrates the procedure) --------
+    // Timeline: hold still (2s) -> swing ×3 (6.6s) -> settle. The Demo button
+    // plays the whole thing with captions; during REAL calibration the swing
+    // segment loops as a guide to mimic.
+    const SWING_PERIOD = 2.2, SWING_CYCLES = 3;
+    const SWING_START = 2.0, SWING_END = SWING_START + SWING_PERIOD * SWING_CYCLES;
+    let anim = null;   // { t, mode: 'demo' | 'guide' }
+    const animQ = new THREE.Quaternion();
+    const X_AXIS = new THREE.Vector3(1, 0, 0);
+
+    function startDemo() {
+      if (calPhase !== 'idle' || anim) return;
+      anim = { t: 0, mode: 'demo' };
+      setArmDim(false);
+    }
+    demoBtn.addEventListener('click', startDemo);
+
+    function startGuide() {
+      anim = { t: SWING_START, mode: 'guide' };
+      setArmDim(false);
+    }
+
+    function stopAnim() {
+      if (!anim) return;
+      anim = null;
+      setArmDim(!live);
+      upperGroup.quaternion.identity();
+      elbowGroup.quaternion.identity();
+    }
+
+    function updateAnim(dt) {
+      if (!anim) return;
+      anim.t += dt;
+      let theta = 0;
+      if (anim.t < SWING_START) {
+        if (anim.mode === 'demo') setPrompt('demo 1/2 — hold the arm still at your side', 'hold');
+      } else if (anim.t < SWING_END) {
+        // forward-first swing (forward = rotation about -X in scene space)
+        theta = -70 * Math.PI / 180 * Math.sin(2 * Math.PI * (anim.t - SWING_START) / SWING_PERIOD);
+        if (anim.mode === 'demo') setPrompt('demo 2/2 — swing forward & back ×3, elbow straight', 'hold');
+      } else if (anim.mode === 'guide') {
+        anim.t = SWING_START;   // loop the swing until the real capture finishes
+      } else if (anim.t < SWING_END + 1.8) {
+        setPrompt("that's it — press Calibrate to do it for real", 'live');
+      } else {
+        stopAnim();
+        fadePrompt(400);
+        return;
+      }
+      animQ.setFromAxisAngle(X_AXIS, theta);
+      upperGroup.quaternion.copy(animQ);
+      elbowGroup.quaternion.identity();   // elbow stays straight throughout
+    }
 
     // --- three.js scene -----------------------------------------------------
     const canvas = document.getElementById('scene');
@@ -789,7 +923,7 @@
     const twistValEl = document.getElementById('twistVal');
 
     function updatePose() {
-      if (!live) return;
+      if (!live || anim) return;   // demo/guide animation owns the arm while playing
       worldDelta(imuUpper, qUpperTarget);
       worldDelta(imuWrist, qWristWorld);
 
@@ -825,6 +959,8 @@
     function frame() {
       const dt = Math.min(clock.getDelta(), 0.05);
       updatePose();
+      updateAnim(dt);
+      checkCalPhases();
       updateHand(dt);
       stepPhysics(dt);
       updateConfetti(dt);

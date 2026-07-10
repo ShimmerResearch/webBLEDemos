@@ -60,10 +60,21 @@ arm**, one on the **wrist** — with full quaternion sensor fusion.
 | `hands.html` | three.js scene (articulated torso/arm/hand, orbit camera, lighting/shadows) + Web Bluetooth wiring + calibration UI. |
 
 ### Use
-1. Strap one sensor to the upper arm, one to the wrist. **Connect** both.
-2. Stand with the arm relaxed at your side, press **Set reference** and hold
-   still ~1.25 s — this captures gyro bias and the reference pose.
+1. Strap one sensor to the upper arm, one to the wrist (any orientation).
+   **Connect** both.
+2. Press **▶ Demo the calibration** to watch the mannequin perform the
+   procedure, then press **⦿ Calibrate**:
+   - **1/2** — hold the arm still at your side (~1.25 s: gyro bias + reference pose)
+   - **2/2** — swing the straight arm forward & back ×3 (the mannequin loops
+     the motion as a guide). Swing **forward first** — that defines "forward".
 3. Move: the 3D arm follows in real time. Orbit with the mouse.
+
+**Why the swing?** Without a magnetometer, each IMU's heading (yaw) is
+arbitrary, and strapping differences add an unknown yaw offset between the two
+sensors. During the swing both sensors rotate about the same physical axis
+(the shoulder), so measuring that axis in each filter's earth frame exposes the
+offset exactly — no strapping discipline needed. Re-calibrate anytime to heal
+slow yaw drift.
 
 ### Features
 - **Madgwick fusion** per IMU: smooth drift-corrected 3D orientation from
@@ -73,5 +84,8 @@ arm**, one on the **wrist** — with full quaternion sensor fusion.
   pronation/supination ±90°, varus/valgus ±8° — applied to the relative
   wrist-vs-upper-arm rotation.
 - Elbow flexion + forearm rotation HUD.
-- **Re-set reference** anytime: without a magnetometer, yaw (rotation about
-  gravity) is unobservable and drifts slowly; re-capturing the reference heals it.
+- **Functional calibration** (hold-still + arm-swing) aligns the two sensors'
+  heading frames regardless of how each is strapped; the mannequin demos and
+  guides the procedure. Re-calibrate anytime to heal slow yaw drift.
+- **Piñata**: cannon-es rigid-body physics — rope chain, momentum transfer from
+  real hand velocity, confetti hits, rope-snap break, floor bounce, respawn.
