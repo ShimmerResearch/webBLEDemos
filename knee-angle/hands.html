@@ -1,0 +1,843 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-T26GWN0LJW');
+  </script>
+
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Arm &amp; Hand — Dual-IMU 3D Demo</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: rgba(22, 27, 34, 0.88);
+      --panel-2: #1c2430;
+      --border: #2a3441;
+      --text: #e6edf3;
+      --muted: #8b98a8;
+      --accent: #2dd4bf;
+      --accent-dim: #0f766e;
+      --flex: #f59e0b;
+      --good: #34d399;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+      color: var(--text); font-family: var(--font); }
+    #scene { position: fixed; inset: 0; display: block; }
+
+    .overlay { position: fixed; z-index: 10; }
+    header.overlay {
+      top: 0; left: 0; right: 0; padding: 14px 20px;
+      display: flex; align-items: baseline; gap: 12px; pointer-events: none;
+    }
+    header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+    header .tag {
+      font-size: 11px; color: var(--accent); border: 1px solid var(--accent-dim);
+      padding: 2px 8px; border-radius: 999px;
+    }
+    header a { color: var(--muted); font-size: 12px; text-decoration: none; pointer-events: auto; }
+    header a:hover { color: var(--accent); }
+
+    .panel {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+      padding: 14px 16px; backdrop-filter: blur(8px);
+    }
+    #controls.overlay { top: 60px; left: 16px; width: 300px; display: flex; flex-direction: column; gap: 12px; }
+
+    .sensor { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+    .sensor:last-of-type { border-bottom: none; }
+    .led { width: 11px; height: 11px; border-radius: 50%; background: #3b4654; flex: none;
+      transition: background .2s, box-shadow .2s; }
+    .led.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
+    .led.streaming { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+    .sensor .info { flex: 1; min-width: 0; }
+    .sensor .role { font-weight: 600; font-size: 14px; }
+    .sensor .name { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    button {
+      font-family: var(--font); font-size: 13px; font-weight: 600;
+      border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+      padding: 8px 14px; border-radius: 9px; cursor: pointer;
+      transition: background .15s, border-color .15s, opacity .15s;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.primary { background: var(--accent-dim); border-color: var(--accent-dim); }
+    button.primary:hover:not(:disabled) { background: var(--accent); color: #04201c; }
+    button.wide { width: 100%; padding: 10px; }
+
+    .seg { display: flex; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
+    .seg button { flex: 1; border: none; border-radius: 0; background: transparent; }
+    .seg button.active { background: var(--accent-dim); color: #fff; }
+
+    .row { display: flex; align-items: center; gap: 10px; }
+    .row label { font-size: 13px; color: var(--muted); }
+    h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+      margin: 0 0 10px; font-weight: 600; }
+
+    #hud.overlay {
+      top: 60px; right: 16px; text-align: right; pointer-events: none;
+    }
+    #hud .val { font-size: 42px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+    #hud .val span { font-size: 18px; color: var(--muted); }
+    #hud .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    #hud .sub { margin-top: 10px; }
+
+    #prompt.overlay {
+      top: 70px; left: 50%; transform: translateX(-50%);
+      font-size: 15px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase;
+      color: var(--muted); background: var(--panel); border: 1px solid var(--border);
+      padding: 8px 18px; border-radius: 999px; pointer-events: none;
+      transition: color .2s, border-color .2s;
+    }
+    #prompt.hold { color: var(--flex); border-color: var(--flex); }
+    #prompt.live { color: var(--good); border-color: var(--good); }
+
+    #hint.overlay {
+      bottom: 14px; left: 50%; transform: translateX(-50%);
+      font-size: 11px; color: var(--muted); pointer-events: none;
+    }
+
+    #console.overlay {
+      bottom: 40px; left: 16px; width: 340px; max-height: 110px; overflow-y: auto;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+      color: var(--muted); background: rgba(13,17,23,.85); border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px 10px; white-space: pre-wrap;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <header class="overlay">
+    <h1>Arm &amp; Hand</h1>
+    <span class="tag">Dual-IMU · Madgwick · 3D</span>
+    <a href="index.html">← knee demo</a>
+  </header>
+
+  <div id="controls" class="overlay">
+    <div class="panel">
+      <h2>Sensors</h2>
+      <div class="sensor">
+        <div class="led" id="ledUpper"></div>
+        <div class="info">
+          <div class="role">Upper arm</div>
+          <div class="name" id="nameUpper">Not connected</div>
+        </div>
+        <button id="connUpper" class="primary">Connect</button>
+      </div>
+      <div class="sensor">
+        <div class="led" id="ledWrist"></div>
+        <div class="info">
+          <div class="role">Wrist</div>
+          <div class="name" id="nameWrist">Not connected</div>
+        </div>
+        <button id="connWrist" class="primary">Connect</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Calibration</h2>
+      <button id="refBtn" class="wide" disabled>⦿ Set reference — hold arm still at your side</button>
+    </div>
+
+    <div class="panel">
+      <h2>Model</h2>
+      <div class="seg" style="margin-bottom: 10px;">
+        <button id="leftBtn">Left arm</button>
+        <button id="rightBtn" class="active">Right arm</button>
+      </div>
+      <div class="row">
+        <input type="checkbox" id="limitsChk" />
+        <label for="limitsChk">Enforce biological joint limits</label>
+      </div>
+    </div>
+  </div>
+
+  <div id="hud" class="overlay">
+    <div class="val"><span id="flexVal">––</span><span>°</span></div>
+    <div class="lbl">elbow flexion</div>
+    <div class="sub">
+      <div class="val" style="font-size: 28px;"><span id="twistVal">––</span><span>°</span></div>
+      <div class="lbl">forearm rotation</div>
+    </div>
+    <div class="sub">
+      <div class="val" style="font-size: 28px;"><span id="hitVal">0</span></div>
+      <div class="lbl">piñata hits</div>
+    </div>
+  </div>
+
+  <div id="prompt" class="overlay">connect both sensors</div>
+  <div id="hint" class="overlay">drag: orbit · scroll: zoom · right-drag: pan</div>
+  <pre id="console" class="overlay"></pre>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import * as CANNON from 'cannon-es';
+    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js';
+    import { ArmImu } from './fusion3d.js';
+
+    // --- config -----------------------------------------------------------
+    const SAMPLING_HZ = 128;
+    const DT = 1 / SAMPLING_HZ;
+    const SENSOR_MASK = (SensorBitmapShimmer3.SENSOR_D_ACCEL |
+                         SensorBitmapShimmer3.SENSOR_GYRO) >>> 0;
+    const ACCEL_RANGE_4G = 1;
+    const GYRO_RANGE_500DPS = 2;
+    const BETA_SETTLE = 0.6;    // fast gravity convergence before reference
+    const BETA_RUN = 0.05;      // smooth tracking after reference
+
+    // arm dimensions (m-ish, scene units)
+    const L_UPPER = 0.28, L_FOREARM = 0.25;
+
+    // --- console ------------------------------------------------------------
+    const consoleEl = document.getElementById('console');
+    const log = (t) => {
+      consoleEl.textContent += t + '\n';
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    };
+
+    // --- fusion -------------------------------------------------------------
+    const imuUpper = new ArmImu({ beta: BETA_SETTLE });
+    const imuWrist = new ArmImu({ beta: BETA_SETTLE });
+
+    // --- BLE ----------------------------------------------------------------
+    class SensorLink {
+      constructor(role, imu, els) {
+        this.role = role;
+        this.imu = imu;
+        this.els = els;
+        this.streaming = false;
+        this.client = new Shimmer3RClient({ timestampFmt: 'u24', debug: false });
+        this.client.onStatus = (m) => log(`[${role}] ${m}`);
+        this.client.onStreamFrame = (oc) => {
+          const ax = oc.get('WR_ACCEL_X')?.value, ay = oc.get('WR_ACCEL_Y')?.value, az = oc.get('WR_ACCEL_Z')?.value;
+          const gx = oc.get('GYRO_X')?.value, gy = oc.get('GYRO_Y')?.value, gz = oc.get('GYRO_Z')?.value;
+          if ([ax, ay, az, gx, gy, gz].some(v => v === undefined)) return;
+          this.imu.update({ x: ax, y: ay, z: az }, { x: gx, y: gy, z: gz }, DT);
+        };
+      }
+      async connectAndStream() {
+        this.els.led.className = 'led';
+        await this.client.connect();
+        this.els.name.textContent = this.client.device?.name || 'Shimmer3R';
+        this.els.led.className = 'led on';
+        await this.client.setSamplingRate(SAMPLING_HZ);
+        await this.client.setAccelRange(ACCEL_RANGE_4G);
+        await this.client.setGyroRange(GYRO_RANGE_500DPS);
+        await this.client.setSensors(SENSOR_MASK);
+        const chans = this.client.schema?.fields?.map(f => f.name) ?? [];
+        log(`[${this.role}] channels: ${chans.join(', ') || '(schema unavailable)'}`);
+        await this.client.startStreaming();
+        this.els.led.className = 'led streaming';
+        this.streaming = true;
+        log(`[${this.role}] streaming @ ${SAMPLING_HZ} Hz, ±4g / 500dps`);
+      }
+    }
+
+    const upper = new SensorLink('upper', imuUpper, {
+      led: document.getElementById('ledUpper'), name: document.getElementById('nameUpper'),
+    });
+    const wrist = new SensorLink('wrist', imuWrist, {
+      led: document.getElementById('ledWrist'), name: document.getElementById('nameWrist'),
+    });
+
+    const refBtn = document.getElementById('refBtn');
+    function wireConnect(btn, link) {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await link.connectAndStream();
+          btn.textContent = 'Connected';
+          if (upper.streaming && wrist.streaming) refBtn.disabled = false;
+        } catch (e) {
+          log(`[${link.role}] ❌ ${e.message}`);
+          link.els.led.className = 'led';
+          btn.disabled = false;
+        }
+      });
+    }
+    wireConnect(document.getElementById('connUpper'), upper);
+    wireConnect(document.getElementById('connWrist'), wrist);
+
+    // --- calibration flow ---------------------------------------------------
+    // "Set reference": hold still ~1.25s -> gyro bias + reference pose captured.
+    // Re-running it at any time re-aligns heading (heals slow yaw drift).
+    const promptEl = document.getElementById('prompt');
+    let live = false;
+    let calPending = 0;
+
+    refBtn.addEventListener('click', () => {
+      refBtn.disabled = true;
+      refBtn.textContent = 'Hold still…';
+      promptEl.style.opacity = '1';
+      promptEl.textContent = 'hold still — capturing reference';
+      promptEl.className = 'overlay hold';
+      calPending = 2;
+      imuUpper.startCalibration(Math.round(1.25 * SAMPLING_HZ));
+      imuWrist.startCalibration(Math.round(1.25 * SAMPLING_HZ));
+    });
+
+    const fmtBias = (b) => `${b.x.toFixed(1)},${b.y.toFixed(1)},${b.z.toFixed(1)}`;
+    function onImuCalibrated() {
+      if (--calPending > 0) return;
+      live = true;
+      imuUpper.filter.beta = BETA_RUN;
+      imuWrist.filter.beta = BETA_RUN;
+      setArmDim(false);
+      refBtn.disabled = false;
+      refBtn.textContent = '⦿ Re-set reference';
+      promptEl.textContent = 'live — move your arm';
+      promptEl.className = 'overlay live';
+      log(`reference captured (gyro bias U: ${fmtBias(imuUpper.bias)} · W: ${fmtBias(imuWrist.bias)} deg/s)`);
+      setTimeout(() => {
+        promptEl.style.transition = 'opacity 1s';
+        promptEl.style.opacity = '0';
+      }, 2500);
+    }
+    imuUpper.onCalibrated = onImuCalibrated;
+    imuWrist.onCalibrated = onImuCalibrated;
+
+    // --- three.js scene -----------------------------------------------------
+    const canvas = document.getElementById('scene');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d1117);
+    scene.fog = new THREE.Fog(0x0d1117, 2.5, 6);
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 20);
+    camera.position.set(0.85, 0.25, 1.15);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.target.set(0.1, -0.05, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 0.5;
+    controls.maxDistance = 3.5;
+
+    scene.add(new THREE.HemisphereLight(0x4a5866, 0x0d1117, 1.4));
+    const key = new THREE.DirectionalLight(0xffffff, 2.2);
+    key.position.set(1.5, 2.5, 1.5);
+    key.castShadow = true;
+    key.shadow.mapSize.set(1024, 1024);
+    key.shadow.camera.left = -1.5; key.shadow.camera.right = 1.5;
+    key.shadow.camera.top = 1.5; key.shadow.camera.bottom = -1.5;
+    scene.add(key);
+    const rim = new THREE.PointLight(0x2dd4bf, 1.5, 4);
+    rim.position.set(-1.2, 0.4, -0.8);
+    scene.add(rim);
+
+    const grid = new THREE.GridHelper(6, 30, 0x2a3441, 0x1c2430);
+    grid.position.y = -0.85;
+    scene.add(grid);
+    const shadowCatcher = new THREE.Mesh(
+      new THREE.PlaneGeometry(6, 6),
+      new THREE.ShadowMaterial({ opacity: 0.35 }),
+    );
+    shadowCatcher.rotation.x = -Math.PI / 2;
+    shadowCatcher.position.y = -0.849;
+    shadowCatcher.receiveShadow = true;
+    scene.add(shadowCatcher);
+
+    // materials (kept in a list so the whole arm can be dimmed pre-calibration)
+    const dimmable = [];
+    function mat(color, opts = {}) {
+      const m = new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.15, transparent: true, ...opts });
+      dimmable.push(m);
+      return m;
+    }
+    function setArmDim(dim) {
+      for (const m of dimmable) m.opacity = dim ? 0.3 : 1;
+    }
+
+    // torso + head context (not dimmable)
+    const torsoMat = new THREE.MeshStandardMaterial({ color: 0x1c2430, roughness: 0.8, metalness: 0.05 });
+    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.36, 8, 24), torsoMat);
+    torso.position.set(0, 0.08, 0);
+    torso.castShadow = true;
+    scene.add(torso);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.1, 24, 16), torsoMat);
+    head.position.set(0, 0.48, 0);
+    head.castShadow = true;
+    scene.add(head);
+
+    // --- articulated arm ----------------------------------------------------
+    // Hierarchy: shoulderPivot -> upperGroup (IMU) -> elbowPivot -> elbowGroup
+    // (relative IMU, clamped) -> forearm + hand. Rest pose = hanging straight
+    // down, which is the calibration reference pose.
+    let armRoot = null;
+    let upperGroup, elbowGroup;
+    let handMarker = null;
+    const handPrev = new THREE.Vector3(NaN, NaN, NaN);
+    const handVel = new THREE.Vector3();
+    let side = +1;    // +1 right, -1 left
+
+    function capsuleY(radius, length, material) {
+      // capsule along -Y from origin (joint at origin)
+      const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(radius, length, 6, 16), material);
+      mesh.position.y = -length / 2;
+      mesh.castShadow = true;
+      return mesh;
+    }
+
+    function buildHand(handSide, material) {
+      const hand = new THREE.Group();
+      const palm = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.085, 0.075), material);
+      palm.position.y = -0.045;
+      palm.castShadow = true;
+      hand.add(palm);
+      // four fingers, slightly splayed
+      for (let i = 0; i < 4; i++) {
+        const f = new THREE.Mesh(new THREE.CapsuleGeometry(0.008, 0.06, 4, 8), material);
+        f.position.set(0, -0.115, -0.028 + i * 0.019);
+        f.rotation.x = (i - 1.5) * 0.05;
+        f.castShadow = true;
+        hand.add(f);
+      }
+      // thumb on the inner side (toward the torso)
+      const thumb = new THREE.Mesh(new THREE.CapsuleGeometry(0.009, 0.045, 4, 8), material);
+      thumb.position.set(-handSide * 0.02, -0.06, 0.045);
+      thumb.rotation.set(-0.7, 0, handSide * 0.5);
+      thumb.castShadow = true;
+      hand.add(thumb);
+      return hand;
+    }
+
+    function buildArm(armSide) {
+      if (armRoot) {
+        scene.remove(armRoot);
+        armRoot.traverse((o) => o.geometry?.dispose());
+        dimmable.length = 0;
+      }
+      const upperMat = mat(0x8b98a8);
+      const foreMat = mat(0xe6edf3);
+      const jointMat = mat(0x2dd4bf, { roughness: 0.35 });
+
+      armRoot = new THREE.Group();
+      armRoot.position.set(armSide * 0.22, 0.30, 0);   // shoulder
+      scene.add(armRoot);
+
+      const shoulderBall = new THREE.Mesh(new THREE.SphereGeometry(0.045, 20, 14), jointMat);
+      shoulderBall.castShadow = true;
+      armRoot.add(shoulderBall);
+
+      upperGroup = new THREE.Group();
+      armRoot.add(upperGroup);
+      upperGroup.add(capsuleY(0.038, L_UPPER - 0.06, upperMat));
+      // IMU puck on the upper arm (visual nod to the hardware)
+      const puckU = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.045, 0.015), jointMat);
+      puckU.position.set(armSide * 0.035, -L_UPPER * 0.45, 0.02);
+      puckU.castShadow = true;
+      upperGroup.add(puckU);
+
+      const elbowPivot = new THREE.Group();
+      elbowPivot.position.y = -L_UPPER;
+      upperGroup.add(elbowPivot);
+      const elbowBall = new THREE.Mesh(new THREE.SphereGeometry(0.038, 20, 14), jointMat);
+      elbowBall.castShadow = true;
+      elbowPivot.add(elbowBall);
+
+      elbowGroup = new THREE.Group();
+      elbowPivot.add(elbowGroup);
+      elbowGroup.add(capsuleY(0.032, L_FOREARM - 0.05, foreMat));
+      const puckW = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.04, 0.014), jointMat);
+      puckW.position.set(armSide * 0.03, -L_FOREARM * 0.85, 0.018);
+      puckW.castShadow = true;
+      elbowGroup.add(puckW);
+
+      const hand = buildHand(armSide, foreMat);
+      hand.position.y = -L_FOREARM;
+      elbowGroup.add(hand);
+
+      // invisible marker at the palm centre — tracked for piñata collisions
+      handMarker = new THREE.Object3D();
+      handMarker.position.set(0, -0.09, 0);
+      hand.add(handMarker);
+      handPrev.set(NaN, NaN, NaN);   // reset velocity tracking after rebuild
+
+      setArmDim(!live);
+      controls.target.set(armSide * 0.15, -0.05, 0);
+    }
+
+    // --- left/right toggle --------------------------------------------------
+    const leftBtn = document.getElementById('leftBtn');
+    const rightBtn = document.getElementById('rightBtn');
+    const SIDE_KEY = 'armDemo.side';
+    function setSide(s) {
+      side = s;
+      leftBtn.classList.toggle('active', s === -1);
+      rightBtn.classList.toggle('active', s === +1);
+      localStorage.setItem(SIDE_KEY, s);
+      buildArm(s);
+    }
+    leftBtn.addEventListener('click', () => setSide(-1));
+    rightBtn.addEventListener('click', () => setSide(+1));
+    setSide(Number(localStorage.getItem(SIDE_KEY)) === -1 ? -1 : +1);
+
+    // --- piñata (cannon-es rigid-body physics) -------------------------------
+    // Anchor -> 3-link rope chain (distance constraints, so the rope bends and
+    // jiggles) -> piñata rigid body. The hand is a kinematic sphere driven by
+    // the IMU pose carrying real velocity, so punches transfer genuine
+    // momentum. After enough solid hits the rope snaps: the piñata tumbles to
+    // the floor, bounces, can still be batted around, then respawns.
+    const PINATA = {
+      pivot: new THREE.Vector3(0, 0.85, 0.40),   // rope anchor
+      ropeLen: 0.62,
+      radius: 0.11,
+      hitCooldown: 0.25,  // s between registered hits
+      breakHits: 8,
+      palette: [0xf59e0b, 0x2dd4bf, 0xe879f9, 0x60a5fa, 0x34d399, 0xf87171],
+    };
+    const pin = {
+      hits: 0, lastHit: 0,
+      broken: false, respawnT: 0,
+      spawnT: 1,   // 0->1 scale-in on respawn
+      squash: 0,
+    };
+
+    function buildPinata() {
+      const g = new THREE.Group();
+      const core = new THREE.Mesh(
+        new THREE.IcosahedronGeometry(PINATA.radius, 1),
+        new THREE.MeshStandardMaterial({ color: 0xe879f9, flatShading: true, roughness: 0.7 }),
+      );
+      core.castShadow = true;
+      g.add(core);
+      // star cones on the six axes
+      const dirs = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]];
+      const up = new THREE.Vector3(0, 1, 0);
+      dirs.forEach((d, i) => {
+        const cone = new THREE.Mesh(
+          new THREE.ConeGeometry(0.045, 0.12, 8),
+          new THREE.MeshStandardMaterial({ color: PINATA.palette[i % PINATA.palette.length], flatShading: true, roughness: 0.7 }),
+        );
+        const dir = new THREE.Vector3(...d);
+        cone.position.copy(dir).multiplyScalar(PINATA.radius + 0.05);
+        cone.quaternion.setFromUnitVectors(up, dir);
+        cone.castShadow = true;
+        g.add(cone);
+      });
+      return g;
+    }
+    const pinataMesh = buildPinata();
+    scene.add(pinataMesh);
+
+    const N_LINKS = 3;
+    const ROPE_POINTS = N_LINKS + 2;   // anchor + links + attachment point
+    const ropeGeo = new THREE.BufferGeometry();
+    ropeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ROPE_POINTS * 3), 3));
+    const rope = new THREE.Line(ropeGeo, new THREE.LineBasicMaterial({ color: 0x8b98a8 }));
+    scene.add(rope);
+
+    // physics world
+    const phys = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+    phys.solver.iterations = 40;
+    phys.solver.tolerance = 1e-4;
+    phys.defaultContactMaterial.restitution = 0.35;
+    phys.defaultContactMaterial.friction = 0.3;
+
+    const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane() });
+    groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+    groundBody.position.y = -0.849;
+    phys.addBody(groundBody);
+
+    const anchor = new CANNON.Body({ type: CANNON.Body.STATIC });
+    anchor.position.set(PINATA.pivot.x, PINATA.pivot.y, PINATA.pivot.z);
+    phys.addBody(anchor);
+
+    const attachLen = PINATA.radius + 0.02;
+    const segLen = (PINATA.ropeLen - attachLen) / N_LINKS;
+    const links = [];
+    for (let i = 0; i < N_LINKS; i++) {
+      const b = new CANNON.Body({ mass: 0.05, shape: new CANNON.Sphere(0.012), linearDamping: 0.25 });
+      b.position.set(PINATA.pivot.x, PINATA.pivot.y - segLen * (i + 1), PINATA.pivot.z);
+      phys.addBody(b);
+      links.push(b);
+    }
+
+    const restPos = new CANNON.Vec3(PINATA.pivot.x, PINATA.pivot.y - PINATA.ropeLen, PINATA.pivot.z);
+    const pinataBody = new CANNON.Body({
+      mass: 0.8,
+      shape: new CANNON.Sphere(PINATA.radius + 0.03),
+      linearDamping: 0.06,
+      angularDamping: 0.25,
+    });
+    pinataBody.position.copy(restPos);
+    phys.addBody(pinataBody);
+
+    phys.addConstraint(new CANNON.DistanceConstraint(anchor, links[0], segLen));
+    for (let i = 0; i < N_LINKS - 1; i++) {
+      phys.addConstraint(new CANNON.DistanceConstraint(links[i], links[i + 1], segLen));
+    }
+    const tieConstraint = new CANNON.DistanceConstraint(links[N_LINKS - 1], pinataBody, attachLen);
+    phys.addConstraint(tieConstraint);
+    // stiffen the rope: default SPOOK regularization lets distance constraints
+    // stretch ~7cm under the piñata's weight; this brings it to ~2cm
+    for (const c of phys.constraints) {
+      c.equations.forEach((eq) => eq.setSpookParams(1e9, 3, 1 / 120));
+    }
+
+    const handBody = new CANNON.Body({ type: CANNON.Body.KINEMATIC, shape: new CANNON.Sphere(0.075) });
+    handBody.position.set(0, -10, 0);   // parked until the arm reports a pose
+    phys.addBody(handBody);
+
+    pinataBody.addEventListener('collide', (e) => {
+      if (e.body !== handBody || pin.broken) return;
+      const now = performance.now() / 1000;
+      if (now - pin.lastHit < PINATA.hitCooldown) return;
+      const impact = Math.abs(e.contact.getImpactVelocityAlongNormal());
+      if (impact < 0.35) return;
+      pin.lastHit = now;
+      pin.squash = 1;
+      pin.hits++;
+      hitValEl.textContent = pin.hits;
+      const at = new THREE.Vector3().copy(pinataBody.position);
+      confetti(at, 60 + Math.min(90, impact * 35), 1 + impact * 0.35);
+      if (pin.hits >= PINATA.breakHits) breakPinata(at);
+    });
+
+    function breakPinata(at) {
+      confetti(at, 350, 2.6);
+      pin.broken = true;
+      pin.respawnT = 3.5;
+      pin.hits = 0;
+      hitValEl.textContent = '0';
+      phys.removeConstraint(tieConstraint);   // rope snaps; the piñata tumbles
+      pinataBody.angularVelocity.set(
+        (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10);
+      promptEl.style.transition = 'none';
+      promptEl.style.opacity = '1';
+      promptEl.textContent = '🎉 piñata down!';
+      promptEl.className = 'overlay live';
+      setTimeout(() => {
+        promptEl.style.transition = 'opacity 1s';
+        promptEl.style.opacity = '0';
+      }, 2200);
+    }
+
+    function respawnPinata() {
+      pin.broken = false;
+      pin.spawnT = 0;
+      pinataBody.position.copy(restPos);
+      pinataBody.velocity.setZero();
+      pinataBody.angularVelocity.setZero();
+      pinataBody.quaternion.set(0, 0, 0, 1);
+      links.forEach((b, i) => {
+        b.position.set(PINATA.pivot.x, PINATA.pivot.y - segLen * (i + 1), PINATA.pivot.z);
+        b.velocity.setZero();
+      });
+      phys.addConstraint(tieConstraint);
+    }
+
+    // --- confetti --------------------------------------------------------------
+    const bursts = [];
+    function confetti(pos, n = 100, speed = 1.6) {
+      n = Math.floor(n);   // fractional n overruns the typed arrays
+      const positions = new Float32Array(n * 3);
+      const colors = new Float32Array(n * 3);
+      const vels = [];
+      const c = new THREE.Color();
+      for (let i = 0; i < n; i++) {
+        positions.set([pos.x, pos.y, pos.z], i * 3);
+        c.set(PINATA.palette[(Math.random() * PINATA.palette.length) | 0]);
+        colors.set([c.r, c.g, c.b], i * 3);
+        const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
+        const s = speed * (0.4 + Math.random() * 0.8);
+        vels.push(new THREE.Vector3(
+          s * Math.sin(ph) * Math.cos(th), s * Math.cos(ph) * 0.8 + 0.6, s * Math.sin(ph) * Math.sin(th)));
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+      const mat = new THREE.PointsMaterial({ size: 0.018, vertexColors: true, transparent: true, opacity: 1 });
+      const points = new THREE.Points(geo, mat);
+      scene.add(points);
+      bursts.push({ points, vels, t: 0, life: 1.3 });
+    }
+    function updateConfetti(dt) {
+      for (let i = bursts.length - 1; i >= 0; i--) {
+        const b = bursts[i];
+        b.t += dt;
+        const pos = b.points.geometry.attributes.position;
+        for (let j = 0; j < b.vels.length; j++) {
+          const v = b.vels[j];
+          v.y -= 3.2 * dt;
+          pos.array[j * 3] += v.x * dt;
+          pos.array[j * 3 + 1] += v.y * dt;
+          pos.array[j * 3 + 2] += v.z * dt;
+        }
+        pos.needsUpdate = true;
+        b.points.material.opacity = Math.max(0, 1 - b.t / b.life);
+        if (b.t >= b.life) {
+          scene.remove(b.points);
+          b.points.geometry.dispose();
+          b.points.material.dispose();
+          bursts.splice(i, 1);
+        }
+      }
+    }
+
+    const hitValEl = document.getElementById('hitVal');
+    const tmpV = new THREE.Vector3();
+    const windF = new CANNON.Vec3();
+
+    function updateHand(dt) {
+      if (!handMarker || dt <= 0) return;
+      handMarker.getWorldPosition(tmpV);
+      if (Number.isFinite(handPrev.x)) {
+        handVel.copy(tmpV).sub(handPrev).divideScalar(dt);
+        // teleports (arm rebuild, re-reference snap) must not read as punches
+        if (handVel.length() > 6) handVel.set(0, 0, 0);
+      } else {
+        handVel.set(0, 0, 0);
+      }
+      handPrev.copy(tmpV);
+    }
+
+    function stepPhysics(dt) {
+      // drive the kinematic hand collider from the IMU pose
+      if (Number.isFinite(handPrev.x)) {
+        handBody.position.set(handPrev.x, handPrev.y, handPrev.z);
+        handBody.velocity.set(handVel.x, handVel.y, handVel.z);
+      }
+
+      // a whisper of draught so the piñata never looks frozen
+      if (!pin.broken) {
+        const t = performance.now() / 1000;
+        windF.set(0.02 * Math.sin(t * 0.7), 0, 0.02 * Math.cos(t * 0.53));
+        pinataBody.applyForce(windF, pinataBody.position);
+      }
+
+      phys.step(1 / 120, dt, 5);
+
+      if (pin.broken) {
+        pin.respawnT -= dt;
+        if (pin.respawnT <= 0) respawnPinata();
+      }
+
+      // sync visuals: engine pose + squash pulse + respawn scale-in
+      pin.spawnT = Math.min(1, pin.spawnT + dt * 2.5);
+      pin.squash = Math.max(0, pin.squash - dt * 4);
+      const squish = 1 - 0.18 * Math.sin(pin.squash * Math.PI);
+      const s = 0.01 + 0.99 * pin.spawnT * pin.spawnT * (3 - 2 * pin.spawnT);
+      pinataMesh.scale.set(s * (1.5 - 0.5 * squish), s * squish, s * (1.5 - 0.5 * squish));
+      pinataMesh.position.copy(pinataBody.position);
+      pinataMesh.quaternion.copy(pinataBody.quaternion);
+
+      // rope polyline: anchor -> links -> attachment on the piñata
+      rope.visible = !pin.broken;
+      if (rope.visible) {
+        const rp = rope.geometry.attributes.position;
+        rp.setXYZ(0, anchor.position.x, anchor.position.y, anchor.position.z);
+        links.forEach((b, i) => rp.setXYZ(i + 1, b.position.x, b.position.y, b.position.z));
+        const last = links[N_LINKS - 1].position;
+        tmpV.set(last.x, last.y, last.z).sub(pinataMesh.position).normalize()
+            .multiplyScalar(attachLen * 0.85).add(pinataMesh.position);
+        rp.setXYZ(ROPE_POINTS - 1, tmpV.x, tmpV.y, tmpV.z);
+        rp.needsUpdate = true;
+      }
+    }
+
+    // --- orientation plumbing ----------------------------------------------
+    // Madgwick earth frame is Z-up; three.js world is Y-up. F maps between them.
+    const F = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+    const Finv = F.clone().invert();
+    const tmpQ = new THREE.Quaternion();
+
+    function worldDelta(imu, out) {
+      const d = imu.deltaQ;
+      tmpQ.set(d.x, d.y, d.z, d.w);
+      return out.copy(F).multiply(tmpQ).multiply(Finv);
+    }
+
+    // biological elbow limits (deg), applied to the relative rotation
+    const LIM = {
+      flexMin: -150, flexMax: 5,     // rotation about local X (negative = forward flexion)
+      twistMin: -90, twistMax: 90,   // pronation / supination about local Y
+      devMin: -8, devMax: 8,         // varus/valgus play about local Z
+    };
+    const limitsChk = document.getElementById('limitsChk');
+    const clampDeg = (v, lo, hi) => Math.min(Math.max(v, lo * Math.PI / 180), hi * Math.PI / 180);
+
+    const qUpperTarget = new THREE.Quaternion();
+    const qWristWorld = new THREE.Quaternion();
+    const qElbowTarget = new THREE.Quaternion();
+    const eElbow = new THREE.Euler(0, 0, 0, 'XYZ');
+    const flexValEl = document.getElementById('flexVal');
+    const twistValEl = document.getElementById('twistVal');
+
+    function updatePose() {
+      if (!live) return;
+      worldDelta(imuUpper, qUpperTarget);
+      worldDelta(imuWrist, qWristWorld);
+
+      // elbow = wrist orientation expressed in the upper arm's frame
+      qElbowTarget.copy(qUpperTarget).invert().multiply(qWristWorld);
+      eElbow.setFromQuaternion(qElbowTarget, 'XYZ');
+      if (limitsChk.checked) {
+        eElbow.x = clampDeg(eElbow.x * 180 / Math.PI, LIM.flexMin, LIM.flexMax);
+        eElbow.y = clampDeg(eElbow.y * 180 / Math.PI, LIM.twistMin, LIM.twistMax);
+        eElbow.z = clampDeg(eElbow.z * 180 / Math.PI, LIM.devMin, LIM.devMax);
+        qElbowTarget.setFromEuler(eElbow);
+      }
+
+      // smooth toward targets (fusion is already smooth; this hides BLE burstiness)
+      upperGroup.quaternion.slerp(qUpperTarget, 0.35);
+      elbowGroup.quaternion.slerp(qElbowTarget, 0.35);
+
+      flexValEl.textContent = Math.round(-eElbow.x * 180 / Math.PI);
+      twistValEl.textContent = Math.round(eElbow.y * 180 / Math.PI);
+    }
+
+    // --- render loop ---------------------------------------------------------
+    function resize() {
+      const w = innerWidth, h = innerHeight;
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    addEventListener('resize', resize);
+    resize();
+
+    const clock = new THREE.Clock();
+    function frame() {
+      const dt = Math.min(clock.getDelta(), 0.05);
+      updatePose();
+      updateHand(dt);
+      stepPhysics(dt);
+      updateConfetti(dt);
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    addEventListener('beforeunload', () => {
+      upper.client.disconnect?.();
+      wrist.client.disconnect?.();
+    });
+  </script>
+</body>
+</html>

@@ -1,5 +1,8 @@
 # Knee Angle — Dual-IMU Physio Demo
 
+> This folder contains **two demos**: `index.html` (knee angle, 2D) and
+> `hands.html` (arm & hand, 3D — see [below](#arm--hand-3d-demo-handshtml)).
+
 A Web Bluetooth demo that estimates **knee flexion/extension angle** in real time
 from two Shimmer3R sensors (one above, one below the knee), and coaches the user
 through repetitions against a target range.
@@ -43,3 +46,32 @@ to `g` / `deg/s` **and rotated into the device frame**, then fused per segment.
 The **knee angle** is the difference between the two fused segment angles, minus a
 zeroing offset captured at the straight-leg pose — so absolute sensor alignment is
 not required.
+
+---
+
+## Arm & Hand 3D demo (`hands.html`)
+
+A 3D visualization of an arm and hand driven by two IMUs — one on the **upper
+arm**, one on the **wrist** — with full quaternion sensor fusion.
+
+| File | Responsibility |
+|------|----------------|
+| `fusion3d.js` | **Madgwick 6-DOF AHRS** (gradient-descent quaternion filter) + `ArmImu` (calibration, gyro-bias capture, reference pose, earth-frame delta). Pure module, no DOM/BLE; reuses `kinematics.js` for raw→device-frame calibration. |
+| `hands.html` | three.js scene (articulated torso/arm/hand, orbit camera, lighting/shadows) + Web Bluetooth wiring + calibration UI. |
+
+### Use
+1. Strap one sensor to the upper arm, one to the wrist. **Connect** both.
+2. Stand with the arm relaxed at your side, press **Set reference** and hold
+   still ~1.25 s — this captures gyro bias and the reference pose.
+3. Move: the 3D arm follows in real time. Orbit with the mouse.
+
+### Features
+- **Madgwick fusion** per IMU: smooth drift-corrected 3D orientation from
+  accel + gyro alone (high beta during settling, low beta while tracking).
+- **Left/right arm toggle** (remembered per browser).
+- **Biological elbow limits** (toggleable, off by default): flexion 0–150°,
+  pronation/supination ±90°, varus/valgus ±8° — applied to the relative
+  wrist-vs-upper-arm rotation.
+- Elbow flexion + forearm rotation HUD.
+- **Re-set reference** anytime: without a magnetometer, yaw (rotation about
+  gravity) is unobservable and drifts slowly; re-capturing the reference heals it.
