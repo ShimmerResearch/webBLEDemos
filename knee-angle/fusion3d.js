@@ -131,6 +131,8 @@ export class ArmImu {
     this.bias = { x: 0, y: 0, z: 0 };   // gyro bias, deg/s (device frame)
     this.qRef = null;                   // filter.q captured at the reference pose
     this._cal = null;
+    this._swing = null;
+    this._swingCalibrated = false;      // a functional (swing) yaw datum exists
     this.onCalibrated = null;
     this.accel = null;                  // last device-frame accel (g)
     this.gyro = null;                   // last device-frame gyro (deg/s), pre-bias
@@ -155,6 +157,42 @@ export class ArmImu {
   cancelCalibration() { this._cal = null; this._swing = null; }
 
   /**
+   * Clear all calibration state so the next run behaves exactly like the
+   * first one. The filter quaternion is deliberately KEPT (a converged
+   * attitude is the one thing that benefits from history); callers should
+   * also raise beta during the hold-still phase to scrub accumulated tilt
+   * error, mirroring first-run conditions.
+   */
+  resetCalibration() {
+    this.qRef = null;
+    this.qYawFix = undefined;
+    this._swingCalibrated = false;
+    this._cal = null;
+    this._swing = null;
+  }
+
+  /** Snapshot calibration state, for rollback when a re-calibration fails. */
+  snapshotCalibration() {
+    return {
+      bias: { ...this.bias },
+      qRef: this.qRef ? { ...this.qRef } : null,
+      qYawFix: this.qYawFix ? { ...this.qYawFix } : undefined,
+      swingCalibrated: this._swingCalibrated,
+      beta: this.filter.beta,
+    };
+  }
+
+  restoreCalibration(s) {
+    this.bias = { ...s.bias };
+    this.qRef = s.qRef ? { ...s.qRef } : null;
+    this.qYawFix = s.qYawFix ? { ...s.qYawFix } : undefined;
+    this._swingCalibrated = s.swingCalibrated;
+    this.filter.beta = s.beta;
+    this._cal = null;
+    this._swing = null;
+  }
+
+  /**
    * Functional calibration, phase 2: while the user swings the straight arm
    * about one physical axis (e.g. forward/back at the shoulder), collect the
    * rotation axis in THIS filter's earth frame. Both sensors move rigidly
@@ -162,7 +200,14 @@ export class ArmImu {
    * the yaw offset between the frames — mounting differences included.
    */
   startSwingCapture() {
-    this._swing = { sum: { x: 0, y: 0, z: 0 }, count: 0 };
+    // The segment's long axis in the body frame = whatever pointed down
+    // (earth -Z) at the reference pose. Its horizontal tilt during the swing
+    // reveals the dominant swing direction (= forward: shoulder/hip flexion
+    // range far exceeds extension), which fixes the axis sign robustly.
+    const down = this.qRef
+      ? qRotate(qConj(this.qRef), { x: 0, y: 0, z: -1 })
+      : { x: 0, y: 0, z: -1 };
+    this._swing = { sum: { x: 0, y: 0, z: 0 }, count: 0, down, hx: 0, hy: 0, hn: 0 };
   }
 
   get swingCount() { return this._swing ? this._swing.count : 0; }
@@ -177,8 +222,19 @@ export class ArmImu {
     this._swing = null;
     if (!s || s.count < minSamples) return null;
     const n = Math.hypot(s.sum.x, s.sum.y, s.sum.z) || 1;
-    const axis = { x: s.sum.x / n, y: s.sum.y / n, z: s.sum.z / n };
+    let axis = { x: s.sum.x / n, y: s.sum.y / n, z: s.sum.z / n };
     if (Math.hypot(axis.x, axis.y) < 0.4) return null;   // near-vertical: no heading info
+    // Fix the axis sign from the DOMINANT horizontal tilt direction: people
+    // swing far further forward than backward, so the mean tilt points
+    // forward. This makes the convention immune to a backswing wind-up, which
+    // would flip a naive "first sample defines forward" seed by 180deg.
+    const hx = s.hx / (s.hn || 1), hy = s.hy / (s.hn || 1);
+    if (Math.hypot(hx, hy) > 0.08) {
+      // for rotation about `axis`, the long axis tilts along axis x down = (-ay, ax, 0)
+      if ((-axis.y) * hx + axis.x * hy < 0) {
+        axis = { x: -axis.x, y: -axis.y, z: -axis.z };
+      }
+    }
     return axis;
   }
 
@@ -191,6 +247,7 @@ export class ArmImu {
   setYawFix(axis, targetYawRad = Math.PI) {
     const yaw = Math.atan2(axis.y, axis.x);
     this.qYawFix = qFromAxisAngle(0, 0, 1, targetYawRad - yaw);
+    this._swingCalibrated = true;
   }
 
   /** Feed one sample of raw sensor counts. */
@@ -216,12 +273,15 @@ export class ArmImu {
     }
 
     if (this._swing) {
+      const s = this._swing;
+      // horizontal tilt of the segment's long axis: forward-direction evidence
+      const dE = qRotate(this.filter.q, s.down);
+      s.hx += dE.x; s.hy += dE.y; s.hn++;
       const gb = { x: gyro.x - this.bias.x, y: gyro.y - this.bias.y, z: gyro.z - this.bias.z };
       if (Math.hypot(gb.x, gb.y, gb.z) > 40) {   // deg/s: only count real swinging
         const ge = qRotate(this.filter.q, gb);   // rotation axis in this earth frame
-        const s = this._swing;
         const dot = ge.x * s.sum.x + ge.y * s.sum.y + ge.z * s.sum.z;
-        const sign = (s.count === 0 || dot >= 0) ? 1 : -1;   // sign seeded by first swing
+        const sign = (s.count === 0 || dot >= 0) ? 1 : -1;   // provisional seed
         s.sum.x += sign * ge.x; s.sum.y += sign * ge.y; s.sum.z += sign * ge.z;
         s.count++;
       }
@@ -246,6 +306,11 @@ export class ArmImu {
    * heading calibration.
    */
   _computeYawFix() {
+    // Once a swing-based (functional) datum exists, never downgrade it: the
+    // yaw alignment is a property of the filter's earth frame, which persists
+    // across reference re-captures — a re-calibration whose swing phase fails
+    // must keep the previous good alignment.
+    if (this._swingCalibrated) return;
     const xe = qRotate(this.qRef, { x: 1, y: 0, z: 0 });
     const ze = qRotate(this.qRef, { x: 0, y: 0, z: 1 });
     const use = Math.hypot(xe.x, xe.y) >= 0.2 ? xe : ze;

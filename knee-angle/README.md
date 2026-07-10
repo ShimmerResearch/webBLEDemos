@@ -51,8 +51,10 @@ not required.
 
 ## Arm & Hand 3D demo (`hands.html`)
 
-A 3D visualization of an arm and hand driven by two IMUs — one on the **upper
-arm**, one on the **wrist** — with full quaternion sensor fusion.
+A 3D full-body mannequin (both arms + both legs) where **two IMUs drive
+whichever limb you select** — proximal sensor on the upper arm / thigh, distal
+on the wrist / ankle — with full quaternion sensor fusion. Sessions can be
+**recorded and played back** on the mannequin.
 
 | File | Responsibility |
 |------|----------------|
@@ -79,7 +81,10 @@ slow yaw drift.
 ### Features
 - **Madgwick fusion** per IMU: smooth drift-corrected 3D orientation from
   accel + gyro alone (high beta during settling, low beta while tracking).
-- **Left/right arm toggle** (remembered per browser).
+- **Active-limb selector** — left/right arm or left/right leg (remembered per
+  browser); sensor labels, joint limits, HUD wording, and piñata height adapt.
+- **Record / playback** — capture a live session (world-orientation keyframes
+  per frame) and replay it on the mannequin through the same pose pipeline.
 - **Biological elbow limits** (toggleable, off by default): flexion 0–150°,
   pronation/supination ±90°, varus/valgus ±8° — applied to the relative
   wrist-vs-upper-arm rotation.
