@@ -57,6 +57,7 @@ const minimizedTimeText = $("minimizedTimeText"), minStopBtn = $("minStopBtn");
 const capPeriodic = $("capPeriodic"), capInterval = $("capInterval"), capClick = $("capClick");
 const capSettled = $("capSettled"), settledRow = $("settledRow");
 const capClickDelay = $("capClickDelay"), capClickDelayVal = $("capClickDelayVal");
+const restEnable = $("restEnable"), restDelay = $("restDelay");
 
 const tabLive = $("tabLive"), tabShots = $("tabShots");
 const shotCount = $("shotCount"), shotsGrid = $("shotsGrid"), shotsEmpty = $("shotsEmpty");
@@ -477,8 +478,11 @@ chrome.runtime.onMessage.addListener((message) => {
     videoTimeLabel.style.color = "var(--brand)";
     currentVideoTime = message.time;
     videoTimeLabel.textContent = videoTimeStr(2) || "—";
-    minimizedTimeText.textContent = videoTimeStr(2) ? videoTimeStr(2) + "s" : "—";
     recTime.textContent = videoTimeStr(2) ? videoTimeStr(2) + "s" : "—";
+    // While resting, the countdown owns the minimized time slot.
+    if (restRemaining === null) {
+      minimizedTimeText.textContent = videoTimeStr(2) ? videoTimeStr(2) + "s" : "—";
+    }
   }
 
   const titleEl = $("videoTitleLabel");
@@ -511,6 +515,8 @@ function cancelPendingSettle() {
   pendingSettle = null;
   shotCount.classList.remove('pending');
 }
+restEnable.onchange = () => { restDelay.disabled = !restEnable.checked; };
+restDelay.disabled = !restEnable.checked;
 capClick.onchange = () => { if (!capClick.checked) cancelPendingSettle(); updateSettleUI(); };
 capSettled.onchange = () => { if (!capSettled.checked) cancelPendingSettle(); updateSettleUI(); };
 
@@ -602,6 +608,40 @@ async function startStreaming() {
   isStreaming = true;
 }
 
+// ===== Resting baseline (record a baseline, then auto-play the video) =====
+// Logging starts the moment recording begins so the resting period lands in the
+// same CSV; the video is only triggered once the delay elapses.
+let restTimer = null;
+let restRemaining = null; // seconds left while resting; null when not resting
+
+function showRest(remaining) {
+  streamBtnText.textContent = `Resting… ${remaining}s`;
+  minimizedTimeText.textContent = `${remaining}s`;
+}
+
+function cancelRest() {
+  if (restTimer) { clearInterval(restTimer); restTimer = null; }
+  restRemaining = null;
+}
+
+function startRest() {
+  cancelRest();
+  const secs = Math.round(parseFloat(restDelay.value));
+  if (!restEnable.checked || isNaN(secs) || secs <= 0) return; // play manually
+  restRemaining = secs;
+  showRest(restRemaining);
+  restTimer = setInterval(() => {
+    restRemaining -= 1;
+    if (restRemaining > 0) {
+      showRest(restRemaining);
+      return;
+    }
+    cancelRest();
+    streamBtnText.textContent = "Stop Recording";
+    window.parent.postMessage({ type: 'PLAY_VIDEO' }, '*');
+  }, 1000);
+}
+
 // ===== Recording (logging to CSV/timeline/screenshots) =====
 function startRecording() {
   isRecording = true;
@@ -609,10 +649,12 @@ function startRecording() {
   streamBtnText.textContent = "Stop Recording";
   setConn('online', 'Recording');
   manageInterval();
+  startRest();
 }
 
 function stopRecording() {
   isRecording = false;
+  cancelRest(); // don't auto-play after the session ended
   cancelPendingSettle(); // don't fire a deferred shot after the session ended
   captureQueue.length = 0;
   body.classList.remove('is-recording');

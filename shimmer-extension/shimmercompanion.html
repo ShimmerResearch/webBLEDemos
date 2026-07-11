@@ -575,6 +575,24 @@
         </div>
       </div>
 
+      <!-- RESTING BASELINE -->
+      <div>
+        <div class="section-title">Resting Baseline</div>
+        <div class="card">
+          <div class="setting-row">
+            <div style="flex:1; min-width:0;">
+              <div class="setting-label">Auto-play after rest</div>
+              <div class="setting-desc">Record a resting baseline, then start the video</div>
+              <div class="delay-row">
+                <input type="number" id="restDelay" class="num-input" value="120" min="0" title="Seconds of resting baseline to record before the video is played" />
+                <span class="delay-val">seconds</span>
+              </div>
+            </div>
+            <label class="toggle"><input type="checkbox" id="restEnable" checked /><span class="toggle-track"></span></label>
+          </div>
+        </div>
+      </div>
+
       <!-- RECORD -->
       <button class="btn-main" id="streamBtn" disabled>
         <div class="record-indicator"></div>

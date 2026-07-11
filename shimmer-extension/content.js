@@ -212,6 +212,20 @@ window.addEventListener('message', (event) => {
     case 'RESIZE_START':
       startInteraction('resize', d.edges);
       break;
+    case 'PLAY_VIDEO': {
+      // Fired by the companion once the resting-baseline delay elapses.
+      const video = document.querySelector('video');
+      if (video && video.paused) {
+        video.play().catch(() => {
+          // Autoplay policy may block a programmatic play after the activation
+          // gesture has expired; fall back to clicking the player's play button.
+          document.querySelector(
+            '.ytp-play-button, button[data-uia="control-play-pause-play"], button[title="Play"], button[aria-label="Play"]'
+          )?.click();
+        });
+      }
+      break;
+    }
   }
 });
 
