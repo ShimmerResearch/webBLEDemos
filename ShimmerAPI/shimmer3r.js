@@ -3,7 +3,7 @@
 // Your note: "timestamp is u24, so layout is: 0x00  [u24 timestamp]  <channel samples...>"
 // This build defaults to u24, and you can also pass { timestampFmt: 'u24' } in the constructor.
 
-const OPCODES = { DATA: 0x00, INQUIRY_CMD: 0x01, INQUIRY_RSP: 0x02, START_STREAM: 0x07, STOP_STREAM: 0x20, ACK: 0xFF, SAMPLING_RATE: 0x05, SET_SENSORS_CMD: 0x08, SET_GSR_RANGE: 0x21, SET_INTERNAL_EXP_POWER_ENABLE_CMD: 0x5E, START_BT_STEAM_SD_Logging: 0x70, STOP_BT_STEAM_SD_Logging: 0x97};
+const OPCODES = { DATA: 0x00, INQUIRY_CMD: 0x01, INQUIRY_RSP: 0x02, START_STREAM: 0x07, STOP_STREAM: 0x20, ACK: 0xFF, SAMPLING_RATE: 0x05, SET_SENSORS_CMD: 0x08, SET_GSR_RANGE: 0x21, SET_GYRO_RANGE: 0x49, SET_INTERNAL_EXP_POWER_ENABLE_CMD: 0x5E, START_BT_STEAM_SD_Logging: 0x70, STOP_BT_STEAM_SD_Logging: 0x97};
 
 const DEFAULTS = {
   SERVICE_UUID: '65333333-a115-11e2-9e9a-0800200ca100',
@@ -290,6 +290,39 @@ export class Shimmer3RClient {
 	this.gsrRangeSetting = gsrRange;
     // Notify any UI or caller interested in changes
     return { gsrRange, ackRemainder };
+  }
+
+  /**
+   * Set the gyro range (SET_MPU9150_GYRO_RANGE_COMMAND, 0x49).
+   * Shimmer3R: 0 = ±125dps, 1 = ±250dps, 2 = ±500dps, 3 = ±1000dps, 4 = ±2000dps, 5 = ±4000dps.
+   * (Shimmer3 only supports 0–3: ±250/500/1000/2000dps.)
+   */
+  async setGyroRange(gyroRange) {
+    if (!Number.isInteger(gyroRange) || gyroRange < 0 || gyroRange > 5) {
+      throw new Error('gyro range must be a 0-5 value');
+    }
+    if (!this.rx) throw new Error('Not connected (RX missing)');
+
+    const cmd = new Uint8Array([
+      OPCODES.SET_GYRO_RANGE,
+      gyroRange & 0xFF,
+    ]);
+
+    this._emitStatus(
+      `SET_GYRO_RANGE → waiting for ACK…`
+    );
+
+    const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+
+    this._emitStatus(
+      `SET_GYRO_RANGE (ACK received).`
+    );
+	this.gyroRangeSetting = gyroRange;
+    return { gyroRange, ackRemainder };
+  }
+
+  getGyroRange() {
+	return this.gyroRangeSetting;
   }
 
   getInternalExpPower(){

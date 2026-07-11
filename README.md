@@ -24,6 +24,8 @@ Migration work has already started on the [`copilot/restructure-repo-for-api-sup
 
 [Spell Caster — Gyro Demo](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/)
 
+[DJ Gyro — 3D Turntable Scratch Demo](https://shimmerresearch.github.io/webBLEDemos/dj-gyro/)
+
 [Shimmer Capture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)
 
 [Shimmer3R Chrome Extension](https://github.com/ShimmerEngineering/webBLEDemos/tree/main/shimmer-extension) source code only, will require loading this locally via Chrome
