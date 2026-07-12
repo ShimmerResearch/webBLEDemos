@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-T26GWN0LJW');
+  </script>
+
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="A suite of single-file Web Bluetooth demos for Shimmer3R and Verisense sensors — motion games, physiological data capture, and developer tools that run right in the browser." />
+  <title>Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="shared/favicon.svg" />
+  <link rel="stylesheet" href="shared/shimmer-ui.css" />
+  <style>
+    /* ---- Landing-page-specific layout ---- */
+    .hero {
+      max-width: var(--maxw);
+      margin: 0 auto;
+      padding: var(--sp-6) var(--sp-4) var(--sp-5);
+    }
+    .hero .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-size: 12px; font-weight: 700; letter-spacing: .6px;
+      text-transform: uppercase; color: var(--accent-2);
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+      padding: 5px 12px; border-radius: var(--r-pill);
+    }
+    .hero h1 {
+      font-size: clamp(30px, 6vw, 52px);
+      margin: var(--sp-4) 0 var(--sp-3);
+      background: linear-gradient(120deg, var(--text), var(--accent-2));
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero .pitch { font-size: clamp(15px, 2.2vw, 19px); color: var(--text-2); max-width: 62ch; }
+    .req-note {
+      display: flex; flex-wrap: wrap; gap: var(--sp-2);
+      margin-top: var(--sp-4);
+    }
+    .req-note .req {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 13px; color: var(--text-2);
+      background: var(--surface); border: 1px solid var(--border);
+      padding: 6px 12px; border-radius: var(--r-pill);
+    }
+    .req-note .req b { color: var(--text); font-weight: 600; }
+
+    .section-head {
+      max-width: var(--maxw); margin: 0 auto;
+      padding: 0 var(--sp-4); display: flex; align-items: baseline;
+      justify-content: space-between; gap: var(--sp-3); flex-wrap: wrap;
+    }
+    .section-head h2 { margin: 0; }
+    .section-head .count { color: var(--text-3); font-size: 13px; }
+
+    .grid {
+      max-width: var(--maxw); margin: var(--sp-4) auto 0;
+      padding: 0 var(--sp-4) var(--sp-6);
+      display: grid; gap: var(--sp-4);
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    }
+
+    .demo-card {
+      display: flex; flex-direction: column;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--r-lg); padding: var(--sp-4);
+      box-shadow: var(--shadow-1);
+      transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+      position: relative; overflow: hidden;
+    }
+    .demo-card::before {
+      content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      opacity: .0; transition: opacity .18s ease;
+    }
+    .demo-card:hover {
+      border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+      transform: translateY(-3px);
+      box-shadow: var(--shadow-2);
+    }
+    .demo-card:hover::before { opacity: 1; }
+    .demo-card .kind {
+      font-size: 11px; font-weight: 700; letter-spacing: .5px;
+      text-transform: uppercase; color: var(--text-3);
+    }
+    .demo-card h3 { margin: 6px 0 4px; font-size: 18px; }
+    .demo-card p { font-size: 13.5px; color: var(--text-2); margin: 0 0 var(--sp-3); flex: 1 1 auto; }
+    .demo-card .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--sp-4); }
+    .demo-card .launch {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-weight: 600; font-size: 14px; color: var(--accent-2);
+      align-self: flex-start;
+    }
+    .demo-card:hover .launch { text-decoration: none; }
+    .demo-card .launch .arr { transition: transform .18s ease; }
+    .demo-card:hover .launch .arr { transform: translateX(3px); }
+    /* Full-card click target */
+    .demo-card .stretch { position: absolute; inset: 0; z-index: 1; }
+    .demo-card .stretch:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--r-lg); }
+
+    /* Tool demos get a subtle distinct accent tone */
+    .demo-card.is-tool .kind { color: var(--info); }
+
+    .site-foot {
+      border-top: 1px solid var(--border);
+      background: var(--bg-2);
+      padding: var(--sp-5) var(--sp-4);
+    }
+    .site-foot .inner {
+      max-width: var(--maxw); margin: 0 auto;
+      display: flex; flex-wrap: wrap; gap: var(--sp-4);
+      justify-content: space-between; align-items: flex-start;
+    }
+    .site-foot p { font-size: 13px; color: var(--text-2); max-width: 60ch; margin: 0 0 var(--sp-2); }
+    .site-foot .links { display: flex; flex-wrap: wrap; gap: var(--sp-4); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <a class="brand" href="./">
+      <span class="brand-mark"></span>
+      <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+    </a>
+    <span class="spacer"></span>
+    <a class="back-link" href="https://shimmersensing.com" target="_blank" rel="noopener">shimmersensing.com ↗</a>
+  </header>
+
+  <section class="hero">
+    <span class="eyebrow">Pre-Alpha · Web Bluetooth</span>
+    <h1>Shimmer Web BLE Demos</h1>
+    <p class="pitch">
+      Stream live sensor data from Shimmer wearables straight to your browser —
+      no app install, no drivers. A growing suite of motion games, physiological
+      dashboards, and developer tools built on Web Bluetooth.
+    </p>
+    <div class="req-note">
+      <span class="req"><b>Device:</b> Shimmer3R</span>
+      <span class="req"><b>Firmware:</b> ≥ v1.0.22</span>
+      <span class="req"><b>Browser:</b> Chrome / Edge with Web Bluetooth</span>
+    </div>
+  </section>
+
+  <div class="section-head">
+    <h2>Demos</h2>
+    <span class="count">9 experiences</span>
+  </div>
+
+  <main class="grid">
+
+    <!-- Games -->
+    <article class="demo-card" style="--accent:#66fcf1; --accent-2:#8afff3">
+      <span class="kind">Game</span>
+      <h3>Gyro Breakout</h3>
+      <p>Classic Breakout paddle steered by tilting a Shimmer around its Z-axis.</p>
+      <div class="tags"><span class="badge">GYRO</span></div>
+      <a class="launch" href="break-gyro/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Gyro Breakout"></span></a>
+    </article>
+
+    <article class="demo-card" style="--accent:#a78bfa; --accent-2:#c4b1fc">
+      <span class="kind">Game</span>
+      <h3>EMG Breakout</h3>
+      <p>Play Breakout with your muscles — flex your wrist to drive the paddle via EMG.</p>
+      <div class="tags"><span class="badge">EMG</span></div>
+      <a class="launch" href="break-emg/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch EMG Breakout"></span></a>
+    </article>
+
+    <article class="demo-card" style="--accent:#f2555a; --accent-2:#ff8080">
+      <span class="kind">Game</span>
+      <h3>Punch Force</h3>
+      <p>A punch-force reaction game powered by the high-range 200G accelerometer.</p>
+      <div class="tags"><span class="badge">200G ACCEL</span></div>
+      <a class="launch" href="punch-highG/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Punch Force"></span></a>
+    </article>
+
+    <article class="demo-card" style="--accent:#2fbf71; --accent-2:#6ee29d">
+      <span class="kind">Game</span>
+      <h3>Rhythm Game</h3>
+      <p>Hit the beat using EMG and gyro together — a two-signal rhythm challenge.</p>
+      <div class="tags"><span class="badge">EMG</span><span class="badge">GYRO</span></div>
+      <a class="launch" href="rythmgame-emggyro/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Rhythm Game"></span></a>
+    </article>
+
+    <article class="demo-card" style="--accent:#f2b134; --accent-2:#ffcd6b">
+      <span class="kind">Game</span>
+      <h3>Gyro Blocks</h3>
+      <p>Two-device falling-blocks game: one gyro moves the piece, the other rotates it.</p>
+      <div class="tags"><span class="badge">2× GYRO</span></div>
+      <a class="launch" href="brick/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Gyro Blocks"></span></a>
+    </article>
+
+    <article class="demo-card" style="--accent:#f26fd8; --accent-2:#ff9be6">
+      <span class="kind">Game</span>
+      <h3>Spell Caster</h3>
+      <p>Cast spells with gyro gestures, recognized live with dynamic time warping (DTW).</p>
+      <div class="tags"><span class="badge">GYRO</span></div>
+      <a class="launch" href="spell-gyro/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Spell Caster"></span></a>
+    </article>
+
+    <!-- Data -->
+    <article class="demo-card" style="--accent:#3fa9f5; --accent-2:#79c6ff">
+      <span class="kind">Data</span>
+      <h3>Video PPG</h3>
+      <p>Live PPG and GSR charts synced alongside video capture, built with Chart.js.</p>
+      <div class="tags"><span class="badge">PPG</span><span class="badge">GSR</span></div>
+      <a class="launch" href="video-ppg/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Video PPG"></span></a>
+    </article>
+
+    <!-- Tools -->
+    <article class="demo-card is-tool" style="--accent:#F26522; --accent-2:#ff8c4b">
+      <span class="kind">Tool</span>
+      <h3>Shimmer Capture</h3>
+      <p>Developer workbench: enable any sensor, watch live plots, and export to CSV.</p>
+      <div class="tags"><span class="badge">ALL SENSORS</span></div>
+      <a class="launch" href="ShimmerCapture/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Shimmer Capture"></span></a>
+    </article>
+
+    <article class="demo-card is-tool" style="--accent:#26c6da; --accent-2:#66dfef">
+      <span class="kind">Tool</span>
+      <h3>Verisense</h3>
+      <p>Stream and log data from the Verisense wrist sensor with live canvas plots.</p>
+      <div class="tags"><span class="badge">VERISENSE</span></div>
+      <a class="launch" href="Verisense/">Launch <span class="arr">→</span><span class="stretch" aria-label="Launch Verisense"></span></a>
+    </article>
+
+  </main>
+
+  <footer class="site-foot">
+    <div class="inner">
+      <div>
+        <p>
+          <b style="color:var(--text)">Pre-Alpha release.</b> These examples are
+          provided as-is. For what that means from a support perspective, or to
+          register interest in shaping future development,
+          <a href="https://shimmersensing.com" target="_blank" rel="noopener">contact Shimmer support</a>.
+        </p>
+        <p class="muted">
+          Migration note: in the coming weeks these demos will move to
+          <code>shimmer-web-sdk</code>, replacing <code>shimmer3r.js</code> and
+          <code>verisense.js</code>.
+        </p>
+      </div>
+      <div class="links">
+        <a href="https://github.com/ShimmerResearch/webBLEDemos" target="_blank" rel="noopener">GitHub repo ↗</a>
+        <a href="https://shimmersensing.com" target="_blank" rel="noopener">Support ↗</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

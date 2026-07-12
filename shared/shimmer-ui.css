@@ -1,0 +1,598 @@
+/* ==========================================================================
+   Shimmer Web BLE Demos — Shared Design System
+   shared/shimmer-ui.css
+
+   A self-contained, dark-first design system for the Shimmer Web BLE demo
+   suite. No external fonts or CDNs — uses the native system font stack.
+
+   Sections:
+     1.  Design tokens (:root custom properties)
+     2.  Per-app accent override mechanism
+     3.  Base / reset
+     4.  App shell (header, main)
+     5.  Card surface
+     6.  Buttons + toolbar
+     7.  Status pill
+     8.  Console / log box
+     9.  Modal overlay
+     10. Form controls
+     11. Game / canvas frame
+     12. Utilities
+     13. Reduced-motion
+   ========================================================================== */
+
+/* ==========================================================================
+   1. Design tokens
+   ========================================================================== */
+:root {
+  /* Background layers — deepest to lightest */
+  --bg:            #0c0e12;   /* page background */
+  --bg-2:          #12151b;   /* raised background */
+  --surface:       #171b22;   /* card / panel surface */
+  --surface-2:     #1e232c;   /* nested surface, inputs */
+  --inset:         #0a0c0f;   /* sunken surfaces (console) */
+
+  /* Borders + lines */
+  --border:        #2a3038;
+  --border-strong: #3a424d;
+
+  /* Text */
+  --text:          #eef1f6;   /* primary */
+  --text-2:        #a7b0bd;   /* secondary / muted */
+  --text-3:        #6b7482;   /* faint / placeholder */
+
+  /* Brand accent — Shimmer orange by default.
+     Apps may override --accent / --accent-2 to keep their own identity. */
+  --accent:        #F26522;   /* Shimmer orange */
+  --accent-2:      #ff8c4b;   /* lighter partner tone */
+  --accent-ink:    #1a0d04;   /* text drawn on top of accent fills */
+
+  /* Semantic colors */
+  --success:       #2fbf71;
+  --success-ink:   #04180d;
+  --warning:       #f2b134;
+  --warning-ink:   #241800;
+  --danger:        #f2555a;
+  --danger-ink:    #2a0406;
+  --info:          #3fa9f5;
+  --info-ink:      #041420;
+
+  /* Radii */
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-pill: 999px;
+
+  /* Spacing scale */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+
+  /* Shadows */
+  --shadow-1: 0 2px 8px rgba(0, 0, 0, .3);
+  --shadow-2: 0 8px 28px rgba(0, 0, 0, .38);
+
+  /* Typography */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+               sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+               "Liberation Mono", monospace;
+
+  /* Layout */
+  --maxw: 1120px;
+
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* ==========================================================================
+   2. Per-app accent override mechanism
+   --------------------------------------------------------------------------
+   Each app should set its own accent so it keeps a distinct identity while
+   sharing the system. Set on :root or body, e.g.:
+
+     <body style="--accent:#66fcf1; --accent-2:#45a29e; --accent-ink:#04201f">
+
+   A dark --accent-ink (text/icon color that sits on top of the accent fill)
+   should be picked to contrast with the chosen accent.
+   ========================================================================== */
+
+/* ==========================================================================
+   3. Base / reset
+   ========================================================================== */
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1, h2, h3, h4 { line-height: 1.2; font-weight: 700; margin: 0 0 var(--sp-3); }
+h1 { font-size: clamp(20px, 3vw, 28px); letter-spacing: .2px; }
+h2 { font-size: clamp(18px, 2.4vw, 22px); }
+h3 { font-size: 16px; }
+h4 { font-size: 14px; color: var(--text-2); }
+
+p { margin: 0 0 var(--sp-3); }
+
+a { color: var(--accent-2); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code {
+  font-family: var(--font-mono);
+  font-size: .9em;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 1px 5px;
+}
+
+img { max-width: 100%; }
+
+::selection { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+
+/* ==========================================================================
+   4. App shell
+   ========================================================================== */
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  background: color-mix(in srgb, var(--bg-2) 90%, transparent);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  backdrop-filter: blur(8px);
+}
+
+/* Brand mark: an accent square + wordmark */
+.app-header .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+}
+.app-header .brand:hover { text-decoration: none; }
+.app-header .brand-mark {
+  width: 22px; height: 22px;
+  border-radius: 6px;
+  flex: 0 0 auto;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.app-header .brand-name { font-size: 14px; letter-spacing: .3px; }
+.app-header .brand-name .brand-sub { color: var(--text-3); font-weight: 500; }
+
+.app-header .app-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-2);
+  border-left: 1px solid var(--border);
+  padding-left: var(--sp-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-header .spacer { flex: 1 1 auto; }
+
+.app-header .back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-2);
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.app-header .back-link:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+  text-decoration: none;
+}
+
+.app-main {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: var(--sp-5) var(--sp-4);
+}
+
+@media (max-width: 560px) {
+  .app-header { padding: var(--sp-2) var(--sp-3); gap: var(--sp-2); }
+  .app-header .app-title { font-size: 13px; padding-left: var(--sp-2); }
+  .app-header .brand-name { display: none; }
+  .app-main { padding: var(--sp-4) var(--sp-3); }
+}
+
+/* ==========================================================================
+   5. Card surface
+   ========================================================================== */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-4);
+  box-shadow: var(--shadow-1);
+}
+.card + .card { margin-top: var(--sp-4); }
+.card h3:first-child, .card h2:first-child { margin-top: 0; }
+
+/* ==========================================================================
+   6. Buttons + toolbar
+   ========================================================================== */
+.btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font: inherit;
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1;
+  padding: 10px 16px;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .15s ease, border-color .15s ease,
+              transform .05s ease, opacity .15s ease, box-shadow .15s ease;
+}
+.btn:hover { background: color-mix(in srgb, var(--surface-2) 70%, #fff 6%); }
+.btn:active { transform: translateY(1px); }
+.btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.btn:disabled,
+.btn[disabled] {
+  opacity: .45;
+  cursor: not-allowed;
+  transform: none;
+}
+.btn:disabled:hover { background: var(--surface-2); }
+
+/* Primary — accent fill */
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: color-mix(in srgb, var(--accent) 80%, #000);
+}
+.btn-primary:hover { background: color-mix(in srgb, var(--accent) 88%, #fff); }
+.btn-primary:disabled:hover { background: var(--accent); }
+
+/* Secondary — ghost / outline */
+.btn-secondary {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.btn-secondary:hover {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--text-3);
+}
+.btn-secondary:disabled:hover { background: transparent; }
+
+/* Success */
+.btn-success {
+  background: var(--success);
+  color: var(--success-ink);
+  border-color: color-mix(in srgb, var(--success) 80%, #000);
+}
+.btn-success:hover { background: color-mix(in srgb, var(--success) 88%, #fff); }
+.btn-success:disabled:hover { background: var(--success); }
+
+/* Danger */
+.btn-danger {
+  background: var(--danger);
+  color: var(--danger-ink);
+  border-color: color-mix(in srgb, var(--danger) 80%, #000);
+}
+.btn-danger:hover { background: color-mix(in srgb, var(--danger) 88%, #fff); }
+.btn-danger:disabled:hover { background: var(--danger); }
+
+/* Small size */
+.btn-sm { padding: 6px 10px; font-size: 12.5px; border-radius: var(--r-sm); }
+
+/* Toolbar — horizontal button row that wraps on mobile */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+/* ==========================================================================
+   7. Status pill
+   --------------------------------------------------------------------------
+   <span class="status-pill is-idle"><span></span>Idle</span>
+   State modifier classes color the dot + label. is-connecting / is-streaming
+   animate the dot.
+   ========================================================================== */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+}
+.status-pill::before {
+  content: "";
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: 0 0 auto;
+}
+.status-pill.is-idle::before      { background: var(--text-3); }
+.status-pill.is-connecting        { color: var(--warning); }
+.status-pill.is-connecting::before{ background: var(--warning); animation: pulse-dot 1s ease-in-out infinite; }
+.status-pill.is-connected         { color: var(--success); }
+.status-pill.is-connected::before { background: var(--success); }
+.status-pill.is-streaming         { color: var(--accent-2); }
+.status-pill.is-streaming::before { background: var(--accent); animation: pulse-dot .9s ease-in-out infinite; }
+.status-pill.is-error             { color: var(--danger); }
+.status-pill.is-error::before     { background: var(--danger); }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1;   box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
+  50%      { opacity: .55; box-shadow: 0 0 0 5px transparent; }
+}
+
+/* ==========================================================================
+   8. Console / log box
+   ========================================================================== */
+.console {
+  background: var(--inset);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  color: #7dffb0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: var(--sp-3);
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  box-shadow: inset 0 2px 8px rgba(0, 0, 0, .4);
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.console::-webkit-scrollbar { width: 9px; height: 9px; }
+.console::-webkit-scrollbar-track { background: transparent; }
+.console::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-pill);
+  border: 2px solid var(--inset);
+}
+.console::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+/* ==========================================================================
+   9. Modal overlay
+   --------------------------------------------------------------------------
+   Toggle with the `hidden` attribute (add/remove) OR the `.is-open` class.
+   Default state = hidden; either removing `hidden` or adding `.is-open`
+   reveals it.
+
+     <div class="overlay" hidden> ... </div>   // show: el.hidden = false
+     <div class="overlay">        ... </div>   // with .is-open toggled
+   ========================================================================== */
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-4);
+  background: rgba(4, 6, 9, .72);
+  backdrop-filter: blur(6px);
+  z-index: 9999;
+}
+.overlay[hidden] { display: none; }        /* supports the hidden attribute */
+
+.overlay-panel {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-2);
+  padding: var(--sp-5);
+  width: 100%;
+  max-width: 560px;
+  max-height: 85vh;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+.overlay-panel h2 { color: var(--accent); margin-top: 0; }
+.overlay-panel ul { padding-left: 20px; margin: var(--sp-2) 0; }
+.overlay-panel li { margin: 4px 0; }
+.overlay-foot {
+  margin-top: var(--sp-4);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+/* ==========================================================================
+   10. Form controls
+   ========================================================================== */
+label {
+  font-size: 13px;
+  color: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+input[type=text],
+input[type=number],
+input[type=search],
+select,
+textarea {
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+input[type=text]:focus,
+input[type=number]:focus,
+input[type=search]:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+input::placeholder { color: var(--text-3); }
+
+select {
+  appearance: none;
+  padding-right: 30px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-2) 50%),
+    linear-gradient(135deg, var(--text-2) 50%, transparent 50%);
+  background-position: right 13px center, right 8px center;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+select[multiple] { background-image: none; padding-right: 10px; }
+
+input[type=checkbox],
+input[type=radio] {
+  width: 16px; height: 16px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* Range slider with accent thumb */
+input[type=range] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 160px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  cursor: pointer;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  cursor: pointer;
+}
+input[type=range]::-moz-range-thumb {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  cursor: pointer;
+}
+input[type=range]:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+/* ==========================================================================
+   11. Game / canvas frame
+   ========================================================================== */
+.game-frame {
+  display: flex;
+  justify-content: center;
+  padding: var(--sp-3);
+  background: var(--inset);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fff 5%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
+    0 0 32px color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.game-frame canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--r-md);
+  background: #0e1116;
+}
+
+/* ==========================================================================
+   12. Utilities
+   ========================================================================== */
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+.muted { color: var(--text-2); font-size: 13px; }
+.center { text-align: center; }
+.spacer { flex: 1 1 auto; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.kbd {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 2px 7px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 3px;
+  border-radius: var(--r-sm);
+}
+
+/* ==========================================================================
+   13. Reduced motion
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
