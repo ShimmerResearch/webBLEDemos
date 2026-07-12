@@ -1,106 +1,63 @@
 /* ==========================================================================
-   Shimmer Web BLE Demos — Shared Design System
+   Shimmer Web BLE Demos — Shared UI layer
    shared/shimmer-ui.css
 
-   A self-contained, dark-first design system for the Shimmer Web BLE demo
-   suite. No external fonts or CDNs — uses the native system font stack.
+   Built on the Consensys Design System (shared/consensys/) — a web
+   recreation of Shimmer's Consensys desktop instrument UI. Light chrome,
+   hairline borders, square 2px corners, UPPERCASE labels, Shimmer orange
+   accents, Carlito (Calibri-metric) type. Apps link ONLY this file; the
+   token bundle + fonts load via the @import below.
+
+   Rule: use --cs-* tokens; never the DS's internal cs-* component classes.
 
    Sections:
-     1.  Design tokens (:root custom properties)
-     2.  Per-app accent override mechanism
-     3.  Base / reset
-     4.  App shell (header, main)
-     5.  Card surface
-     6.  Buttons + toolbar
-     7.  Status pill
-     8.  Console / log box
-     9.  Modal overlay
-     10. Form controls
-     11. Game / canvas frame
-     12. Utilities
-     13. Reduced-motion
+     1.  Import + app-facing aliases
+     2.  Base / reset
+     3.  App shell (header, main)
+     4.  Card surface (instrument panel)
+     5.  Buttons + toolbar
+     6.  Status pill
+     7.  Console / log box (intentional dark inset)
+     8.  Modal overlay
+     9.  Form controls
+     10. Game / canvas frame (intentional dark inset)
+     11. Utilities
+     12. Reduced-motion
    ========================================================================== */
+
+@import url("consensys/styles.css");
 
 /* ==========================================================================
-   1. Design tokens
+   1. App-facing aliases
+   --------------------------------------------------------------------------
+   Per-app accent: apps may set --accent (+ optional --accent-2) on
+   :root/body to keep an identity tint (used for badges, .game-frame trim,
+   selected states). Default = Shimmer orange. Keep page chrome light and
+   grey regardless — accents are trim, not theme.
    ========================================================================== */
 :root {
-  /* Background layers — deepest to lightest */
-  --bg:            #0c0e12;   /* page background */
-  --bg-2:          #12151b;   /* raised background */
-  --surface:       #171b22;   /* card / panel surface */
-  --surface-2:     #1e232c;   /* nested surface, inputs */
-  --inset:         #0a0c0f;   /* sunken surfaces (console) */
-
-  /* Borders + lines */
-  --border:        #2a3038;
-  --border-strong: #3a424d;
-
-  /* Text */
-  --text:          #eef1f6;   /* primary */
-  --text-2:        #a7b0bd;   /* secondary / muted */
-  --text-3:        #6b7482;   /* faint / placeholder */
-
-  /* Brand accent — Shimmer orange by default.
-     Apps may override --accent / --accent-2 to keep their own identity. */
-  --accent:        #F26522;   /* Shimmer orange */
-  --accent-2:      #ff8c4b;   /* lighter partner tone */
-  --accent-ink:    #1a0d04;   /* text drawn on top of accent fills */
-
-  /* Semantic colors */
-  --success:       #2fbf71;
-  --success-ink:   #04180d;
-  --warning:       #f2b134;
-  --warning-ink:   #241800;
-  --danger:        #f2555a;
-  --danger-ink:    #2a0406;
-  --info:          #3fa9f5;
-  --info-ink:      #041420;
-
-  /* Radii */
-  --r-sm: 6px;
-  --r-md: 10px;
-  --r-lg: 14px;
-  --r-pill: 999px;
-
-  /* Spacing scale */
-  --sp-1: 4px;
-  --sp-2: 8px;
-  --sp-3: 12px;
-  --sp-4: 16px;
-  --sp-5: 24px;
-  --sp-6: 32px;
-
-  /* Shadows */
-  --shadow-1: 0 2px 8px rgba(0, 0, 0, .3);
-  --shadow-2: 0 8px 28px rgba(0, 0, 0, .38);
-
-  /* Typography */
-  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
-               sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
-  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
-               "Liberation Mono", monospace;
-
-  /* Layout */
+  --accent:   var(--cs-orange);
+  --accent-2: var(--cs-orange-deep);
   --maxw: 1120px;
 
-  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
+  /* --- Extension tokens -------------------------------------------------
+     Not part of the upstream Consensys token set (consensys/_ds_bundle.css
+     is vendored verbatim — do not edit it). These fill gaps the demos need;
+     values chosen to sit within the Consensys idiom. */
+  --cs-surface-inset: #EDEDED;                 /* sunken wells, track fills */
+  --cs-text-faint:    #B4B4B4;                 /* disabled / placeholder */
+  --cs-text-invert:   var(--cs-text-on-accent);/* on orange / dark fills */
+  --cs-blue-tint:     #E3F1F9;                 /* info fills (matches DS badge) */
+  --cs-amber:         #E8A013;                 /* warning / busy */
+  --cs-amber-tint:    #FBF3DF;
+  --cs-font:          var(--cs-font-family);
+  --cs-font-mono:     ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+                      "Liberation Mono", monospace;
+  --cs-letterspace-label: .06em;               /* uppercase label tracking */
 }
 
 /* ==========================================================================
-   2. Per-app accent override mechanism
-   --------------------------------------------------------------------------
-   Each app should set its own accent so it keeps a distinct identity while
-   sharing the system. Set on :root or body, e.g.:
-
-     <body style="--accent:#66fcf1; --accent-2:#45a29e; --accent-ink:#04201f">
-
-   A dark --accent-ink (text/icon color that sits on top of the accent fill)
-   should be picked to contrast with the chosen accent.
-   ========================================================================== */
-
-/* ==========================================================================
-   3. Base / reset
+   2. Base / reset
    ========================================================================== */
 * { box-sizing: border-box; }
 
@@ -108,81 +65,87 @@ html { -webkit-text-size-adjust: 100%; }
 
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font-sans);
-  font-size: 15px;
+  background: var(--cs-surface);
+  color: var(--cs-text);
+  font-family: var(--cs-font);
+  font-size: var(--cs-text-md);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
 }
 
-h1, h2, h3, h4 { line-height: 1.2; font-weight: 700; margin: 0 0 var(--sp-3); }
-h1 { font-size: clamp(20px, 3vw, 28px); letter-spacing: .2px; }
-h2 { font-size: clamp(18px, 2.4vw, 22px); }
-h3 { font-size: 16px; }
-h4 { font-size: 14px; color: var(--text-2); }
+h1, h2, h3, h4 { color: var(--cs-text-strong); line-height: 1.25; margin: 0 0 var(--cs-space-3); }
+h1 { font-size: var(--cs-text-3xl); font-weight: 700; }
+h2 { font-size: var(--cs-text-2xl); font-weight: 700; }
+h3 { font-size: var(--cs-text-lg);  font-weight: 700; }
+h4 {
+  font-size: var(--cs-text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--cs-letterspace-label);
+  color: var(--cs-text);
+}
 
-p { margin: 0 0 var(--sp-3); }
+p { margin: 0 0 var(--cs-space-3); }
+strong, b { color: var(--cs-text-strong); }
 
-a { color: var(--accent-2); text-decoration: none; }
+a { color: var(--cs-blue); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
 code {
-  font-family: var(--font-mono);
+  font-family: var(--cs-font-mono);
   font-size: .9em;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
+  color: var(--cs-text-strong);
+  background: var(--cs-surface-alt);
+  border: 1px solid var(--cs-border);
+  border-radius: var(--cs-radius);
   padding: 1px 5px;
 }
 
 img { max-width: 100%; }
 
-::selection { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+::selection { background: var(--cs-orange-tint); color: var(--cs-text-strong); }
 
 /* ==========================================================================
-   4. App shell
+   3. App shell
    ========================================================================== */
 .app-header {
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
-  padding: var(--sp-3) var(--sp-4);
-  background: color-mix(in srgb, var(--bg-2) 90%, transparent);
-  border-bottom: 1px solid var(--border);
+  gap: var(--cs-space-3);
+  padding: var(--cs-space-2) var(--cs-space-4);
+  background: var(--cs-surface);
+  border-bottom: 1px solid var(--cs-border);
   position: sticky;
   top: 0;
   z-index: 50;
-  backdrop-filter: blur(8px);
 }
 
-/* Brand mark: an accent square + wordmark */
 .app-header .brand {
   display: inline-flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: var(--cs-space-2);
+  color: var(--cs-text-strong);
   font-weight: 700;
-  color: var(--text);
   white-space: nowrap;
 }
 .app-header .brand:hover { text-decoration: none; }
 .app-header .brand-mark {
-  width: 22px; height: 22px;
-  border-radius: 6px;
+  width: 20px; height: 20px;
   flex: 0 0 auto;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+  border-radius: var(--cs-radius);
+  background: var(--cs-orange);
 }
-.app-header .brand-name { font-size: 14px; letter-spacing: .3px; }
-.app-header .brand-name .brand-sub { color: var(--text-3); font-weight: 500; }
+.app-header .brand-name { font-size: var(--cs-text-md); letter-spacing: .02em; }
+.app-header .brand-name .brand-sub { color: var(--cs-text); font-weight: 400; }
 
 .app-header .app-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-2);
-  border-left: 1px solid var(--border);
-  padding-left: var(--sp-3);
+  font-size: var(--cs-text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--cs-letterspace-label);
+  color: var(--cs-text);
+  border-left: 1px solid var(--cs-border);
+  padding-left: var(--cs-space-3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -191,50 +154,66 @@ img { max-width: 100%; }
 .app-header .spacer { flex: 1 1 auto; }
 
 .app-header .back-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--text-2);
-  padding: 6px 10px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--border);
+  font-size: var(--cs-text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--cs-letterspace-label);
+  color: var(--cs-text);
+  padding: 5px 10px;
+  border: 1px solid var(--cs-border);
+  border-radius: var(--cs-radius);
   white-space: nowrap;
 }
 .app-header .back-link:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
+  color: var(--cs-orange);
+  border-color: var(--cs-border-strong);
   text-decoration: none;
 }
 
 .app-main {
   max-width: var(--maxw);
   margin: 0 auto;
-  padding: var(--sp-5) var(--sp-4);
+  padding: var(--cs-space-5) var(--cs-space-4);
 }
 
 @media (max-width: 560px) {
-  .app-header { padding: var(--sp-2) var(--sp-3); gap: var(--sp-2); }
-  .app-header .app-title { font-size: 13px; padding-left: var(--sp-2); }
+  .app-header { padding: var(--cs-space-2) var(--cs-space-3); gap: var(--cs-space-2); }
   .app-header .brand-name { display: none; }
-  .app-main { padding: var(--sp-4) var(--sp-3); }
+  .app-main { padding: var(--cs-space-4) var(--cs-space-3); }
 }
 
 /* ==========================================================================
-   5. Card surface
+   4. Card surface — instrument panel
+   --------------------------------------------------------------------------
+   White panel, hairline border, no shadows. A leading h3/h2 renders as an
+   uppercase section-title row with a hairline underline.
    ========================================================================== */
 .card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: var(--sp-4);
-  box-shadow: var(--shadow-1);
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border);
+  border-radius: var(--cs-radius);
+  padding: var(--cs-space-4);
 }
-.card + .card { margin-top: var(--sp-4); }
-.card h3:first-child, .card h2:first-child { margin-top: 0; }
+.card + .card { margin-top: var(--cs-space-4); }
+
+.card > h2:first-child,
+.card > h3:first-child {
+  font-size: var(--cs-text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--cs-letterspace-label);
+  color: var(--cs-text);
+  margin: calc(-1 * var(--cs-space-4)) calc(-1 * var(--cs-space-4)) var(--cs-space-4);
+  padding: var(--cs-space-2) var(--cs-space-4);
+  background: var(--cs-surface-alt);
+  border-bottom: 1px solid var(--cs-border);
+}
 
 /* ==========================================================================
-   6. Buttons + toolbar
+   5. Buttons + toolbar
+   --------------------------------------------------------------------------
+   Instrument idiom: UPPERCASE labels, square corners, hairline outlines.
+   Active/selected = orange; inactive = grey.
    ========================================================================== */
 .btn {
   appearance: none;
@@ -242,160 +221,168 @@ img { max-width: 100%; }
   align-items: center;
   justify-content: center;
   gap: 6px;
-  font: inherit;
-  font-weight: 600;
-  font-size: 14px;
+  font-family: var(--cs-font);
+  font-size: var(--cs-text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--cs-letterspace-label);
   line-height: 1;
-  padding: 10px 16px;
-  border-radius: var(--r-md);
-  border: 1px solid transparent;
-  background: var(--surface-2);
-  color: var(--text);
+  padding: 9px 14px;
+  border-radius: var(--cs-radius);
+  border: 1px solid var(--cs-border-strong);
+  background: var(--cs-surface);
+  color: var(--cs-text-strong);
   cursor: pointer;
   white-space: nowrap;
-  transition: background .15s ease, border-color .15s ease,
-              transform .05s ease, opacity .15s ease, box-shadow .15s ease;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
 }
-.btn:hover { background: color-mix(in srgb, var(--surface-2) 70%, #fff 6%); }
-.btn:active { transform: translateY(1px); }
-.btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.btn:hover { background: var(--cs-surface-alt); }
+.btn:active { background: var(--cs-surface-inset); }
+.btn:focus-visible { outline: none; box-shadow: var(--cs-focus-ring); }
 .btn:disabled,
 .btn[disabled] {
   opacity: .45;
   cursor: not-allowed;
-  transform: none;
 }
-.btn:disabled:hover { background: var(--surface-2); }
+.btn:disabled:hover { background: var(--cs-surface); }
 
-/* Primary — accent fill */
+/* Primary — orange fill (the active/selected idiom) */
 .btn-primary {
-  background: var(--accent);
-  color: var(--accent-ink);
-  border-color: color-mix(in srgb, var(--accent) 80%, #000);
+  background: var(--cs-orange);
+  border-color: var(--cs-orange-deep);
+  color: var(--cs-text-invert);
 }
-.btn-primary:hover { background: color-mix(in srgb, var(--accent) 88%, #fff); }
-.btn-primary:disabled:hover { background: var(--accent); }
+.btn-primary:hover  { background: var(--cs-orange-deep); }
+.btn-primary:active { background: var(--cs-orange-pressed); }
+.btn-primary:disabled:hover { background: var(--cs-orange); }
 
-/* Secondary — ghost / outline */
+/* Secondary — grey outline (the inactive idiom); orange tint on hover */
 .btn-secondary {
-  background: transparent;
-  color: var(--text);
-  border-color: var(--border-strong);
+  background: var(--cs-surface);
+  border-color: var(--cs-border-strong);
+  color: var(--cs-text);
 }
 .btn-secondary:hover {
-  background: color-mix(in srgb, var(--text) 8%, transparent);
-  border-color: var(--text-3);
+  background: var(--cs-orange-tint);
+  border-color: var(--cs-orange);
+  color: var(--cs-orange-deep);
 }
-.btn-secondary:disabled:hover { background: transparent; }
+.btn-secondary:disabled:hover {
+  background: var(--cs-surface);
+  border-color: var(--cs-border-strong);
+  color: var(--cs-text);
+}
 
-/* Success */
+/* Success — green fill */
 .btn-success {
-  background: var(--success);
-  color: var(--success-ink);
-  border-color: color-mix(in srgb, var(--success) 80%, #000);
+  background: var(--cs-green);
+  border-color: var(--cs-green);
+  color: var(--cs-text-invert);
 }
-.btn-success:hover { background: color-mix(in srgb, var(--success) 88%, #fff); }
-.btn-success:disabled:hover { background: var(--success); }
+.btn-success:hover  { background: #35852D; }
+.btn-success:active { background: #2C7025; }
+.btn-success:disabled:hover { background: var(--cs-green); }
 
-/* Danger */
+/* Danger — red fill */
 .btn-danger {
-  background: var(--danger);
-  color: var(--danger-ink);
-  border-color: color-mix(in srgb, var(--danger) 80%, #000);
+  background: var(--cs-red);
+  border-color: var(--cs-red);
+  color: var(--cs-text-invert);
 }
-.btn-danger:hover { background: color-mix(in srgb, var(--danger) 88%, #fff); }
-.btn-danger:disabled:hover { background: var(--danger); }
+.btn-danger:hover  { background: #B01B28; }
+.btn-danger:active { background: #951722; }
+.btn-danger:disabled:hover { background: var(--cs-red); }
 
 /* Small size */
-.btn-sm { padding: 6px 10px; font-size: 12.5px; border-radius: var(--r-sm); }
+.btn-sm { padding: 6px 10px; font-size: 11px; }
 
-/* Toolbar — horizontal button row that wraps on mobile */
+/* Toolbar — horizontal control strip, wraps on mobile */
 .toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--sp-2);
+  gap: var(--cs-space-2);
+  padding: var(--cs-space-2);
+  background: var(--cs-surface-alt);
+  border: 1px solid var(--cs-border);
+  border-radius: var(--cs-radius);
 }
 
 /* ==========================================================================
-   7. Status pill
+   6. Status pill
    --------------------------------------------------------------------------
-   <span class="status-pill is-idle"><span></span>Idle</span>
-   State modifier classes color the dot + label. is-connecting / is-streaming
-   animate the dot.
+   <span class="status-pill is-idle">Idle</span>
+   Dot via ::before. is-connecting / is-streaming pulse gently (disabled
+   under prefers-reduced-motion).
    ========================================================================== */
 .status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  font-weight: 600;
-  padding: 6px 12px;
-  border-radius: var(--r-pill);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  color: var(--text-2);
+  gap: 7px;
+  font-size: var(--cs-text-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--cs-letterspace-label);
+  padding: 5px 10px;
+  border-radius: var(--cs-radius);
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border);
+  color: var(--cs-text);
 }
 .status-pill::before {
   content: "";
   width: 8px; height: 8px;
   border-radius: 50%;
-  background: var(--text-3);
+  background: var(--cs-border-strong);
   flex: 0 0 auto;
 }
-.status-pill.is-idle::before      { background: var(--text-3); }
-.status-pill.is-connecting        { color: var(--warning); }
-.status-pill.is-connecting::before{ background: var(--warning); animation: pulse-dot 1s ease-in-out infinite; }
-.status-pill.is-connected         { color: var(--success); }
-.status-pill.is-connected::before { background: var(--success); }
-.status-pill.is-streaming         { color: var(--accent-2); }
-.status-pill.is-streaming::before { background: var(--accent); animation: pulse-dot .9s ease-in-out infinite; }
-.status-pill.is-error             { color: var(--danger); }
-.status-pill.is-error::before     { background: var(--danger); }
+.status-pill.is-idle::before       { background: var(--cs-border-strong); }
+.status-pill.is-connecting         { color: var(--cs-amber); border-color: var(--cs-amber); background: var(--cs-amber-tint); }
+.status-pill.is-connecting::before { background: var(--cs-amber); animation: cs-pulse 1.2s ease-in-out infinite; }
+.status-pill.is-connected          { color: var(--cs-green); border-color: var(--cs-green); background: var(--cs-green-tint); }
+.status-pill.is-connected::before  { background: var(--cs-green); }
+.status-pill.is-streaming          { color: var(--cs-orange-deep); border-color: var(--cs-orange); background: var(--cs-orange-tint); }
+.status-pill.is-streaming::before  { background: var(--cs-orange); animation: cs-pulse 1.2s ease-in-out infinite; }
+.status-pill.is-error              { color: var(--cs-red); border-color: var(--cs-red); background: var(--cs-red-tint); }
+.status-pill.is-error::before      { background: var(--cs-red); }
 
-@keyframes pulse-dot {
-  0%, 100% { opacity: 1;   box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
-  50%      { opacity: .55; box-shadow: 0 0 0 5px transparent; }
+@keyframes cs-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .35; }
 }
 
 /* ==========================================================================
-   8. Console / log box
+   7. Console / log box — intentional dark inset
+   --------------------------------------------------------------------------
+   A dark readout well inside the light instrument panel. Hairline border,
+   no glow.
    ========================================================================== */
 .console {
-  background: var(--inset);
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  color: #7dffb0;
-  font-family: var(--font-mono);
-  font-size: 12.5px;
+  background: #1B1B1B;
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  color: #9FD9A8;
+  font-family: var(--cs-font-mono);
+  font-size: var(--cs-text-xs);
   line-height: 1.55;
-  padding: var(--sp-3);
+  padding: var(--cs-space-3);
   max-height: 200px;
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  box-shadow: inset 0 2px 8px rgba(0, 0, 0, .4);
   scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-color: #5A5A5A #1B1B1B;
 }
-.console::-webkit-scrollbar { width: 9px; height: 9px; }
-.console::-webkit-scrollbar-track { background: transparent; }
-.console::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: var(--r-pill);
-  border: 2px solid var(--inset);
-}
-.console::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+.console::-webkit-scrollbar { width: 8px; height: 8px; }
+.console::-webkit-scrollbar-track { background: #1B1B1B; }
+.console::-webkit-scrollbar-thumb { background: #5A5A5A; border-radius: var(--cs-radius); }
+.console::-webkit-scrollbar-thumb:hover { background: #7A7A7A; }
 
 /* ==========================================================================
-   9. Modal overlay
+   8. Modal overlay
    --------------------------------------------------------------------------
-   Toggle with the `hidden` attribute (add/remove) OR the `.is-open` class.
-   Default state = hidden; either removing `hidden` or adding `.is-open`
-   reveals it.
-
-     <div class="overlay" hidden> ... </div>   // show: el.hidden = false
-     <div class="overlay">        ... </div>   // with .is-open toggled
+   Toggle with the `hidden` attribute (el.hidden = false to show) OR the
+   `.is-open` class — both are supported; `hidden` always wins.
    ========================================================================== */
 .overlay {
   position: fixed;
@@ -403,44 +390,56 @@ img { max-width: 100%; }
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: var(--sp-4);
-  background: rgba(4, 6, 9, .72);
-  backdrop-filter: blur(6px);
+  padding: var(--cs-space-4);
+  background: rgba(72, 72, 72, .45);
+  backdrop-filter: blur(2px);
   z-index: 9999;
 }
-.overlay[hidden] { display: none; }        /* supports the hidden attribute */
+.overlay[hidden] { display: none; }
 
 .overlay-panel {
-  background: var(--surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow-2);
-  padding: var(--sp-5);
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, .18);
+  padding: var(--cs-space-5);
   width: 100%;
   max-width: 560px;
   max-height: 85vh;
   overflow-y: auto;
   scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
+  scrollbar-color: var(--cs-border-strong) transparent;
 }
-.overlay-panel h2 { color: var(--accent); margin-top: 0; }
-.overlay-panel ul { padding-left: 20px; margin: var(--sp-2) 0; }
+.overlay-panel h2 {
+  font-size: var(--cs-text-sm);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: var(--cs-letterspace-label);
+  color: var(--cs-orange-deep);
+  margin: calc(-1 * var(--cs-space-5)) calc(-1 * var(--cs-space-5)) var(--cs-space-4);
+  padding: var(--cs-space-3) var(--cs-space-5);
+  background: var(--cs-surface-alt);
+  border-bottom: 1px solid var(--cs-border);
+}
+.overlay-panel ul { padding-left: 20px; margin: var(--cs-space-2) 0; }
 .overlay-panel li { margin: 4px 0; }
 .overlay-foot {
-  margin-top: var(--sp-4);
+  margin-top: var(--cs-space-4);
+  padding-top: var(--cs-space-3);
+  border-top: 1px solid var(--cs-border);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--sp-3);
+  gap: var(--cs-space-3);
   flex-wrap: wrap;
 }
 
 /* ==========================================================================
-   10. Form controls
+   9. Form controls
    ========================================================================== */
 label {
-  font-size: 13px;
-  color: var(--text-2);
+  font-size: var(--cs-text-xs);
+  color: var(--cs-text);
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -451,14 +450,14 @@ input[type=number],
 input[type=search],
 select,
 textarea {
-  font: inherit;
-  font-size: 14px;
-  color: var(--text);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  padding: 8px 10px;
-  transition: border-color .15s ease, box-shadow .15s ease;
+  font-family: var(--cs-font);
+  font-size: var(--cs-text-sm);
+  color: var(--cs-text-strong);
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  padding: 7px 9px;
+  transition: border-color .12s ease;
 }
 input[type=text]:focus,
 input[type=number]:focus,
@@ -466,97 +465,94 @@ input[type=search]:focus,
 select:focus,
 textarea:focus {
   outline: none;
-  border-color: var(--accent);
-  box-shadow: var(--focus-ring);
+  border-color: var(--cs-orange);
 }
-input::placeholder { color: var(--text-3); }
+input::placeholder { color: var(--cs-text-faint); }
 
 select {
   appearance: none;
-  padding-right: 30px;
+  padding-right: 28px;
   background-image:
-    linear-gradient(45deg, transparent 50%, var(--text-2) 50%),
-    linear-gradient(135deg, var(--text-2) 50%, transparent 50%);
-  background-position: right 13px center, right 8px center;
+    linear-gradient(45deg, transparent 50%, var(--cs-text) 50%),
+    linear-gradient(135deg, var(--cs-text) 50%, transparent 50%);
+  background-position: right 12px center, right 7px center;
   background-size: 5px 5px, 5px 5px;
   background-repeat: no-repeat;
 }
-select[multiple] { background-image: none; padding-right: 10px; }
+select[multiple] { background-image: none; padding-right: 9px; }
 
 input[type=checkbox],
 input[type=radio] {
-  width: 16px; height: 16px;
-  accent-color: var(--accent);
+  width: 15px; height: 15px;
+  accent-color: var(--cs-orange);
   cursor: pointer;
 }
 
-/* Range slider with accent thumb */
+/* Range slider — grey hairline track, orange thumb */
 input[type=range] {
   -webkit-appearance: none;
   appearance: none;
   width: 160px;
-  height: 6px;
-  border-radius: var(--r-pill);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
+  height: 4px;
+  border-radius: var(--cs-radius);
+  background: var(--cs-surface-inset);
+  border: 1px solid var(--cs-border);
   cursor: pointer;
 }
 input[type=range]::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 16px; height: 16px;
+  width: 14px; height: 14px;
   border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--surface);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  background: var(--cs-orange);
+  border: 1px solid var(--cs-orange-deep);
   cursor: pointer;
 }
 input[type=range]::-moz-range-thumb {
-  width: 14px; height: 14px;
+  width: 12px; height: 12px;
   border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--surface);
+  background: var(--cs-orange);
+  border: 1px solid var(--cs-orange-deep);
   cursor: pointer;
 }
-input[type=range]:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+input[type=range]:focus-visible { outline: none; box-shadow: var(--cs-focus-ring); }
 
 /* ==========================================================================
-   11. Game / canvas frame
+   10. Game / canvas frame — intentional dark inset
+   --------------------------------------------------------------------------
+   Dark canvas framed by the light instrument panel: hairline border,
+   no glow. Optional per-app --accent tints the top trim line.
    ========================================================================== */
 .game-frame {
   display: flex;
   justify-content: center;
-  padding: var(--sp-3);
-  background: var(--inset);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-lg);
-  box-shadow:
-    inset 0 1px 0 color-mix(in srgb, #fff 5%, transparent),
-    0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent),
-    0 0 32px color-mix(in srgb, var(--accent) 14%, transparent);
+  padding: var(--cs-space-3);
+  background: #141414;
+  border: 1px solid var(--cs-border-strong);
+  border-top: 2px solid var(--accent);
+  border-radius: var(--cs-radius);
 }
 .game-frame canvas {
   display: block;
   max-width: 100%;
   height: auto;
-  border-radius: var(--r-md);
-  background: #0e1116;
+  background: #0E1116;
 }
 
 /* ==========================================================================
-   12. Utilities
+   11. Utilities
    ========================================================================== */
 .row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--sp-2);
+  gap: var(--cs-space-2);
 }
 .stack {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-3);
+  gap: var(--cs-space-3);
 }
-.muted { color: var(--text-2); font-size: 13px; }
+.muted { color: var(--cs-text); font-size: var(--cs-text-sm); }
 .center { text-align: center; }
 .spacer { flex: 1 1 auto; }
 
@@ -565,29 +561,29 @@ input[type=range]:focus-visible { outline: none; box-shadow: var(--focus-ring); 
   align-items: center;
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: .4px;
+  letter-spacing: var(--cs-letterspace-label);
   text-transform: uppercase;
-  padding: 3px 8px;
-  border-radius: var(--r-pill);
-  background: color-mix(in srgb, var(--accent) 18%, transparent);
-  color: var(--accent-2);
-  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  padding: 2px 7px;
+  border-radius: var(--cs-radius);
+  background: var(--cs-orange-tint);
+  color: var(--cs-orange-deep);
+  border: 1px solid var(--cs-orange);
 }
 
 .kbd {
   display: inline-block;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  padding: 2px 7px;
-  color: var(--text);
-  background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  border-bottom-width: 3px;
-  border-radius: var(--r-sm);
+  font-family: var(--cs-font-mono);
+  font-size: var(--cs-text-xs);
+  padding: 1px 6px;
+  color: var(--cs-text-strong);
+  background: var(--cs-surface-alt);
+  border: 1px solid var(--cs-border-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--cs-radius);
 }
 
 /* ==========================================================================
-   13. Reduced motion
+   12. Reduced motion
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

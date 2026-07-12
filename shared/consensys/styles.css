@@ -1,0 +1,8 @@
+/* ==========================================================================
+   Consensys Design System — entry point
+   Import this single file; it pulls in fonts and the token bundle.
+   Paths are relative to this file so it works served statically.
+   ========================================================================== */
+
+@import url("fonts/fonts.css");
+@import url("_ds_bundle.css");

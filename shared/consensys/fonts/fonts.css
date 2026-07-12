@@ -1,0 +1,26 @@
+/* Carlito — metric-compatible with Calibri. SIL Open Font License 1.1
+   (see LICENSE-OFL.txt). Vendored locally; no external font requests. */
+
+@font-face {
+  font-family: "Carlito";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("carlito-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Carlito";
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url("carlito-400-italic.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Carlito";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("carlito-700-normal.woff2") format("woff2");
+}

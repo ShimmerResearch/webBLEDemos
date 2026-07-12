@@ -1,21 +1,37 @@
 # Shimmer Web BLE Demos — Design System Guide
 
-Apply the shared design system in `shared/shimmer-ui.css` to each app so the
-suite feels like one product. **Style only — never touch behavior.**
+The suite uses the **Consensys Design System** — a web recreation of Shimmer's
+Consensys desktop instrument UI. LIGHT theme: white surfaces, thin grey
+hairline borders, grey text, UPPERCASE control/section labels, square 2px
+corners, Shimmer orange `#F15D22` accents, Carlito (Calibri-metric) type.
+
+Apps link **only** `../shared/shimmer-ui.css`; it `@import`s
+`consensys/styles.css` (tokens + vendored Carlito woff2). Use the `--cs-*`
+tokens in any local CSS — **never** the DS's internal `cs-*` component classes.
 
 ## Golden rules
 
 - **DO NOT** change any JavaScript logic, event wiring, or BLE/Shimmer code.
 - **DO NOT** rename or remove element `id`s — the JS depends on them.
-- Only change **markup structure/classes** and swap ad-hoc `<style>` for shared
-  classes. Each app's functionality must stay byte-for-byte identical at runtime.
-- Keep every existing `id`. You may add wrapper elements and classes around them.
-- Prefer replacing inline `<style>` rules with shared classes; keep app-specific
-  rules (canvas sizing, game-specific bits) in a trimmed local `<style>`.
+- Only change **markup structure/classes** and CSS. Runtime behavior must stay
+  identical. Keep every existing `id`; wrap rather than rewrite.
+- Trim ad-hoc `<style>` down to app-specific bits (canvas sizing, game logic
+  visuals) written with `--cs-*` tokens.
+
+## Idiom rules
+
+- Page chrome is **LIGHT**: white panels, hairline borders (`--cs-border` /
+  `--cs-border-strong`), no shadows/glows.
+- Buttons and section titles are **UPPERCASE**; active/selected = orange,
+  inactive = grey. Values use `--cs-text-strong`, labels use `--cs-text`.
+- Square corners everywhere (`--cs-radius: 2px`).
+- **Exception — intentional dark insets:** `.console` and `.game-frame` stay
+  dark (dark canvas framed by the light instrument panel is the desired look).
+  Hairline border, no glow.
 
 ## `<head>` boilerplate
 
-Add/normalize the head. Keep the app's existing GA4 snippet at the top.
+Keep the app's existing GA4 snippet at the top, then:
 
 ```html
 <meta charset="UTF-8" />
@@ -26,19 +42,18 @@ Add/normalize the head. Keep the app's existing GA4 snippet at the top.
 <link rel="stylesheet" href="../shared/shimmer-ui.css" />
 ```
 
-Title convention: `App Name · Shimmer Web BLE Demos`.
 (From the repo-root `index.html`, use `shared/…` paths instead of `../shared/…`.)
 
 ## Per-app accent
 
-Keep each app's identity by setting `--accent` (and optionally `--accent-2` and
-`--accent-ink`) on `<body>`. Pick `--accent-ink` to contrast the accent fill.
+Chrome stays light and grey; the accent is **trim only** (badges, `.game-frame`
+top trim). Optionally set on `<body>`:
 
 ```html
-<body style="--accent:#66fcf1; --accent-2:#45a29e; --accent-ink:#04201f">
+<body style="--accent:#0081C6; --accent-2:#006CA6">
 ```
 
-Default (unset) = Shimmer orange `#F26522`.
+Default (unset) = Shimmer orange `#F15D22`. Do not theme whole panels with it.
 
 ## App header (with back-link to the index)
 
@@ -52,52 +67,45 @@ Default (unset) = Shimmer orange `#F26522`.
   <span class="spacer"></span>
   <a class="back-link" href="../">← All demos</a>
 </header>
-<main class="app-main">
-  <!-- app content -->
-</main>
+<main class="app-main"><!-- app content --></main>
 ```
 
 ## Toolbar + status + console
 
-Map existing buttons/IDs onto these classes (keep the IDs!):
+Map existing buttons/IDs onto these classes (keep the IDs!). Button text is
+auto-uppercased by CSS — don't rewrite labels.
 
 ```html
 <div class="card">
+  <h3>Device</h3>  <!-- first h3 in .card renders as uppercase title row -->
   <div class="toolbar">
-    <button id="scanBtn" class="btn btn-primary">🔍 Scan</button>
-    <button id="configureBtn" class="btn btn-secondary" disabled>⚙️ Configure</button>
-    <button id="streamBtn" class="btn btn-success" disabled>📡 Start Streaming</button>
-    <button id="disconfigureBtn" class="btn btn-danger" disabled>❌ Disconnect</button>
+    <button id="scanBtn" class="btn btn-primary">Scan</button>
+    <button id="configureBtn" class="btn btn-secondary" disabled>Configure</button>
+    <button id="streamBtn" class="btn btn-success" disabled>Start Streaming</button>
+    <button id="disconfigureBtn" class="btn btn-danger" disabled>Disconnect</button>
     <span class="spacer"></span>
-    <span id="statusPill" class="status-pill is-idle"><!-- dot via ::before -->Idle</span>
+    <span id="statusPill" class="status-pill is-idle">Idle</span>
   </div>
   <p id="deviceName" class="muted" style="margin-top:12px">No device selected</p>
   <pre id="consoleOutput" class="console" aria-live="polite"></pre>
 </div>
 ```
 
-Button variant convention: Scan = `btn-primary`, Configure = `btn-secondary`,
-Start Streaming = `btn-success`, Disconnect = `btn-danger`, game/util =
-`btn-secondary`. Small buttons add `btn-sm`.
-
-Status pill states (optional — set via JS or leave static `is-idle`):
-`is-idle`, `is-connecting`, `is-connected`, `is-streaming`, `is-error`.
+Variants: Scan = `btn-primary` (orange), Configure/util = `btn-secondary`
+(grey outline), Start Streaming = `btn-success`, Disconnect = `btn-danger`.
+Small: add `btn-sm`. Status states: `is-idle`, `is-connecting`, `is-connected`,
+`is-streaming`, `is-error` (connecting/streaming pulse; reduced-motion safe).
 
 ## Modal / intro overlay
 
-The overlay is hidden by default. Reveal it by **removing the `hidden`
-attribute** (`el.hidden = false`) or by toggling **`.is-open`** — pick whichever
-matches the app's existing JS. If the JS currently sets
-`style.display = 'flex'/'none'`, keep that JS working by using the `hidden`
-attribute pattern (simplest: leave the existing JS and just restyle the panel),
-or migrate the JS's display toggles — but only if you can do so without changing
-any other logic.
+Hidden by default; reveal by removing `hidden` (`el.hidden = false`) or
+toggling `.is-open`. If the app's JS toggles `style.display`, keep that JS —
+just restyle the markup with these classes.
 
 ```html
 <div id="introOverlay" class="overlay" hidden role="dialog" aria-modal="true">
   <div class="overlay-panel">
     <h2>App Name</h2>
-    <p>How to play / use…</p>
     <ul><li>Scan → Configure → Start Streaming</li></ul>
     <div class="overlay-foot">
       <label><input type="checkbox" id="dontShowAgain"> Don't show again</label>
@@ -109,18 +117,12 @@ any other logic.
 
 ## Game canvas
 
-Wrap game `<canvas>` elements in `.game-frame` for a consistent framed look:
-
 ```html
 <div class="game-frame"><canvas id="game"></canvas></div>
 ```
 
 ## Other components
 
-- `.card` — surface for grouping content.
-- `.row` (flex wrap) / `.stack` (column) — layout helpers.
-- `.badge` — sensor tags (GYRO, EMG…). `.kbd` — keyboard hints.
-- Form controls (`input`, `select`, `range`, `checkbox`) are styled globally —
-  no class needed.
-
-Keep changes minimal and reversible; when in doubt, wrap rather than rewrite.
+- `.card` — instrument panel (leading `h2/h3` becomes the uppercase title row).
+- `.row` / `.stack` — flex helpers. `.muted`, `.badge` (sensor tags), `.kbd`.
+- Form controls (`input`, `select`, `range`, `checkbox`) styled globally.

@@ -1,0 +1,949 @@
+/* styles/tokens.css */
+:root {
+  --cs-orange: #F15D22;
+  --cs-orange-deep: #D66617;
+  --cs-orange-pressed: #BB5913;
+  --cs-orange-tint: #FDEFE7;
+  --cs-blue: #0081C6;
+  --cs-blue-deep: #0645AD;
+  --cs-surface: #FFFFFF;
+  --cs-surface-alt: #F5F5F5;
+  --cs-grey-100: #EAEAEA;
+  --cs-grey-150: #E9E9E9;
+  --cs-grey-200: #E8E8E8;
+  --cs-grey-300: #D7D7D7;
+  --cs-border: #D3D3D3;
+  --cs-border-strong: #A0A0A0;
+  --cs-text: #808080;
+  --cs-text-mid: #8A8A8A;
+  --cs-text-strong: #484848;
+  --cs-text-on-accent: #FFFFFF;
+  --cs-green-progress: #C3D69B;
+  --cs-green: #7CAC7C;
+  --cs-green-tint: #E4F3E4;
+  --cs-red: #B22222;
+  --cs-red-tint: #FBEAEA;
+  --cs-font-family:
+    "Carlito",
+    "Segoe UI",
+    Arial,
+    sans-serif;
+  --cs-text-xs: 12px;
+  --cs-text-sm: 13px;
+  --cs-text-md: 14px;
+  --cs-text-lg: 16px;
+  --cs-text-xl: 18px;
+  --cs-text-2xl: 22px;
+  --cs-text-3xl: 24px;
+  --cs-space-1: 4px;
+  --cs-space-2: 8px;
+  --cs-space-3: 12px;
+  --cs-space-4: 16px;
+  --cs-space-5: 24px;
+  --cs-space-6: 32px;
+  --cs-radius: 2px;
+  --cs-radius-round: 999px;
+  --cs-focus-ring: 0 0 0 2px rgba(241, 93, 34, 0.35);
+}
+
+/* styles/base.css */
+[class^=cs-],
+[class*=" cs-"],
+[class^=cs-] *,
+[class*=" cs-"] * {
+  box-sizing: border-box;
+}
+[class^=cs-],
+[class*=" cs-"] {
+  -webkit-font-smoothing: antialiased;
+}
+
+/* styles/components/button.css */
+.cs-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--cs-space-1);
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+  border-radius: var(--cs-radius);
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+  box-sizing: border-box;
+}
+.cs-button:focus-visible {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-button:disabled {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+.cs-button__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+.cs-button__label {
+  text-transform: uppercase;
+  letter-spacing: .5px;
+}
+.cs-button--full-width {
+  display: flex;
+  width: 100%;
+}
+.cs-button--sm {
+  font-size: 12px;
+  padding: 4px 12px;
+}
+.cs-button--md {
+  font-size: 13px;
+  padding: 6px 16px;
+}
+.cs-button--lg {
+  font-size: 14px;
+  padding: 8px 20px;
+}
+.cs-button--default {
+  background: var(--cs-surface);
+  border-color: var(--cs-border-strong);
+  color: var(--cs-text);
+}
+.cs-button--default:hover:not(:disabled) {
+  color: var(--cs-orange-deep);
+  border-color: var(--cs-orange-deep);
+}
+.cs-button--default:active:not(:disabled) {
+  color: var(--cs-orange-pressed);
+  border-color: var(--cs-orange-pressed);
+}
+.cs-button--accent {
+  background: var(--cs-orange);
+  border-color: var(--cs-orange);
+  color: var(--cs-text-on-accent);
+}
+.cs-button--accent:hover:not(:disabled) {
+  background: var(--cs-orange-deep);
+  border-color: var(--cs-orange-deep);
+}
+.cs-button--accent:active:not(:disabled) {
+  background: var(--cs-orange-pressed);
+  border-color: var(--cs-orange-pressed);
+}
+.cs-button--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--cs-text);
+}
+.cs-button--ghost:hover:not(:disabled) {
+  color: var(--cs-orange-deep);
+}
+.cs-button--ghost:active:not(:disabled) {
+  color: var(--cs-orange-pressed);
+}
+
+/* styles/components/checkbox.css */
+.cs-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--cs-space-2);
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+  cursor: pointer;
+  user-select: none;
+}
+.cs-checkbox__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.cs-checkbox__box {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  color: var(--cs-text-on-accent);
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-checkbox__input:focus-visible ~ .cs-checkbox__box {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-checkbox:hover .cs-checkbox__box {
+  border-color: var(--cs-orange-deep);
+}
+.cs-checkbox--checked .cs-checkbox__box {
+  background: var(--cs-orange);
+  border-color: var(--cs-orange);
+}
+.cs-checkbox--checked:hover .cs-checkbox__box {
+  background: var(--cs-orange-deep);
+  border-color: var(--cs-orange-deep);
+}
+.cs-checkbox__check {
+  display: block;
+}
+.cs-checkbox__label {
+  font-size: 13px;
+  color: var(--cs-text);
+}
+.cs-checkbox--disabled {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* styles/components/radio.css */
+.cs-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--cs-space-2);
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+  cursor: pointer;
+  user-select: none;
+}
+.cs-radio__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.cs-radio__circle {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius-round);
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-radio__input:focus-visible ~ .cs-radio__circle {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-radio:hover .cs-radio__circle {
+  border-color: var(--cs-orange-deep);
+}
+.cs-radio--checked .cs-radio__circle {
+  border-color: var(--cs-orange);
+}
+.cs-radio--checked:hover .cs-radio__circle {
+  border-color: var(--cs-orange-deep);
+}
+.cs-radio__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--cs-radius-round);
+  background: var(--cs-orange);
+  transition: background-color .12s;
+}
+.cs-radio--checked:hover .cs-radio__dot {
+  background: var(--cs-orange-deep);
+}
+.cs-radio__label {
+  font-size: 13px;
+  color: var(--cs-text);
+}
+.cs-radio--disabled {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* styles/components/text-field.css */
+.cs-text-field {
+  display: inline-flex;
+  flex-direction: column;
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+}
+.cs-text-field--full-width {
+  display: flex;
+  width: 100%;
+}
+.cs-text-field__label {
+  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--cs-text);
+  margin-bottom: 4px;
+}
+.cs-text-field__input {
+  box-sizing: border-box;
+  width: 100%;
+  font-family: var(--cs-font-family);
+  font-size: 14px;
+  color: var(--cs-text-strong);
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  padding: 6px 8px;
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-text-field__input::placeholder {
+  color: var(--cs-text-mid);
+}
+.cs-text-field__input:hover:not(:disabled) {
+  border-color: var(--cs-orange-deep);
+}
+.cs-text-field__input:focus {
+  border-color: var(--cs-orange);
+}
+.cs-text-field__input:focus-visible {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-text-field--error .cs-text-field__input {
+  border-color: var(--cs-red);
+}
+.cs-text-field__error {
+  font-size: 13px;
+  color: var(--cs-red);
+  margin-top: 4px;
+}
+.cs-text-field--disabled {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* styles/components/select.css */
+.cs-select {
+  display: inline-flex;
+  flex-direction: column;
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+}
+.cs-select--full-width {
+  display: flex;
+  width: 100%;
+}
+.cs-select__label {
+  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--cs-text);
+  margin-bottom: 4px;
+}
+.cs-select__control {
+  position: relative;
+  display: flex;
+  width: 100%;
+}
+.cs-select__input {
+  box-sizing: border-box;
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  font-family: var(--cs-font-family);
+  font-size: 14px;
+  color: var(--cs-text-strong);
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  padding: 6px 28px 6px 8px;
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-select__input:hover:not(:disabled) {
+  border-color: var(--cs-orange-deep);
+}
+.cs-select__input:focus {
+  border-color: var(--cs-orange);
+}
+.cs-select__input:focus-visible {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-select__chevron {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--cs-text-mid);
+  pointer-events: none;
+}
+.cs-select--disabled {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* styles/components/slider.css */
+.cs-slider {
+  display: inline-flex;
+  flex-direction: column;
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+}
+.cs-slider__label {
+  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--cs-text);
+  margin-bottom: 4px;
+}
+.cs-slider__row {
+  display: flex;
+  align-items: center;
+  gap: var(--cs-space-2);
+}
+.cs-slider__track-wrap {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+}
+.cs-slider__value {
+  font-size: 13px;
+  color: var(--cs-text-strong);
+  min-width: 2em;
+  text-align: right;
+}
+.cs-slider__input {
+  --cs-slider-fill: 0%;
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  margin: 0;
+  border-radius: var(--cs-radius-round);
+  background:
+    linear-gradient(
+      to right,
+      var(--cs-orange) 0%,
+      var(--cs-orange) var(--cs-slider-fill),
+      var(--cs-grey-300) var(--cs-slider-fill),
+      var(--cs-grey-300) 100%);
+  transition: box-shadow .12s;
+}
+.cs-slider__input::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: var(--cs-radius-round);
+  background: transparent;
+}
+.cs-slider__input::-moz-range-track {
+  height: 4px;
+  border-radius: var(--cs-radius-round);
+  background: transparent;
+}
+.cs-slider__input::-moz-range-progress {
+  height: 4px;
+  border-radius: var(--cs-radius-round);
+  background: var(--cs-orange);
+}
+.cs-slider__input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: var(--cs-radius-round);
+  background: var(--cs-surface);
+  border: 2px solid var(--cs-orange);
+  box-sizing: border-box;
+  cursor: pointer;
+  transition: border-color .12s;
+}
+.cs-slider__input::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: var(--cs-radius-round);
+  background: var(--cs-surface);
+  border: 2px solid var(--cs-orange);
+  box-sizing: border-box;
+  cursor: pointer;
+  transition: border-color .12s;
+}
+.cs-slider__input:hover:not(:disabled)::-webkit-slider-thumb {
+  border-color: var(--cs-orange-deep);
+}
+.cs-slider__input:hover:not(:disabled)::-moz-range-thumb {
+  border-color: var(--cs-orange-deep);
+}
+.cs-slider__input:focus-visible {
+  outline: none;
+}
+.cs-slider__input:focus-visible::-webkit-slider-thumb {
+  box-shadow: var(--cs-focus-ring);
+}
+.cs-slider__input:focus-visible::-moz-range-thumb {
+  box-shadow: var(--cs-focus-ring);
+}
+.cs-slider--disabled {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* styles/components/panel.css */
+.cs-panel {
+  box-sizing: border-box;
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border);
+  border-radius: var(--cs-radius);
+}
+.cs-panel--padded {
+  padding: var(--cs-space-4);
+}
+.cs-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--cs-space-2);
+  margin-bottom: var(--cs-space-3);
+}
+.cs-panel__title {
+  text-transform: uppercase;
+  font-size: var(--cs-text-sm);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--cs-text-strong);
+}
+.cs-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--cs-space-2);
+}
+.cs-panel__body {
+  color: var(--cs-text);
+}
+
+/* styles/components/section-heading.css */
+.cs-section-heading {
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-sm);
+  font-weight: 700;
+  color: var(--cs-text);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  margin: 0;
+}
+
+/* styles/components/nav-tabs.css */
+.cs-nav-tabs {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--cs-space-6);
+  background: transparent;
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+}
+.cs-nav-tabs__tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--cs-space-1);
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  color: var(--cs-text-mid);
+  font-family: inherit;
+  transition:
+    color 0.12s,
+    background-color 0.12s,
+    border-color 0.12s;
+}
+.cs-nav-tabs__tab:focus-visible {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-nav-tabs__tab:hover {
+  color: var(--cs-orange-deep);
+}
+.cs-nav-tabs__tab--active,
+.cs-nav-tabs__tab--active:hover {
+  color: var(--cs-orange);
+}
+.cs-nav-tabs__icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  font-size: 32px;
+  line-height: 1;
+  color: inherit;
+}
+.cs-nav-tabs__label {
+  font-size: var(--cs-text-sm);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: inherit;
+}
+
+/* styles/components/toolbar.css */
+.cs-toolbar {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--cs-space-1);
+  padding: 4px 8px;
+  background: var(--cs-surface);
+  border: none;
+  border-bottom: 1px solid var(--cs-border);
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+}
+.cs-toolbar-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--cs-space-1);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--cs-radius);
+  padding: 4px 6px;
+  margin: 0;
+  cursor: pointer;
+  color: var(--cs-text);
+  font-family: inherit;
+  transition:
+    color 0.12s,
+    background-color 0.12s,
+    border-color 0.12s;
+}
+.cs-toolbar-button:hover:not(:disabled) {
+  color: var(--cs-orange-deep);
+  border-color: var(--cs-border);
+}
+.cs-toolbar-button:focus-visible {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-toolbar-button--active {
+  color: var(--cs-orange);
+}
+.cs-toolbar-button--active:hover:not(:disabled) {
+  color: var(--cs-orange-deep);
+}
+.cs-toolbar-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+  pointer-events: none;
+}
+.cs-toolbar-button__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: 18px;
+  line-height: 1;
+  color: inherit;
+}
+.cs-toolbar-button__label {
+  font-size: var(--cs-text-sm);
+  color: inherit;
+  white-space: nowrap;
+}
+.cs-toolbar-separator {
+  display: inline-block;
+  width: 1px;
+  height: 20px;
+  margin: 0 6px;
+  background: var(--cs-grey-300);
+  border: none;
+}
+
+/* styles/components/step-marker.css */
+.cs-step-marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--cs-radius-round);
+  border: 2px solid var(--cs-orange);
+  background: var(--cs-surface);
+  color: var(--cs-orange);
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  font-weight: 700;
+  line-height: 1;
+  transition:
+    color 0.12s,
+    background-color 0.12s,
+    border-color 0.12s;
+}
+.cs-step-marker--filled {
+  background: var(--cs-orange);
+  color: var(--cs-text-on-accent);
+}
+
+/* styles/components/data-table.css */
+.cs-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+}
+.cs-data-table__head .cs-data-table__cell {
+  background: var(--cs-grey-200);
+  text-transform: uppercase;
+  font-size: var(--cs-text-xs);
+  font-weight: bold;
+  color: var(--cs-text);
+  letter-spacing: .5px;
+  text-align: left;
+  padding: 8px 12px;
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-data-table--dense .cs-data-table__head .cs-data-table__cell {
+  padding: 6px 12px;
+}
+.cs-data-table__body .cs-data-table__cell {
+  background: var(--cs-surface);
+  border-bottom: 1px solid var(--cs-grey-100);
+  font-size: var(--cs-text-sm);
+  color: var(--cs-text-strong);
+  padding: 8px 12px;
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-data-table--dense .cs-data-table__body .cs-data-table__cell {
+  padding: 6px 12px;
+}
+.cs-data-table__row--body:hover .cs-data-table__cell {
+  background: var(--cs-surface-alt);
+}
+.cs-data-table__row--selected .cs-data-table__cell {
+  background: var(--cs-orange-tint);
+}
+.cs-data-table__cell--checkbox {
+  width: 36px;
+  text-align: center;
+}
+.cs-data-table__empty {
+  text-align: center;
+  color: var(--cs-text-mid);
+  padding: var(--cs-space-4);
+}
+
+/* styles/components/progress-bar.css */
+.cs-progress-bar {
+  position: relative;
+  width: 100%;
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.cs-progress-bar__fill {
+  height: 100%;
+  border-radius: 0;
+  transition: width .12s;
+}
+.cs-progress-bar--green .cs-progress-bar__fill {
+  background: var(--cs-green-progress);
+}
+.cs-progress-bar--accent .cs-progress-bar__fill {
+  background: var(--cs-orange);
+}
+.cs-progress-bar__label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--cs-text-xs);
+  font-weight: bold;
+  color: var(--cs-text-strong);
+}
+
+/* styles/components/status-badge.css */
+.cs-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: var(--cs-radius);
+  border: 1px solid transparent;
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-xs);
+  font-weight: bold;
+  text-transform: uppercase;
+  color: var(--cs-text);
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-status-badge__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--cs-radius-round);
+  background: currentColor;
+  flex: 0 0 auto;
+}
+.cs-status-badge--neutral {
+  background: var(--cs-grey-150);
+  color: var(--cs-text-strong);
+}
+.cs-status-badge--pending {
+  background: var(--cs-surface-alt);
+  color: var(--cs-text-mid);
+  border-style: dashed;
+  border-width: 1px;
+  border-color: var(--cs-border-strong);
+}
+.cs-status-badge--success {
+  background: var(--cs-green-tint);
+  color: #3D6B3D;
+}
+.cs-status-badge--error {
+  background: var(--cs-red-tint);
+  color: var(--cs-red);
+}
+.cs-status-badge--info {
+  background: #E3F1F9;
+  color: var(--cs-blue);
+}
+.cs-status-badge--accent {
+  background: var(--cs-orange-tint);
+  color: var(--cs-orange-deep);
+}
+
+/* styles/components/dialog.css */
+.cs-dialog {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, .35);
+  font-family: var(--cs-font-family);
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+}
+.cs-dialog__window {
+  background: var(--cs-surface);
+  border: 1px solid var(--cs-border-strong);
+  border-radius: var(--cs-radius);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, .18);
+  display: flex;
+  flex-direction: column;
+  max-width: 100%;
+}
+.cs-dialog__title-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--cs-grey-300);
+}
+.cs-dialog__title {
+  font-size: var(--cs-text-lg);
+  font-weight: bold;
+  color: var(--cs-text-strong);
+}
+.cs-dialog__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--cs-text);
+  font-size: var(--cs-text-lg);
+  line-height: 1;
+  cursor: pointer;
+  border-radius: var(--cs-radius);
+  transition:
+    color .12s,
+    background-color .12s,
+    border-color .12s;
+}
+.cs-dialog__close:hover:not(:disabled) {
+  color: var(--cs-orange-deep);
+}
+.cs-dialog__close:focus-visible {
+  box-shadow: var(--cs-focus-ring);
+  outline: none;
+}
+.cs-dialog__close:disabled {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+.cs-dialog__body {
+  padding: 16px;
+  font-size: var(--cs-text-md);
+  color: var(--cs-text);
+}
+.cs-dialog__footer {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--cs-grey-100);
+}
