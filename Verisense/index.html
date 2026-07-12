@@ -11,82 +11,120 @@
   </script>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Verisense Stream (Accel + GSR)</title>
+  <meta name="description" content="Stream and log data from the Verisense wrist sensor with live canvas plots." />
+  <title>Verisense · Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="../shared/favicon.svg" />
+  <link rel="stylesheet" href="../shared/shimmer-ui.css" />
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 16px; }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin: 10px 0; }
-    button, select, input { padding: 10px 12px; }
-    .card { border: 1px solid #444; border-radius: 12px; padding: 12px; }
-    pre { background:#111; color:#ddd; padding:10px; border-radius:12px; overflow:auto; max-height: 320px; }
-    small { color:#666; }
-    .grid { display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
-    canvas { display:block; }
+    /* App-specific bits only — everything else comes from shimmer-ui.css */
+    .plot-frame {
+      display: flex;
+      justify-content: center;
+      padding: var(--cs-space-2);
+      background: #141414;
+      border: 1px solid var(--cs-border-strong);
+      border-top: 2px solid var(--accent);
+      border-radius: var(--cs-radius);
+      margin-top: var(--cs-space-2);
+    }
+    .plot-frame canvas {
+      display: block;
+      width: 100%;
+      max-width: 520px;
+      height: auto;
+      background: #111;
+    }
+    .live-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--cs-space-4);
+    }
+    @media (max-width: 720px) {
+      .live-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h2>Verisense Stream (Accel1 + GSR)</h2>
-  <small>Must be served over <b>https</b> or <b>http://localhost</b>. Click buttons (user gesture required).</small>
+  <header class="app-header">
+    <a class="brand" href="../">
+      <span class="brand-mark"></span>
+      <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+    </a>
+    <span class="app-title">Verisense</span>
+    <span class="spacer"></span>
+    <a class="back-link" href="../">← All demos</a>
+  </header>
 
-  <div class="card">
+  <main class="app-main">
 
-    <div class="row">
-      <button id="btnConnect" disabled>Connect (BLE)</button>
-      <button id="btnConnectSerial">Connect USB (Serial)</button>
-      <button id="btnDisconnect" disabled>Disconnect</button>
-    </div>
+    <p class="muted">Must be served over <b>https</b> or <b>http://localhost</b>. Click buttons (user gesture required).</p>
 
-    <div class="row">
-      <button id="btnStart" disabled>Start streaming</button>
-      <button id="btnStop" disabled>Stop streaming</button>
-      <button id="btnSync" disabled>Sync logged data (.bin)</button>
-      <span id="status">Status: idle</span>
-    </div>
-  </div>
-
-    <div class="card" style="margin-top:12px;">
-      <div class="row">
-        <b>Operational Config</b>
-        <button id="btnApplyOpCfg" disabled>Apply</button>
-        <span id="opcfgStatus" style="opacity:0.8;"></span>
+    <div class="card">
+      <h3>Connection</h3>
+      <div class="toolbar">
+        <button id="btnConnect" class="btn btn-primary" disabled>Connect (BLE)</button>
+        <button id="btnConnectSerial" class="btn btn-secondary">Connect USB (Serial)</button>
+        <button id="btnDisconnect" class="btn btn-danger" disabled>Disconnect</button>
       </div>
+      <div class="toolbar" style="margin-top:8px">
+        <button id="btnStart" class="btn btn-success" disabled>Start streaming</button>
+        <button id="btnStop" class="btn btn-danger" disabled>Stop streaming</button>
+        <span class="spacer"></span>
+        <span id="status" class="status-pill is-idle">Status: idle</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Configuration</h3>
       <div class="row">
+        <span class="muted"><b>Operational Config</b></span>
+        <button id="btnApplyOpCfg" class="btn btn-secondary btn-sm" disabled>Apply</button>
+        <span id="opcfgStatus" class="muted"></span>
+      </div>
+      <div class="row" style="margin-top:8px">
         <label><input type="checkbox" id="chkAccelEnable" checked /> Accel1 enabled</label>
         <label><input type="checkbox" id="chkGsrEnable" checked /> GSR enabled</label>
         <label><input type="checkbox" id="chkBattEnable" checked /> Battery</label>
-        <small style="opacity:0.8;">(Checkboxes affect parsing immediately; <b>Apply</b> writes to device.)</small>
+      </div>
+      <p class="muted" style="margin-top:8px">(Checkboxes affect parsing immediately; <b>Apply</b> writes to device.)</p>
+    </div>
+
+    <div class="card">
+      <h3>Live Data</h3>
+      <div class="live-grid">
+        <div>
+          <h4>Latest accel sample</h4>
+          <div id="latest" class="muted">—</div>
+          <div class="plot-frame"><canvas id="plot" width="520" height="170"></canvas></div>
+          <small id="plotInfo" class="muted"></small>
+        </div>
+        <div>
+          <h4>Latest GSR sample</h4>
+          <div id="latestGsr" class="muted">—</div>
+          <div class="plot-frame"><canvas id="plotGsr" width="520" height="170"></canvas></div>
+          <small id="plotGsrInfo" class="muted"></small>
+        </div>
       </div>
     </div>
 
-    <div class="grid">
     <div class="card">
-      <h3>Latest accel sample</h3>
-      <div id="latest">—</div>
-      <canvas id="plot" width="520" height="170" style="width:100%; background:#111; border-radius:12px; margin-top:8px;"></canvas>
-      <small id="plotInfo"></small>
+      <h3>Log Sync</h3>
+      <div class="toolbar">
+        <button id="btnSync" class="btn btn-secondary" disabled>Sync logged data (.bin)</button>
+        <button id="btnClear" class="btn btn-secondary">Clear log</button>
+      </div>
+      <pre id="log" class="console" aria-live="polite" style="margin-top:12px"></pre>
     </div>
 
     <div class="card">
-      <h3>Latest GSR sample</h3>
-      <div id="latestGsr">—</div>
-      <canvas id="plotGsr" width="520" height="170" style="width:100%; background:#111; border-radius:12px; margin-top:8px;"></canvas>
-      <small id="plotGsrInfo"></small>
-    </div>
-
-    <div class="card">
-      <h3>Log</h3>
-      <pre id="log"></pre>
-      <div class="row">
-        <button id="btnClear">Clear log</button>
+      <h3>Firmware</h3>
+      <div class="toolbar">
+        <a href="https://shimmerengineering.github.io/ASM_web-bluetooth-dfu/examples/web.html"
+           target="_blank" rel="noopener" class="btn btn-secondary">Open DFU Update Tool ↗</a>
       </div>
     </div>
-  </div>
-<div class="dfu-link-container" style="margin: 10px 0;">
-    <a href="https://shimmerengineering.github.io/ASM_web-bluetooth-dfu/examples/web.html" 
-       target="_blank" 
-       style="background-color: #007bff; color: white; padding: 10px 15px; text-decoration: none; border-radius: 5px; font-family: sans-serif; display: inline-block;">
-        🔗 Open DFU Update Tool
-    </a>
-</div>
+
+  </main>
 <script type="module">
     import { VerisenseBleDevice } from "./verisense.js";
 

@@ -10,7 +10,11 @@
     gtag('config', 'G-T26GWN0LJW');
   </script>
   <meta charset="UTF-8" />
-  <title>ShimmerCapture (Shimmer3R)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Developer workbench for Shimmer3R: enable any sensor, watch live plots, and export to CSV." />
+  <title>Shimmer Capture · Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="../shared/favicon.svg" />
+  <link rel="stylesheet" href="../shared/shimmer-ui.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script type="module">
     import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js';
@@ -277,14 +281,18 @@ function hashString(s) {
   return (h >>> 0); // uint32
 }
 
-// Map hash -> pretty HSL color
+// Map hash -> a series color from the instrument palette (orange/blue/grey idiom)
+const SERIES_PALETTE = ['#F15D22', '#0081C6', '#5B5B5B', '#E8A013', '#2F8F46', '#8B5CF6'];
+function hexToRgba(hex, alpha) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
 function colorFromLabel(label, alpha = 1) {
-  const h = hashString(label) % 360; // hue 0–359
-  const s = 68;                      // saturation %
-  const l = 52;                      // lightness %
+  const hex = SERIES_PALETTE[hashString(label) % SERIES_PALETTE.length];
   return {
-    border: `hsl(${h} ${s}% ${l}%)`,
-    fill: `hsla(${h} ${s}% ${l}% / ${alpha})`
+    border: hex,
+    fill: hexToRgba(hex, alpha)
   };
 }
 
@@ -322,8 +330,20 @@ function rebuildChart() {
       animation: false,
       parsing: false,
       scales: {
-        x: { type: 'linear', title: { text: 'Sample Index', display: true } },
-        y: { title: { text: 'Value', display: true } }
+        x: {
+          type: 'linear',
+          title: { text: 'Sample Index', display: true, color: '#5B5B5B', font: { family: 'Carlito, sans-serif' } },
+          ticks: { color: '#5B5B5B', font: { family: 'Carlito, sans-serif' } },
+          grid: { color: '#EAEAEA' }
+        },
+        y: {
+          title: { text: 'Value', display: true, color: '#5B5B5B', font: { family: 'Carlito, sans-serif' } },
+          ticks: { color: '#5B5B5B', font: { family: 'Carlito, sans-serif' } },
+          grid: { color: '#EAEAEA' }
+        }
+      },
+      plugins: {
+        legend: { labels: { color: '#5B5B5B', font: { family: 'Carlito, sans-serif' } } }
       }
     }
   });
@@ -373,39 +393,92 @@ if (!isStreaming || !chart) return;
   </script>
 
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    #toolbar { margin-bottom: 10px; }
-    #chart { width: 100%; height: 400px; }
-    button { margin-right: 6px; }
-    #signalList { margin-top: 8px; }
-    #log { font-size: 0.9em; color: #555; margin-top: 6px; }
-    label.exp { margin-left: 12px; margin-right: 8px; }
+    /* App-specific bits only — everything else comes from shimmer-ui.css */
+    #sensorMenu { width: 240px; max-width: 100%; }
+    #chart { width: 100%; max-width: 100%; height: 360px; }
+    #signalList { display: flex; flex-wrap: wrap; gap: var(--cs-space-2); }
+    #signalList label {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 10px;
+      border: 1px solid var(--cs-border);
+      border-radius: var(--cs-radius);
+      background: var(--cs-surface-alt);
+    }
+    #signalList br { display: none; }
   </style>
 </head>
 <body>
-  <h2>Shimmer Capture (Shimmer3R BLE)</h2>
-  <div id="toolbar">
-      <button id="connectBtn">Connect</button>
-      <button id="startBtn">Start BT Stream</button>
-      <button id="stopBtn">Stop BT</button>
-      <button id="startSDBTBtn">Start BT+SD</button>
-      <button id="stopSDBTBtn">Stop BT+SD</button>
-      <button id="disconnectBtn">Disconnect</button>
-      <button id="saveBtn">Start Saving</button>
-      <select id="sensorMenu" multiple size="5" style="margin-left:10px; min-width: 220px;"></select>
-      <button id="applySensorsBtn">Apply Sensors</button>
-      <button id="exgTestBtn" disabled>EXG Test (16‑bit)</button>
-      <button id="emg16Btn" disabled>Enable EMG 16‑bit</button>
-      <button id="ecg16Btn" disabled>Enable ECG 16‑bit</button>
+  <header class="app-header">
+    <a class="brand" href="../">
+      <span class="brand-mark"></span>
+      <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+    </a>
+    <span class="app-title">Shimmer Capture</span>
+    <span class="spacer"></span>
+    <a class="back-link" href="../">← All demos</a>
+  </header>
 
-      <!-- Expansion power checkbox -->
-      <label class="exp"><input id="expPowerChk" type="checkbox"> Expansion Power</label>
-  </div>
+  <main class="app-main">
 
-  <div id="status"></div>
-  <div id="signalList"></div>
-  <small id="signalNote" style="color:#666"></small>
-  <canvas id="chart"></canvas>
-  <div id="log"></div>
+    <div class="card">
+      <h3>Connection</h3>
+      <div class="toolbar">
+        <button id="connectBtn" class="btn btn-primary">Connect</button>
+        <button id="disconnectBtn" class="btn btn-danger">Disconnect</button>
+        <span class="spacer"></span>
+        <span id="status" class="status-pill is-idle">Idle</span>
+      </div>
+      <pre id="log" class="console" aria-live="polite" style="margin-top:12px"></pre>
+    </div>
+
+    <div class="card">
+      <h3>Configuration</h3>
+      <div class="stack">
+        <div class="row">
+          <label for="sensorMenu">Sensors</label>
+        </div>
+        <div class="row">
+          <select id="sensorMenu" multiple size="5"></select>
+          <button id="applySensorsBtn" class="btn btn-secondary">Apply Sensors</button>
+        </div>
+        <div class="toolbar">
+          <button id="exgTestBtn" class="btn btn-secondary" disabled>EXG Test (16‑bit)</button>
+          <button id="emg16Btn" class="btn btn-secondary" disabled>Enable EMG 16‑bit</button>
+          <button id="ecg16Btn" class="btn btn-secondary" disabled>Enable ECG 16‑bit</button>
+          <span class="spacer"></span>
+          <label class="exp"><input id="expPowerChk" type="checkbox"> Expansion Power</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Streaming</h3>
+      <div class="toolbar">
+        <button id="startBtn" class="btn btn-success">Start BT Stream</button>
+        <button id="stopBtn" class="btn btn-danger">Stop BT</button>
+        <button id="startSDBTBtn" class="btn btn-success">Start BT+SD</button>
+        <button id="stopSDBTBtn" class="btn btn-danger">Stop BT+SD</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Signals</h3>
+      <div id="signalList"></div>
+      <small id="signalNote" class="muted"></small>
+    </div>
+
+    <div class="card">
+      <h3>Live Data</h3>
+      <canvas id="chart"></canvas>
+    </div>
+
+    <div class="card">
+      <h3>Export</h3>
+      <div class="toolbar">
+        <button id="saveBtn" class="btn btn-secondary">Start Saving</button>
+      </div>
+    </div>
+
+  </main>
 </body>
 </html>
