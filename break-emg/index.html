@@ -5,88 +5,174 @@
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
   <script>
     window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}    
+    function gtag(){dataLayer.push(arguments);}
     gtag('js', new Date());
     gtag('config', 'G-T26GWN0LJW');
   </script>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Breakout Game (EMG) — Shimmer3R API</title>
+  <meta name="description" content="Play Breakout with your muscles — flex your wrist to drive the paddle via Shimmer3R EMG." />
+  <title>EMG Breakout · Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="../shared/favicon.svg" />
+  <link rel="stylesheet" href="../shared/shimmer-ui.css" />
   <style>
-    body { margin:0; padding:0; background:#000; color:white; font-family:sans-serif; display:block; overflow-y:auto; }
-    button { margin:5px; padding:10px 16px; font-size:16px; border-radius:6px; border:none; cursor:pointer; }
-    #scanBtn { background:#2196F3; color:white; }
-    #connectBtn { background:#4CAF50; color:white; }
-    #streamBtn { background:#FFC107; color:black; }
-    #disconnectBtn { background:#f44336; color:white; }
-    #startBtn { background:#9C27B0; color:white; }
-    #consoleOutput { background:#000; color:#0f0; padding:10px; margin:10px auto; max-width:480px; font-family:monospace; font-size:16px; border:1px solid #0f0; width:90%; line-height:1.4em; max-height:calc(1.4em * 12); overflow-y:auto; }
-    canvas { background:#111; border:2px solid #fff; width:100%; max-width:480px; height:auto; max-height:540px; display:block; margin:20px auto; box-sizing:border-box; }
-    #controls { display:flex; flex-wrap:wrap; justify-content:center; align-items:center; gap:10px; margin-top:10px; text-align:center; }
-    #controls button, #controls p { margin:5px; }
-    #banner { width:100%; max-width:1000px; margin:10px auto 0; background-image:url('banner.png'); background-repeat:no-repeat; background-position:center; background-size:contain; aspect-ratio:3 / 1; }
-    #introOverlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); color:white; display:flex; justify-content:center; align-items:center; z-index:9999; }
-    .introContent { max-width:550px; padding:20px; background:#111; border:2px solid white; border-radius:12px; overflow-y:auto; max-height:90vh; }
+    /* ---- App-specific bits only (Consensys light idiom in shared CSS) ---- */
+
+    /* Arcade banner art — dark inset, same idiom as .game-frame/.console */
+    #banner {
+      width: 100%;
+      max-width: 640px;
+      margin: 0 auto var(--cs-space-3);
+      background-color: #141414;
+      background-image: url('banner.png');
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: contain;
+      aspect-ratio: 3 / 1;
+      border: 1px solid var(--cs-border-strong);
+      border-radius: var(--cs-radius);
+    }
+
+    /* EMG live-signal plots — dark inset, matches .console/.game-frame idiom */
+    .emg-frame {
+      background: #141414;
+      border: 1px solid var(--cs-border-strong);
+      border-radius: var(--cs-radius);
+      padding: var(--cs-space-3);
+    }
+    .emg-frame + .emg-frame { margin-top: var(--cs-space-3); }
+    .emg-label {
+      font-size: var(--cs-text-xs);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: var(--cs-letterspace-label);
+      margin-bottom: var(--cs-space-2);
+    }
+    .emg-frame canvas {
+      display: block;
+      width: 100%;
+      max-width: 480px;
+      height: auto;
+      background: #0E1116;
+      margin: 0 auto;
+    }
+
+    /* Game-over / win toast */
+    #customAlert {
+      display: none;
+      position: fixed;
+      bottom: var(--cs-space-4);
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 420px;
+      background: var(--cs-surface);
+      color: var(--cs-text-strong);
+      border: 1px solid var(--cs-red);
+      border-radius: var(--cs-radius);
+      box-shadow: 0 4px 18px rgba(0, 0, 0, .18);
+      padding: var(--cs-space-3) var(--cs-space-4);
+      font-size: var(--cs-text-sm);
+      text-align: center;
+      z-index: 9999;
+    }
   </style>
 </head>
 <body>
-<div id="introOverlay">
-  <div class="introContent">
-    <h2>🎮 EMG Wrist-Controlled Paddle Game</h2>
-    <p><strong>Requirements:</strong></p>
-    <ul>
-      <li><strong>Device:</strong> Shimmer3R (EMG)</li>
-      <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
-    </ul>
-    <hr />
-    <h3>⚡ EMG Electrode Placement</h3>
-    <p>This game uses <strong>wrist extension</strong> and <strong>wrist flexion</strong> to control the paddle. To get good signals, place electrodes on the belly of each muscle. For the right hand, use EMG1 (Ch1N red and Ch1P brown). Polarity doesn't matter because the signal is rectified.
-    Place the reference electrode (green) at an electrically neutral bony prominence (e.g., wrist).</p>
-    <a href="example.png" target="_blank" style="color:#0af; text-decoration:underline;">Example</a>
-    <a href="break-emg-demo.mp4" target="_blank" style="color:#0af; text-decoration:underline;">🎥 Demo Video</a>
+<header class="app-header">
+  <a class="brand" href="../">
+    <span class="brand-mark"></span>
+    <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+  </a>
+  <span class="app-title">EMG Breakout</span>
+  <span class="spacer"></span>
+  <a class="back-link" href="../">← All demos</a>
+</header>
 
-    <h4>✅ FLEXION — Locate Flexor Muscles</h4>
-    <ul><li>📍 <strong>Target:</strong> Flexor carpi radialis / ulnaris</li><li>🔘 <strong>Location:</strong> Inner forearm, 2–3 fingers below elbow</li></ul>
-    <ol><li>Sit with palm up</li><li>Bend wrist toward body</li><li>Place electrode on firm bulge</li></ol>
+<main class="app-main">
+  <div id="introOverlay" class="overlay" role="dialog" aria-modal="true">
+    <div class="overlay-panel">
+      <h2>EMG Wrist-Controlled Paddle Game</h2>
+      <p><strong>Requirements:</strong></p>
+      <ul>
+        <li><strong>Device:</strong> Shimmer3R (EMG)</li>
+        <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
+      </ul>
+      <hr />
+      <h3>Electrode Placement</h3>
+      <p>This game uses <strong>wrist extension</strong> and <strong>wrist flexion</strong> to control the paddle. To get good signals, place electrodes on the belly of each muscle. For the right hand, use EMG1 (Ch1N red and Ch1P brown). Polarity doesn't matter because the signal is rectified.
+      Place the reference electrode (green) at an electrically neutral bony prominence (e.g., wrist).</p>
+      <p class="row">
+        <a href="example.png" target="_blank">Example image ↗</a>
+        <a href="break-emg-demo.mp4" target="_blank">Demo video ↗</a>
+      </p>
 
-    <h4>✅ EXTENSION — Locate Extensor Muscles</h4>
-    <ul><li>📍 <strong>Target:</strong> Extensor carpi radialis longus</li><li>🔘 <strong>Location:</strong> Outer top of forearm, near elbow</li></ul>
-    <ol><li>Rest forearm palm-down</li><li>Lift hand upward</li><li>Place electrode on tightening band</li></ol>
+      <h4>Flexion — locate flexor muscles</h4>
+      <ul><li><strong>Target:</strong> Flexor carpi radialis / ulnaris</li><li><strong>Location:</strong> Inner forearm, 2–3 fingers below elbow</li></ul>
+      <ol><li>Sit with palm up</li><li>Bend wrist toward body</li><li>Place electrode on firm bulge</li></ol>
 
-    <p style="font-size:14px;color:#ccc;">Tip: adjust the activation threshold slider to tune sensitivity.</p>
-    <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
-      <input type="checkbox" id="dontShowAgain" />
-      <label for="dontShowAgain">Don't show this again</label>
+      <h4>Extension — locate extensor muscles</h4>
+      <ul><li><strong>Target:</strong> Extensor carpi radialis longus</li><li><strong>Location:</strong> Outer top of forearm, near elbow</li></ul>
+      <ol><li>Rest forearm palm-down</li><li>Lift hand upward</li><li>Place electrode on tightening band</li></ol>
+
+      <p class="muted">Tip: adjust the activation threshold slider to tune sensitivity.</p>
+      <div class="overlay-foot">
+        <label><input type="checkbox" id="dontShowAgain" /> Don't show this again</label>
+        <button id="closeIntroBtn" class="btn btn-primary">Got it!</button>
+      </div>
     </div>
-    <button id="closeIntroBtn">Got it!</button>
   </div>
-</div>
 
-<div id="controls">
-  <button id="scanBtn">🔍 Scan / Connect (API)</button>
-  <button id="streamBtn" disabled>📡 Start Streaming</button>
-  <button id="disconnectBtn" disabled>❌ Disconnect</button>
-  <button id="showTipBtn">💡 Show Tip</button>
-  <p id="deviceName">No device selected</p>
-  <div style="text-align:center; margin-top:10px;">
-    <label for="onThreshSlider">Activation Threshold: <span id="threshLabel">3</span></label><br />
-    <input type="range" id="onThreshSlider" min="1" max="20" step="0.1" value="3" style="width:300px;" />
+  <div class="card">
+    <h3>Device</h3>
+    <div class="toolbar">
+      <button id="scanBtn" class="btn btn-primary">Scan / Connect</button>
+      <button id="streamBtn" class="btn btn-success" disabled>Start Streaming</button>
+      <button id="disconnectBtn" class="btn btn-danger" disabled>Disconnect</button>
+      <span class="spacer"></span>
+    </div>
+    <p id="deviceName" class="muted" style="margin-top:12px">No device selected</p>
+    <div id="consoleWrapper">
+      <pre id="consoleOutput" class="console" aria-live="polite"></pre>
+    </div>
   </div>
-  <div style="text-align:center; margin-top:10px;">
-    <label for="ballSpeedSlider">Ball Speed: <span id="ballSpeedLabel">175</span></label><br />
-    <input type="range" id="ballSpeedSlider" min="50" max="350" step="5" value="175" style="width:300px;" />
-  </div>
-</div>
 
-<div id="consoleWrapper"><pre id="consoleOutput"></pre></div>
-<div id="banner"></div>
-<div style="text-align:center; margin-top:20px;"><button id="startBtn">▶️ Start Game</button></div>
-<div style="text-align:center; margin-top:10px;"><input type="checkbox" id="autoRestart" /> <label for="autoRestart">Auto-restart after Game Over (5s)</label></div>
-<canvas id="breakout"></canvas>
-<div style="text-align:center; color:#0f0; font-family:monospace; font-size:16px;">📈 EMG Signal 1 (brown - red)</div>
-<canvas id="emg1Plot" width="480" height="100" style="background:#111; border:1px solid #0f0; display:block; margin:5px auto 20px;"></canvas>
-<div style="text-align:center; color:#f0f; font-family:monospace; font-size:16px;">📈 EMG Signal 2 (black - white)</div>
-<canvas id="emg2Plot" width="480" height="100" style="background:#111; border:1px solid #0f0; display:block; margin:5px auto 20px;"></canvas>
+  <div class="card">
+    <h3>Controls</h3>
+    <div class="stack">
+      <div>
+        <label for="onThreshSlider">Activation Threshold: <span id="threshLabel">3</span></label><br />
+        <input type="range" id="onThreshSlider" min="1" max="20" step="0.1" value="3" style="width:100%; max-width:300px;" />
+      </div>
+      <div>
+        <label for="ballSpeedSlider">Ball Speed: <span id="ballSpeedLabel">175</span></label><br />
+        <input type="range" id="ballSpeedSlider" min="50" max="350" step="5" value="175" style="width:100%; max-width:300px;" />
+      </div>
+      <button id="showTipBtn" class="btn btn-secondary btn-sm" style="align-self:flex-start">Show Tip</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Game</h3>
+    <div class="row" style="margin-bottom:var(--cs-space-3)">
+      <button id="startBtn" class="btn btn-primary">Start Game</button>
+      <label><input type="checkbox" id="autoRestart" /> Auto-restart after Game Over (5s)</label>
+    </div>
+    <div id="banner"></div>
+    <div class="game-frame"><canvas id="breakout"></canvas></div>
+  </div>
+
+  <div class="card">
+    <h3>EMG Signals</h3>
+    <div class="emg-frame">
+      <div class="emg-label" style="color:#3FCB6E">EMG Signal 1 (brown – red)</div>
+      <canvas id="emg1Plot" width="480" height="100"></canvas>
+    </div>
+    <div class="emg-frame">
+      <div class="emg-label" style="color:#E066E0">EMG Signal 2 (black – white)</div>
+      <canvas id="emg2Plot" width="480" height="100"></canvas>
+    </div>
+  </div>
+</main>
 
 <!-- ===================== -->
 <!-- Core logic and game   -->
@@ -127,7 +213,7 @@ client.onStreamFrame = (oc) => {
   if (typeof ch1 !== 'number' || typeof ch2 !== 'number') return;
 
   // === EMG1 filtering ===
-  emg1FIR[firIndex] = ch1; 
+  emg1FIR[firIndex] = ch1;
   let filtered = 0;
   for (let i=0;i<hpKernel.length;i++){
     const idx=(firIndex - i + firLen) % firLen;
@@ -140,7 +226,7 @@ client.onStreamFrame = (oc) => {
   const smoothed = emg1Smooth.reduce((a,b)=>a+b,0) / smoothWindow;
 
   // === EMG2 filtering ===
-  emg2FIR[firIndex2] = ch2; 
+  emg2FIR[firIndex2] = ch2;
   let filtered2 = 0;
   for (let i=0;i<hpKernel2.length;i++){
     const idx=(firIndex2 - i + firLen) % firLen;
@@ -178,7 +264,7 @@ client.onStreamFrame = (oc) => {
   document.getElementById('scanBtn').addEventListener('click', async () => {
     try {
       await client.connect(); // requestDevice + GATT connect + start notifications
-	  
+
 	        // Apply equivalent config through the API
       await client.setInternalExpPower(1);                // expansion power on
       await sleep(200);
@@ -190,7 +276,7 @@ client.onStreamFrame = (oc) => {
       await sleep(200);
       // Optional: Inquiry to build schema (channels, timestamp width, etc.)
       await client.inquiry();
-	  
+
       deviceNameEl.textContent = `Selected: ${client.device?.name || 'Shimmer3R'}`;
       document.getElementById('streamBtn').disabled = false;
       document.getElementById('disconnectBtn').disabled = false;
@@ -375,9 +461,9 @@ client.onStreamFrame = (oc) => {
   function showCustomAlert(message, duration=3000){ const el=document.getElementById('customAlert'); el.textContent=message; el.style.display='block'; setTimeout(()=>{ el.style.display='none'; }, duration); }
 
   // Keyboard/gamepad flags
-  
+
 </script>
 
-<div id="customAlert" style="display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#222; color:#fff; padding:16px 24px; border:2px solid #f00; border-radius:10px; font-size:16px; z-index:9999; text-align:center;">Game Over! You can still move the paddle. Press Start Game to restart.</div>
+<div id="customAlert">Game Over! You can still move the paddle. Press Start Game to restart.</div>
 </body>
 </html>

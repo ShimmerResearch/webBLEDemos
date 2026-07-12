@@ -11,165 +11,113 @@
   </script>
 
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Breakout Game</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Classic Breakout paddle steered by tilting a Shimmer3R around its Z-axis gyro." />
+  <title>Gyro Breakout · Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="../shared/favicon.svg" />
+  <link rel="stylesheet" href="../shared/shimmer-ui.css" />
   <style>
-    body {
-      margin: 0;
-      padding: 0;
-      background: #000;
-      color: white;
-      font-family: sans-serif;
-      display: block;
-      overflow-y: auto;
-    }
+    /* ---- App-specific bits only (Consensys light idiom in shared CSS) ---- */
 
-    button {
-      margin: 5px;
-      padding: 10px 16px;
-      font-size: 16px;
-      border-radius: 6px;
-      border: none;
-      cursor: pointer;
-    }
-
-    #scanBtn { background: #2196F3; color: white; }
-    #configureBtn { background: #4CAF50; color: white; }
-    #streamBtn { background: #FFC107; color: black; }
-    #disconfigureBtn { background: #f44336; color: white; }
-    #startBtn { background: #9C27B0; color: white; }
-
-    #consoleOutput {
-      background: #000;
-      color: #0f0;
-      padding: 10px;
-      margin: 10px auto;
-      max-width: 480px;
-      font-family: monospace;
-      font-size: 14px;
-      border: 1px solid #0f0;
-      width: 90%;
-      /* limit to 3 lines */
-      line-height: 1.4em;
-      max-height: calc(1.4em * 3);
-      overflow-y: auto;
-    }
-
-    canvas {
-      background: #111;
-      border: 2px solid #fff;
-      width: 100%;
-      max-width: 480px;
-      height: auto;
-      max-height: 540px;
-      display: block;
-      margin: 20px auto;
-      box-sizing: border-box;
-    }
-
-    #controls {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: center;
-      align-items: center;
-      gap: 10px;
-      margin-top: 10px;
-      text-align: center;
-    }
-
-    #controls button, #controls p { margin: 5px; }
-
+    /* Arcade banner art — dark inset, same idiom as .game-frame/.console */
     #banner {
       width: 100%;
-      max-width: 1000px;
-      margin: 10px auto 0;
+      max-width: 640px;
+      margin: 0 auto var(--cs-space-3);
+      background-color: #141414;
       background-image: url('banner.png');
       background-repeat: no-repeat;
       background-position: center;
       background-size: contain;
       aspect-ratio: 3 / 1;
+      border: 1px solid var(--cs-border-strong);
+      border-radius: var(--cs-radius);
     }
 
-    #introOverlay {
+    /* Game-over / win toast */
+    #customAlert {
+      display: none;
       position: fixed;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      background: rgba(0,0,0,0.9);
-      color: #fff;
-      display: flex;
-      justify-content: center;
-      align-items: center;
+      bottom: var(--cs-space-4);
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 420px;
+      background: var(--cs-surface);
+      color: var(--cs-text-strong);
+      border: 1px solid var(--cs-red);
+      border-radius: var(--cs-radius);
+      box-shadow: 0 4px 18px rgba(0, 0, 0, .18);
+      padding: var(--cs-space-3) var(--cs-space-4);
+      font-size: var(--cs-text-sm);
+      text-align: center;
       z-index: 9999;
-    }
-
-    .introContent {
-      max-width: 500px;
-      padding: 20px;
-      background: #111;
-      border: 2px solid #fff;
-      border-radius: 10px;
-      text-align: left;
-      font-size: 16px;
-    }
-    .introContent h2 { margin-top: 0; color: #0f0; }
-    .introContent ul { padding-left: 20px; }
-    .introContent .btnHint {
-      background: #444;
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-family: monospace;
     }
   </style>
 </head>
 <body>
-  <div id="introOverlay">
-    <div class="introContent">
-      <h2>🎮 Welcome to Breakout!</h2>
-      <p>Here's what you need to know to get started:</p>
-      <ul>
-        <li><strong>Connect your Bluetooth device:</strong> Click <span class="btnHint">🔍 Scan</span>, then <span class="btnHint">⚙️ Configure</span>.</li>
-        <li><strong>Start data stream:</strong> Tap <span class="btnHint">📡 Start Streaming</span> to enable motion-based control.</li>
-        <li><strong>Tilt to move:</strong> Rotate the device <strong>around the Z-axis</strong> to move the paddle.</li>
-        <li><strong>No Bluetooth?</strong> Use arrow keys or touch to control the paddle.</li>
-        <li><strong>Objective:</strong> Break all the bricks. Don’t let the ball fall!</li>
-        <li><strong>Start game:</strong> Click <span class="btnHint">▶️ Start Game</span>.</li>
-      </ul>
-      <p><strong>Requirements:</strong></p>
-      <ul>
-        <li><strong>Device:</strong> Shimmer3R</li>
-        <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
-      </ul>
-      <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram" style="width: 100%; max-width: 300px; display: block; margin: 10px auto;" />
-      <p style="font-size: 14px; color: #aaa; text-align: center;">
-        ↺ Rotate the device clockwise (right) or counter-clockwise (left) around the <strong>Z-axis</strong> to control the paddle.
-      </p>
-      <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px;">
-        <input type="checkbox" id="dontShowAgain" />
-        <label for="dontShowAgain">Don't show this again</label>
+  <header class="app-header">
+    <a class="brand" href="../">
+      <span class="brand-mark"></span>
+      <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+    </a>
+    <span class="app-title">Gyro Breakout</span>
+    <span class="spacer"></span>
+    <a class="back-link" href="../">← All demos</a>
+  </header>
+
+  <main class="app-main">
+    <div id="introOverlay" class="overlay" role="dialog" aria-modal="true">
+      <div class="overlay-panel">
+        <h2>Welcome to Breakout!</h2>
+        <p>Here's what you need to know to get started:</p>
+        <ul>
+          <li><strong>Connect your Bluetooth device:</strong> Click <span class="kbd">Scan</span>, then <span class="kbd">Configure</span>.</li>
+          <li><strong>Start data stream:</strong> Tap <span class="kbd">Start Streaming</span> to enable motion-based control.</li>
+          <li><strong>Tilt to move:</strong> Rotate the device <strong>around the Z-axis</strong> to move the paddle.</li>
+          <li><strong>No Bluetooth?</strong> Use arrow keys or touch to control the paddle.</li>
+          <li><strong>Objective:</strong> Break all the bricks. Don't let the ball fall!</li>
+          <li><strong>Start game:</strong> Click <span class="kbd">Start Game</span>.</li>
+        </ul>
+        <p><strong>Requirements:</strong></p>
+        <ul>
+          <li><strong>Device:</strong> Shimmer3R</li>
+          <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
+        </ul>
+        <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram" style="max-width:300px; display:block; margin:var(--cs-space-3) auto;" />
+        <p class="muted center">↺ Rotate the device clockwise (right) or counter-clockwise (left) around the <strong>Z-axis</strong> to control the paddle.</p>
+        <div class="overlay-foot">
+          <label><input type="checkbox" id="dontShowAgain" /> Don't show this again</label>
+          <button id="closeIntroBtn" class="btn btn-primary">Got it!</button>
+        </div>
       </div>
-      <button id="closeIntroBtn">Got it!</button>
     </div>
-  </div>
 
-  <div id="controls">
-    <button id="scanBtn">🔍 Scan Bluetooth</button>
-    <button id="configureBtn" disabled>⚙️ Configure</button>
-    <button id="streamBtn" disabled>📡 Start Streaming</button>
-    <button id="disconfigureBtn" disabled>❌ Disconnect</button>
-    <button id="startBtn">▶️ Start Game</button>
-    <button id="showTipBtn">💡 Show Tip</button>
-    <p id="deviceName">No device selected</p>
-  </div>
-  <div style="text-align: center; margin-top: 10px;">
-    <input type="checkbox" id="autoRestart" />
-    <label for="autoRestart">Auto-restart after Game Over (5s)</label>
-  </div>
+    <div class="card">
+      <h3>Device</h3>
+      <div class="toolbar" id="controls">
+        <button id="scanBtn" class="btn btn-primary">Scan Bluetooth</button>
+        <button id="configureBtn" class="btn btn-secondary" disabled>Configure</button>
+        <button id="streamBtn" class="btn btn-success" disabled>Start Streaming</button>
+        <button id="disconfigureBtn" class="btn btn-danger" disabled>Disconnect</button>
+        <span class="spacer"></span>
+      </div>
+      <p id="deviceName" class="muted" style="margin-top:12px">No device selected</p>
+      <div id="consoleWrapper">
+        <pre id="consoleOutput" class="console" aria-live="polite"></pre>
+      </div>
+    </div>
 
-  <div id="consoleWrapper">
-    <pre id="consoleOutput"></pre>
-  </div>
-  <div id="banner"></div>
-  <canvas id="breakout"></canvas>
+    <div class="card">
+      <h3>Game</h3>
+      <div class="row" style="margin-bottom:var(--cs-space-3)">
+        <button id="startBtn" class="btn btn-primary">Start Game</button>
+        <button id="showTipBtn" class="btn btn-secondary btn-sm">Show Tip</button>
+        <label><input type="checkbox" id="autoRestart" /> Auto-restart after Game Over (5s)</label>
+      </div>
+      <div id="banner"></div>
+      <div class="game-frame"><canvas id="breakout"></canvas></div>
+    </div>
+  </main>
 
   <!-- Your game code (unchanged except the tiny helper below) -->
   <script>
@@ -440,7 +388,7 @@
 
     streamBtn.addEventListener("click", async () => {
       try {
-        
+
         await client.startStreaming();
         log("📡 Streaming (gyro-only)");
       } catch (e) {
@@ -462,20 +410,7 @@
     });
   </script>
 
-  <div id="customAlert" style="
-    display: none;
-    position: fixed;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: #222;
-    color: #fff;
-    padding: 16px 24px;
-    border: 2px solid #f00;
-    border-radius: 10px;
-    font-size: 16px;
-    z-index: 9999;
-    text-align: center;">
+  <div id="customAlert">
     Game Over! You can still move the paddle. Press Start Game to restart.
   </div>
 </body>
