@@ -1,143 +1,65 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
 
-  gtag('config', 'G-T26GWN0LJW');
-</script>
+    gtag('config', 'G-T26GWN0LJW');
+  </script>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Rhythm Game (EMG + Gyro)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Hit the beat using EMG and gyro together — a two-signal rhythm challenge on a Shimmer3R." />
+  <title>Rhythm Game · Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="../shared/favicon.svg" />
+  <link rel="stylesheet" href="../shared/shimmer-ui.css" />
   <style>
-     body {
-  margin: 0;
-  padding: 0;
-  background: #000;
-  color: white;
-  font-family: sans-serif;
-  display: block;        /* allow natural flow */
-  overflow-y: auto;      /* vertical scrolling */
-}
+    /* ---- App-specific bits only (Consensys light idiom in shared CSS) ---- */
 
-  button {
-    margin: 5px;
-    padding: 10px 16px;
-    font-size: 16px;
-    border-radius: 6px;
-    border: none;
-    cursor: pointer;
-  }
+    /* Arcade banner art — dark inset, same idiom as .game-frame/.console */
+    #banner {
+      width: 100%;
+      max-width: 640px;
+      margin: 0 auto var(--cs-space-3);
+      background-color: #141414;
+      background-image: url('banner.png');
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: contain;
+      aspect-ratio: 3 / 1;
+      border: 1px solid var(--cs-border-strong);
+      border-radius: var(--cs-radius);
+    }
 
-  #scanBtn { background: #2196F3; color: white; }
-  #connectBtn { background: #4CAF50; color: white; }
-  #streamBtn { background: #FFC107; color: black; }
-  #disconnectBtn { background: #f44336; color: white; }
-  
-#consoleOutput {
-  background: #000;
-  color: #0f0;
-  padding: 10px;
-  margin: 10px auto;
-  max-width: 480px;
-  font-family: monospace;
-  font-size: 16px;       /* Increased for better visibility */
-  border: 1px solid #0f0;
-  width: 90%;
-
-  /* updated to allow more lines */
-  line-height: 1.4em;
-  max-height: calc(1.4em * 12);  /* was 1, now shows ~12 lines */
-  overflow-y: auto;
-}
-
-canvas {
-  background: #111;
-  border: 2px solid #fff;
-  width: 100%;
-  max-width: 720px;       /* increase from 480px */
-  height: auto;
-  max-height: 720px;      /* increase from 540px */
-  display: block;
-  margin: 20px auto;
-  box-sizing: border-box;
-}
-
-#controls {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center; /* center horizontally */
-  align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  text-align: center;
-}
-
-#controls button, #controls p {
-  margin: 5px;
-}
-#banner {
-  width: 100%;
-  max-width: 1000px;
-  margin: 10px auto 0;
-  background-image: url('banner.png');
-  background-repeat: no-repeat;
-  background-position: center;
-  background-size: contain;
-  aspect-ratio: 3 / 1;
-}
-#introOverlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background: rgba(0, 0, 0, 0.9);
-  color: white;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  z-index: 9999;
-}
-.introContent {
-  max-width: 550px;
-  padding: 20px;
-  background: #111;
-  border: 2px solid white;
-  border-radius: 12px;
-  overflow-y: auto;
-  max-height: 90vh;
-}
+    .signal-label {
+      text-align: center;
+      margin: 0 0 var(--cs-space-2);
+    }
   </style>
 </head>
 <body>
-<div id="introOverlay">
-  <div class="introContent">
-    <h2>🥁 EMG Rhythm Game with Motion Monitoring</h2>
+<div id="introOverlay" class="overlay" role="dialog" aria-modal="true">
+  <div class="overlay-panel">
+    <h2>EMG Rhythm Game with Motion Monitoring</h2>
     <p><strong>Welcome!</strong> This is a rhythm-based game where you tap notes using your muscle activity — powered by <strong>EMG (Electromyography)</strong> from your <strong>biceps</strong>. Simultaneously, <strong>gyroscope data</strong> is visualized to monitor wrist or elbow movement range, useful for tracking motor control or rehab progress.</p>
 
-    <hr>
-
-    <h3>⚡ Signal Setup</h3>
+    <h3>Signal Setup</h3>
     <p>This game uses:</p>
     <ul>
-      <li>🎯 <strong>EMG</strong> (Biceps) to trigger note hits based on muscle activation</li>
-      <li>📈 <strong>Gyroscope</strong> to monitor range of motion during play</li>
+      <li><strong>EMG</strong> (Biceps) to trigger note hits based on muscle activation</li>
+      <li><strong>Gyroscope</strong> to monitor range of motion during play</li>
     </ul>
 
     <p><strong>Device required:</strong> Shimmer3R (EMG + Gyro)<br>
     <strong>Firmware:</strong> v1.0.22 or later</p>
 
-    <hr>
-
-    <h3>💪 EMG Electrode Placement — Biceps</h3>
+    <h3>EMG Electrode Placement — Biceps</h3>
     <ul>
-      <li>📍 <strong>Target:</strong> Biceps brachii (main upper arm muscle)</li>
-      <li>🔘 <strong>Where:</strong> Midpoint between shoulder and elbow crease, on the front of upper arm</li>
+      <li><strong>Target:</strong> Biceps brachii (main upper arm muscle)</li>
+      <li><strong>Where:</strong> Midpoint between shoulder and elbow crease, on the front of upper arm</li>
     </ul>
     <ol>
       <li>Flex your elbow to locate the bulging bicep</li>
@@ -145,48 +67,64 @@ canvas {
       <li>Place the green reference electrode on a neutral bony area (e.g. wrist, elbow, or shoulder)</li>
     </ol>
 
-    <a href="emg_gyro_example.mp4" target="_blank" style="color: #0af; text-decoration: underline;">Watch demo video</a>
+    <p><a href="emg_gyro_example.mp4" target="_blank">Watch demo video</a></p>
 
-	<p style="font-size: 14px; color: #ccc;">
-	  ✅ Tip: Flex your biceps to trigger in-game actions. You can adjust the activation threshold using the slider — increasing it makes detection <em>less sensitive</em>, while lowering it makes it <em>more sensitive</em>.
-	</p>
+    <p class="muted">Tip: Flex your biceps to trigger in-game actions. You can adjust the activation threshold using the slider — increasing it makes detection <em>less sensitive</em>, while lowering it makes it <em>more sensitive</em>.</p>
 
-
-    <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px;">
-      <input type="checkbox" id="dontShowAgain" />
-      <label for="dontShowAgain">Don't show this again</label>
+    <div class="overlay-foot">
+      <label><input type="checkbox" id="dontShowAgain" /> Don't show this again</label>
+      <button id="closeIntroBtn" class="btn btn-primary">Got it!</button>
     </div>
-    <button id="closeIntroBtn">Got it!</button>
   </div>
 </div>
 
+<header class="app-header">
+  <a class="brand" href="../">
+    <span class="brand-mark"></span>
+    <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+  </a>
+  <span class="app-title">Rhythm Game</span>
+  <span class="spacer"></span>
+  <a class="back-link" href="../">← All demos</a>
+</header>
 
+<main class="app-main">
 
-  <div id="controls">
-  <button id="scanBtn">🔍 Scan Bluetooth</button>
-  <button id="connectBtn" disabled>🔗 Connect</button>
-  <button id="streamBtn" disabled>📡 Start Streaming</button>
-  <button id="disconnectBtn" disabled>❌ Disconnect</button>
-  <button id="showTipBtn">💡 Show Tip</button>
-  <p id="deviceName">No device selected</p>
-  <div style="text-align:center; margin-top: 10px;">
-  <label for="onThreshSlider">Activation Threshold: <span id="threshLabel">3</span></label><br>
-  <input type="range" id="onThreshSlider" min="1" max="20" step="0.1" value="3" style="width:300px;">
-</div>
-</div>
+  <div class="card">
+    <h3>Device</h3>
+    <div id="controls" class="toolbar">
+      <button id="scanBtn" class="btn btn-primary">Scan Bluetooth</button>
+      <button id="connectBtn" class="btn btn-secondary" disabled>Connect</button>
+      <button id="streamBtn" class="btn btn-success" disabled>Start Streaming</button>
+      <button id="disconnectBtn" class="btn btn-danger" disabled>Disconnect</button>
+      <span class="spacer"></span>
+      <button id="showTipBtn" class="btn btn-secondary btn-sm">Show Tip</button>
+    </div>
+    <p id="deviceName" class="muted" style="margin-top:12px">No device selected</p>
+    <div class="row" style="margin-top:var(--cs-space-2)">
+      <label for="onThreshSlider">Activation Threshold: <span id="threshLabel">3</span></label>
+      <input type="range" id="onThreshSlider" min="1" max="20" step="0.1" value="3" />
+    </div>
+    <div id="consoleWrapper" style="margin-top:var(--cs-space-3)">
+      <pre id="consoleOutput" class="console" aria-live="polite"></pre>
+    </div>
+  </div>
 
-<div id="consoleWrapper">
-  <pre id="consoleOutput"></pre>
-</div>
-<div id="banner"></div>
+  <div class="card">
+    <h3>Game</h3>
+    <div id="banner"></div>
+    <div class="game-frame"><canvas id="gameCanvas"></canvas></div>
+  </div>
 
-<canvas id="gameCanvas"></canvas>
-<div style="text-align: center; color: #0f0; font-family: monospace; font-size: 16px;">📈 EMG 1 Signal (brown-red)</div>
-<canvas id="emg1Plot" width="480" height="100" style="background:#111; border:1px solid #0f0; display:block; margin:5px auto 20px;"></canvas>
+  <div class="card">
+    <h3>Live Signals</h3>
+    <h4 class="signal-label">EMG 1 Signal (brown-red)</h4>
+    <div class="game-frame"><canvas id="emg1Plot" width="480" height="100"></canvas></div>
+    <h4 class="signal-label" style="margin-top:var(--cs-space-4)">Gyroscope (X-axis)</h4>
+    <div class="game-frame"><canvas id="emg2Plot" width="480" height="200"></canvas></div>
+  </div>
 
-<div style="text-align: center; color: #f0f; font-family: monospace; font-size: 16px;">📉 Gyroscope (X-axis)</div>
-<canvas id="emg2Plot" width="480" height="200" style="background:#111; border:1px solid #0f0; display:block; margin:5px auto 20px;"></canvas>
-
+</main>
 
   <script>
   const emg1Buffer = new Array(256*5).fill(0);
@@ -321,7 +259,7 @@ document.getElementById("scanBtn").addEventListener("click", async () => {
       document.getElementById("deviceName").textContent =
         `Selected: ${selectedDevice.name || 'Unnamed Device'}`;
       document.getElementById("connectBtn").disabled = false;
-	  
+
 	  if (selectedDevice.name.includes("Shimmer3R")){
 		SERVICE_UUID = SERVICE_UUID_3R;
 		CHAR_RX_UUID = CHAR_RX_UUID_3R;
@@ -331,7 +269,7 @@ document.getElementById("scanBtn").addEventListener("click", async () => {
 		CHAR_RX_UUID = CHAR_RX_UUID_3;
 		CHAR_TX_UUID = CHAR_TX_UUID_3;
 	  }
-	  
+
     } else {
       alert("Please select a device named Shimmer3R or Shimmer3.");
     }
@@ -398,10 +336,10 @@ document.getElementById("connectBtn").addEventListener("click", async () => {
 	setInterval(() => {
 	  const now = Date.now();
 	  if ((now - lastPrintedTime) >= 10) {
-		
+
 		lastPrintedTime = now;
 
-		
+
 		// --- Optional: use activation to control paddle or action ---
 		// Default to both off
 		rightPressed = false;
@@ -435,12 +373,12 @@ document.getElementById("streamBtn").addEventListener("click", async () => {
   }
 
   try {
-  
+
     const samplingCommand = new Uint8Array([0x05, 0x80, 0x00]);
     await rxCharacteristic.writeValue(samplingCommand);
 	    // Step 3: Wait 200ms
     await sleep(200);
-  
+
     const writeSensorCommand = new Uint8Array([0x08, 0x40, 0x00, 0x10]); //gyro and mag
     await rxCharacteristic.writeValue(writeSensorCommand);
 	    // Step 3: Wait 200ms
@@ -450,17 +388,17 @@ document.getElementById("streamBtn").addEventListener("click", async () => {
     await rxCharacteristic.writeValue(writeRangeCommand);
 	    // Step 3: Wait 200ms
     await sleep(200);
-  
+
 	const writeEXG1Command = new Uint8Array([0x61, 0x00, 0x00, 0x0A, 0x02, 0xA8, 0x10, 0x69, 0x60, 0x20, 0x00, 0x00, 0x02, 0x03]);
     await rxCharacteristic.writeValue(writeEXG1Command);
 	    // Step 3: Wait 200ms
     await sleep(200);
-  
+
   	const writeEXG2Command = new Uint8Array([0x61, 0x01, 0x00, 0x0A, 0x02, 0xA0, 0x10, 0xE1, 0xE1, 0x00, 0x00, 0x00, 0x02, 0x01]);
     await rxCharacteristic.writeValue(writeEXG2Command);
 	    // Step 3: Wait 200ms
     await sleep(200);
-  
+
     // Step 4: Send 0x07 to start streaming
     const streamCommand = new Uint8Array([0x07]);
     await rxCharacteristic.writeValue(streamCommand);
@@ -468,8 +406,8 @@ document.getElementById("streamBtn").addEventListener("click", async () => {
 	if (!plotIntervalId) {
   plotIntervalId = setInterval(() => {
     const latest = emg1Buffer.slice(emgIndex - 10, emgIndex).join(', ');
-	
-	
+
+
 
     drawEMG(document.getElementById("emg1Plot"), emg1Buffer);
     drawGyro(document.getElementById("emg2Plot"), gyroBuffer);
@@ -749,7 +687,7 @@ function appendToConsole(text) {
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
 
-  
+
    const canvas = document.getElementById("gameCanvas");
    canvas.width = 720;
 canvas.height = 720;

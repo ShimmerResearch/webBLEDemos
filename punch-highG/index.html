@@ -1,70 +1,43 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
 
-  gtag('config', 'G-T26GWN0LJW');
-</script>
+    gtag('config', 'G-T26GWN0LJW');
+  </script>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Arcade Punching Bag</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="A punch-force reaction game powered by the high-range 200G accelerometer on a Shimmer3R." />
+  <title>Punch Force · Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="../shared/favicon.svg" />
+  <link rel="stylesheet" href="../shared/shimmer-ui.css" />
   <style>
-    body {
-      margin: 0;
-      padding: 0;
-      background: black;
-      color: white;
-      font-family: sans-serif;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: start;
-      height: 100vh;
-      overflow-x: hidden;
-      overflow-y: auto;
+    /* ---- App-specific bits only (Consensys light idiom in shared CSS) ---- */
+
+    /* Arcade banner art — dark inset, same idiom as .game-frame/.console */
+    #banner {
+      width: 100%;
+      max-width: 480px;
+      margin: 0 auto var(--cs-space-3);
+      background-color: #141414;
+      background-image: url('banner.png');
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: contain;
+      aspect-ratio: 3 / 1;
+      border: 1px solid var(--cs-border-strong);
+      border-radius: var(--cs-radius);
     }
 
-    #controls {
-      margin: 15px 0;
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: center;
-      gap: 10px;
-    }
-
-    button {
-      padding: 10px 16px;
-      font-size: 16px;
-      border-radius: 6px;
-      border: none;
-      cursor: pointer;
-    }
-
-    #scanBtn { background: #2196F3; color: white; }
-    #connectBtn { background: #4CAF50; color: white; }
-    #streamBtn { background: #FFC107; color: black; }
-    #disconnectBtn { background: #f44336; color: white; }
-    #resetScoreBtn { background: #9C27B0; color: white; }
-
-    #scoreDisplay, #statusConsole, #punchCounter {
-      margin: 10px 0;
-      font-size: 18px;
-      font-family: monospace;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      max-width: 90vw;
-      text-align: center;
-    }
-
+    /* Punching-bag sprite (idle.png / punch.png swapped by the game logic) */
     #punchingBag {
-      width: min(90vw, 360px);
-      height: calc(min(90vw, 360px) * 1.5);
+      width: min(80vw, 320px);
+      height: calc(min(80vw, 320px) * 1.5);
       background-image: url('idle.png');
       background-repeat: no-repeat;
       background-position: center;
@@ -73,118 +46,93 @@
       transition: opacity 0.1s ease;
       margin: 0 auto;
     }
-	
-#banner {
-  width: 100%;
-  max-width: 720px;
-  margin: 10px auto 0;
-  background-image: url('banner.png');
-  background-repeat: no-repeat;
-  background-position: center;
-  background-size: contain;
-  aspect-ratio: 3 / 1;
-}
-#introOverlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background: rgba(0,0,0,0.9);
-  color: #fff;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  z-index: 9999;
-}
-
-.introContent {
-  max-width: 500px;
-  padding: 20px;
-  background: #111;
-  border: 2px solid #fff;
-  border-radius: 10px;
-  text-align: left;
-  font-size: 16px;
-}
-
-.introContent h2 {
-  margin-top: 0;
-  color: #0f0;
-}
-
-.introContent ul {
-  padding-left: 20px;
-}
-
-.introContent .btnHint {
-  background: #444;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: monospace;
-}
   </style>
 </head>
 <body>
+  <header class="app-header">
+    <a class="brand" href="../">
+      <span class="brand-mark"></span>
+      <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+    </a>
+    <span class="app-title">Punch Force</span>
+    <span class="spacer"></span>
+    <a class="back-link" href="../">← All demos</a>
+  </header>
 
-  <div id="introOverlay">
-  <div class="introContent">
-    <h2>🎮 Welcome to Punching Bag!</h2>
-    <p>Here's what you need to know to get started:</p>
-    <ul>
-      <li><strong>Connect your Bluetooth device:</strong> Click <span class="btnHint">🔍 Scan</span>, then <span class="btnHint">🔗 Configure</span>.</li>
-      <li><strong>Start data stream:</strong> Tap <span class="btnHint">📡 Start Streaming</span> to enable high G measurements.</li>
-      <li><strong>Punching:</strong> Is measured <strong>along the Z-axis</strong>.</li>
-      <li><strong>Objective:</strong> Punch and get into the high score list!</li>
-      <li><strong>Start game:</strong> Click <span class="btnHint">▶️ Start Game</span>.</li>
-    </ul>
-	    <!-- ✅ Minimum Requirements -->
-    <p><strong>Requirements:</strong></p>
-    <ul>
-      <li><strong>Device:</strong> Shimmer3R with high G sensor</li>
-      <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
-    </ul>
-    <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram" style="width: 100%; max-width: 300px; display: block; margin: 10px auto;" />
-    <p style="font-size: 14px; color: #aaa; text-align: center;">
-      Punching is measured along the <strong>Z-axis</strong>.
-    </p>
-        <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px;">
-      <input type="checkbox" id="dontShowAgain" />
-      <label for="dontShowAgain">Don't show this again</label>
+  <main class="app-main">
+
+    <div id="introOverlay" class="overlay" role="dialog" aria-modal="true">
+      <div class="overlay-panel">
+        <h2>Welcome to Punching Bag!</h2>
+        <p>Here's what you need to know to get started:</p>
+        <ul>
+          <li><strong>Connect your Bluetooth device:</strong> Click <span class="kbd">Scan</span>, then <span class="kbd">Configure</span>.</li>
+          <li><strong>Start data stream:</strong> Tap <span class="kbd">Start Streaming</span> to enable high G measurements.</li>
+          <li><strong>Punching:</strong> Is measured along the <strong>Z-axis</strong>.</li>
+          <li><strong>Objective:</strong> Punch and get into the high score list!</li>
+        </ul>
+        <p><strong>Requirements:</strong></p>
+        <ul>
+          <li><strong>Device:</strong> Shimmer3R with high G sensor</li>
+          <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
+        </ul>
+        <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram" style="max-width:300px; display:block; margin:var(--cs-space-3) auto;" />
+        <p class="muted center">Punching is measured along the <strong>Z-axis</strong>.</p>
+        <div class="overlay-foot">
+          <label><input type="checkbox" id="dontShowAgain" /> Don't show this again</label>
+          <button id="closeIntroBtn" class="btn btn-primary">Got it!</button>
+        </div>
+      </div>
     </div>
-    <button id="closeIntroBtn">Got it!</button>
-  </div>
-</div>
 
+    <!-- Highscore Modal -->
+    <div id="highScoreModal" class="overlay" style="display:none;" role="dialog" aria-modal="true">
+      <div class="overlay-panel">
+        <h2>High Score!</h2>
+        <p>You made it to the top 10!</p>
+        <div class="stack">
+          <label for="initialsInput">Enter your initials</label>
+          <input id="initialsInput" type="text" maxlength="3" style="text-transform:uppercase; text-align:center; max-width:120px;" />
+        </div>
+        <div class="overlay-foot">
+          <button onclick="submitHighScore()" class="btn btn-primary">Submit</button>
+          <button onclick="closeHighScoreModal()" class="btn btn-secondary">Cancel</button>
+        </div>
+      </div>
+    </div>
 
-<!-- Highscore Modal -->
-<div id="highScoreModal" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.8); color:white; display:flex; align-items:center; justify-content:center; flex-direction:column; z-index:999;">
-  <div style="background:black; border:2px solid white; padding:20px; text-align:center; border-radius:10px; max-width:90vw;">
-    <h2>🏆 High Score!</h2>
-    <p>You made it to the top 10!</p>
-    <label>Enter your initials:</label><br/>
-    <input id="initialsInput" maxlength="3" style="font-size:20px; text-transform:uppercase; text-align:center;" /><br/><br/>
-    <button onclick="submitHighScore()">✅ Submit</button>
-    <button onclick="closeHighScoreModal()">❌ Cancel</button>
-  </div>
-</div>
+    <div class="card">
+      <h3>Device</h3>
+      <div class="toolbar" id="controls">
+        <button id="scanBtn" class="btn btn-primary">Scan Bluetooth</button>
+        <button id="connectBtn" class="btn btn-secondary" disabled>Configure</button>
+        <button id="streamBtn" class="btn btn-success" disabled>Start Streaming</button>
+        <button id="disconnectBtn" class="btn btn-danger" disabled>Disconnect</button>
+        <span class="spacer"></span>
+        <button id="showTipBtn" class="btn btn-secondary btn-sm">Show Tip</button>
+      </div>
+      <p id="statusConsole" class="console" style="margin-top:12px">Status: Ready</p>
+    </div>
 
-  <div id="controls">
-    <button id="scanBtn">🔍 Scan Bluetooth</button>
-    <button id="connectBtn" disabled>🔗 Configure</button>
-    <button id="streamBtn" disabled>📡 Start Streaming</button>
-    <button id="disconnectBtn" disabled>❌ Disconnect</button>
-    <button id="resetScoreBtn">🔁 Reset High Scores</button>
-	<button onclick="showHighScoreBoard()">📜 View High Scores</button>
-	  <button id="showTipBtn">💡 Show Tip</button>
-  </div>
+    <div class="card">
+      <h3>Session</h3>
+      <div class="row">
+        <p id="scoreDisplay" class="muted" style="font-size:var(--cs-text-lg); color:var(--cs-text-strong); margin:0;">💥 Max Punch Score: 0</p>
+        <p id="punchCounter" class="muted" style="font-size:var(--cs-text-lg); color:var(--cs-text-strong); margin:0;">🥊 Punch Count: 0</p>
+      </div>
+      <div class="row" style="margin-top:var(--cs-space-3)">
+        <button id="resetScoreBtn" class="btn btn-secondary btn-sm">Reset High Scores</button>
+        <button onclick="showHighScoreBoard()" class="btn btn-secondary btn-sm">View High Scores</button>
+      </div>
+    </div>
 
-  <p id="scoreDisplay">💥 Max Punch Score: 0</p>
-  <p id="punchCounter">🥊 Punch Count: 0</p>
-  <p id="statusConsole">Status: Ready</p>
-  <!-- Insert this just before the punching bag div -->
-<div id="banner"></div>
-  <div id="punchingBag"></div>
+    <div class="card">
+      <h3>Game</h3>
+      <div id="banner"></div>
+      <div class="game-frame"><div id="punchingBag"></div></div>
+    </div>
+
+  </main>
 
     <script type="module">
     import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js';
@@ -350,7 +298,7 @@
 	    await shimmer.setSamplingRate(51.2);
         await shimmer.setSensors(4194304);
         const info = await shimmer.inquiry();
-        
+
         updateStatus(`Connected. Channels: ${info?.numChannels ?? "?"}`);
         setButtons({ scan: true, connect: true, stream: true, disconnect: true });
       } catch (err) {
