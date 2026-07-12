@@ -11,424 +11,252 @@
   </script>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Spell Caster — Shimmer Gyro Demo</title>
+  <meta name="description" content="Cast spells with Shimmer3R gyro gestures, recognized live with dynamic time warping (DTW)." />
+  <title>Spell Caster · Shimmer Web BLE Demos</title>
+  <link rel="icon" type="image/svg+xml" href="../shared/favicon.svg" />
+  <link rel="stylesheet" href="../shared/shimmer-ui.css" />
 
   <style>
-    :root {
-      --bg:      #06060f;
-      --panel:   #0e0e22;
-      --ink:     #e8eaf6;
-      --thunder: #a855f7;
-      --inferno: #ef4444;
-      --torrent: #3b82f6;
+    /* ---- App-specific bits only: spell brand colors, plot readouts, FX canvas ---- */
+    .spell-item {
+      display: flex; gap: 12px;
+      align-items: flex-start;
+      margin: 8px 0; padding: 8px;
+      background: var(--cs-surface-alt);
+      border: 1px solid var(--cs-border);
+      border-radius: var(--cs-radius);
     }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; padding: 0;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: system-ui, Segoe UI, Roboto, Arial, sans-serif;
-      overflow-y: auto;
-    }
-    h1 {
-      text-align: center;
-      font-size: clamp(1.2rem, 4vw, 1.8rem);
-      margin: 14px 0 2px;
-      letter-spacing: 3px;
-      text-transform: uppercase;
-    }
-    .subtitle {
-      text-align: center;
-      color: #7878aa;
-      font-size: 0.85rem;
-      margin-bottom: 10px;
+    .spell-item .icon {
+      font-size: 1.6rem;
+      min-width: 34px;
+      display: flex; align-items: center; justify-content: center;
     }
 
-    /* ── Controls ── */
-    #controls {
-      display: flex; flex-wrap: wrap;
-      justify-content: center; align-items: center;
-      gap: 8px; padding: 6px 8px;
-    }
-    button {
-      border: none; border-radius: 8px;
-      padding: 9px 15px; font-size: 14px;
-      font-weight: 600; cursor: pointer;
-    }
-    #scanBtn    { background: #2196F3; color: #fff; }
-    #configBtn  { background: #4CAF50; color: #fff; }
-    #streamBtn  { background: #FFC107; color: #000; }
-    #disconnBtn { background: #f44336; color: #fff; }
-    #startBtn   { background: #9C27B0; color: #fff; }
-    #showTipBtn { background: #37474F; color: #fff; }
-    #trainBtn { background: #7c3aed; color: #fff; }
-    #clearTrainBtn { background: #455A64; color: #fff; }
-    #trainSpellSel {
-      background: #1f2937;
-      color: #e5e7eb;
-      border: 1px solid #374151;
-      border-radius: 8px;
-      padding: 8px 10px;
-      font-size: 13px;
-    }
-    #deviceName { font-size: 13px; color: #9999bb; }
-
-    /* ── Console ── */
-    #console {
-      background: #000; color: #0f0;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 12px; border: 1px solid #0f0;
-      padding: 6px 8px; max-width: 600px;
-      margin: 4px auto; height: 48px;
-      overflow-y: auto; border-radius: 4px;
-    }
-
-    #trainingPanel {
-      max-width: 860px;
-      margin: 10px auto 0;
-      padding: 0 8px;
-    }
-    #thresholdControls {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      color: #aab0d6;
-      font-size: 13px;
-      margin-bottom: 8px;
-    }
-    #thresholdSlider {
-      width: min(260px, 75vw);
-      accent-color: #a855f7;
-    }
-    #thresholdValue {
-      min-width: 52px;
-      text-align: right;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      color: #e8eaf6;
-    }
-    #thresholdHelp {
-      text-align: center;
-      color: #7f89b3;
-      font-size: 12px;
-      margin: -2px 0 8px;
-    }
-    #plotLegend {
-      text-align: center;
-      color: #7f89b3;
-      font-size: 12px;
-      margin-bottom: 8px;
-    }
-    #plotGrid {
+    .plot-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: var(--cs-space-3);
+      margin-top: var(--cs-space-3);
     }
-    .plotCard {
-      background: #0b0b1a;
-      border: 1px solid #242447;
-      border-radius: 10px;
-      padding: 8px;
+    .plot-card {
+      background: #141414;
+      border: 1px solid var(--cs-border-strong);
+      border-radius: var(--cs-radius);
+      padding: var(--cs-space-2);
     }
-    .plotTitle {
+    .plot-title {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      color: #d5d8f0;
-      font-size: 12px;
+      color: #cfd3ea;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: var(--cs-letterspace-label);
       margin-bottom: 6px;
-      letter-spacing: 0.5px;
     }
-    .plotCanvas {
+    .plot-canvas {
       display: block;
       width: 100%;
-      height: 130px;
-      background: #050510;
-      border: 1px solid #17172d;
-      border-radius: 8px;
+      height: 120px;
+      background: #0a0a14;
+      border: 1px solid #23233a;
+      border-radius: var(--cs-radius);
     }
 
-    /* ── Intro Overlay ── */
-    #introOverlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.85);
-      display: flex; align-items: center; justify-content: center;
-      z-index: 1000;
-      backdrop-filter: blur(2px);
+    /* ── Spell score badges ── */
+    .spell-row {
+      display: flex; flex-wrap: wrap;
+      justify-content: center;
+      gap: var(--cs-space-3);
+      margin: var(--cs-space-3) 0;
     }
-    .introContent {
-      background: linear-gradient(135deg, #0e0e22 0%, #1a1a3a 100%);
-      border: 2px solid #2d3255;
-      border-radius: 16px;
-      padding: 28px;
-      max-width: 520px;
-      max-height: 90vh;
-      overflow-y: auto;
-      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
-      color: #e8eaf6;
-    }
-    .introContent h2 {
-      margin: 0 0 12px;
-      font-size: 1.6rem;
+    .spell-badge {
+      border: 2px solid;
+      border-radius: var(--cs-radius);
+      padding: 10px 20px;
       text-align: center;
-      letter-spacing: 2px;
-    }
-    .introContent h3 {
-      font-size: 1.1rem;
-      margin: 16px 0 8px;
-      color: #d5d8f0;
-      letter-spacing: 1px;
-    }
-    .introContent ol {
-      margin: 8px 0;
-      padding-left: 20px;
-      line-height: 1.7;
-    }
-    .spellItem {
-      display: flex; gap: 12px;
-      margin: 8px 0; padding: 8px;
-      background: rgba(255,255,255,0.05);
-      border-radius: 8px;
-    }
-    .spellIcon {
-      font-size: 1.8rem;
-      min-width: 40px;
-      display: flex; align-items: center; justify-content: center;
-    }
-    .btnHint {
-      background: #1f2937; padding: 2px 6px;
-      border-radius: 4px; font-size: 0.9em;
-      font-family: ui-monospace, monospace;
-    }
-    .introFoot {
-      display: flex; justify-content: space-between;
-      align-items: center; margin-top: 16px;
-    }
-
-    /* ── Win Overlay ── */
-    #winOverlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0, 0, 0, 0.9);
-      display: none; flex-direction: column;
-      align-items: center; justify-content: center;
-      z-index: 999;
-      text-align: center;
-      color: #e8eaf6;
-    }
-    .winSub {
-      color: #9999bb; margin: 8px 0 0;
-    }
-    .winTally {
-      font-size: 1.1rem; margin: 14px 0;
-      font-family: ui-monospace, monospace;
-    }
-    #playAgainBtn {
-      background: #a855f7; color: #fff;
-      padding: 12px 24px; font-size: 16px;
-      margin-top: 16px; cursor: pointer;
-      border-radius: 8px; border: none;
-    }
-    #playAgainBtn:hover { background: #9333ea; }
-
-    /* ── Spell Row ── */
-    #spellRow {
-      display: flex; justify-content: center;
-      gap: 16px; margin: 12px 0;
-    }
-    .spellBadge {
-      border: 3px solid;
-      border-radius: 12px;
-      padding: 12px 20px;
-      text-align: center;
-      background: rgba(0,0,0,0.3);
-      transition: all 0.2s;
+      background: #141414;
       min-width: 100px;
     }
-    .bigEmoji {
-      font-size: 2.2rem;
-      display: block;
-      margin: 0 0 4px;
-    }
-    .spellLabel {
-      font-size: 0.85rem;
-      font-weight: 600;
-      letter-spacing: 1px;
+    .spell-badge .emoji { font-size: 2rem; display: block; margin: 0 0 4px; }
+    .spell-badge .label {
+      font-size: .8rem;
+      font-weight: 700;
+      letter-spacing: var(--cs-letterspace-label);
+      text-transform: uppercase;
       margin: 4px 0;
     }
-    .castCount {
-      font-size: 1.4rem;
-      font-weight: bold;
-      color: #fff;
-    }
-
-    /* ── Canvas & Hint ── */
-    #spellCanvas {
-      display: block;
-      margin: 12px auto;
-      border: 2px solid #2d3255;
-      border-radius: 8px;
-      background: #000;
-    }
-    #keyHint {
-      text-align: center;
-      font-size: 12px;
-      color: #7878aa;
-      margin: 8px 0;
-    }
-    kbd {
-      background: #1f2937;
-      padding: 2px 6px;
-      border-radius: 3px;
-      font-family: ui-monospace, monospace;
-      font-size: 11px;
-    }
+    .spell-badge .count { font-size: 1.3rem; font-weight: 700; color: #fff; }
   </style>
 </head>
 <body>
 
 <!-- ═══════════════════ INTRO OVERLAY ═══════════════════ -->
-<div id="introOverlay">
-  <div class="introContent">
-    <h2>🧙 Spell Caster — Gyro Demo</h2>
-    <p style="color:#9999bb;margin:0 0 12px">
+<div id="introOverlay" class="overlay" role="dialog" aria-modal="true" aria-labelledby="introTitle">
+  <div class="overlay-panel">
+    <h2 id="introTitle">Spell Caster — Gyro Demo</h2>
+    <p class="muted">
       Cast three magical spells with motion gestures from your <strong>Shimmer3R</strong> gyroscope.
     </p>
 
-    <h3>🪄 The Three Spells</h3>
-    <p style="font-size:12px;color:#7778aa;margin:8px 0">
-      💡 <strong>Tip:</strong> Gyros detect <strong>rotation</strong>, not linear movement. Train sharp, rotational gestures for best results.
+    <h3>The Three Spells</h3>
+    <p class="muted" style="font-size:12px">
+      Tip: Gyros detect <strong>rotation</strong>, not linear movement. Train sharp, rotational gestures for best results.
     </p>
-    <div class="spellItem">
-      <span class="spellIcon">⚡</span>
+    <div class="spell-item">
+      <span class="icon">⚡</span>
       <div>
         <strong style="color:#a855f7">THUNDER</strong> — Train your own motion<br>
-        <small style="color:#6666aa">Example: Sharp wrist flick left-right, twist, or snap</small>
+        <small class="muted">Example: Sharp wrist flick left-right, twist, or snap</small>
       </div>
     </div>
-    <div class="spellItem">
-      <span class="spellIcon">🔥</span>
+    <div class="spell-item">
+      <span class="icon">🔥</span>
       <div>
         <strong style="color:#ef4444">INFERNO</strong> — Train your own motion<br>
-        <small style="color:#6666aa">Example: Arm rotation, rapid pitch motion, or circular swing</small>
+        <small class="muted">Example: Arm rotation, rapid pitch motion, or circular swing</small>
       </div>
     </div>
-    <div class="spellItem">
-      <span class="spellIcon">🌊</span>
+    <div class="spell-item">
+      <span class="icon">🌊</span>
       <div>
         <strong style="color:#3b82f6">TORRENT</strong> — Train your own motion<br>
-        <small style="color:#6666aa">Example: Wrist roll, tilt side-to-side, or figure-8 motion</small>
+        <small class="muted">Example: Wrist roll, tilt side-to-side, or figure-8 motion</small>
       </div>
     </div>
     <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram"
-         style="width:100%;max-width:280px;display:block;margin:10px auto;border-radius:8px;opacity:0.85"/>
+         style="width:100%;max-width:280px;display:block;margin:10px auto"/>
 
-    <h3>📡 Setup Steps</h3>
+    <h3>Setup Steps</h3>
     <ol>
-      <li>Click <span class="btnHint">🔍 Scan</span> and select your Shimmer3R</li>
-      <li>Click <span class="btnHint">⚙️ Configure</span> to enable gyro streaming</li>
-      <li>Click <span class="btnHint">📡 Stream</span> to start data</li>
-      <li><strong>Train each spell:</strong> Select spell → Click <span class="btnHint">🎯 Train Next</span> → Perform motion cleanly</li>
-      <li>Once all three spells trained, click <span class="btnHint">▶️ Start</span> to play</li>
+      <li>Click <span class="kbd">🔍 Scan</span> and select your Shimmer3R</li>
+      <li>Click <span class="kbd">⚙️ Configure</span> to enable gyro streaming</li>
+      <li>Click <span class="kbd">📡 Stream</span> to start data</li>
+      <li><strong>Train each spell:</strong> Select spell → Click <span class="kbd">🎯 Train Next</span> → Perform motion cleanly</li>
+      <li>Once all three spells trained, click <span class="kbd">▶️ Start</span> to play</li>
     </ol>
-    <p style="font-size:13px;color:#5555aa">
+    <p class="muted" style="font-size:13px">
       <strong>Device:</strong> Shimmer3R &nbsp;|&nbsp;
       <strong>Firmware:</strong> v1.0.22+<br>
-      <strong>No BLE?</strong> Use keys <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> to demo each spell.
+      <strong>No BLE?</strong> Use keys <span class="kbd">1</span> <span class="kbd">2</span> <span class="kbd">3</span> to demo each spell.
     </p>
 
-    <div class="introFoot">
-      <label style="font-size:13px;color:#9999bb">
-        <input type="checkbox" id="dontShowAgain"> Don't show again
-      </label>
-      <button id="closeIntroBtn"
-        style="background:#a855f7;color:#fff;border:none:border-radius:8px;
-               padding:9px 20px;cursor:pointer;font-size:14px;font-weight:600;">
-        Got it! ✨
-      </button>
+    <div class="overlay-foot">
+      <label><input type="checkbox" id="dontShowAgain"> Don't show again</label>
+      <button id="closeIntroBtn" class="btn btn-primary">Got it! ✨</button>
     </div>
   </div>
 </div>
 
 <!-- ═══════════════════ WIN OVERLAY ═══════════════════ -->
-<div id="winOverlay">
-  <div style="font-size:3rem">🏆</div>
-  <h2>All Spells Mastered!</h2>
-  <p class="winSub">You successfully cast all three spells.</p>
-  <p class="winTally" id="winTally"></p>
-  <button id="playAgainBtn">Play Again ↺</button>
+<div id="winOverlay" class="overlay" hidden>
+  <div class="overlay-panel center">
+    <div style="font-size:3rem">🏆</div>
+    <h2>All Spells Mastered!</h2>
+    <p class="muted">You successfully cast all three spells.</p>
+    <p id="winTally" style="font-family:var(--cs-font-mono)"></p>
+    <button id="playAgainBtn" class="btn btn-primary">Play Again ↺</button>
+  </div>
 </div>
 
-<!-- ═══════════════════ MAIN UI ═══════════════════ -->
-<h1>🧙 Spell Caster</h1>
-<p class="subtitle">Perform motion gestures to cast spells • Shimmer3R Gyro Demo</p>
+<!-- ═══════════════════ APP CHROME ═══════════════════ -->
+<header class="app-header">
+  <a class="brand" href="../">
+    <span class="brand-mark"></span>
+    <span class="brand-name">Shimmer <span class="brand-sub">Web BLE</span></span>
+  </a>
+  <span class="app-title">Spell Caster</span>
+  <span class="spacer"></span>
+  <a class="back-link" href="../">← All demos</a>
+</header>
 
-<div id="controls">
-  <button id="scanBtn">🔍 Scan</button>
-  <button id="configBtn" disabled>⚙️ Configure</button>
-  <button id="streamBtn" disabled>📡 Stream</button>
-  <button id="disconnBtn" disabled>❌ Disconnect</button>
-  <button id="startBtn">▶️ Start</button>
-  <select id="trainSpellSel" title="Spell to train">
-    <option value="thunder">⚡ Thunder</option>
-    <option value="inferno">🔥 Inferno</option>
-    <option value="torrent">🌊 Torrent</option>
-  </select>
-  <button id="trainBtn">🎯 Train Next</button>
-  <button id="clearTrainBtn">🧹 Clear Training</button>
-  <button id="showTipBtn">💡 Help</button>
-  <span id="deviceName">No device</span>
-</div>
+<main class="app-main">
+  <p class="muted">Perform motion gestures to cast spells — Shimmer3R gyro demo, recognized live with dynamic time warping (DTW).</p>
 
-<div id="console"></div>
-
-<div id="trainingPanel">
-  <div id="thresholdControls">
-    <label for="thresholdSlider">DTW match threshold</label>
-    <input id="thresholdSlider" type="range" min="0.08" max="0.35" step="0.005" />
-    <span id="thresholdValue">—</span>
-  </div>
-  <div id="thresholdHelp" style="text-align:center;color:#7f89b3;font-size:12px;margin:-2px 0 8px;">
-    Lower = stricter match (fewer false casts). Higher = easier match (more sensitive).
-  </div>
-  <div id="plotLegend">Training plots: X = red, Y = green, Z = blue</div>
-  <div id="plotGrid">
-    <div class="plotCard">
-      <div class="plotTitle"><span>⚡ Thunder</span><span id="plotCount-thunder">0 samples</span></div>
-      <canvas id="plot-thunder" class="plotCanvas" width="320" height="130"></canvas>
+  <div class="card">
+    <h3>Device</h3>
+    <div class="toolbar">
+      <button id="scanBtn" class="btn btn-primary">🔍 Scan</button>
+      <button id="configBtn" class="btn btn-secondary" disabled>⚙️ Configure</button>
+      <button id="streamBtn" class="btn btn-success" disabled>📡 Stream</button>
+      <button id="disconnBtn" class="btn btn-danger" disabled>❌ Disconnect</button>
+      <span class="spacer"></span>
+      <span id="deviceName" class="muted">No device</span>
     </div>
-    <div class="plotCard">
-      <div class="plotTitle"><span>🔥 Inferno</span><span id="plotCount-inferno">0 samples</span></div>
-      <canvas id="plot-inferno" class="plotCanvas" width="320" height="130"></canvas>
-    </div>
-    <div class="plotCard">
-      <div class="plotTitle"><span>🌊 Torrent</span><span id="plotCount-torrent">0 samples</span></div>
-      <canvas id="plot-torrent" class="plotCanvas" width="320" height="130"></canvas>
-    </div>
+    <div id="console" class="console" aria-live="polite" style="margin-top:12px"></div>
   </div>
-</div>
 
-<!-- Spell score badges -->
-<div id="spellRow">
-  <div class="spellBadge" id="badge-thunder" style="border-color:#a855f7">
-    <span class="bigEmoji">⚡</span>
-    <div class="spellLabel" style="color:#a855f7">THUNDER</div>
-    <div class="castCount" id="cnt-thunder">0</div>
-  </div>
-  <div class="spellBadge" id="badge-inferno" style="border-color:#ef4444">
-    <span class="bigEmoji">🔥</span>
-    <div class="spellLabel" style="color:#ef4444">INFERNO</div>
-    <div class="castCount" id="cnt-inferno">0</div>
-  </div>
-  <div class="spellBadge" id="badge-torrent" style="border-color:#3b82f6">
-    <span class="bigEmoji">🌊</span>
-    <div class="spellLabel" style="color:#3b82f6">TORRENT</div>
-    <div class="castCount" id="cnt-torrent">0</div>
-  </div>
-</div>
+  <div class="card">
+    <h3>Train Spells</h3>
+    <div class="toolbar">
+      <select id="trainSpellSel" title="Spell to train">
+        <option value="thunder">⚡ Thunder</option>
+        <option value="inferno">🔥 Inferno</option>
+        <option value="torrent">🌊 Torrent</option>
+      </select>
+      <button id="trainBtn" class="btn btn-primary">🎯 Train Next</button>
+      <button id="clearTrainBtn" class="btn btn-secondary">🧹 Clear Training</button>
+      <span class="spacer"></span>
+      <button id="showTipBtn" class="btn btn-secondary btn-sm">💡 Help</button>
+    </div>
 
-<canvas id="spellCanvas" width="600" height="460"></canvas>
-<p id="keyHint">Keyboard: <kbd>1</kbd> Thunder &nbsp; <kbd>2</kbd> Inferno &nbsp; <kbd>3</kbd> Torrent</p>
+    <div class="row" style="margin-top:12px">
+      <label for="thresholdSlider">DTW match threshold</label>
+      <input id="thresholdSlider" type="range" min="0.08" max="0.35" step="0.005" />
+      <span id="thresholdValue" class="muted" style="font-family:var(--cs-font-mono)">—</span>
+    </div>
+    <p class="muted" style="font-size:12px;margin-top:6px">
+      Lower = stricter match (fewer false casts). Higher = easier match (more sensitive).
+    </p>
+    <p class="muted" style="font-size:12px">Training plots: X = red, Y = green, Z = blue</p>
+
+    <div class="plot-grid">
+      <div class="plot-card">
+        <div class="plot-title"><span>⚡ Thunder</span><span id="plotCount-thunder">0 samples</span></div>
+        <canvas id="plot-thunder" class="plot-canvas" width="320" height="130"></canvas>
+      </div>
+      <div class="plot-card">
+        <div class="plot-title"><span>🔥 Inferno</span><span id="plotCount-inferno">0 samples</span></div>
+        <canvas id="plot-inferno" class="plot-canvas" width="320" height="130"></canvas>
+      </div>
+      <div class="plot-card">
+        <div class="plot-title"><span>🌊 Torrent</span><span id="plotCount-torrent">0 samples</span></div>
+        <canvas id="plot-torrent" class="plot-canvas" width="320" height="130"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Cast</h3>
+    <div class="row" style="justify-content:center">
+      <button id="startBtn" class="btn btn-primary">▶️ Start</button>
+    </div>
+
+    <div class="spell-row">
+      <div class="spell-badge" id="badge-thunder" style="border-color:#a855f7">
+        <span class="emoji">⚡</span>
+        <div class="label" style="color:#a855f7">THUNDER</div>
+        <div class="count" id="cnt-thunder">0</div>
+      </div>
+      <div class="spell-badge" id="badge-inferno" style="border-color:#ef4444">
+        <span class="emoji">🔥</span>
+        <div class="label" style="color:#ef4444">INFERNO</div>
+        <div class="count" id="cnt-inferno">0</div>
+      </div>
+      <div class="spell-badge" id="badge-torrent" style="border-color:#3b82f6">
+        <span class="emoji">🌊</span>
+        <div class="label" style="color:#3b82f6">TORRENT</div>
+        <div class="count" id="cnt-torrent">0</div>
+      </div>
+    </div>
+
+    <div class="game-frame">
+      <canvas id="spellCanvas" width="600" height="460"></canvas>
+    </div>
+    <p id="keyHint" class="muted center">Keyboard: <span class="kbd">1</span> Thunder &nbsp; <span class="kbd">2</span> Inferno &nbsp; <span class="kbd">3</span> Torrent</p>
+  </div>
+</main>
 
 <!-- ═══════════════════ GAME SCRIPT ═══════════════════ -->
 <script>
@@ -670,7 +498,7 @@ function finalizeSegment() {
     trainedSamples[id] = [motionSegment];  // Replace with single new sample
     saveTraining();
     window._uiLog(`✅ Trained ${id.toUpperCase()}: ${trainedSamples[id].length} sample`);
-    
+
     document.getElementById('trainBtn').textContent = '🎯 Train Next';
     trainingArmed = false;
   } else if (gameRunning) {
