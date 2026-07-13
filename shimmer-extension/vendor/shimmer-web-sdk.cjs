@@ -3336,6 +3336,23 @@ function getVerisenseHardwareCapabilities(revHwMajor, revHwMinor) {
         supportsMagnetometer: secondGeneration,
     };
 }
+/**
+ * GSR-capable hardware. Mirrors the firmware's authoritative
+ * `ShimBrd_isGsrSupportedForHwVersion` (shimmer_boards.c):
+ * - SR62 (any revision)
+ * - SR61 minor >= 5
+ * - SR68 minor >= 5
+ *
+ * Deliberately NOT {@link isVerisenseSecondGenerationHardware}: that predicate
+ * requires SR68 >= 9, but GSR arrived on the SR68 at minor revision 5.
+ */
+function isVerisenseGsrSupportedHardware(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return false;
+    return major === 62 || ((major === 61 || major === 68) && minor >= 5);
+}
 const VERISENSE_SENSOR_SUPPORT_NONE = {
     accel1: false,
     gyroAccel2: false,
@@ -3412,11 +3429,14 @@ function getVerisenseHardwareSensorSupport(revHwMajor, revHwMinor) {
                         algorithmHub: true,
                         ledAutoBrightness: true,
                     }
-                : // SR68.1-8: LIS2DW12 + PPG; skin temperature added from SR68.7.
+                : // SR68.1-8: LIS2DW12 + PPG; GSR added from SR68.5 (Model IC matrix +
+                    // firmware ShimBrd_isGsrSupportedForHwVersion); skin temperature from
+                    // SR68.7.
                     {
                         ...VERISENSE_SENSOR_SUPPORT_NONE,
                         accel1: true,
                         ppg: true,
+                        gsr: isVerisenseGsrSupportedHardware(major, minor),
                         skinTemperature: minor >= 7,
                     };
         default:
@@ -5809,6 +5829,28 @@ class SensorADC extends SensorBase {
             return 2.0;
         return 1.0;
     }
+    /**
+     * Whether this board uses the SR62 (Verisense GSR+) Shimmer3-style analog
+     * front end: 3.0 V SAADC reference, 40.2/287/1000/3300 kΩ GSR feedback
+     * resistors, 0.5 V GSR reference and range-3 uncal limit 683. Every other
+     * GSR-capable board (SR61 >= 5, SR68 >= 5 — firmware
+     * `ShimBrd_isGsrSupportedForHwVersion`) carries the second-generation DC
+     * front end: 1.8 V reference, 21/150/562/1740 kΩ, 0.4986 V, limit 1134.
+     *
+     * Mirrors the firmware's `selectFeedbackResistorsFromHwVersion` (hal_gsr.c),
+     * which keys the choice on the major revision alone (SR62 vs everything
+     * else). Prefers the production-config hardware revision; falls back to the
+     * caller-supplied hardware identifier when no revision has been read yet.
+     * Previously this was keyed only on the `VERISENSE_PULSE_PLUS` identifier
+     * string, so an SR61-5/6 presenting its true identity decoded ~1.91× high
+     * (DEV-874).
+     */
+    usesSr62GsrFrontEnd() {
+        if (this.hwRevisionMajor != null) {
+            return this.hwRevisionMajor === 62;
+        }
+        return this.hardwareIdentifier === 'VERISENSE_GSR_PLUS';
+    }
     setEnabled(arg1, opConfigBytes) {
         if (opConfigBytes != null) {
             const desired = typeof arg1 === 'boolean' ? { gsr: arg1 } : arg1 && typeof arg1 === 'object' ? arg1 : {};
@@ -5855,18 +5897,19 @@ class SensorADC extends SensorBase {
     calibrateAdcToVolts(uncal12bit) {
         const adcRange = 2 ** 12 - 1;
         let refVoltage = 1.8 / 4.0;
-        if (this.hardwareIdentifier === 'VERISENSE_GSR_PLUS') {
+        if (this.usesSr62GsrFrontEnd()) {
             refVoltage = 3.0 / 4.0;
         }
         const adcScaling = 1.0 / 4.0;
         return (uncal12bit * refVoltage) / adcRange / adcScaling;
     }
     calibrateGsrToKOhmsUsingAmplifierEq(volts, range) {
-        let rFeedback = this.SHIMMER3_REF_KOHMS[range];
-        if (this.hardwareIdentifier === 'VERISENSE_PULSE_PLUS') {
-            rFeedback = this.SR68_REF_KOHMS[range];
+        let rFeedback = this.SR68_REF_KOHMS[range];
+        let gsrRefVoltage = 0.4986;
+        if (this.usesSr62GsrFrontEnd()) {
+            rFeedback = this.SHIMMER3_REF_KOHMS[range];
+            gsrRefVoltage = 0.5;
         }
-        const gsrRefVoltage = this.hardwareIdentifier === 'VERISENSE_PULSE_PLUS' ? 0.4986 : 0.5;
         return rFeedback / (volts / gsrRefVoltage - 1.0);
     }
     nudgeGsrResistance(kOhms) {
@@ -5909,9 +5952,9 @@ class SensorADC extends SensorBase {
                 if (currentRange === 4)
                     currentRange = (gsrraw >> 14) & 0x03;
                 if (currentRange === 3) {
-                    const limit = this.hardwareIdentifier === 'VERISENSE_PULSE_PLUS'
-                        ? this.GSR_UNCAL_LIMIT_RANGE3_SR68
-                        : this.GSR_UNCAL_LIMIT_RANGE3_SR62;
+                    const limit = this.usesSr62GsrFrontEnd()
+                        ? this.GSR_UNCAL_LIMIT_RANGE3_SR62
+                        : this.GSR_UNCAL_LIMIT_RANGE3_SR68;
                     if (adc12 < limit)
                         adc12 = limit;
                 }
@@ -6413,7 +6456,12 @@ class SensorLSM6DSV extends SensorBase {
         const dev = this.calibration?.getImu(CalibSensorId.LSM6DSV_GYRO, this.fsGCode);
         if (dev)
             return applyImuCalibration(raw, dev);
-        const scale = this.gyroFsDps / 32768;
+        // ST angular-rate sensitivity: 4.375 mdps/LSB at ±125 dps, doubling per
+        // range (LSM6DSV datasheet §4.3; same spec as the gen-1 LSM6DS3 and the
+        // device calibration seed / calibrationDefaults GYRO_RANGES). Unlike the
+        // accel, the gyro does NOT span the full 16-bit range at nominal full
+        // scale, so a FS/32768 derivation reads ~12.8% low (DEV-874).
+        const scale = 0.004375 * (this.gyroFsDps / 125);
         return [raw[0] * scale, raw[1] * scale, raw[2] * scale];
     }
     calibrateMag(raw) {
@@ -9925,6 +9973,7 @@ exports.isNackCommand = isNackCommand;
 exports.isRoutineVerisenseDfuLogMessage = isRoutineVerisenseDfuLogMessage;
 exports.isSafeFirmwareArchiveName = isSafeFirmwareArchiveName;
 exports.isUniformByteArray = isUniformByteArray;
+exports.isVerisenseGsrSupportedHardware = isVerisenseGsrSupportedHardware;
 exports.isVerisenseLightDarkChannelEnabled = isVerisenseLightDarkChannelEnabled;
 exports.isVerisenseSecondGenerationHardware = isVerisenseSecondGenerationHardware;
 exports.minutesSinceMidnightToHHMM = minutesSinceMidnightToHHMM;
