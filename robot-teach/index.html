@@ -1,0 +1,1527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-T26GWN0LJW');
+  </script>
+
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Teach a Robot — IMU Imitation Learning</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --panel: rgba(22, 27, 34, 0.88);
+      --panel-2: #1c2430;
+      --border: #2a3441;
+      --text: #e6edf3;
+      --muted: #8b98a8;
+      --accent: #2dd4bf;
+      --accent-dim: #0f766e;
+      --flex: #f59e0b;
+      --good: #34d399;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+      color: var(--text); font-family: var(--font); }
+    #scene { position: fixed; inset: 0; display: block; }
+
+    .overlay { position: fixed; z-index: 10; }
+    header.overlay {
+      top: 0; left: 0; right: 0; padding: 14px 20px;
+      display: flex; align-items: baseline; gap: 12px; pointer-events: none;
+    }
+    header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+    header .tag {
+      font-size: 11px; color: var(--accent); border: 1px solid var(--accent-dim);
+      padding: 2px 8px; border-radius: 999px;
+    }
+    header a { color: var(--muted); font-size: 12px; text-decoration: none; pointer-events: auto; }
+    header a:hover { color: var(--accent); }
+
+    .panel {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+      padding: 14px 16px; backdrop-filter: blur(8px);
+    }
+    #controls.overlay { top: 60px; left: 16px; width: 302px; display: flex; flex-direction: column; gap: 12px; }
+
+    .sensor { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
+    .led { width: 11px; height: 11px; border-radius: 50%; background: #3b4654; flex: none;
+      transition: background .2s, box-shadow .2s; }
+    .led.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
+    .led.streaming { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+    .sensor .info { flex: 1; min-width: 0; }
+    .sensor .role { font-weight: 600; font-size: 14px; }
+    .sensor .name { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .magRow {
+      display: flex; align-items: center; gap: 8px;
+      padding: 0 0 8px 21px; margin-top: -2px;
+      border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted);
+    }
+    .magRow:last-of-type { border-bottom: none; padding-bottom: 0; }
+    .magRow .magState { flex: 1; }
+    .magRow .magState.ok { color: var(--good); }
+    .magRow .magState.bad { color: var(--flex); }
+    .magRow button { font-size: 11px; padding: 3px 10px; border-radius: 7px; }
+
+    button {
+      font-family: var(--font); font-size: 13px; font-weight: 600;
+      border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+      padding: 8px 14px; border-radius: 9px; cursor: pointer;
+      transition: background .15s, border-color .15s, opacity .15s;
+    }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button.primary { background: var(--accent-dim); border-color: var(--accent-dim); }
+    button.primary:hover:not(:disabled) { background: var(--accent); color: #04201c; }
+    button.wide { width: 100%; padding: 10px; }
+    button.stop { background: #7f1d1d; border-color: #f87171; }
+    .row-btns { display: flex; gap: 8px; }
+    .row-btns button { flex: 1; }
+    .row-btns button.active { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
+
+    .row { display: flex; align-items: center; gap: 10px; }
+    .row label { font-size: 13px; color: var(--muted); }
+    .slider-row label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 6px; }
+    .slider-row label b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+    .slider-row input[type=range] {
+      width: 100%; height: 4px; -webkit-appearance: none; appearance: none;
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; cursor: pointer;
+    }
+    .slider-row input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%;
+      background: var(--accent); border: none; cursor: pointer;
+    }
+    .slider-row input[type=range]::-moz-range-thumb {
+      width: 16px; height: 16px; border-radius: 50%; background: var(--accent); border: none; cursor: pointer;
+    }
+    h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+      margin: 0 0 10px; font-weight: 600; }
+    .caption { font-size: 12px; color: var(--muted); margin: 0 0 10px; line-height: 1.45; }
+
+    .stats { font-size: 12px; color: var(--muted); line-height: 1.7; }
+    .stats b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+    #hud.overlay { top: 60px; right: 16px; text-align: right; pointer-events: none; }
+    #hud .val { font-size: 42px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+    #hud .val span { font-size: 18px; color: var(--muted); }
+    #hud .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    #hud .sub { margin-top: 10px; }
+
+    #prompt.overlay {
+      top: 70px; left: 50%; transform: translateX(-50%);
+      font-size: 15px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase;
+      color: var(--muted); background: var(--panel); border: 1px solid var(--border);
+      padding: 8px 18px; border-radius: 999px; pointer-events: none;
+      transition: color .2s, border-color .2s;
+    }
+    #prompt.hold { color: var(--flex); border-color: var(--flex); }
+    #prompt.live { color: var(--good); border-color: var(--good); }
+
+    .station-label {
+      position: fixed; bottom: 44px; z-index: 5; pointer-events: none;
+      font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+      background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 5px 14px;
+    }
+    #labelHuman { left: 32%; transform: translateX(-50%); }
+    #labelRobot { left: 68%; transform: translateX(-50%); }
+
+    #hint.overlay {
+      bottom: 14px; left: 50%; transform: translateX(-50%);
+      font-size: 12px; color: var(--muted); pointer-events: none;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 999px; padding: 7px 16px; white-space: nowrap;
+      display: flex; gap: 14px; align-items: center;
+    }
+    #hint kbd {
+      font-family: var(--font); font-size: 11px; color: var(--text);
+      background: var(--panel-2); border: 1px solid var(--border);
+      border-radius: 5px; padding: 1px 7px; margin-right: 5px;
+    }
+
+    #console.overlay {
+      bottom: 40px; left: 16px; width: 340px; max-height: 100px; overflow-y: auto;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+      color: var(--muted); background: rgba(13,17,23,.85); border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px 10px; white-space: pre-wrap;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <header class="overlay">
+    <h1>Teach a Robot</h1>
+    <span class="tag">2 IMUs · no cameras · live robot teleoperation</span>
+    <a href="../knee-angle/hands-mag.html">← arm &amp; hand demo</a>
+  </header>
+
+  <div id="controls" class="overlay">
+    <div class="panel">
+      <h2>Sensors</h2>
+      <div class="sensor">
+        <div class="led" id="ledUpper"></div>
+        <div class="info">
+          <div class="role">Upper arm</div>
+          <div class="name" id="nameUpper">Not connected</div>
+        </div>
+        <button id="connUpper" class="primary">Connect</button>
+      </div>
+      <div class="magRow">
+        <span class="magState" id="magStateUpper">mag: not calibrated</span>
+        <button id="magBtnUpper" disabled>⟳ Cal mag</button>
+      </div>
+      <div class="sensor">
+        <div class="led" id="ledWrist"></div>
+        <div class="info">
+          <div class="role">Wrist</div>
+          <div class="name" id="nameWrist">Not connected</div>
+        </div>
+        <button id="connWrist" class="primary">Connect</button>
+      </div>
+      <div class="magRow">
+        <span class="magState" id="magStateWrist">mag: not calibrated</span>
+        <button id="magBtnWrist" disabled>⟳ Cal mag</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Calibration</h2>
+      <div class="row-btns" style="margin-bottom: 10px;">
+        <button data-hand="R" class="active">Right hand</button>
+        <button data-hand="L">Left hand</button>
+      </div>
+      <p class="caption">Hang the arm &amp; hold still, then swing it forward &amp; back ×3 (the avatar demonstrates). Afterwards: hold the tray pose and place the bottles.</p>
+      <button id="calBtn" class="wide primary" disabled>⦿ Calibrate — hang, then swing ×3</button>
+      <button id="placeBtn" class="wide" disabled style="margin-top: 8px;">🍾 Set tray level &amp; place bottles</button>
+      <div class="row" style="margin-top: 10px;">
+        <input type="checkbox" id="simChk" />
+        <label for="simChk">Simulated demonstrator (no sensors)</label>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Balance challenge</h2>
+      <p class="caption">The floor under the avatar starts shifting and gets harder over time. Keep the tray level — the robot mirrors you, so it only stays up as long as you do.</p>
+      <button id="demoBtn" class="wide" disabled>▶ Start</button>
+      <div class="slider-row" style="margin-top: 12px;">
+        <label for="speedRange">Floor speed <b id="speedVal">25%</b></label>
+        <input type="range" id="speedRange" min="5" max="100" step="5" value="25" />
+      </div>
+      <div class="slider-row" style="margin-top: 12px;">
+        <label for="tiltRange">Max tilt <b id="tiltCapVal">30°</b></label>
+        <input type="range" id="tiltRange" min="10" max="45" step="1" value="30" />
+      </div>
+      <div class="row-btns" style="margin-top: 12px;">
+        <button data-tiltmode="lr" class="active">↔ Left / right</button>
+        <button data-tiltmode="free">✳ Free range</button>
+      </div>
+      <div class="row" style="margin-top: 10px;">
+        <input type="checkbox" id="followChk" checked />
+        <label for="followChk">Robot follows my movements</label>
+      </div>
+      <button id="viewBtn" class="wide" style="margin-top: 10px;">📷 View from behind</button>
+      <div class="stats" id="epInfo" style="margin-top: 8px;">press Start when ready</div>
+    </div>
+  </div>
+
+  <div id="hud" class="overlay">
+    <div class="val"><span id="timeVal">0.0</span><span> s</span></div>
+    <div class="lbl" id="timeLbl">balance time</div>
+    <div class="sub">
+      <div class="val" style="font-size: 28px;"><span id="tiltVal">–</span><span>°</span></div>
+      <div class="lbl" id="tiltLbl">tray tilt</div>
+    </div>
+  </div>
+
+  <div id="prompt" class="overlay">connect sensors, or tick “simulated demonstrator”</div>
+  <div id="labelHuman" class="station-label">Human — wearing 2 IMUs</div>
+  <div id="labelRobot" class="station-label">Robot — shadowing</div>
+  <div id="hint" class="overlay">
+    <span><kbd>Left-drag</kbd>rotate camera</span>
+    <span><kbd>Scroll</kbd>zoom</span>
+    <span><kbd>Right-drag</kbd>pan</span>
+  </div>
+  <pre id="console" class="overlay"></pre>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import * as CANNON from 'cannon-es';
+    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js?v=2';
+    import { ArmImu } from 'fusion3d.js?v=6';
+
+    // --- config -----------------------------------------------------------
+    const SAMPLING_HZ = 128;
+    const DT = 1 / SAMPLING_HZ;
+    const SENSOR_MASK = (SensorBitmapShimmer3.SENSOR_D_ACCEL |
+                         SensorBitmapShimmer3.SENSOR_GYRO |
+                         SensorBitmapShimmer3.SENSOR_MAG) >>> 0;
+    const ACCEL_RANGE_4G = 1;
+    const GYRO_RANGE_500DPS = 2;
+    const BETA_SETTLE = 0.6;
+    const BETA_RUN = 0.05;
+    const MAGCAL_KEY = (name) => `armDemo.magcal.${name}`;   // shared with hands-mag
+
+    const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+    const TRAY = { half: 0.15, rimH: 0.022, y: 0.02 };       // tray geometry (m)
+    const EPISODE_CAP = 90;                                   // s — attempt time cap
+    const RESTART_PAUSE = 2.0;                                // s between attempts
+
+    // --- console ------------------------------------------------------------
+    const consoleEl = document.getElementById('console');
+    const log = (t) => {
+      consoleEl.textContent += t + '\n';
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    };
+    const promptEl = document.getElementById('prompt');
+    function setPrompt(text, cls = '') {
+      promptEl.textContent = text;
+      promptEl.className = 'overlay' + (cls ? ' ' + cls : '');
+    }
+
+    // --- fusion + BLE (same stack as ../knee-angle/hands-mag.html) ----------
+    const imuUpper = new ArmImu({ beta: BETA_SETTLE, useMag: true });
+    const imuWrist = new ArmImu({ beta: BETA_SETTLE, useMag: true });
+
+    class SensorLink {
+      constructor(role, imu, els) {
+        this.role = role;
+        this.imu = imu;
+        this.els = els;
+        this.streaming = false;
+        this.client = new Shimmer3RClient({ timestampFmt: 'u24', debug: false });
+        this.client.onStatus = (m) => log(`[${role}] ${m}`);
+        this.client.onStreamFrame = (oc) => {
+          const ax = oc.get('WR_ACCEL_X')?.value, ay = oc.get('WR_ACCEL_Y')?.value, az = oc.get('WR_ACCEL_Z')?.value;
+          const gx = oc.get('GYRO_X')?.value, gy = oc.get('GYRO_Y')?.value, gz = oc.get('GYRO_Z')?.value;
+          if ([ax, ay, az, gx, gy, gz].some(v => v === undefined)) return;
+          const mx = oc.get('MAG_X')?.value, my = oc.get('MAG_Y')?.value, mz = oc.get('MAG_Z')?.value;
+          const mag = [mx, my, mz].some(v => v === undefined) ? null : { x: mx, y: my, z: mz };
+          this.imu.update({ x: ax, y: ay, z: az }, { x: gx, y: gy, z: gz }, DT, mag);
+        };
+      }
+      async connectAndStream() {
+        this.els.led.className = 'led';
+        await this.client.connect();
+        this.els.name.textContent = this.client.device?.name || 'Shimmer3R';
+        this.els.led.className = 'led on';
+        await this.client.setSamplingRate(SAMPLING_HZ);
+        await this.client.setAccelRange(ACCEL_RANGE_4G);
+        await this.client.setGyroRange(GYRO_RANGE_500DPS);
+        await this.client.setSensors(SENSOR_MASK);
+        await this.client.startStreaming();
+        this.els.led.className = 'led streaming';
+        this.streaming = true;
+        log(`[${this.role}] streaming @ ${SAMPLING_HZ} Hz`);
+      }
+    }
+
+    const upper = new SensorLink('upper', imuUpper, {
+      led: document.getElementById('ledUpper'), name: document.getElementById('nameUpper'),
+      magState: document.getElementById('magStateUpper'), magBtn: document.getElementById('magBtnUpper'),
+    });
+    const wrist = new SensorLink('wrist', imuWrist, {
+      led: document.getElementById('ledWrist'), name: document.getElementById('nameWrist'),
+      magState: document.getElementById('magStateWrist'), magBtn: document.getElementById('magBtnWrist'),
+    });
+
+    const calBtn = document.getElementById('calBtn');
+    function wireConnect(btn, link) {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          await link.connectAndStream();
+          btn.textContent = 'Connected';
+          link.els.magBtn.disabled = false;
+          loadMagCal(link);
+          if (upper.streaming && wrist.streaming) calBtn.disabled = false;
+        } catch (e) {
+          log(`[${link.role}] ❌ ${e.message}`);
+          link.els.led.className = 'led';
+          btn.disabled = false;
+        }
+      });
+    }
+    wireConnect(document.getElementById('connUpper'), upper);
+    wireConnect(document.getElementById('connWrist'), wrist);
+
+    // --- mag hard-iron calibration (same flow + storage keys as hands-mag) ---
+    let magCap = null;
+    const MAGCAP_TIMEOUT = 45;
+
+    function setMagState(link, text, cls = '') {
+      link.els.magState.textContent = text;
+      link.els.magState.className = 'magState' + (cls ? ' ' + cls : '');
+    }
+    function loadMagCal(link) {
+      const name = link.client.device?.name;
+      if (!name) return;
+      try {
+        const stored = localStorage.getItem(MAGCAL_KEY(name));
+        if (!stored) return;
+        const cal = JSON.parse(stored);
+        link.imu.setMagCalibration(cal);
+        setMagState(link, `mag ✓ ${cal.field.toFixed(2)} Ga (stored)`, 'ok');
+        log(`[${link.role}] mag hard-iron loaded for "${name}"`);
+      } catch { /* corrupted entry — leave uncalibrated */ }
+    }
+    function wireMagBtn(link) {
+      link.els.magBtn.addEventListener('click', () => {
+        if (magCap || calActive()) return;
+        magCap = { link, deadline: performance.now() / 1000 + MAGCAP_TIMEOUT };
+        link.imu.startMagCapture();
+        link.els.magBtn.disabled = true;
+        setPrompt(`hold the ${link.role} sensor IN HAND — wave slow figure-8s · 0%`, 'hold');
+      });
+    }
+    wireMagBtn(upper);
+    wireMagBtn(wrist);
+
+    function checkMagCapture() {
+      if (!magCap) return;
+      const t = performance.now() / 1000;
+      const { link } = magCap;
+      const p = link.imu.magCaptureProgress ?? 1;
+      setPrompt(`wave the ${link.role} sensor in slow figure-8s — all orientations · ${Math.round(p * 100)}%`, 'hold');
+      if (p < 1 && t < magCap.deadline) return;
+      const fit = link.imu.finishMagCapture();
+      magCap = null;
+      link.els.magBtn.disabled = false;
+      if (!fit) {
+        setMagState(link, 'mag: capture failed — retry', 'bad');
+        setPrompt('mag calibration failed — try again');
+        return;
+      }
+      link.imu.setMagCalibration(fit);
+      const name = link.client.device?.name;
+      if (name) localStorage.setItem(MAGCAL_KEY(name), JSON.stringify({ offset: fit.offset, field: fit.field }));
+      setMagState(link, `mag ✓ ${fit.field.toFixed(2)} Ga`, 'ok');
+      setPrompt(`mag calibrated — strap the sensor back on`, 'live');
+      log(`[${link.role}] hard-iron fit · field ${fit.field.toFixed(3)} Ga · spread ${(fit.quality * 100).toFixed(1)}%`);
+    }
+
+    // --- calibration: functional 2-phase flow, then an EXPLICIT level set ---
+    // 1/2 hang the arm, hold still  -> gyro bias per sensor
+    // 2/2 swing the straight arm forward & back ×3
+    //     -> both sensors rotate about the same physical axis; measuring it in
+    //        each filter's earth frame aligns the frames REGARDLESS of how the
+    //        pucks are strapped, and pins "forward" physically (so the tray's
+    //        lean direction on screen matches your real lean direction)
+    // Then the user holds the tray pose and PRESSES "place bottles" — that
+    // press captures the reference ("tray level"). Explicit by design:
+    // stillness alone can't tell a hanging arm from the tray pose, so any
+    // automatic pose capture fires too early.
+    let calPhase = 'idle';    // idle | still1 | swing
+    let calibrated = false;
+    let trayLevelSet = false;
+    let calPending = 0;
+    let calDeadline = 0;
+    let quietSince = null;
+    let calSnapshot = null;
+    const CAL_BTN_LABEL = '⦿ Calibrate — hang, then swing ×3';
+    const SWING_TARGET = 160;   // ~1.25 s of >40 deg/s rotation per device
+    const calActive = () => calPhase !== 'idle';
+
+    calBtn.addEventListener('click', () => {
+      if (calActive() || magCap) return;
+      for (const link of [upper, wrist]) {
+        if (!link.imu.magCalibrated) log(`[${link.role}] ⚠ mag not calibrated — heading may drift over long sessions`);
+      }
+      calSnapshot = [imuUpper.snapshotCalibration(), imuWrist.snapshotCalibration()];
+      imuUpper.resetCalibration();
+      imuWrist.resetCalibration();
+      imuUpper.filter.beta = BETA_SETTLE;
+      imuWrist.filter.beta = BETA_SETTLE;
+      hideBottlesForCal(true);
+      calPhase = 'still1';
+      calPending = 2;
+      calDeadline = performance.now() / 1000 + 6;
+      guideT = 0;
+      calBtn.disabled = true;
+      calBtn.textContent = 'Calibrating…';
+      setPrompt('1/2 — hang the arm straight down, hold still', 'hold');
+      imuUpper.startCalibration(Math.round(1.25 * SAMPLING_HZ));
+      imuWrist.startCalibration(Math.round(1.25 * SAMPLING_HZ));
+    });
+
+    function rollbackCal(msg) {
+      if (calSnapshot) {
+        imuUpper.restoreCalibration(calSnapshot[0]);
+        imuWrist.restoreCalibration(calSnapshot[1]);
+        calSnapshot = null;
+      }
+      if (calibrated) {   // previous good calibration back in force
+        imuUpper.filter.beta = BETA_RUN;
+        imuWrist.filter.beta = BETA_RUN;
+      }
+      calPhase = 'idle';
+      calPending = 0;
+      calBtn.disabled = false;
+      calBtn.textContent = calibrated ? '⦿ Re-calibrate' : CAL_BTN_LABEL;
+      setPrompt(msg);
+      hideBottlesForCal(false);
+    }
+
+    function onImuCalibrated() {
+      if (--calPending > 0) return;
+      if (calPhase !== 'still1') return;
+      calPhase = 'swing';
+      calDeadline = performance.now() / 1000 + 15;   // generous backstop
+      quietSince = null;
+      guideT = 0;
+      imuUpper.startSwingCapture();
+      imuWrist.startSwingCapture();
+    }
+    imuUpper.onCalibrated = onImuCalibrated;
+    imuWrist.onCalibrated = onImuCalibrated;
+
+    function checkCalPhases() {
+      if (!calActive()) return;
+      const t = performance.now() / 1000;
+
+      if (calPhase === 'still1') {
+        const pU = imuUpper.calProgress, pW = imuWrist.calProgress;
+        const pct = Math.round(Math.min(pU ?? 1, pW ?? 1) * 100);
+        setPrompt(`1/2 — hang the arm straight down, hold still · ${pct}%`, 'hold');
+        if (t > calDeadline) rollbackCal('calibration timed out — check both sensors are streaming');
+        return;
+      }
+
+      if (calPhase === 'swing') {
+        const cU = imuUpper.swingCount, cW = imuWrist.swingCount;
+        const pct = Math.min(100, Math.round(Math.min(cU, cW) / SWING_TARGET * 100));
+        setPrompt(`2/2 — swing the straight arm forward & back ×3, then hold still · ${pct}%`, 'hold');
+        const quiet = (imuUpper.gyroMag ?? 99) < 25 && (imuWrist.gyroMag ?? 99) < 25;
+        if (!quiet) quietSince = null;
+        else if (quietSince === null) quietSince = t;
+        const settled = cU >= SWING_TARGET && cW >= SWING_TARGET
+                        && quietSince !== null && (t - quietSince) > 0.7;
+        if (!settled && t < calDeadline) return;
+        const aU = imuUpper.finishSwingCapture();
+        const aW = imuWrist.finishSwingCapture();
+        if (!aU || !aW) {
+          rollbackCal(calibrated
+            ? 'not enough swing — previous calibration restored'
+            : 'not enough swing detected — press Calibrate to retry');
+          log(`swing failed: samples upper ${cU}, wrist ${cW} (need ${SWING_TARGET} each)`);
+          return;
+        }
+        imuUpper.setYawFix(aU);
+        imuWrist.setYawFix(aW);
+        const yaw = (a) => Math.atan2(a.y, a.x) * 180 / Math.PI;
+        log(`swing ok: strap yaw offset ${(((yaw(aU) - yaw(aW)) % 360 + 540) % 360 - 180).toFixed(1)}° corrected`);
+        // done — the tray level is set explicitly by the "place bottles" button
+        calPhase = 'idle';
+        calibrated = true;
+        trayLevelSet = false;
+        calSnapshot = null;
+        imuUpper.filter.beta = BETA_RUN;
+        imuWrist.filter.beta = BETA_RUN;
+        calBtn.disabled = false;
+        calBtn.textContent = '⦿ Re-calibrate';
+        placeBtn.classList.add('primary');
+        setPrompt('✓ calibrated — hold the TRAY POSE, then press “place bottles”', 'live');
+        log('calibrated: now set the tray level with the place-bottles button');
+        refreshButtons();
+      }
+    }
+
+    // Explicit tray-level capture + bottle placement — pressed while HOLDING
+    // the tray pose (forearm level, palm up).
+    const placeBtn = document.getElementById('placeBtn');
+    placeBtn.addEventListener('click', () => {
+      if (calActive() || magCap || mode !== 'idle') return;
+      if (!simChk.checked) {
+        if (!calibrated) return;
+        imuUpper.captureReference();
+        imuWrist.captureReference();
+        trayLevelSet = true;
+        log('tray level captured from the pose you are holding');
+      }
+      placeBtn.classList.remove('primary');
+      hideBottlesForCal(false);   // respawns both trays' bottles
+      setPrompt('bottles placed — keep the tray level', 'live');
+      refreshButtons();
+    });
+
+    // guide animation: during calibration the avatar (and robot) demonstrate
+    // the current step — hang the arm, swing it, then back to the tray pose
+    const qGuideProx = new THREE.Quaternion();
+    const qGuideDist = new THREE.Quaternion();
+    let guideT = 0;
+    function calGuidePose(dt) {
+      guideT += dt;
+      const theta = calPhase === 'swing'
+        ? -70 * Math.PI / 180 * Math.sin(2 * Math.PI * guideT / 2.2)
+        : 0;
+      qGuideProx.setFromAxisAngle(X_AXIS, theta);
+      qGuideDist.copy(Binv);       // straight arm: forearm hangs in line
+    }
+
+    let bottlesHiddenForCal = false;
+    function hideBottlesForCal(hide) {
+      bottlesHiddenForCal = hide;
+      if (!hide) {
+        respawnBottles(humanRig);
+        respawnBottles(robotRig);
+      }
+    }
+
+    // --- three.js scene -----------------------------------------------------
+    const canvas = document.getElementById('scene');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d1117);
+    scene.fog = new THREE.Fog(0x0d1117, 4, 9);
+
+    const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 30);
+    camera.position.set(0.55, 1.55, 3.2);
+    const controls = new OrbitControls(camera, canvas);
+    controls.target.set(0.12, 0.55, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 1.0;
+    controls.maxDistance = 6;
+
+    scene.add(new THREE.HemisphereLight(0x4a5866, 0x0d1117, 1.9));
+    const key = new THREE.DirectionalLight(0xffffff, 2.2);
+    key.position.set(2, 3.5, 2);
+    key.castShadow = true;
+    key.shadow.mapSize.set(2048, 2048);
+    key.shadow.camera.left = -2.5; key.shadow.camera.right = 2.5;
+    key.shadow.camera.top = 2.5; key.shadow.camera.bottom = -2.5;
+    scene.add(key);
+    const back = new THREE.DirectionalLight(0xbdd4ff, 1.1);
+    back.position.set(-1.5, 2.5, -2.5);
+    scene.add(back);
+    const rimL = new THREE.PointLight(0x2dd4bf, 1.2, 5);
+    rimL.position.set(-2, 1, -1);
+    scene.add(rimL);
+
+    const grid = new THREE.GridHelper(12, 48, 0x2a3441, 0x1c2430);
+    scene.add(grid);
+    const shadowCatcher = new THREE.Mesh(
+      new THREE.PlaneGeometry(12, 12), new THREE.ShadowMaterial({ opacity: 0.35 }));
+    shadowCatcher.rotation.x = -Math.PI / 2;
+    shadowCatcher.position.y = 0.001;
+    shadowCatcher.receiveShadow = true;
+    scene.add(shadowCatcher);
+
+    // shared arm geometry constants — human and robot arms are CONGRUENT, so
+    // human joint quaternions drive the robot directly (no IK)
+    const ARM = { shoulderY: 0.86, upperLen: 0.26, foreLen: 0.24 };
+    // baked elbow bend: forearm forward (+Z), palm up — the calibration pose
+    const B = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+    const Binv = B.clone().invert();
+    const PALM_UP = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+
+    function buildTrayVisual(mat) {   // square tray with a low rim, teal edge
+      const g = new THREE.Group();
+      const base = new THREE.Mesh(new THREE.BoxGeometry(TRAY.half * 2, 0.016, TRAY.half * 2), mat);
+      base.position.y = TRAY.y;
+      base.castShadow = true;
+      g.add(base);
+      const rimMat = new THREE.MeshStandardMaterial({ color: 0x2dd4bf, roughness: 0.4, metalness: 0.3 });
+      for (const [dx, dz, w, d] of [
+        [0, -TRAY.half, TRAY.half * 2, 0.012], [0, TRAY.half, TRAY.half * 2, 0.012],
+        [-TRAY.half, 0, 0.012, TRAY.half * 2], [TRAY.half, 0, 0.012, TRAY.half * 2]]) {
+        const rim = new THREE.Mesh(new THREE.BoxGeometry(w, TRAY.rimH, d), rimMat);
+        rim.position.set(dx, TRAY.y + 0.008 + TRAY.rimH / 2, dz);
+        rim.castShadow = true;
+        g.add(rim);
+      }
+      return g;
+    }
+
+    // Each station: tilting platform -> figure -> articulated arm -> palmFrame
+    // (world-level at rest) -> tray. Returns handles used by pose + physics.
+    function buildHumanStation(x) {
+      const mats = [];
+      const mat = (color, opts = {}) => {
+        const m = new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.15, transparent: true, ...opts });
+        mats.push({ m, base: opts.opacity ?? 1 });   // remember baseline for un-dim
+        return m;
+      };
+      const bodyMat = mat(0x8b98a8);
+      const skinMat = mat(0xe6edf3);
+      // barely-there body: the trainer stands BEHIND the avatar, so the torso
+      // must never occlude the tray (depthWrite off keeps sorting artifacts away)
+      const ghostMat = mat(0x6b7a8c, { opacity: 0.15, depthWrite: false, roughness: 0.8 });
+
+      const platform = new THREE.Group();
+      platform.position.set(x, 0.03, 0);
+      scene.add(platform);
+      const disc = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.54, 0.05, 40), mat(0x1c2430, { roughness: 0.8 }));
+      disc.castShadow = true; disc.receiveShadow = true;
+      platform.add(disc);
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.008, 8, 48),
+        new THREE.MeshStandardMaterial({ color: 0x2dd4bf, emissive: 0x2dd4bf, emissiveIntensity: 0.4 }));
+      ring.rotation.x = Math.PI / 2;
+      ring.position.y = 0.026;
+      platform.add(ring);
+
+      // figure (ghosted body, solid right arm)
+      for (const lx of [-0.08, 0.08]) {
+        const leg = new THREE.Mesh(new THREE.CapsuleGeometry(0.05, 0.42, 6, 12), ghostMat);
+        leg.position.set(lx, 0.28, 0);
+        platform.add(leg);
+      }
+      const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.13, 0.30, 8, 20), ghostMat);
+      torso.position.set(0, 0.66, 0);
+      platform.add(torso);
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.09, 24, 16), ghostMat);
+      head.position.set(0, 1.0, 0);
+      platform.add(head);
+
+      // shoulder x is set by the hand selector (right = -X, model faces +Z);
+      // arm baked into the waiter pose (this IS the calibration pose)
+      const shoulder = new THREE.Group();
+      shoulder.position.set(-0.21, ARM.shoulderY, 0);
+      platform.add(shoulder);
+      shoulder.add(new THREE.Mesh(new THREE.SphereGeometry(0.045, 18, 12), bodyMat));
+
+      const proxGroup = new THREE.Group();
+      shoulder.add(proxGroup);
+      const upperArm = new THREE.Mesh(new THREE.CapsuleGeometry(0.036, ARM.upperLen - 0.06, 6, 14), bodyMat);
+      upperArm.position.y = -ARM.upperLen / 2;
+      upperArm.castShadow = true;
+      proxGroup.add(upperArm);
+      const puck = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.045, 0.015),
+        new THREE.MeshStandardMaterial({ color: 0x2dd4bf, roughness: 0.35 }));
+      puck.position.set(-0.038, -ARM.upperLen * 0.45, 0.01);
+      proxGroup.add(puck);
+
+      const jointPivot = new THREE.Group();
+      jointPivot.position.y = -ARM.upperLen;
+      jointPivot.quaternion.copy(B);          // baked 90° bend: forearm forward
+      proxGroup.add(jointPivot);
+      jointPivot.add(new THREE.Mesh(new THREE.SphereGeometry(0.038, 18, 12), bodyMat));
+
+      const distGroup = new THREE.Group();
+      jointPivot.add(distGroup);
+      const forearm = new THREE.Mesh(new THREE.CapsuleGeometry(0.03, ARM.foreLen - 0.05, 6, 14), skinMat);
+      forearm.position.y = -ARM.foreLen / 2;
+      forearm.castShadow = true;
+      distGroup.add(forearm);
+      const puckW = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.04, 0.014),
+        new THREE.MeshStandardMaterial({ color: 0x2dd4bf, roughness: 0.35 }));
+      puckW.position.set(-0.034, -ARM.foreLen * 0.7, 0.01);
+      distGroup.add(puckW);
+
+      const palmFrame = new THREE.Group();      // +Y = world up at rest
+      palmFrame.position.y = -ARM.foreLen - 0.02;
+      palmFrame.quaternion.copy(PALM_UP);
+      distGroup.add(palmFrame);
+      const palm = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.02, 0.09), skinMat);
+      palm.castShadow = true;
+      palmFrame.add(palm);
+      palmFrame.add(buildTrayVisual(mat(0x3a4654, { roughness: 0.5, metalness: 0.4 })));
+
+      return { platform, shoulder, proxGroup, distGroup, palmFrame, mats };
+    }
+
+    function buildRobotStation(x) {
+      const mats = [];
+      const mat = (color, opts = {}) => {
+        const m = new THREE.MeshStandardMaterial({ color, roughness: 0.45, metalness: 0.5, transparent: true, ...opts });
+        mats.push({ m, base: opts.opacity ?? 1 });
+        return m;
+      };
+      const linkMat = mat(0x3a4654);
+      const accentMat = mat(0xf59e0b, { roughness: 0.35, metalness: 0.2 });
+
+      const platform = new THREE.Group();
+      platform.position.set(x, 0.03, 0);
+      scene.add(platform);
+      const disc = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.54, 0.05, 40), mat(0x1c2430, { roughness: 0.8, metalness: 0.1 }));
+      disc.castShadow = true; disc.receiveShadow = true;
+      platform.add(disc);
+      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.5, 0.008, 8, 48),
+        new THREE.MeshStandardMaterial({ color: 0xf59e0b, emissive: 0xf59e0b, emissiveIntensity: 0.4 }));
+      ring.rotation.x = Math.PI / 2;
+      ring.position.y = 0.026;
+      platform.add(ring);
+
+      // pedestal column up to "shoulder" height — arm congruent with the human's
+      const column = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.10, ARM.shoulderY, 20), linkMat);
+      column.position.y = ARM.shoulderY / 2;
+      column.castShadow = true;
+      platform.add(column);
+      const collar = new THREE.Mesh(new THREE.TorusGeometry(0.075, 0.012, 8, 24), accentMat);
+      collar.rotation.x = Math.PI / 2;
+      collar.position.y = ARM.shoulderY - 0.02;
+      platform.add(collar);
+
+      const shoulder = new THREE.Group();
+      shoulder.position.set(0, ARM.shoulderY, 0);
+      platform.add(shoulder);
+      shoulder.add(new THREE.Mesh(new THREE.SphereGeometry(0.055, 20, 14), accentMat));
+
+      const proxGroup = new THREE.Group();
+      shoulder.add(proxGroup);
+      const upperLink = new THREE.Mesh(new THREE.BoxGeometry(0.06, ARM.upperLen, 0.06), linkMat);
+      upperLink.position.y = -ARM.upperLen / 2;
+      upperLink.castShadow = true;
+      proxGroup.add(upperLink);
+
+      const jointPivot = new THREE.Group();
+      jointPivot.position.y = -ARM.upperLen;
+      jointPivot.quaternion.copy(B);
+      proxGroup.add(jointPivot);
+      jointPivot.add(new THREE.Mesh(new THREE.SphereGeometry(0.048, 18, 12), accentMat));
+
+      const distGroup = new THREE.Group();
+      jointPivot.add(distGroup);
+      const foreLink = new THREE.Mesh(new THREE.BoxGeometry(0.05, ARM.foreLen, 0.05), linkMat);
+      foreLink.position.y = -ARM.foreLen / 2;
+      foreLink.castShadow = true;
+      distGroup.add(foreLink);
+
+      const palmFrame = new THREE.Group();
+      palmFrame.position.y = -ARM.foreLen - 0.02;
+      palmFrame.quaternion.copy(PALM_UP);
+      distGroup.add(palmFrame);
+      const flange = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.02, 20), accentMat);
+      palmFrame.add(flange);
+      palmFrame.add(buildTrayVisual(mat(0x3a4654, { roughness: 0.5 })));
+
+      return { platform, proxGroup, distGroup, palmFrame, mats };
+    }
+
+    const human = buildHumanStation(-0.75);
+    const robot = buildRobotStation(0.75);
+
+    // --- physics: trays (kinematic compounds) + bottles ---------------------
+    const phys = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+    phys.solver.iterations = 30;
+    phys.solver.tolerance = 1e-4;
+    phys.defaultContactMaterial.friction = 0.55;
+    phys.defaultContactMaterial.restitution = 0.05;
+    const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane() });
+    groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+    phys.addBody(groundBody);   // spilled bottles land on the floor
+
+    // static topple at atan(hw/hh) ≈ 12.7° — an uncorrected floor crosses that
+    // within seconds, a decent demonstrator stays well under it
+    const BOTTLE = { hw: 0.018, hh: 0.08, mass: 0.12, colors: [0x34d399, 0xf59e0b, 0x60a5fa] };
+    const BOTTLE_SPOTS = [[-0.07, -0.05], [0.07, -0.05], [0, 0.06]];
+
+    function buildBottleVisual(color) {
+      const g = new THREE.Group();
+      const m = new THREE.MeshStandardMaterial({ color, roughness: 0.15, metalness: 0.1, transparent: true, opacity: 0.88 });
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(0.019, 0.019, 0.115, 14), m);
+      body.position.y = -0.0225;
+      body.castShadow = true;
+      g.add(body);
+      const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.007, 0.017, 0.038, 10), m);
+      neck.position.y = 0.054;
+      g.add(neck);
+      const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.0085, 0.0085, 0.012, 10),
+        new THREE.MeshStandardMaterial({ color: 0xe6edf3, roughness: 0.5 }));
+      cap.position.y = 0.078;
+      g.add(cap);
+      return g;
+    }
+
+    function makeTrayRig() {
+      const body = new CANNON.Body({ type: CANNON.Body.KINEMATIC });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(TRAY.half, 0.008, TRAY.half)), new CANNON.Vec3(0, TRAY.y, 0));
+      const rimHalf = TRAY.rimH / 2;
+      for (const [ox, oz, hx, hz] of [
+        [0, -TRAY.half, TRAY.half, 0.006], [0, TRAY.half, TRAY.half, 0.006],
+        [-TRAY.half, 0, 0.006, TRAY.half], [TRAY.half, 0, 0.006, TRAY.half]]) {
+        body.addShape(new CANNON.Box(new CANNON.Vec3(hx, rimHalf, hz)),
+          new CANNON.Vec3(ox, TRAY.y + 0.008 + rimHalf, oz));
+      }
+      body.position.set(0, -5, 0);   // parked until driven
+      phys.addBody(body);
+
+      const bottles = [];
+      for (let i = 0; i < BOTTLE_SPOTS.length; i++) {
+        const b = new CANNON.Body({
+          mass: BOTTLE.mass,
+          shape: new CANNON.Box(new CANNON.Vec3(BOTTLE.hw, BOTTLE.hh, BOTTLE.hw)),
+          linearDamping: 0.05,
+          angularDamping: 0.05,
+        });
+        b.allowSleep = false;
+        b.position.set(0, -6 - i, 0);
+        phys.addBody(b);
+        const mesh = buildBottleVisual(BOTTLE.colors[i % BOTTLE.colors.length]);
+        scene.add(mesh);
+        bottles.push({ body: b, mesh });
+      }
+      return {
+        body, bottles,
+        tPrevPos: new THREE.Vector3(0, -5, 0), tPrevQ: new THREE.Quaternion(),
+        tNowPos: new THREE.Vector3(0, -5, 0), tNowQ: new THREE.Quaternion(),
+        grace: 0,
+        driven: false,
+        tumbleT: 0, needsRerack: false,   // free-play spill recovery
+      };
+    }
+    const humanRig = makeTrayRig();
+    const robotRig = makeTrayRig();
+
+    // Free-play spill recovery: after a spill, show it briefly, then re-rack
+    // as soon as the TRAY ITSELF is back near neutral — not the platform, so a
+    // well-compensated tray re-racks even while the floor is tilted. Keeps the
+    // demo flowing: bottles return promptly at the next steady moment instead
+    // of waiting out a fixed timer. Returns true on a fresh spill.
+    const trayUp = new CANNON.Vec3();
+    function tumbleRerack(rig, dt) {
+      if (rig.tumbleT > 0) {
+        rig.tumbleT -= dt;   // brief window so the spill is legible
+      } else if (rig.needsRerack) {
+        rig.body.quaternion.vmult(UP_LOCAL, trayUp);
+        if (trayUp.y > 0.985) {   // tray within ~10° of level → neutral enough to re-rack
+          respawnBottles(rig);
+          rig.needsRerack = false;
+        }
+      } else if (checkSpill(rig)) {
+        rig.tumbleT = 0.5;
+        rig.needsRerack = true;
+        return true;
+      }
+      return false;
+    }
+
+    const wp = new THREE.Vector3(), wq = new THREE.Quaternion();
+    const dq = new THREE.Quaternion(), prevQinv = new THREE.Quaternion();
+
+    // Tray driving. Bottles resting on a kinematic surface are extremely
+    // sensitive to how that surface is advanced: teleports, or velocities
+    // applied over render frames that don't align with the physics' fixed
+    // 1/120 s substeps, pulse the contact velocities and slowly walk the
+    // bottles over. So: (1) capture the tray's target transform once per
+    // frame, (2) step the world OURSELVES in exact fixed quanta, and
+    // (3) before each substep, servo the tray toward the target interpolated
+    // at that substep — the surface velocity the contacts see is uniform.
+    function setTrayTarget(rig, palmFrame) {
+      rig.tPrevPos.copy(rig.tNowPos);
+      rig.tPrevQ.copy(rig.tNowQ);
+      palmFrame.getWorldPosition(rig.tNowPos);
+      palmFrame.getWorldQuaternion(rig.tNowQ);
+      if (!rig.driven || rig.tPrevPos.distanceTo(rig.tNowPos) > 0.4) {
+        // first frame or a genuine teleport: snap, no imparted velocity
+        rig.tPrevPos.copy(rig.tNowPos);
+        rig.tPrevQ.copy(rig.tNowQ);
+        rig.body.position.set(rig.tNowPos.x, rig.tNowPos.y, rig.tNowPos.z);
+        rig.body.quaternion.set(rig.tNowQ.x, rig.tNowQ.y, rig.tNowQ.z, rig.tNowQ.w);
+        rig.body.velocity.setZero();
+        rig.body.angularVelocity.setZero();
+      }
+      rig.driven = true;
+    }
+
+    const iPos = new THREE.Vector3(), iQ = new THREE.Quaternion();
+    function servoTray(rig, frac, h) {   // servo toward the frame target at fraction `frac`
+      const b = rig.body;
+      iPos.lerpVectors(rig.tPrevPos, rig.tNowPos, frac);
+      iQ.copy(rig.tPrevQ).slerp(rig.tNowQ, frac);
+      b.velocity.set((iPos.x - b.position.x) / h, (iPos.y - b.position.y) / h, (iPos.z - b.position.z) / h);
+      prevQinv.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w).invert();
+      dq.copy(iQ).multiply(prevQinv);
+      const ang = 2 * Math.acos(Math.min(1, Math.abs(dq.w)));
+      if (ang > 1e-5) {
+        const s = Math.sqrt(Math.max(1e-12, 1 - dq.w * dq.w));
+        const k = (dq.w < 0 ? -1 : 1) * ang / (s * h);
+        b.angularVelocity.set(dq.x * k, dq.y * k, dq.z * k);
+      } else b.angularVelocity.set(0, 0, 0);
+    }
+
+    const PHYS_H = 1 / 120;
+    let physAcc = 0;
+    function stepPhysics(dt) {
+      physAcc = Math.min(physAcc + dt, 0.1);   // cap catch-up work
+      const n = Math.floor(physAcc / PHYS_H);
+      physAcc -= n * PHYS_H;
+      for (let i = 0; i < n; i++) {
+        const frac = (i + 1) / n;
+        servoTray(humanRig, frac, PHYS_H);
+        servoTray(robotRig, frac, PHYS_H);
+        phys.step(PHYS_H);
+      }
+    }
+
+    function respawnBottles(rig) {
+      const b = rig.body;
+      for (let i = 0; i < rig.bottles.length; i++) {
+        const [ox, oz] = BOTTLE_SPOTS[i];
+        const local = new CANNON.Vec3(ox, TRAY.y + 0.008 + BOTTLE.hh + 0.002, oz);
+        const world = b.pointToWorldFrame(local);
+        const bt = rig.bottles[i].body;
+        bt.position.copy(world);
+        bt.quaternion.copy(b.quaternion);
+        bt.velocity.setZero();
+        bt.angularVelocity.setZero();
+      }
+      rig.grace = 0.6;
+      rig.tumbleT = 0;          // any explicit placement clears pending recovery
+      rig.needsRerack = false;
+    }
+
+    const upWorld = new CANNON.Vec3();
+    const UP_LOCAL = new CANNON.Vec3(0, 1, 0);
+    function checkSpill(rig) {   // true if any bottle toppled or left the tray
+      if (rig.grace > 0) return false;
+      for (const { body } of rig.bottles) {
+        body.quaternion.vmult(UP_LOCAL, upWorld);
+        if (upWorld.y < 0.55) return true;
+        if (body.position.y < rig.body.position.y - 0.25) return true;
+      }
+      return false;
+    }
+
+    function syncBottles(rig, visible) {
+      for (const { body, mesh } of rig.bottles) {
+        mesh.visible = visible;
+        mesh.position.copy(body.position);
+        mesh.quaternion.copy(body.quaternion);
+      }
+    }
+
+    // --- disturbance: slow multi-sine platform tilt, amplitude ramps up ------
+    function mulberry32(seed) {
+      let a = seed >>> 0;
+      return () => {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    // The floor tips with an oscillating MAGNITUDE in a slowly ROTATING
+    // direction. Structuring it this way (rather than independent sines per
+    // axis) makes `cap` the true peak tilt: |tilt| = amp·|sin| reaches `cap`
+    // exactly at each magnitude peak, so "max tilt 30°" means what it says.
+    // live, persisted floor controls (set via the sliders)
+    let distSpeed = (() => {
+      const v = parseInt(localStorage.getItem('robotTeach.speed'), 10);
+      return Number.isFinite(v) ? Math.min(100, Math.max(5, v)) / 100 : 0.25;
+    })();
+    let distCap = (() => {   // peak tilt, degrees
+      const v = parseInt(localStorage.getItem('robotTeach.tilt'), 10);
+      return Number.isFinite(v) ? Math.min(45, Math.max(10, v)) : 30;
+    })();
+    // 'lr' = floor rocks along ONE axis (side to side) — easy, compensated by a
+    // single wrist roll. 'free' = tilt direction slowly rotates (harder).
+    let tiltMode = localStorage.getItem('robotTeach.tiltmode') === 'free' ? 'free' : 'lr';
+    const LR_DIR = Math.PI / 2;   // left/right = tilt about Z (rz only)
+    class Disturbance {
+      constructor(seed, ramp = { start: 4, rate: 0.35 }) {
+        this.ramp = ramp;
+        const rnd = mulberry32(seed);
+        this.fMag = 0.11 + rnd() * 0.05;              // magnitude oscillation ~0.11–0.16 Hz
+        this.phMag = rnd() * Math.PI * 2;
+        this.fDir = (0.03 + rnd() * 0.03) * (rnd() < 0.5 ? 1 : -1);   // slow direction drift
+        this.phDir = rnd() * Math.PI * 2;
+      }
+      /** amplitude ramp (deg→rad): start + rate·t, capped at the live max tilt */
+      amp(t) { return Math.min(distCap, this.ramp.start + t * this.ramp.rate) * D2R; }
+      at(t) {
+        const A = this.amp(t);
+        // soft start so a toggle/episode never begins with a lurch that knocks
+        // bottles over dynamically instead of by tilt
+        const env = Math.min(1, t / 1.5);
+        const denv = t < 1.5 ? 1 / 1.5 : 0;
+        // distSpeed (0..1) scales how fast the floor oscillates/rotates — the
+        // amplitude ramp is left alone, so only the MOTION speed changes.
+        // Derivatives use these same w's, so reported rates scale consistently.
+        const wM = 2 * Math.PI * this.fMag * distSpeed, wD = 2 * Math.PI * this.fDir * distSpeed;
+        const s = Math.sin(wM * t + this.phMag);      // magnitude oscillation, ±1
+        const ds = wM * Math.cos(wM * t + this.phMag);
+        const mag = env * A * s;                      // signed tilt magnitude (rad)
+        const dmag = env * A * ds + denv * A * s;
+        // free: direction slowly rotates. lr: direction fixed to one axis, so
+        // the floor just rocks side to side (dphi = 0).
+        const lr = tiltMode === 'lr';
+        const phi = lr ? LR_DIR : wD * t + this.phDir;
+        const dphi = lr ? 0 : wD;
+        const c = Math.cos(phi), sn = Math.sin(phi);
+        return {
+          rx: mag * c,
+          rz: mag * sn,
+          drx: dmag * c - mag * sn * dphi,
+          drz: dmag * sn + mag * c * dphi,
+        };
+      }
+    }
+
+    const qTiltX = new THREE.Quaternion(), qTiltZ = new THREE.Quaternion();
+    const X_AXIS = new THREE.Vector3(1, 0, 0), Z_AXIS = new THREE.Vector3(0, 0, 1);
+    function tiltQuat(out, rx, rz) {
+      qTiltX.setFromAxisAngle(X_AXIS, rx);
+      qTiltZ.setFromAxisAngle(Z_AXIS, rz);
+      return out.copy(qTiltZ).multiply(qTiltX);
+    }
+
+    // --- orientation plumbing (Madgwick Z-up -> three.js Y-up) --------------
+    const F = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+    const Finv = F.clone().invert();
+    const tmpQ = new THREE.Quaternion();
+    function worldDelta(imu, out) {
+      const d = imu.deltaQ;
+      tmpQ.set(d.x, d.y, d.z, d.w);
+      return out.copy(F).multiply(tmpQ).multiply(Finv);
+    }
+    const upV = new THREE.Vector3();
+    function tiltOf(q) {   // up-normal tilt components of an orientation
+      upV.set(0, 1, 0).applyQuaternion(q);
+      return { x: upV.x, z: upV.z };
+    }
+
+    // --- simulated demonstrator ----------------------------------------------
+    // A human-like controller: compensates the platform tilt with gain < 1,
+    // reaction delay, first-order lag, tremor, and occasional lapses. Lets the
+    // demo run without hardware, and doubles as a booth attract mode.
+    const simChk = document.getElementById('simChk');
+    const sim = {
+      p: { x: 0, z: 0 }, buf: [],
+      rnd: mulberry32(1234567),
+      nextLapse: 8, lapseUntil: -1,
+    };
+    function simStep(t, dist, dt) {
+      sim.buf.push({ t, rx: dist.rx, rz: dist.rz });
+      while (sim.buf.length > 2 && sim.buf[0].t < t - 0.15) sim.buf.shift();   // 150 ms reaction delay
+      const delayed = tiltOfR(sim.buf[0]);
+      if (t > sim.nextLapse) { sim.lapseUntil = t + 0.6; sim.nextLapse = t + 8 + sim.rnd() * 10; }
+      const gain = t < sim.lapseUntil ? 0.45 : 0.93;   // attention lapses cause the spills
+      const ampDeg = Math.hypot(dist.rx, dist.rz) * R2D;
+      const tremor = (0.6 + ampDeg * 0.12) * D2R;
+      // compensation target = minus the (delayed) platform tilt, plus tremor
+      const target = {
+        x: -delayed.x * gain + tremor * Math.sin(2 * Math.PI * 1.7 * t),
+        z: -delayed.z * gain + tremor * Math.sin(2 * Math.PI * 3.1 * t + 1.3),
+      };
+      const k = 1 - Math.exp(-dt / 0.12);
+      sim.p.x += (target.x - sim.p.x) * k;
+      sim.p.z += (target.z - sim.p.z) * k;
+    }
+    const qTmpTilt = new THREE.Quaternion();
+    function tiltOfR(d) {   // platform tilt -> up-normal components
+      return tiltOf(tiltQuat(qTmpTilt, d.rx, d.rz));
+    }
+    function quatFromTilt(out, tx, tz) {
+      const cl = 0.35;   // ~20° clamp
+      const a = Math.asin(Math.max(-cl, Math.min(cl, tz)));
+      const b = -Math.asin(Math.max(-cl, Math.min(cl, tx)));
+      qTiltX.setFromAxisAngle(X_AXIS, a);
+      qTiltZ.setFromAxisAngle(Z_AXIS, b);
+      return out.copy(qTiltZ).multiply(qTiltX);
+    }
+
+    // --- balance-challenge score ----------------------------------------------
+    let bestHuman = 0;   // longest balance time this session
+
+    // --- session state machine -------------------------------------------------
+    // idle: free play, platforms level.  demo: the balance challenge (floor
+    // disturbance ramps up, timer runs, restarts on spill).
+    let mode = 'idle';
+    let dist = null;          // active Disturbance
+    let epT = 0;              // attempt clock (balance time)
+    let pauseT = 0;           // between-attempt pause
+    let robotSpills = 0;      // diagnostic: robot-side spills
+    let seedCounter = 1;
+
+    const demoBtn = document.getElementById('demoBtn');
+    const epInfoEl = document.getElementById('epInfo');
+    const timeValEl = document.getElementById('timeVal'), timeLblEl = document.getElementById('timeLbl');
+    const tiltValEl = document.getElementById('tiltVal'), tiltLblEl = document.getElementById('tiltLbl');
+    const labelRobotEl = document.getElementById('labelRobot');
+
+    // --- hand selector ---------------------------------------------------------
+    // The pose pipeline is side-agnostic (world-frame IMU orientations, and the
+    // waiter-pose bake is symmetric), so switching hands only moves the
+    // avatar's shoulder to the other side of the torso.
+    const HAND_KEY = 'robotTeach.hand';
+    const handBtns = [...document.querySelectorAll('[data-hand]')];
+    function setHand(h, save = true) {
+      if (mode !== 'idle' || calActive()) return;   // structural change: idle only
+      human.shoulder.position.x = h === 'L' ? 0.21 : -0.21;
+      for (const b of handBtns) b.classList.toggle('active', b.dataset.hand === (h === 'L' ? 'L' : 'R'));
+      humanRig.driven = false;                    // tray teleports with the arm: snap, don't fling
+      setTrayTarget(humanRig, human.palmFrame);
+      respawnBottles(humanRig);
+      if (save) localStorage.setItem(HAND_KEY, h === 'L' ? 'L' : 'R');
+    }
+    for (const b of handBtns) b.addEventListener('click', () => setHand(b.dataset.hand));
+
+    // --- floor speed slider ---------------------------------------------------
+    const speedRange = document.getElementById('speedRange');
+    const speedVal = document.getElementById('speedVal');
+    function applySpeed(pct) {
+      distSpeed = pct / 100;
+      speedRange.value = pct;
+      speedVal.textContent = pct + '%';
+      localStorage.setItem('robotTeach.speed', pct);
+    }
+    speedRange.addEventListener('input', () => applySpeed(parseInt(speedRange.value, 10)));
+    applySpeed(Math.round(distSpeed * 100));   // reflect persisted value in the UI
+
+    const tiltRange = document.getElementById('tiltRange');
+    const tiltCapVal = document.getElementById('tiltCapVal');
+    function applyTiltCap(deg) {
+      distCap = deg;
+      tiltRange.value = deg;
+      tiltCapVal.textContent = deg + '°';
+      localStorage.setItem('robotTeach.tilt', deg);
+    }
+    tiltRange.addEventListener('input', () => applyTiltCap(parseInt(tiltRange.value, 10)));
+    applyTiltCap(distCap);
+
+    const tiltModeBtns = [...document.querySelectorAll('[data-tiltmode]')];
+    function applyTiltMode(m) {
+      tiltMode = m === 'free' ? 'free' : 'lr';
+      for (const b of tiltModeBtns) b.classList.toggle('active', b.dataset.tiltmode === tiltMode);
+      localStorage.setItem('robotTeach.tiltmode', tiltMode);
+    }
+    for (const b of tiltModeBtns) b.addEventListener('click', () => applyTiltMode(b.dataset.tiltmode));
+    applyTiltMode(tiltMode);
+
+    // --- follow toggle + camera view preset ----------------------------------
+    const followChk = document.getElementById('followChk');
+    const viewBtn = document.getElementById('viewBtn');
+    const labelHumanEl = document.getElementById('labelHuman');
+    const VIEW_KEY = 'robotTeach.view';
+    let viewBehind = localStorage.getItem(VIEW_KEY) === 'behind';
+
+    function updateRobotLabel() {
+      labelRobotEl.textContent = followChk.checked
+        ? 'Robot — shadowing' : 'Robot — not following (no corrections)';
+    }
+    // Not following in IDLE = the robot gets its OWN floor disturbance so the
+    // "watch it fail" beat is visible without starting the challenge.
+    let showcaseDist = null;
+    let showcaseT = 0;
+    followChk.addEventListener('change', () => {
+      updateRobotLabel();
+      if (!followChk.checked) {
+        showcaseDist = new Disturbance(9000 + seedCounter++, { start: 3, rate: 4 });
+        showcaseT = 0;
+        setPrompt('floors moving — keep YOUR tray level; the robot won’t', 'hold');
+      } else {
+        showcaseDist = null;
+        if (mode === 'idle') setPrompt('robot shadowing again', 'live');
+      }
+    });
+
+    function applyView() {
+      // trainer stands behind the avatar: view from -Z so left/right match
+      if (viewBehind) {
+        camera.position.set(-0.55, 1.55, -3.2);
+        controls.target.set(-0.12, 0.55, 0);
+        labelHumanEl.style.left = '68%';
+        labelRobotEl.style.left = '32%';
+        viewBtn.textContent = '📷 View from front';
+      } else {
+        // aim slightly left so a right-hand tray clears the UI panels
+        camera.position.set(0.3, 1.55, 3.3);
+        controls.target.set(-0.05, 0.55, 0);
+        labelHumanEl.style.left = '32%';
+        labelRobotEl.style.left = '68%';
+        viewBtn.textContent = '📷 View from behind';
+      }
+    }
+    viewBtn.addEventListener('click', () => {
+      viewBehind = !viewBehind;
+      localStorage.setItem(VIEW_KEY, viewBehind ? 'behind' : 'front');
+      applyView();
+    });
+
+    const sourceReady = () => simChk.checked || (calibrated && trayLevelSet);
+    function refreshButtons() {
+      demoBtn.disabled = !(mode === 'demo' || (mode === 'idle' && sourceReady()));
+      placeBtn.disabled = !(mode === 'idle' && !calActive() && (simChk.checked || calibrated));
+    }
+    simChk.addEventListener('change', () => {
+      if (simChk.checked) setPrompt('simulated demonstrator armed — press Start', 'live');
+      refreshButtons();
+    });
+
+    function startEpisode() {   // one balance attempt
+      dist = new Disturbance(seedCounter++);
+      epT = 0;
+      pauseT = 0;
+      respawnBottles(humanRig);
+      respawnBottles(robotRig);
+    }
+
+    function endEpisode(reason) {
+      if (epT > bestHuman) bestHuman = epT;
+      const bestTxt = bestHuman ? ` · best ${bestHuman.toFixed(1)}s` : '';
+      setPrompt(`${reason === 'spill' ? '🍾 spill!' : '⏱ time cap'} balanced ${epT.toFixed(1)} s${bestTxt}`, 'hold');
+      log(`attempt: ${epT.toFixed(1)}s (${reason})`);
+      dist = null;              // next attempt starts (fresh seed) after the pause
+      pauseT = RESTART_PAUSE;
+      refreshButtons();
+    }
+
+    demoBtn.addEventListener('click', () => {
+      if (mode === 'demo') { setMode('idle'); return; }
+      if (mode !== 'idle' || !sourceReady()) return;
+      setMode('demo');
+    });
+
+    function setMode(m) {
+      mode = m;
+      dist = null;
+      updateRobotLabel();
+      demoBtn.textContent = m === 'demo' ? '⏹ Stop' : '▶ Start';
+      demoBtn.classList.toggle('stop', m === 'demo');
+      if (m === 'idle') {
+        setPrompt(sourceReady() ? 'free play — trays level, floor still' : 'connect sensors, or tick “simulated demonstrator”');
+        if (!bottlesHiddenForCal) {
+          respawnBottles(humanRig);
+          respawnBottles(robotRig);
+        }
+      } else {
+        bottlesHiddenForCal = false;   // active modes always show bottles
+        setPrompt('keep the tray level — floor gets harder!', 'live');
+        startEpisode();
+      }
+      refreshButtons();
+    }
+
+    // --- render loop -----------------------------------------------------------
+    const qUser = new THREE.Quaternion();       // wrist orientation (action)
+    const qUpper = new THREE.Quaternion();
+    const qRel = new THREE.Quaternion();
+    const qPlat = new THREE.Quaternion();
+    const qPlatR = new THREE.Quaternion();
+    const Q_ID = new THREE.Quaternion();
+    let timeScale = 1;
+
+    // hangRef: between calibration (reference = hanging arm) and the explicit
+    // tray-level capture, deltaQ-identity must RENDER as the hanging pose —
+    // X = B⁻¹·qRel shows the arm down at identity and lands exactly on the
+    // baked tray pose when the user raises 90°. After the level capture
+    // (reference = tray pose) the usual conjugation X = B⁻¹·qRel·B applies.
+    function applyArm(st, qu, qw, smooth, hangRef = false) {
+      qRel.copy(qu).invert().multiply(qw);
+      tmpQ.copy(Binv).multiply(qRel);
+      if (!hangRef) tmpQ.multiply(B);
+      if (smooth) {
+        st.proxGroup.quaternion.slerp(qu, 0.35);
+        st.distGroup.quaternion.slerp(tmpQ, 0.35);
+      } else {
+        st.proxGroup.quaternion.copy(qu);
+        st.distGroup.quaternion.copy(tmpQ);
+      }
+    }
+
+    function frame() {
+      const dtRaw = Math.min(clock.getDelta(), 0.05);
+      const dt = dtRaw * timeScale;
+      const now = performance.now() / 1000;
+
+      checkCalPhases();
+      checkMagCapture();
+
+      // 1. platform disturbance (pause between attempts -> level, then restart)
+      if (pauseT > 0) {
+        pauseT -= dt;
+        if (pauseT <= 0 && mode === 'demo') {
+          startEpisode();
+          setPrompt('next attempt — keep the tray level!', 'live');
+        }
+      }
+      let d = { rx: 0, rz: 0, drx: 0, drz: 0 };
+      const episodeRunning = mode === 'demo' && pauseT <= 0 && dist !== null;
+      if (episodeRunning) {
+        epT += dt;
+        d = dist.at(epT);
+      }
+
+      tiltQuat(qPlat, d.rx, d.rz);
+      // rate-limited platform motion: fps-independent, so transitions (episode
+      // resets, follow toggles) glide instead of jolting the bottles over
+      const maxStep = dt * 0.5;   // rad/s cap: smooths toggles/resets, headroom for the disturbance's own rates
+      let dShow = null;
+      if (mode === 'idle' && !followChk.checked) {
+        // idle + not following: the floors start moving IMMEDIATELY — both
+        // with the same showcase disturbance, so the compensated-vs-rigid
+        // comparison is visible without starting an episode
+        if (!showcaseDist) { showcaseDist = new Disturbance(9000 + seedCounter++, { start: 3, rate: 4 }); showcaseT = 0; }
+        showcaseT += dt;
+        dShow = showcaseDist.at(showcaseT);
+        tiltQuat(qPlatR, dShow.rx, dShow.rz);
+        human.platform.quaternion.rotateTowards(qPlatR, maxStep);
+        robot.platform.quaternion.rotateTowards(qPlatR, maxStep);
+      } else {
+        // demo (following or not): BOTH platforms share the same floor —
+        // the only difference is whether the tray gets corrected
+        human.platform.quaternion.rotateTowards(qPlat, maxStep);
+        robot.platform.quaternion.rotateTowards(qPlat, maxStep);
+      }
+
+      // 2/3. arms: calibration guide, else demonstrator (IMU/sim) + robot
+      if (calActive() && !simChk.checked) {
+        // both figures demonstrate the current calibration step
+        calGuidePose(dt);
+        for (const st of [human, robot]) {
+          st.proxGroup.quaternion.slerp(qGuideProx, 0.35);
+          st.distGroup.quaternion.slerp(qGuideDist, 0.35);
+        }
+      } else {
+        if (simChk.checked) {
+          // the sim compensates whatever floor the human is standing on
+          if (episodeRunning || mode === 'idle') simStep(now, dShow ?? d, dt);
+          quatFromTilt(qUser, sim.p.x, sim.p.z);
+          qUpper.identity();
+        } else {
+          worldDelta(imuUpper, qUpper);
+          worldDelta(imuWrist, qUser);
+        }
+        // calibrated but level not yet set: reference is the HANGING arm, so
+        // render hang-referenced — the avatar follows the real arm up into
+        // the tray pose instead of showing the tray upright prematurely
+        const hangRef = calibrated && !trayLevelSet && !simChk.checked;
+        applyArm(human, qUpper, qUser, true, hangRef);
+
+        // robot mirrors the human when following, else holds its arm rigid so
+        // the uncompensated floor tips its tray and the bottles go over
+        if (followChk.checked) {
+          applyArm(robot, qUpper, qUser, true, hangRef);
+        } else {
+          applyArm(robot, Q_ID, Q_ID, true);
+        }
+      }
+
+      // 4. physics: capture tray targets, fixed-step with per-substep servo
+      setTrayTarget(humanRig, human.palmFrame);
+      setTrayTarget(robotRig, robot.palmFrame);
+      humanRig.grace = Math.max(0, humanRig.grace - dt);
+      robotRig.grace = Math.max(0, robotRig.grace - dt);
+      if (dt > 0) stepPhysics(dt);
+      syncBottles(humanRig, !bottlesHiddenForCal);
+      syncBottles(robotRig, !bottlesHiddenForCal);
+
+      // 5. attempt logic: the human's tray is what's scored
+      if (episodeRunning) {
+        const tAct = tiltOf(qUser);
+        timeValEl.textContent = epT.toFixed(1);
+        // net tray tilt shown on the HUD (platform + correction, small angles)
+        const net = Math.hypot(tiltOfR(d).x + tAct.x, tiltOfR(d).z + tAct.z);
+        tiltValEl.textContent = (Math.asin(Math.min(1, net)) * R2D).toFixed(1);
+        if (checkSpill(humanRig)) endEpisode('spill');
+        else if (epT >= EPISODE_CAP) endEpisode('cap');
+      } else if (mode === 'idle') {
+        timeValEl.textContent = '0.0';
+        const tAct = tiltOf(qUser);
+        tiltValEl.textContent = (Math.asin(Math.min(1, Math.hypot(tAct.x, tAct.z))) * R2D).toFixed(1);
+        // human tray uses the same free-play spill recovery as the robot
+        if (!bottlesHiddenForCal) tumbleRerack(humanRig, dt);
+      }
+      // robot spills (e.g. follow OFF) never end an attempt; the showcase ramp
+      // is NOT reset, so the floor keeps climbing to its cap.
+      if (!bottlesHiddenForCal) {
+        if (tumbleRerack(robotRig, dt)) robotSpills++;
+      }
+      epInfoEl.textContent = mode === 'demo'
+        ? `balancing… ${epT.toFixed(1)} s`
+        : (bestHuman ? `best balance ${bestHuman.toFixed(1)} s` : 'press Start when ready');
+
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(frame);
+    }
+
+    // --- boot -----------------------------------------------------------------
+    function resize() {
+      renderer.setSize(innerWidth, innerHeight, false);
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+    }
+    addEventListener('resize', resize);
+    resize();
+    const clock = new THREE.Clock();
+    respawnBottles(humanRig);   // initial placement happens after first drive below
+    respawnBottles(robotRig);
+    requestAnimationFrame(() => {   // one frame to settle transforms, then place bottles
+      setTrayTarget(humanRig, human.palmFrame);
+      setTrayTarget(robotRig, robot.palmFrame);
+      respawnBottles(humanRig);
+      respawnBottles(robotRig);
+    });
+    applyView();
+    setHand(localStorage.getItem(HAND_KEY) || 'R', false);
+    refreshButtons();
+    requestAnimationFrame(frame);
+
+    addEventListener('beforeunload', () => {
+      upper.client.disconnect?.();
+      wrist.client.disconnect?.();
+    });
+
+    // --- debug/test hooks (no secrets, just state) ------------------------------
+    window.__rt = {
+      imus: { upper: imuUpper, wrist: imuWrist },   // synthetic-feed test hook
+      get state() {
+        return {
+          mode, calPhase, calibrated, trayLevelSet,
+          bestHuman, epT, robotSpills,
+          robotDebug: {
+            trayY: +robotRig.body.position.y.toFixed(3),
+            trayUpY: (() => {
+              const u = new CANNON.Vec3();
+              robotRig.body.quaternion.vmult(UP_LOCAL, u);
+              return +u.y.toFixed(4);
+            })(),
+            platDeg: +(2 * Math.acos(Math.min(1, Math.abs(robot.platform.quaternion.w))) * R2D).toFixed(2),
+            platUp: (() => {   // platform up-vector: x = left/right tip, z = fwd/back tip
+              const u = new THREE.Vector3(0, 1, 0).applyQuaternion(robot.platform.quaternion);
+              return { x: +u.x.toFixed(3), z: +u.z.toFixed(3) };
+            })(),
+            platHumanDeg: +(2 * Math.acos(Math.min(1, Math.abs(human.platform.quaternion.w))) * R2D).toFixed(2),
+            platTargetDeg: +(2 * Math.acos(Math.min(1, Math.abs(qPlatR.w))) * R2D).toFixed(2),
+            bottles: robotRig.bottles.map(({ body }) => {
+              const u = new CANNON.Vec3();
+              body.quaternion.vmult(UP_LOCAL, u);
+              return { upY: +u.y.toFixed(3), y: +body.position.y.toFixed(3) };
+            }),
+          },
+        };
+      },
+      setTimeScale(s) { timeScale = Math.max(0.1, Math.min(5, s)); },
+      get distSpeed() { return distSpeed; },
+      get distCap() { return distCap; },
+      get tiltMode() { return tiltMode; },
+      rigUps(which) {   // up-vector Y of each bottle, for spill/recovery tests
+        const rig = which === 'human' ? humanRig : robotRig;
+        return rig.bottles.map(({ body }) => {
+          const u = new CANNON.Vec3();
+          body.quaternion.vmult(UP_LOCAL, u);
+          return +u.y.toFixed(3);
+        });
+      },
+      rigState(which) {
+        const rig = which === 'human' ? humanRig : robotRig;
+        return { tumbleT: +rig.tumbleT.toFixed(2), needsRerack: rig.needsRerack };
+      },
+    };
+  </script>
+</body>
+</html>
