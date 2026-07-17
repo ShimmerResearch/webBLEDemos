@@ -348,6 +348,10 @@
       <input type="range" id="sensSlider" min="0.1" max="4" step="0.05" value="1" />
     </div>
     <div class="sliderRow">
+      <label><span>Grab threshold</span><span id="grabVal">30 °/s</span></label>
+      <input type="range" id="grabSlider" min="5" max="80" step="1" value="30" />
+    </div>
+    <div class="sliderRow">
       <label><span>Volume</span><span id="volVal">80%</span></label>
       <input type="range" id="volSlider" min="0" max="100" step="1" value="80" />
     </div>
@@ -382,7 +386,15 @@
     // =====================================================================
     const NOMINAL_RPM   = 100 / 3;                 // 33⅓ RPM
     const NOMINAL_REVS  = NOMINAL_RPM / 60;        // rev/s at pitch 0
-    const GYRO_DEADZONE_DPS = 6;                   // below this the "hand" is off the record
+    // Hand-on/off hysteresis: the hand "grabs" the record above the grab
+    // threshold (HUD slider, ui.grabDps) and only "lets go" after staying
+    // below 40% of it for a short hold — micro-tremor can't grab the record
+    // or pin it near zero.
+    const GYRO_HAND_OFF_RATIO = 0.4;
+    const GYRO_HAND_OFF_MS    = 90;
+    // Post-scratch recovery: the motor never stopped, so the platter grabs
+    // the record through the slipmat — constant accel, lands exactly on pitch 0
+    const MOTOR_RECOVERY_ACCEL = 2.5;              // rev/s² (~0.22 s from a dead stop)
 
     // Shimmer3R (LSM6DSV) gyro ranges — index = SET_GYRO_RANGE value,
     // sensitivities from the Shimmer C# API default calibration matrices
@@ -408,6 +420,8 @@
       biasSamples: [],
       calibrated: false,
       lastGyroAt: 0,        // ms timestamp of last frame (stale detection)
+      handOn: false,        // hysteresis: is the hand currently on the record?
+      handOffSince: 0,      // ms timestamp when gyro first dropped below the OFF threshold
       // pointer scratch
       pointerOn: false,
       pointerVel: 0,        // rev/s
@@ -428,6 +442,7 @@
       sensitivity: 1,
       invert: false,
       volume: 0.8,
+      grabDps: 30,          // gyro °/s above which the hand grabs the record
     };
 
     // =====================================================================
@@ -1406,6 +1421,9 @@
       if (state.motorOn) ensureAudio();
     }
 
+    let prevScratching = false;    // was a hand (gyro or pointer) on the record last frame?
+    let motorRecovering = false;   // post-scratch slipmat grab in progress
+
     function physicsStep(dt, nowS) {
       // pick the driving hand
       let gyroDps = state.gyroDps;
@@ -1417,8 +1435,26 @@
 
       // stale stream guard: if no gyro frame for 400 ms, treat as hands-off
       const gyroFresh = state.streaming && (performance.now() - state.lastGyroAt < 400);
-      const gyroActive = (gyroFresh || (state.autoDj && !state.streaming)) &&
-                         Math.abs(gyroDps) > GYRO_DEADZONE_DPS;
+      const gyroDriving = gyroFresh || (state.autoDj && !state.streaming);
+
+      // hand-on/off hysteresis
+      if (!gyroDriving) {
+        state.handOn = false;
+      } else if (!state.handOn) {
+        if (Math.abs(gyroDps) > ui.grabDps) { state.handOn = true; state.handOffSince = 0; }
+      } else if (Math.abs(gyroDps) < ui.grabDps * GYRO_HAND_OFF_RATIO) {
+        if (!state.handOffSince) state.handOffSince = performance.now();
+        else if (performance.now() - state.handOffSince > GYRO_HAND_OFF_MS) state.handOn = false;
+      } else {
+        state.handOffSince = 0;
+      }
+      const gyroActive = gyroDriving && state.handOn;
+
+      // hand released with the motor on → slipmat grabs the record back to speed
+      const scratching = state.pointerOn || gyroActive;
+      if (prevScratching && !scratching && state.motorOn) motorRecovering = true;
+      if (scratching || !state.motorOn) motorRecovering = false;
+      prevScratching = scratching;
 
       let target, slew;
       if (state.swapping) {
@@ -1434,7 +1470,16 @@
         slew = 28;
       } else if (state.motorOn) {
         target = NOMINAL_REVS;
-        slew = 5;            // motor spin-up feel
+        if (motorRecovering) {
+          // constant accel so it lands crisply on pitch 0 instead of creeping up
+          slew = 0;
+          const dv = target - state.platterVel;
+          const step = MOTOR_RECOVERY_ACCEL * dt;
+          if (Math.abs(dv) <= step) { state.platterVel = target; motorRecovering = false; }
+          else state.platterVel += Math.sign(dv) * step;
+        } else {
+          slew = 5;          // cold-start spin-up feel (Technics power-on)
+        }
       } else {
         target = 0;
         slew = 1.6;          // free-wheeling spin-down
@@ -1499,6 +1544,10 @@
     document.getElementById('sensSlider').addEventListener('input', (e) => {
       ui.sensitivity = parseFloat(e.target.value);
       document.getElementById('sensVal').textContent = ui.sensitivity.toFixed(2).replace(/0$/, '') + '×';
+    });
+    document.getElementById('grabSlider').addEventListener('input', (e) => {
+      ui.grabDps = parseFloat(e.target.value);
+      document.getElementById('grabVal').textContent = ui.grabDps.toFixed(0) + ' °/s';
     });
     document.getElementById('volSlider').addEventListener('input', (e) => {
       ui.volume = e.target.value / 100;
