@@ -239,6 +239,15 @@
       <button id="viewBtn" class="wide" style="margin-top: 10px;">📷 View from behind</button>
       <div class="stats" id="epInfo" style="margin-top: 8px;">press Start when ready</div>
     </div>
+
+    <div class="panel">
+      <h2>Teach the robot</h2>
+      <p class="caption">Record yourself balancing — the robot fits <b>one number</b> (how hard you push back per unit of tilt), then balances a floor it has <b>never seen</b>. No replay, no script.</p>
+      <button id="teachBtn" class="wide primary" disabled>⏺ 1 · Record my balancing</button>
+      <div class="stats" id="teachInfo" style="margin: 8px 0;">not trained yet — record a demonstration first</div>
+      <button id="autoBtn" class="wide" disabled>🤖 2 · Robot solo — new floor</button>
+      <button id="forgetBtn" class="wide" disabled style="margin-top: 8px;">🗑 Forget training</button>
+    </div>
   </div>
 
   <div id="hud" class="overlay">
@@ -265,7 +274,7 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import * as CANNON from 'cannon-es';
     import { Shimmer3RClient, SensorBitmapShimmer3 } from '../ShimmerAPI/shimmer3r.js?v=2';
-    import { ArmImu } from 'fusion3d.js?v=6';
+    import { ArmImu } from './fusion3d.js?v=6';
 
     // --- config -----------------------------------------------------------
     const SAMPLING_HZ = 128;
@@ -1209,8 +1218,10 @@
     let viewBehind = localStorage.getItem(VIEW_KEY) === 'behind';
 
     function updateRobotLabel() {
-      labelRobotEl.textContent = followChk.checked
-        ? 'Robot — shadowing' : 'Robot — not following (no corrections)';
+      labelRobotEl.textContent =
+        mode === 'auto' ? (learned ? 'Robot — learned policy, solo' : 'Robot — untrained, solo')
+        : mode === 'teach' ? 'Robot — watching you teach'
+        : followChk.checked ? 'Robot — shadowing' : 'Robot — not following (no corrections)';
     }
     // Not following in IDLE = the robot gets its OWN floor disturbance so the
     // "watch it fail" beat is visible without starting the challenge.
@@ -1255,6 +1266,11 @@
     function refreshButtons() {
       demoBtn.disabled = !(mode === 'demo' || (mode === 'idle' && sourceReady()));
       placeBtn.disabled = !(mode === 'idle' && !calActive() && (simChk.checked || calibrated));
+      teachBtn.disabled = !(mode === 'teach' || (mode === 'idle' && sourceReady()));
+      // robot solo needs no live source — untrained it goes out rigid-armed
+      // (and spills), which IS the baseline worth showing
+      autoBtn.disabled = !(mode === 'auto' || (mode === 'idle' && !calActive()));
+      forgetBtn.disabled = !(learned && mode === 'idle');
     }
     simChk.addEventListener('change', () => {
       if (simChk.checked) setPrompt('simulated demonstrator armed — press Start', 'live');
@@ -1265,15 +1281,28 @@
       dist = new Disturbance(seedCounter++);
       epT = 0;
       pauseT = 0;
+      // robot-solo: the arm may jump from its previous pose to the policy
+      // pose — snap the tray with it instead of flinging the bottles
+      if (mode === 'auto') robotRig.driven = false;
       respawnBottles(humanRig);
       respawnBottles(robotRig);
     }
 
     function endEpisode(reason) {
-      if (epT > bestHuman) bestHuman = epT;
-      const bestTxt = bestHuman ? ` · best ${bestHuman.toFixed(1)}s` : '';
-      setPrompt(`${reason === 'spill' ? '🍾 spill!' : '⏱ time cap'} balanced ${epT.toFixed(1)} s${bestTxt}`, 'hold');
-      log(`attempt: ${epT.toFixed(1)}s (${reason})`);
+      if (mode === 'teach') { finishTeaching(reason); return; }   // one take, no restart
+      const label = reason === 'spill' ? '🍾 spill!' : '⏱ time cap';
+      if (mode === 'auto') {
+        if (epT > bestRobot) bestRobot = epT;
+        const vsTxt = bestHuman ? ` · your best ${bestHuman.toFixed(1)}s` : '';
+        const who = learned ? 'robot' : 'untrained robot';
+        setPrompt(`${label} ${who} balanced ${epT.toFixed(1)} s solo${vsTxt}`, 'hold');
+        log(`robot solo${learned ? '' : ' (untrained)'}: ${epT.toFixed(1)}s (${reason})`);
+      } else {
+        if (epT > bestHuman) bestHuman = epT;
+        const bestTxt = bestHuman ? ` · best ${bestHuman.toFixed(1)}s` : '';
+        setPrompt(`${label} balanced ${epT.toFixed(1)} s${bestTxt}`, 'hold');
+        log(`attempt: ${epT.toFixed(1)}s (${reason})`);
+      }
       dist = null;              // next attempt starts (fresh seed) after the pause
       pauseT = RESTART_PAUSE;
       refreshButtons();
@@ -1291,6 +1320,13 @@
       updateRobotLabel();
       demoBtn.textContent = m === 'demo' ? '⏹ Stop' : '▶ Start';
       demoBtn.classList.toggle('stop', m === 'demo');
+      teachBtn.textContent = m === 'teach' ? '⏹ Stop & learn' : '⏺ 1 · Record my balancing';
+      teachBtn.classList.toggle('stop', m === 'teach');
+      autoBtn.textContent = m === 'auto' ? '⏹ Stop robot'
+        : learned ? '🤖 2 · Robot solo — new floor' : '🤖 Robot solo — untrained';
+      autoBtn.classList.toggle('stop', m === 'auto');
+      timeLblEl.textContent = m === 'auto' ? 'robot balance time' : 'balance time';
+      tiltLblEl.textContent = m === 'auto' ? 'robot tray tilt' : 'tray tilt';
       if (m === 'idle') {
         setPrompt(sourceReady() ? 'free play — trays level, floor still' : 'connect sensors, or tick “simulated demonstrator”');
         if (!bottlesHiddenForCal) {
@@ -1299,11 +1335,92 @@
         }
       } else {
         bottlesHiddenForCal = false;   // active modes always show bottles
-        setPrompt('keep the tray level — floor gets harder!', 'live');
+        if (m === 'teach') rec = { n: 0, sPP: 0, sPC: 0, sC: 0, sCC: 0 };
+        setPrompt(
+          m === 'teach' ? '⏺ recording — balance the tray, the robot is watching!'
+          : m === 'auto' ? (learned ? '🤖 robot solo — a floor it has never seen'
+                                    : '🤖 untrained robot — no policy yet, watch what happens…')
+          : 'keep the tray level — floor gets harder!', 'live');
         startEpisode();
       }
       refreshButtons();
+      updateTeachInfo();
     }
+
+    // --- teach the robot: record → fit ONE gain → robot solo on a new floor ----
+    // The policy is `correction = g · platformTilt`, pooled over both axes (the
+    // wrist is symmetric). Recording keeps only least-squares running sums, so a
+    // demonstration of any length costs O(1) memory. Validated offline: this fit
+    // recovers the sim demonstrator's gain to ~1% and generalizes across seeds
+    // and tilt modes. Deploy seed always differs from the training seed
+    // (seedCounter strictly increases), so playback is never a replay.
+    const POLICY_KEY = 'robotTeach.policy';
+    const teachBtn = document.getElementById('teachBtn');
+    const autoBtn = document.getElementById('autoBtn');
+    const forgetBtn = document.getElementById('forgetBtn');
+    const teachInfoEl = document.getElementById('teachInfo');
+    const MIN_TEACH_S = 4;     // s of demonstration below which we refuse to fit
+    const TEACH_CAP = 30;      // s — recording auto-stops; plenty for one gain
+    let bestRobot = 0;         // longest solo balance this session
+    let rec = null;            // running sums while recording
+    let learned = (() => {
+      try {
+        const p = JSON.parse(localStorage.getItem(POLICY_KEY) || 'null');
+        return p && Number.isFinite(p.g) && p.g < 0 ? p : null;
+      } catch { return null; }
+    })();
+
+    function recordSample(p, c) {   // one axis, one frame: platform tilt → correction
+      rec.n++; rec.sPP += p * p; rec.sPC += p * c; rec.sC += c; rec.sCC += c * c;
+    }
+    function fitRecording() {       // pooled least squares + R² from the sums
+      if (!rec || epT < MIN_TEACH_S || rec.sPP < 1e-6) return null;
+      const g = rec.sPC / rec.sPP;
+      const ssr = rec.sCC - 2 * g * rec.sPC + g * g * rec.sPP;
+      const sst = rec.sCC - (rec.sC * rec.sC) / rec.n;
+      return { g, r2: sst > 1e-9 ? 1 - ssr / sst : 0, secs: epT, when: Date.now() };
+    }
+    function finishTeaching(reason) {
+      const fit = fitRecording();
+      rec = null;
+      if (fit && fit.g < -0.05) {   // must push AGAINST the tilt, however gently
+        learned = fit;
+        localStorage.setItem(POLICY_KEY, JSON.stringify(learned));
+        log(`learned: gain ${learned.g.toFixed(3)} · R² ${learned.r2.toFixed(3)} · ${learned.secs.toFixed(1)}s (${reason})`);
+        setMode('idle');
+        setPrompt(`🧠 learned! push-back ${(-learned.g).toFixed(2)}× per unit of tilt — now press “Robot solo”`, 'hold');
+      } else {
+        setMode('idle');
+        setPrompt(fit ? '🤔 that demo pushed WITH the tilt — try again, oppose the wobble'
+                      : `⏺ too short — demonstrate for at least ${MIN_TEACH_S} s`, 'hold');
+      }
+    }
+    function updateTeachInfo() {
+      teachInfoEl.textContent =
+        mode === 'teach' ? 'recording your reactions…'
+        : learned ? `trained: push-back ${(-learned.g).toFixed(2)}× · fit ${(100 * Math.max(0, learned.r2)).toFixed(0)}% · from ${learned.secs.toFixed(1)} s`
+        : 'not trained yet — record a demonstration first';
+      if (mode !== 'auto')   // keep the solo button honest about what it will run
+        autoBtn.textContent = learned ? '🤖 2 · Robot solo — new floor' : '🤖 Robot solo — untrained';
+    }
+    teachBtn.addEventListener('click', () => {
+      if (mode === 'teach') { endEpisode('stop'); return; }   // → finishTeaching
+      if (mode !== 'idle' || !sourceReady()) return;
+      setMode('teach');
+    });
+    autoBtn.addEventListener('click', () => {
+      if (mode === 'auto') { setMode('idle'); return; }
+      if (mode !== 'idle' || calActive()) return;
+      setMode('auto');
+    });
+    forgetBtn.addEventListener('click', () => {
+      if (mode !== 'idle') return;
+      learned = null;
+      localStorage.removeItem(POLICY_KEY);
+      refreshButtons();
+      updateTeachInfo();
+      setPrompt('training forgotten — the robot is a blank slate again');
+    });
 
     // --- render loop -----------------------------------------------------------
     const qUser = new THREE.Quaternion();       // wrist orientation (action)
@@ -1312,6 +1429,8 @@
     const qPlat = new THREE.Quaternion();
     const qPlatR = new THREE.Quaternion();
     const Q_ID = new THREE.Quaternion();
+    const qAuto = new THREE.Quaternion();       // robot-solo wrist correction
+    const D_LEVEL = { rx: 0, rz: 0, drx: 0, drz: 0 };   // a still, level floor
     let timeScale = 1;
 
     // hangRef: between calibration (reference = hanging arm) and the explicit
@@ -1333,9 +1452,12 @@
     }
 
     function frame() {
-      const dtRaw = Math.min(clock.getDelta(), 0.05);
-      const dt = dtRaw * timeScale;
-      const now = performance.now() / 1000;
+      stepFrame(Math.min(clock.getDelta(), 0.05) * timeScale, performance.now() / 1000);
+      requestAnimationFrame(frame);
+    }
+    // one simulation+render step — extracted from frame() so tests can drive
+    // the loop deterministically (e.g. while the tab is hidden and rAF is off)
+    function stepFrame(dt, now) {
 
       checkCalPhases();
       checkMagCapture();
@@ -1343,13 +1465,13 @@
       // 1. platform disturbance (pause between attempts -> level, then restart)
       if (pauseT > 0) {
         pauseT -= dt;
-        if (pauseT <= 0 && mode === 'demo') {
+        if (pauseT <= 0 && (mode === 'demo' || mode === 'auto')) {
           startEpisode();
-          setPrompt('next attempt — keep the tray level!', 'live');
+          setPrompt(mode === 'auto' ? '🤖 robot tries again — fresh floor!' : 'next attempt — keep the tray level!', 'live');
         }
       }
       let d = { rx: 0, rz: 0, drx: 0, drz: 0 };
-      const episodeRunning = mode === 'demo' && pauseT <= 0 && dist !== null;
+      const episodeRunning = mode !== 'idle' && pauseT <= 0 && dist !== null;
       if (episodeRunning) {
         epT += dt;
         d = dist.at(epT);
@@ -1371,9 +1493,10 @@
         human.platform.quaternion.rotateTowards(qPlatR, maxStep);
         robot.platform.quaternion.rotateTowards(qPlatR, maxStep);
       } else {
-        // demo (following or not): BOTH platforms share the same floor —
-        // the only difference is whether the tray gets corrected
-        human.platform.quaternion.rotateTowards(qPlat, maxStep);
+        // demo/teach (following or not): BOTH platforms share the same floor —
+        // the only difference is whether the tray gets corrected.
+        // auto: the human is off duty — only the ROBOT faces the new floor
+        human.platform.quaternion.rotateTowards(mode === 'auto' ? Q_ID : qPlat, maxStep);
         robot.platform.quaternion.rotateTowards(qPlat, maxStep);
       }
 
@@ -1387,8 +1510,9 @@
         }
       } else {
         if (simChk.checked) {
-          // the sim compensates whatever floor the human is standing on
-          if (episodeRunning || mode === 'idle') simStep(now, dShow ?? d, dt);
+          // the sim compensates whatever floor the human is standing on — in
+          // robot-solo mode that floor is LEVEL, so the sim just holds steady
+          if (episodeRunning || mode === 'idle') simStep(now, mode === 'auto' ? D_LEVEL : (dShow ?? d), dt);
           quatFromTilt(qUser, sim.p.x, sim.p.z);
           qUpper.identity();
         } else {
@@ -1401,9 +1525,19 @@
         const hangRef = calibrated && !trayLevelSet && !simChk.checked;
         applyArm(human, qUpper, qUser, true, hangRef);
 
-        // robot mirrors the human when following, else holds its arm rigid so
+        // robot-solo: no mirroring — the robot corrects from its OWN tilt
+        // "sensor" using the single gain it learned from the demonstration.
+        // Otherwise it mirrors the human when following, else holds rigid so
         // the uncompensated floor tips its tray and the bottles go over
-        if (followChk.checked) {
+        if (mode === 'auto') {
+          if (learned) {
+            const p = tiltOfR(d);
+            quatFromTilt(qAuto, learned.g * p.x, learned.g * p.z);
+          } else {
+            qAuto.identity();   // untrained: rigid arm, no corrections — the baseline
+          }
+          applyArm(robot, Q_ID, qAuto, true);
+        } else if (followChk.checked) {
           applyArm(robot, qUpper, qUser, true, hangRef);
         } else {
           applyArm(robot, Q_ID, Q_ID, true);
@@ -1419,15 +1553,28 @@
       syncBottles(humanRig, !bottlesHiddenForCal);
       syncBottles(robotRig, !bottlesHiddenForCal);
 
-      // 5. attempt logic: the human's tray is what's scored
+      // 5. attempt logic: demo/teach score the human's tray, auto the robot's
       if (episodeRunning) {
-        const tAct = tiltOf(qUser);
         timeValEl.textContent = epT.toFixed(1);
-        // net tray tilt shown on the HUD (platform + correction, small angles)
-        const net = Math.hypot(tiltOfR(d).x + tAct.x, tiltOfR(d).z + tAct.z);
-        tiltValEl.textContent = (Math.asin(Math.min(1, net)) * R2D).toFixed(1);
-        if (checkSpill(humanRig)) endEpisode('spill');
-        else if (epT >= EPISODE_CAP) endEpisode('cap');
+        if (mode === 'auto') {
+          const tAct = tiltOf(qAuto);
+          const net = Math.hypot(tiltOfR(d).x + tAct.x, tiltOfR(d).z + tAct.z);
+          tiltValEl.textContent = (Math.asin(Math.min(1, net)) * R2D).toFixed(1);
+          if (checkSpill(robotRig)) endEpisode('spill');
+          else if (epT >= EPISODE_CAP) endEpisode('cap');
+        } else {
+          const tAct = tiltOf(qUser);
+          // net tray tilt shown on the HUD (platform + correction, small angles)
+          const net = Math.hypot(tiltOfR(d).x + tAct.x, tiltOfR(d).z + tAct.z);
+          tiltValEl.textContent = (Math.asin(Math.min(1, net)) * R2D).toFixed(1);
+          if (mode === 'teach' && rec) {   // one (tilt → correction) sample per axis
+            const p = tiltOfR(d);
+            recordSample(p.x, tAct.x);
+            recordSample(p.z, tAct.z);
+          }
+          if (checkSpill(humanRig)) endEpisode('spill');
+          else if (epT >= (mode === 'teach' ? TEACH_CAP : EPISODE_CAP)) endEpisode('cap');
+        }
       } else if (mode === 'idle') {
         timeValEl.textContent = '0.0';
         const tAct = tiltOf(qUser);
@@ -1436,17 +1583,21 @@
         if (!bottlesHiddenForCal) tumbleRerack(humanRig, dt);
       }
       // robot spills (e.g. follow OFF) never end an attempt; the showcase ramp
-      // is NOT reset, so the floor keeps climbing to its cap.
+      // is NOT reset, so the floor keeps climbing to its cap. In robot-solo the
+      // roles flip: the robot's spill ENDS the attempt (scored above, no
+      // re-rack) and it's the idle HUMAN tray that gets tidied.
       if (!bottlesHiddenForCal) {
-        if (tumbleRerack(robotRig, dt)) robotSpills++;
+        if (mode === 'auto') tumbleRerack(humanRig, dt);
+        else if (tumbleRerack(robotRig, dt)) robotSpills++;
       }
-      epInfoEl.textContent = mode === 'demo'
-        ? `balancing… ${epT.toFixed(1)} s`
+      epInfoEl.textContent =
+        mode === 'teach' ? `⏺ recording… ${epT.toFixed(1)} s · ${rec ? rec.n : 0} samples`
+        : mode === 'auto' ? `🤖 robot solo… ${epT.toFixed(1)} s${bestRobot ? ` · robot best ${bestRobot.toFixed(1)}s` : ''}`
+        : mode === 'demo' ? `balancing… ${epT.toFixed(1)} s`
         : (bestHuman ? `best balance ${bestHuman.toFixed(1)} s` : 'press Start when ready');
 
       controls.update();
       renderer.render(scene, camera);
-      requestAnimationFrame(frame);
     }
 
     // --- boot -----------------------------------------------------------------
@@ -1469,6 +1620,7 @@
     applyView();
     setHand(localStorage.getItem(HAND_KEY) || 'R', false);
     refreshButtons();
+    updateTeachInfo();
     requestAnimationFrame(frame);
 
     addEventListener('beforeunload', () => {
@@ -1482,7 +1634,8 @@
       get state() {
         return {
           mode, calPhase, calibrated, trayLevelSet,
-          bestHuman, epT, robotSpills,
+          bestHuman, bestRobot, epT, robotSpills,
+          learned, recSamples: rec ? rec.n : 0,
           robotDebug: {
             trayY: +robotRig.body.position.y.toFixed(3),
             trayUpY: (() => {
@@ -1506,6 +1659,9 @@
         };
       },
       setTimeScale(s) { timeScale = Math.max(0.1, Math.min(5, s)); },
+      tick(dt = 1 / 60, n = 1) {   // drive the loop manually (works with rAF paused)
+        for (let i = 0; i < n; i++) stepFrame(dt, performance.now() / 1000 + i * dt);
+      },
       get distSpeed() { return distSpeed; },
       get distCap() { return distCap; },
       get tiltMode() { return tiltMode; },
