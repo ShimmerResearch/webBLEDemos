@@ -57,13 +57,22 @@ function getTitle() {
   return cleanTitle(og || document.title) || "Unknown";
 }
 
+// True until the extension is reloaded/updated/disabled out from under this
+// tab, at which point chrome.runtime.id becomes undefined.
+function contextAlive() {
+  return Boolean(chrome.runtime?.id);
+}
+
 function broadcastData() {
-	
+  if (!contextAlive()) { stopBroadcasting(); return; }
+
   const video = document.querySelector('video');
   const isAdShowing = document.querySelector('.ad-showing, .ad-interrupting') !== null;
 
   try {
-    chrome.runtime.sendMessage({
+    // No callback, so this returns a Promise: an invalidated context surfaces
+    // as a rejection, not a throw, and needs its own handler.
+    const p = chrome.runtime.sendMessage({
       type: "VIDEO_UPDATE",
       // Pages without a <video> (e.g. virtual tours) still report their title;
       // time is null so the companion knows there is no playback position.
@@ -72,9 +81,10 @@ function broadcastData() {
       isPaused: video ? video.paused : true,
       isAd: isAdShowing
     });
+    if (p && typeof p.catch === 'function') p.catch(stopBroadcasting);
   } catch (err) {
-    // Ignore extension context invalidated error which happens when extension reloads
-    // without refreshing the tab.
+    // Extension context invalidated / no receiving end: stop trying.
+    stopBroadcasting();
   }
 }
 
@@ -82,12 +92,26 @@ function broadcastData() {
 // The content script is injected on every page, so stay idle until the
 // companion overlay is first opened — no polling or DOM observation before then.
 let broadcasting = false;
+let broadcastTimer = null;
+let broadcastObserver = null;
+
 function startBroadcasting() {
   if (broadcasting) return;
   broadcasting = true;
-  setInterval(broadcastData, 200);
-  const observer = new MutationObserver(broadcastData);
-  observer.observe(document.documentElement, { childList: true, subtree: true });
+  broadcastTimer = setInterval(broadcastData, 200);
+  broadcastObserver = new MutationObserver(broadcastData);
+  broadcastObserver.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+// Called once the extension context dies; otherwise the interval and the
+// (very chatty on YouTube) observer would keep re-raising the same error.
+function stopBroadcasting() {
+  if (!broadcasting) return;
+  broadcasting = false;
+  clearInterval(broadcastTimer);
+  broadcastTimer = null;
+  broadcastObserver?.disconnect();
+  broadcastObserver = null;
 }
 
 // === OVERLAY INJECTION ===
@@ -120,6 +144,101 @@ function toggleOverlay() {
   if (!overlayIframe) { createOverlay(); return; }
   overlayIframe.style.display = overlayIframe.style.display === 'none' ? 'block' : 'none';
 }
+
+// === IMMERSIVE MODE ===
+// Fullscreen is entered on the Start Recording click — never at video onset.
+// An abrupt fullscreen transition elicits a non-specific SCR of its own, so it
+// must not coincide with the stimulus; the resting baseline runs behind a
+// neutral field and the video fades in once it elapses.
+const NEUTRAL_FIELD = '#808080'; // mid-grey, near the mean luminance of video
+const FADE_MS = 700;
+
+let baselineCover = null;
+
+// The player container rather than the bare <video>: keeps the site's own
+// controls usable, and gives us an element to parent the cover to.
+function getPlayerRoot() {
+  const video = document.querySelector('video');
+  if (!video) return null;
+  return video.closest(
+    '#movie_player, .html5-video-player, .watch-video, [data-uia="video-canvas"]'
+  ) || video.parentElement || video;
+}
+
+// In fullscreen only the fullscreen element's subtree is painted, so the cover
+// has to live inside it — and the overlay iframe is hidden for free.
+function showBaselineCover(parent, seconds) {
+  hideBaselineCover();
+  baselineCover = document.createElement('div');
+  Object.assign(baselineCover.style, {
+    position: 'absolute', inset: '0', zIndex: '2147483647',
+    background: NEUTRAL_FIELD, opacity: '1',
+    transition: `opacity ${FADE_MS}ms linear`,
+    display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center',
+    font: '400 14px system-ui, sans-serif', color: 'rgba(0,0,0,0.55)',
+    userSelect: 'none', pointerEvents: 'none'
+  });
+
+  // Fixation cross: holds gaze centrally and limits mind-wandering, which
+  // would otherwise add spontaneous SCRs to the "resting" period.
+  const cross = document.createElement('div');
+  cross.textContent = '+';
+  Object.assign(cross.style, { font: '300 40px system-ui, sans-serif', lineHeight: '1' });
+
+  const note = document.createElement('div');
+  note.dataset.role = 'countdown';
+  Object.assign(note.style, { marginTop: '18px', letterSpacing: '0.04em' });
+  note.textContent = seconds > 0 ? `Please relax and stay still — ${seconds}s` : 'Please relax and stay still';
+
+  baselineCover.append(cross, note);
+  if (getComputedStyle(parent).position === 'static') parent.style.position = 'relative';
+  parent.appendChild(baselineCover);
+}
+
+function updateBaselineCover(seconds) {
+  const note = baselineCover?.querySelector('[data-role="countdown"]');
+  if (note) note.textContent = `Please relax and stay still — ${seconds}s`;
+}
+
+// Fade rather than cut: a hard grey→video step is a luminance transient that
+// contaminates the first seconds of the stimulus response.
+function fadeOutBaselineCover() {
+  if (!baselineCover) return;
+  const cover = baselineCover;
+  baselineCover = null;
+  cover.style.opacity = '0';
+  setTimeout(() => cover.remove(), FADE_MS + 50);
+}
+
+function hideBaselineCover() {
+  baselineCover?.remove();
+  baselineCover = null;
+}
+
+function enterImmersive(restSeconds) {
+  const root = getPlayerRoot();
+  if (!root) return;
+  // Cover first, so nothing is briefly revealed as fullscreen animates in.
+  showBaselineCover(root, restSeconds);
+  // A click inside the overlay iframe grants the parent transient activation
+  // too, but only for a few seconds — hence entering here and not at onset.
+  root.requestFullscreen?.().catch(() => {
+    // Blocked (activation expired, or permissions-policy): the neutral field
+    // and baseline still work windowed, just not fullscreen.
+  });
+}
+
+function exitImmersive() {
+  hideBaselineCover();
+  if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+}
+
+// Escape / the player's own control leaves fullscreen without telling us; the
+// cover would then be stranded over the windowed player.
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) hideBaselineCover();
+});
 
 // ---- Smooth drag / resize via a page-level capture layer ----
 // Handling movement here (not inside the iframe) avoids lost events when the
@@ -212,8 +331,19 @@ window.addEventListener('message', (event) => {
     case 'RESIZE_START':
       startInteraction('resize', d.edges);
       break;
+    case 'ENTER_IMMERSIVE':
+      enterImmersive(d.restSeconds || 0);
+      break;
+    case 'REST_TICK':
+      updateBaselineCover(d.remaining);
+      break;
+    case 'EXIT_IMMERSIVE':
+      exitImmersive();
+      break;
     case 'PLAY_VIDEO': {
       // Fired by the companion once the resting-baseline delay elapses.
+      // Fade starts with playback so onset of sound and picture coincide.
+      fadeOutBaselineCover();
       const video = document.querySelector('video');
       if (video && video.paused) {
         video.play().catch(() => {

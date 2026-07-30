@@ -58,6 +58,7 @@ const capPeriodic = $("capPeriodic"), capInterval = $("capInterval"), capClick =
 const capSettled = $("capSettled"), settledRow = $("settledRow");
 const capClickDelay = $("capClickDelay"), capClickDelayVal = $("capClickDelayVal");
 const restEnable = $("restEnable"), restDelay = $("restDelay");
+const immersiveEnable = $("immersiveEnable");
 
 const tabLive = $("tabLive"), tabShots = $("tabShots");
 const shotCount = $("shotCount"), shotsGrid = $("shotsGrid"), shotsEmpty = $("shotsEmpty");
@@ -274,6 +275,13 @@ function toggleMinimize() {
   window.parent.postMessage({ type: 'MINIMIZE_OVERLAY' }, '*');
   body.classList.toggle('is-minimized');
 }
+// Collapse/expand to a known state (toggleMinimize alone would flip whichever
+// way the user last left it).
+function setMinimized(want) {
+  if (body.classList.contains('is-minimized') === want) return;
+  toggleMinimize();
+}
+
 minBtn.onclick = toggleMinimize;
 expandBtn.onclick = toggleMinimize;
 minStopBtn.onclick = () => streamBtn.click();
@@ -624,16 +632,26 @@ function cancelRest() {
   restRemaining = null;
 }
 
+// Seconds of resting baseline, or 0 when the baseline is off / misconfigured.
+function restSeconds() {
+  const secs = Math.round(parseFloat(restDelay.value));
+  if (!restEnable.checked || isNaN(secs) || secs <= 0) return 0;
+  return secs;
+}
+
 function startRest() {
   cancelRest();
-  const secs = Math.round(parseFloat(restDelay.value));
-  if (!restEnable.checked || isNaN(secs) || secs <= 0) return; // play manually
+  const secs = restSeconds();
+  if (!secs) return; // play manually
   restRemaining = secs;
   showRest(restRemaining);
   restTimer = setInterval(() => {
     restRemaining -= 1;
     if (restRemaining > 0) {
       showRest(restRemaining);
+      // The widget is hidden by fullscreen, so the countdown the participant
+      // sees is the one drawn on the neutral field by the content script.
+      window.parent.postMessage({ type: 'REST_TICK', remaining: restRemaining }, '*');
       return;
     }
     cancelRest();
@@ -649,6 +667,15 @@ function startRecording() {
   streamBtnText.textContent = "Stop Recording";
   setConn('online', 'Recording');
   manageInterval();
+
+  // Fullscreen must be requested inside this click's activation window, before
+  // the baseline — not at video onset, where the transition would confound the
+  // stimulus response.
+  if (immersiveEnable.checked) {
+    window.parent.postMessage({ type: 'ENTER_IMMERSIVE', restSeconds: restSeconds() }, '*');
+    setMinimized(true);
+  }
+
   startRest();
 }
 
@@ -659,6 +686,8 @@ function stopRecording() {
   captureQueue.length = 0;
   body.classList.remove('is-recording');
   streamBtnText.textContent = "Start Recording";
+  window.parent.postMessage({ type: 'EXIT_IMMERSIVE' }, '*');
+  setMinimized(false);
   if (shimmer.device?.gatt?.connected) setConn('online', 'Online');
   manageInterval();
 }
