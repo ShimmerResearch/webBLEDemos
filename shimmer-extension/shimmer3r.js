@@ -3,7 +3,15 @@
 // Your note: "timestamp is u24, so layout is: 0x00  [u24 timestamp]  <channel samples...>"
 // This build defaults to u24, and you can also pass { timestampFmt: 'u24' } in the constructor.
 
-const OPCODES = { DATA: 0x00, INQUIRY_CMD: 0x01, INQUIRY_RSP: 0x02, START_STREAM: 0x07, STOP_STREAM: 0x20, ACK: 0xFF, SAMPLING_RATE: 0x05, SET_SENSORS_CMD: 0x08, SET_GSR_RANGE: 0x21, SET_INTERNAL_EXP_POWER_ENABLE_CMD: 0x5E, START_BT_STEAM_SD_Logging: 0x70, STOP_BT_STEAM_SD_Logging: 0x97};
+const OPCODES = { DATA: 0x00, INQUIRY_CMD: 0x01, INQUIRY_RSP: 0x02, START_STREAM: 0x07, STOP_STREAM: 0x20, ACK: 0xFF, SAMPLING_RATE: 0x05, SET_SENSORS_CMD: 0x08, SET_GSR_RANGE: 0x21, SET_INTERNAL_EXP_POWER_ENABLE_CMD: 0x5E, START_BT_STEAM_SD_Logging: 0x70, STOP_BT_STEAM_SD_Logging: 0x97, GET_INFOMEM_CMD: 0x8E, INFOMEM_RSP: 0x8D};
+
+// InfoMem (device config memory) layout, mirroring ConfigByteLayoutShimmer3 in the
+// Shimmer Java driver: idxMacAddress = 128+96 (=224), lengthMacIdBytes = 6.
+// 224+6 stays within one 128-byte InfoMem segment, so a single read suffices.
+const INFOMEM_MAC_OFFSET = 224;
+const INFOMEM_MAC_LENGTH = 6;
+// Devices that have not been provisioned report an all-FF or all-zero MAC.
+const INVALID_MAC_IDS = ['FFFFFFFFFFFF', '000000000000'];
 
 const DEFAULTS = {
   SERVICE_UUID: '65333333-a115-11e2-9e9a-0800200ca100',
@@ -390,6 +398,61 @@ export class Shimmer3RClient {
     const info = this._interpretInquiryResponseShimmer3R(rsp);
     this.onInquiry?.(info); return info;
   }
+
+  /**
+   * Read a block from the device's InfoMem (config memory).
+   * Request layout is [cmd, length, addrLSB, addrMSB] (address is little-endian 16-bit),
+   * matching readMem()/GET_INFOMEM_COMMAND in the Shimmer Java driver.
+   * @returns {Promise<Uint8Array>} the raw bytes read
+   */
+  async readInfoMem(address, length){
+    if (!this.rx) throw new Error('Not connected.');
+    if (length < 1 || length > 128) throw new Error('InfoMem read length must be 1..128 bytes.');
+
+    this._emitStatus(`GET_INFOMEM ${length}B @ ${address} → waiting for ACK then RSP…`);
+    const cmd = new Uint8Array([
+      OPCODES.GET_INFOMEM_CMD,
+      length & 0xFF,
+      address & 0xFF,
+      (address >> 8) & 0xFF,
+    ]);
+
+    const remainder = await this._writeExpectingAck(cmd, 1500);
+    const rsp = (remainder && remainder[0] === OPCODES.INFOMEM_RSP)
+      ? remainder
+      : await this._waitForResponse(OPCODES.INFOMEM_RSP, 2000);
+
+    // Response is [INFOMEM_RSP][length][data...]; tolerate either prefix being absent.
+    let off = 0;
+    if (rsp[off] === OPCODES.INFOMEM_RSP) off++;
+    if (rsp.length > off && rsp[off] === length && rsp.length >= off + 1 + length) off++;
+
+    const data = rsp.slice(off, off + length);
+    if (data.length < length){
+      throw new Error(`InfoMem read returned ${data.length} of ${length} bytes.`);
+    }
+    return data;
+  }
+
+  /**
+   * Read the device's MAC address from InfoMem and return it as 12 uppercase hex
+   * characters (e.g. "2601140185B8") — byte order as stored, matching the identifier
+   * format used by Verisense.
+   */
+  async getMacAddress(){
+    const bytes = await this.readInfoMem(INFOMEM_MAC_OFFSET, INFOMEM_MAC_LENGTH);
+    const mac = Array.from(bytes)
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('')
+      .toUpperCase();
+
+    if (INVALID_MAC_IDS.includes(mac)){
+      throw new Error(`Device reported an unprovisioned MAC (${mac}).`);
+    }
+    this._emitStatus(`Device MAC: ${mac}`);
+    return mac;
+  }
+
   /**
    * Enable EMG (ADS1292R) in 16-bit mode on EXG1 & EXG2.
    * - Powers the internal expansion rail

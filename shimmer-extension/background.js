@@ -25,6 +25,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             });
         }
         return true; // Keep message channel open for async response
+    } else if (message.type === "GET_PAGE_INFO") {
+        // The companion runs in an extension-origin iframe and cannot read the host
+        // page's URL directly. Used to derive the NeuroLynQ content hash.
+        const respond = (tab) => {
+            if (!tab) {
+                sendResponse({ ok: false, error: "no active tab" });
+                return;
+            }
+            sendResponse({ ok: true, url: tab.url || "", title: tab.title || "" });
+        };
+
+        if (sender.tab) {
+            respond(sender.tab);
+        } else {
+            chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => respond(tabs && tabs[0]));
+        }
+        return true; // Keep message channel open for async response
     }
 });
 

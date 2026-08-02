@@ -373,6 +373,43 @@
     }
     .footer .btn { flex: 1; text-align: center; }
 
+    /* ====== Cloud sync ====== */
+    .cloud-modal {
+      display: none; position: absolute; inset: 0; z-index: 210;
+      background: rgba(0,0,0,0.72); align-items: center; justify-content: center; padding: 20px;
+    }
+    .cloud-modal.open { display: flex; }
+    .cloud-card {
+      width: 100%; max-width: 320px; max-height: 100%; overflow-y: auto;
+      background: var(--surface-raised); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 16px;
+    }
+    .cloud-head {
+      display: flex; align-items: center; justify-content: space-between;
+      font-size: 14px; font-weight: 600; margin-bottom: 10px;
+    }
+    .cloud-hint { font-size: 12px; color: var(--text-muted); margin-bottom: 12px; line-height: 1.45; }
+    .cloud-label { display: block; font-size: 11px; color: var(--text-dim); margin: 0 0 4px; }
+    .cloud-input {
+      width: 100%; box-sizing: border-box; margin-bottom: 10px; padding: 8px 10px;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px; font-size: 13px; font-family: var(--font-sans);
+    }
+    .cloud-input:focus { outline: none; border-color: var(--border-hover); }
+    .cloud-action { width: 100%; margin-top: 6px; }
+    .cloud-status { font-size: 12px; margin-top: 10px; min-height: 16px; line-height: 1.4; color: var(--text-muted); }
+    .cloud-status[data-state="error"] { color: var(--error); }
+    .cloud-status[data-state="ok"] { color: var(--online); }
+    .cloud-progress {
+      height: 4px; border-radius: 2px; background: var(--bg);
+      overflow: hidden; margin-bottom: 10px;
+    }
+    .cloud-progress-fill { height: 100%; width: 0%; background: var(--online); transition: width 0.2s ease; }
+    .cloud-files {
+      font-family: var(--font-mono); font-size: 11px; color: var(--text-dim);
+      max-height: 120px; overflow-y: auto; margin-bottom: 10px; line-height: 1.6;
+    }
+
     /* ====== Minimized bar ====== */
     body.is-minimized { background: transparent; }
     body.is-minimized > *:not(.minimized-bar) { display: none !important; }
@@ -627,6 +664,42 @@
   <div class="footer">
     <button class="btn danger" id="clearBtn">Clear</button>
     <button class="btn" id="downloadBtn">Export ZIP</button>
+    <button class="btn" id="cloudSyncBtn">Cloud Sync</button>
+  </div>
+
+  <!-- CLOUD SYNC -->
+  <div class="cloud-modal" id="cloudModal">
+    <div class="cloud-card">
+      <div class="cloud-head">
+        <span id="cloudTitle">Cloud Sync</span>
+        <button class="btn-icon" id="cloudCloseBtn" title="Close">
+          <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <!-- Sign in -->
+      <div id="cloudLoginView">
+        <div class="cloud-hint">Sign in with your participant account to upload this session.</div>
+        <label class="cloud-label" for="cloudEmail">Email</label>
+        <input class="cloud-input" type="email" id="cloudEmail" placeholder="you@example.com" autocomplete="username">
+        <label class="cloud-label" for="cloudPassword">Password</label>
+        <input class="cloud-input" type="password" id="cloudPassword" placeholder="Password" autocomplete="current-password">
+        <label class="cloud-label" for="cloudApiBase">Server</label>
+        <input class="cloud-input" type="url" id="cloudApiBase" placeholder="https://api.example.com">
+        <button class="btn-main cloud-action" id="cloudSignInBtn">Sign In</button>
+      </div>
+
+      <!-- Upload -->
+      <div id="cloudUploadView" hidden>
+        <div class="cloud-hint" id="cloudAccount"></div>
+        <div class="cloud-progress"><div class="cloud-progress-fill" id="cloudProgressFill"></div></div>
+        <div class="cloud-files" id="cloudFiles"></div>
+        <button class="btn-main cloud-action" id="cloudUploadBtn">Upload Session</button>
+        <button class="btn cloud-action" id="cloudSignOutBtn">Sign Out</button>
+      </div>
+
+      <div class="cloud-status" id="cloudStatus"></div>
+    </div>
   </div>
 
   <!-- EVENT POPOVER -->

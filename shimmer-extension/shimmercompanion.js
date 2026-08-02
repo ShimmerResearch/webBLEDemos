@@ -1,4 +1,5 @@
 import { Shimmer3RClient, SensorBitmapShimmer3 } from "./shimmer3r.js";
+import { signIn, signOut, getAuth, uploadSession, DEFAULT_API_BASE } from "./cloudsync.js";
 
 // ===== Charts =====
 const gsrCtx = document.getElementById('gsrChart').getContext('2d');
@@ -848,3 +849,110 @@ function triggerDownload(blob, filename) {
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
 }
+
+// ===== Cloud sync =====
+const cloudSyncBtn = $("cloudSyncBtn");
+const cloudModal = $("cloudModal");
+const cloudCloseBtn = $("cloudCloseBtn");
+const cloudLoginView = $("cloudLoginView"), cloudUploadView = $("cloudUploadView");
+const cloudEmail = $("cloudEmail"), cloudPassword = $("cloudPassword"), cloudApiBase = $("cloudApiBase");
+const cloudSignInBtn = $("cloudSignInBtn"), cloudSignOutBtn = $("cloudSignOutBtn");
+const cloudUploadBtn = $("cloudUploadBtn"), cloudAccount = $("cloudAccount");
+const cloudStatus = $("cloudStatus"), cloudProgressFill = $("cloudProgressFill"), cloudFiles = $("cloudFiles");
+
+function cloudSetStatus(message, state) {
+  cloudStatus.textContent = message || "";
+  if (state) cloudStatus.dataset.state = state; else delete cloudStatus.dataset.state;
+}
+
+function cloudShowView(auth) {
+  const signedIn = !!auth?.token;
+  cloudLoginView.hidden = signedIn;
+  cloudUploadView.hidden = !signedIn;
+  if (signedIn) cloudAccount.textContent = `Signed in as ${auth.login}`;
+}
+
+async function cloudOpen() {
+  const auth = await getAuth();
+  cloudApiBase.value = auth?.apiBase || DEFAULT_API_BASE;
+  if (auth?.login) cloudEmail.value = auth.login;
+  cloudShowView(auth);
+  cloudSetStatus("");
+  cloudProgressFill.style.width = "0%";
+  cloudFiles.textContent = "";
+  cloudModal.classList.add("open");
+}
+
+cloudSyncBtn.onclick = cloudOpen;
+cloudCloseBtn.onclick = () => cloudModal.classList.remove("open");
+cloudModal.addEventListener("click", (e) => { if (e.target === cloudModal) cloudModal.classList.remove("open"); });
+
+cloudSignInBtn.onclick = async () => {
+  const apiBase = cloudApiBase.value.trim();
+  const email = cloudEmail.value.trim();
+  const password = cloudPassword.value;
+
+  if (!apiBase || !email || !password) { cloudSetStatus("Server, email and password are required.", "error"); return; }
+
+  cloudSignInBtn.disabled = true;
+  cloudSetStatus("Signing in…");
+  try {
+    const auth = await signIn(apiBase, email, password);
+    cloudPassword.value = "";
+    cloudShowView(auth);
+    if (auth.isTemporaryPassword) {
+      cloudSetStatus("Signed in, but this account still has a temporary password. Activate it in the web portal first.", "error");
+    } else {
+      cloudSetStatus("Signed in.", "ok");
+    }
+  } catch (e) {
+    cloudSetStatus(e.message || "Sign-in failed.", "error");
+  } finally {
+    cloudSignInBtn.disabled = false;
+  }
+};
+
+cloudSignOutBtn.onclick = async () => {
+  await signOut();
+  cloudShowView(null);
+  cloudSetStatus("Signed out.");
+};
+
+cloudUploadBtn.onclick = async () => {
+  if (csvRows.length === 0) { cloudSetStatus("No data recorded yet.", "error"); return; }
+  if (!shimmer.device?.gatt?.connected) { cloudSetStatus("Connect the device so its MAC can be read.", "error"); return; }
+
+  const auth = await getAuth();
+  if (!auth?.token) { cloudShowView(null); cloudSetStatus("Please sign in first.", "error"); return; }
+
+  cloudUploadBtn.disabled = true;
+  cloudFiles.textContent = "";
+  cloudProgressFill.style.width = "0%";
+
+  try {
+    cloudSetStatus("Reading device MAC…");
+    const deviceMac = await shimmer.getMacAddress();
+
+    cloudSetStatus("Preparing session…");
+    const t0ms = csvRows[0].tMs;
+    const session = { csvRows, screenshots, reportHtml: await buildReport(t0ms) };
+
+    const result = await uploadSession({
+      auth,
+      deviceMac,
+      session,
+      onProgress: ({ done, total, message }) => {
+        cloudProgressFill.style.width = `${total ? Math.round((done / total) * 100) : 0}%`;
+        cloudSetStatus(`Uploading ${done}/${total}…`);
+        if (message && done > 0) cloudFiles.textContent += `${message}\n`;
+      },
+    });
+
+    cloudProgressFill.style.width = "100%";
+    cloudSetStatus(`Uploaded ${result.uploaded} file(s).`, "ok");
+  } catch (e) {
+    cloudSetStatus(e.message || "Upload failed.", "error");
+  } finally {
+    cloudUploadBtn.disabled = false;
+  }
+};
