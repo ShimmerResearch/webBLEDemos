@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Shimmer Companion",
-  "version": "1.4",
+  "version": "1.5",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAutZmPiHeBAizdt9hoVp2PlUt6jdkq63jX62MVsnS60uTOhJDJhIgPJD2ntJtIP/wh/BlDc8cg4cwuLfqbcKc21YHiGfKzpXIBeaf3AlUdturJsrREFn9XuXa4el8V3yxUgGKzZVsq9DBRGxd5Ivnug89vnJbH1WpQPZkXqk/Uqu96Uj5MP49oF+fP40vKpRUcGvCnqXo3zzuqjQGUW7xrNieqEgesqQyK7vFMzQYgYBueySdw6aqrMu2ebvlMgDeuBa/bFWiUTvx41sS2OEUGKUmfTQqdL7D7cqsq0npTYZORPlda12FjfUZrVpQt056coeBchJZ92uT3pLBiYWYLQIDAQAB",
   "permissions": ["tabs", "scripting", "storage", "activeTab"],
   "host_permissions": [
@@ -19,6 +19,9 @@
     }
   ],
   "action": { "default_title": "Open Shimmer Companion" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "web_accessible_resources": [
     {
       "resources": ["shimmercompanion.html", "shimmercompanion.js", "chart.min.js", "shimmer3r.js", "cloudsync.js"],

@@ -9,9 +9,9 @@
 // access token, so nothing about identity is asserted by this client.
 
 const STORAGE_KEY = 'neurolynqAuth';
-// Local docker maps the admin portal to 5001 and the REST API to 5002; the API is a
-// separate app from the web portal (deployed behind *api.verisense.net).
-const DEFAULT_API_BASE = 'http://localhost:5002';
+// Deliberately blank: the UI placeholder shows the required tenant-specific shape,
+// but must never be mistaken for a real server address.
+const DEFAULT_API_BASE = '';
 
 // ---- storage -------------------------------------------------------------
 
@@ -103,11 +103,21 @@ function getPageInfo() {
 // ---- API -----------------------------------------------------------------
 
 async function postJson(url, body) {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    let target = url;
+    try {
+      const parsed = new URL(url);
+      target = `${parsed.host}${parsed.pathname}`;
+    } catch { /* retain the original value */ }
+    throw new Error(`Could not reach ${target}. Check the Server address and network connection. (${error?.message || 'network error'})`);
+  }
   let payload = null;
   try { payload = await res.json(); } catch { /* non-JSON error body */ }
   if (!res.ok && !payload) {
@@ -179,7 +189,7 @@ async function requestUploadUrls(auth, deviceMac, contentHash, files) {
  * Build the individual files for a session. Signals are split per-channel so the
  * signal type is visible in the file name.
  */
-export async function buildSessionFiles({ csvRows, screenshots, reportHtml, deviceMac, pageInfo, canonical }) {
+export async function buildSessionFiles({ csvRows, visionRows, screenshots, reportHtml, deviceMac, pageInfo, canonical }) {
   if (!csvRows?.length) throw new Error('No data recorded yet.');
 
   const t0ms = csvRows[0].tMs;
@@ -205,6 +215,22 @@ export async function buildSessionFiles({ csvRows, screenshots, reportHtml, devi
       name: `${ts}_PPG_00001.csv`,
       type: 'signals',
       blob: new Blob([signalCsv('PPG (Raw)', r => (typeof r.ppg === 'number' ? r.ppg : ''))], { type: 'text/csv' }),
+    });
+  }
+
+  if (visionRows?.length) {
+    const header = ['Timestamp', 'Elapsed (s)', 'Video Time (s)', 'Face Present'];
+    const visionCsv = [
+      header.join(','),
+      ...visionRows.map(r => [
+        csvEscape(r.timestamp), elapsed(r.tMs), csvEscape(r.videoTime ?? ''),
+        r.facePresent ? 1 : 0,
+      ].join(',')),
+    ].join('\n');
+    files.push({
+      name: `${ts}_Vision_00001.csv`,
+      type: 'vision',
+      blob: new Blob([visionCsv], { type: 'text/csv' }),
     });
   }
 
@@ -246,6 +272,7 @@ export async function buildSessionFiles({ csvRows, screenshots, reportHtml, devi
     deviceMac,
     content: { canonical, url: pageInfo?.url || '', title: pageInfo?.title || '' },
     sampleCount: csvRows.length,
+    visionSampleCount: visionRows?.length ?? 0,
     screenshotCount: screenshots?.length ?? 0,
     files: files.map(f => ({ name: f.name, type: f.type })),
   };
@@ -276,7 +303,14 @@ export async function uploadSession({ auth, deviceMac, session, onProgress }) {
     const url = byName.get(file.name);
     if (!url) throw new Error(`No upload URL returned for ${file.name}.`);
 
-    const res = await fetch(url, { method: 'PUT', body: file.blob });
+    let res;
+    try {
+      res = await fetch(url, { method: 'PUT', body: file.blob });
+    } catch (error) {
+      let host = 'the storage server';
+      try { host = new URL(url).host; } catch { /* use generic host label */ }
+      throw new Error(`Could not upload ${file.name} to ${host}. The presigned storage URL may be unreachable or expired. (${error?.message || 'network error'})`);
+    }
     if (!res.ok) throw new Error(`Upload failed for ${file.name} (${res.status}).`);
 
     done += 1;

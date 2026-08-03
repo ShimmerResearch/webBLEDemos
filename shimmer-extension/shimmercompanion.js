@@ -1,5 +1,6 @@
 import { Shimmer3RClient, SensorBitmapShimmer3 } from "./shimmer3r.js";
 import { signIn, signOut, getAuth, uploadSession, DEFAULT_API_BASE } from "./cloudsync.js";
+import { WebcamAnalysis } from "./webcam.js";
 
 // ===== Charts =====
 const gsrCtx = document.getElementById('gsrChart').getContext('2d');
@@ -27,9 +28,34 @@ const shimmer = new Shimmer3RClient({ debug: false });
 let isStreaming = false; // device is streaming (live preview) — on from connect to disconnect
 let isRecording = false; // logging to CSV/timeline/screenshots — toggled by the record button
 let intentionalDisconnect = false;
+let deviceMac = null;    // read from InfoMem on connect (before streaming); used by cloud upload
+let immersiveActive = false; // fullscreen/immersive currently engaged for this recording
+
+// Device-clock timing: samples are stamped from the Shimmer's own TIMESTAMP (32768 Hz
+// ticks) rather than wall-clock-at-processing-time, so a JS stall renders as accurate
+// device time instead of distorting/losing the trace.
+const TS_TICKS_PER_SEC = 32768;
+const TS_MOD = 16777216; // u24 rollover
+let deviceClockAnchorWallMs = null; // wall time anchored at the first device sample
+let deviceLastTicks = null;
+let deviceAccumTicks = 0;
+let lastFrameWallMs = null;         // for stall detection
+
+// ===== Diagnostics: page-lifecycle freeze/visibility =====
+// A hidden cross-origin iframe with no active media playback (e.g. during a resting
+// baseline with the video paused) gets frozen by Chrome, stalling BLE. These logs
+// confirm exactly when that happens.
+['freeze', 'resume', 'pagehide', 'pageshow'].forEach(evt =>
+  document.addEventListener(evt, () =>
+    console.log(`[shimmer-lifecycle] ${evt} recording=${isRecording} @ ${new Date().toISOString()}`))
+);
+document.addEventListener('visibilitychange', () =>
+  console.log(`[shimmer-lifecycle] visibility=${document.visibilityState} recording=${isRecording} @ ${new Date().toISOString()}`)
+);
 let currentVideoTime = null; // null when the page has no <video> (e.g. virtual tours)
 const videoTimeStr = (digits) => currentVideoTime == null ? "" : currentVideoTime.toFixed(digits);
 let csvRows = [];
+let visionRows = [];
 let screenshots = [];
 let shotSeq = 0;  // image numbering; a settled shot reuses its click's number
 let eventSeq = 0; // one id per click event, shared by its onset + settled shots
@@ -37,6 +63,7 @@ let screenshotInterval = null;
 
 // throttled display buffers
 let latestGsr = null, latestPpg = null;
+let latestVision = null;
 let displayDirty = false;
 
 // ===== DOM =====
@@ -68,6 +95,139 @@ const lightbox = $("lightbox"), lightboxImg = $("lightboxImg"), lightboxClose = 
 const lightboxMeta = $("lightboxMeta");
 const lbStage = $("lbStage"), lbTopImg = $("lbTopImg"), lbDivider = $("lbDivider");
 const lbTagL = $("lbTagL"), lbTagR = $("lbTagR");
+
+const webcamEnableRow = $("webcamEnableRow"), webcamEnableBtn = $("webcamEnableBtn");
+const webcamActive = $("webcamActive"), webcamHead = $("webcamHead"), webcamState = $("webcamState");
+const webcamFace = $("webcamFace"), webcamAttention = $("webcamAttention"), webcamHeadPose = $("webcamHeadPose");
+const webcamEyes = $("webcamEyes"), webcamBlinkRate = $("webcamBlinkRate"), webcamMovement = $("webcamMovement");
+const webcamEvent = $("webcamEvent"), webcamPreviewWrap = $("webcamPreviewWrap");
+const webcamVideo = $("webcamVideo"), webcamCanvas = $("webcamCanvas"), webcamError = $("webcamError");
+const webcamPreviewBtn = $("webcamPreviewBtn"), webcamDebugBtn = $("webcamDebugBtn"), webcamStopBtn = $("webcamStopBtn");
+
+let webcamPreviewVisible = localStorage.getItem("shimmerWebcamPreview") === "true";
+let webcamDebugVisible = localStorage.getItem("shimmerWebcamDebug") === "true";
+// Calibration was removed from the product; discard values saved by earlier builds.
+localStorage.removeItem("shimmerWebcamCalibrationV1");
+
+const webcam = new WebcamAnalysis({
+  video: webcamVideo,
+  canvas: webcamCanvas,
+  onState: updateWebcamState,
+  onError: (message) => {
+    webcam.stop();
+    showWebcamError(message);
+  },
+});
+
+function setWebcamExpanded(expanded) {
+  webcamEnableRow.hidden = expanded;
+  webcamActive.hidden = !expanded;
+}
+
+function setWebcamViewOptions() {
+  if (webcamDebugVisible) webcamPreviewVisible = true;
+  webcamPreviewWrap.hidden = !webcamPreviewVisible;
+  webcamPreviewBtn.classList.toggle("active", webcamPreviewVisible);
+  webcamDebugBtn.classList.toggle("active", webcamDebugVisible);
+  webcamDebugBtn.disabled = !webcamPreviewVisible;
+  webcam.setDebugLandmarks(webcamDebugVisible);
+  localStorage.setItem("shimmerWebcamPreview", String(webcamPreviewVisible));
+  localStorage.setItem("shimmerWebcamDebug", String(webcamDebugVisible));
+}
+
+function webcamPlaceholder(label = "—") {
+  webcamFace.textContent = label;
+  webcamAttention.textContent = label;
+  webcamHeadPose.textContent = label;
+  webcamEyes.textContent = label;
+  webcamBlinkRate.textContent = label;
+  webcamMovement.textContent = label;
+}
+
+function describeWebcamError(error) {
+  if (error?.name === "NotAllowedError") return "Camera permission was not granted.";
+  if (error?.name === "NotFoundError") return "No webcam was found.";
+  if (error?.name === "NotReadableError") return "The webcam is unavailable or already in use.";
+  return error?.message || String(error || "Webcam analysis could not start.");
+}
+
+async function enableWebcam() {
+  setWebcamExpanded(true);
+  webcamHead.dataset.state = "loading";
+  webcamState.textContent = "Requesting camera…";
+  webcamEvent.textContent = "Waiting for camera permission…";
+  webcamError.hidden = true;
+  webcamPlaceholder();
+  setWebcamViewOptions();
+  webcamEnableBtn.disabled = true;
+  try {
+    await webcam.start();
+  } catch (error) {
+    webcam.stop();
+    showWebcamError(describeWebcamError(error));
+  } finally {
+    webcamEnableBtn.disabled = false;
+  }
+}
+
+function stopWebcam({ collapse = true } = {}) {
+  webcam.stop();
+  latestVision = null;
+  webcamError.hidden = true;
+  webcamHead.dataset.state = "loading";
+  webcamState.textContent = "Stopped";
+  webcamEvent.textContent = "Waiting for face…";
+  webcamPlaceholder();
+  if (collapse) setWebcamExpanded(false);
+}
+
+function showWebcamError(message) {
+  webcamHead.dataset.state = "error";
+  webcamState.textContent = "Unavailable";
+  webcamError.textContent = message;
+  webcamError.hidden = false;
+  webcamEvent.textContent = "Webcam analysis stopped";
+}
+
+function updateWebcamState(state) {
+  webcamHead.dataset.state = state.status === "Active" ? "active" : "loading";
+  webcamState.textContent = state.status || "Active";
+  webcamError.hidden = true;
+  if (!state.tMs) return;
+
+  latestVision = state;
+  webcamFace.textContent = state.face || "Not detected";
+  webcamAttention.textContent = state.attention || "Unavailable";
+  webcamHeadPose.textContent = state.head || "Unavailable";
+  webcamEyes.textContent = state.eyes || "Unavailable";
+  webcamBlinkRate.textContent = state.facePresent ? `${state.blinkRate || 0}/min` : "Unavailable";
+  webcamMovement.textContent = state.movement || "Unavailable";
+  webcamEvent.textContent = state.action || "Monitoring…";
+
+  if (isRecording) {
+    visionRows.push({
+      timestamp: state.timestamp,
+      tMs: state.tMs,
+      facePresent: Boolean(state.facePresent),
+      videoTime: videoTimeStr(3),
+      videoTitle: ($("videoTitleLabel").textContent || "").trim(),
+    });
+  }
+}
+
+webcamEnableBtn.onclick = enableWebcam;
+webcamStopBtn.onclick = () => stopWebcam();
+webcamPreviewBtn.onclick = () => {
+  webcamPreviewVisible = !webcamPreviewVisible;
+  if (!webcamPreviewVisible) webcamDebugVisible = false;
+  setWebcamViewOptions();
+};
+webcamDebugBtn.onclick = () => {
+  webcamDebugVisible = !webcamDebugVisible;
+  setWebcamViewOptions();
+};
+setWebcamExpanded(false);
+setWebcamViewOptions();
 
 // ===== Session timeline (whole-session GSR trend + snapshot markers) =====
 // Colors validated for CVD separation and contrast on the overlay surface.
@@ -270,7 +430,11 @@ function setConn(state, label) {
 setConn('offline', 'Offline');
 
 // ===== Window controls =====
-closeBtn.onclick = () => window.parent.postMessage({ type: 'CLOSE_OVERLAY' }, '*');
+closeBtn.onclick = () => {
+  stopWebcam();
+  window.parent.postMessage({ type: 'CLOSE_OVERLAY' }, '*');
+};
+window.addEventListener("beforeunload", () => webcam.stop());
 
 function toggleMinimize() {
   window.parent.postMessage({ type: 'MINIMIZE_OVERLAY' }, '*');
@@ -368,7 +532,8 @@ function recordShot(job, dataUrl) {
     title: ($("videoTitleLabel").textContent || "").trim(),
     reason,
     file: `shot_${String(num).padStart(3, "0")}_${reason}${meta.kind === 'settled' ? '_settled' : ''}.jpg`,
-    dataUrl
+    dataUrl,
+    vision: latestVision ? { facePresent: Boolean(latestVision.facePresent) } : null,
   };
   screenshots.push(shot);
   appendShot(shot);
@@ -479,6 +644,10 @@ capInterval.onchange = manageInterval;
 
 // ===== Video/context messages =====
 chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "PAGE_CLICK") {
+    handlePageClick();
+    return;
+  }
   if (message.type !== "VIDEO_UPDATE") return;
   if (message.isAd) {
     videoTimeLabel.textContent = "ad";
@@ -496,6 +665,15 @@ chrome.runtime.onMessage.addListener((message) => {
 
   const titleEl = $("videoTitleLabel");
   titleEl.textContent = message.isAd ? "Advertisement Playing" : message.title;
+
+  // When the video finishes, drop out of fullscreen/immersive automatically
+  // (equivalent to the participant pressing Esc). Guarded by immersiveActive so
+  // it fires once, and only when we entered immersive for this recording.
+  if (message.ended && immersiveActive) {
+    immersiveActive = false;
+    window.parent.postMessage({ type: 'EXIT_IMMERSIVE' }, '*');
+    setMinimized(false);
+  }
 });
 
 // ===== Capture-on-click (relayed from content script) =====
@@ -529,8 +707,8 @@ restDelay.disabled = !restEnable.checked;
 capClick.onchange = () => { if (!capClick.checked) cancelPendingSettle(); updateSettleUI(); };
 capSettled.onchange = () => { if (!capSettled.checked) cancelPendingSettle(); updateSettleUI(); };
 
-window.addEventListener('message', (event) => {
-  if (event.data?.type !== 'PAGE_CLICK' || !isRecording || !capClick.checked) return;
+function handlePageClick() {
+  if (!isRecording || !capClick.checked) return;
   const eventId = ++eventSeq;
   const clickTMs = Date.now();
   captureScreenshot("click", { clickTMs, eventId, kind: 'onset' });
@@ -543,7 +721,7 @@ window.addEventListener('message', (event) => {
     cancelPendingSettle();
     captureScreenshot("click", { clickTMs: p.clickTMs, eventId: p.eventId, kind: 'settled' });
   }, settleDelayMs());
-});
+}
 
 // ===== Connect / Disconnect =====
 scanBtn.onclick = async () => {
@@ -569,6 +747,16 @@ scanBtn.onclick = async () => {
 
     if (shimmer.device?.name) deviceNameLabel.textContent = shimmer.device.name;
     shimmer.device?.addEventListener('gattserverdisconnected', onUnexpectedDisconnect);
+
+    // Read the device MAC now — while the device is quiet, before any DATA frames.
+    // Doing it here (not at cloud-upload time) keeps all BLE command traffic on
+    // connect, so upload issues no commands to a streaming/finished device.
+    try {
+      deviceMac = await shimmer.getMacAddress();
+    } catch (macErr) {
+      deviceMac = null;
+      console.warn("Could not read device MAC:", macErr.message);
+    }
 
     // live preview begins immediately; logging waits for the record button
     await startStreaming();
@@ -607,6 +795,12 @@ function resetToOffline() {
 
 // ===== Streaming (live preview; runs from connect to disconnect) =====
 async function startStreaming() {
+  // Reset the device-clock accumulator for this streaming session.
+  deviceClockAnchorWallMs = null;
+  deviceLastTicks = null;
+  deviceAccumTicks = 0;
+  lastFrameWallMs = null;
+
   await shimmer.setSamplingRate(128);
   await shimmer.setInternalExpPower(1);
   await shimmer.setGSRRange(4); // auto range
@@ -675,6 +869,7 @@ function startRecording() {
   if (immersiveEnable.checked) {
     window.parent.postMessage({ type: 'ENTER_IMMERSIVE', restSeconds: restSeconds() }, '*');
     setMinimized(true);
+    immersiveActive = true;
   }
 
   startRest();
@@ -688,6 +883,7 @@ function stopRecording() {
   body.classList.remove('is-recording');
   streamBtnText.textContent = "Start Recording";
   window.parent.postMessage({ type: 'EXIT_IMMERSIVE' }, '*');
+  immersiveActive = false;
   setMinimized(false);
   if (shimmer.device?.gatt?.connected) setConn('online', 'Online');
   manageInterval();
@@ -708,17 +904,49 @@ function onFrame(oc) {
 
   const ppg = oc.get('PPG', 'raw')?.value;
 
+  // Advance the device clock every frame (preview + recording) so u24 rollover
+  // tracking stays continuous. Timestamp from the device, not wall-clock, so a
+  // processing stall places samples at their true time rather than as a false gap.
+  const tsField = oc.get('TIMESTAMP', 'raw');
+  const ts = tsField ? tsField.value : null;
+  let dTicks = 0;
+  let sampleMs;
+  if (ts != null) {
+    if (deviceClockAnchorWallMs === null) {
+      deviceClockAnchorWallMs = Date.now();
+      deviceLastTicks = ts;
+      deviceAccumTicks = 0;
+    } else {
+      dTicks = (((ts - deviceLastTicks) % TS_MOD) + TS_MOD) % TS_MOD;
+      deviceAccumTicks += dTicks;
+      deviceLastTicks = ts;
+    }
+    sampleMs = deviceClockAnchorWallMs + (deviceAccumTicks / TS_TICKS_PER_SEC) * 1000;
+  } else {
+    sampleMs = Date.now(); // device sent no TIMESTAMP — fall back to wall clock
+  }
+
+  // Stall diagnostic: log when frames stop arriving for a while. If the device
+  // clock advanced by the same amount, frames were dropped (real gap); if not,
+  // they were buffered and delivered late (device timestamps recover them).
+  const wallNow = Date.now();
+  if (lastFrameWallMs && wallNow - lastFrameWallMs > 2000) {
+    console.warn(`[shimmer-gap] no frames for ${((wallNow - lastFrameWallMs) / 1000).toFixed(1)}s; ` +
+      `device clock advanced ${(dTicks / TS_TICKS_PER_SEC).toFixed(1)}s; ` +
+      `recording=${isRecording}, visibility=${document.visibilityState}`);
+  }
+  lastFrameWallMs = wallNow;
+
   // live preview always updates; the session log only grows while recording
   if (isRecording) {
-    const now = new Date();
     csvRows.push({
-      timestamp: now.toISOString(),
-      tMs: now.getTime(),
+      timestamp: new Date(sampleMs).toISOString(),
+      tMs: sampleMs,
       videoTitle: ($("videoTitleLabel").textContent || "").replace(/,/g, ""),
       videoTime: videoTimeStr(3),
       gsr, ppg
     });
-    tlFeed(now.getTime(), gsr);
+    tlFeed(sampleMs, gsr);
   }
 
   latestGsr = gsr;
@@ -757,6 +985,7 @@ clearBtn.onclick = () => {
   if (!confirm("Clear all recorded data and screenshots for this session?")) return;
 
   csvRows = [];
+  visionRows = [];
   screenshots = [];
   shotsGrid.innerHTML = "";
   shotCount.textContent = "0";
@@ -764,6 +993,7 @@ clearBtn.onclick = () => {
   gsrChart.data.labels = []; gsrChart.data.datasets[0].data = []; gsrChart.update('none');
   ppgChart.data.labels = []; ppgChart.data.datasets[0].data = []; ppgChart.update('none');
   latestGsr = latestPpg = null;
+  latestVision = null;
   gsrValLabel.textContent = "—";
   ppgValLabel.textContent = "—";
   cancelPendingSettle();
@@ -788,6 +1018,12 @@ async function buildReport(t0ms) {
     t: csvRows.map(r => round3((r.tMs - t0ms) / 1000)),
     gsr: csvRows.map(r => (typeof r.gsr === "number" ? round3(r.gsr) : null)),
     ppg: csvRows.map(r => (typeof r.ppg === "number" ? r.ppg : null)),
+    mediaTime: csvRows.map(r => r.videoTime !== "" && Number.isFinite(Number(r.videoTime)) ? Number(r.videoTime) : null),
+    mediaTitle: csvRows.map(r => r.videoTitle || ""),
+    vision: visionRows.length ? {
+      t: visionRows.map(r => round3((r.tMs - t0ms) / 1000)),
+      facePresent: visionRows.map(r => Boolean(r.facePresent)),
+    } : null,
     events: screenshots.map(s => ({
       t: round3(((s.tMs ?? t0ms) - t0ms) / 1000),
       clickT: s.clickTMs != null ? round3((s.clickTMs - t0ms) / 1000) : null,
@@ -798,6 +1034,7 @@ async function buildReport(t0ms) {
       videoTime: s.videoTime || "",
       title: s.title || "",
       file: s.file,
+      vision: s.vision || null,
     })),
   };
   const tpl = await fetch(chrome.runtime.getURL("report_template.html")).then(r => r.text());
@@ -819,6 +1056,19 @@ downloadBtn.onclick = async () => {
   try {
     const zip = new JSZip();
     zip.file("results.csv", csvContent);
+    if (visionRows.length > 0) {
+      const visionHeader = ["Timestamp", "Elapsed (s)", "Video Time (s)", "Face Present"];
+      const visionCsv = [
+        visionHeader.join(","),
+        ...visionRows.map(r => [
+          r.timestamp,
+          ((r.tMs - t0ms) / 1000).toFixed(3),
+          r.videoTime || "",
+          r.facePresent ? 1 : 0,
+        ].join(","))
+      ].join("\n");
+      zip.file("vision.csv", visionCsv);
+    }
     if (screenshots.length > 0) {
       const evHeader = ["Timestamp", "Elapsed (s)", "Click Elapsed (s)", "Event", "Kind", "Video Time (s)", "Reason", "Page Title", "Filename"];
       const eventsCsv = [
@@ -920,7 +1170,7 @@ cloudSignOutBtn.onclick = async () => {
 
 cloudUploadBtn.onclick = async () => {
   if (csvRows.length === 0) { cloudSetStatus("No data recorded yet.", "error"); return; }
-  if (!shimmer.device?.gatt?.connected) { cloudSetStatus("Connect the device so its MAC can be read.", "error"); return; }
+  if (!deviceMac) { cloudSetStatus("Device MAC unavailable — reconnect the device and try again.", "error"); return; }
 
   const auth = await getAuth();
   if (!auth?.token) { cloudShowView(null); cloudSetStatus("Please sign in first.", "error"); return; }
@@ -930,12 +1180,9 @@ cloudUploadBtn.onclick = async () => {
   cloudProgressFill.style.width = "0%";
 
   try {
-    cloudSetStatus("Reading device MAC…");
-    const deviceMac = await shimmer.getMacAddress();
-
     cloudSetStatus("Preparing session…");
     const t0ms = csvRows[0].tMs;
-    const session = { csvRows, screenshots, reportHtml: await buildReport(t0ms) };
+    const session = { csvRows, visionRows, screenshots, reportHtml: await buildReport(t0ms) };
 
     const result = await uploadSession({
       auth,
@@ -943,7 +1190,7 @@ cloudUploadBtn.onclick = async () => {
       session,
       onProgress: ({ done, total, message }) => {
         cloudProgressFill.style.width = `${total ? Math.round((done / total) * 100) : 0}%`;
-        cloudSetStatus(`Uploading ${done}/${total}…`);
+        cloudSetStatus(done === 0 ? message : `Uploading ${done}/${total}…`);
         if (message && done > 0) cloudFiles.textContent += `${message}\n`;
       },
     });

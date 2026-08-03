@@ -197,6 +197,48 @@
     .btn.danger { color: var(--error); border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.08); }
     .btn.danger:hover { background: rgba(239,68,68,0.16); }
 
+    /* ====== Optional webcam analysis ====== */
+    .webcam-card { padding: 12px 14px; }
+    .webcam-enable-row { display: flex; align-items: center; gap: 10px; }
+    .webcam-enable-copy { flex: 1; min-width: 0; }
+    .webcam-active[hidden], .webcam-enable-row[hidden] { display: none; }
+    .webcam-head { display: flex; align-items: center; gap: 8px; margin-bottom: 11px; }
+    .webcam-head .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: none; }
+    .webcam-head[data-state="active"] .dot { background: var(--online); box-shadow: 0 0 7px rgba(52,211,153,0.5); }
+    .webcam-head[data-state="error"] .dot { background: var(--error); }
+    .webcam-head-label { font-size: 12px; font-weight: 650; flex: 1; }
+    .webcam-head-state { color: var(--text-muted); font-size: 11px; }
+    .webcam-status-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px;
+      padding-top: 10px; border-top: 1px solid var(--border);
+    }
+    .webcam-stat { min-width: 0; }
+    .webcam-stat-label { color: var(--text-dim); font-size: 9px; letter-spacing: 0.7px; text-transform: uppercase; }
+    .webcam-stat-value { color: var(--text); font-size: 12px; font-weight: 600; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .webcam-event {
+      margin-top: 10px; padding: 7px 9px; border-radius: 8px;
+      color: var(--text-muted); background: var(--surface-raised);
+      font-size: 11px; min-height: 30px;
+    }
+    .webcam-preview-wrap {
+      position: relative; display: block; overflow: hidden; margin-top: 10px;
+      border-radius: 10px; background: #08090b; aspect-ratio: 16 / 9;
+      border: 1px solid var(--border);
+    }
+    .webcam-preview-wrap[hidden] { display: none; }
+    .webcam-preview-wrap video,
+    .webcam-preview-wrap canvas {
+      position: absolute; inset: 0; display: block; width: 100% !important; height: 100% !important;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    .webcam-preview-wrap canvas { pointer-events: none; }
+    .webcam-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; }
+    .webcam-tools .btn { padding: 6px 9px; font-size: 10px; }
+    .webcam-tools .btn.active { color: var(--brand-hover); border-color: rgba(241,93,34,0.45); background: rgba(241,93,34,0.10); }
+    .webcam-tools .btn.webcam-stop { margin-left: auto; color: var(--text-muted); }
+    .webcam-error { color: var(--error); font-size: 10px; line-height: 1.4; margin-top: 8px; }
+    .webcam-error[hidden] { display: none; }
+
     /* ====== Context sync ====== */
     .sync-card { display: flex; align-items: center; gap: 12px; }
     .sync-icon { color: var(--brand); flex: none; width: 16px; height: 16px; }
@@ -533,6 +575,47 @@
         </div>
       </div>
 
+      <!-- OPTIONAL WEBCAM ANALYSIS -->
+      <div id="webcamSection">
+        <div class="section-title">Webcam Analysis</div>
+        <div class="card webcam-card">
+          <div class="webcam-enable-row" id="webcamEnableRow">
+            <div class="webcam-enable-copy">
+              <div class="setting-label">Webcam analysis is off</div>
+              <div class="setting-desc">Optional on-device face and head-state detection</div>
+            </div>
+            <button class="btn" id="webcamEnableBtn">Enable</button>
+          </div>
+
+          <div class="webcam-active" id="webcamActive" hidden>
+            <div class="webcam-head" id="webcamHead" data-state="loading">
+              <span class="dot"></span>
+              <span class="webcam-head-label">Webcam</span>
+              <span class="webcam-head-state" id="webcamState">Starting…</span>
+            </div>
+            <div class="webcam-status-grid">
+              <div class="webcam-stat"><div class="webcam-stat-label">Face</div><div class="webcam-stat-value" id="webcamFace">—</div></div>
+              <div class="webcam-stat"><div class="webcam-stat-label">Attention</div><div class="webcam-stat-value" id="webcamAttention">—</div></div>
+              <div class="webcam-stat"><div class="webcam-stat-label">Head</div><div class="webcam-stat-value" id="webcamHeadPose">—</div></div>
+              <div class="webcam-stat"><div class="webcam-stat-label">Eyes</div><div class="webcam-stat-value" id="webcamEyes">—</div></div>
+              <div class="webcam-stat"><div class="webcam-stat-label">Blink rate</div><div class="webcam-stat-value" id="webcamBlinkRate">—</div></div>
+              <div class="webcam-stat"><div class="webcam-stat-label">Movement</div><div class="webcam-stat-value" id="webcamMovement">—</div></div>
+            </div>
+            <div class="webcam-event" id="webcamEvent">Waiting for face…</div>
+            <div class="webcam-preview-wrap" id="webcamPreviewWrap" hidden>
+              <video id="webcamVideo" playsinline muted></video>
+              <canvas id="webcamCanvas"></canvas>
+            </div>
+            <div class="webcam-tools">
+              <button class="btn" id="webcamPreviewBtn">Preview</button>
+              <button class="btn" id="webcamDebugBtn">Landmarks</button>
+              <button class="btn webcam-stop" id="webcamStopBtn">Stop</button>
+            </div>
+            <div class="webcam-error" id="webcamError" hidden></div>
+          </div>
+        </div>
+      </div>
+
       <!-- CONTEXT SYNC -->
       <div>
         <div class="section-title">Context Sync</div>
@@ -685,7 +768,7 @@
         <label class="cloud-label" for="cloudPassword">Password</label>
         <input class="cloud-input" type="password" id="cloudPassword" placeholder="Password" autocomplete="current-password">
         <label class="cloud-label" for="cloudApiBase">Server</label>
-        <input class="cloud-input" type="url" id="cloudApiBase" placeholder="https://api.example.com">
+        <input class="cloud-input" type="url" id="cloudApiBase" placeholder="https://XXXXapi.verisense.net">
         <button class="btn-main cloud-action" id="cloudSignInBtn">Sign In</button>
       </div>
 

@@ -136,6 +136,8 @@
     box-shadow: 0 6px 24px rgba(0,0,0,0.18); padding: 9px 12px; font-size: 12px; min-width: 130px;
   }
   .tip .tip-time { font-weight: 650; margin-bottom: 5px; font-variant-numeric: tabular-nums; }
+  .tip .tip-media { color: var(--ink-2); font-variant-numeric: tabular-nums; margin-bottom: 2px; }
+  .tip .tip-title { color: var(--muted); max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 5px; }
   .tip .row { display: flex; align-items: center; gap: 7px; margin-top: 2px; }
   .tip .key { width: 12px; height: 0; border-top: 2.5px solid; border-radius: 2px; flex: none; }
   .tip .val { font-weight: 650; font-variant-numeric: tabular-nums; }
@@ -348,8 +350,73 @@ const fmtTick = (v) => Math.abs(v) >= 1000 ? fmtNum(Math.round(v)) : +v.toFixed(
 
 /* ================= Data prep ================= */
 const T = SESSION.t, GSR = SESSION.gsr, PPG = SESSION.ppg || [];
+const MEDIA_TIME = SESSION.mediaTime || [];
+const MEDIA_TITLE = (SESSION.mediaTitle || []).map(title =>
+  title && title !== "Unknown" && !/^Waiting for media/i.test(title) ? title : ""
+);
+const VISION = SESSION.vision || null;
 const N = T.length;
 const hasPpg = PPG.some(v => v != null);
+const hasVision = Boolean(VISION?.t?.length);
+const hasMediaContext = MEDIA_TIME.some(Number.isFinite) || MEDIA_TITLE.some(Boolean);
+
+const MEDIA_SEGMENTS = (() => {
+  if (!hasMediaContext || !N) return [];
+  const segments = [];
+  let start = 0, title = MEDIA_TITLE[0] || "Media playback";
+  for (let i = 1; i < N; i++) {
+    const next = MEDIA_TITLE[i] || title;
+    if (next !== title) {
+      segments.push({ t0: T[start], t1: T[i], title });
+      start = i;
+      title = next;
+    }
+  }
+  segments.push({ t0: T[start], t1: T[N - 1], title });
+  return segments;
+})();
+
+// Infer coarse playback state from one-second windows. This avoids pretending
+// that media time is continuous across pauses or seeks.
+const MEDIA_MARKERS = (() => {
+  if (!MEDIA_TIME.some(Number.isFinite)) return [];
+  const markers = [];
+  let anchor = MEDIA_TIME.findIndex(Number.isFinite);
+  let paused = false;
+  for (let i = anchor + 1; i < N; i++) {
+    if (!Number.isFinite(MEDIA_TIME[i]) || T[i] - T[anchor] < 1) continue;
+    const sessionDelta = T[i] - T[anchor];
+    const mediaDelta = MEDIA_TIME[i] - MEDIA_TIME[anchor];
+    const nowPaused = Math.abs(mediaDelta) < 0.25;
+    if (nowPaused !== paused) {
+      markers.push({ t: T[i], label: nowPaused ? "Paused" : "Resumed" });
+      paused = nowPaused;
+    } else if (!paused && Math.abs(mediaDelta - sessionDelta) > 2) {
+      markers.push({ t: T[i], label: "Seek" });
+    }
+    anchor = i;
+  }
+  return markers;
+})();
+
+// Face-absence spans are overlaid on the signal traces so a GSR/PPG excursion
+// can be read against whether the participant was visible to the webcam.
+const VISION_SPANS = (() => {
+  if (!hasVision) return [];
+  const vt = VISION.t, fp = VISION.facePresent;
+  const spans = [];
+  let cur = null;
+  for (let i = 0; i < vt.length; i++) {
+    const kind = fp[i] ? null : "noface";
+    if (kind) {
+      if (cur && cur.kind === kind) cur.t1 = vt[i];
+      else { if (cur) spans.push(cur); cur = { t0: vt[i], t1: vt[i], kind }; }
+    } else if (cur) { spans.push(cur); cur = null; }
+  }
+  if (cur) spans.push(cur);
+  return spans;
+})();
+const VISION_SHADE = { noface: "rgba(120,120,120,0.20)" };
 const IMAGES = (SESSION.events || []).slice().sort((a, b) => a.t - b.t);
 // Pair each settled shot with its click onset → one logical event per click.
 // A settled shot whose onset is missing (capture failed) stays standalone.
@@ -384,7 +451,8 @@ const GAP = Math.max(1, medianDt * 20);
   const d = new Date(SESSION.exportedAt);
   $("headSub").textContent =
     `${d.toLocaleDateString(undefined, { dateStyle: "long" })} · ${d.toLocaleTimeString(undefined, { timeStyle: "short" })}` +
-    ` · GSR & PPG @ ${(N / durationS).toFixed(0)} Hz`;
+    ` · GSR & PPG @ ${(N / durationS).toFixed(0)} Hz` +
+    (hasVision ? ` · webcam @ ${(VISION.t.length / durationS).toFixed(0)} Hz` : "");
 
   const chips = $("metaChips");
   const addChip = (label, value) => {
@@ -396,6 +464,7 @@ const GAP = Math.max(1, medianDt * 20);
     chips.appendChild(c);
   };
   addChip("Device", SESSION.device);
+  if (hasVision) addChip("Webcam", "On-device face analysis");
   (SESSION.titles || []).slice(0, 4).forEach(t => addChip("Media", t));
   if ((SESSION.titles || []).length > 4) addChip("", `+${SESSION.titles.length - 4} more`);
 
@@ -409,6 +478,10 @@ const GAP = Math.max(1, medianDt * 20);
     ["Mean GSR", cnt ? mean.toFixed(2) : "—", "µS"],
     ["Peak GSR", cnt ? peak.toFixed(2) : "—", "µS"],
   ];
+  if (hasVision) {
+    const faceSamples = VISION.facePresent.filter(Boolean).length;
+    tiles.push(["Face visible", `${Math.round(faceSamples / VISION.t.length * 100)}`, "%"]);
+  }
   for (const [label, value, unit] of tiles) {
     const el = document.createElement("div"); el.className = "tile";
     const l = document.createElement("div"); l.className = "t-label"; l.textContent = label;
@@ -418,7 +491,8 @@ const GAP = Math.max(1, medianDt * 20);
   }
 
   $("foot").textContent =
-    `Generated by Shimmer Companion on ${d.toLocaleString()} — full sample table in results.csv, snapshot index in events.csv.`;
+    `Generated by Shimmer Companion on ${d.toLocaleString()} — full sample table in results.csv, snapshot index in events.csv` +
+    (hasVision ? ", face-presence samples in vision.csv." : ".");
 })();
 
 /* ================= Legend ================= */
@@ -433,6 +507,7 @@ function buildLegend() {
   };
   add("line", cssVar("--gsr"), "GSR (µS)");
   if (hasPpg) add("line", cssVar("--ppg"), "PPG (raw)");
+  if (VISION_SPANS.some(s => s.kind === "noface")) add("dot", "rgb(140,140,140)", "No face");
   const present = REASONS.filter(r => EVENTS.some(e => e.reason === r));
   if (present.length) { const sep = document.createElement("span"); sep.className = "lg-sep"; lg.appendChild(sep); }
   const NAMES = { click: "Click", navigation: "Navigation", periodic: "Periodic" };
@@ -448,20 +523,22 @@ let hoverEv = null;      // hovered event
 let brush = null;        // {x0, x1} while dragging
 let layout = null;       // computed region rects
 
-const PAD_L = 58, PAD_R = 18, PAD_T = 16, AXIS_H = 30, LANE_H = 34;
+const PAD_L = 58, PAD_R = 18, PAD_T = 10, AXIS_H = 46, LANE_H = 34, MEDIA_H = 30;
 
 function computeLayout(w) {
   const gsrH = hasPpg ? 220 : 300;
   const ppgH = hasPpg ? 170 : 0;
   const laneH = EVENTS.length ? LANE_H : 10;
-  const totalH = PAD_T + gsrH + laneH + ppgH + AXIS_H + 8;
+  const mediaH = hasMediaContext ? MEDIA_H : 0;
+  const totalH = PAD_T + mediaH + gsrH + laneH + ppgH + AXIS_H + 8;
   const x = PAD_L, cw = Math.max(50, w - PAD_L - PAD_R);
   return {
     w, h: totalH, x, cw,
-    gsr: { y: PAD_T, h: gsrH },
-    lane: { y: PAD_T + gsrH, h: laneH },
-    ppg: hasPpg ? { y: PAD_T + gsrH + laneH, h: ppgH } : null,
-    axisY: PAD_T + gsrH + laneH + ppgH,
+    media: hasMediaContext ? { y: PAD_T, h: mediaH } : null,
+    gsr: { y: PAD_T + mediaH, h: gsrH },
+    lane: { y: PAD_T + mediaH + gsrH, h: laneH },
+    ppg: hasPpg ? { y: PAD_T + mediaH + gsrH + laneH, h: ppgH } : null,
+    axisY: PAD_T + mediaH + gsrH + laneH + ppgH,
   };
 }
 const tx = (t) => layout.x + ((t - domain[0]) / (domain[1] - domain[0])) * layout.cw;
@@ -479,6 +556,63 @@ function visibleRange() {
   return [lo, hi];
 }
 
+function mediaAtTime(t) {
+  if (!N) return { time: null, title: "" };
+  const i = Math.min(N - 1, Math.max(0, lowerBound(t)));
+  return { time: Number.isFinite(MEDIA_TIME[i]) ? MEDIA_TIME[i] : null, title: MEDIA_TITLE[i] || "" };
+}
+
+function faceAtTime(t) {
+  if (!hasVision) return null;
+  let lo = 0, hi = VISION.t.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (VISION.t[m] < t) lo = m + 1; else hi = m; }
+  const i = Math.min(VISION.t.length - 1, lo);
+  const prev = Math.max(0, i - 1);
+  const nearest = Math.abs(VISION.t[prev] - t) <= Math.abs(VISION.t[i] - t) ? prev : i;
+  return Boolean(VISION.facePresent[nearest]);
+}
+
+function fitText(text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let value = text;
+  while (value.length > 1 && ctx.measureText(value + "…").width > maxWidth) value = value.slice(0, -1);
+  return value + "…";
+}
+
+function drawMediaBand() {
+  if (!layout.media) return;
+  const region = layout.media;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(layout.x, region.y, layout.cw, region.h); ctx.clip();
+  ctx.fillStyle = cssVar("--grid"); ctx.globalAlpha = 0.45;
+  ctx.fillRect(layout.x, region.y, layout.cw, region.h - 2);
+  ctx.globalAlpha = 1;
+  ctx.font = "600 11px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  for (const segment of MEDIA_SEGMENTS) {
+    if (segment.t1 < domain[0] || segment.t0 > domain[1]) continue;
+    const x0 = tx(Math.max(segment.t0, domain[0]));
+    const x1 = tx(Math.min(segment.t1, domain[1]));
+    ctx.strokeStyle = cssVar("--baseline");
+    ctx.beginPath(); ctx.moveTo(x0 + 0.5, region.y); ctx.lineTo(x0 + 0.5, region.y + region.h - 2); ctx.stroke();
+    const width = Math.max(0, x1 - x0 - 12);
+    if (width > 24) {
+      ctx.fillStyle = cssVar("--ink-2");
+      ctx.fillText(fitText(segment.title, width), x0 + 7, region.y + region.h / 2 - 1);
+    }
+  }
+  ctx.font = "600 10px system-ui, sans-serif";
+  for (const marker of MEDIA_MARKERS) {
+    if (marker.t < domain[0] || marker.t > domain[1]) continue;
+    const x = Math.round(tx(marker.t)) + 0.5;
+    ctx.strokeStyle = cssVar("--brand"); ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.moveTo(x, region.y); ctx.lineTo(x, region.y + region.h - 2); ctx.stroke();
+    ctx.setLineDash([]); ctx.fillStyle = cssVar("--brand");
+    ctx.fillText(marker.label, x + 4, region.y + region.h - 7);
+  }
+  ctx.restore();
+}
+
 function yDomainFor(vals, lo, hi) {
   let mn = Infinity, mx = -Infinity;
   for (let i = lo; i <= hi; i++) { const v = vals[i]; if (v == null) continue; if (v < mn) mn = v; if (v > mx) mx = v; }
@@ -486,6 +620,23 @@ function yDomainFor(vals, lo, hi) {
   if (mn === mx) { mn -= 1; mx += 1; }
   const pad = (mx - mn) * 0.08;
   return [mn - pad, mx + pad];
+}
+
+// Paint face-absence spans behind a plot region.
+function drawAttentionShading(region) {
+  if (!VISION_SPANS.length) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(layout.x, region.y, layout.cw, region.h);
+  ctx.clip();
+  for (const s of VISION_SPANS) {
+    if (s.t1 < domain[0] || s.t0 > domain[1]) continue;
+    const x0 = tx(Math.max(s.t0, domain[0]));
+    const x1 = tx(Math.min(s.t1, domain[1]));
+    ctx.fillStyle = VISION_SHADE[s.kind];
+    ctx.fillRect(x0, region.y, Math.max(1, x1 - x0), region.h);
+  }
+  ctx.restore();
 }
 
 function drawSeries(region, vals, color, lo, hi, yd) {
@@ -642,13 +793,16 @@ function draw() {
   ctx.clearRect(0, 0, w, layout.h);
 
   const [lo, hi] = visibleRange();
+  drawMediaBand();
   const gsrYd = yDomainFor(GSR, lo, hi);
   drawPlotFrame(layout.gsr, "GSR — µS", gsrYd);
+  drawAttentionShading(layout.gsr);
   drawSeries(layout.gsr, GSR, cssVar("--gsr"), lo, hi, gsrYd);
   let ppgYd = null;
   if (hasPpg) {
     ppgYd = yDomainFor(PPG, lo, hi);
     drawPlotFrame(layout.ppg, "PPG — raw ADC", ppgYd);
+    drawAttentionShading(layout.ppg);
     drawSeries(layout.ppg, PPG, cssVar("--ppg"), lo, hi, ppgYd);
   }
 
@@ -667,7 +821,13 @@ function draw() {
     if (x < layout.x - 1 || x > layout.x + layout.cw + 1) continue;
     ctx.beginPath(); ctx.strokeStyle = cssVar("--grid");
     ctx.moveTo(Math.round(x) + 0.5, layout.axisY); ctx.lineTo(Math.round(x) + 0.5, layout.axisY + 4); ctx.stroke();
-    ctx.fillText(fmtClock(v - t0, dec), x, layout.axisY + 17);
+    ctx.fillStyle = cssVar("--ink-2");
+    ctx.fillText(`S ${fmtClock(v - t0, dec)}`, x, layout.axisY + 15);
+    const media = mediaAtTime(v).time;
+    if (media != null) {
+      ctx.fillStyle = cssVar("--muted");
+      ctx.fillText(`M ${fmtClock(media, dec)}`, x, layout.axisY + 31);
+    }
   }
   ctx.textAlign = "left";
 
@@ -797,8 +957,18 @@ function positionFloat(el, cx, cy) {
 function showTip(clientX, clientY, i) {
   tip.textContent = "";
   const tm = document.createElement("div"); tm.className = "tip-time";
-  tm.textContent = fmtClock(T[i] - t0, 2);
+  tm.textContent = `Session ${fmtClock(T[i] - t0, 2)}`;
   tip.appendChild(tm);
+  if (Number.isFinite(MEDIA_TIME[i])) {
+    const media = document.createElement("div"); media.className = "tip-media";
+    media.textContent = `Media ${fmtClock(MEDIA_TIME[i], 2)}`;
+    tip.appendChild(media);
+  }
+  if (MEDIA_TITLE[i]) {
+    const title = document.createElement("div"); title.className = "tip-title";
+    title.textContent = MEDIA_TITLE[i]; title.title = MEDIA_TITLE[i];
+    tip.appendChild(title);
+  }
   const row = (color, val, lbl) => {
     if (val == null) return;
     const r = document.createElement("div"); r.className = "row";
@@ -809,6 +979,8 @@ function showTip(clientX, clientY, i) {
   };
   row(cssVar("--gsr"), GSR[i] != null ? GSR[i].toFixed(3) : null, "µS · GSR");
   if (hasPpg) row(cssVar("--ppg"), PPG[i] != null ? String(PPG[i]) : null, "raw · PPG");
+  const facePresent = faceAtTime(T[i]);
+  if (facePresent != null) row(cssVar("--muted"), facePresent ? "Yes" : "No", "face detected");
   positionFloat(tip, clientX, clientY);
 }
 

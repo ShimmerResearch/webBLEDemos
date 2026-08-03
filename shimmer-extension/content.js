@@ -79,6 +79,7 @@ function broadcastData() {
       time: video ? video.currentTime : null,
       title: getTitle(),
       isPaused: video ? video.paused : true,
+      ended: video ? video.ended : false,
       isAd: isAdShowing
     });
     if (p && typeof p.catch === 'function') p.catch(stopBroadcasting);
@@ -134,7 +135,7 @@ function createOverlay() {
     boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
     zIndex: '2147483647', background: 'transparent', colorScheme: 'normal'
   });
-  overlayIframe.allow = 'bluetooth';
+  overlayIframe.allow = 'bluetooth; camera';
   overlayIframe.dataset.fullHeight = String(DEFAULT_H);
   overlayIframe.dataset.minimized = 'false';
   document.body.appendChild(overlayIframe);
@@ -308,6 +309,9 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 window.addEventListener('message', (event) => {
+  // Only the extension iframe may control the injected overlay or host page.
+  // Without this check, the host page could spoof immersive/play/resize commands.
+  if (event.source !== overlayIframe?.contentWindow) return;
   const d = event.data;
   if (!d || !overlayIframe) return;
 
@@ -360,7 +364,7 @@ window.addEventListener('message', (event) => {
 });
 
 document.addEventListener('click', () => {
-  if (overlayIframe && overlayIframe.contentWindow) {
-    overlayIframe.contentWindow.postMessage({ type: 'PAGE_CLICK' }, '*');
-  }
+  if (!overlayIframe || !contextAlive()) return;
+  const p = chrome.runtime.sendMessage({ type: 'PAGE_CLICK' });
+  if (p && typeof p.catch === 'function') p.catch(() => {});
 });
