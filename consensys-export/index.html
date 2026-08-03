@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Google tag (gtag.js) -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-T26GWN0LJW');
+  </script>
+
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Shimmer3 / Shimmer3R → Consensys Export</title>
+
+  <!-- JSZip for building the .zip in-browser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #0e1116;
+      --panel: #171c24;
+      --panel2: #1f2731;
+      --text: #e6edf3;
+      --muted: #9aa7b4;
+      --accent: #2196F3;
+      --accent2: #4CAF50;
+      --border: #2b333d;
+      --warn: #FFC107;
+      --err: #f44336;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.45;
+    }
+    header {
+      padding: 18px 20px;
+      background: linear-gradient(180deg, #1b222c, #12171e);
+      border-bottom: 1px solid var(--border);
+    }
+    h1 { margin: 0; font-size: 20px; }
+    header p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+    main { max-width: 760px; margin: 0 auto; padding: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+    .card h2 {
+      margin: 0 0 4px;
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      color: var(--muted);
+    }
+    .step-num {
+      display: inline-block;
+      width: 22px; height: 22px;
+      line-height: 22px; text-align: center;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff; font-size: 12px; font-weight: 700;
+      margin-right: 8px;
+    }
+    button {
+      padding: 12px 18px;
+      font-size: 15px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-go { background: var(--accent2); color: #fff; }
+    label.field { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+    input[type=text] {
+      width: 100%;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--panel2);
+      color: var(--text);
+      font-size: 14px;
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .device {
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-top: 10px;
+    }
+    .device .dname { font-weight: 700; font-size: 14px; }
+    .device .meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .mac { color: var(--accent2); font-family: ui-monospace, monospace; }
+    .mac.editable { color: var(--warn); }
+    .tree {
+      font-family: ui-monospace, "SF Mono", Consolas, monospace;
+      font-size: 12px;
+      white-space: pre;
+      overflow-x: auto;
+      background: #0b0e12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      color: #c7d2dc;
+      margin-top: 8px;
+    }
+    #status {
+      font-size: 13px;
+      min-height: 18px;
+      margin-top: 10px;
+      color: var(--muted);
+    }
+    #status.err { color: var(--err); }
+    #status.ok { color: var(--accent2); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .hidden { display: none; }
+    a.ghost { color: var(--accent); font-size: 12px; }
+    code { background:#0b0e12; padding:1px 5px; border-radius:4px; font-size:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Shimmer3 / Shimmer3R → Consensys Export</h1>
+    <p>Package a logged Shimmer3 or Shimmer3R trial into the Consensys import folder structure, zip it, and share.</p>
+  </header>
+
+  <main>
+    <div class="card">
+      <h2>Device utility — Set Real-Time Clock</h2>
+      <p class="hint">Scan, connect and write the current time (PC/phone clock) to a Shimmer3 or Shimmer3R real-time
+        clock in one step, before logging. Requires Chrome on Windows or Android (Web Bluetooth is not
+        available on iOS).</p>
+      <div class="row" style="margin-top:10px">
+        <button class="btn-primary" id="rtcBtn">Scan, connect &amp; set RTC</button>
+      </div>
+      <div id="rtcStatus" style="font-size:13px;min-height:18px;margin-top:10px;color:var(--muted)"></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="step-num">1</span>Select a trial folder</h2>
+      <p class="hint">Open the Shimmer storage or SD card on your computer, then choose a trial folder
+        (e.g. <code>DefaultTrial_1783578145</code>) that contains the device sub-folders
+        (e.g. <code>Shimmer_68DD-000</code>) with the binary files <code>000, 001, …</code></p>
+      <div class="row" style="margin-top:10px">
+        <!-- webkitdirectory: folder picker on Windows + Android Chrome -->
+        <input id="dirInput" type="file" webkitdirectory directory multiple class="hidden" />
+        <button class="btn-primary" id="pickBtn">Choose trial folder</button>
+      </div>
+      <p class="hint" id="iosNote"></p>
+    </div>
+
+    <div class="card hidden" id="trialCard">
+      <h2><span class="step-num">2</span>Detected trial</h2>
+      <div id="trialSummary"></div>
+      <div id="deviceList"></div>
+    </div>
+
+    <div class="card hidden" id="optsCard">
+      <h2><span class="step-num">3</span>Import details</h2>
+      <label class="field" for="importDate">Import date/time folder</label>
+      <input id="importDate" type="text" />
+      <p class="hint">Format <code>YYYY-MM-DD_HH.MM.SS</code>. Defaults to now — this is the top folder Consensys shows as the import date.</p>
+
+      <h2 style="margin-top:16px">Resulting structure</h2>
+      <div class="tree" id="tree"></div>
+    </div>
+
+    <div class="card hidden" id="goCard">
+      <h2><span class="step-num">4</span>Build &amp; share</h2>
+      <div class="row">
+        <button class="btn-go" id="buildBtn">Build ZIP &amp; share</button>
+      </div>
+      <div id="status"></div>
+    </div>
+  </main>
+
+<script>
+(function () {
+  "use strict";
+
+  const pickBtn   = document.getElementById("pickBtn");
+  const dirInput  = document.getElementById("dirInput");
+  const trialCard = document.getElementById("trialCard");
+  const optsCard  = document.getElementById("optsCard");
+  const goCard    = document.getElementById("goCard");
+  const trialSummary = document.getElementById("trialSummary");
+  const deviceList   = document.getElementById("deviceList");
+  const importDateEl = document.getElementById("importDate");
+  const treeEl    = document.getElementById("tree");
+  const buildBtn  = document.getElementById("buildBtn");
+  const statusEl  = document.getElementById("status");
+  const iosNote   = document.getElementById("iosNote");
+
+  // Per ShimmerSDLog.processSDLogHeader(): MAC = header bytes 24..29 (lowercase hex).
+  const MAC_OFFSET = 24;
+  const MAC_LEN = 6;
+  const HEADER_BYTES = 256; // enough to reach the MAC bytes
+
+  // model: { trialId, devices: [ { name, mac, macAuto, files: [ {name, file} ] } ] }
+  let model = null;
+
+  const isIOS = /iP(hone|ad|od)/.test(navigator.platform) ||
+                (navigator.userAgent.includes("Mac") && "ontouchend" in document);
+  const dirSupported = "webkitdirectory" in document.createElement("input");
+  if (!dirSupported || isIOS) {
+    iosNote.innerHTML = "⚠️ Folder picking is limited on iOS Safari. Use Windows or an Android device " +
+      "(Chrome) for the full experience. On iOS you can still pick a folder from the Files app if the " +
+      "device is mounted, but support varies by iOS version.";
+  }
+
+  function setStatus(msg, cls) {
+    statusEl.textContent = msg;
+    statusEl.className = cls || "";
+  }
+
+  function two(n) { return String(n).padStart(2, "0"); }
+  function nowStamp() {
+    const d = new Date();
+    return d.getFullYear() + "-" + two(d.getMonth() + 1) + "-" + two(d.getDate()) +
+      "_" + two(d.getHours()) + "." + two(d.getMinutes()) + "." + two(d.getSeconds());
+  }
+
+  function macSuffixFromDeviceName(name) {
+    // e.g. "Shimmer_2F31-000" -> "2f31"
+    const m = /Shimmer_([0-9A-Fa-f]{4})/.exec(name);
+    return m ? m[1].toLowerCase() : null;
+  }
+
+  async function readMacFromHeader(file) {
+    const buf = new Uint8Array(await file.slice(0, HEADER_BYTES).arrayBuffer());
+    if (buf.length < MAC_OFFSET + MAC_LEN) return null;
+    const bytes = [];
+    for (let i = 0; i < MAC_LEN; i++) bytes.push(buf[MAC_OFFSET + i]);
+    const fwd = bytes.map(b => b.toString(16).padStart(2, "0")).join("");
+    const rev = bytes.slice().reverse().map(b => b.toString(16).padStart(2, "0")).join("");
+    return { fwd, rev }; // e.g. { fwd:"e747aa7d2f31", rev:"312f7daa47e7" }
+  }
+
+  // ---------- Device utility: scan + connect + write RTC (Web Bluetooth) ----------
+  const rtcBtn = document.getElementById("rtcBtn");
+  const rtcStatusEl = document.getElementById("rtcStatus");
+
+  // Self-contained BLE UART profiles. Shimmer3 uses the RN4678 Transparent
+  // UART service; Shimmer3R uses its dedicated Shimmer UART service.
+  const BLE_PROFILES = {
+    shimmer3r: {
+      label: "Shimmer3R",
+      service: "65333333-a115-11e2-9e9a-0800200ca100",
+      write:   "65333333-a115-11e2-9e9a-0800200ca102",
+      notify:  "65333333-a115-11e2-9e9a-0800200ca101"
+    },
+    shimmer3: {
+      label: "Shimmer3",
+      service: "49535343-fe7d-4ae5-8fa9-9fafd205e455",
+      write:   "49535343-8841-43f4-a8d4-ecbe34729bb3",
+      notify:  "49535343-1e4d-4bd9-ba61-23c647249616"
+    }
+  };
+  const SET_RWC_COMMAND = 0x8f;
+  const ACK = 0xff;
+
+  function rtcStatus(msg, cls) {
+    rtcStatusEl.textContent = msg;
+    rtcStatusEl.style.color = cls === "err" ? "var(--err)" : cls === "ok" ? "var(--accent2)" : "var(--muted)";
+  }
+
+  // 9-byte SET_RWC: opcode + 8 bytes of (ms * 32.768) ticks, little-endian (LSB first).
+  function buildRwcCommand(ms) {
+    let ticks = BigInt(Math.round(ms * 32.768));
+    const out = new Uint8Array(9);
+    out[0] = SET_RWC_COMMAND;
+    for (let i = 0; i < 8; i++) {
+      out[1 + i] = Number(ticks & 0xffn); // LSB first
+      ticks >>= 8n;
+    }
+    return out;
+  }
+
+  async function openShimmerUart(server) {
+    // The chooser is filtered to these services, but use actual GATT discovery
+    // instead of the advertised name to determine the hardware generation.
+    for (const profile of Object.values(BLE_PROFILES)) {
+      try {
+        const service = await server.getPrimaryService(profile.service);
+        const write = await service.getCharacteristic(profile.write);
+        const notify = await service.getCharacteristic(profile.notify);
+        return { profile, write, notify };
+      } catch (err) {
+        if (err && err.name !== "NotFoundError") console.debug(profile.label + " profile:", err);
+      }
+    }
+    throw new Error("The selected device does not expose a supported Shimmer3 or Shimmer3R BLE UART service.");
+  }
+
+  async function writeWithoutResponse(characteristic, value) {
+    if (typeof characteristic.writeValueWithoutResponse === "function") {
+      await characteristic.writeValueWithoutResponse(value);
+    } else {
+      // Compatibility fallback for older Chromium Web Bluetooth builds.
+      await characteristic.writeValue(value);
+    }
+  }
+
+  rtcBtn.addEventListener("click", async () => {
+    if (!navigator.bluetooth) {
+      rtcStatus("Web Bluetooth is not available in this browser. Use Chrome on Windows or Android.", "err");
+      return;
+    }
+    rtcBtn.disabled = true;
+    let device = null;
+    try {
+      rtcStatus("Requesting device… pick your Shimmer3 or Shimmer3R.");
+      device = await navigator.bluetooth.requestDevice({
+        // Some Shimmer3 firmware exposes the UART service after connection but
+        // does not include its UUID in the advertisement. The name filter lets
+        // those devices appear; openShimmerUart still validates the GATT service.
+        filters: [
+          { namePrefix: "Shimmer" },
+          ...Object.values(BLE_PROFILES).map(profile => ({ services: [profile.service] }))
+        ],
+        optionalServices: Object.values(BLE_PROFILES).map(profile => profile.service)
+      });
+      rtcStatus("Connecting to " + (device.name || "Shimmer device") + "…");
+      const server = await device.gatt.connect();
+      const uart = await openShimmerUart(server);
+      const rx = uart.write;
+      const tx = uart.notify;
+      rtcStatus("Connected as " + uart.profile.label + ". Starting notifications…");
+
+      // Wait for the device's ACK to the command.
+      const ackPromise = new Promise((resolve) => {
+        let settled = false;
+        let timer;
+        const finish = (acked) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          tx.removeEventListener("characteristicvaluechanged", onNotify);
+          resolve(acked);
+        };
+        const onNotify = (evt) => {
+          const dv = evt.target.value;
+          const v = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+          if (v.length && v[0] === ACK) {
+            finish(true);
+          }
+        };
+        tx.addEventListener("characteristicvaluechanged", onNotify);
+        timer = setTimeout(() => finish(false), 3000);
+      });
+      await tx.startNotifications();
+
+      const now = Date.now();
+      rtcStatus("Writing " + uart.profile.label + " RTC (" + new Date(now).toLocaleString() + ")…");
+      await writeWithoutResponse(rx, buildRwcCommand(now));
+
+      const acked = await ackPromise;
+      try { await tx.stopNotifications(); } catch (e) {}
+      if (device.gatt.connected) device.gatt.disconnect();
+
+      rtcStatus(acked
+        ? uart.profile.label + " RTC set to " + new Date(now).toLocaleString() + " ✓ (device acknowledged). Disconnected."
+        : uart.profile.label + " RTC command sent (" + new Date(now).toLocaleString() + "), but no ACK received. Disconnected.",
+        acked ? "ok" : "");
+    } catch (err) {
+      if (err && err.name === "NotFoundError") rtcStatus("No device selected.", "");
+      else { console.error(err); rtcStatus("Failed: " + err.message, "err"); }
+      try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch (e) {}
+    } finally {
+      rtcBtn.disabled = false;
+    }
+  });
+
+  pickBtn.addEventListener("click", () => dirInput.click());
+
+  dirInput.addEventListener("change", async () => {
+    const files = Array.from(dirInput.files || []);
+    if (!files.length) return;
+    setStatus("Reading folder…");
+
+    // Locate the device folder wherever it sits in the path. The on-device layout
+    // can be <trialId>/<deviceName>/000 or data/<trialId>/<deviceName>/000, and the
+    // user may pick any ancestor folder, so find the "Shimmer_XXXX" segment and take
+    // the segment immediately before it as the trial id.
+    const trials = {};
+    for (const f of files) {
+      const rel = f.webkitRelativePath || f.name;
+      const parts = rel.split("/");
+      const fileName = parts[parts.length - 1];
+      if (fileName.startsWith(".")) continue;    // skip hidden/system files
+      const devIdx = parts.findIndex(p => /^Shimmer_/i.test(p));
+      if (devIdx < 1 || devIdx >= parts.length - 1) continue; // need a trial before + file after
+      const trialId = parts[devIdx - 1];
+      const deviceName = parts[devIdx];
+      (trials[trialId] = trials[trialId] || {});
+      (trials[trialId][deviceName] = trials[trialId][deviceName] || []).push({ name: fileName, file: f });
+    }
+
+    const trialIds = Object.keys(trials);
+    if (!trialIds.length) {
+      setStatus("No valid trial/device/file structure found. Pick a trial folder that contains " +
+        "device sub-folders with 000, 001 … files.", "err");
+      return;
+    }
+    // Use the first trial folder selected.
+    const trialId = trialIds[0];
+    const devObj = trials[trialId];
+
+    const devices = [];
+    for (const devName of Object.keys(devObj)) {
+      const fileList = devObj[devName].sort((a, b) => a.name.localeCompare(b.name));
+      // Read MAC from the first binary file's header (bytes 24..29).
+      let read = null;
+      try { read = await readMacFromHeader(fileList[0].file); } catch (e) { read = null; }
+      const suffix = macSuffixFromDeviceName(devName); // e.g. "68dd"
+      let mac, macAuto = false, macNote = "";
+      // The driver reads the MAC as header bytes 24..29 in order (ShimmerSDLog).
+      if (read && /^[0-9a-f]{12}$/.test(read.fwd)) {
+        mac = read.fwd;
+        macAuto = true;
+        macNote = "auto-read from header";
+      } else {
+        mac = suffix ? ("xxxxxxxx" + suffix) : "xxxxxxxxxxxx";
+        macNote = "could not read header — edit if needed";
+      }
+      devices.push({ name: devName, mac, macAuto, macNote,
+        headerHex: read ? read.fwd : null, files: fileList });
+    }
+
+    model = { trialId, devices };
+    importDateEl.value = nowStamp();
+    renderModel();
+    setStatus("");
+    trialCard.classList.remove("hidden");
+    optsCard.classList.remove("hidden");
+    goCard.classList.remove("hidden");
+    if (trialIds.length > 1) {
+      setStatus("Note: multiple trial folders detected — exporting only \"" + trialId +
+        "\". Select one trial folder at a time.", "");
+    }
+  });
+
+  function renderModel() {
+    if (!model) return;
+    let totalFiles = 0;
+    model.devices.forEach(d => totalFiles += d.files.length);
+    trialSummary.innerHTML =
+      '<div><strong>Trial:</strong> <span class="mac">' + escapeHtml(model.trialId) + "</span></div>" +
+      '<div class="hint">' + model.devices.length + " device(s), " + totalFiles + " binary file(s)</div>";
+
+    deviceList.innerHTML = "";
+    model.devices.forEach((d, idx) => {
+      const el = document.createElement("div");
+      el.className = "device";
+      const macClass = d.macAuto ? "mac" : "mac editable";
+      const macLabel = "MAC" + (d.macNote ? " — " + escapeHtml(d.macNote)
+                                          : d.macAuto ? " (auto-read from header)" : "");
+      el.innerHTML =
+        '<div class="dname">' + escapeHtml(d.name) + "</div>" +
+        '<div class="meta">' + d.files.length + " file(s): " +
+          escapeHtml(d.files.map(f => f.name).join(", ")) + "</div>" +
+        '<label class="field">' + macLabel + "</label>" +
+        '<input type="text" class="' + macClass + '" data-idx="' + idx +
+          '" value="' + escapeHtml(d.mac) + '" maxlength="12" />';
+      deviceList.appendChild(el);
+    });
+
+    deviceList.querySelectorAll("input[data-idx]").forEach(inp => {
+      inp.addEventListener("input", () => {
+        const i = +inp.dataset.idx;
+        model.devices[i].mac = inp.value.trim().toLowerCase();
+        renderTree();
+      });
+    });
+
+    renderTree();
+  }
+
+  importDateEl.addEventListener("input", renderTree);
+
+  function renderTree() {
+    if (!model) return;
+    const date = importDateEl.value.trim() || "IMPORT_DATE";
+    let out = date + "/\n";
+    model.devices.forEach(d => {
+      out += "  " + d.mac + "/\n";
+      out += "    data/\n";
+      out += "      " + model.trialId + "/\n";
+      out += "        " + d.name + "/\n";
+      d.files.forEach(f => { out += "          " + f.name + "\n"; });
+    });
+    treeEl.textContent = out;
+  }
+
+  function validate() {
+    const date = importDateEl.value.trim();
+    if (!/^\d{4}-\d{2}-\d{2}_\d{2}\.\d{2}\.\d{2}$/.test(date)) {
+      setStatus("Import date must look like YYYY-MM-DD_HH.MM.SS", "err");
+      return false;
+    }
+    for (const d of model.devices) {
+      if (!/^[0-9a-f]{12}$/.test(d.mac)) {
+        setStatus("MAC for " + d.name + " must be 12 hex characters (got \"" + d.mac + "\").", "err");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  buildBtn.addEventListener("click", async () => {
+    if (!model) return;
+    if (!validate()) return;
+    buildBtn.disabled = true;
+    setStatus("Building ZIP…");
+
+    try {
+      const zip = new JSZip();
+      const date = importDateEl.value.trim();
+
+      // Instructions placed next to the date folder.
+      const readme =
+        "Shimmer3 / Shimmer3R data export for Consensys\r\n" +
+        "===================================\r\n\r\n" +
+        "This archive contains the folder:  " + date + "\r\n\r\n" +
+        "To import this data into Consensys:\r\n\r\n" +
+        "1. Move the \"" + date + "\" folder into the Backup folder of your\r\n" +
+        "   Consensys workspace.\r\n\r\n" +
+        "2. In Consensys, import the data from the Backup directory:\r\n" +
+        "   Application Settings --> Manage Data --> Import Data From Backup Directory\r\n";
+      zip.file("README.txt", readme);
+
+      const root = zip.folder(date);
+      for (const d of model.devices) {
+        const base = root.folder(d.mac).folder("data").folder(model.trialId).folder(d.name);
+        for (const f of d.files) {
+          const buf = await f.file.arrayBuffer();
+          base.file(f.name, buf);
+        }
+      }
+
+      const blob = await zip.generateAsync(
+        { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
+        (meta) => setStatus("Compressing… " + Math.round(meta.percent) + "%")
+      );
+
+      const zipName = model.trialId + "_" + date + ".zip";
+      setStatus("ZIP ready (" + formatBytes(blob.size) + "). Opening share…", "ok");
+      await shareOrDownload(blob, zipName);
+      buildBtn.disabled = false;
+    } catch (err) {
+      console.error(err);
+      setStatus("Failed to build ZIP: " + err.message, "err");
+      buildBtn.disabled = false;
+    }
+  });
+
+  async function shareOrDownload(blob, zipName) {
+    const file = new File([blob], zipName, { type: "application/zip" });
+    // Web Share API with files: Android Chrome, iOS Safari.
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: zipName, text: "Shimmer trial export for Consensys import" });
+        setStatus("Shared " + zipName, "ok");
+        return;
+      } catch (e) {
+        if (e && e.name === "AbortError") { setStatus("Share cancelled — you can build again.", ""); return; }
+        // fall through to download
+      }
+    }
+    // Fallback: trigger a download (Windows desktop etc.)
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = zipName;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    setStatus("Downloaded " + zipName + " (sharing not supported on this browser).", "ok");
+  }
+
+  function formatBytes(b) {
+    if (b < 1024) return b + " B";
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
+    return (b / 1024 / 1024).toFixed(1) + " MB";
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+})();
+</script>
+</body>
+</html>
