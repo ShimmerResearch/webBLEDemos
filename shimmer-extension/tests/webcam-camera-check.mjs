@@ -53,7 +53,8 @@ const video = {
   pause() {},
 };
 const canvas = { width: 0, height: 0, getContext: () => ({ clearRect() {} }) };
-const webcam = new WebcamAnalysis({ video, canvas, onState() {}, onError() {} });
+const states = [];
+const webcam = new WebcamAnalysis({ video, canvas, onState: (state) => states.push(state), onError() {} });
 
 await webcam.start("external-camera");
 assert.equal(requests[0].video.deviceId.exact, "external-camera");
@@ -66,5 +67,10 @@ await webcam.start();
 assert.equal(requests[1].video.facingMode, "user");
 assert.equal("deviceId" in requests[1].video, false);
 webcam.stop();
+
+webcam.processSample({ facePresent: true, yaw: 20, pitch: 0, facingScore: 1, motionScore: 0 });
+assert.equal(states.at(-1).head, "Turned left");
+webcam.processSample({ facePresent: true, yaw: -20, pitch: 0, facingScore: 1, motionScore: 0 });
+assert.equal(states.at(-1).head, "Turned right");
 
 console.log("Webcam camera-selection checks passed.");

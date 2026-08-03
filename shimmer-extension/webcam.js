@@ -173,7 +173,7 @@ export class WebcamAnalysis {
     const yaw = Number.isFinite(raw.yaw) ? raw.yaw : 0;
     const pitch = Number.isFinite(raw.pitch) ? raw.pitch : 0;
     const head = Math.abs(yaw) > 14
-      ? (yaw > 0 ? "Turned right" : "Turned left")
+      ? (yaw > 0 ? "Turned left" : "Turned right")
       : Math.abs(pitch) > 12
         ? (pitch > 0 ? "Tilted down" : "Tilted up")
         : "Centered";
