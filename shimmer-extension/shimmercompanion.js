@@ -103,9 +103,11 @@ const webcamEyes = $("webcamEyes"), webcamBlinkRate = $("webcamBlinkRate"), webc
 const webcamEvent = $("webcamEvent"), webcamPreviewWrap = $("webcamPreviewWrap");
 const webcamVideo = $("webcamVideo"), webcamCanvas = $("webcamCanvas"), webcamError = $("webcamError");
 const webcamPreviewBtn = $("webcamPreviewBtn"), webcamDebugBtn = $("webcamDebugBtn"), webcamStopBtn = $("webcamStopBtn");
+const webcamCameraRow = $("webcamCameraRow"), webcamCameraSelect = $("webcamCameraSelect");
 
 let webcamPreviewVisible = localStorage.getItem("shimmerWebcamPreview") === "true";
 let webcamDebugVisible = localStorage.getItem("shimmerWebcamDebug") === "true";
+const WEBCAM_DEVICE_KEY = "shimmerWebcamDeviceId";
 // Calibration was removed from the product; discard values saved by earlier builds.
 localStorage.removeItem("shimmerWebcamCalibrationV1");
 
@@ -151,6 +153,28 @@ function describeWebcamError(error) {
   return error?.message || String(error || "Webcam analysis could not start.");
 }
 
+async function refreshCameraOptions() {
+  try {
+    const cameras = await webcam.listCameras();
+    const savedDeviceId = localStorage.getItem(WEBCAM_DEVICE_KEY) || "";
+    const activeDeviceId = webcam.activeDeviceId;
+    webcamCameraSelect.replaceChildren(...cameras.map((camera, index) => {
+      const option = document.createElement("option");
+      option.value = camera.deviceId;
+      option.textContent = camera.label || `Camera ${index + 1}`;
+      return option;
+    }));
+
+    const savedCamera = cameras.find((camera) => camera.deviceId === savedDeviceId);
+    const activeCamera = cameras.find((camera) => camera.deviceId === activeDeviceId);
+    webcamCameraSelect.value = (savedCamera || activeCamera || cameras[0])?.deviceId || "";
+    webcamCameraRow.hidden = cameras.length < 2;
+    if (savedDeviceId && !savedCamera) localStorage.removeItem(WEBCAM_DEVICE_KEY);
+  } catch {
+    webcamCameraRow.hidden = true;
+  }
+}
+
 async function enableWebcam() {
   setWebcamExpanded(true);
   webcamHead.dataset.state = "loading";
@@ -161,7 +185,15 @@ async function enableWebcam() {
   setWebcamViewOptions();
   webcamEnableBtn.disabled = true;
   try {
-    await webcam.start();
+    const savedDeviceId = localStorage.getItem(WEBCAM_DEVICE_KEY) || "";
+    try {
+      await webcam.start(savedDeviceId);
+    } catch (error) {
+      if (!savedDeviceId || !["NotFoundError", "OverconstrainedError"].includes(error?.name)) throw error;
+      localStorage.removeItem(WEBCAM_DEVICE_KEY);
+      await webcam.start();
+    }
+    await refreshCameraOptions();
   } catch (error) {
     webcam.stop();
     showWebcamError(describeWebcamError(error));
@@ -178,6 +210,7 @@ function stopWebcam({ collapse = true } = {}) {
   webcamState.textContent = "Stopped";
   webcamEvent.textContent = "Waiting for face…";
   webcamPlaceholder();
+  webcamCameraRow.hidden = true;
   if (collapse) setWebcamExpanded(false);
 }
 
@@ -217,6 +250,16 @@ function updateWebcamState(state) {
 
 webcamEnableBtn.onclick = enableWebcam;
 webcamStopBtn.onclick = () => stopWebcam();
+webcamCameraSelect.onchange = async () => {
+  const deviceId = webcamCameraSelect.value;
+  if (!deviceId || deviceId === webcam.activeDeviceId) return;
+  localStorage.setItem(WEBCAM_DEVICE_KEY, deviceId);
+  webcamCameraSelect.disabled = true;
+  webcam.stop();
+  latestVision = null;
+  await enableWebcam();
+  webcamCameraSelect.disabled = false;
+};
 webcamPreviewBtn.onclick = () => {
   webcamPreviewVisible = !webcamPreviewVisible;
   if (!webcamPreviewVisible) webcamDebugVisible = false;
@@ -228,6 +271,9 @@ webcamDebugBtn.onclick = () => {
 };
 setWebcamExpanded(false);
 setWebcamViewOptions();
+navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+  if (webcam.active) refreshCameraOptions();
+});
 
 // ===== Session timeline (whole-session GSR trend + snapshot markers) =====
 // Colors validated for CVD separation and contrast on the overlay surface.

@@ -7,6 +7,7 @@ const extensionRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const html = readFileSync(resolve(extensionRoot, "shimmercompanion.html"), "utf8");
 const companion = readFileSync(resolve(extensionRoot, "shimmercompanion.js"), "utf8");
 const manifest = JSON.parse(readFileSync(resolve(extensionRoot, "manifest.json"), "utf8"));
+const visionWorker = readFileSync(resolve(extensionRoot, "vision-worker.js"), "utf8");
 
 const referencedIds = [...companion.matchAll(/\$\(["']([^"']+)["']\)/g)].map((match) => match[1]);
 const missingIds = [...new Set(referencedIds)].filter((id) => !html.includes(`id="${id}"`));
@@ -26,6 +27,38 @@ if (missingAssets.length) throw new Error(`Missing webcam assets: ${missingAsset
 if (manifest.manifest_version !== 3) throw new Error("The extension must use Manifest V3.");
 if (!manifest.content_security_policy?.extension_pages?.includes("wasm-unsafe-eval")) {
   throw new Error("The extension CSP must permit local MediaPipe WebAssembly.");
+}
+
+const workerSandbox = {
+  importScripts() {},
+  self: {
+    Vision: { FaceLandmarker: {}, FilesetResolver: {} },
+    postMessage() {},
+    close() {},
+  },
+};
+vm.runInNewContext(`${visionWorker}\n;globalThis.eulerFromMatrixForTest = eulerFromMatrix;`, workerSandbox);
+
+const pitchMatrix = (degrees) => {
+  const angle = degrees * Math.PI / 180;
+  const cosine = Math.cos(angle);
+  const sine = Math.sin(angle);
+  return {
+    rows: 4,
+    columns: 4,
+    // Column-major rotation around the X axis.
+    data: [
+      1, 0, 0, 0,
+      0, cosine, sine, 0,
+      0, -sine, cosine, 0,
+      0, 0, 0, 1,
+    ],
+  };
+};
+const downPose = workerSandbox.eulerFromMatrixForTest(pitchMatrix(20));
+const upPose = workerSandbox.eulerFromMatrixForTest(pitchMatrix(-20));
+if (Math.abs(downPose.pitch - 20) > 0.001 || Math.abs(upPose.pitch + 20) > 0.001) {
+  throw new Error(`MediaPipe pitch direction is inverted (down=${downPose.pitch}, up=${upPose.pitch}).`);
 }
 
 const reportTemplate = readFileSync(resolve(extensionRoot, "report_template.html"), "utf8");

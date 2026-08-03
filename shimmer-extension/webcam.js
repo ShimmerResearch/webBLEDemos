@@ -26,16 +26,19 @@ export class WebcamAnalysis {
     return Boolean(this.stream && this.running);
   }
 
-  async start() {
+  async start(deviceId = "") {
     if (this.active) return;
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("Camera access is not supported in this browser.");
     }
 
+    const cameraConstraint = deviceId
+      ? { deviceId: { exact: deviceId } }
+      : { facingMode: "user" };
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
-        facingMode: "user",
+        ...cameraConstraint,
         width: { ideal: 1280 },
         height: { ideal: 720 },
         frameRate: { ideal: 30, max: 30 },
@@ -57,6 +60,16 @@ export class WebcamAnalysis {
     this.worker.postMessage({ type: "config", debugLandmarks: this.debugLandmarks });
     this.running = true;
     this.emit({ status: "Loading model", facePresent: false });
+  }
+
+  async listCameras() {
+    if (!navigator.mediaDevices?.enumerateDevices) return [];
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((device) => device.kind === "videoinput");
+  }
+
+  get activeDeviceId() {
+    return this.stream?.getVideoTracks?.()[0]?.getSettings?.().deviceId || "";
   }
 
   stop() {

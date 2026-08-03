@@ -22,10 +22,10 @@ function eulerFromMatrix(matrix) {
   const m = matrix?.data;
   if (!m || m.length < 11) return null;
 
-  // MediaPipe's canonical-face transform is a row-major 4x4 matrix.
-  const pitch = Math.atan2(m[9], m[10]);
-  const yaw = Math.asin(clamp(-m[8], -1, 1));
-  const roll = Math.atan2(m[4], m[0]);
+  // MediaPipe exposes the canonical-face transform in column-major order.
+  const pitch = Math.atan2(m[6], m[10]);
+  const yaw = Math.asin(clamp(-m[2], -1, 1));
+  const roll = Math.atan2(m[1], m[0]);
   return {
     yaw: radiansToDegrees(yaw),
     pitch: radiansToDegrees(pitch),

@@ -220,6 +220,14 @@
       color: var(--text-muted); background: var(--surface-raised);
       font-size: 11px; min-height: 30px;
     }
+    .webcam-camera-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+    .webcam-camera-row[hidden] { display: none; }
+    .webcam-camera-label { color: var(--text-dim); font-size: 9px; letter-spacing: 0.7px; text-transform: uppercase; flex: none; }
+    .webcam-camera-select {
+      min-width: 0; flex: 1; padding: 6px 8px; border-radius: 7px;
+      border: 1px solid var(--border); background: var(--surface); color: var(--text);
+      font: inherit; font-size: 10px;
+    }
     .webcam-preview-wrap {
       position: relative; display: block; overflow: hidden; margin-top: 10px;
       border-radius: 10px; background: #08090b; aspect-ratio: 16 / 9;
@@ -602,6 +610,10 @@
               <div class="webcam-stat"><div class="webcam-stat-label">Movement</div><div class="webcam-stat-value" id="webcamMovement">—</div></div>
             </div>
             <div class="webcam-event" id="webcamEvent">Waiting for face…</div>
+            <label class="webcam-camera-row" id="webcamCameraRow" hidden>
+              <span class="webcam-camera-label">Camera</span>
+              <select class="webcam-camera-select" id="webcamCameraSelect" aria-label="Webcam"></select>
+            </label>
             <div class="webcam-preview-wrap" id="webcamPreviewWrap" hidden>
               <video id="webcamVideo" playsinline muted></video>
               <canvas id="webcamCanvas"></canvas>
