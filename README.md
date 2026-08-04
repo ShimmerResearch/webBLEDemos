@@ -33,10 +33,11 @@ Migration work has already started on the [`copilot/restructure-repo-for-api-sup
 
 [Shimmer Companion Chrome extension](./shimmer-extension/) — a locally loaded Chrome extension for streaming PPG and GSR, capturing screenshots and media context, generating session reports, and optionally adding on-device webcam face/head-state analysis. It supports selecting between multiple cameras and uploading session files to a compatible ASM Cloud deployment. See the [extension README](./shimmer-extension/README.md) for installation, privacy, export, and server requirements.
 
+[Consensys Export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) — package a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zip it, and share. Also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
+
 ## Verisense demos
 
-### Requirements
-
+# Requirements
 - Verisense
 
 [Wrist Sensor Example](https://shimmerresearch.github.io/webBLEDemos/Verisense/)
