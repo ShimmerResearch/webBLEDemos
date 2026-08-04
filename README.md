@@ -28,6 +28,8 @@ Migration work has already started on the [`copilot/restructure-repo-for-api-sup
 
 [Shimmer3R Chrome Extension](https://github.com/ShimmerEngineering/webBLEDemos/tree/main/shimmer-extension) source code only, will require loading this locally via Chrome
 
+[Consensys Export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) — package a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zip it, and share. Also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
+
 # Requirements
 - Verisense
 

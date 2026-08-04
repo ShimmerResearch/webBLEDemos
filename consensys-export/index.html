@@ -154,8 +154,10 @@
   <header>
     <h1>Shimmer3 / Shimmer3R → Consensys Export</h1>
     <p>Package a logged Shimmer3 or Shimmer3R trial into the Consensys import folder structure, zip it, and share.</p>
-    <p class="reqs"><strong>Requires a Chromium browser</strong> — Google Chrome or Microsoft Edge, kept up to date
-      (Android: Chrome 132+). The Bluetooth "Set RTC" feature does <strong>not</strong> work on iPhone/iPad or Firefox.</p>
+    <p class="reqs"><strong>Best on a Chromium browser</strong> — Google Chrome or Microsoft Edge, kept up to date
+      (Android: Chrome 132+ for folder picking). The Bluetooth "Set RTC" feature needs Web Bluetooth: use Chrome/Edge on
+      Windows/Android, or the <strong>Bluefy</strong> app on iPhone/iPad (Safari, Chrome-iOS and Firefox can't do Web Bluetooth).
+      No folder picker? Use <strong>Option B</strong> below to pick the binary files directly.</p>
   </header>
 
   <main>
@@ -164,8 +166,8 @@
     <div class="card">
       <h2>Device utility — Set Real-Time Clock</h2>
       <p class="hint">Scan, connect and write the current time (PC/phone clock) to a Shimmer3 or Shimmer3R real-time
-        clock in one step, before logging. Requires Chrome on Windows or Android (Web Bluetooth is not
-        available on iOS).</p>
+        clock in one step, before logging. Needs a Web-Bluetooth browser: Chrome/Edge on Windows or Android,
+        or the <strong>Bluefy</strong> app on iPhone/iPad (Safari and Chrome-for-iOS can't do Web Bluetooth).</p>
       <div class="row" style="margin-top:10px">
         <button class="btn-primary" id="rtcBtn">Scan, connect &amp; set RTC</button>
       </div>
@@ -173,16 +175,30 @@
     </div>
 
     <div class="card">
-      <h2><span class="step-num">1</span>Select a trial folder</h2>
-      <p class="hint">Open the Shimmer storage or SD card on your computer, then choose a trial folder
-        (e.g. <code>DefaultTrial_1783578145</code>) that contains the device sub-folders
+      <h2><span class="step-num">1</span>Select the trial data</h2>
+
+      <p class="hint"><strong>Option A — pick the whole trial folder</strong> (desktop, or Android Chrome 132+).
+        Choose a trial folder (e.g. <code>DefaultTrial_1783578145</code>) containing the device sub-folders
         (e.g. <code>Shimmer_68DD-000</code>) with the binary files <code>000, 001, …</code></p>
-      <div class="row" style="margin-top:10px">
+      <div class="row" style="margin-top:8px">
         <!-- webkitdirectory: folder picker on Windows + Android Chrome -->
         <input id="dirInput" type="file" webkitdirectory directory multiple class="hidden" />
         <button class="btn-primary" id="pickBtn">Choose trial folder</button>
       </div>
       <p class="hint" id="iosNote"></p>
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0" />
+
+      <p class="hint"><strong>Option B — pick the binary file(s)</strong> for one device
+        (iPhone/iPad, or older Android where folder picking crashes). Open the device's folder in your
+        Files app and select the <code>000, 001, …</code> files. The MAC is read from the file; enter the
+        Trial ID yourself since single files carry no folder path.</p>
+      <label class="field" for="fileTrialId">Trial ID</label>
+      <input id="fileTrialId" type="text" placeholder="DefaultTrial_1783578145" />
+      <div class="row" style="margin-top:8px">
+        <input id="fileInput" type="file" multiple class="hidden" />
+        <button class="btn-primary" id="pickFilesBtn">Choose file(s)</button>
+      </div>
     </div>
 
     <div class="card hidden" id="trialCard">
@@ -226,6 +242,9 @@
   const buildBtn  = document.getElementById("buildBtn");
   const statusEl  = document.getElementById("status");
   const iosNote   = document.getElementById("iosNote");
+  const pickFilesBtn = document.getElementById("pickFilesBtn");
+  const fileInput    = document.getElementById("fileInput");
+  const fileTrialId  = document.getElementById("fileTrialId");
 
   // Per ShimmerSDLog.processSDLogHeader(): MAC = header bytes 24..29 (lowercase hex).
   const MAC_OFFSET = 24;
@@ -282,9 +301,8 @@
                 (navigator.userAgent.includes("Mac") && "ontouchend" in document);
   const dirSupported = "webkitdirectory" in document.createElement("input");
   if (!dirSupported || isIOS) {
-    iosNote.innerHTML = "⚠️ Folder picking is limited on iOS Safari. Use Windows or an Android device " +
-      "(Chrome) for the full experience. On iOS you can still pick a folder from the Files app if the " +
-      "device is mounted, but support varies by iOS version.";
+    iosNote.innerHTML = "⚠️ Folder picking doesn't work on iPhone/iPad (and crashes on older Android Chrome). " +
+      "Use <strong>Option B</strong> below to pick the binary files directly.";
   }
 
   function setStatus(msg, cls) {
@@ -450,6 +468,32 @@
     }
   });
 
+  // Build one device entry: sorts files and auto-reads the MAC from the first header.
+  async function buildDeviceEntry(devName, fileList) {
+    const files = fileList.slice().sort((a, b) => a.name.localeCompare(b.name));
+    let read = null;
+    try { read = await readMacFromHeader(files[0].file); } catch (e) { read = null; }
+    const suffix = macSuffixFromDeviceName(devName); // e.g. "68dd"
+    let mac, macAuto = false, macNote = "";
+    // The driver reads the MAC as header bytes 24..29 in order (ShimmerSDLog).
+    if (read && /^[0-9a-f]{12}$/.test(read.fwd)) {
+      mac = read.fwd; macAuto = true; macNote = "auto-read from header";
+    } else {
+      mac = suffix ? ("xxxxxxxx" + suffix) : "xxxxxxxxxxxx";
+      macNote = "could not read header — edit if needed";
+    }
+    return { name: devName, mac, macAuto, macNote, headerHex: read ? read.fwd : null, files };
+  }
+
+  function showModel() {
+    if (!importDateEl.value.trim()) importDateEl.value = nowStamp();
+    renderModel();
+    trialCard.classList.remove("hidden");
+    optsCard.classList.remove("hidden");
+    goCard.classList.remove("hidden");
+  }
+
+  // ---- Option A: whole-folder picker (desktop / Android Chrome 132+) ----
   pickBtn.addEventListener("click", () => dirInput.click());
 
   dirInput.addEventListener("change", async () => {
@@ -478,7 +522,7 @@
     const trialIds = Object.keys(trials);
     if (!trialIds.length) {
       setStatus("No valid trial/device/file structure found. Pick a trial folder that contains " +
-        "device sub-folders with 000, 001 … files.", "err");
+        "device sub-folders with 000, 001 … files — or use Option B to pick the files directly.", "err");
       return;
     }
     // Use the first trial folder selected.
@@ -487,36 +531,43 @@
 
     const devices = [];
     for (const devName of Object.keys(devObj)) {
-      const fileList = devObj[devName].sort((a, b) => a.name.localeCompare(b.name));
-      // Read MAC from the first binary file's header (bytes 24..29).
-      let read = null;
-      try { read = await readMacFromHeader(fileList[0].file); } catch (e) { read = null; }
-      const suffix = macSuffixFromDeviceName(devName); // e.g. "68dd"
-      let mac, macAuto = false, macNote = "";
-      // The driver reads the MAC as header bytes 24..29 in order (ShimmerSDLog).
-      if (read && /^[0-9a-f]{12}$/.test(read.fwd)) {
-        mac = read.fwd;
-        macAuto = true;
-        macNote = "auto-read from header";
-      } else {
-        mac = suffix ? ("xxxxxxxx" + suffix) : "xxxxxxxxxxxx";
-        macNote = "could not read header — edit if needed";
-      }
-      devices.push({ name: devName, mac, macAuto, macNote,
-        headerHex: read ? read.fwd : null, files: fileList });
+      devices.push(await buildDeviceEntry(devName, devObj[devName]));
     }
 
     model = { trialId, devices };
-    importDateEl.value = nowStamp();
-    renderModel();
-    setStatus("");
-    trialCard.classList.remove("hidden");
-    optsCard.classList.remove("hidden");
-    goCard.classList.remove("hidden");
-    if (trialIds.length > 1) {
-      setStatus("Note: multiple trial folders detected — exporting only \"" + trialId +
-        "\". Select one trial folder at a time.", "");
-    }
+    showModel();
+    setStatus(trialIds.length > 1
+      ? "Note: multiple trial folders detected — exporting only \"" + trialId + "\". Select one at a time."
+      : "");
+  });
+
+  // ---- Option B: individual binary files (iOS / older Android) ----
+  pickFilesBtn.addEventListener("click", () => fileInput.click());
+
+  fileInput.addEventListener("change", async () => {
+    const picked = Array.from(fileInput.files || []);
+    if (!picked.length) return;
+    setStatus("Reading file(s)…");
+
+    const entries = picked
+      .filter(f => !f.name.startsWith("."))
+      .map(f => ({ name: f.name, file: f }));
+    if (!entries.length) { setStatus("No usable files selected.", "err"); return; }
+
+    // Derive a default device name from the MAC (e.g. Shimmer_2F31-000); user can edit it.
+    let read = null;
+    try { read = await readMacFromHeader(entries[0].file); } catch (e) { read = null; }
+    const defName = (read && /^[0-9a-f]{12}$/.test(read.fwd))
+      ? ("Shimmer_" + read.fwd.slice(-4).toUpperCase() + "-000")
+      : "Shimmer_XXXX-000";
+
+    const trialId = fileTrialId.value.trim() || "DefaultTrial";
+    const device = await buildDeviceEntry(defName, entries);
+    model = { trialId, devices: [device] };
+    showModel();
+    setStatus(fileTrialId.value.trim()
+      ? ""
+      : "Enter the Trial ID above (edit it in step 2) so the folder name matches your device.", "");
   });
 
   function renderModel() {
@@ -524,7 +575,8 @@
     let totalFiles = 0;
     model.devices.forEach(d => totalFiles += d.files.length);
     trialSummary.innerHTML =
-      '<div><strong>Trial:</strong> <span class="mac">' + escapeHtml(model.trialId) + "</span></div>" +
+      '<label class="field">Trial ID</label>' +
+      '<input type="text" id="trialIdInput" value="' + escapeHtml(model.trialId) + '" />' +
       '<div class="hint">' + model.devices.length + " device(s), " + totalFiles + " binary file(s)</div>";
 
     deviceList.innerHTML = "";
@@ -535,19 +587,31 @@
       const macLabel = "MAC" + (d.macNote ? " — " + escapeHtml(d.macNote)
                                           : d.macAuto ? " (auto-read from header)" : "");
       el.innerHTML =
-        '<div class="dname">' + escapeHtml(d.name) + "</div>" +
         '<div class="meta">' + d.files.length + " file(s): " +
           escapeHtml(d.files.map(f => f.name).join(", ")) + "</div>" +
+        '<label class="field">Device name</label>' +
+        '<input type="text" class="dname-input" data-name-idx="' + idx +
+          '" value="' + escapeHtml(d.name) + '" />' +
         '<label class="field">' + macLabel + "</label>" +
         '<input type="text" class="' + macClass + '" data-idx="' + idx +
           '" value="' + escapeHtml(d.mac) + '" maxlength="12" />';
       deviceList.appendChild(el);
     });
 
+    const trialInput = document.getElementById("trialIdInput");
+    trialInput.addEventListener("input", () => {
+      model.trialId = trialInput.value.trim();
+      renderTree();
+    });
     deviceList.querySelectorAll("input[data-idx]").forEach(inp => {
       inp.addEventListener("input", () => {
-        const i = +inp.dataset.idx;
-        model.devices[i].mac = inp.value.trim().toLowerCase();
+        model.devices[+inp.dataset.idx].mac = inp.value.trim().toLowerCase();
+        renderTree();
+      });
+    });
+    deviceList.querySelectorAll("input[data-name-idx]").forEach(inp => {
+      inp.addEventListener("input", () => {
+        model.devices[+inp.dataset.nameIdx].name = inp.value.trim();
         renderTree();
       });
     });
@@ -577,7 +641,15 @@
       setStatus("Import date must look like YYYY-MM-DD_HH.MM.SS", "err");
       return false;
     }
+    if (!model.trialId) {
+      setStatus("Enter a Trial ID (e.g. DefaultTrial_1783578145).", "err");
+      return false;
+    }
     for (const d of model.devices) {
+      if (!d.name) {
+        setStatus("Device name cannot be empty.", "err");
+        return false;
+      }
       if (!/^[0-9a-f]{12}$/.test(d.mac)) {
         setStatus("MAC for " + d.name + " must be 12 hex characters (got \"" + d.mac + "\").", "err");
         return false;
