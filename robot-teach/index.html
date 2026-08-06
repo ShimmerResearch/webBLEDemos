@@ -339,24 +339,25 @@
           <button data-hand="R" class="active">Right hand</button>
           <button data-hand="L">Left hand</button>
         </div>
-        <p class="caption">Two still poses — no swinging. Hang the arm, then hold the tray pose.</p>
+        <p class="caption">Automatic mounting — any sensor axis or sign. Keep the strap fixed between both poses.</p>
         <div class="cal-guide" id="calGuide" aria-label="Two calibration steps">
           <div class="cal-card" data-cal-step="still">
             <span class="cal-step-num">1</span>
             <b>Arm down + still</b>
-            <small>Sensor Y+ faces up, away from gravity</small>
+            <small>Any sensor face · let the arm hang naturally</small>
             <span class="pose-glyph">↓</span>
           </div>
           <span class="cal-flow-arrow">→</span>
           <div class="cal-card" data-cal-step="tray">
             <span class="cal-step-num">2</span>
             <b>Hold the tray pose</b>
-            <small>Sensor Z+ faces up, away from gravity</small>
+            <small>Raise the same arm forward · keep tray level</small>
             <span class="tray-glyph"></span>
           </div>
         </div>
         <button id="calBtn" class="wide primary" disabled>⦿ Start guided calibration</button>
         <button id="placeBtn" class="wide" disabled style="margin-top: 8px;">🍾 Set tray level &amp; place bottles</button>
+        <div class="stats" id="axisResult" style="margin-top: 8px;">axes detected automatically from both poses</div>
       </details>
     </div>
 
@@ -512,6 +513,7 @@
     });
 
     const calBtn = document.getElementById('calBtn');
+    const axisResult = document.getElementById('axisResult');
     function wireConnect(btn, link) {
       btn.addEventListener('click', async () => {
         btn.disabled = true;
@@ -625,6 +627,7 @@
       guideT = 0;
       calBtn.disabled = true;
       calBtn.textContent = '1/2 · Arm down and still…';
+      axisResult.textContent = 'detecting pose 1 orientation…';
       setPrompt('1/2 · let your ARM HANG STRAIGHT DOWN · hold still', 'hold');
       refreshButtons();
       imuWrist.startCalibration(Math.round(1.25 * SAMPLING_HZ));
@@ -639,6 +642,10 @@
       setCalPhase('idle');
       calBtn.disabled = false;
       calBtn.textContent = calibrated ? '⦿ Re-run guided calibration' : CAL_BTN_LABEL;
+      const restoredMounting = imuWrist.detectedMounting;
+      axisResult.textContent = restoredMounting
+        ? `detected ${restoredMounting.hangUp} up → ${restoredMounting.trayUp} up`
+        : 'axes detected automatically from both poses';
       setPrompt(msg);
       hideBottlesForCal(false);
       refreshButtons();
@@ -646,12 +653,6 @@
 
     imuWrist.onCalibrated = () => {
       if (calPhase !== 'still') return;
-      // Mounting protocol, pose 1: sensor +Y points away from gravity (up).
-      if (imuWrist.bodyAxisUpDot({ x: 0, y: 1, z: 0 }) < 0.85) {
-        rollbackCal('pose 1 rejected · point sensor Y+ UP, then hold the arm still');
-        log('hang capture rejected: sensor +Y was not facing away from gravity');
-        return;
-      }
       imuWrist.filter.beta = BETA_RUN;
       setCalPhase('idle');
       calibrated = true;
@@ -660,6 +661,7 @@
       calBtn.disabled = false;
       calBtn.textContent = '⦿ Re-run guided calibration';
       placeBtn.classList.add('primary');
+      axisResult.textContent = 'pose 1 captured · keep the strap fixed for pose 2';
       updateCalCards();
       setPrompt('2/2 · now HOLD THE TRAY POSE — forearm level, palm up — and press “Set tray level”', 'live');
       log('hang reference captured; waiting for the tray-pose capture');
@@ -682,12 +684,10 @@
     const placeBtn = document.getElementById('placeBtn');
     placeBtn.addEventListener('click', () => {
       if (calActive() || magCap || mode !== 'idle' || !calibrated) return;
-      // Mounting protocol, pose 2: sensor +Z points away from gravity (up),
-      // making sensor -Y the physical forearm/tray forward direction.
-      if (!imuWrist.setForwardFix(-Math.PI / 2,
-          { x: 0, y: -1, z: 0 }, { x: 0, y: 0, z: 1 })) {
-        setPrompt('pose 2 rejected · point sensor Z+ UP with the tray level, then press again', 'hold');
-        log('tray-pose capture rejected: sensor +Z was not facing away from gravity');
+      if (!imuWrist.setForwardFix()) {
+        axisResult.textContent = 'poses too similar · raise the forearm fully into the tray pose';
+        setPrompt('pose 2 rejected · keep the tray level and forearm forward, farther from the hanging pose', 'hold');
+        log('tray-pose capture rejected: the two gravity vectors were too similar');
         return;
       }
       imuWrist.captureReference();
@@ -695,8 +695,12 @@
       updateCalCards();
       placeBtn.classList.remove('primary');
       hideBottlesForCal(false);
-      setPrompt('bottles placed · gently tip left/right and forward to verify direction', 'live');
-      log('tray-pose captured: heading + working level set');
+      const mounting = imuWrist.detectedMounting;
+      axisResult.textContent = mounting
+        ? `detected ${mounting.hangUp} up → ${mounting.trayUp} up · ${mounting.separationDeg.toFixed(0)}° apart`
+        : 'automatic mounting detected';
+      setPrompt(`bottles placed · ${axisResult.textContent} · gently verify each direction`, 'live');
+      log(`tray-pose captured: ${axisResult.textContent}`);
       refreshButtons();
     });
 

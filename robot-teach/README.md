@@ -54,11 +54,12 @@ no IK is required.
 - Built on the local MARG (9-DOF) fusion stack in `./fusion3d.js`:
   optional magnetometer hard-iron calibration (figure-8, shared localStorage
   with the hands-mag demo) prevents heading drift during long sessions.
-- Calibration uses two still poses with one wrist sensor: hang the straight arm
-  with sensor **Y+ facing up/away from gravity** and hold still (gyro bias),
-  then hold the palm/tray level with sensor **Z+ facing up/away from gravity**
-  and press **Set tray level & place bottles**. The app validates both poses;
-  in the working pose sensor −Y defines physical forward.
+- Calibration automatically supports any sensor axis, sign, or intermediate
+  strap angle. With the strap kept fixed, hold the straight arm hanging and
+  still (gyro bias + first gravity vector), then raise the same forearm forward,
+  hold the palm/tray level, and press **Set tray level & place bottles** (second
+  gravity vector + task zero). The two non-parallel vectors define forward, up,
+  and right; the detected nearest signed axes are shown after capture.
 - The teaching panel separately demonstrates how to rock the tray: lower the
   wrist edge to tip back, and lower the fingertip edge to tip forward.
 - The default camera is an over-the-shoulder view from behind the robot, so

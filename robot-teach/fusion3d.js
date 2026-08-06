@@ -238,6 +238,9 @@ export class ArmImu {
     this._swing = null;
     this._swingCalibrated = false;      // a functional yaw datum exists (swing or working-pose)
     this.longAxis = null;               // segment long axis in the BODY frame, from the hang reference
+    this.hangUpAxis = null;             // earth-up expressed in BODY coordinates at pose 1
+    this.trayUpAxis = null;             // earth-up expressed in BODY coordinates at pose 2
+    this.forwardAxis = null;            // derived BODY-frame task-forward axis
     this.onCalibrated = null;
     this.accel = null;                  // last device-frame accel (g)
     this.gyro = null;                   // last device-frame gyro (deg/s), pre-bias
@@ -280,6 +283,9 @@ export class ArmImu {
     this.qYawFix = undefined;
     this._swingCalibrated = false;
     this.longAxis = null;
+    this.hangUpAxis = null;
+    this.trayUpAxis = null;
+    this.forwardAxis = null;
     this._cal = null;
     this._swing = null;
   }
@@ -292,6 +298,9 @@ export class ArmImu {
       qYawFix: this.qYawFix ? { ...this.qYawFix } : undefined,
       swingCalibrated: this._swingCalibrated,
       longAxis: this.longAxis ? { ...this.longAxis } : null,
+      hangUpAxis: this.hangUpAxis ? { ...this.hangUpAxis } : null,
+      trayUpAxis: this.trayUpAxis ? { ...this.trayUpAxis } : null,
+      forwardAxis: this.forwardAxis ? { ...this.forwardAxis } : null,
       beta: this.filter.beta,
     };
   }
@@ -302,6 +311,9 @@ export class ArmImu {
     this.qYawFix = s.qYawFix ? { ...s.qYawFix } : undefined;
     this._swingCalibrated = s.swingCalibrated;
     this.longAxis = s.longAxis ? { ...s.longAxis } : null;
+    this.hangUpAxis = s.hangUpAxis ? { ...s.hangUpAxis } : null;
+    this.trayUpAxis = s.trayUpAxis ? { ...s.trayUpAxis } : null;
+    this.forwardAxis = s.forwardAxis ? { ...s.forwardAxis } : null;
     this.filter.beta = s.beta;
     this._cal = null;
     this._swing = null;
@@ -381,20 +393,42 @@ export class ArmImu {
    * — i.e. the user has not actually raised the limb into the task pose.
    */
   setForwardFix(targetYawRad = -Math.PI / 2, forwardBody = null, expectedUpBody = null) {
-    const forward = forwardBody || this.longAxis;
-    if (!forward) return false;
-    // When the mounting protocol specifies which puck axis must point up in
-    // the working pose, reject the capture unless it actually does. This keeps
-    // a slightly twisted/sideways pose from silently rotating the task frame.
+    const seed = forwardBody || this.longAxis;
+    if (!seed) return false;
+
+    // Pose 2 tells us which BODY-space direction is up. Project the pose-1
+    // down/forward seed into that tray plane: two non-parallel gravity vectors
+    // then define an orthonormal task basis for any puck mounting.
+    let trayUp;
     if (expectedUpBody) {
-      const u = qRotate(this.filter.q, expectedUpBody);
-      const un = Math.hypot(u.x, u.y, u.z) || 1;
-      if (u.z / un < 0.85) return false;   // expected axis must be within ~32° of up
+      trayUp = { ...expectedUpBody };
+      const uEarth = qRotate(this.filter.q, trayUp);
+      const uen = Math.hypot(uEarth.x, uEarth.y, uEarth.z) || 1;
+      if (uEarth.z / uen < 0.85) return false;
+    } else {
+      trayUp = qRotate(qConj(this.filter.q), { x: 0, y: 0, z: 1 });
     }
-    const e = qRotate(this.filter.q, forward);   // forward axis in the earth frame
-    if (Math.hypot(e.x, e.y) < 0.35) return false;     // ~>70deg from horizontal: no heading
+    const un = Math.hypot(trayUp.x, trayUp.y, trayUp.z) || 1;
+    trayUp = { x: trayUp.x / un, y: trayUp.y / un, z: trayUp.z / un };
+
+    const sn = Math.hypot(seed.x, seed.y, seed.z) || 1;
+    const s = { x: seed.x / sn, y: seed.y / sn, z: seed.z / sn };
+    const dot = s.x * trayUp.x + s.y * trayUp.y + s.z * trayUp.z;
+    let forward = {
+      x: s.x - dot * trayUp.x,
+      y: s.y - dot * trayUp.y,
+      z: s.z - dot * trayUp.z,
+    };
+    const fn = Math.hypot(forward.x, forward.y, forward.z);
+    if (fn < 0.5) return false;   // poses less than ~30° apart cannot define twist
+    forward = { x: forward.x / fn, y: forward.y / fn, z: forward.z / fn };
+
+    const e = qRotate(this.filter.q, forward);   // task forward in the earth frame
+    if (Math.hypot(e.x, e.y) < 0.5) return false;
     const yaw = Math.atan2(e.y, e.x);
     this.qYawFix = qFromAxisAngle(0, 0, 1, targetYawRad - yaw);
+    this.trayUpAxis = trayUp;
+    this.forwardAxis = forward;
     this._swingCalibrated = true;   // functional datum: never downgrade to the body-X fallback
     return true;
   }
@@ -403,6 +437,22 @@ export class ArmImu {
   bodyAxisUpDot(axisBody) {
     const e = qRotate(this.filter.q, axisBody);
     return e.z / (Math.hypot(e.x, e.y, e.z) || 1);
+  }
+
+  /** Human-readable nearest signed axes and pose separation for calibration UI. */
+  get detectedMounting() {
+    if (!this.hangUpAxis || !this.trayUpAxis) return null;
+    const label = (v) => {
+      const entries = [['X', v.x], ['Y', v.y], ['Z', v.z]];
+      entries.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+      const [axis, value] = entries[0];
+      return `${Math.abs(value) < 0.9 ? '~' : ''}${value >= 0 ? '+' : '-'}${axis}`;
+    };
+    const a = this.hangUpAxis, b = this.trayUpAxis;
+    const an = Math.hypot(a.x, a.y, a.z) || 1, bn = Math.hypot(b.x, b.y, b.z) || 1;
+    const dot = Math.max(-1, Math.min(1,
+      (a.x * b.x + a.y * b.y + a.z * b.z) / (an * bn)));
+    return { hangUp: label(a), trayUp: label(b), separationDeg: Math.acos(dot) / D2R };
   }
 
   // --- magnetometer hard-iron calibration (in-hand figure-8) ---------------
@@ -548,10 +598,15 @@ export class ArmImu {
         this.bias = { x: c.sum.x / c.count, y: c.sum.y / c.count, z: c.sum.z / c.count };
         this._cal = null;
         this.qRef = { ...this.filter.q };
-        // the segment's own axis: whatever pointed down (earth -Z) while the
-        // limb hung straight. Held out horizontally later, this is what reveals
-        // the heading — see setForwardFix.
-        this.longAxis = qRotate(qConj(this.qRef), { x: 0, y: 0, z: -1 });
+        // Capture earth-up in BODY coordinates without assuming X/Y/Z or sign.
+        // Its opposite is the hanging limb direction and becomes the forward
+        // seed when the same rigidly strapped sensor moves into the tray pose.
+        this.hangUpAxis = qRotate(qConj(this.qRef), { x: 0, y: 0, z: 1 });
+        this.longAxis = {
+          x: -this.hangUpAxis.x, y: -this.hangUpAxis.y, z: -this.hangUpAxis.z,
+        };
+        this.trayUpAxis = null;
+        this.forwardAxis = null;
         this._computeYawFix();
         this.onCalibrated?.(this);
       }
