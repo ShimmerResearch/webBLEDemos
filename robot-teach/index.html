@@ -1512,9 +1512,9 @@
       if (mode === 'auto') {
         if (epT > bestRobot) bestRobot = epT;
         if (learned) bestLearned = Math.max(bestLearned, epT);
-        else bestUntrained = Math.max(bestUntrained, epT);
+        else lastUntrained = epT;
         updateScoreboard();
-        const vsTxt = learned && bestUntrained ? ` · untrained baseline ${bestUntrained.toFixed(1)}s` : '';
+        const vsTxt = learned && lastUntrained ? ` · untrained baseline ${lastUntrained.toFixed(1)}s` : '';
         const who = learned ? 'robot' : 'untrained robot';
         setPrompt(`${label} ${who} balanced ${epT.toFixed(1)} s solo${vsTxt}`, 'hold');
         log(`robot solo${learned ? '' : ' (untrained)'}: ${epT.toFixed(1)}s (${reason})`);
@@ -1582,7 +1582,7 @@
     function updateActPanels() {
       for (const panel of Object.values(actPanels)) panel.classList.remove('active');
       const active = mode === 'idle'
-        ? (learned ? actPanels.auto : (bestHuman || bestUntrained) ? actPanels.teach : actPanels.demo)
+        ? (learned ? actPanels.auto : (bestHuman || lastUntrained) ? actPanels.teach : actPanels.demo)
         : actPanels[mode];
       active?.classList.add('active');
     }
@@ -1610,7 +1610,7 @@
     const MIN_TEACH_S = 4;     // s of demonstration below which we refuse to fit
     const TEACH_CAP = 15;      // s — enough coverage while keeping the booth flow concise
     let bestRobot = 0;         // longest solo balance this session
-    let bestUntrained = 0;
+    let lastUntrained = 0;     // latest completed no-correction run, not a best-of-session score
     let bestLearned = 0;
     let rec = null;            // running sums while recording
     let plotPoints = [];       // decimated examples retained only for the explanation plot
@@ -1732,7 +1732,7 @@
         : null;
       baselineScoreEl.textContent = liveUntrained !== null
         ? `${liveUntrained.toFixed(1)} s`
-        : bestUntrained ? `${bestUntrained.toFixed(1)} s` : 'not run';
+        : lastUntrained ? `${lastUntrained.toFixed(1)} s` : 'not run';
       learnedScoreEl.textContent = bestLearned ? `${bestLearned.toFixed(1)} s` : 'not run';
     }
     teachBtn.addEventListener('click', () => {
@@ -1748,7 +1748,7 @@
       if (mode === 'auto') {
         bestRobot = Math.max(bestRobot, epT);
         if (learned) bestLearned = Math.max(bestLearned, epT);
-        else bestUntrained = Math.max(bestUntrained, epT);
+        else lastUntrained = epT;
         const stoppedAt = epT;
         setMode('idle');
         setPrompt(`${learned ? 'learned reflex' : 'untrained baseline'} scored ${stoppedAt.toFixed(1)} s`, 'hold');
@@ -1951,7 +1951,7 @@
           robotSpills++;
           if (!followChk.checked) {
             const baselineT = mode === 'demo' ? epT : showcaseT;
-            bestUntrained = Math.max(bestUntrained, baselineT);
+            lastUntrained = baselineT;
             updateScoreboard();
             updateActPanels();
             setPrompt(`baseline · no-correction robot spilled after ${baselineT.toFixed(1)} s`, 'hold');
@@ -2017,7 +2017,7 @@
       get state() {
         return {
           mode, calPhase, calibrated, trayLevelSet,
-          bestHuman, bestRobot, bestUntrained, bestLearned, epT, robotSpills,
+          bestHuman, bestRobot, lastUntrained, bestLearned, epT, robotSpills,
           learned, recSamples: rec ? rec.n : 0,
           // human arm render state — how the avatar is actually DRAWN, which
           // is what the hang-referenced calibration handoff has to get right
