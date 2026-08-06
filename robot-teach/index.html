@@ -226,8 +226,7 @@
     .fit-axis { stroke: var(--muted); stroke-width: 1; }
     .fit-tick, .fit-axis-label { fill: var(--muted); font-size: 8px; }
     .fit-axis-label { font-size: 9px; }
-    .fit-point-lr { fill: var(--accent); opacity: .72; }
-    .fit-point-fb { fill: var(--flex); opacity: .72; }
+    .fit-point-pitch { fill: var(--accent); opacity: .72; }
     .fit-legend {
       display: flex; flex-wrap: wrap; gap: 5px 12px; color: var(--muted); font-size: 9px;
       margin-top: 2px;
@@ -360,7 +359,7 @@
           <div class="cal-card" data-cal-step="tray">
             <span class="cal-step-num">2</span>
             <b>Hold the tray pose</b>
-            <small>Raise the same arm forward · keep tray level</small>
+            <small>Raise your hand and forearm forward · palm and tray level</small>
             <span class="tray-glyph"></span>
           </div>
         </div>
@@ -372,7 +371,7 @@
 
     <div class="panel act-panel active" id="act1Panel">
       <h2 class="step-title"><span class="step-num">1</span> See why correction matters</h2>
-      <p class="caption">Both stations face the same moving floor. Your wrist keeps the teal tray level; the robot first mirrors that correction.</p>
+      <p class="caption">The floor pitches forward and backward. Gently raise or lower your hand and forearm to keep the teal tray level; the robot first mirrors that natural correction.</p>
       <button id="demoBtn" class="wide" disabled>▶ Start live challenge</button>
       <input type="checkbox" id="followChk" checked class="sr-only" />
       <label for="followChk" class="sr-only">Robot mirrors the human</label>
@@ -385,11 +384,11 @@
           <input type="range" id="speedRange" min="5" max="100" step="5" value="55" />
         </div>
         <div class="slider-row" style="margin-top: 12px;">
-          <label for="tiltRange">Max tilt <b id="tiltCapVal">30°</b> · spills near 13°</label>
+          <label for="tiltRange">Max floor angle <b id="tiltCapVal">30°</b> · spills near 13°</label>
           <input type="range" id="tiltRange" min="10" max="45" step="1" value="30" />
         </div>
         <div class="row-btns" style="margin-top: 12px;">
-          <button data-tiltmode="lr" class="active">↔ Left / right</button>
+          <button data-tiltmode="pitch" class="active">↕ Forward / back</button>
           <button data-tiltmode="free">✳ Free range</button>
         </div>
         <button id="viewBtn" class="wide" style="margin-top: 10px;">📷 Front overview</button>
@@ -398,9 +397,9 @@
 
     <div class="panel act-panel" id="act2Panel">
       <h2 class="step-title"><span class="step-num">2</span> Teach one balance reflex</h2>
-      <p class="caption">Balance for about 10 seconds. We learn one transparent rule: how much wrist correction you use for each degree of floor tilt.</p>
+      <p class="caption">Balance for about 10 seconds. Move your hand and forearm up or down together—without twisting side to side—to oppose the floor pitch. We learn how much tray-pitch correction you use.</p>
       <div class="learning-rule">
-        <span>Floor tilts<b>10°</b></span><span class="arrow">→</span><span>You correct<b id="ruleCorrection">?</b></span>
+        <span>Floor pitch<b>10°</b></span><span class="arrow">→</span><span>Tray correction<b id="ruleCorrection">?</b></span>
       </div>
       <div class="fit-viz">
         <div class="fit-viz-head">
@@ -409,13 +408,12 @@
         </div>
         <svg id="fitPlot" viewBox="0 0 300 188" role="img" aria-labelledby="fitPlotTitle fitPlotDesc">
           <title id="fitPlotTitle">Demonstration examples and learned balance rule</title>
-          <desc id="fitPlotDesc">Floor tilt is plotted against wrist correction. Teal points are left-right examples and orange points are forward-back examples.</desc>
+          <desc id="fitPlotDesc">Forward and backward floor pitch is plotted against the demonstrated tray-pitch correction.</desc>
           <g id="fitGrid"></g>
           <g id="fitPoints"></g>
         </svg>
         <div class="fit-legend">
-          <span class="fit-key" style="--key: var(--accent);">left / right examples</span>
-          <span class="fit-key" style="--key: var(--flex);">forward / back examples</span>
+          <span class="fit-key" style="--key: var(--accent);">forward / back pitch examples</span>
         </div>
         <div class="fit-explain" id="fitExplanation">Record a demonstration to collect examples.</div>
       </div>
@@ -426,7 +424,7 @@
 
     <div class="panel act-panel" id="act3Panel">
       <h2 class="step-title"><span class="step-num">3</span> Test the robot solo</h2>
-      <p class="caption">The human is now off duty. Test the robot on a fresh randomized floor motion and compare it with the untrained baseline.</p>
+      <p class="caption">The human is now off duty. Test the learned pitch correction on a fresh forward/backward floor motion—or select free range for a harder test.</p>
       <div class="scoreboard">
         <div class="score"><span>Untrained</span><b id="baselineScore">—</b><small>balance time</small></div>
         <span class="score-arrow">→</span>
@@ -442,7 +440,7 @@
     <div class="lbl" id="timeLbl">balance time</div>
     <div class="sub">
       <div class="val" style="font-size: 28px;"><span id="tiltVal">–</span><span>°</span></div>
-      <div class="lbl" id="tiltLbl">tray tilt</div>
+      <div class="lbl" id="tiltLbl">tray pitch</div>
     </div>
   </div>
 
@@ -684,7 +682,7 @@
       placeBtn.classList.add('primary');
       axisResult.textContent = 'pose 1 captured · keep the strap fixed for pose 2';
       updateCalCards();
-      setPrompt('2/2 · now HOLD THE TRAY POSE — forearm level, palm up — and press “Set tray level”', 'live');
+      setPrompt('2/2 · hold your HAND AND FOREARM comfortably forward · palm up · tray level · then press “Set tray level”', 'live');
       log('hang reference captured; waiting for the tray-pose capture');
       refreshButtons();
     };
@@ -720,7 +718,7 @@
       axisResult.textContent = mounting
         ? `detected ${mounting.hangUp} up → ${mounting.trayUp} up · ${mounting.separationDeg.toFixed(0)}° apart`
         : 'automatic mounting detected';
-      setPrompt(`bottles placed · ${axisResult.textContent} · gently verify each direction`, 'live');
+      setPrompt(`bottles placed · ${axisResult.textContent} · gently raise and lower your hand and forearm to verify tray pitch`, 'live');
       log(`tray-pose captured: ${axisResult.textContent}`);
       refreshButtons();
     });
@@ -1192,10 +1190,10 @@
       const v = parseInt(localStorage.getItem('robotTeach.tilt'), 10);
       return Number.isFinite(v) ? Math.min(45, Math.max(10, v)) : 30;
     })();
-    // 'lr' = floor rocks along ONE axis (side to side) — easy, compensated by a
-    // single wrist roll. 'free' = tilt direction slowly rotates (harder).
-    let tiltMode = localStorage.getItem('robotTeach.tiltmode') === 'free' ? 'free' : 'lr';
-    const LR_DIR = Math.PI / 2;   // left/right = tilt about Z (rz only)
+    // 'pitch' = floor rocks forward/back about scene X — the natural teaching
+    // motion is raising/lowering the hand and forearm. 'free' slowly rotates
+    // the tilt direction and remains the optional harder test.
+    let tiltMode = localStorage.getItem('robotTeach.tiltmode') === 'free' ? 'free' : 'pitch';
     class Disturbance {
       constructor(seed, ramp = { start: 6, rate: 0.75 }) {
         this.ramp = ramp;
@@ -1221,11 +1219,11 @@
         const ds = wM * Math.cos(wM * t + this.phMag);
         const mag = env * A * s;                      // signed tilt magnitude (rad)
         const dmag = env * A * ds + denv * A * s;
-        // free: direction slowly rotates. lr: direction fixed to one axis, so
-        // the floor just rocks side to side (dphi = 0).
-        const lr = tiltMode === 'lr';
-        const phi = lr ? LR_DIR : wD * t + this.phDir;
-        const dphi = lr ? 0 : wD;
+        // free: direction slowly rotates. pitch: direction is fixed so rx is
+        // the only floor rotation and the platform rocks forward/backward.
+        const pitch = tiltMode === 'pitch';
+        const phi = pitch ? 0 : wD * t + this.phDir;
+        const dphi = pitch ? 0 : wD;
         const c = Math.cos(phi), sn = Math.sin(phi);
         return {
           rx: mag * c,
@@ -1257,6 +1255,10 @@
     function tiltOf(q) {   // up-normal tilt components of an orientation
       upV.set(0, 1, 0).applyQuaternion(q);
       return { x: upV.x, z: upV.z };
+    }
+    function displayedTrayAngle(x, z) {
+      const component = tiltMode === 'pitch' ? Math.abs(z) : Math.hypot(x, z);
+      return Math.asin(Math.min(1, component)) * R2D;
     }
 
     // --- simulated demonstrator ----------------------------------------------
@@ -1362,10 +1364,15 @@
     applyTiltCap(distCap);
 
     const tiltModeBtns = [...document.querySelectorAll('[data-tiltmode]')];
+    function updateTiltLabel() {
+      const measure = tiltMode === 'pitch' ? 'pitch' : 'tilt';
+      tiltLblEl.textContent = `${mode === 'auto' ? 'robot tray' : 'tray'} ${measure}`;
+    }
     function applyTiltMode(m) {
-      tiltMode = m === 'free' ? 'free' : 'lr';
+      tiltMode = m === 'free' ? 'free' : 'pitch';
       for (const b of tiltModeBtns) b.classList.toggle('active', b.dataset.tiltmode === tiltMode);
       localStorage.setItem('robotTeach.tiltmode', tiltMode);
+      updateTiltLabel();
     }
     for (const b of tiltModeBtns) b.addEventListener('click', () => applyTiltMode(b.dataset.tiltmode));
     applyTiltMode(tiltMode);
@@ -1548,7 +1555,7 @@
         : learned ? '🤖 Test learned reflex — fresh motion' : '🤖 Run untrained baseline';
       autoBtn.classList.toggle('stop', m === 'auto');
       timeLblEl.textContent = m === 'auto' ? 'robot balance time' : 'balance time';
-      tiltLblEl.textContent = m === 'auto' ? 'robot tray tilt' : 'tray tilt';
+      updateTiltLabel();
       if (m === 'idle') {
         setPrompt(sourceReady() ? 'ready · choose the next numbered step' : 'choose instant demo or connect the wrist sensor');
         if (!bottlesHiddenForCal) {
@@ -1562,10 +1569,10 @@
           rec = { n: 0, sPP: 0, sPC: 0, sC: 0, sCC: 0, points: [], lastPlotT: -Infinity };
         }
         setPrompt(
-          m === 'teach' ? '⏺ recording · floor tilt → your wrist correction'
+          m === 'teach' ? '⏺ recording · floor pitch → tray-pitch correction'
           : m === 'auto' ? (learned ? '🤖 learned reflex · fresh randomized floor motion'
                                     : '🤖 baseline · robot has no correction rule')
-          : 'same floor · human and robot correcting together', 'live');
+          : 'same floor pitch · hand, forearm, and robot correcting together', 'live');
         startEpisode();
       }
       refreshButtons();
@@ -1588,13 +1595,13 @@
     }
 
     // --- teach the robot: record → fit ONE gain → robot solo on a new floor ----
-    // The policy is `correction = g · platformTilt`, pooled over both axes (the
-    // wrist is symmetric). Recording keeps only least-squares running sums, so a
-    // demonstration of any length costs O(1) memory. Validated offline: this fit
-    // recovers the sim demonstrator's gain to ~1% and generalizes across seeds
-    // and tilt modes. Deploy seed always differs from the training seed
+    // The demonstration fits `trayPitchCorrection = g · floorPitch` from the
+    // forward/backward pitch component only. The one scalar is also applied to
+    // both horizontal components in optional free-range testing. Recording keeps
+    // least-squares running sums, so a demonstration of any length costs O(1)
+    // memory. Deploy seed always differs from the training seed
     // (seedCounter strictly increases), so playback is never a replay.
-    const POLICY_KEY = 'robotTeach.policy';
+    const POLICY_KEY = 'robotTeach.policy.pitch.v1';
     const teachBtn = document.getElementById('teachBtn');
     const autoBtn = document.getElementById('autoBtn');
     const forgetBtn = document.getElementById('forgetBtn');
@@ -1622,10 +1629,10 @@
       } catch { return null; }
     })();
 
-    function recordSample(p, c) {   // one axis, one frame: platform tilt → correction
+    function recordSample(p, c) {   // one frame: floor pitch → tray-pitch correction
       rec.n++; rec.sPP += p * p; rec.sPC += p * c; rec.sC += c; rec.sCC += c * c;
     }
-    function fitRecording() {       // pooled least squares + R² from the sums
+    function fitRecording() {       // pitch-axis least squares + R² from the sums
       if (!rec || epT < MIN_TEACH_S || rec.sPP < 1e-6) return null;
       const g = rec.sPC / rec.sPP;
       const ssr = rec.sCC - 2 * g * rec.sPC + g * g * rec.sPP;
@@ -1660,27 +1667,27 @@
         }
       }
       const xLabel = svgEl('text', { x: (PLOT.left + PLOT.right) / 2, y: 181, class: 'fit-axis-label', 'text-anchor': 'middle' });
-      xLabel.textContent = 'floor tilt';
+      xLabel.textContent = 'floor pitch';
       const yLabel = svgEl('text', {
         x: 9, y: (PLOT.top + PLOT.bottom) / 2, class: 'fit-axis-label', 'text-anchor': 'middle',
         transform: `rotate(-90 9 ${(PLOT.top + PLOT.bottom) / 2})`
       });
-      yLabel.textContent = 'wrist correction';
+      yLabel.textContent = 'tray pitch correction';
       fitGridEl.append(xLabel, yLabel);
 
       fitPointsEl.replaceChildren(...plotPoints.map(point => svgEl('circle', {
         cx: plotX(plotDeg(point.p)), cy: plotY(plotDeg(point.c)), r: 2.1,
-        class: point.axis === 'lr' ? 'fit-point-lr' : 'fit-point-fb'
+        class: 'fit-point-pitch'
       })));
 
       if (mode === 'teach') {
-        fitFormulaEl.textContent = `${Math.floor(plotPoints.length / 2)} moments recorded`;
-        fitExplanationEl.textContent = 'Each dot is one moment from your demonstration. Keep opposing the floor tilt; the learned equation appears when you stop.';
+        fitFormulaEl.textContent = `${plotPoints.length} moments recorded`;
+        fitExplanationEl.textContent = 'Each dot is one moment of forward/backward pitch. Raise or lower your hand and forearm to oppose the floor; the learned equation appears when you stop.';
       } else if (learned) {
         fitFormulaEl.textContent = `y = ${learned.g.toFixed(2)}x`;
         fitExplanationEl.textContent = plotPoints.length
-          ? 'The robot fits one number, m, to these examples: y = mx. Here x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction.'
-          : 'Saved equation: y = mx, where x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction. Record again to see the examples.';
+          ? 'The robot fits one number, m, to these examples: y = mx. Here x is floor pitch and y is tray-pitch correction. The negative m means pitch the tray in the opposite direction.'
+          : 'Saved equation: y = mx, where x is floor pitch and y is tray-pitch correction. The negative m means pitch the tray in the opposite direction. Record again to see the examples.';
       } else {
         fitFormulaEl.textContent = plotPoints.length ? 'no valid rule fitted' : 'waiting for examples';
         fitExplanationEl.textContent = plotPoints.length
@@ -1692,7 +1699,7 @@
       if (mode !== 'auto' || !learned) return;
       const floorDeg = plotDeg(platformComponent);
       const correctionDeg = plotDeg(correctionComponent);
-      fitFormulaEl.textContent = `live: ${floorDeg.toFixed(1)}° → ${correctionDeg.toFixed(1)}°`;
+      fitFormulaEl.textContent = `live pitch: ${floorDeg.toFixed(1)}° → ${correctionDeg.toFixed(1)}°`;
     }
     function finishTeaching(reason) {
       const fit = fitRecording();
@@ -1703,7 +1710,7 @@
         localStorage.setItem(POLICY_KEY, JSON.stringify(learned));
         log(`learned: gain ${learned.g.toFixed(3)} · R² ${learned.r2.toFixed(3)} · ${learned.secs.toFixed(1)}s (${reason})`);
         setMode('idle');
-        setPrompt(`🧠 learned · 10° floor tilt → ${(-learned.g * 10).toFixed(1)}° opposite correction`, 'hold');
+        setPrompt(`🧠 learned · 10° floor pitch → ${(-learned.g * 10).toFixed(1)}° opposite tray pitch`, 'hold');
         document.getElementById('act3Panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       } else {
         setMode('idle');
@@ -1713,13 +1720,13 @@
     }
     function updateTeachInfo() {
       teachInfoEl.textContent =
-        mode === 'teach' ? 'recording examples… keep opposing the floor tilt'
+        mode === 'teach' ? 'recording pitch examples… raise or lower your hand and forearm to oppose the floor'
         : learned ? `learned from ${learned.secs.toFixed(1)} s of your balancing`
         : 'not trained yet — record about 10 seconds';
       ruleCorrectionEl.textContent = learned ? `${(-learned.g * 10).toFixed(1)}° opposite` : '?';
       learnedRuleEl.hidden = !learned;
       learnedRuleEl.textContent = learned
-        ? `Learned rule: for 10° of floor tilt, correct ${(-learned.g * 10).toFixed(1)}° in the opposite direction.`
+        ? `Learned rule: for 10° of floor pitch, apply ${(-learned.g * 10).toFixed(1)}° of tray pitch in the opposite direction.`
         : '';
       if (mode !== 'auto')   // keep the solo button honest about what it will run
         autoBtn.textContent = learned ? '🤖 Test learned reflex — fresh motion' : '🤖 Run untrained baseline';
@@ -1742,6 +1749,7 @@
       // from live mirroring again so the recorded cause-and-effect is visible.
       followChk.checked = true;
       showcaseDist = null;
+      applyTiltMode('pitch');   // teaching is always the clear forward/back pitch task
       setMode('teach');
     });
     autoBtn.addEventListener('click', () => {
@@ -1775,7 +1783,7 @@
     const qPlat = new THREE.Quaternion();
     const qPlatR = new THREE.Quaternion();
     const Q_ID = new THREE.Quaternion();
-    const qAuto = new THREE.Quaternion();       // robot-solo wrist correction
+    const qAuto = new THREE.Quaternion();       // robot-solo tray-pitch correction
     const D_LEVEL = { rx: 0, rz: 0, drx: 0, drz: 0 };   // a still, level floor
     let timeScale = 1;
 
@@ -1880,9 +1888,10 @@
         if (mode === 'auto') {
           if (learned) {
             const p = tiltOfR(d);
+            // The demonstrated gain comes from pitch. In free range, the same
+            // symmetric scalar rule is applied to both horizontal components.
             quatFromTilt(qAuto, learned.g * p.x, learned.g * p.z);
-            const liveP = Math.abs(p.x) >= Math.abs(p.z) ? p.x : p.z;
-            updateLiveCalculation(liveP, learned.g * liveP);
+            updateLiveCalculation(p.z, learned.g * p.z);
           } else {
             qAuto.identity();   // untrained: rigid arm, no corrections — the baseline
           }
@@ -1908,25 +1917,20 @@
         timeValEl.textContent = epT.toFixed(1);
         if (mode === 'auto') {
           const tAct = tiltOf(qAuto);
-          const net = Math.hypot(tiltOfR(d).x + tAct.x, tiltOfR(d).z + tAct.z);
-          tiltValEl.textContent = (Math.asin(Math.min(1, net)) * R2D).toFixed(1);
+          const p = tiltOfR(d);
+          tiltValEl.textContent = displayedTrayAngle(p.x + tAct.x, p.z + tAct.z).toFixed(1);
           if (checkSpill(robotRig)) endEpisode('spill');
           else if (epT >= EPISODE_CAP) endEpisode('cap');
         } else {
           const tAct = tiltOf(qUser);
-          // net tray tilt shown on the HUD (platform + correction, small angles)
-          const net = Math.hypot(tiltOfR(d).x + tAct.x, tiltOfR(d).z + tAct.z);
-          tiltValEl.textContent = (Math.asin(Math.min(1, net)) * R2D).toFixed(1);
-          if (mode === 'teach' && rec) {   // one (tilt → correction) sample per axis
-            const p = tiltOfR(d);
-            recordSample(p.x, tAct.x);
+          // Net pitch (or total tilt in optional free range) shown on the HUD.
+          const p = tiltOfR(d);
+          tiltValEl.textContent = displayedTrayAngle(p.x + tAct.x, p.z + tAct.z).toFixed(1);
+          if (mode === 'teach' && rec) {   // forward/back pitch → tray pitch correction
             recordSample(p.z, tAct.z);
-            if (epT - rec.lastPlotT >= .1 && rec.points.length <= 298) {
+            if (epT - rec.lastPlotT >= .1 && rec.points.length < 150) {
               rec.lastPlotT = epT;
-              rec.points.push(
-                { axis: 'lr', p: p.x, c: tAct.x },
-                { axis: 'fb', p: p.z, c: tAct.z }
-              );
+              rec.points.push({ p: p.z, c: tAct.z });
               plotPoints = rec.points;
               renderFitPlot();
             }
@@ -1937,7 +1941,7 @@
       } else if (mode === 'idle') {
         timeValEl.textContent = '0.0';
         const tAct = tiltOf(qUser);
-        tiltValEl.textContent = (Math.asin(Math.min(1, Math.hypot(tAct.x, tAct.z))) * R2D).toFixed(1);
+        tiltValEl.textContent = displayedTrayAngle(tAct.x, tAct.z).toFixed(1);
         // human tray uses the same free-play spill recovery as the robot
         if (!bottlesHiddenForCal) tumbleRerack(humanRig, dt);
       }
