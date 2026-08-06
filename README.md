@@ -1,12 +1,17 @@
 # webBLEDemos
-This examples are Pre-Alpha Releases, what that implies from a support perspective can be found [here](https://shimmersensing.com/wp-content/uploads/2022/04/Shimmer-Support-Policy_27.04.2022.pdf). If you encounter any technical issues, or would like to express interest in shaping future development, please reach out to our support team.
+
+These examples are pre-alpha releases. See the [Shimmer support policy](https://shimmersensing.com/wp-content/uploads/2022/04/Shimmer-Support-Policy_27.04.2022.pdf) for what that means. If you encounter a technical issue or would like to help shape future development, please contact our support team.
+
 If sufficient interest is registered, we may prioritize building a more fully scoped and robust API.
 
 ## Migration notice
 In the next 4–8 weeks, we plan to migrate to [`shimmer-web-sdk`](https://github.com/ShimmerResearch/shimmer-web-sdk) as a replacement for `shimmer3r.js` and `verisense.js`.
 Migration work has already started on the [`copilot/restructure-repo-for-api-support`](https://github.com/ShimmerResearch/webBLEDemos/tree/copilot/restructure-repo-for-api-support) branch.
 
-# Requirements
+## Shimmer3R demos
+
+### Requirements
+
 - Shimmer3R
 - FW Version >= v1.0.22
 
@@ -26,7 +31,11 @@ Migration work has already started on the [`copilot/restructure-repo-for-api-sup
 
 [Shimmer Capture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)
 
-[Shimmer3R Chrome Extension](https://github.com/ShimmerEngineering/webBLEDemos/tree/main/shimmer-extension) source code only, will require loading this locally via Chrome
+[Shimmer Companion Chrome extension](./shimmer-extension/) — a locally loaded Chrome extension for streaming PPG and GSR, capturing screenshots and media context, generating session reports, and optionally adding on-device webcam face/head-state analysis. It supports selecting between multiple cameras and uploading session files to a compatible ASM Cloud deployment. See the [extension README](./shimmer-extension/README.md) for installation, privacy, export, and server requirements.
+
+[Consensys Export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) — package a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zip it, and share. Also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
+
+## Verisense demos
 
 # Requirements
 - Verisense

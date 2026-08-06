@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Active webcam UI smoke test</title>
+  <style>html, body { margin: 0; width: 360px; height: 640px; overflow: hidden; background: #101116; } iframe { border: 0; width: 360px; height: 640px; }</style>
+</head>
+<body>
+  <iframe id="companion" src="../shimmercompanion.html"></iframe>
+  <script>
+    document.getElementById("companion").addEventListener("load", (event) => {
+      const doc = event.target.contentDocument;
+      doc.getElementById("webcamEnableRow").hidden = true;
+      doc.getElementById("webcamActive").hidden = false;
+      doc.getElementById("webcamHead").dataset.state = "active";
+      doc.getElementById("webcamState").textContent = "Active";
+      doc.getElementById("webcamFace").textContent = "Detected";
+      doc.getElementById("webcamAttention").textContent = "Facing screen";
+      doc.getElementById("webcamHeadPose").textContent = "Centered";
+      doc.getElementById("webcamEyes").textContent = "Open";
+      doc.getElementById("webcamBlinkRate").textContent = "12/min";
+      doc.getElementById("webcamMovement").textContent = "Low";
+      doc.getElementById("webcamEvent").textContent = "Monitoring…";
+    });
+  </script>
+</body>
+</html>
