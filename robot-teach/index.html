@@ -1399,8 +1399,36 @@
     const quickLabel = document.getElementById('quickLabel');
     const viewBtn = document.getElementById('viewBtn');
     const labelHumanEl = document.getElementById('labelHuman');
-    const VIEW_KEY = 'robotTeach.view.v2';
+    const VIEW_KEY = 'robotTeach.view.v3';
+    const CAMERA_KEY = 'robotTeach.camera.v1';
     let viewBehind = localStorage.getItem(VIEW_KEY) !== 'front';
+
+    function cameraPoseName(narrow = innerWidth <= 900) {
+      return `${viewBehind ? 'behind' : 'front'}-${narrow ? 'narrow' : 'wide'}`;
+    }
+    function readCameraPoses() {
+      try {
+        const poses = JSON.parse(localStorage.getItem(CAMERA_KEY) || '{}');
+        return poses && typeof poses === 'object' ? poses : {};
+      } catch { return {}; }
+    }
+    function restoreCameraPose(narrow) {
+      const pose = readCameraPoses()[cameraPoseName(narrow)];
+      const valid = values => Array.isArray(values) && values.length === 3 && values.every(Number.isFinite);
+      if (!pose || !valid(pose.position) || !valid(pose.target)) return false;
+      camera.position.fromArray(pose.position);
+      controls.target.fromArray(pose.target);
+      return true;
+    }
+    function saveCameraPose() {
+      const poses = readCameraPoses();
+      poses[cameraPoseName()] = {
+        position: camera.position.toArray(),
+        target: controls.target.toArray(),
+      };
+      localStorage.setItem(CAMERA_KEY, JSON.stringify(poses));
+    }
+    controls.addEventListener('end', saveCameraPose);
 
     function updateRobotLabel() {
       labelRobotEl.textContent =
@@ -1434,6 +1462,7 @@
 
     function applyView() {
       const narrow = innerWidth <= 900;
+      const restored = restoreCameraPose(narrow);
       // Default training view: over the PUPPET's own shoulder, looking the way
       // it faces. Physical forward is screen-forward and left stays left, so the
       // demonstrator copies the correction without mentally mirroring it — and
@@ -1441,19 +1470,26 @@
       if (viewBehind) {
         // looking along +Z with +Y up puts screen-right at -X, so from behind
         // the puppet (-0.75) sits on the RIGHT and the robot (+0.75) on the left
-        camera.position.set(narrow ? -0.9 : -0.86, narrow ? 1.14 : 1.07, narrow ? -2.3 : -1.86);
-        controls.target.set(narrow ? -0.1 : -0.04, 0.72, 0.34);
+        if (!restored) {
+          // Wide preset is pulled back to keep both stations and their bases in
+          // view beside the instruction rail (the framing used in the demo).
+          camera.position.set(narrow ? -0.9 : -1.18, narrow ? 1.14 : 1.21, narrow ? -2.3 : -2.72);
+          controls.target.set(narrow ? -0.1 : -0.04, 0.72, 0.34);
+        }
         labelHumanEl.style.left = narrow ? '72%' : '70%';
         labelRobotEl.style.left = narrow ? '26%' : '28%';
         viewBtn.textContent = '📷 Front overview';
       } else {
         // aim slightly left so a right-hand tray clears the UI panels
-        camera.position.set(narrow ? 0.2 : 0.3, 1.55, narrow ? 5.0 : 3.3);
-        controls.target.set(narrow ? 0 : -0.05, 0.55, 0);
+        if (!restored) {
+          camera.position.set(narrow ? 0.2 : 0.3, 1.55, narrow ? 5.0 : 3.3);
+          controls.target.set(narrow ? 0 : -0.05, 0.55, 0);
+        }
         labelHumanEl.style.left = '32%';
         labelRobotEl.style.left = '68%';
         viewBtn.textContent = '📷 Behind robot · 1st person';
       }
+      controls.update();
     }
     viewBtn.addEventListener('click', () => {
       viewBehind = !viewBehind;
