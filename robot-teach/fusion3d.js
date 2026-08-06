@@ -236,7 +236,8 @@ export class ArmImu {
     this.qRef = null;                   // filter.q captured at the reference pose
     this._cal = null;
     this._swing = null;
-    this._swingCalibrated = false;      // a functional (swing) yaw datum exists
+    this._swingCalibrated = false;      // a functional yaw datum exists (swing or working-pose)
+    this.longAxis = null;               // segment long axis in the BODY frame, from the hang reference
     this.onCalibrated = null;
     this.accel = null;                  // last device-frame accel (g)
     this.gyro = null;                   // last device-frame gyro (deg/s), pre-bias
@@ -278,6 +279,7 @@ export class ArmImu {
     this.qRef = null;
     this.qYawFix = undefined;
     this._swingCalibrated = false;
+    this.longAxis = null;
     this._cal = null;
     this._swing = null;
   }
@@ -289,6 +291,7 @@ export class ArmImu {
       qRef: this.qRef ? { ...this.qRef } : null,
       qYawFix: this.qYawFix ? { ...this.qYawFix } : undefined,
       swingCalibrated: this._swingCalibrated,
+      longAxis: this.longAxis ? { ...this.longAxis } : null,
       beta: this.filter.beta,
     };
   }
@@ -298,6 +301,7 @@ export class ArmImu {
     this.qRef = s.qRef ? { ...s.qRef } : null;
     this.qYawFix = s.qYawFix ? { ...s.qYawFix } : undefined;
     this._swingCalibrated = s.swingCalibrated;
+    this.longAxis = s.longAxis ? { ...s.longAxis } : null;
     this.filter.beta = s.beta;
     this._cal = null;
     this._swing = null;
@@ -359,6 +363,46 @@ export class ArmImu {
     const yaw = Math.atan2(axis.y, axis.x);
     this.qYawFix = qFromAxisAngle(0, 0, 1, targetYawRad - yaw);
     this._swingCalibrated = true;
+  }
+
+  /**
+   * Heading datum for a SINGLE sensor, taken from the WORKING pose instead of a
+   * swing. `longAxis` (captured at the hang reference) is the segment's own
+   * axis; when the limb is held out horizontally in the task pose, that axis's
+   * horizontal projection in the earth frame IS the user's forward direction.
+   *
+   * Preferred over setYawFix for one-sensor setups: a still capture in a pose
+   * the user already has to hold, with no swing to perform, no dependence on
+   * WHICH way they swung, and no forward-sign heuristic to get wrong. (Swinging
+   * sideways instead of forward/back rotates a swing datum by 90 degrees, which
+   * shows up as the two horizontal axes being transposed.)
+   *
+   * Returns false when the segment is too close to vertical to define a heading
+   * — i.e. the user has not actually raised the limb into the task pose.
+   */
+  setForwardFix(targetYawRad = -Math.PI / 2, forwardBody = null, expectedUpBody = null) {
+    const forward = forwardBody || this.longAxis;
+    if (!forward) return false;
+    // When the mounting protocol specifies which puck axis must point up in
+    // the working pose, reject the capture unless it actually does. This keeps
+    // a slightly twisted/sideways pose from silently rotating the task frame.
+    if (expectedUpBody) {
+      const u = qRotate(this.filter.q, expectedUpBody);
+      const un = Math.hypot(u.x, u.y, u.z) || 1;
+      if (u.z / un < 0.85) return false;   // expected axis must be within ~32° of up
+    }
+    const e = qRotate(this.filter.q, forward);   // forward axis in the earth frame
+    if (Math.hypot(e.x, e.y) < 0.35) return false;     // ~>70deg from horizontal: no heading
+    const yaw = Math.atan2(e.y, e.x);
+    this.qYawFix = qFromAxisAngle(0, 0, 1, targetYawRad - yaw);
+    this._swingCalibrated = true;   // functional datum: never downgrade to the body-X fallback
+    return true;
+  }
+
+  /** Cosine alignment of a body-fixed axis with earth up (+Z). */
+  bodyAxisUpDot(axisBody) {
+    const e = qRotate(this.filter.q, axisBody);
+    return e.z / (Math.hypot(e.x, e.y, e.z) || 1);
   }
 
   // --- magnetometer hard-iron calibration (in-hand figure-8) ---------------
@@ -504,6 +548,10 @@ export class ArmImu {
         this.bias = { x: c.sum.x / c.count, y: c.sum.y / c.count, z: c.sum.z / c.count };
         this._cal = null;
         this.qRef = { ...this.filter.q };
+        // the segment's own axis: whatever pointed down (earth -Z) while the
+        // limb hung straight. Held out horizontally later, this is what reveals
+        // the heading — see setForwardFix.
+        this.longAxis = qRotate(qConj(this.qRef), { x: 0, y: 0, z: -1 });
         this._computeYawFix();
         this.onCalibrated?.(this);
       }

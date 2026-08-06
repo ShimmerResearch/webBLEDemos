@@ -49,7 +49,25 @@
       background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
       padding: 14px 16px; backdrop-filter: blur(8px);
     }
-    #controls.overlay { top: 60px; left: 16px; width: 302px; display: flex; flex-direction: column; gap: 12px; }
+    #controls.overlay {
+      top: 60px; bottom: 14px; left: 16px; width: 322px;
+      display: flex; flex-direction: column; gap: 10px;
+      overflow-y: auto; overscroll-behavior: contain; padding-right: 5px;
+      scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+    }
+    #controls::-webkit-scrollbar { width: 6px; }
+    #controls::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
+    #controls .panel { flex: none; }
+    #setupPanel { border-color: var(--accent-dim); }
+    .step-title { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+    .step-num {
+      display: inline-grid; place-items: center; width: 22px; height: 22px;
+      border-radius: 50%; color: #04201c; background: var(--accent); font-size: 12px;
+    }
+    .act-panel.active { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(45,212,191,.18); }
+    body[data-mode="demo"] #act2Panel, body[data-mode="demo"] #act3Panel,
+    body[data-mode="teach"] #act1Panel, body[data-mode="teach"] #act3Panel,
+    body[data-mode="auto"] #act1Panel, body[data-mode="auto"] #act2Panel { opacity: .62; }
 
     .sensor { display: flex; align-items: center; gap: 10px; padding: 8px 0; }
     .led { width: 11px; height: 11px; border-radius: 50%; background: #3b4654; flex: none;
@@ -83,6 +101,17 @@
     button.primary:hover:not(:disabled) { background: var(--accent); color: #04201c; }
     button.wide { width: 100%; padding: 10px; }
     button.stop { background: #7f1d1d; border-color: #f87171; }
+    .button-label {
+      display: block; text-align: center; font-size: 13px; font-weight: 650;
+      border: 1px solid var(--accent-dim); background: var(--accent-dim); color: var(--text);
+      padding: 10px 14px; border-radius: 9px; cursor: pointer;
+    }
+    .button-label:hover { background: var(--accent); color: #04201c; }
+    .button-label.checked { background: rgba(45,212,191,.12); color: var(--accent); }
+    .sr-only {
+      position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+    }
     .row-btns { display: flex; gap: 8px; }
     .row-btns button { flex: 1; }
     .row-btns button.active { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
@@ -125,11 +154,102 @@
     #prompt.hold { color: var(--flex); border-color: var(--flex); }
     #prompt.live { color: var(--good); border-color: var(--good); }
 
+    details.setup { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+    details.setup summary, details.advanced summary {
+      color: var(--muted); font-size: 12px; cursor: pointer; user-select: none;
+    }
+    details.setup[open] summary, details.advanced[open] summary { color: var(--text); margin-bottom: 8px; }
+    details.advanced { margin-top: 10px; }
+
+    .cal-guide {
+      display: grid; grid-template-columns: 1fr auto 1fr; gap: 7px; align-items: stretch;
+      margin: 10px 0; color: var(--muted);
+    }
+    .cal-card {
+      min-width: 0; padding: 8px 6px; text-align: center; border: 1px solid var(--border);
+      border-radius: 10px; background: rgba(13,17,23,.55); transition: border-color .2s, background .2s;
+    }
+    .cal-card b { display: block; color: var(--text); font-size: 11px; margin: 3px 0; }
+    .cal-card small { display: block; min-height: 26px; font-size: 9px; line-height: 1.35; }
+    .cal-step-num {
+      display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 50%;
+      background: var(--panel-2); color: var(--muted); font-size: 10px; font-weight: 700;
+    }
+    .cal-flow-arrow { align-self: center; color: var(--accent); }
+    body[data-cal-phase="still"] .cal-card[data-cal-step="still"],
+    body[data-cal-phase="tray"] .cal-card[data-cal-step="tray"] {
+      border-color: var(--accent); background: rgba(45,212,191,.10);
+    }
+    body[data-cal-phase="still"] .cal-card[data-cal-step="still"] .cal-step-num,
+    body[data-cal-phase="tray"] .cal-card[data-cal-step="tray"] .cal-step-num {
+      color: #04201c; background: var(--accent);
+    }
+    .pose-glyph {
+      display: grid; place-items: center; width: 64px; height: 31px; margin: 5px auto 0;
+      color: var(--accent); font-size: 24px; line-height: 1;
+    }
+    .tray-glyph {
+      position: relative; display: block; width: 64px; height: 31px; margin: 5px auto 0;
+      transform-origin: 50% 80%;
+    }
+    .tray-glyph::before {
+      content: ""; position: absolute; left: 5px; right: 5px; bottom: 6px; height: 4px;
+      background: var(--accent); border-radius: 999px; box-shadow: 0 0 6px rgba(45,212,191,.35);
+    }
+    .tray-glyph::after {
+      content: ""; position: absolute; left: 27px; bottom: 10px; width: 9px; height: 17px;
+      background: var(--flex); border-radius: 3px 3px 2px 2px;
+    }
+    .tray-glyph.rocking { animation: tray-tip-demo 2.8s ease-in-out infinite; }
+    @keyframes tray-tip-demo {
+      0%, 12%, 92%, 100% { transform: rotate(0deg); }
+      30% { transform: rotate(22deg); }
+      58% { transform: rotate(-22deg); }
+      78% { transform: rotate(18deg); }
+    }
+    .tip-words { color: var(--accent); font-size: 9px; margin-top: 2px; }
+    .tray-practice {
+      display: grid; grid-template-columns: 1fr 72px 1fr; gap: 7px; align-items: center;
+      margin: 9px 0 2px; padding: 8px; border: 1px solid var(--accent-dim);
+      border-radius: 10px; background: rgba(45,212,191,.06); text-align: center;
+    }
+    .tray-practice b { display: block; color: var(--text); font-size: 10px; }
+    .tray-practice small { display: block; color: var(--muted); font-size: 9px; line-height: 1.3; }
+    .tray-practice .tray-glyph { margin: 0 auto; }
+    @media (prefers-reduced-motion: reduce) {
+      .tray-glyph.rocking { animation: none; transform: rotate(16deg); }
+    }
+
+    .learning-rule {
+      display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center;
+      margin: 10px 0; padding: 10px; border-radius: 10px; background: rgba(13,17,23,.6);
+      border: 1px solid var(--border); text-align: center; font-size: 11px; color: var(--muted);
+    }
+    .learning-rule b { display: block; color: var(--text); font-size: 13px; margin-top: 3px; }
+    .learning-rule .arrow { color: var(--accent); font-size: 18px; }
+    #learnedRule { color: var(--good); font-size: 12px; line-height: 1.45; margin: 8px 0; }
+
+    .scoreboard {
+      display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center;
+      margin: 10px 0; text-align: center;
+    }
+    .score {
+      padding: 9px 6px; border: 1px solid var(--border); border-radius: 10px;
+      background: rgba(13,17,23,.55); color: var(--muted); font-size: 10px;
+      text-transform: uppercase; letter-spacing: .05em;
+    }
+    .score.learned { border-color: var(--accent-dim); }
+    .score b { display: block; color: var(--text); font-size: 19px; letter-spacing: 0; margin: 3px 0 1px; }
+    .score.learned b { color: var(--good); }
+    .score-arrow { color: var(--accent); }
+
     .station-label {
       position: fixed; bottom: 44px; z-index: 5; pointer-events: none;
-      font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+      font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
       background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 5px 14px;
     }
+    #labelHuman { color: var(--accent); border-color: var(--accent-dim); }
+    #labelRobot { color: var(--flex); border-color: #92400e; }
     #labelHuman { left: 32%; transform: translateX(-50%); }
     #labelRobot { left: 68%; transform: translateX(-50%); }
 
@@ -151,6 +271,27 @@
       font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
       color: var(--muted); background: rgba(13,17,23,.85); border: 1px solid var(--border);
       border-radius: 10px; padding: 8px 10px; white-space: pre-wrap;
+      display: none;
+    }
+
+    @media (max-width: 900px) {
+      header.overlay { padding: 10px 12px; align-items: center; }
+      header .tag, header a { display: none; }
+      #controls.overlay {
+        top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: 46vh;
+        padding-right: 4px; gap: 8px;
+      }
+      .panel { padding: 12px 14px; }
+      #hud.overlay { top: 52px; right: 10px; }
+      #hud .val { font-size: 32px; }
+      #prompt.overlay {
+        top: 52px; left: 10px; right: 92px; transform: none; text-align: center;
+        font-size: 11px; padding: 7px 10px; white-space: normal;
+      }
+      .station-label { bottom: calc(46vh + 18px); font-size: 9px; padding: 4px 8px; }
+      #labelHuman { left: 28%; }
+      #labelRobot { left: 72%; }
+      #hint { display: none !important; }
     }
   </style>
   <script type="importmap">
@@ -168,85 +309,109 @@
 
   <header class="overlay">
     <h1>Teach a Robot</h1>
-    <span class="tag">2 IMUs · no cameras · live robot teleoperation</span>
+    <span class="tag">1 wrist IMU · one learned balance reflex · no cameras</span>
     <a href="../knee-angle/hands-mag.html">← arm &amp; hand demo</a>
   </header>
 
   <div id="controls" class="overlay">
-    <div class="panel">
-      <h2>Sensors</h2>
-      <div class="sensor">
-        <div class="led" id="ledUpper"></div>
-        <div class="info">
-          <div class="role">Upper arm</div>
-          <div class="name" id="nameUpper">Not connected</div>
+    <div class="panel" id="setupPanel">
+      <h2>Get started</h2>
+      <p class="caption">See how a human correction becomes a robot reflex. Start instantly, or connect one wrist sensor.</p>
+      <input type="checkbox" id="simChk" class="sr-only" />
+      <label for="simChk" id="quickLabel" class="button-label">▶ Try instant demo — no hardware</label>
+
+      <details class="setup" id="hardwareSetup">
+        <summary>Use one Shimmer3R wrist sensor</summary>
+        <div class="sensor">
+          <div class="led" id="ledWrist"></div>
+          <div class="info">
+            <div class="role">Wrist / tray</div>
+            <div class="name" id="nameWrist">Not connected</div>
+          </div>
+          <button id="connWrist" class="primary">Connect</button>
         </div>
-        <button id="connUpper" class="primary">Connect</button>
-      </div>
-      <div class="magRow">
-        <span class="magState" id="magStateUpper">mag: not calibrated</span>
-        <button id="magBtnUpper" disabled>⟳ Cal mag</button>
-      </div>
-      <div class="sensor">
-        <div class="led" id="ledWrist"></div>
-        <div class="info">
-          <div class="role">Wrist</div>
-          <div class="name" id="nameWrist">Not connected</div>
+        <div class="magRow">
+          <span class="magState" id="magStateWrist">mag: optional for long sessions</span>
+          <button id="magBtnWrist" disabled>⟳ Cal mag</button>
         </div>
-        <button id="connWrist" class="primary">Connect</button>
-      </div>
-      <div class="magRow">
-        <span class="magState" id="magStateWrist">mag: not calibrated</span>
-        <button id="magBtnWrist" disabled>⟳ Cal mag</button>
-      </div>
+        <h2 style="margin-top: 14px;">Calibrate</h2>
+        <div class="row-btns" style="margin-bottom: 10px;">
+          <button data-hand="R" class="active">Right hand</button>
+          <button data-hand="L">Left hand</button>
+        </div>
+        <p class="caption">Two still poses — no swinging. Hang the arm, then hold the tray pose.</p>
+        <div class="cal-guide" id="calGuide" aria-label="Two calibration steps">
+          <div class="cal-card" data-cal-step="still">
+            <span class="cal-step-num">1</span>
+            <b>Arm down + still</b>
+            <small>Sensor Y+ faces up, away from gravity</small>
+            <span class="pose-glyph">↓</span>
+          </div>
+          <span class="cal-flow-arrow">→</span>
+          <div class="cal-card" data-cal-step="tray">
+            <span class="cal-step-num">2</span>
+            <b>Hold the tray pose</b>
+            <small>Sensor Z+ faces up, away from gravity</small>
+            <span class="tray-glyph"></span>
+          </div>
+        </div>
+        <button id="calBtn" class="wide primary" disabled>⦿ Start guided calibration</button>
+        <button id="placeBtn" class="wide" disabled style="margin-top: 8px;">🍾 Set tray level &amp; place bottles</button>
+      </details>
     </div>
 
-    <div class="panel">
-      <h2>Calibration</h2>
-      <div class="row-btns" style="margin-bottom: 10px;">
-        <button data-hand="R" class="active">Right hand</button>
-        <button data-hand="L">Left hand</button>
-      </div>
-      <p class="caption">Hang the arm &amp; hold still, then swing it forward &amp; back ×3 (the avatar demonstrates). Afterwards: hold the tray pose and place the bottles.</p>
-      <button id="calBtn" class="wide primary" disabled>⦿ Calibrate — hang, then swing ×3</button>
-      <button id="placeBtn" class="wide" disabled style="margin-top: 8px;">🍾 Set tray level &amp; place bottles</button>
-      <div class="row" style="margin-top: 10px;">
-        <input type="checkbox" id="simChk" />
-        <label for="simChk">Simulated demonstrator (no sensors)</label>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>Balance challenge</h2>
-      <p class="caption">The floor under the avatar starts shifting and gets harder over time. Keep the tray level — the robot mirrors you, so it only stays up as long as you do.</p>
-      <button id="demoBtn" class="wide" disabled>▶ Start</button>
-      <div class="slider-row" style="margin-top: 12px;">
-        <label for="speedRange">Floor speed <b id="speedVal">25%</b></label>
-        <input type="range" id="speedRange" min="5" max="100" step="5" value="25" />
-      </div>
-      <div class="slider-row" style="margin-top: 12px;">
-        <label for="tiltRange">Max tilt <b id="tiltCapVal">30°</b></label>
-        <input type="range" id="tiltRange" min="10" max="45" step="1" value="30" />
-      </div>
-      <div class="row-btns" style="margin-top: 12px;">
-        <button data-tiltmode="lr" class="active">↔ Left / right</button>
-        <button data-tiltmode="free">✳ Free range</button>
-      </div>
-      <div class="row" style="margin-top: 10px;">
-        <input type="checkbox" id="followChk" checked />
-        <label for="followChk">Robot follows my movements</label>
-      </div>
-      <button id="viewBtn" class="wide" style="margin-top: 10px;">📷 View from behind</button>
+    <div class="panel act-panel active" id="act1Panel">
+      <h2 class="step-title"><span class="step-num">1</span> See why correction matters</h2>
+      <p class="caption">Both stations face the same moving floor. Your wrist keeps the teal tray level; the robot first mirrors that correction.</p>
+      <button id="demoBtn" class="wide" disabled>▶ Start live challenge</button>
+      <input type="checkbox" id="followChk" checked class="sr-only" />
+      <label for="followChk" class="sr-only">Robot mirrors the human</label>
+      <button id="compareBtn" class="wide" style="margin-top: 8px;" disabled>Show robot with no correction</button>
       <div class="stats" id="epInfo" style="margin-top: 8px;">press Start when ready</div>
+      <details class="advanced">
+        <summary>Challenge settings</summary>
+        <div class="slider-row" style="margin-top: 12px;">
+          <label for="speedRange">Floor speed <b id="speedVal">55%</b></label>
+          <input type="range" id="speedRange" min="5" max="100" step="5" value="55" />
+        </div>
+        <div class="slider-row" style="margin-top: 12px;">
+          <label for="tiltRange">Max tilt <b id="tiltCapVal">30°</b> · spills near 13°</label>
+          <input type="range" id="tiltRange" min="10" max="45" step="1" value="30" />
+        </div>
+        <div class="row-btns" style="margin-top: 12px;">
+          <button data-tiltmode="lr" class="active">↔ Left / right</button>
+          <button data-tiltmode="free">✳ Free range</button>
+        </div>
+        <button id="viewBtn" class="wide" style="margin-top: 10px;">📷 Front overview</button>
+      </details>
     </div>
 
-    <div class="panel">
-      <h2>Teach the robot</h2>
-      <p class="caption">Record yourself balancing — the robot fits <b>one number</b> (how hard you push back per unit of tilt), then balances a floor it has <b>never seen</b>. No replay, no script.</p>
-      <button id="teachBtn" class="wide primary" disabled>⏺ 1 · Record my balancing</button>
+    <div class="panel act-panel" id="act2Panel">
+      <h2 class="step-title"><span class="step-num">2</span> Teach one balance reflex</h2>
+      <p class="caption">Balance for about 10 seconds. We learn one transparent rule: how much wrist correction you use for each degree of floor tilt.</p>
+      <div class="tray-practice" aria-label="Rock the tray backward and forward">
+        <span><b>TIP BACK</b><small>lower the wrist edge</small></span>
+        <span class="tray-glyph rocking"></span>
+        <span><b>TIP FORWARD</b><small>lower the fingertip edge</small></span>
+      </div>
+      <div class="learning-rule">
+        <span>Floor tilts<b>10°</b></span><span class="arrow">→</span><span>You correct<b id="ruleCorrection">?</b></span>
+      </div>
+      <button id="teachBtn" class="wide primary" disabled>⏺ Record my correction</button>
       <div class="stats" id="teachInfo" style="margin: 8px 0;">not trained yet — record a demonstration first</div>
-      <button id="autoBtn" class="wide" disabled>🤖 2 · Robot solo — new floor</button>
-      <button id="forgetBtn" class="wide" disabled style="margin-top: 8px;">🗑 Forget training</button>
+      <div id="learnedRule" hidden></div>
+    </div>
+
+    <div class="panel act-panel" id="act3Panel">
+      <h2 class="step-title"><span class="step-num">3</span> Test the robot solo</h2>
+      <p class="caption">The human is now off duty. Test the robot on a fresh randomized floor motion and compare it with the untrained baseline.</p>
+      <div class="scoreboard">
+        <div class="score"><span>Untrained</span><b id="baselineScore">—</b><small>balance time</small></div>
+        <span class="score-arrow">→</span>
+        <div class="score learned"><span>Learned</span><b id="learnedScore">—</b><small>balance time</small></div>
+      </div>
+      <button id="autoBtn" class="wide" disabled>🤖 Run untrained baseline</button>
+      <button id="forgetBtn" class="wide" disabled style="margin-top: 8px;">Reset learned reflex</button>
     </div>
   </div>
 
@@ -259,9 +424,9 @@
     </div>
   </div>
 
-  <div id="prompt" class="overlay">connect sensors, or tick “simulated demonstrator”</div>
-  <div id="labelHuman" class="station-label">Human — wearing 2 IMUs</div>
-  <div id="labelRobot" class="station-label">Robot — shadowing</div>
+  <div id="prompt" class="overlay">choose instant demo or connect the wrist sensor</div>
+  <div id="labelHuman" class="station-label">Human · 1 wrist IMU</div>
+  <div id="labelRobot" class="station-label">Robot · live mirror</div>
   <div id="hint" class="overlay">
     <span><kbd>Left-drag</kbd>rotate camera</span>
     <span><kbd>Scroll</kbd>zoom</span>
@@ -290,7 +455,7 @@
 
     const D2R = Math.PI / 180, R2D = 180 / Math.PI;
     const TRAY = { half: 0.15, rimH: 0.022, y: 0.02 };       // tray geometry (m)
-    const EPISODE_CAP = 90;                                   // s — attempt time cap
+    const EPISODE_CAP = 45;                                   // s — concise demo attempt cap
     const RESTART_PAUSE = 2.0;                                // s between attempts
 
     // --- console ------------------------------------------------------------
@@ -306,7 +471,6 @@
     }
 
     // --- fusion + BLE (same stack as ../knee-angle/hands-mag.html) ----------
-    const imuUpper = new ArmImu({ beta: BETA_SETTLE, useMag: true });
     const imuWrist = new ArmImu({ beta: BETA_SETTLE, useMag: true });
 
     class SensorLink {
@@ -342,10 +506,6 @@
       }
     }
 
-    const upper = new SensorLink('upper', imuUpper, {
-      led: document.getElementById('ledUpper'), name: document.getElementById('nameUpper'),
-      magState: document.getElementById('magStateUpper'), magBtn: document.getElementById('magBtnUpper'),
-    });
     const wrist = new SensorLink('wrist', imuWrist, {
       led: document.getElementById('ledWrist'), name: document.getElementById('nameWrist'),
       magState: document.getElementById('magStateWrist'), magBtn: document.getElementById('magBtnWrist'),
@@ -360,7 +520,7 @@
           btn.textContent = 'Connected';
           link.els.magBtn.disabled = false;
           loadMagCal(link);
-          if (upper.streaming && wrist.streaming) calBtn.disabled = false;
+          if (wrist.streaming) calBtn.disabled = false;
         } catch (e) {
           log(`[${link.role}] ❌ ${e.message}`);
           link.els.led.className = 'led';
@@ -368,7 +528,6 @@
         }
       });
     }
-    wireConnect(document.getElementById('connUpper'), upper);
     wireConnect(document.getElementById('connWrist'), wrist);
 
     // --- mag hard-iron calibration (same flow + storage keys as hands-mag) ---
@@ -400,7 +559,6 @@
         setPrompt(`hold the ${link.role} sensor IN HAND — wave slow figure-8s · 0%`, 'hold');
       });
     }
-    wireMagBtn(upper);
     wireMagBtn(wrist);
 
     function checkMagCapture() {
@@ -426,162 +584,130 @@
       log(`[${link.role}] hard-iron fit · field ${fit.field.toFixed(3)} Ga · spread ${(fit.quality * 100).toFixed(1)}%`);
     }
 
-    // --- calibration: functional 2-phase flow, then an EXPLICIT level set ---
-    // 1/2 hang the arm, hold still  -> gyro bias per sensor
-    // 2/2 swing the straight arm forward & back ×3
-    //     -> both sensors rotate about the same physical axis; measuring it in
-    //        each filter's earth frame aligns the frames REGARDLESS of how the
-    //        pucks are strapped, and pins "forward" physically (so the tray's
-    //        lean direction on screen matches your real lean direction)
-    // Then the user holds the tray pose and PRESSES "place bottles" — that
-    // press captures the reference ("tray level"). Explicit by design:
-    // stillness alone can't tell a hanging arm from the tray pose, so any
-    // automatic pose capture fires too early.
-    let calPhase = 'idle';    // idle | still1 | swing
+    // --- one-sensor calibration: two still poses, no swing ------------------
+    // Step 1: hang the straight arm and hold still — gyro bias, the attitude
+    // reference, and the forearm's own axis in the body frame.
+    // Step 2: hold the tray pose and press "Set tray level". With the forearm
+    // horizontal, that same axis points along the user's FORWARD direction, so
+    // this one capture fixes the heading AND re-zeros the working pose.
+    // (The old straight-arm swing also pinned the heading, but only if you
+    // swung forward/back — a sideways swing rotated the datum 90°, transposing
+    // the two horizontal axes. A pose the user must hold anyway can't be
+    // performed in the wrong direction.)
+    let calPhase = 'idle';    // idle | still
     let calibrated = false;
     let trayLevelSet = false;
-    let calPending = 0;
     let calDeadline = 0;
-    let quietSince = null;
     let calSnapshot = null;
-    const CAL_BTN_LABEL = '⦿ Calibrate — hang, then swing ×3';
-    const SWING_TARGET = 160;   // ~1.25 s of >40 deg/s rotation per device
+    let guideT = 0;
+    const CAL_BTN_LABEL = '⦿ Start guided calibration';
     const calActive = () => calPhase !== 'idle';
+    function setCalPhase(phase) {
+      calPhase = phase;
+      updateCalCards();
+    }
+    // Card 2 stays lit once the hang is captured and we're waiting on the
+    // tray-pose press, which is 'idle' as far as the state machine cares.
+    function updateCalCards() {
+      document.body.dataset.calPhase = calPhase !== 'idle' ? calPhase
+        : (calibrated && !trayLevelSet && !simChk.checked) ? 'tray' : 'idle';
+    }
 
     calBtn.addEventListener('click', () => {
       if (calActive() || magCap) return;
-      for (const link of [upper, wrist]) {
-        if (!link.imu.magCalibrated) log(`[${link.role}] ⚠ mag not calibrated — heading may drift over long sessions`);
-      }
-      calSnapshot = [imuUpper.snapshotCalibration(), imuWrist.snapshotCalibration()];
-      imuUpper.resetCalibration();
+      if (!imuWrist.magCalibrated) log('[wrist] mag not calibrated — fine for short balance demonstrations');
+      calSnapshot = imuWrist.snapshotCalibration();
       imuWrist.resetCalibration();
-      imuUpper.filter.beta = BETA_SETTLE;
       imuWrist.filter.beta = BETA_SETTLE;
       hideBottlesForCal(true);
-      calPhase = 'still1';
-      calPending = 2;
+      setCalPhase('still');
       calDeadline = performance.now() / 1000 + 6;
       guideT = 0;
       calBtn.disabled = true;
-      calBtn.textContent = 'Calibrating…';
-      setPrompt('1/2 — hang the arm straight down, hold still', 'hold');
-      imuUpper.startCalibration(Math.round(1.25 * SAMPLING_HZ));
+      calBtn.textContent = '1/2 · Arm down and still…';
+      setPrompt('1/2 · let your ARM HANG STRAIGHT DOWN · hold still', 'hold');
+      refreshButtons();
       imuWrist.startCalibration(Math.round(1.25 * SAMPLING_HZ));
     });
 
     function rollbackCal(msg) {
       if (calSnapshot) {
-        imuUpper.restoreCalibration(calSnapshot[0]);
-        imuWrist.restoreCalibration(calSnapshot[1]);
+        imuWrist.restoreCalibration(calSnapshot);
         calSnapshot = null;
       }
-      if (calibrated) {   // previous good calibration back in force
-        imuUpper.filter.beta = BETA_RUN;
-        imuWrist.filter.beta = BETA_RUN;
-      }
-      calPhase = 'idle';
-      calPending = 0;
+      if (calibrated) imuWrist.filter.beta = BETA_RUN;
+      setCalPhase('idle');
       calBtn.disabled = false;
-      calBtn.textContent = calibrated ? '⦿ Re-calibrate' : CAL_BTN_LABEL;
+      calBtn.textContent = calibrated ? '⦿ Re-run guided calibration' : CAL_BTN_LABEL;
       setPrompt(msg);
       hideBottlesForCal(false);
+      refreshButtons();
     }
 
-    function onImuCalibrated() {
-      if (--calPending > 0) return;
-      if (calPhase !== 'still1') return;
-      calPhase = 'swing';
-      calDeadline = performance.now() / 1000 + 15;   // generous backstop
-      quietSince = null;
-      guideT = 0;
-      imuUpper.startSwingCapture();
-      imuWrist.startSwingCapture();
-    }
-    imuUpper.onCalibrated = onImuCalibrated;
-    imuWrist.onCalibrated = onImuCalibrated;
+    imuWrist.onCalibrated = () => {
+      if (calPhase !== 'still') return;
+      // Mounting protocol, pose 1: sensor +Y points away from gravity (up).
+      if (imuWrist.bodyAxisUpDot({ x: 0, y: 1, z: 0 }) < 0.85) {
+        rollbackCal('pose 1 rejected · point sensor Y+ UP, then hold the arm still');
+        log('hang capture rejected: sensor +Y was not facing away from gravity');
+        return;
+      }
+      imuWrist.filter.beta = BETA_RUN;
+      setCalPhase('idle');
+      calibrated = true;
+      trayLevelSet = false;
+      calSnapshot = null;
+      calBtn.disabled = false;
+      calBtn.textContent = '⦿ Re-run guided calibration';
+      placeBtn.classList.add('primary');
+      updateCalCards();
+      setPrompt('2/2 · now HOLD THE TRAY POSE — forearm level, palm up — and press “Set tray level”', 'live');
+      log('hang reference captured; waiting for the tray-pose capture');
+      refreshButtons();
+    };
 
     function checkCalPhases() {
       if (!calActive()) return;
       const t = performance.now() / 1000;
-
-      if (calPhase === 'still1') {
-        const pU = imuUpper.calProgress, pW = imuWrist.calProgress;
-        const pct = Math.round(Math.min(pU ?? 1, pW ?? 1) * 100);
-        setPrompt(`1/2 — hang the arm straight down, hold still · ${pct}%`, 'hold');
-        if (t > calDeadline) rollbackCal('calibration timed out — check both sensors are streaming');
-        return;
-      }
-
-      if (calPhase === 'swing') {
-        const cU = imuUpper.swingCount, cW = imuWrist.swingCount;
-        const pct = Math.min(100, Math.round(Math.min(cU, cW) / SWING_TARGET * 100));
-        setPrompt(`2/2 — swing the straight arm forward & back ×3, then hold still · ${pct}%`, 'hold');
-        const quiet = (imuUpper.gyroMag ?? 99) < 25 && (imuWrist.gyroMag ?? 99) < 25;
-        if (!quiet) quietSince = null;
-        else if (quietSince === null) quietSince = t;
-        const settled = cU >= SWING_TARGET && cW >= SWING_TARGET
-                        && quietSince !== null && (t - quietSince) > 0.7;
-        if (!settled && t < calDeadline) return;
-        const aU = imuUpper.finishSwingCapture();
-        const aW = imuWrist.finishSwingCapture();
-        if (!aU || !aW) {
-          rollbackCal(calibrated
-            ? 'not enough swing — previous calibration restored'
-            : 'not enough swing detected — press Calibrate to retry');
-          log(`swing failed: samples upper ${cU}, wrist ${cW} (need ${SWING_TARGET} each)`);
-          return;
-        }
-        imuUpper.setYawFix(aU);
-        imuWrist.setYawFix(aW);
-        const yaw = (a) => Math.atan2(a.y, a.x) * 180 / Math.PI;
-        log(`swing ok: strap yaw offset ${(((yaw(aU) - yaw(aW)) % 360 + 540) % 360 - 180).toFixed(1)}° corrected`);
-        // done — the tray level is set explicitly by the "place bottles" button
-        calPhase = 'idle';
-        calibrated = true;
-        trayLevelSet = false;
-        calSnapshot = null;
-        imuUpper.filter.beta = BETA_RUN;
-        imuWrist.filter.beta = BETA_RUN;
-        calBtn.disabled = false;
-        calBtn.textContent = '⦿ Re-calibrate';
-        placeBtn.classList.add('primary');
-        setPrompt('✓ calibrated — hold the TRAY POSE, then press “place bottles”', 'live');
-        log('calibrated: now set the tray level with the place-bottles button');
-        refreshButtons();
-      }
+      const pct = Math.round((imuWrist.calProgress ?? 1) * 100);
+      setPrompt(`1/2 · ARM HANGING STRAIGHT DOWN · stay still · ${pct}%`, 'hold');
+      if (t > calDeadline) rollbackCal('calibration timed out — check the wrist sensor is streaming');
     }
 
-    // Explicit tray-level capture + bottle placement — pressed while HOLDING
-    // the tray pose (forearm level, palm up).
+    // The task pose is captured with a separate button, and it does double duty:
+    // with the forearm horizontal its long axis gives the heading (see
+    // ArmImu.setForwardFix), so this one press sets BOTH which way is forward
+    // and where "tray level" is. No swing, and no way to do it in the wrong
+    // direction — the pose is the same one the demo is about.
     const placeBtn = document.getElementById('placeBtn');
     placeBtn.addEventListener('click', () => {
-      if (calActive() || magCap || mode !== 'idle') return;
-      if (!simChk.checked) {
-        if (!calibrated) return;
-        imuUpper.captureReference();
-        imuWrist.captureReference();
-        trayLevelSet = true;
-        log('tray level captured from the pose you are holding');
+      if (calActive() || magCap || mode !== 'idle' || !calibrated) return;
+      // Mounting protocol, pose 2: sensor +Z points away from gravity (up),
+      // making sensor -Y the physical forearm/tray forward direction.
+      if (!imuWrist.setForwardFix(-Math.PI / 2,
+          { x: 0, y: -1, z: 0 }, { x: 0, y: 0, z: 1 })) {
+        setPrompt('pose 2 rejected · point sensor Z+ UP with the tray level, then press again', 'hold');
+        log('tray-pose capture rejected: sensor +Z was not facing away from gravity');
+        return;
       }
+      imuWrist.captureReference();
+      trayLevelSet = true;
+      updateCalCards();
       placeBtn.classList.remove('primary');
-      hideBottlesForCal(false);   // respawns both trays' bottles
-      setPrompt('bottles placed — keep the tray level', 'live');
+      hideBottlesForCal(false);
+      setPrompt('bottles placed · gently tip left/right and forward to verify direction', 'live');
+      log('tray-pose captured: heading + working level set');
       refreshButtons();
     });
 
-    // guide animation: during calibration the avatar (and robot) demonstrate
-    // the current step — hang the arm, swing it, then back to the tray pose
+    // During calibration both figures demonstrate the original straight-arm
+    // hang and shoulder swing. Tray rocking is demonstrated in the Teach panel.
     const qGuideProx = new THREE.Quaternion();
     const qGuideDist = new THREE.Quaternion();
-    let guideT = 0;
     function calGuidePose(dt) {
       guideT += dt;
-      const theta = calPhase === 'swing'
-        ? -70 * Math.PI / 180 * Math.sin(2 * Math.PI * guideT / 2.2)
-        : 0;
-      qGuideProx.setFromAxisAngle(X_AXIS, theta);
-      qGuideDist.copy(Binv);       // straight arm: forearm hangs in line
+      qGuideProx.setFromAxisAngle(X_AXIS, 0);   // hold the straight hanging arm
+      qGuideDist.copy(Binv); // cancel the baked elbow: show one straight arm
     }
 
     let bottlesHiddenForCal = false;
@@ -646,13 +772,14 @@
     const Binv = B.clone().invert();
     const PALM_UP = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
 
-    function buildTrayVisual(mat) {   // square tray with a low rim, teal edge
+    function buildTrayVisual(mat, rimColor) {   // square tray with a low, station-colored rim
       const g = new THREE.Group();
       const base = new THREE.Mesh(new THREE.BoxGeometry(TRAY.half * 2, 0.016, TRAY.half * 2), mat);
       base.position.y = TRAY.y;
       base.castShadow = true;
       g.add(base);
-      const rimMat = new THREE.MeshStandardMaterial({ color: 0x2dd4bf, roughness: 0.4, metalness: 0.3 });
+      const rimMat = new THREE.MeshStandardMaterial({ color: rimColor, emissive: rimColor,
+        emissiveIntensity: 0.12, roughness: 0.4, metalness: 0.3 });
       for (const [dx, dz, w, d] of [
         [0, -TRAY.half, TRAY.half * 2, 0.012], [0, TRAY.half, TRAY.half * 2, 0.012],
         [-TRAY.half, 0, 0.012, TRAY.half * 2], [TRAY.half, 0, 0.012, TRAY.half * 2]]) {
@@ -673,11 +800,18 @@
         mats.push({ m, base: opts.opacity ?? 1 });   // remember baseline for un-dim
         return m;
       };
-      const bodyMat = mat(0x8b98a8);
-      const skinMat = mat(0xe6edf3);
-      // barely-there body: the trainer stands BEHIND the avatar, so the torso
-      // must never occlude the tray (depthWrite off keeps sorting artifacts away)
-      const ghostMat = mat(0x6b7a8c, { opacity: 0.15, depthWrite: false, roughness: 0.8 });
+      // The camera sits BEHIND the puppet, so everything between the viewer and
+      // the tray is ghosted and depth-write-free (no sorting artifacts): body
+      // faintest, arm semi-transparent, and only the HAND + tray left solid so
+      // the thing the demo is actually about reads clearly through the figure.
+      const bodyMat = mat(0xa7b6c6, { opacity: 0.34, depthWrite: false });
+      const skinMat = mat(0xcfe2f2, { opacity: 0.62, depthWrite: false,
+        emissive: 0x2b5f7a, emissiveIntensity: 0.28 });
+      // the hand is the one part that must never wash out: opaque and lifted
+      // with emissive so it reads as the thing holding the tray
+      const handMat = mat(0xf6fbff, { opacity: 1, roughness: 0.3,
+        emissive: 0x7fd4ee, emissiveIntensity: 0.75 });
+      const ghostMat = mat(0x6b7a8c, { opacity: 0.10, depthWrite: false, roughness: 0.8 });
 
       const platform = new THREE.Group();
       platform.position.set(x, 0.03, 0);
@@ -705,7 +839,8 @@
       platform.add(head);
 
       // shoulder x is set by the hand selector (right = -X, model faces +Z);
-      // arm baked into the waiter pose (this IS the calibration pose)
+      // Upper arm stays in a fixed waiter pose; the single wrist IMU controls
+      // the forearm/tray attitude that matters to the balance task.
       const shoulder = new THREE.Group();
       shoulder.position.set(-0.21, ARM.shoulderY, 0);
       platform.add(shoulder);
@@ -717,11 +852,6 @@
       upperArm.position.y = -ARM.upperLen / 2;
       upperArm.castShadow = true;
       proxGroup.add(upperArm);
-      const puck = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.045, 0.015),
-        new THREE.MeshStandardMaterial({ color: 0x2dd4bf, roughness: 0.35 }));
-      puck.position.set(-0.038, -ARM.upperLen * 0.45, 0.01);
-      proxGroup.add(puck);
-
       const jointPivot = new THREE.Group();
       jointPivot.position.y = -ARM.upperLen;
       jointPivot.quaternion.copy(B);          // baked 90° bend: forearm forward
@@ -743,10 +873,10 @@
       palmFrame.position.y = -ARM.foreLen - 0.02;
       palmFrame.quaternion.copy(PALM_UP);
       distGroup.add(palmFrame);
-      const palm = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.02, 0.09), skinMat);
+      const palm = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.02, 0.09), handMat);
       palm.castShadow = true;
       palmFrame.add(palm);
-      palmFrame.add(buildTrayVisual(mat(0x3a4654, { roughness: 0.5, metalness: 0.4 })));
+      palmFrame.add(buildTrayVisual(mat(0x3a4654, { roughness: 0.5, metalness: 0.4 }), 0x2dd4bf));
 
       return { platform, shoulder, proxGroup, distGroup, palmFrame, mats };
     }
@@ -758,8 +888,10 @@
         mats.push({ m, base: opts.opacity ?? 1 });
         return m;
       };
-      const linkMat = mat(0x3a4654);
-      const accentMat = mat(0xf59e0b, { roughness: 0.35, metalness: 0.2 });
+      // same treatment as the puppet: structure recedes, the working end reads
+      const linkMat = mat(0x6b7d92, { opacity: 0.34, depthWrite: false });
+      const accentMat = mat(0xf59e0b, { roughness: 0.35, metalness: 0.2,
+        emissive: 0xf59e0b, emissiveIntensity: 0.25 });
 
       const platform = new THREE.Group();
       platform.position.set(x, 0.03, 0);
@@ -814,7 +946,7 @@
       distGroup.add(palmFrame);
       const flange = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.02, 20), accentMat);
       palmFrame.add(flange);
-      palmFrame.add(buildTrayVisual(mat(0x3a4654, { roughness: 0.5 })));
+      palmFrame.add(buildTrayVisual(mat(0x3a4654, { roughness: 0.5 }), 0xf59e0b));
 
       return { platform, proxGroup, distGroup, palmFrame, mats };
     }
@@ -1029,7 +1161,7 @@
     // live, persisted floor controls (set via the sliders)
     let distSpeed = (() => {
       const v = parseInt(localStorage.getItem('robotTeach.speed'), 10);
-      return Number.isFinite(v) ? Math.min(100, Math.max(5, v)) / 100 : 0.25;
+      return Number.isFinite(v) ? Math.min(100, Math.max(5, v)) / 100 : 0.55;
     })();
     let distCap = (() => {   // peak tilt, degrees
       const v = parseInt(localStorage.getItem('robotTeach.tilt'), 10);
@@ -1040,7 +1172,7 @@
     let tiltMode = localStorage.getItem('robotTeach.tiltmode') === 'free' ? 'free' : 'lr';
     const LR_DIR = Math.PI / 2;   // left/right = tilt about Z (rz only)
     class Disturbance {
-      constructor(seed, ramp = { start: 4, rate: 0.35 }) {
+      constructor(seed, ramp = { start: 6, rate: 0.75 }) {
         this.ramp = ramp;
         const rnd = mulberry32(seed);
         this.fMag = 0.11 + rnd() * 0.05;              // magnitude oscillation ~0.11–0.16 Hz
@@ -1212,16 +1344,21 @@
 
     // --- follow toggle + camera view preset ----------------------------------
     const followChk = document.getElementById('followChk');
+    const compareBtn = document.getElementById('compareBtn');
+    const quickLabel = document.getElementById('quickLabel');
     const viewBtn = document.getElementById('viewBtn');
     const labelHumanEl = document.getElementById('labelHuman');
-    const VIEW_KEY = 'robotTeach.view';
-    let viewBehind = localStorage.getItem(VIEW_KEY) === 'behind';
+    const VIEW_KEY = 'robotTeach.view.v2';
+    let viewBehind = localStorage.getItem(VIEW_KEY) !== 'front';
 
     function updateRobotLabel() {
       labelRobotEl.textContent =
-        mode === 'auto' ? (learned ? 'Robot — learned policy, solo' : 'Robot — untrained, solo')
-        : mode === 'teach' ? 'Robot — watching you teach'
-        : followChk.checked ? 'Robot — shadowing' : 'Robot — not following (no corrections)';
+        mode === 'auto' ? (learned ? 'Robot · learned reflex' : 'Robot · no correction')
+        : mode === 'teach' ? 'Robot · observing'
+        : followChk.checked ? 'Robot · live mirror' : 'Robot · no correction';
+      compareBtn.textContent = followChk.checked
+        ? 'Show robot with no correction'
+        : 'Restore live mirroring';
     }
     // Not following in IDLE = the robot gets its OWN floor disturbance so the
     // "watch it fail" beat is visible without starting the challenge.
@@ -1230,30 +1367,41 @@
     followChk.addEventListener('change', () => {
       updateRobotLabel();
       if (!followChk.checked) {
-        showcaseDist = new Disturbance(9000 + seedCounter++, { start: 3, rate: 4 });
+        showcaseDist = new Disturbance(9000 + seedCounter++, { start: 4, rate: 5 });
         showcaseT = 0;
-        setPrompt('floors moving — keep YOUR tray level; the robot won’t', 'hold');
+        setPrompt('same floor · human corrects · robot does not', 'hold');
       } else {
         showcaseDist = null;
-        if (mode === 'idle') setPrompt('robot shadowing again', 'live');
+        if (mode === 'idle') setPrompt('live mirroring restored', 'live');
       }
+    });
+    compareBtn.addEventListener('click', () => {
+      if (compareBtn.disabled) return;
+      followChk.checked = !followChk.checked;
+      followChk.dispatchEvent(new Event('change'));
     });
 
     function applyView() {
-      // trainer stands behind the avatar: view from -Z so left/right match
+      const narrow = innerWidth <= 900;
+      // Default training view: over the PUPPET's own shoulder, looking the way
+      // it faces. Physical forward is screen-forward and left stays left, so the
+      // demonstrator copies the correction without mentally mirroring it — and
+      // the robot sits alongside on the right for comparison.
       if (viewBehind) {
-        camera.position.set(-0.55, 1.55, -3.2);
-        controls.target.set(-0.12, 0.55, 0);
-        labelHumanEl.style.left = '68%';
-        labelRobotEl.style.left = '32%';
-        viewBtn.textContent = '📷 View from front';
+        // looking along +Z with +Y up puts screen-right at -X, so from behind
+        // the puppet (-0.75) sits on the RIGHT and the robot (+0.75) on the left
+        camera.position.set(narrow ? -0.9 : -0.86, narrow ? 1.14 : 1.07, narrow ? -2.3 : -1.86);
+        controls.target.set(narrow ? -0.1 : -0.04, 0.72, 0.34);
+        labelHumanEl.style.left = narrow ? '72%' : '70%';
+        labelRobotEl.style.left = narrow ? '26%' : '28%';
+        viewBtn.textContent = '📷 Front overview';
       } else {
         // aim slightly left so a right-hand tray clears the UI panels
-        camera.position.set(0.3, 1.55, 3.3);
-        controls.target.set(-0.05, 0.55, 0);
+        camera.position.set(narrow ? 0.2 : 0.3, 1.55, narrow ? 5.0 : 3.3);
+        controls.target.set(narrow ? 0 : -0.05, 0.55, 0);
         labelHumanEl.style.left = '32%';
         labelRobotEl.style.left = '68%';
-        viewBtn.textContent = '📷 View from behind';
+        viewBtn.textContent = '📷 Behind robot · 1st person';
       }
     }
     viewBtn.addEventListener('click', () => {
@@ -1264,16 +1412,22 @@
 
     const sourceReady = () => simChk.checked || (calibrated && trayLevelSet);
     function refreshButtons() {
-      demoBtn.disabled = !(mode === 'demo' || (mode === 'idle' && sourceReady()));
-      placeBtn.disabled = !(mode === 'idle' && !calActive() && (simChk.checked || calibrated));
-      teachBtn.disabled = !(mode === 'teach' || (mode === 'idle' && sourceReady()));
+      demoBtn.disabled = !(mode === 'demo' || (mode === 'idle' && !calActive() && sourceReady()));
+      compareBtn.disabled = !(sourceReady() && !calActive() && (mode === 'idle' || mode === 'demo'));
+      placeBtn.disabled = !(mode === 'idle' && !calActive() && calibrated && !simChk.checked);
+      teachBtn.disabled = !(mode === 'teach' || (mode === 'idle' && !calActive() && sourceReady()));
       // robot solo needs no live source — untrained it goes out rigid-armed
       // (and spills), which IS the baseline worth showing
       autoBtn.disabled = !(mode === 'auto' || (mode === 'idle' && !calActive()));
       forgetBtn.disabled = !(learned && mode === 'idle');
     }
     simChk.addEventListener('change', () => {
-      if (simChk.checked) setPrompt('simulated demonstrator armed — press Start', 'live');
+      quickLabel.textContent = simChk.checked
+        ? '✓ Instant demo active — click to exit'
+        : '▶ Try instant demo — no hardware';
+      quickLabel.classList.toggle('checked', simChk.checked);
+      if (simChk.checked) setPrompt('instant demo ready · start with step 1', 'live');
+      else if (!sourceReady()) setPrompt('choose instant demo or connect the wrist sensor');
       refreshButtons();
     });
 
@@ -1293,7 +1447,10 @@
       const label = reason === 'spill' ? '🍾 spill!' : '⏱ time cap';
       if (mode === 'auto') {
         if (epT > bestRobot) bestRobot = epT;
-        const vsTxt = bestHuman ? ` · your best ${bestHuman.toFixed(1)}s` : '';
+        if (learned) bestLearned = Math.max(bestLearned, epT);
+        else bestUntrained = Math.max(bestUntrained, epT);
+        updateScoreboard();
+        const vsTxt = learned && bestUntrained ? ` · untrained baseline ${bestUntrained.toFixed(1)}s` : '';
         const who = learned ? 'robot' : 'untrained robot';
         setPrompt(`${label} ${who} balanced ${epT.toFixed(1)} s solo${vsTxt}`, 'hold');
         log(`robot solo${learned ? '' : ' (untrained)'}: ${epT.toFixed(1)}s (${reason})`);
@@ -1316,19 +1473,20 @@
 
     function setMode(m) {
       mode = m;
+      document.body.dataset.mode = m;
       dist = null;
       updateRobotLabel();
-      demoBtn.textContent = m === 'demo' ? '⏹ Stop' : '▶ Start';
+      demoBtn.textContent = m === 'demo' ? '⏹ Stop challenge' : '▶ Start live challenge';
       demoBtn.classList.toggle('stop', m === 'demo');
-      teachBtn.textContent = m === 'teach' ? '⏹ Stop & learn' : '⏺ 1 · Record my balancing';
+      teachBtn.textContent = m === 'teach' ? '⏹ Stop & learn' : '⏺ Record my correction';
       teachBtn.classList.toggle('stop', m === 'teach');
-      autoBtn.textContent = m === 'auto' ? '⏹ Stop robot'
-        : learned ? '🤖 2 · Robot solo — new floor' : '🤖 Robot solo — untrained';
+      autoBtn.textContent = m === 'auto' ? '⏹ Stop & score'
+        : learned ? '🤖 Test learned reflex — fresh motion' : '🤖 Run untrained baseline';
       autoBtn.classList.toggle('stop', m === 'auto');
       timeLblEl.textContent = m === 'auto' ? 'robot balance time' : 'balance time';
       tiltLblEl.textContent = m === 'auto' ? 'robot tray tilt' : 'tray tilt';
       if (m === 'idle') {
-        setPrompt(sourceReady() ? 'free play — trays level, floor still' : 'connect sensors, or tick “simulated demonstrator”');
+        setPrompt(sourceReady() ? 'ready · choose the next numbered step' : 'choose instant demo or connect the wrist sensor');
         if (!bottlesHiddenForCal) {
           respawnBottles(humanRig);
           respawnBottles(robotRig);
@@ -1337,14 +1495,28 @@
         bottlesHiddenForCal = false;   // active modes always show bottles
         if (m === 'teach') rec = { n: 0, sPP: 0, sPC: 0, sC: 0, sCC: 0 };
         setPrompt(
-          m === 'teach' ? '⏺ recording — balance the tray, the robot is watching!'
-          : m === 'auto' ? (learned ? '🤖 robot solo — a floor it has never seen'
-                                    : '🤖 untrained robot — no policy yet, watch what happens…')
-          : 'keep the tray level — floor gets harder!', 'live');
+          m === 'teach' ? '⏺ recording · floor tilt → your wrist correction'
+          : m === 'auto' ? (learned ? '🤖 learned reflex · fresh randomized floor motion'
+                                    : '🤖 baseline · robot has no correction rule')
+          : 'same floor · human and robot correcting together', 'live');
         startEpisode();
       }
       refreshButtons();
       updateTeachInfo();
+      updateActPanels();
+    }
+
+    const actPanels = {
+      demo: document.getElementById('act1Panel'),
+      teach: document.getElementById('act2Panel'),
+      auto: document.getElementById('act3Panel'),
+    };
+    function updateActPanels() {
+      for (const panel of Object.values(actPanels)) panel.classList.remove('active');
+      const active = mode === 'idle'
+        ? (learned ? actPanels.auto : (bestHuman || bestUntrained) ? actPanels.teach : actPanels.demo)
+        : actPanels[mode];
+      active?.classList.add('active');
     }
 
     // --- teach the robot: record → fit ONE gain → robot solo on a new floor ----
@@ -1359,9 +1531,15 @@
     const autoBtn = document.getElementById('autoBtn');
     const forgetBtn = document.getElementById('forgetBtn');
     const teachInfoEl = document.getElementById('teachInfo');
+    const ruleCorrectionEl = document.getElementById('ruleCorrection');
+    const learnedRuleEl = document.getElementById('learnedRule');
+    const baselineScoreEl = document.getElementById('baselineScore');
+    const learnedScoreEl = document.getElementById('learnedScore');
     const MIN_TEACH_S = 4;     // s of demonstration below which we refuse to fit
-    const TEACH_CAP = 30;      // s — recording auto-stops; plenty for one gain
+    const TEACH_CAP = 15;      // s — enough coverage while keeping the booth flow concise
     let bestRobot = 0;         // longest solo balance this session
+    let bestUntrained = 0;
+    let bestLearned = 0;
     let rec = null;            // running sums while recording
     let learned = (() => {
       try {
@@ -1388,7 +1566,8 @@
         localStorage.setItem(POLICY_KEY, JSON.stringify(learned));
         log(`learned: gain ${learned.g.toFixed(3)} · R² ${learned.r2.toFixed(3)} · ${learned.secs.toFixed(1)}s (${reason})`);
         setMode('idle');
-        setPrompt(`🧠 learned! push-back ${(-learned.g).toFixed(2)}× per unit of tilt — now press “Robot solo”`, 'hold');
+        setPrompt(`🧠 learned · 10° floor tilt → ${(-learned.g * 10).toFixed(1)}° opposite correction`, 'hold');
+        document.getElementById('act3Panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       } else {
         setMode('idle');
         setPrompt(fit ? '🤔 that demo pushed WITH the tilt — try again, oppose the wobble'
@@ -1397,35 +1576,57 @@
     }
     function updateTeachInfo() {
       teachInfoEl.textContent =
-        mode === 'teach' ? 'recording your reactions…'
-        : learned ? `trained: push-back ${(-learned.g).toFixed(2)}× · fit ${(100 * Math.max(0, learned.r2)).toFixed(0)}% · from ${learned.secs.toFixed(1)} s`
-        : 'not trained yet — record a demonstration first';
+        mode === 'teach' ? 'recording examples… keep opposing the floor tilt'
+        : learned ? `learned from ${learned.secs.toFixed(1)} s of your balancing`
+        : 'not trained yet — record about 10 seconds';
+      ruleCorrectionEl.textContent = learned ? `${(-learned.g * 10).toFixed(1)}° opposite` : '?';
+      learnedRuleEl.hidden = !learned;
+      learnedRuleEl.textContent = learned
+        ? `Learned rule: for 10° of floor tilt, correct ${(-learned.g * 10).toFixed(1)}° in the opposite direction. Match quality ${(100 * Math.max(0, learned.r2)).toFixed(0)}%.`
+        : '';
       if (mode !== 'auto')   // keep the solo button honest about what it will run
-        autoBtn.textContent = learned ? '🤖 2 · Robot solo — new floor' : '🤖 Robot solo — untrained';
+        autoBtn.textContent = learned ? '🤖 Test learned reflex — fresh motion' : '🤖 Run untrained baseline';
+      updateScoreboard();
+    }
+    function updateScoreboard() {
+      baselineScoreEl.textContent = bestUntrained ? `${bestUntrained.toFixed(1)} s` : 'not run';
+      learnedScoreEl.textContent = bestLearned ? `${bestLearned.toFixed(1)} s` : 'not run';
     }
     teachBtn.addEventListener('click', () => {
       if (mode === 'teach') { endEpisode('stop'); return; }   // → finishTeaching
       if (mode !== 'idle' || !sourceReady()) return;
+      // The comparison beat may have left the robot rigid. Teaching starts
+      // from live mirroring again so the recorded cause-and-effect is visible.
+      followChk.checked = true;
+      showcaseDist = null;
       setMode('teach');
     });
     autoBtn.addEventListener('click', () => {
-      if (mode === 'auto') { setMode('idle'); return; }
+      if (mode === 'auto') {
+        bestRobot = Math.max(bestRobot, epT);
+        if (learned) bestLearned = Math.max(bestLearned, epT);
+        else bestUntrained = Math.max(bestUntrained, epT);
+        const stoppedAt = epT;
+        setMode('idle');
+        setPrompt(`${learned ? 'learned reflex' : 'untrained baseline'} scored ${stoppedAt.toFixed(1)} s`, 'hold');
+        return;
+      }
       if (mode !== 'idle' || calActive()) return;
       setMode('auto');
     });
     forgetBtn.addEventListener('click', () => {
       if (mode !== 'idle') return;
       learned = null;
+      bestLearned = 0;
       localStorage.removeItem(POLICY_KEY);
       refreshButtons();
       updateTeachInfo();
-      setPrompt('training forgotten — the robot is a blank slate again');
+      updateActPanels();
+      setPrompt('learned reflex reset — run a new demonstration');
     });
 
     // --- render loop -----------------------------------------------------------
     const qUser = new THREE.Quaternion();       // wrist orientation (action)
-    const qUpper = new THREE.Quaternion();
-    const qRel = new THREE.Quaternion();
     const qPlat = new THREE.Quaternion();
     const qPlatR = new THREE.Quaternion();
     const Q_ID = new THREE.Quaternion();
@@ -1433,20 +1634,24 @@
     const D_LEVEL = { rx: 0, rz: 0, drx: 0, drz: 0 };   // a still, level floor
     let timeScale = 1;
 
-    // hangRef: between calibration (reference = hanging arm) and the explicit
-    // tray-level capture, deltaQ-identity must RENDER as the hanging pose —
-    // X = B⁻¹·qRel shows the arm down at identity and lands exactly on the
-    // baked tray pose when the user raises 90°. After the level capture
-    // (reference = tray pose) the usual conjugation X = B⁻¹·qRel·B applies.
-    function applyArm(st, qu, qw, smooth, hangRef = false) {
-      qRel.copy(qu).invert().multiply(qw);
-      tmpQ.copy(Binv).multiply(qRel);
+    // The upper arm remains in the baked waiter pose. Conjugating the wrist
+    // delta into the distal group makes the palm/tray world attitude equal the
+    // one IMU's attitude while keeping the arm visually connected.
+    //
+    // hangRef: between the hanging-arm calibration and the explicit tray-level
+    // capture the IMU reference is still the HANGING arm, so deltaQ must be
+    // rendered hang-referenced — X = B⁻¹·qw draws the straight hanging arm at
+    // identity (matching the calibration guide exactly, no snap at handoff) and
+    // lands on the baked tray pose when the user raises 90°. Once the level is
+    // captured (reference = tray pose) the usual X = B⁻¹·qw·B applies.
+    function applyWrist(st, qw, smooth, hangRef = false) {
+      tmpQ.copy(Binv).multiply(qw);
       if (!hangRef) tmpQ.multiply(B);
       if (smooth) {
-        st.proxGroup.quaternion.slerp(qu, 0.35);
+        st.proxGroup.quaternion.slerp(Q_ID, 0.35);
         st.distGroup.quaternion.slerp(tmpQ, 0.35);
       } else {
-        st.proxGroup.quaternion.copy(qu);
+        st.proxGroup.quaternion.copy(Q_ID);
         st.distGroup.quaternion.copy(tmpQ);
       }
     }
@@ -1509,21 +1714,19 @@
           st.distGroup.quaternion.slerp(qGuideDist, 0.35);
         }
       } else {
+        const hangRef = calibrated && !trayLevelSet && !simChk.checked;
         if (simChk.checked) {
           // the sim compensates whatever floor the human is standing on — in
           // robot-solo mode that floor is LEVEL, so the sim just holds steady
           if (episodeRunning || mode === 'idle') simStep(now, mode === 'auto' ? D_LEVEL : (dShow ?? d), dt);
           quatFromTilt(qUser, sim.p.x, sim.p.z);
-          qUpper.identity();
         } else {
-          worldDelta(imuUpper, qUpper);
           worldDelta(imuWrist, qUser);
         }
         // calibrated but level not yet set: reference is the HANGING arm, so
-        // render hang-referenced — the avatar follows the real arm up into
-        // the tray pose instead of showing the tray upright prematurely
-        const hangRef = calibrated && !trayLevelSet && !simChk.checked;
-        applyArm(human, qUpper, qUser, true, hangRef);
+        // render hang-referenced — the avatar follows the real arm up into the
+        // tray pose instead of showing the tray upright prematurely
+        applyWrist(human, qUser, true, hangRef);
 
         // robot-solo: no mirroring — the robot corrects from its OWN tilt
         // "sensor" using the single gain it learned from the demonstration.
@@ -1536,11 +1739,11 @@
           } else {
             qAuto.identity();   // untrained: rigid arm, no corrections — the baseline
           }
-          applyArm(robot, Q_ID, qAuto, true);
+          applyWrist(robot, qAuto, true);
         } else if (followChk.checked) {
-          applyArm(robot, qUpper, qUser, true, hangRef);
+          applyWrist(robot, qUser, true, hangRef);
         } else {
-          applyArm(robot, Q_ID, Q_ID, true);
+          applyWrist(robot, Q_ID, true);
         }
       }
 
@@ -1588,23 +1791,42 @@
       // re-rack) and it's the idle HUMAN tray that gets tidied.
       if (!bottlesHiddenForCal) {
         if (mode === 'auto') tumbleRerack(humanRig, dt);
-        else if (tumbleRerack(robotRig, dt)) robotSpills++;
+        else if (tumbleRerack(robotRig, dt)) {
+          robotSpills++;
+          if (!followChk.checked) {
+            const baselineT = mode === 'demo' ? epT : showcaseT;
+            bestUntrained = Math.max(bestUntrained, baselineT);
+            updateScoreboard();
+            updateActPanels();
+            setPrompt(`baseline · no-correction robot spilled after ${baselineT.toFixed(1)} s`, 'hold');
+            if (mode === 'idle') {
+              showcaseDist = new Disturbance(9000 + seedCounter++, { start: 4, rate: 5 });
+              showcaseT = 0;
+            }
+          }
+        }
       }
       epInfoEl.textContent =
-        mode === 'teach' ? `⏺ recording… ${epT.toFixed(1)} s · ${rec ? rec.n : 0} samples`
-        : mode === 'auto' ? `🤖 robot solo… ${epT.toFixed(1)} s${bestRobot ? ` · robot best ${bestRobot.toFixed(1)}s` : ''}`
-        : mode === 'demo' ? `balancing… ${epT.toFixed(1)} s`
-        : (bestHuman ? `best balance ${bestHuman.toFixed(1)} s` : 'press Start when ready');
+        mode === 'teach' ? `recording examples… ${epT.toFixed(1)} s of 15 s`
+        : mode === 'auto' ? `${learned ? 'learned reflex' : 'untrained baseline'}… ${epT.toFixed(1)} s`
+        : mode === 'demo' ? `live mirroring… ${epT.toFixed(1)} s`
+        : (bestHuman ? `human best ${bestHuman.toFixed(1)} s · continue to step 2` : 'start here, then compare no correction');
 
       controls.update();
       renderer.render(scene, camera);
     }
 
     // --- boot -----------------------------------------------------------------
+    let lastNarrow = innerWidth <= 900;
     function resize() {
       renderer.setSize(innerWidth, innerHeight, false);
       camera.aspect = innerWidth / innerHeight;
       camera.updateProjectionMatrix();
+      const narrow = innerWidth <= 900;
+      if (narrow !== lastNarrow) {
+        lastNarrow = narrow;
+        applyView();
+      }
     }
     addEventListener('resize', resize);
     resize();
@@ -1619,23 +1841,38 @@
     });
     applyView();
     setHand(localStorage.getItem(HAND_KEY) || 'R', false);
+    document.body.dataset.mode = mode;
+    updateCalCards();
+    updateRobotLabel();
     refreshButtons();
     updateTeachInfo();
+    updateActPanels();
     requestAnimationFrame(frame);
 
     addEventListener('beforeunload', () => {
-      upper.client.disconnect?.();
       wrist.client.disconnect?.();
     });
 
     // --- debug/test hooks (no secrets, just state) ------------------------------
     window.__rt = {
-      imus: { upper: imuUpper, wrist: imuWrist },   // synthetic-feed test hook
+      imus: { wrist: imuWrist },   // synthetic-feed test hook
       get state() {
         return {
           mode, calPhase, calibrated, trayLevelSet,
-          bestHuman, bestRobot, epT, robotSpills,
+          bestHuman, bestRobot, bestUntrained, bestLearned, epT, robotSpills,
           learned, recSamples: rec ? rec.n : 0,
+          // human arm render state — how the avatar is actually DRAWN, which
+          // is what the hang-referenced calibration handoff has to get right
+          humanDebug: {
+            trayUp: (() => {
+              const u = new THREE.Vector3(0, 1, 0).applyQuaternion(human.palmFrame.getWorldQuaternion(new THREE.Quaternion()));
+              return { x: +u.x.toFixed(3), y: +u.y.toFixed(3), z: +u.z.toFixed(3) };
+            })(),
+            forearm: (() => {   // forearm long axis (-Y of distGroup) in world
+              const u = new THREE.Vector3(0, -1, 0).applyQuaternion(human.distGroup.getWorldQuaternion(new THREE.Quaternion()));
+              return { x: +u.x.toFixed(3), y: +u.y.toFixed(3), z: +u.z.toFixed(3) };
+            })(),
+          },
           robotDebug: {
             trayY: +robotRig.body.position.y.toFixed(3),
             trayUpY: (() => {
