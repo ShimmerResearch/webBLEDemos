@@ -200,25 +200,7 @@
       content: ""; position: absolute; left: 27px; bottom: 10px; width: 9px; height: 17px;
       background: var(--flex); border-radius: 3px 3px 2px 2px;
     }
-    .tray-glyph.rocking { animation: tray-tip-demo 2.8s ease-in-out infinite; }
-    @keyframes tray-tip-demo {
-      0%, 12%, 92%, 100% { transform: rotate(0deg); }
-      30% { transform: rotate(22deg); }
-      58% { transform: rotate(-22deg); }
-      78% { transform: rotate(18deg); }
-    }
     .tip-words { color: var(--accent); font-size: 9px; margin-top: 2px; }
-    .tray-practice {
-      display: grid; grid-template-columns: 1fr 72px 1fr; gap: 7px; align-items: center;
-      margin: 9px 0 2px; padding: 8px; border: 1px solid var(--accent-dim);
-      border-radius: 10px; background: rgba(45,212,191,.06); text-align: center;
-    }
-    .tray-practice b { display: block; color: var(--text); font-size: 10px; }
-    .tray-practice small { display: block; color: var(--muted); font-size: 9px; line-height: 1.3; }
-    .tray-practice .tray-glyph { margin: 0 auto; }
-    @media (prefers-reduced-motion: reduce) {
-      .tray-glyph.rocking { animation: none; transform: rotate(16deg); }
-    }
 
     .learning-rule {
       display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center;
@@ -417,11 +399,6 @@
     <div class="panel act-panel" id="act2Panel">
       <h2 class="step-title"><span class="step-num">2</span> Teach one balance reflex</h2>
       <p class="caption">Balance for about 10 seconds. We learn one transparent rule: how much wrist correction you use for each degree of floor tilt.</p>
-      <div class="tray-practice" aria-label="Rock the tray backward and forward">
-        <span><b>TIP BACK</b><small>lower the wrist edge</small></span>
-        <span class="tray-glyph rocking"></span>
-        <span><b>TIP FORWARD</b><small>lower the fingertip edge</small></span>
-      </div>
       <div class="learning-rule">
         <span>Floor tilts<b>10°</b></span><span class="arrow">→</span><span>You correct<b id="ruleCorrection">?</b></span>
       </div>
@@ -1701,10 +1678,9 @@
         fitExplanationEl.textContent = 'Each dot is one moment from your demonstration. Keep opposing the floor tilt; the learned equation appears when you stop.';
       } else if (learned) {
         fitFormulaEl.textContent = `y = ${learned.g.toFixed(2)}x`;
-        const consistency = Math.round(100 * Math.max(0, Math.min(1, learned.r2)));
         fitExplanationEl.textContent = plotPoints.length
-          ? `The robot fits one number, m, to these examples: y = mx. Here x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction. Demonstration consistency: ${consistency}%.`
-          : `Saved equation: y = mx, where x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction. Demonstration consistency: ${consistency}%. Record again to see the examples.`;
+          ? 'The robot fits one number, m, to these examples: y = mx. Here x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction.'
+          : 'Saved equation: y = mx, where x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction. Record again to see the examples.';
       } else {
         fitFormulaEl.textContent = plotPoints.length ? 'no valid rule fitted' : 'waiting for examples';
         fitExplanationEl.textContent = plotPoints.length
@@ -1743,14 +1719,20 @@
       ruleCorrectionEl.textContent = learned ? `${(-learned.g * 10).toFixed(1)}° opposite` : '?';
       learnedRuleEl.hidden = !learned;
       learnedRuleEl.textContent = learned
-        ? `Learned rule: for 10° of floor tilt, correct ${(-learned.g * 10).toFixed(1)}° in the opposite direction. Match quality ${(100 * Math.max(0, learned.r2)).toFixed(0)}%.`
+        ? `Learned rule: for 10° of floor tilt, correct ${(-learned.g * 10).toFixed(1)}° in the opposite direction.`
         : '';
       if (mode !== 'auto')   // keep the solo button honest about what it will run
         autoBtn.textContent = learned ? '🤖 Test learned reflex — fresh motion' : '🤖 Run untrained baseline';
       updateScoreboard();
     }
     function updateScoreboard() {
-      baselineScoreEl.textContent = bestUntrained ? `${bestUntrained.toFixed(1)} s` : 'not run';
+      const liveUntrained = mode === 'auto' && !learned && dist && pauseT <= 0 ? epT
+        : mode === 'demo' && !followChk.checked && dist && pauseT <= 0 ? epT
+        : mode === 'idle' && !followChk.checked && showcaseDist ? showcaseT
+        : null;
+      baselineScoreEl.textContent = liveUntrained !== null
+        ? `${liveUntrained.toFixed(1)} s`
+        : bestUntrained ? `${bestUntrained.toFixed(1)} s` : 'not run';
       learnedScoreEl.textContent = bestLearned ? `${bestLearned.toFixed(1)} s` : 'not run';
     }
     teachBtn.addEventListener('click', () => {
@@ -1986,6 +1968,7 @@
         : mode === 'demo' ? `live mirroring… ${epT.toFixed(1)} s`
         : (bestHuman ? `human best ${bestHuman.toFixed(1)} s · continue to step 2` : 'start here, then compare no correction');
 
+      updateScoreboard();
       controls.update();
       renderer.render(scene, camera);
     }
