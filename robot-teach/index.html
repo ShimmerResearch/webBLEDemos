@@ -229,6 +229,33 @@
     .learning-rule .arrow { color: var(--accent); font-size: 18px; }
     #learnedRule { color: var(--good); font-size: 12px; line-height: 1.45; margin: 8px 0; }
 
+    .fit-viz {
+      margin: 10px 0; padding: 9px; border: 1px solid var(--border); border-radius: 10px;
+      background: rgba(13,17,23,.62);
+    }
+    body[data-mode="auto"] #act2Panel { opacity: .88; }
+    .fit-viz-head {
+      display: flex; justify-content: space-between; gap: 8px; align-items: baseline;
+      color: var(--text); font-size: 11px; font-weight: 700;
+    }
+    #fitFormula { color: var(--good); font-size: 10px; font-weight: 600; text-align: right; }
+    #fitPlot { display: block; width: 100%; height: auto; margin-top: 5px; overflow: visible; }
+    .fit-grid { stroke: var(--border); stroke-width: 1; }
+    .fit-axis { stroke: var(--muted); stroke-width: 1; }
+    .fit-tick, .fit-axis-label { fill: var(--muted); font-size: 8px; }
+    .fit-axis-label { font-size: 9px; }
+    .fit-point-lr { fill: var(--accent); opacity: .72; }
+    .fit-point-fb { fill: var(--flex); opacity: .72; }
+    .fit-legend {
+      display: flex; flex-wrap: wrap; gap: 5px 12px; color: var(--muted); font-size: 9px;
+      margin-top: 2px;
+    }
+    .fit-key::before {
+      content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 4px;
+      border-radius: 50%; background: var(--key); vertical-align: 0;
+    }
+    .fit-explain { color: var(--muted); font-size: 10px; line-height: 1.4; margin-top: 7px; }
+
     .scoreboard {
       display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center;
       margin: 10px 0; text-align: center;
@@ -397,6 +424,23 @@
       </div>
       <div class="learning-rule">
         <span>Floor tilts<b>10°</b></span><span class="arrow">→</span><span>You correct<b id="ruleCorrection">?</b></span>
+      </div>
+      <div class="fit-viz">
+        <div class="fit-viz-head">
+          <span>Examples → learned equation</span>
+          <span id="fitFormula">waiting for examples</span>
+        </div>
+        <svg id="fitPlot" viewBox="0 0 300 188" role="img" aria-labelledby="fitPlotTitle fitPlotDesc">
+          <title id="fitPlotTitle">Demonstration examples and learned balance rule</title>
+          <desc id="fitPlotDesc">Floor tilt is plotted against wrist correction. Teal points are left-right examples and orange points are forward-back examples.</desc>
+          <g id="fitGrid"></g>
+          <g id="fitPoints"></g>
+        </svg>
+        <div class="fit-legend">
+          <span class="fit-key" style="--key: var(--accent);">left / right examples</span>
+          <span class="fit-key" style="--key: var(--flex);">forward / back examples</span>
+        </div>
+        <div class="fit-explain" id="fitExplanation">Record a demonstration to collect examples.</div>
       </div>
       <button id="teachBtn" class="wide primary" disabled>⏺ Record my correction</button>
       <div class="stats" id="teachInfo" style="margin: 8px 0;">not trained yet — record a demonstration first</div>
@@ -1334,7 +1378,10 @@
       tiltCapVal.textContent = deg + '°';
       localStorage.setItem('robotTeach.tilt', deg);
     }
-    tiltRange.addEventListener('input', () => applyTiltCap(parseInt(tiltRange.value, 10)));
+    tiltRange.addEventListener('input', () => {
+      applyTiltCap(parseInt(tiltRange.value, 10));
+      renderFitPlot();
+    });
     applyTiltCap(distCap);
 
     const tiltModeBtns = [...document.querySelectorAll('[data-tiltmode]')];
@@ -1497,7 +1544,10 @@
         }
       } else {
         bottlesHiddenForCal = false;   // active modes always show bottles
-        if (m === 'teach') rec = { n: 0, sPP: 0, sPC: 0, sC: 0, sCC: 0 };
+        if (m === 'teach') {
+          plotPoints = [];
+          rec = { n: 0, sPP: 0, sPC: 0, sC: 0, sCC: 0, points: [], lastPlotT: -Infinity };
+        }
         setPrompt(
           m === 'teach' ? '⏺ recording · floor tilt → your wrist correction'
           : m === 'auto' ? (learned ? '🤖 learned reflex · fresh randomized floor motion'
@@ -1508,6 +1558,7 @@
       refreshButtons();
       updateTeachInfo();
       updateActPanels();
+      renderFitPlot();
     }
 
     const actPanels = {
@@ -1537,6 +1588,10 @@
     const teachInfoEl = document.getElementById('teachInfo');
     const ruleCorrectionEl = document.getElementById('ruleCorrection');
     const learnedRuleEl = document.getElementById('learnedRule');
+    const fitGridEl = document.getElementById('fitGrid');
+    const fitPointsEl = document.getElementById('fitPoints');
+    const fitFormulaEl = document.getElementById('fitFormula');
+    const fitExplanationEl = document.getElementById('fitExplanation');
     const baselineScoreEl = document.getElementById('baselineScore');
     const learnedScoreEl = document.getElementById('learnedScore');
     const MIN_TEACH_S = 4;     // s of demonstration below which we refuse to fit
@@ -1545,6 +1600,8 @@
     let bestUntrained = 0;
     let bestLearned = 0;
     let rec = null;            // running sums while recording
+    let plotPoints = [];       // decimated examples retained only for the explanation plot
+    let plotDomain = 30;
     let learned = (() => {
       try {
         const p = JSON.parse(localStorage.getItem(POLICY_KEY) || 'null');
@@ -1562,8 +1619,72 @@
       const sst = rec.sCC - (rec.sC * rec.sC) / rec.n;
       return { g, r2: sst > 1e-9 ? 1 - ssr / sst : 0, secs: epT, when: Date.now() };
     }
+    const PLOT = { left: 35, right: 292, top: 9, bottom: 151 };
+    const svgEl = (name, attrs = {}) => {
+      const el = document.createElementNS('http://www.w3.org/2000/svg', name);
+      for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
+      return el;
+    };
+    const plotDeg = v => Math.asin(Math.max(-1, Math.min(1, v))) * R2D;
+    const plotX = deg => PLOT.left + (deg + plotDomain) / (2 * plotDomain) * (PLOT.right - PLOT.left);
+    const plotY = deg => PLOT.bottom - (deg + plotDomain) / (2 * plotDomain) * (PLOT.bottom - PLOT.top);
+    function renderFitPlot() {
+      plotDomain = Math.max(10, Number(tiltRange.value) || 30);
+      fitGridEl.replaceChildren();
+      for (const ratio of [-1, -.5, 0, .5, 1]) {
+        const value = ratio * plotDomain;
+        const x = plotX(value), y = plotY(value);
+        fitGridEl.append(
+          svgEl('line', { x1: x, y1: PLOT.top, x2: x, y2: PLOT.bottom, class: ratio ? 'fit-grid' : 'fit-axis' }),
+          svgEl('line', { x1: PLOT.left, y1: y, x2: PLOT.right, y2: y, class: ratio ? 'fit-grid' : 'fit-axis' })
+        );
+        if (ratio !== 0) {
+          const xTick = svgEl('text', { x, y: PLOT.bottom + 11, class: 'fit-tick', 'text-anchor': 'middle' });
+          xTick.textContent = `${Math.round(value)}°`;
+          const yTick = svgEl('text', { x: PLOT.left - 5, y: y + 3, class: 'fit-tick', 'text-anchor': 'end' });
+          yTick.textContent = `${Math.round(value)}°`;
+          fitGridEl.append(xTick, yTick);
+        }
+      }
+      const xLabel = svgEl('text', { x: (PLOT.left + PLOT.right) / 2, y: 181, class: 'fit-axis-label', 'text-anchor': 'middle' });
+      xLabel.textContent = 'floor tilt';
+      const yLabel = svgEl('text', {
+        x: 9, y: (PLOT.top + PLOT.bottom) / 2, class: 'fit-axis-label', 'text-anchor': 'middle',
+        transform: `rotate(-90 9 ${(PLOT.top + PLOT.bottom) / 2})`
+      });
+      yLabel.textContent = 'wrist correction';
+      fitGridEl.append(xLabel, yLabel);
+
+      fitPointsEl.replaceChildren(...plotPoints.map(point => svgEl('circle', {
+        cx: plotX(plotDeg(point.p)), cy: plotY(plotDeg(point.c)), r: 2.1,
+        class: point.axis === 'lr' ? 'fit-point-lr' : 'fit-point-fb'
+      })));
+
+      if (mode === 'teach') {
+        fitFormulaEl.textContent = `${Math.floor(plotPoints.length / 2)} moments recorded`;
+        fitExplanationEl.textContent = 'Each dot is one moment from your demonstration. Keep opposing the floor tilt; the learned equation appears when you stop.';
+      } else if (learned) {
+        fitFormulaEl.textContent = `y = ${learned.g.toFixed(2)}x`;
+        const consistency = Math.round(100 * Math.max(0, Math.min(1, learned.r2)));
+        fitExplanationEl.textContent = plotPoints.length
+          ? `The robot fits one number, m, to these examples: y = mx. Here x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction. Demonstration consistency: ${consistency}%.`
+          : `Saved equation: y = mx, where x is floor tilt and y is wrist correction. The negative m means correct in the opposite direction. Demonstration consistency: ${consistency}%. Record again to see the examples.`;
+      } else {
+        fitFormulaEl.textContent = plotPoints.length ? 'no valid rule fitted' : 'waiting for examples';
+        fitExplanationEl.textContent = plotPoints.length
+          ? 'These examples did not produce an opposing correction rule. Try another demonstration.'
+          : 'Record a demonstration to collect examples.';
+      }
+    }
+    function updateLiveCalculation(platformComponent, correctionComponent) {
+      if (mode !== 'auto' || !learned) return;
+      const floorDeg = plotDeg(platformComponent);
+      const correctionDeg = plotDeg(correctionComponent);
+      fitFormulaEl.textContent = `live: ${floorDeg.toFixed(1)}° → ${correctionDeg.toFixed(1)}°`;
+    }
     function finishTeaching(reason) {
       const fit = fitRecording();
+      plotPoints = rec ? rec.points.slice() : [];
       rec = null;
       if (fit && fit.g < -0.05) {   // must push AGAINST the tilt, however gently
         learned = fit;
@@ -1622,10 +1743,12 @@
       if (mode !== 'idle') return;
       learned = null;
       bestLearned = 0;
+      plotPoints = [];
       localStorage.removeItem(POLICY_KEY);
       refreshButtons();
       updateTeachInfo();
       updateActPanels();
+      renderFitPlot();
       setPrompt('learned reflex reset — run a new demonstration');
     });
 
@@ -1740,6 +1863,8 @@
           if (learned) {
             const p = tiltOfR(d);
             quatFromTilt(qAuto, learned.g * p.x, learned.g * p.z);
+            const liveP = Math.abs(p.x) >= Math.abs(p.z) ? p.x : p.z;
+            updateLiveCalculation(liveP, learned.g * liveP);
           } else {
             qAuto.identity();   // untrained: rigid arm, no corrections — the baseline
           }
@@ -1778,6 +1903,15 @@
             const p = tiltOfR(d);
             recordSample(p.x, tAct.x);
             recordSample(p.z, tAct.z);
+            if (epT - rec.lastPlotT >= .1 && rec.points.length <= 298) {
+              rec.lastPlotT = epT;
+              rec.points.push(
+                { axis: 'lr', p: p.x, c: tAct.x },
+                { axis: 'fb', p: p.z, c: tAct.z }
+              );
+              plotPoints = rec.points;
+              renderFitPlot();
+            }
           }
           if (checkSpill(humanRig)) endEpisode('spill');
           else if (epT >= (mode === 'teach' ? TEACH_CAP : EPISODE_CAP)) endEpisode('cap');
@@ -1851,6 +1985,7 @@
     refreshButtons();
     updateTeachInfo();
     updateActPanels();
+    renderFitPlot();
     requestAnimationFrame(frame);
 
     addEventListener('beforeunload', () => {
