@@ -50,8 +50,11 @@ The full Verisense control console now lives in a dedicated repository:
 | Spell caster (gyro gestures) | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/) |
 | Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
 | Consensys trial export + Bluetooth RTC set | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) |
+| RTC drift test (32k crystal, DEV-866) | [rtc-drift-test](https://shimmerresearch.github.io/webBLEDemos/rtc-drift-test/) |
 
 **Consensys Export** packages a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zips it, and shares it. It also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
+
+**RTC Drift Test** measures the Shimmer3R real-world-clock drift against the host clock and least-squares fits the slope in ppm, with NTP host-step detection and CSV export. Also works over the dock UART (Web Serial — preferred, lower jitter than BLE).
 
 ### Verisense
 **Requirements:** Verisense device (IMU or Pulse+), Chrome/Edge
