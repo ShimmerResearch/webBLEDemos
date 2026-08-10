@@ -69,17 +69,18 @@
       <label>Sample every <input id="intervalS" type="number" min="2" max="600" value="30" /> s</label>
       <button id="btnStart" disabled>Start</button>
       <button id="btnStop" disabled>Stop</button>
-      <button id="btnSync" disabled title="Write host time to the device RTC (local civil time, per firmware convention) and restart the fit">Sync RTC to host</button>
+      <button id="btnSync" disabled title="Write host time (UTC, stock Consensys convention) to the device RTC and restart the fit">Sync RTC to host</button>
       <button id="btnRebase" disabled title="Drop collected samples and restart the fit">Reset baseline</button>
       <button id="btnCsv" disabled>Download CSV</button>
       <span id="wakePill" class="pill">wake lock off</span>
     </div>
     <div class="note">
-      Expected on current (pre-cap-fix) boards: the RWC is driven by the 32k LSE, so the
-      fleet's known error shows here directly (DEV-844/DEV-866 predict roughly +40…+65 ppm ≈
-      +3.5…+5.5 s/day fast on 12 pF boards). 22 pF-reworked boards should sit within ±25 ppm
-      if the crystal is truly on-spec — this page is the LSE-only ground truth that
-      S3R_TEST_0028's differential measurement cannot give by itself.
+      The RWC is driven by the 32k LSE, so its error shows here directly — the LSE-only
+      ground truth that S3R_TEST_0028's differential (LSE − HSE) cannot give by itself.
+      First hardware runs (2026-08-10, docked): stock 12 pF Shimmer3R ≈ −9 ppm (near-spec —
+      unlike the Verisense, whose identical BOM ran +40…+65 fast), while a 22 pF-reworked
+      unit ≈ −98 ppm (over-loaded). Docked units read a few ppm low from charge self-heating;
+      a battery/BLE run at ambient gives the spec-comparable figure.
     </div>
   </div>
 
@@ -161,24 +162,30 @@ function ticksFromBytes(u8) {
 }
 
 async function readDeviceSeconds() {
-  // Raw device reading. Firmware convention (DEV-900): the RWC holds LOCAL
-  // civil time, so this is local-civil seconds, not UTC unix seconds.
-  let localSec;
+  // Raw device reading, no convention assumed: different tools set the RWC
+  // with different epoch bases (the Java dock driver / Consensys write UTC
+  // ms x 32.768; the Verisense console writes LOCAL civil time per DEV-900).
+  // The clock-base detection in takeSampleInner absorbs whichever base the
+  // device carries, so the offset stat always shows the true clock error.
   if (mode === "dock") {
     const raw = await client.getConfig(UART_PROP.MAIN_PROCESSOR.CURR_LOCAL_TIME);
     if (!raw || raw.length < 8) throw new Error(`CURR_LOCAL_TIME returned ${raw?.length ?? 0} bytes`);
-    localSec = Number(ticksFromBytes(raw)) / TICKS_PER_SEC;
-  } else {
-    const { unixMs } = await client.getRtcTime();
-    localSec = unixMs / 1000;
+    return Number(ticksFromBytes(raw)) / TICKS_PER_SEC;
   }
-  // Convert to UTC using this computer's current timezone so the offset stat
-  // compares like with like (host side is UTC unix time). Without this a
-  // correctly-synced device shows offset = the timezone (e.g. +3600 s on
-  // IST). A DST transition mid-run shifts this by an hour and is reported as
-  // a device step - rare, and the log makes it explainable.
-  const tzSec = -new Date().getTimezoneOffset() * 60;
-  return localSec - tzSec;
+  const { unixMs } = await client.getRtcTime();
+  return unixMs / 1000;
+}
+
+// Whole-quarter-hour base between the device clock and host UTC, detected
+// from the first sample of a series: covers timezone conventions (any
+// 15-minute-grid zone) and time-set-tool differences without guessing. The
+// residual is the true clock error. Recomputed after any rebaseline/sync.
+let clockBaseSec = null;
+
+function fmtClockBase(sec) {
+  const sign = sec < 0 ? "-" : "+";
+  const a = Math.abs(sec);
+  return `${sign}${Math.floor(a / 3600)}:${String(Math.round((a % 3600) / 60)).padStart(2, "0")} h`;
 }
 
 let sampleInFlight = false;
@@ -209,6 +216,14 @@ async function takeSampleInner() {
   // Host wall time at the midpoint of the round-trip (bounds latency to ±rtt/2).
   const hostSec = (Date.now() - rttMs / 2) / 1000;
   const perfMs = p0 + rttMs / 2;
+
+  if (clockBaseSec === null) {
+    clockBaseSec = Math.round((devSec - hostSec) / 900) * 900;
+    if (clockBaseSec !== 0) {
+      log(`clock base ${fmtClockBase(clockBaseSec)} detected (timezone / time-set convention) — offsets shown relative to it`);
+    }
+  }
+  devSec -= clockBaseSec;
 
   const ev = monitor.addSample({ hostSec, devSec, rttMs: Math.round(rttMs), perfMs });
   if (ev.kind === "host-step") {
@@ -320,6 +335,7 @@ els.dock.onclick = async () => {
       log(`identify failed (continuing): ${e.message}`);
     }
     deviceLabel = label;
+    clockBaseSec = null;
     setConnected(true, `dock · ${label}`);
     log(`connected over dock UART (${label})`);
   } catch (e) {
@@ -333,6 +349,7 @@ els.ble.onclick = async () => {
     await c.connect();
     client = c; mode = "ble";
     deviceLabel = c.deviceName ?? "BLE";
+    clockBaseSec = null;
     setConnected(true, `BLE · ${deviceLabel}`);
     log(`connected over BLE (${deviceLabel}) — note: BLE round-trip jitter is larger than dock UART`);
   } catch (e) {
@@ -396,17 +413,22 @@ els.stop.onclick = () => { stopSampling(); log("sampling stopped"); };
 
 els.sync.onclick = async () => {
   try {
-    // Firmware convention (DEV-900): RWC holds LOCAL civil time.
-    const localMs = Date.now() - new Date().getTimezoneOffset() * 60000;
+    // Write UTC unix ms - the stock Shimmer3/3R convention (the Java dock
+    // driver and Consensys write System.currentTimeMillis() x 32.768). The
+    // Verisense console's local-civil-time convention (DEV-900) does NOT
+    // apply to Shimmer3R; hardware test confirmed Consensys-set boards hold
+    // UTC. Either way the clock-base detection keeps the offset display true.
+    const nowMs = Date.now();
     if (mode === "dock") {
       // The clock is SET by writing RTC_CFG_TIME (0x04) - the firmware's only
       // UART_SET time property; CURR_LOCAL_TIME (0x05) is read-only (BAD_CMD).
-      await client.writeRtcFromHostTime(localMs);
+      await client.writeRtcFromHostTime(nowMs);
     } else {
-      await client.setRtcTime(localMs);
+      await client.setRtcTime(nowMs);
     }
     monitor.rebaseline();
-    log("device RTC synced to host (local civil time) — fit rebaselined");
+    clockBaseSec = null;
+    log("device RTC synced to host (UTC, stock Consensys convention) — fit rebaselined");
     render();
   } catch (e) {
     log(`RTC sync failed: ${e.message}`);
@@ -415,6 +437,7 @@ els.sync.onclick = async () => {
 
 els.rebase.onclick = () => {
   monitor.rebaseline();
+  clockBaseSec = null;
   log("baseline reset — fit restarted");
   render();
 };
@@ -425,6 +448,7 @@ els.csv.onclick = () => {
     `# device: ${deviceLabel} · transport: ${mode}`,
     `# exported: ${new Date().toISOString()}`,
     `# ppm_fit: ${monitor.ppmFit()?.toFixed(2) ?? "n/a"} · device_steps: ${monitor.deviceSteps} · host_steps: ${monitor.hostSteps}`,
+    `# clock_base_s: ${clockBaseSec ?? 0} (whole-quarter-hour base subtracted from device_unix_s; timezone / time-set convention)`,
   ];
   const csv = meta.concat(monitor.toCsvRows()).join("\n");
   const a = document.createElement("a");
