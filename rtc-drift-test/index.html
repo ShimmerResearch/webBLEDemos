@@ -170,7 +170,21 @@ async function readDeviceSeconds() {
   return unixMs / 1000;
 }
 
+let sampleInFlight = false;
+
 async function takeSample() {
+  // One sample at a time: a read slower than the interval (BLE latency,
+  // retries) must not overlap the next tick and interleave monitor updates.
+  if (sampleInFlight) return;
+  sampleInFlight = true;
+  try {
+    await takeSampleInner();
+  } finally {
+    sampleInFlight = false;
+  }
+}
+
+async function takeSampleInner() {
   const p0 = performance.now();
   let devSec;
   try {
@@ -334,6 +348,10 @@ async function acquireWakeLock() {
       wakeLock = await navigator.wakeLock.request("screen");
       els.wake.textContent = "wake lock on"; els.wake.classList.add("on");
       wakeLock.addEventListener("release", () => {
+        // Clear the handle: the UA releases the lock when the tab is
+        // backgrounded, and re-acquisition (visibilitychange below) is
+        // gated on !wakeLock.
+        wakeLock = null;
         els.wake.textContent = "wake lock off"; els.wake.classList.remove("on");
       });
     }
@@ -403,7 +421,9 @@ els.csv.onclick = () => {
   a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
   a.download = `s3r-rtc-drift_${deviceLabel.replace(/[^\w-]+/g, "_")}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
   a.click();
-  URL.revokeObjectURL(a.href);
+  // Delay revocation: revoking immediately after click() can cancel the
+  // download in some browsers (same pattern as consensys-export).
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 };
 
 // Feature detection notices
