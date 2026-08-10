@@ -388,10 +388,9 @@ els.sync.onclick = async () => {
     // Firmware convention (DEV-900): RWC holds LOCAL civil time.
     const localMs = Date.now() - new Date().getTimezoneOffset() * 60000;
     if (mode === "dock") {
-      let ticks = BigInt(Math.round(localMs * 32.768));
-      const payload = new Uint8Array(8);
-      for (let i = 0; i < 8; i++) { payload[i] = Number(ticks & 0xffn); ticks >>= 8n; }
-      await client.setConfig(UART_PROP.MAIN_PROCESSOR.CURR_LOCAL_TIME, payload);
+      // The clock is SET by writing RTC_CFG_TIME (0x04) - the firmware's only
+      // UART_SET time property; CURR_LOCAL_TIME (0x05) is read-only (BAD_CMD).
+      await client.writeRtcFromHostTime(localMs);
     } else {
       await client.setRtcTime(localMs);
     }
