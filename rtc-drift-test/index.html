@@ -161,13 +161,24 @@ function ticksFromBytes(u8) {
 }
 
 async function readDeviceSeconds() {
+  // Raw device reading. Firmware convention (DEV-900): the RWC holds LOCAL
+  // civil time, so this is local-civil seconds, not UTC unix seconds.
+  let localSec;
   if (mode === "dock") {
     const raw = await client.getConfig(UART_PROP.MAIN_PROCESSOR.CURR_LOCAL_TIME);
     if (!raw || raw.length < 8) throw new Error(`CURR_LOCAL_TIME returned ${raw?.length ?? 0} bytes`);
-    return Number(ticksFromBytes(raw)) / TICKS_PER_SEC;
+    localSec = Number(ticksFromBytes(raw)) / TICKS_PER_SEC;
+  } else {
+    const { unixMs } = await client.getRtcTime();
+    localSec = unixMs / 1000;
   }
-  const { unixMs } = await client.getRtcTime();
-  return unixMs / 1000;
+  // Convert to UTC using this computer's current timezone so the offset stat
+  // compares like with like (host side is UTC unix time). Without this a
+  // correctly-synced device shows offset = the timezone (e.g. +3600 s on
+  // IST). A DST transition mid-run shifts this by an hour and is reported as
+  // a device step - rare, and the log makes it explainable.
+  const tzSec = -new Date().getTimezoneOffset() * 60;
+  return localSec - tzSec;
 }
 
 let sampleInFlight = false;
