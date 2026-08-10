@@ -218,9 +218,20 @@ async function takeSampleInner() {
   const perfMs = p0 + rttMs / 2;
 
   if (clockBaseSec === null) {
-    clockBaseSec = Math.round((devSec - hostSec) / 900) * 900;
-    if (clockBaseSec !== 0) {
+    const raw = devSec - hostSec;
+    const base = Math.round(raw / 900) * 900;
+    // Only treat the quarter-hour multiple as a timezone / time-set-convention
+    // base when the residual is small: a genuinely wrong clock (> ~2 min off
+    // the grid) must SHOW as wrong, not be folded into the base - otherwise a
+    // 10-minute error would display as its rounding remainder.
+    if (base !== 0 && Math.abs(raw - base) <= 120) {
+      clockBaseSec = base;
       log(`clock base ${fmtClockBase(clockBaseSec)} detected (timezone / time-set convention) — offsets shown relative to it`);
+    } else {
+      clockBaseSec = 0;
+      if (Math.abs(raw) > 120) {
+        log(`device clock is ${raw >= 0 ? "+" : ""}${raw.toFixed(0)} s off host UTC — consider "Sync RTC to host" before a long run (drift fit is unaffected)`);
+      }
     }
   }
   devSec -= clockBaseSec;
