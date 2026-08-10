@@ -381,6 +381,19 @@ interface WebSerialTransportOptions {
     flowControl?: FlowControlType;
     /** `requestPort` filters. */
     filters?: SerialPortFilter[] | null;
+    /**
+     * DTR (data-terminal-ready) line state asserted right after the port opens.
+     * Defaults to TRUE together with {@link requestToSend}: the Shimmer
+     * single-slot dock wires the docked sensor's reset to the COM-port control
+     * lines and holds the sensor in RESET until both DTR and RTS are asserted,
+     * and asserted lines are also the safe norm for USB-CDC devices (hardware
+     * that ignores them behaves the same either way). Set false only for
+     * hardware that needs the line deasserted.
+     */
+    dataTerminalReady?: boolean;
+    /** RTS (request-to-send) line state asserted right after the port opens.
+     * Defaults to TRUE — see {@link dataTerminalReady}. */
+    requestToSend?: boolean;
     /** Enable verbose console logging. */
     debug?: boolean;
 }
@@ -398,6 +411,7 @@ declare class WebSerialTransport implements ShimmerTransport {
     private readonly _debug;
     private readonly _openOptions;
     private readonly _filters;
+    private readonly _signals;
     private _port;
     private _abort;
     private _reader;
@@ -1382,6 +1396,32 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * identifier format used by Verisense.
      */
     getMacAddress(): Promise<string>;
+    /**
+     * Read the device's real-world clock (GET_RWC_COMMAND).
+     *
+     * The response payload is the current RTC value as a 64-bit little-endian
+     * tick count at 32768 Hz since the Unix epoch (the same unit SET_RWC writes:
+     * `ticks = ms * 32.768`). Intended for RTC drift measurement (DEV-844 /
+     * DEV-866): pair the returned time with a host timestamp taken at the
+     * midpoint of the round-trip and feed {@link RtcDriftMonitor}.
+     *
+     * @returns the raw tick count plus the conversion to Unix milliseconds.
+     */
+    getRtcTime(): Promise<{
+        ticks: bigint;
+        unixMs: number;
+    }>;
+    /**
+     * Set the device's real-world clock (SET_RWC_COMMAND) to the given Unix
+     * millisecond time, encoded as 64-bit little-endian 32768 Hz ticks via the
+     * same {@link msToRtcBytesLE} helper as the dock path (truncating, matching
+     * the Java driver's `(long)(ms * 32.768)`). Call with `Date.now()` to sync
+     * the device clock to the host before a drift run.
+     * NOTE (DEV-900): the device treats RWC as LOCAL civil time — pass a
+     * local-adjusted value if that distinction matters for the use case; for
+     * drift measurement only the rate matters, not the epoch.
+     */
+    setRtcTime(unixMs: number): Promise<void>;
     /** Enable EMG (ADS1292R) in 16-bit mode on EXG1 & EXG2. */
     enableEMG16Bit(): Promise<void>;
     /** Enable EXG test signal in 16-bit mode (useful for verifying ExG hardware). */
@@ -2869,13 +2909,12 @@ declare class WiredShimmerClient extends BaseShimmerClient {
      * PC time. The payload is the 8-byte, LSB-first 32.768 kHz tick count
      * ({@link msToRtcBytesLE}).
      *
-     * NB the target property is `RTC_CFG_TIME` (0x04): the Java props table marks
-     * it READ_ONLY, yet the driver's SET issues a WRITE against it directly
-     * (line 150), which this mirrors by going through the low-level {@link _write}
-     * rather than the permission-checked {@link setConfig}.
-     *
-     * HARDWARE-VERIFY: the RTC payload format and RTC_CFG_TIME write have not been
-     * exercised against a real dock.
+     * NB the target property is `RTC_CFG_TIME` (0x04) — hardware-confirmed
+     * (DEV-866 drift tool bring-up): the firmware's UART_SET handler implements
+     * a time write ONLY for this property (RTC_setTimeFromTicksPtr), while a
+     * SET on CURR_LOCAL_TIME (0x05) is answered with BAD_CMD. The Java props
+     * table's READ_ONLY flag on 0x04 was wrong; the SDK table now says
+     * READ_WRITE, matching the firmware.
      */
     writeRtcFromHostTime(nowMs?: number): Promise<void>;
     /** Non-serialized RTC write — callers must already hold the queue. */

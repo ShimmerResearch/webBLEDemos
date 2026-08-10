@@ -299,6 +299,10 @@
             this._disconnectCbs = new Set();
             this._port = opts.port ?? null;
             this._filters = opts.filters ?? null;
+            this._signals = {
+                dataTerminalReady: opts.dataTerminalReady ?? true,
+                requestToSend: opts.requestToSend ?? true,
+            };
             this._debug = opts.debug ?? false;
             this._openOptions = {
                 baudRate: opts.baudRate ?? 115200,
@@ -321,6 +325,18 @@
                 this._port = await serial.requestPort(this._filters ? { filters: this._filters } : undefined);
             }
             await this._port.open(this._openOptions);
+            // Assert DTR/RTS now that the port is open. The Shimmer single-slot dock
+            // holds the docked sensor in RESET until both lines are asserted, so a
+            // port opened without them leaves the sensor unresponsive. Non-fatal when
+            // unsupported: not every serial stack implements setSignals, and hardware
+            // that ignores the control lines behaves the same either way.
+            try {
+                await this._port.setSignals?.(this._signals);
+            }
+            catch (e) {
+                if (this._debug)
+                    console.warn('[WebSerialTransport] setSignals failed (continuing):', e);
+            }
             this._abort = new AbortController();
             this._startReadLoop(this._abort.signal);
         }
@@ -1369,6 +1385,659 @@
     /** Format a byte as a 2-digit uppercase hex string. */
     function hex2(v) {
         return v.toString(16).padStart(2, '0').toUpperCase();
+    }
+
+    /**
+     * Shimmer wired/dock UART CRC.
+     *
+     * This is the Shimmer-specific 16-bit CRC used by the dock UART protocol — it is
+     * **not** CRC-16/CCITT-FALSE (the algorithm the Verisense client uses in
+     * `../verisense/protocolUtils.ts#crc16_ccitt_false`), so it cannot be reused:
+     * different seed (0xB0CA), a byte-swap step, and an odd-length zero-pad rule.
+     * Ported verbatim from the Java driver:
+     *   com.shimmerresearch.comms.wiredProtocol.ShimmerCrc (ShimmerCrc.java:12-60).
+     *
+     * All functions are pure. Every operation mirrors the Java `int` (32-bit,
+     * two's-complement) arithmetic exactly — JavaScript bitwise operators are also
+     * 32-bit, so the results are byte-for-byte identical (verified against the Java
+     * implementation compiled and run directly; e.g. CRC over `[0x24, 0xFF]` = the
+     * `TEST_ACK` header+command → `0xD9 0xB2`, matching
+     * `AbstractCommsProtocolWired.TEST_ACK`).
+     */
+    /** Seed value for the wired UART CRC (ShimmerCrc.java:29 `CRC_INIT`). */
+    const SHIMMER_UART_CRC_INIT = 0xb0ca;
+    /**
+     * Fold a single byte into the running CRC.
+     * Ported from `ShimmerCrc.shimmerUartCrcByte` (ShimmerCrc.java:12-21).
+     *
+     * NB: only the first and last lines mask to 0xFFFF, exactly as in Java — the
+     * intermediate byte-swap / shift / XOR steps run on the full 32-bit word. Adding
+     * intermediate masks changes the result, so do not "tidy" this.
+     */
+    function shimmerUartCrcByte(crc, b) {
+        crc &= 0xffff;
+        crc = ((crc & 0xffff) >>> 8) | ((crc & 0xffff) << 8);
+        crc ^= b & 0xff;
+        crc ^= (crc & 0xff) >>> 4;
+        crc ^= crc << 12;
+        crc ^= (crc & 0xff) << 5;
+        crc &= 0xffff;
+        return crc;
+    }
+    /**
+     * Compute the 2-byte CRC over the first `len` bytes of `msg`.
+     * Returns `[LSB, MSB]` — the on-wire order (LSB first), matching
+     * `ShimmerCrc.shimmerUartCrcCalc` (ShimmerCrc.java:28-46).
+     *
+     * If `len` is odd, one `0x00` byte is folded in before finalising
+     * (ShimmerCrc.java:37-39) — the padding is part of the algorithm and must be
+     * kept.
+     *
+     * @param msg the input bytes
+     * @param len number of bytes to CRC (defaults to `msg.length`)
+     */
+    function shimmerUartCrcCalc(msg, len = msg.length) {
+        let crc = shimmerUartCrcByte(SHIMMER_UART_CRC_INIT, msg[0]);
+        for (let i = 1; i < len; i++) {
+            crc = shimmerUartCrcByte(crc, msg[i]);
+        }
+        if (len % 2 > 0) {
+            crc = shimmerUartCrcByte(crc, 0x00);
+        }
+        return [crc & 0xff, (crc >> 8) & 0xff];
+    }
+    /**
+     * Validate a full packet whose last two bytes are the CRC (LSB then MSB).
+     * Recomputes over `msg[0 .. length-2)` and compares, matching
+     * `ShimmerCrc.shimmerUartCrcCheck` (ShimmerCrc.java:52-60).
+     */
+    function shimmerUartCrcCheck(msg) {
+        if (msg.length < 3)
+            return false;
+        const [lsb, msb] = shimmerUartCrcCalc(msg, msg.length - 2);
+        return lsb === msg[msg.length - 2] && msb === msg[msg.length - 1];
+    }
+
+    /**
+     * Constants for the Shimmer wired/dock UART protocol.
+     *
+     * Ported from the Java driver's wiredProtocol package:
+     *   com.shimmerresearch.comms.wiredProtocol.UartPacketDetails (UartPacketDetails.java)
+     *   com.shimmerresearch.comms.wiredProtocol.AbstractCommsProtocolWired
+     *
+     * This is the protocol a Shimmer speaks when docked in a BasicDock/Base over the
+     * dock's FTDI UART (host↔device). It is unrelated to the LiteProtocol used by
+     * `Shimmer3Client` / `Shimmer3RClient` over Bluetooth — different framing,
+     * commands, addressing and CRC.
+     */
+    /** ASCII `$` — every packet starts with this byte (UartPacketDetails.java:28). */
+    const UART_PACKET_HEADER = 0x24;
+    /**
+     * Serial-line settings for the dock FTDI UART (SerialPortCommJssc.connect:
+     * 8 data bits, 1 stop bit, no parity, no flow control; baud below). These are
+     * transport-level hints — the codec/client are byte-pipe-agnostic — surfaced so
+     * a Web Serial / native transport can configure the port. Baud from
+     * AbstractSerialPortHal.SHIMMER_UART_BAUD_RATES.SHIMMER3_DOCKED = 115200.
+     */
+    const UART_DOCK_BAUD_RATE = 115200;
+    /**
+     * UART packet commands (`enum UART_PACKET_CMD`, UartPacketDetails.java:34-54).
+     * WRITE/READ are host→device requests; the rest are device→host responses.
+     */
+    const UART_PACKET_CMD = Object.freeze({
+        /** Host→device: set a component property (expects ACK). */
+        WRITE: 0x01,
+        /** Device→host: the data payload for a READ (carries component+property). */
+        DATA_RESPONSE: 0x02,
+        /** Host→device: get a component property (expects DATA_RESPONSE). */
+        READ: 0x03,
+        /** Device→host: unrecognised command. */
+        BAD_CMD_RESPONSE: 0xfc, // 252
+        /** Device→host: bad argument. */
+        BAD_ARG_RESPONSE: 0xfd, // 253
+        /** Device→host: CRC mismatch on the received command. */
+        BAD_CRC_RESPONSE: 0xfe, // 254
+        /** Device→host: command accepted (the response to a successful WRITE). */
+        ACK_RESPONSE: 0xff, // 255
+    });
+    /**
+     * UART components — the addressable sub-systems (`enum UART_COMPONENT`,
+     * UartPacketDetails.java:57-80).
+     */
+    const UART_COMPONENT = Object.freeze({
+        MAIN_PROCESSOR: 0x01,
+        BAT: 0x02,
+        DAUGHTER_CARD: 0x03,
+        PPG: 0x04,
+        GSR: 0x05,
+        LSM303DLHC_ACCEL: 0x06,
+        MPU9X50_ACCEL: 0x07,
+        BEACON: 0x08,
+        RADIO_802154: 0x09,
+        RADIO_BLUETOOTH: 0x0a,
+        TEST: 0x0b,
+    });
+    const cp = (component, property, permission, name) => Object.freeze({ component, property, permission, name });
+    /**
+     * The component/property table (`UART_COMPONENT_AND_PROPERTY`,
+     * UartPacketDetails.java:98-160). Only the groups relevant to a docked
+     * Shimmer3/3R identify + status + config path are surfaced; the GQ-only
+     * 802.15.4 radio and device-self-test entries are omitted from D1 (see README).
+     */
+    const UART_PROP = Object.freeze({
+        MAIN_PROCESSOR: Object.freeze({
+            ENABLE: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x00, 'READ_WRITE', 'ENABLE'),
+            SAMPLE_RATE: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x01, 'READ_WRITE', 'SAMPLE_RATE'),
+            MAC: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x02, 'READ_WRITE', 'MAC'),
+            VER: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x03, 'READ_ONLY', 'VER'),
+            /* Access flags verified against the firmware handler (log-and-stream-common
+             * Comms/shimmer_dock_usart.c): UART_SET is implemented ONLY for
+             * RWC_CFG_TIME (0x04) — writing it calls RTC_setTimeFromTicksPtr(), i.e.
+             * this is the property that SETS the clock (payload from msToRtcBytesLE);
+             * reading it returns the time at which the RTC was last configured.
+             * CURR_LOCAL_TIME (0x05) is GET-only (current RTC value) — a SET is
+             * answered with BAD_CMD. */
+            RTC_CFG_TIME: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x04, 'READ_WRITE', 'RTC_CFG_TIME'),
+            CURR_LOCAL_TIME: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x05, 'READ_ONLY', 'CURR_LOCAL_TIME'),
+            INFOMEM: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x06, 'READ_WRITE', 'INFOMEM'),
+            LED0_STATE: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x07, 'READ_WRITE', 'LED_TOGGLE'),
+            DEVICE_BOOT: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x08, 'READ_ONLY', 'DEVICE_BOOT'),
+            ENTER_BOOTLOADER: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x09, 'WRITE_ONLY', 'ENTER_BOOTLOADER'),
+        }),
+        BAT: Object.freeze({
+            ENABLE: cp(UART_COMPONENT.BAT, 0x00, 'READ_WRITE', 'ENABLE'),
+            VALUE: cp(UART_COMPONENT.BAT, 0x02, 'READ_ONLY', 'VALUE'),
+            FREQ_DIVIDER: cp(UART_COMPONENT.BAT, 0x06, 'READ_WRITE', 'DIVIDER'),
+        }),
+        GSR: Object.freeze({
+            ENABLE: cp(UART_COMPONENT.GSR, 0x00, 'READ_WRITE', 'ENABLE'),
+            RANGE: cp(UART_COMPONENT.GSR, 0x03, 'READ_WRITE', 'RANGE'),
+            FREQ_DIVIDER: cp(UART_COMPONENT.GSR, 0x06, 'READ_WRITE', 'DIVIDER'),
+        }),
+        PPG: Object.freeze({
+            ENABLE: cp(UART_COMPONENT.PPG, 0x00, 'READ_WRITE', 'ENABLE'),
+            FREQ_DIVIDER: cp(UART_COMPONENT.PPG, 0x06, 'READ_WRITE', 'DIVIDER'),
+        }),
+        DAUGHTER_CARD: Object.freeze({
+            CARD_ID: cp(UART_COMPONENT.DAUGHTER_CARD, 0x02, 'READ_WRITE', 'CARD_ID'),
+            CARD_MEM: cp(UART_COMPONENT.DAUGHTER_CARD, 0x03, 'READ_WRITE', 'CARD_MEM'),
+        }),
+        LSM303DLHC_ACCEL: Object.freeze({
+            ENABLE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x00, 'READ_WRITE', 'ENABLE'),
+            DATA_RATE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x02, 'READ_WRITE', 'DATA_RATE'),
+            RANGE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x03, 'READ_WRITE', 'RANGE'),
+            LP_MODE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x04, 'READ_WRITE', 'LP_MODE'),
+            HR_MODE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x05, 'READ_WRITE', 'HR_MODE'),
+            FREQ_DIVIDER: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x06, 'READ_WRITE', 'FREQ_DIVIDER'),
+            CALIBRATION: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x07, 'READ_WRITE', 'CALIBRATION'),
+        }),
+        BEACON: Object.freeze({
+            ENABLE: cp(UART_COMPONENT.BEACON, 0x00, 'READ_WRITE', 'ENABLE'),
+            FREQ_DIVIDER: cp(UART_COMPONENT.BEACON, 0x06, 'READ_WRITE', 'DIVIDER'),
+        }),
+        BLUETOOTH: Object.freeze({
+            VER: cp(UART_COMPONENT.RADIO_BLUETOOTH, 0x03, 'READ_ONLY', 'BT_FW_VER'),
+        }),
+    });
+    /**
+     * The ordered list of component/properties the Java config loops iterate
+     * (`UartPacketDetails.mListOfUartCommandsConfig`, UartPacketDetails.java:172-197).
+     *
+     * NB: this list is GQ-oriented. `BasicDock.internalReadAllConfigByUart` only
+     * issues each entry when the docked device's version is compatible
+     * (`isVerCompatibleWithAnyOf`), and for a Shimmer3/3R the real configuration
+     * path is InfoMem — not this list. It is surfaced here verbatim (same order) so
+     * a caller can drive property-level get/set exactly as the Java does, and to
+     * document precisely which properties the wired protocol exposes as discrete
+     * commands. See README for what maps to the app config model.
+     */
+    const UART_CONFIG_COMMANDS = Object.freeze([
+        UART_PROP.BAT.ENABLE,
+        UART_PROP.BAT.FREQ_DIVIDER,
+        UART_PROP.LSM303DLHC_ACCEL.ENABLE,
+        UART_PROP.LSM303DLHC_ACCEL.DATA_RATE,
+        UART_PROP.LSM303DLHC_ACCEL.RANGE,
+        UART_PROP.LSM303DLHC_ACCEL.LP_MODE,
+        UART_PROP.LSM303DLHC_ACCEL.HR_MODE,
+        UART_PROP.LSM303DLHC_ACCEL.FREQ_DIVIDER,
+        UART_PROP.LSM303DLHC_ACCEL.CALIBRATION,
+        UART_PROP.GSR.ENABLE,
+        UART_PROP.GSR.RANGE,
+        UART_PROP.GSR.FREQ_DIVIDER,
+        UART_PROP.BEACON.ENABLE,
+        UART_PROP.BEACON.FREQ_DIVIDER,
+    ]);
+    /**
+     * Packet framing overhead (UartPacketDetails.java:30-31).
+     * DATA = header + cmd + length + component + property (CRC counted in length).
+     * OTHER = header + cmd + CRC-LSB + CRC-MSB.
+     */
+    const PACKET_OVERHEAD_RESPONSE_DATA = 5;
+    const PACKET_OVERHEAD_RESPONSE_OTHER = 4;
+    /**
+     * Request/response timing (AbstractCommsProtocolWired.java).
+     * SERIAL_PORT_TIMEOUT = 500 ms (line 69), polled at 100 ms intervals in
+     * `waitForResponse` (line 507). Retry is a dock-layer concern
+     * (`AbstractDock.READ_MAC_RETRY_ATTEMPTS = 2`), not the comms layer.
+     */
+    const WIRED_DEFAULTS = Object.freeze({
+        /** Per-request response timeout (ms). Matches Java SERIAL_PORT_TIMEOUT. */
+        RESPONSE_TIMEOUT_MS: 500,
+        /** MAC-read retry attempts, from AbstractDock.READ_MAC_RETRY_ATTEMPTS. */
+        MAC_READ_RETRIES: 2,
+    });
+    /** Charging-status raw bytes (ShimmerBattStatusDetails.CHARGING_STATUS_BYTE). */
+    const CHARGING_STATUS_BYTE = Object.freeze({
+        SUSPENDED: 0xc0,
+        FULLY_CHARGED: 0x40,
+        PRECONDITIONING: 0x80,
+        BAD_BATTERY: 0x00,
+        UNKNOWN: 0xff,
+    });
+
+    /**
+     * Pure codec for the Shimmer wired/dock UART protocol.
+     *
+     * Everything here is a side-effect-free function so it can be unit-tested with
+     * byte fixtures and reused by the {@link WiredShimmerClient} regardless of the
+     * byte pipe underneath. Ported from the Java driver:
+     *   com.shimmerresearch.comms.wiredProtocol.AbstractCommsProtocolWired
+     *     (#assembleTxPacket — TX build, AbstractCommsProtocolWired.java:404-456)
+     *     (#processRxBuf     — RX framing, :639-757)
+     *   com.shimmerresearch.comms.wiredProtocol.UartRxPacketObject (RX field parse)
+     *   com.shimmerresearch.comms.wiredProtocol.CommsProtocolWiredShimmerViaDock
+     *     (MAC / VER / battery response parsing)
+     *   com.shimmerresearch.driverUtilities.ShimmerVerObject#parseVersionByteArray
+     *   com.shimmerresearch.driverUtilities.ShimmerBattStatusDetails
+     *   com.shimmerresearch.driverUtilities.ExpansionBoardDetails
+     */
+    // ---------------------------------------------------------------------------
+    // TX — packet assembly
+    // ---------------------------------------------------------------------------
+    /**
+     * Assemble a command packet: `$ | cmd | [length] | [comp | prop] | [payload] | crcLSB | crcMSB`.
+     *
+     * Mirrors `AbstractCommsProtocolWired#assembleTxPacket` (AbstractCommsProtocolWired.java:404-456):
+     * - the LENGTH byte = component(1) + property(1) + payload.length, and is
+     *   OMITTED entirely when that sum is 0 (i.e. an ACK/bad-response echo with no
+     *   arg) — see the `msgLength>0` guard at lines 414/435;
+     * - the CRC (2 bytes, LSB then MSB) is computed over the whole preceding buffer
+     *   and appended, and is NOT counted in the LENGTH byte.
+     *
+     * @param command one of `UART_PACKET_CMD`
+     * @param arg     the component/property address, or null (ACK / bad responses)
+     * @param payload optional value bytes (for WRITE / mem commands), or null
+     */
+    function buildUartPacket(command, arg, payload = null) {
+        const compPropLen = arg ? 2 : 0;
+        const valueLen = payload ? payload.length : 0;
+        const msgLength = compPropLen + valueLen;
+        const pre = [UART_PACKET_HEADER, command & 0xff];
+        if (msgLength > 0)
+            pre.push(msgLength & 0xff);
+        if (arg) {
+            pre.push(arg.component & 0xff, arg.property & 0xff);
+        }
+        if (payload) {
+            for (const b of payload)
+                pre.push(b & 0xff);
+        }
+        const preU8 = Uint8Array.from(pre);
+        const [crcLsb, crcMsb] = shimmerUartCrcCalc(preU8, preU8.length);
+        return concatU8(preU8, Uint8Array.from([crcLsb, crcMsb]));
+    }
+    /** Build a READ (get) request for a component/property. */
+    function buildReadPacket(arg) {
+        return buildUartPacket(UART_PACKET_CMD.READ, arg);
+    }
+    /** Build a WRITE (set) request for a component/property with a value payload. */
+    function buildWritePacket(arg, value) {
+        return buildUartPacket(UART_PACKET_CMD.WRITE, arg, value);
+    }
+    /**
+     * Build the memory-read payload used by INFOMEM / daughter-card reads:
+     * `[sizeByte] [addressBytes...]`. The address is 2 bytes little-endian, except
+     * for `DAUGHTER_CARD.CARD_ID` where it is a single byte
+     * (AbstractCommsProtocolWired#shimmerUartGetMemCommand, :293-309).
+     */
+    function buildMemReadPayload(arg, address, size) {
+        const singleByteAddr = isDaughterCardId(arg);
+        const addr = singleByteAddr
+            ? Uint8Array.from([address & 0xff])
+            : Uint8Array.from([address & 0xff, (address >> 8) & 0xff]); // little-endian
+        return concatU8(Uint8Array.from([size & 0xff]), addr);
+    }
+    /**
+     * Build the memory-write payload: `[sizeByte] [addressBytes...] [data...]`
+     * (AbstractCommsProtocolWired#shimmerUartSetMemCommand, :341-360). `size` is the
+     * data length. Address encoding matches {@link buildMemReadPayload}.
+     */
+    function buildMemWritePayload(arg, address, data) {
+        const head = buildMemReadPayload(arg, address, data.length);
+        return concatU8(head, data);
+    }
+    function isDaughterCardId(arg) {
+        return arg.component === 0x03 && arg.property === 0x02;
+    }
+    // ---------------------------------------------------------------------------
+    // RTC (real-world clock) payload — set from host time
+    // ---------------------------------------------------------------------------
+    /**
+     * Encode a UNIX-epoch millisecond value as the 8-byte, LSB-first RTC payload the
+     * Shimmer expects on `MAIN_PROCESSOR.RTC_CFG_TIME`.
+     *
+     * Ported byte-for-byte from `UtilShimmer.convertMilliSecondsToShimmerRtcDataBytesLSB`
+     * (UtilShimmer.java:854-868):
+     *   1. `ticks = (long)((double)milliseconds * 32.768)` — the 32.768 kHz RTC tick
+     *      count; the `(long)` cast truncates toward zero (`Math.trunc` here matches,
+     *      since the IEEE-754 double multiply is identical).
+     *   2. `ByteBuffer.allocate(8).putLong(ticks)` — 8 bytes big-endian (…MSB).
+     *   3. `ArrayUtils.reverse(...)` — reversed to little-endian (LSB first).
+     *
+     * BigInt is used for the 64-bit width so the full 8-byte tick count is exact
+     * (host-time ticks are ~5.6e13 in 2026 — within double range, but BigInt keeps
+     * the byte extraction exact regardless).
+     *
+     * HARDWARE-VERIFY: this exact 8-byte LSB-first tick encoding has not been
+     * exercised against a real dock/Shimmer; it is a faithful port of the Java only.
+     */
+    function msToRtcBytesLE(milliseconds) {
+        const ticks = BigInt(Math.trunc(milliseconds * 32.768));
+        const out = new Uint8Array(8);
+        let v = ticks;
+        for (let i = 0; i < 8; i++) {
+            out[i] = Number(v & 0xffn); // LSB first
+            v >>= 8n;
+        }
+        return out;
+    }
+    // HW/FW identity codes referenced by the RTC-config gate below
+    // (ShimmerVerDetails.HW_ID / FW_ID). Only the values the gate reads are defined.
+    const RTC_HW_ID = Object.freeze({
+        SHIMMER_3: 3,
+        SHIMMER_GQ_BLE: 5,
+        SHIMMER_2R_GQ: 9,
+        SHIMMER_3R: 10,
+        SHIMMER_GQ_802154_LR: 56,
+        SHIMMER_GQ_802154_NR: 57,
+        SHIMMER_4_SDK: 58,
+    });
+    const RTC_FW_ID = Object.freeze({
+        SDLOG: 2,
+        LOGANDSTREAM: 3,
+        GQ_BLE: 5,
+        STROKARE: 15,
+    });
+    /**
+     * Whether the docked device supports setting its real-world clock over the dock
+     * UART. Faithful port of `ShimmerVerObject.isSupportedRtcConfigViaUart(hwVer, fwId)`
+     * (ShimmerVerObject.java:405-418) — desktop `CallableWriteConfig` only issues the
+     * RTC write when this is true (BasicDock.java:1564), and SKIPS it otherwise. For
+     * the Shimmer3/3R scope: Shimmer3 requires SDLog/LogAndStream/StroKare firmware;
+     * Shimmer3R is supported on any firmware. The GQ/Shimmer4 branches are ported
+     * verbatim for completeness.
+     */
+    function isSupportedRtcConfigViaUart(hwVer, fwId) {
+        if ((hwVer === RTC_HW_ID.SHIMMER_3 && fwId === RTC_FW_ID.SDLOG) ||
+            (hwVer === RTC_HW_ID.SHIMMER_3 && fwId === RTC_FW_ID.LOGANDSTREAM) ||
+            (hwVer === RTC_HW_ID.SHIMMER_3 && fwId === RTC_FW_ID.STROKARE) ||
+            (hwVer === RTC_HW_ID.SHIMMER_GQ_BLE && fwId === RTC_FW_ID.GQ_BLE) ||
+            hwVer === RTC_HW_ID.SHIMMER_GQ_802154_NR ||
+            hwVer === RTC_HW_ID.SHIMMER_GQ_802154_LR ||
+            hwVer === RTC_HW_ID.SHIMMER_2R_GQ ||
+            hwVer === RTC_HW_ID.SHIMMER_4_SDK ||
+            hwVer === RTC_HW_ID.SHIMMER_3R) {
+            return true;
+        }
+        return false;
+    }
+    // ---------------------------------------------------------------------------
+    // RX — framing (reassembly length) + single-packet parse
+    // ---------------------------------------------------------------------------
+    /** Sentinel: not enough bytes buffered yet to know the message length. */
+    const NEED_MORE$1 = -1;
+    /** Sentinel: leading byte is not a valid header/command — caller drops 1 byte. */
+    const RESYNC$1 = 0;
+    /**
+     * Given the head of the accumulated RX buffer, return the total byte length of
+     * the complete UART packet it starts with, or {@link NEED_MORE} / {@link RESYNC}.
+     *
+     * This is the primitive that makes the unframed serial stream tractable: the
+     * dock UART (over FTDI serial) delivers bytes split or coalesced arbitrarily, so
+     * the client cannot assume one read == one packet. The Java driver solves the
+     * same problem in `processRxBuf` with blocking top-up reads that know each
+     * packet's length from `PACKET_OVERHEAD_RESPONSE_* + payloadLength`
+     * (AbstractCommsProtocolWired.java:661-680); this expresses that as a pure
+     * function.
+     *
+     * - Header must be `$` (0x24); otherwise RESYNC.
+     * - DATA_RESPONSE/READ/WRITE: length = 5 + LENGTH-byte (needs index 2 present).
+     * - ACK / BAD_*: length = 4.
+     */
+    function wiredPacketLength(buf) {
+        if (buf.length === 0)
+            return NEED_MORE$1;
+        if (buf[0] !== UART_PACKET_HEADER)
+            return RESYNC$1;
+        if (buf.length < 2)
+            return NEED_MORE$1;
+        const cmd = buf[1];
+        if (cmd === UART_PACKET_CMD.DATA_RESPONSE ||
+            cmd === UART_PACKET_CMD.READ ||
+            cmd === UART_PACKET_CMD.WRITE) {
+            if (buf.length < 3)
+                return NEED_MORE$1; // need the LENGTH byte at index 2
+            return PACKET_OVERHEAD_RESPONSE_DATA + buf[2];
+        }
+        if (cmd === UART_PACKET_CMD.ACK_RESPONSE ||
+            cmd === UART_PACKET_CMD.BAD_CMD_RESPONSE ||
+            cmd === UART_PACKET_CMD.BAD_ARG_RESPONSE ||
+            cmd === UART_PACKET_CMD.BAD_CRC_RESPONSE) {
+            return PACKET_OVERHEAD_RESPONSE_OTHER;
+        }
+        return RESYNC$1; // unknown command byte
+    }
+    /**
+     * Parse exactly one complete packet from the START of `buf`. The caller is
+     * responsible for having ensured a full packet is present (via
+     * {@link wiredPacketLength}); the length is recomputed here and used to slice.
+     *
+     * Field extraction mirrors `UartRxPacketObject` (UartRxPacketObject.java:34-72):
+     * for DATA_RESPONSE/READ/WRITE the LENGTH byte at index 2 counts
+     * component+property+payload, so the payload is `LENGTH-2` bytes starting at
+     * index 5 and the CRC is the final 2 bytes. CRC is validated with
+     * `shimmerUartCrcCheck` over the whole packet (AbstractCommsProtocolWired
+     * #parseSinglePacket, :760-767).
+     *
+     * @throws if `buf` does not start with a header or is too short for the packet.
+     */
+    function parseUartPacket(buf) {
+        if (buf.length < 2 || buf[0] !== UART_PACKET_HEADER) {
+            throw new Error('parseUartPacket: buffer does not start with a UART packet header');
+        }
+        const command = buf[1];
+        const total = wiredPacketLength(buf);
+        if (total <= 0 || buf.length < total) {
+            throw new Error('parseUartPacket: incomplete packet');
+        }
+        const packet = buf.subarray(0, total);
+        const crcOk = shimmerUartCrcCheck(packet);
+        if (command === UART_PACKET_CMD.DATA_RESPONSE ||
+            command === UART_PACKET_CMD.READ ||
+            command === UART_PACKET_CMD.WRITE) {
+            const lengthByte = buf[2];
+            const component = buf[3];
+            const property = buf[4];
+            // payload = LENGTH-2 bytes at offset 5 (comp+prop already consumed).
+            const payloadLen = Math.max(0, lengthByte - 2);
+            const payload = new Uint8Array(packet.subarray(5, 5 + payloadLen));
+            return { command, component, property, payload, crcOk, length: total };
+        }
+        // ACK / BAD_* — no component/property/payload.
+        return {
+            command,
+            component: null,
+            property: null,
+            payload: new Uint8Array(0),
+            crcOk,
+            length: total,
+        };
+    }
+    /** True when a parsed command byte is one of the device error responses. */
+    function isBadResponse(command) {
+        return (command === UART_PACKET_CMD.BAD_CMD_RESPONSE ||
+            command === UART_PACKET_CMD.BAD_ARG_RESPONSE ||
+            command === UART_PACKET_CMD.BAD_CRC_RESPONSE);
+    }
+    /** Map a bad-response command byte to a human-readable reason. */
+    function badResponseReason(command) {
+        switch (command) {
+            case UART_PACKET_CMD.BAD_CMD_RESPONSE:
+                return 'BAD_CMD';
+            case UART_PACKET_CMD.BAD_ARG_RESPONSE:
+                return 'BAD_ARG';
+            case UART_PACKET_CMD.BAD_CRC_RESPONSE:
+                return 'BAD_CRC';
+            default:
+                return `0x${command.toString(16)}`;
+        }
+    }
+    // ---------------------------------------------------------------------------
+    // Response payload parsers
+    // ---------------------------------------------------------------------------
+    /**
+     * Format a MAC-address payload as a 12-char UPPERCASE hex string (no
+     * separators), taking the first 6 bytes in the order the device sends them.
+     * Mirrors `CommsProtocolWiredShimmerViaDock#readMacId` (:40-53) +
+     * `UtilShimmer.bytesToHexString`, whose `hexArray = "0123456789ABCDEF"` renders
+     * uppercase — matching this SDK's Verisense MAC/hex rendering.
+     */
+    function parseMacId(payload) {
+        if (payload.length < 6)
+            throw new Error('MAC payload too short (need 6 bytes)');
+        let s = '';
+        for (let i = 0; i < 6; i++)
+            s += payload[i].toString(16).toUpperCase().padStart(2, '0');
+        return s;
+    }
+    /**
+     * Parse a VER response payload. Accepts the 7-byte (1-byte HW version) or
+     * 8-byte (2-byte HW version) layout, matching
+     * `ShimmerVerObject#parseVersionByteArray` (ShimmerVerObject.java:193-217):
+     *   7-byte: [hw][fwId LE(2)][major LE(2)][minor][internal]
+     *   8-byte: [hw LE(2)][fwId LE(2)][major LE(2)][minor][internal]
+     */
+    function parseVersionInfo(payload) {
+        if (payload.length !== 7 && payload.length !== 8) {
+            throw new Error(`VER payload must be 7 or 8 bytes, got ${payload.length}`);
+        }
+        let i = 0;
+        let hardwareVersion;
+        if (payload.length === 7) {
+            hardwareVersion = payload[i++] & 0xff;
+        }
+        else {
+            hardwareVersion = (payload[i++] | (payload[i++] << 8)) & 0xffff;
+        }
+        const firmwareIdentifier = (payload[i++] | (payload[i++] << 8)) & 0xffff;
+        const firmwareVersionMajor = (payload[i++] | (payload[i++] << 8)) & 0xffff;
+        const firmwareVersionMinor = payload[i++] & 0xff;
+        const firmwareVersionInternal = payload[i] & 0xff;
+        return {
+            hardwareVersion,
+            firmwareIdentifier,
+            firmwareVersionMajor,
+            firmwareVersionMinor,
+            firmwareVersionInternal,
+        };
+    }
+    const BATTERY_ERROR_VOLTAGE = 4.5;
+    /**
+     * Convert a raw 12-bit battery ADC value to volts.
+     * `adcValToBattVoltage` (ShimmerBattStatusDetails.java:143-147): the U12 ADC is
+     * calibrated to millivolts (Vref=3 V, gain=1, offset=0 — reusing the shared
+     * {@link calibrateU12AdcValue}), scaled by the on-board divider factor 1.988,
+     * then converted mV→V.
+     */
+    function battAdcToVoltage(adcValue) {
+        const mv = calibrateU12AdcValue(adcValue, 0, 3, 1);
+        return (mv * 1.988) / 1000;
+    }
+    /**
+     * 4th-order polynomial charge-% estimate from voltage
+     * (ShimmerBattStatusDetails#battVoltageToBattPercentage, :175-181), with the
+     * pre-clamp to [3.2, 4.167] V and post-clamp to [0, 100]
+     * (#calculateBattPercentage, :155-173).
+     */
+    function battVoltageToPercentage(voltage) {
+        let v = voltage;
+        if (v > 4.167 + 0.2)
+            v = 4.167;
+        else if (v < 3.2 - 0.2)
+            v = 3.2;
+        let pct = 1109.739792 * v ** 4 -
+            17167.12674 * v ** 3 +
+            99232.71686 * v ** 2 -
+            253825.397 * v +
+            242266.0527;
+        if (pct > 100)
+            pct = 100;
+        else if (pct < 0)
+            pct = 0;
+        return pct;
+    }
+    function decodeChargingStatus(raw, voltage) {
+        if (voltage > BATTERY_ERROR_VOLTAGE)
+            return 'CHECKING';
+        switch (raw & 0xff) {
+            case CHARGING_STATUS_BYTE.SUSPENDED:
+                return 'SUSPENDED';
+            case CHARGING_STATUS_BYTE.FULLY_CHARGED:
+                return 'FULLY_CHARGED';
+            case CHARGING_STATUS_BYTE.PRECONDITIONING:
+                return 'CHARGING';
+            case CHARGING_STATUS_BYTE.BAD_BATTERY:
+                return 'BAD_BATTERY';
+            case CHARGING_STATUS_BYTE.UNKNOWN:
+                return 'UNKNOWN';
+            default:
+                return 'ERROR';
+        }
+    }
+    /**
+     * Parse a BAT.VALUE response payload (needs ≥3 bytes). ADC is a 12-bit
+     * little-endian value in bytes [0..1] (LSB first), charging status byte [2]
+     * (ShimmerBattStatusDetails.java:74-82).
+     */
+    function parseBatteryStatus(payload) {
+        if (payload.length < 3)
+            throw new Error('battery payload too short (need 3 bytes)');
+        const adcValue = ((payload[1] & 0xff) << 8) | (payload[0] & 0xff);
+        const voltage = battAdcToVoltage(adcValue);
+        const chargingStatusRaw = payload[2] & 0xff;
+        const percentage = voltage <= BATTERY_ERROR_VOLTAGE ? battVoltageToPercentage(voltage) : null;
+        return {
+            adcValue,
+            voltage,
+            percentage,
+            chargingStatusRaw,
+            chargingStatus: decodeChargingStatus(chargingStatusRaw, voltage),
+        };
+    }
+    /**
+     * Parse the first 3 bytes of a daughter-card CARD_ID read as
+     * `[boardId, boardRev, specialRev]` (ExpansionBoardDetails.java:58-60). Returns
+     * null when the board is absent (an unwritten card memory reads back all 0xFF).
+     */
+    function parseExpansionBoard(payload) {
+        if (payload.length < 3)
+            return null;
+        const boardId = payload[0] & 0xff;
+        const boardRev = payload[1] & 0xff;
+        const specialRev = payload[2] & 0xff;
+        if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
+            return null;
+        return { boardId, boardRev, specialRev };
     }
 
     /**
@@ -2602,6 +3271,63 @@
             return mac;
         }
         // ---------------------------------------------------------------------------
+        // Real-world clock (RWC)
+        // ---------------------------------------------------------------------------
+        /**
+         * Read the device's real-world clock (GET_RWC_COMMAND).
+         *
+         * The response payload is the current RTC value as a 64-bit little-endian
+         * tick count at 32768 Hz since the Unix epoch (the same unit SET_RWC writes:
+         * `ticks = ms * 32.768`). Intended for RTC drift measurement (DEV-844 /
+         * DEV-866): pair the returned time with a host timestamp taken at the
+         * midpoint of the round-trip and feed {@link RtcDriftMonitor}.
+         *
+         * @returns the raw tick count plus the conversion to Unix milliseconds.
+         */
+        async getRtcTime() {
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_RWC_COMMAND]), 1500);
+            const rsp = remainder && remainder[0] === OPCODES.RWC_RESPONSE
+                ? remainder
+                : await this._waitForResponse(OPCODES.RWC_RESPONSE, 2000);
+            // Response is [RWC_RSP][8 bytes LSB-first]. Deliberately opcode-framed
+            // ONLY (the firmware always opcode-frames the RWC response, and both paths
+            // above select on the opcode): an opcode-less 8-byte chunk could be an
+            // unrelated notification and must not be mis-read as a clock value — the
+            // same policy as readInfoMem.
+            if (rsp[0] !== OPCODES.RWC_RESPONSE || rsp.length < 9) {
+                throw new Error(`Malformed RWC response (${rsp.length} bytes).`);
+            }
+            let ticks = 0n;
+            for (let i = 8; i >= 1; i--) {
+                ticks = (ticks << 8n) | BigInt(rsp[i]);
+            }
+            return { ticks, unixMs: Number(ticks) / 32.768 };
+        }
+        /**
+         * Set the device's real-world clock (SET_RWC_COMMAND) to the given Unix
+         * millisecond time, encoded as 64-bit little-endian 32768 Hz ticks via the
+         * same {@link msToRtcBytesLE} helper as the dock path (truncating, matching
+         * the Java driver's `(long)(ms * 32.768)`). Call with `Date.now()` to sync
+         * the device clock to the host before a drift run.
+         * NOTE (DEV-900): the device treats RWC as LOCAL civil time — pass a
+         * local-adjusted value if that distinction matters for the use case; for
+         * drift measurement only the rate matters, not the epoch.
+         */
+        async setRtcTime(unixMs) {
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            if (!Number.isFinite(unixMs)) {
+                throw new Error('setRtcTime: unixMs must be a finite number.');
+            }
+            const cmd = new Uint8Array(9);
+            cmd[0] = OPCODES.SET_RWC_COMMAND;
+            cmd.set(msToRtcBytesLE(unixMs), 1);
+            await this._writeExpectingAck(cmd, 1500);
+            this._emitStatus('RWC set');
+        }
+        // ---------------------------------------------------------------------------
         // ExG configuration helpers
         // ---------------------------------------------------------------------------
         /** Enable EMG (ADS1292R) in 16-bit mode on EXG1 & EXG2. */
@@ -3396,9 +4122,9 @@
         [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
     });
     /** Sentinel: need more bytes before the message length can be determined. */
-    const NEED_MORE$1 = -1;
+    const NEED_MORE = -1;
     /** Sentinel: leading byte is not a recognised control opcode — caller resyncs. */
-    const RESYNC$1 = 0;
+    const RESYNC = 0;
     /**
      * Given the head of the accumulated RFCOMM byte buffer, return the total length
      * (INCLUDING the leading opcode) of the complete control message it starts with,
@@ -3420,13 +4146,13 @@
      */
     function shimmer3ControlMessageLength(buf) {
         if (buf.length === 0)
-            return NEED_MORE$1;
+            return NEED_MORE;
         const opcode = buf[0];
         if (opcode === ACK || opcode === NACK)
             return 1;
         if (opcode === OPCODES.INQUIRY_RESPONSE) {
             if (buf.length <= SHIMMER3_INQ_NUM_CHANNELS_OFFSET)
-                return NEED_MORE$1; // need index 7 present
+                return NEED_MORE; // need index 7 present
             const numChannels = buf[SHIMMER3_INQ_NUM_CHANNELS_OFFSET];
             // Sanity bound: a stray stream-data byte 0x02 can masquerade as an
             // INQUIRY_RESPONSE whose "numChannels" comes from garbage, swallowing up to
@@ -3434,12 +4160,12 @@
             // has anywhere near 32 channels — treat implausible values as garbage and
             // resync instead.
             if (numChannels > 32)
-                return RESYNC$1;
+                return RESYNC;
             return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
         }
         const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
         if (payload === undefined)
-            return RESYNC$1;
+            return RESYNC;
         return 1 + payload;
     }
 
@@ -3740,9 +4466,9 @@
                     continue;
                 }
                 const len = shimmer3ControlMessageLength(buf);
-                if (len === NEED_MORE$1)
+                if (len === NEED_MORE)
                     break;
-                if (len === RESYNC$1) {
+                if (len === RESYNC) {
                     this._log(`resync: dropping unexpected control byte 0x${buf[0].toString(16)}`);
                     buf = buf.subarray(1);
                     continue;
@@ -4257,652 +4983,6 @@
                 }
             });
         }
-    }
-
-    /**
-     * Constants for the Shimmer wired/dock UART protocol.
-     *
-     * Ported from the Java driver's wiredProtocol package:
-     *   com.shimmerresearch.comms.wiredProtocol.UartPacketDetails (UartPacketDetails.java)
-     *   com.shimmerresearch.comms.wiredProtocol.AbstractCommsProtocolWired
-     *
-     * This is the protocol a Shimmer speaks when docked in a BasicDock/Base over the
-     * dock's FTDI UART (host↔device). It is unrelated to the LiteProtocol used by
-     * `Shimmer3Client` / `Shimmer3RClient` over Bluetooth — different framing,
-     * commands, addressing and CRC.
-     */
-    /** ASCII `$` — every packet starts with this byte (UartPacketDetails.java:28). */
-    const UART_PACKET_HEADER = 0x24;
-    /**
-     * Serial-line settings for the dock FTDI UART (SerialPortCommJssc.connect:
-     * 8 data bits, 1 stop bit, no parity, no flow control; baud below). These are
-     * transport-level hints — the codec/client are byte-pipe-agnostic — surfaced so
-     * a Web Serial / native transport can configure the port. Baud from
-     * AbstractSerialPortHal.SHIMMER_UART_BAUD_RATES.SHIMMER3_DOCKED = 115200.
-     */
-    const UART_DOCK_BAUD_RATE = 115200;
-    /**
-     * UART packet commands (`enum UART_PACKET_CMD`, UartPacketDetails.java:34-54).
-     * WRITE/READ are host→device requests; the rest are device→host responses.
-     */
-    const UART_PACKET_CMD = Object.freeze({
-        /** Host→device: set a component property (expects ACK). */
-        WRITE: 0x01,
-        /** Device→host: the data payload for a READ (carries component+property). */
-        DATA_RESPONSE: 0x02,
-        /** Host→device: get a component property (expects DATA_RESPONSE). */
-        READ: 0x03,
-        /** Device→host: unrecognised command. */
-        BAD_CMD_RESPONSE: 0xfc, // 252
-        /** Device→host: bad argument. */
-        BAD_ARG_RESPONSE: 0xfd, // 253
-        /** Device→host: CRC mismatch on the received command. */
-        BAD_CRC_RESPONSE: 0xfe, // 254
-        /** Device→host: command accepted (the response to a successful WRITE). */
-        ACK_RESPONSE: 0xff, // 255
-    });
-    /**
-     * UART components — the addressable sub-systems (`enum UART_COMPONENT`,
-     * UartPacketDetails.java:57-80).
-     */
-    const UART_COMPONENT = Object.freeze({
-        MAIN_PROCESSOR: 0x01,
-        BAT: 0x02,
-        DAUGHTER_CARD: 0x03,
-        PPG: 0x04,
-        GSR: 0x05,
-        LSM303DLHC_ACCEL: 0x06,
-        MPU9X50_ACCEL: 0x07,
-        BEACON: 0x08,
-        RADIO_802154: 0x09,
-        RADIO_BLUETOOTH: 0x0a,
-        TEST: 0x0b,
-    });
-    const cp = (component, property, permission, name) => Object.freeze({ component, property, permission, name });
-    /**
-     * The component/property table (`UART_COMPONENT_AND_PROPERTY`,
-     * UartPacketDetails.java:98-160). Only the groups relevant to a docked
-     * Shimmer3/3R identify + status + config path are surfaced; the GQ-only
-     * 802.15.4 radio and device-self-test entries are omitted from D1 (see README).
-     */
-    const UART_PROP = Object.freeze({
-        MAIN_PROCESSOR: Object.freeze({
-            ENABLE: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x00, 'READ_WRITE', 'ENABLE'),
-            SAMPLE_RATE: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x01, 'READ_WRITE', 'SAMPLE_RATE'),
-            MAC: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x02, 'READ_WRITE', 'MAC'),
-            VER: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x03, 'READ_ONLY', 'VER'),
-            RTC_CFG_TIME: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x04, 'READ_ONLY', 'RTC_CFG_TIME'),
-            CURR_LOCAL_TIME: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x05, 'READ_WRITE', 'CURR_LOCAL_TIME'),
-            INFOMEM: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x06, 'READ_WRITE', 'INFOMEM'),
-            LED0_STATE: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x07, 'READ_WRITE', 'LED_TOGGLE'),
-            DEVICE_BOOT: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x08, 'READ_ONLY', 'DEVICE_BOOT'),
-            ENTER_BOOTLOADER: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x09, 'WRITE_ONLY', 'ENTER_BOOTLOADER'),
-        }),
-        BAT: Object.freeze({
-            ENABLE: cp(UART_COMPONENT.BAT, 0x00, 'READ_WRITE', 'ENABLE'),
-            VALUE: cp(UART_COMPONENT.BAT, 0x02, 'READ_ONLY', 'VALUE'),
-            FREQ_DIVIDER: cp(UART_COMPONENT.BAT, 0x06, 'READ_WRITE', 'DIVIDER'),
-        }),
-        GSR: Object.freeze({
-            ENABLE: cp(UART_COMPONENT.GSR, 0x00, 'READ_WRITE', 'ENABLE'),
-            RANGE: cp(UART_COMPONENT.GSR, 0x03, 'READ_WRITE', 'RANGE'),
-            FREQ_DIVIDER: cp(UART_COMPONENT.GSR, 0x06, 'READ_WRITE', 'DIVIDER'),
-        }),
-        PPG: Object.freeze({
-            ENABLE: cp(UART_COMPONENT.PPG, 0x00, 'READ_WRITE', 'ENABLE'),
-            FREQ_DIVIDER: cp(UART_COMPONENT.PPG, 0x06, 'READ_WRITE', 'DIVIDER'),
-        }),
-        DAUGHTER_CARD: Object.freeze({
-            CARD_ID: cp(UART_COMPONENT.DAUGHTER_CARD, 0x02, 'READ_WRITE', 'CARD_ID'),
-            CARD_MEM: cp(UART_COMPONENT.DAUGHTER_CARD, 0x03, 'READ_WRITE', 'CARD_MEM'),
-        }),
-        LSM303DLHC_ACCEL: Object.freeze({
-            ENABLE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x00, 'READ_WRITE', 'ENABLE'),
-            DATA_RATE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x02, 'READ_WRITE', 'DATA_RATE'),
-            RANGE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x03, 'READ_WRITE', 'RANGE'),
-            LP_MODE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x04, 'READ_WRITE', 'LP_MODE'),
-            HR_MODE: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x05, 'READ_WRITE', 'HR_MODE'),
-            FREQ_DIVIDER: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x06, 'READ_WRITE', 'FREQ_DIVIDER'),
-            CALIBRATION: cp(UART_COMPONENT.LSM303DLHC_ACCEL, 0x07, 'READ_WRITE', 'CALIBRATION'),
-        }),
-        BEACON: Object.freeze({
-            ENABLE: cp(UART_COMPONENT.BEACON, 0x00, 'READ_WRITE', 'ENABLE'),
-            FREQ_DIVIDER: cp(UART_COMPONENT.BEACON, 0x06, 'READ_WRITE', 'DIVIDER'),
-        }),
-        BLUETOOTH: Object.freeze({
-            VER: cp(UART_COMPONENT.RADIO_BLUETOOTH, 0x03, 'READ_ONLY', 'BT_FW_VER'),
-        }),
-    });
-    /**
-     * The ordered list of component/properties the Java config loops iterate
-     * (`UartPacketDetails.mListOfUartCommandsConfig`, UartPacketDetails.java:172-197).
-     *
-     * NB: this list is GQ-oriented. `BasicDock.internalReadAllConfigByUart` only
-     * issues each entry when the docked device's version is compatible
-     * (`isVerCompatibleWithAnyOf`), and for a Shimmer3/3R the real configuration
-     * path is InfoMem — not this list. It is surfaced here verbatim (same order) so
-     * a caller can drive property-level get/set exactly as the Java does, and to
-     * document precisely which properties the wired protocol exposes as discrete
-     * commands. See README for what maps to the app config model.
-     */
-    const UART_CONFIG_COMMANDS = Object.freeze([
-        UART_PROP.BAT.ENABLE,
-        UART_PROP.BAT.FREQ_DIVIDER,
-        UART_PROP.LSM303DLHC_ACCEL.ENABLE,
-        UART_PROP.LSM303DLHC_ACCEL.DATA_RATE,
-        UART_PROP.LSM303DLHC_ACCEL.RANGE,
-        UART_PROP.LSM303DLHC_ACCEL.LP_MODE,
-        UART_PROP.LSM303DLHC_ACCEL.HR_MODE,
-        UART_PROP.LSM303DLHC_ACCEL.FREQ_DIVIDER,
-        UART_PROP.LSM303DLHC_ACCEL.CALIBRATION,
-        UART_PROP.GSR.ENABLE,
-        UART_PROP.GSR.RANGE,
-        UART_PROP.GSR.FREQ_DIVIDER,
-        UART_PROP.BEACON.ENABLE,
-        UART_PROP.BEACON.FREQ_DIVIDER,
-    ]);
-    /**
-     * Packet framing overhead (UartPacketDetails.java:30-31).
-     * DATA = header + cmd + length + component + property (CRC counted in length).
-     * OTHER = header + cmd + CRC-LSB + CRC-MSB.
-     */
-    const PACKET_OVERHEAD_RESPONSE_DATA = 5;
-    const PACKET_OVERHEAD_RESPONSE_OTHER = 4;
-    /**
-     * Request/response timing (AbstractCommsProtocolWired.java).
-     * SERIAL_PORT_TIMEOUT = 500 ms (line 69), polled at 100 ms intervals in
-     * `waitForResponse` (line 507). Retry is a dock-layer concern
-     * (`AbstractDock.READ_MAC_RETRY_ATTEMPTS = 2`), not the comms layer.
-     */
-    const WIRED_DEFAULTS = Object.freeze({
-        /** Per-request response timeout (ms). Matches Java SERIAL_PORT_TIMEOUT. */
-        RESPONSE_TIMEOUT_MS: 500,
-        /** MAC-read retry attempts, from AbstractDock.READ_MAC_RETRY_ATTEMPTS. */
-        MAC_READ_RETRIES: 2,
-    });
-    /** Charging-status raw bytes (ShimmerBattStatusDetails.CHARGING_STATUS_BYTE). */
-    const CHARGING_STATUS_BYTE = Object.freeze({
-        SUSPENDED: 0xc0,
-        FULLY_CHARGED: 0x40,
-        PRECONDITIONING: 0x80,
-        BAD_BATTERY: 0x00,
-        UNKNOWN: 0xff,
-    });
-
-    /**
-     * Shimmer wired/dock UART CRC.
-     *
-     * This is the Shimmer-specific 16-bit CRC used by the dock UART protocol — it is
-     * **not** CRC-16/CCITT-FALSE (the algorithm the Verisense client uses in
-     * `../verisense/protocolUtils.ts#crc16_ccitt_false`), so it cannot be reused:
-     * different seed (0xB0CA), a byte-swap step, and an odd-length zero-pad rule.
-     * Ported verbatim from the Java driver:
-     *   com.shimmerresearch.comms.wiredProtocol.ShimmerCrc (ShimmerCrc.java:12-60).
-     *
-     * All functions are pure. Every operation mirrors the Java `int` (32-bit,
-     * two's-complement) arithmetic exactly — JavaScript bitwise operators are also
-     * 32-bit, so the results are byte-for-byte identical (verified against the Java
-     * implementation compiled and run directly; e.g. CRC over `[0x24, 0xFF]` = the
-     * `TEST_ACK` header+command → `0xD9 0xB2`, matching
-     * `AbstractCommsProtocolWired.TEST_ACK`).
-     */
-    /** Seed value for the wired UART CRC (ShimmerCrc.java:29 `CRC_INIT`). */
-    const SHIMMER_UART_CRC_INIT = 0xb0ca;
-    /**
-     * Fold a single byte into the running CRC.
-     * Ported from `ShimmerCrc.shimmerUartCrcByte` (ShimmerCrc.java:12-21).
-     *
-     * NB: only the first and last lines mask to 0xFFFF, exactly as in Java — the
-     * intermediate byte-swap / shift / XOR steps run on the full 32-bit word. Adding
-     * intermediate masks changes the result, so do not "tidy" this.
-     */
-    function shimmerUartCrcByte(crc, b) {
-        crc &= 0xffff;
-        crc = ((crc & 0xffff) >>> 8) | ((crc & 0xffff) << 8);
-        crc ^= b & 0xff;
-        crc ^= (crc & 0xff) >>> 4;
-        crc ^= crc << 12;
-        crc ^= (crc & 0xff) << 5;
-        crc &= 0xffff;
-        return crc;
-    }
-    /**
-     * Compute the 2-byte CRC over the first `len` bytes of `msg`.
-     * Returns `[LSB, MSB]` — the on-wire order (LSB first), matching
-     * `ShimmerCrc.shimmerUartCrcCalc` (ShimmerCrc.java:28-46).
-     *
-     * If `len` is odd, one `0x00` byte is folded in before finalising
-     * (ShimmerCrc.java:37-39) — the padding is part of the algorithm and must be
-     * kept.
-     *
-     * @param msg the input bytes
-     * @param len number of bytes to CRC (defaults to `msg.length`)
-     */
-    function shimmerUartCrcCalc(msg, len = msg.length) {
-        let crc = shimmerUartCrcByte(SHIMMER_UART_CRC_INIT, msg[0]);
-        for (let i = 1; i < len; i++) {
-            crc = shimmerUartCrcByte(crc, msg[i]);
-        }
-        if (len % 2 > 0) {
-            crc = shimmerUartCrcByte(crc, 0x00);
-        }
-        return [crc & 0xff, (crc >> 8) & 0xff];
-    }
-    /**
-     * Validate a full packet whose last two bytes are the CRC (LSB then MSB).
-     * Recomputes over `msg[0 .. length-2)` and compares, matching
-     * `ShimmerCrc.shimmerUartCrcCheck` (ShimmerCrc.java:52-60).
-     */
-    function shimmerUartCrcCheck(msg) {
-        if (msg.length < 3)
-            return false;
-        const [lsb, msb] = shimmerUartCrcCalc(msg, msg.length - 2);
-        return lsb === msg[msg.length - 2] && msb === msg[msg.length - 1];
-    }
-
-    /**
-     * Pure codec for the Shimmer wired/dock UART protocol.
-     *
-     * Everything here is a side-effect-free function so it can be unit-tested with
-     * byte fixtures and reused by the {@link WiredShimmerClient} regardless of the
-     * byte pipe underneath. Ported from the Java driver:
-     *   com.shimmerresearch.comms.wiredProtocol.AbstractCommsProtocolWired
-     *     (#assembleTxPacket — TX build, AbstractCommsProtocolWired.java:404-456)
-     *     (#processRxBuf     — RX framing, :639-757)
-     *   com.shimmerresearch.comms.wiredProtocol.UartRxPacketObject (RX field parse)
-     *   com.shimmerresearch.comms.wiredProtocol.CommsProtocolWiredShimmerViaDock
-     *     (MAC / VER / battery response parsing)
-     *   com.shimmerresearch.driverUtilities.ShimmerVerObject#parseVersionByteArray
-     *   com.shimmerresearch.driverUtilities.ShimmerBattStatusDetails
-     *   com.shimmerresearch.driverUtilities.ExpansionBoardDetails
-     */
-    // ---------------------------------------------------------------------------
-    // TX — packet assembly
-    // ---------------------------------------------------------------------------
-    /**
-     * Assemble a command packet: `$ | cmd | [length] | [comp | prop] | [payload] | crcLSB | crcMSB`.
-     *
-     * Mirrors `AbstractCommsProtocolWired#assembleTxPacket` (AbstractCommsProtocolWired.java:404-456):
-     * - the LENGTH byte = component(1) + property(1) + payload.length, and is
-     *   OMITTED entirely when that sum is 0 (i.e. an ACK/bad-response echo with no
-     *   arg) — see the `msgLength>0` guard at lines 414/435;
-     * - the CRC (2 bytes, LSB then MSB) is computed over the whole preceding buffer
-     *   and appended, and is NOT counted in the LENGTH byte.
-     *
-     * @param command one of `UART_PACKET_CMD`
-     * @param arg     the component/property address, or null (ACK / bad responses)
-     * @param payload optional value bytes (for WRITE / mem commands), or null
-     */
-    function buildUartPacket(command, arg, payload = null) {
-        const compPropLen = arg ? 2 : 0;
-        const valueLen = payload ? payload.length : 0;
-        const msgLength = compPropLen + valueLen;
-        const pre = [UART_PACKET_HEADER, command & 0xff];
-        if (msgLength > 0)
-            pre.push(msgLength & 0xff);
-        if (arg) {
-            pre.push(arg.component & 0xff, arg.property & 0xff);
-        }
-        if (payload) {
-            for (const b of payload)
-                pre.push(b & 0xff);
-        }
-        const preU8 = Uint8Array.from(pre);
-        const [crcLsb, crcMsb] = shimmerUartCrcCalc(preU8, preU8.length);
-        return concatU8(preU8, Uint8Array.from([crcLsb, crcMsb]));
-    }
-    /** Build a READ (get) request for a component/property. */
-    function buildReadPacket(arg) {
-        return buildUartPacket(UART_PACKET_CMD.READ, arg);
-    }
-    /** Build a WRITE (set) request for a component/property with a value payload. */
-    function buildWritePacket(arg, value) {
-        return buildUartPacket(UART_PACKET_CMD.WRITE, arg, value);
-    }
-    /**
-     * Build the memory-read payload used by INFOMEM / daughter-card reads:
-     * `[sizeByte] [addressBytes...]`. The address is 2 bytes little-endian, except
-     * for `DAUGHTER_CARD.CARD_ID` where it is a single byte
-     * (AbstractCommsProtocolWired#shimmerUartGetMemCommand, :293-309).
-     */
-    function buildMemReadPayload(arg, address, size) {
-        const singleByteAddr = isDaughterCardId(arg);
-        const addr = singleByteAddr
-            ? Uint8Array.from([address & 0xff])
-            : Uint8Array.from([address & 0xff, (address >> 8) & 0xff]); // little-endian
-        return concatU8(Uint8Array.from([size & 0xff]), addr);
-    }
-    /**
-     * Build the memory-write payload: `[sizeByte] [addressBytes...] [data...]`
-     * (AbstractCommsProtocolWired#shimmerUartSetMemCommand, :341-360). `size` is the
-     * data length. Address encoding matches {@link buildMemReadPayload}.
-     */
-    function buildMemWritePayload(arg, address, data) {
-        const head = buildMemReadPayload(arg, address, data.length);
-        return concatU8(head, data);
-    }
-    function isDaughterCardId(arg) {
-        return arg.component === 0x03 && arg.property === 0x02;
-    }
-    // ---------------------------------------------------------------------------
-    // RTC (real-world clock) payload — set from host time
-    // ---------------------------------------------------------------------------
-    /**
-     * Encode a UNIX-epoch millisecond value as the 8-byte, LSB-first RTC payload the
-     * Shimmer expects on `MAIN_PROCESSOR.RTC_CFG_TIME`.
-     *
-     * Ported byte-for-byte from `UtilShimmer.convertMilliSecondsToShimmerRtcDataBytesLSB`
-     * (UtilShimmer.java:854-868):
-     *   1. `ticks = (long)((double)milliseconds * 32.768)` — the 32.768 kHz RTC tick
-     *      count; the `(long)` cast truncates toward zero (`Math.trunc` here matches,
-     *      since the IEEE-754 double multiply is identical).
-     *   2. `ByteBuffer.allocate(8).putLong(ticks)` — 8 bytes big-endian (…MSB).
-     *   3. `ArrayUtils.reverse(...)` — reversed to little-endian (LSB first).
-     *
-     * BigInt is used for the 64-bit width so the full 8-byte tick count is exact
-     * (host-time ticks are ~5.6e13 in 2026 — within double range, but BigInt keeps
-     * the byte extraction exact regardless).
-     *
-     * HARDWARE-VERIFY: this exact 8-byte LSB-first tick encoding has not been
-     * exercised against a real dock/Shimmer; it is a faithful port of the Java only.
-     */
-    function msToRtcBytesLE(milliseconds) {
-        const ticks = BigInt(Math.trunc(milliseconds * 32.768));
-        const out = new Uint8Array(8);
-        let v = ticks;
-        for (let i = 0; i < 8; i++) {
-            out[i] = Number(v & 0xffn); // LSB first
-            v >>= 8n;
-        }
-        return out;
-    }
-    // HW/FW identity codes referenced by the RTC-config gate below
-    // (ShimmerVerDetails.HW_ID / FW_ID). Only the values the gate reads are defined.
-    const RTC_HW_ID = Object.freeze({
-        SHIMMER_3: 3,
-        SHIMMER_GQ_BLE: 5,
-        SHIMMER_2R_GQ: 9,
-        SHIMMER_3R: 10,
-        SHIMMER_GQ_802154_LR: 56,
-        SHIMMER_GQ_802154_NR: 57,
-        SHIMMER_4_SDK: 58,
-    });
-    const RTC_FW_ID = Object.freeze({
-        SDLOG: 2,
-        LOGANDSTREAM: 3,
-        GQ_BLE: 5,
-        STROKARE: 15,
-    });
-    /**
-     * Whether the docked device supports setting its real-world clock over the dock
-     * UART. Faithful port of `ShimmerVerObject.isSupportedRtcConfigViaUart(hwVer, fwId)`
-     * (ShimmerVerObject.java:405-418) — desktop `CallableWriteConfig` only issues the
-     * RTC write when this is true (BasicDock.java:1564), and SKIPS it otherwise. For
-     * the Shimmer3/3R scope: Shimmer3 requires SDLog/LogAndStream/StroKare firmware;
-     * Shimmer3R is supported on any firmware. The GQ/Shimmer4 branches are ported
-     * verbatim for completeness.
-     */
-    function isSupportedRtcConfigViaUart(hwVer, fwId) {
-        if ((hwVer === RTC_HW_ID.SHIMMER_3 && fwId === RTC_FW_ID.SDLOG) ||
-            (hwVer === RTC_HW_ID.SHIMMER_3 && fwId === RTC_FW_ID.LOGANDSTREAM) ||
-            (hwVer === RTC_HW_ID.SHIMMER_3 && fwId === RTC_FW_ID.STROKARE) ||
-            (hwVer === RTC_HW_ID.SHIMMER_GQ_BLE && fwId === RTC_FW_ID.GQ_BLE) ||
-            hwVer === RTC_HW_ID.SHIMMER_GQ_802154_NR ||
-            hwVer === RTC_HW_ID.SHIMMER_GQ_802154_LR ||
-            hwVer === RTC_HW_ID.SHIMMER_2R_GQ ||
-            hwVer === RTC_HW_ID.SHIMMER_4_SDK ||
-            hwVer === RTC_HW_ID.SHIMMER_3R) {
-            return true;
-        }
-        return false;
-    }
-    // ---------------------------------------------------------------------------
-    // RX — framing (reassembly length) + single-packet parse
-    // ---------------------------------------------------------------------------
-    /** Sentinel: not enough bytes buffered yet to know the message length. */
-    const NEED_MORE = -1;
-    /** Sentinel: leading byte is not a valid header/command — caller drops 1 byte. */
-    const RESYNC = 0;
-    /**
-     * Given the head of the accumulated RX buffer, return the total byte length of
-     * the complete UART packet it starts with, or {@link NEED_MORE} / {@link RESYNC}.
-     *
-     * This is the primitive that makes the unframed serial stream tractable: the
-     * dock UART (over FTDI serial) delivers bytes split or coalesced arbitrarily, so
-     * the client cannot assume one read == one packet. The Java driver solves the
-     * same problem in `processRxBuf` with blocking top-up reads that know each
-     * packet's length from `PACKET_OVERHEAD_RESPONSE_* + payloadLength`
-     * (AbstractCommsProtocolWired.java:661-680); this expresses that as a pure
-     * function.
-     *
-     * - Header must be `$` (0x24); otherwise RESYNC.
-     * - DATA_RESPONSE/READ/WRITE: length = 5 + LENGTH-byte (needs index 2 present).
-     * - ACK / BAD_*: length = 4.
-     */
-    function wiredPacketLength(buf) {
-        if (buf.length === 0)
-            return NEED_MORE;
-        if (buf[0] !== UART_PACKET_HEADER)
-            return RESYNC;
-        if (buf.length < 2)
-            return NEED_MORE;
-        const cmd = buf[1];
-        if (cmd === UART_PACKET_CMD.DATA_RESPONSE ||
-            cmd === UART_PACKET_CMD.READ ||
-            cmd === UART_PACKET_CMD.WRITE) {
-            if (buf.length < 3)
-                return NEED_MORE; // need the LENGTH byte at index 2
-            return PACKET_OVERHEAD_RESPONSE_DATA + buf[2];
-        }
-        if (cmd === UART_PACKET_CMD.ACK_RESPONSE ||
-            cmd === UART_PACKET_CMD.BAD_CMD_RESPONSE ||
-            cmd === UART_PACKET_CMD.BAD_ARG_RESPONSE ||
-            cmd === UART_PACKET_CMD.BAD_CRC_RESPONSE) {
-            return PACKET_OVERHEAD_RESPONSE_OTHER;
-        }
-        return RESYNC; // unknown command byte
-    }
-    /**
-     * Parse exactly one complete packet from the START of `buf`. The caller is
-     * responsible for having ensured a full packet is present (via
-     * {@link wiredPacketLength}); the length is recomputed here and used to slice.
-     *
-     * Field extraction mirrors `UartRxPacketObject` (UartRxPacketObject.java:34-72):
-     * for DATA_RESPONSE/READ/WRITE the LENGTH byte at index 2 counts
-     * component+property+payload, so the payload is `LENGTH-2` bytes starting at
-     * index 5 and the CRC is the final 2 bytes. CRC is validated with
-     * `shimmerUartCrcCheck` over the whole packet (AbstractCommsProtocolWired
-     * #parseSinglePacket, :760-767).
-     *
-     * @throws if `buf` does not start with a header or is too short for the packet.
-     */
-    function parseUartPacket(buf) {
-        if (buf.length < 2 || buf[0] !== UART_PACKET_HEADER) {
-            throw new Error('parseUartPacket: buffer does not start with a UART packet header');
-        }
-        const command = buf[1];
-        const total = wiredPacketLength(buf);
-        if (total <= 0 || buf.length < total) {
-            throw new Error('parseUartPacket: incomplete packet');
-        }
-        const packet = buf.subarray(0, total);
-        const crcOk = shimmerUartCrcCheck(packet);
-        if (command === UART_PACKET_CMD.DATA_RESPONSE ||
-            command === UART_PACKET_CMD.READ ||
-            command === UART_PACKET_CMD.WRITE) {
-            const lengthByte = buf[2];
-            const component = buf[3];
-            const property = buf[4];
-            // payload = LENGTH-2 bytes at offset 5 (comp+prop already consumed).
-            const payloadLen = Math.max(0, lengthByte - 2);
-            const payload = new Uint8Array(packet.subarray(5, 5 + payloadLen));
-            return { command, component, property, payload, crcOk, length: total };
-        }
-        // ACK / BAD_* — no component/property/payload.
-        return {
-            command,
-            component: null,
-            property: null,
-            payload: new Uint8Array(0),
-            crcOk,
-            length: total,
-        };
-    }
-    /** True when a parsed command byte is one of the device error responses. */
-    function isBadResponse(command) {
-        return (command === UART_PACKET_CMD.BAD_CMD_RESPONSE ||
-            command === UART_PACKET_CMD.BAD_ARG_RESPONSE ||
-            command === UART_PACKET_CMD.BAD_CRC_RESPONSE);
-    }
-    /** Map a bad-response command byte to a human-readable reason. */
-    function badResponseReason(command) {
-        switch (command) {
-            case UART_PACKET_CMD.BAD_CMD_RESPONSE:
-                return 'BAD_CMD';
-            case UART_PACKET_CMD.BAD_ARG_RESPONSE:
-                return 'BAD_ARG';
-            case UART_PACKET_CMD.BAD_CRC_RESPONSE:
-                return 'BAD_CRC';
-            default:
-                return `0x${command.toString(16)}`;
-        }
-    }
-    // ---------------------------------------------------------------------------
-    // Response payload parsers
-    // ---------------------------------------------------------------------------
-    /**
-     * Format a MAC-address payload as a 12-char UPPERCASE hex string (no
-     * separators), taking the first 6 bytes in the order the device sends them.
-     * Mirrors `CommsProtocolWiredShimmerViaDock#readMacId` (:40-53) +
-     * `UtilShimmer.bytesToHexString`, whose `hexArray = "0123456789ABCDEF"` renders
-     * uppercase — matching this SDK's Verisense MAC/hex rendering.
-     */
-    function parseMacId(payload) {
-        if (payload.length < 6)
-            throw new Error('MAC payload too short (need 6 bytes)');
-        let s = '';
-        for (let i = 0; i < 6; i++)
-            s += payload[i].toString(16).toUpperCase().padStart(2, '0');
-        return s;
-    }
-    /**
-     * Parse a VER response payload. Accepts the 7-byte (1-byte HW version) or
-     * 8-byte (2-byte HW version) layout, matching
-     * `ShimmerVerObject#parseVersionByteArray` (ShimmerVerObject.java:193-217):
-     *   7-byte: [hw][fwId LE(2)][major LE(2)][minor][internal]
-     *   8-byte: [hw LE(2)][fwId LE(2)][major LE(2)][minor][internal]
-     */
-    function parseVersionInfo(payload) {
-        if (payload.length !== 7 && payload.length !== 8) {
-            throw new Error(`VER payload must be 7 or 8 bytes, got ${payload.length}`);
-        }
-        let i = 0;
-        let hardwareVersion;
-        if (payload.length === 7) {
-            hardwareVersion = payload[i++] & 0xff;
-        }
-        else {
-            hardwareVersion = (payload[i++] | (payload[i++] << 8)) & 0xffff;
-        }
-        const firmwareIdentifier = (payload[i++] | (payload[i++] << 8)) & 0xffff;
-        const firmwareVersionMajor = (payload[i++] | (payload[i++] << 8)) & 0xffff;
-        const firmwareVersionMinor = payload[i++] & 0xff;
-        const firmwareVersionInternal = payload[i] & 0xff;
-        return {
-            hardwareVersion,
-            firmwareIdentifier,
-            firmwareVersionMajor,
-            firmwareVersionMinor,
-            firmwareVersionInternal,
-        };
-    }
-    const BATTERY_ERROR_VOLTAGE = 4.5;
-    /**
-     * Convert a raw 12-bit battery ADC value to volts.
-     * `adcValToBattVoltage` (ShimmerBattStatusDetails.java:143-147): the U12 ADC is
-     * calibrated to millivolts (Vref=3 V, gain=1, offset=0 — reusing the shared
-     * {@link calibrateU12AdcValue}), scaled by the on-board divider factor 1.988,
-     * then converted mV→V.
-     */
-    function battAdcToVoltage(adcValue) {
-        const mv = calibrateU12AdcValue(adcValue, 0, 3, 1);
-        return (mv * 1.988) / 1000;
-    }
-    /**
-     * 4th-order polynomial charge-% estimate from voltage
-     * (ShimmerBattStatusDetails#battVoltageToBattPercentage, :175-181), with the
-     * pre-clamp to [3.2, 4.167] V and post-clamp to [0, 100]
-     * (#calculateBattPercentage, :155-173).
-     */
-    function battVoltageToPercentage(voltage) {
-        let v = voltage;
-        if (v > 4.167 + 0.2)
-            v = 4.167;
-        else if (v < 3.2 - 0.2)
-            v = 3.2;
-        let pct = 1109.739792 * v ** 4 -
-            17167.12674 * v ** 3 +
-            99232.71686 * v ** 2 -
-            253825.397 * v +
-            242266.0527;
-        if (pct > 100)
-            pct = 100;
-        else if (pct < 0)
-            pct = 0;
-        return pct;
-    }
-    function decodeChargingStatus(raw, voltage) {
-        if (voltage > BATTERY_ERROR_VOLTAGE)
-            return 'CHECKING';
-        switch (raw & 0xff) {
-            case CHARGING_STATUS_BYTE.SUSPENDED:
-                return 'SUSPENDED';
-            case CHARGING_STATUS_BYTE.FULLY_CHARGED:
-                return 'FULLY_CHARGED';
-            case CHARGING_STATUS_BYTE.PRECONDITIONING:
-                return 'CHARGING';
-            case CHARGING_STATUS_BYTE.BAD_BATTERY:
-                return 'BAD_BATTERY';
-            case CHARGING_STATUS_BYTE.UNKNOWN:
-                return 'UNKNOWN';
-            default:
-                return 'ERROR';
-        }
-    }
-    /**
-     * Parse a BAT.VALUE response payload (needs ≥3 bytes). ADC is a 12-bit
-     * little-endian value in bytes [0..1] (LSB first), charging status byte [2]
-     * (ShimmerBattStatusDetails.java:74-82).
-     */
-    function parseBatteryStatus(payload) {
-        if (payload.length < 3)
-            throw new Error('battery payload too short (need 3 bytes)');
-        const adcValue = ((payload[1] & 0xff) << 8) | (payload[0] & 0xff);
-        const voltage = battAdcToVoltage(adcValue);
-        const chargingStatusRaw = payload[2] & 0xff;
-        const percentage = voltage <= BATTERY_ERROR_VOLTAGE ? battVoltageToPercentage(voltage) : null;
-        return {
-            adcValue,
-            voltage,
-            percentage,
-            chargingStatusRaw,
-            chargingStatus: decodeChargingStatus(chargingStatusRaw, voltage),
-        };
-    }
-    /**
-     * Parse the first 3 bytes of a daughter-card CARD_ID read as
-     * `[boardId, boardRev, specialRev]` (ExpansionBoardDetails.java:58-60). Returns
-     * null when the board is absent (an unwritten card memory reads back all 0xFF).
-     */
-    function parseExpansionBoard(payload) {
-        if (payload.length < 3)
-            return null;
-        const boardId = payload[0] & 0xff;
-        const boardRev = payload[1] & 0xff;
-        const specialRev = payload[2] & 0xff;
-        if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
-            return null;
-        return { boardId, boardRev, specialRev };
     }
 
     /**
@@ -5568,13 +5648,12 @@
          * PC time. The payload is the 8-byte, LSB-first 32.768 kHz tick count
          * ({@link msToRtcBytesLE}).
          *
-         * NB the target property is `RTC_CFG_TIME` (0x04): the Java props table marks
-         * it READ_ONLY, yet the driver's SET issues a WRITE against it directly
-         * (line 150), which this mirrors by going through the low-level {@link _write}
-         * rather than the permission-checked {@link setConfig}.
-         *
-         * HARDWARE-VERIFY: the RTC payload format and RTC_CFG_TIME write have not been
-         * exercised against a real dock.
+         * NB the target property is `RTC_CFG_TIME` (0x04) — hardware-confirmed
+         * (DEV-866 drift tool bring-up): the firmware's UART_SET handler implements
+         * a time write ONLY for this property (RTC_setTimeFromTicksPtr), while a
+         * SET on CURR_LOCAL_TIME (0x05) is answered with BAD_CMD. The Java props
+         * table's READ_ONLY flag on 0x04 was wrong; the SDK table now says
+         * READ_WRITE, matching the firmware.
          */
         async writeRtcFromHostTime(nowMs) {
             return this._serialize(() => this._writeRtcFromHostTimeImpl(nowMs ?? Date.now()));
@@ -5783,9 +5862,9 @@
                 if (buf.length === 0)
                     break;
                 const len = wiredPacketLength(buf);
-                if (len === NEED_MORE)
+                if (len === NEED_MORE$1)
                     break;
-                if (len === RESYNC) {
+                if (len === RESYNC$1) {
                     this._log(`resync: dropping byte 0x${buf[0].toString(16)}`);
                     buf = buf.subarray(1);
                     continue;
@@ -15917,9 +15996,9 @@
     exports.SHIMMER3_INQ_CONFIG_OFFSET = SHIMMER3_INQ_CONFIG_OFFSET;
     exports.SHIMMER3_INQ_NUM_CHANNELS_OFFSET = SHIMMER3_INQ_NUM_CHANNELS_OFFSET;
     exports.SHIMMER3_NACK = NACK;
-    exports.SHIMMER3_NEED_MORE = NEED_MORE$1;
+    exports.SHIMMER3_NEED_MORE = NEED_MORE;
     exports.SHIMMER3_RESPONSE_PAYLOAD_LENGTHS = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS;
-    exports.SHIMMER3_RESYNC = RESYNC$1;
+    exports.SHIMMER3_RESYNC = RESYNC;
     exports.SHIMMER3_SAMPLING_CLOCK_FREQ = SHIMMER3_SAMPLING_CLOCK_FREQ;
     exports.SHIMMER3_SPP_UUID = SHIMMER3_SPP_UUID;
     exports.SHIMMER_UART_CRC_INIT = SHIMMER_UART_CRC_INIT;
@@ -15977,8 +16056,8 @@
     exports.VERISENSE_STREAM_SENSOR_LABELS = VERISENSE_STREAM_SENSOR_LABELS;
     exports.VerisenseBleDevice = VerisenseBleDevice;
     exports.WIRED_DEFAULTS = WIRED_DEFAULTS;
-    exports.WIRED_NEED_MORE = NEED_MORE;
-    exports.WIRED_RESYNC = RESYNC;
+    exports.WIRED_NEED_MORE = NEED_MORE$1;
+    exports.WIRED_RESYNC = RESYNC$1;
     exports.WebBluetoothTransport = WebBluetoothTransport;
     exports.WebSerialTransport = WebSerialTransport;
     exports.WiredShimmerClient = WiredShimmerClient;
