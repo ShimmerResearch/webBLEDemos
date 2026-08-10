@@ -18,7 +18,8 @@ brick/               │
 rythmgame-emggyro/   │  Shimmer3R demos
 video-ppg/           │
 spell-gyro/          │
-ShimmerCapture/      ┘
+ShimmerCapture/      │
+consensys-export/    ┘
 Verisense/           ←  Verisense demo
 shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpacked in Chrome)
 sdk-source.json      ←  Single source-of-truth for SDK source mode/version
@@ -48,6 +49,9 @@ The full Verisense control console now lives in a dedicated repository:
 | Two-device gyro brick game | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/) |
 | Spell caster (gyro gestures) | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/) |
 | Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
+| Consensys trial export + Bluetooth RTC set | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) |
+
+**Consensys Export** packages a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zips it, and shares it. It also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
 
 ### Verisense
 **Requirements:** Verisense device (IMU or Pulse+), Chrome/Edge
@@ -58,9 +62,9 @@ The full Verisense control console now lives in a dedicated repository:
 | Verisense Device Console (full SDK operations) | [verisense-device-console](https://shimmerresearch.github.io/verisense-device-console/) |
 
 ### Chrome Extension
-[Shimmer3R Chrome Extension](https://github.com/ShimmerResearch/webBLEDemos/tree/main/shimmer-extension) — source code only; load via **chrome://extensions → Developer mode → Load unpacked** when you are specifically developing or testing extension features.
+[Shimmer Companion Chrome extension](./shimmer-extension/) — a locally loaded Chrome extension for streaming PPG and GSR, capturing screenshots and media context, generating session reports, and optionally adding on-device webcam face/head-state analysis. It supports selecting between multiple cameras and uploading session files to a compatible ASM Cloud deployment. See the [extension README](./shimmer-extension/README.md) for installation, privacy, export, and server requirements.
 
-This is optional and is **not required** for running the web demos in this repository.
+Load via **chrome://extensions → Developer mode → Load unpacked**. This is optional and is **not required** for running the web demos in this repository.
 
 ---
 

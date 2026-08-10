@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Vision worker smoke test</title>
+</head>
+<body>
+  <main>
+    <h1>Vision worker smoke test</h1>
+    <p id="status" role="status">Loading MediaPipe model…</p>
+  </main>
+  <script type="module">
+    const status = document.getElementById("status");
+    const worker = new Worker(new URL("../vision-worker.js?v=1.5", location.href));
+    let sawBlankResult = false;
+    worker.onmessage = async (event) => {
+      if (event.data?.type === "ready") {
+        status.textContent = "Model ready; processing blank frame…";
+        const canvas = document.createElement("canvas");
+        canvas.width = 640;
+        canvas.height = 360;
+        const context = canvas.getContext("2d");
+        context.fillStyle = "#ffffff";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        const bitmap = await createImageBitmap(canvas);
+        worker.postMessage({ type: "frame", bitmap, timestampMs: performance.now() }, [bitmap]);
+      } else if (event.data?.type === "result") {
+        sawBlankResult = event.data.sample?.facePresent === false;
+      } else if (event.data?.type === "frame-complete") {
+        status.textContent = sawBlankResult ? "Ready; blank frame processed" : "Error: no blank-frame result";
+        worker.postMessage({ type: "close" });
+      } else if (event.data?.type === "error") {
+        status.textContent = `Error: ${event.data.message}`;
+      }
+    };
+    worker.onerror = (event) => { status.textContent = `Error: ${event.message}`; };
+    worker.postMessage({
+      type: "init",
+      wasmRoot: new URL("../vendor/mediapipe/wasm", location.href).href,
+      modelPath: new URL("../vendor/mediapipe/models/face_landmarker.task", location.href).href,
+    });
+  </script>
+</body>
+</html>
