@@ -200,7 +200,7 @@ $("btnConnect").onclick = async () => {
     const banner = $("fwBanner");
     if (!supported) {
       banner.className = "banner err";
-      banner.textContent = `Firmware ${verStr} does not support SD file transfer (needs LogAndStream_Shimmer3R v1.01.008 or later).`;
+      banner.textContent = `Firmware ${verStr} does not support SD file transfer (needs LogAndStream_Shimmer3R v1.01.009 or later).`;
       return;
     }
     banner.className = "banner ok";
