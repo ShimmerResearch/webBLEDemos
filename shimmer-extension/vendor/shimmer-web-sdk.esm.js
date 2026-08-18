@@ -3047,7 +3047,7 @@ function encodeSdPath(path) {
     }
     return out;
 }
-/** Decode a FAT date/time pair; null when unset (open/never-closed files). */
+/** Decode a FAT date/time pair; null when unset or invalid. */
 function fatDateTimeToDate(fdate, ftime) {
     if (!fdate)
         return null;
@@ -3058,6 +3058,8 @@ function fatDateTimeToDate(fdate, ftime) {
     const minutes = (ftime >> 5) & 0x3f;
     const seconds = (ftime & 0x1f) * 2;
     if (month < 1 || month > 12 || day < 1 || day > 31)
+        return null;
+    if (hours > 23 || minutes > 59 || seconds > 59)
         return null;
     return new Date(year, month - 1, day, hours, minutes, seconds);
 }
@@ -3098,6 +3100,9 @@ function buildAbortCmd() {
     return new Uint8Array([SD_TRANSFER_OPCODES.TRANSFER_ABORT_COMMAND]);
 }
 function buildReadCmd(path, offset, windowLen, blockPayloadLen = SD_BLOCK_PAYLOAD_DEFAULT) {
+    if (blockPayloadLen < SD_BLOCK_PAYLOAD_MIN || blockPayloadLen > SD_BLOCK_PAYLOAD_MAX) {
+        throw new SdTransferError(`blockPayloadLen must be ${SD_BLOCK_PAYLOAD_MIN}..${SD_BLOCK_PAYLOAD_MAX}, got ${blockPayloadLen}`, SD_STATUS.BAD_ARGS);
+    }
     const p = encodeSdPath(path);
     const cmd = new Uint8Array(12 + p.length);
     cmd[0] = SD_TRANSFER_OPCODES.FILE_READ_COMMAND;
@@ -3336,6 +3341,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         /** Handle an unexpected / requested transport disconnect. */
         this._handleTransportDisconnect = () => {
             this._streaming = false;
+            this._sdKnownSession = null;
             this._emitStatus('Device disconnected');
         };
         // ---------------------------------------------------------------------------
@@ -3488,6 +3494,8 @@ class Shimmer3RClient extends BaseShimmerClient {
     async connect(transport) {
         const t = transport ?? this._injectedTransport ?? this._makeWebTransport();
         this._transport = t;
+        // The firmware's SD session counter restarts with the connection
+        this._sdKnownSession = null;
         this._notifyUnsub = t.onNotify(this._handleNotify);
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         this._emitStatus('Requesting Bluetooth device…');
@@ -3517,6 +3525,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._streaming = false;
             this.ExpPower = 0;
             this._deviceCalibrations = {};
+            this._sdKnownSession = null;
             this._emitStatus('Disconnected');
         }
     }
@@ -4376,7 +4385,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             return {
                 bytesReceived: bytes,
                 durationMs: measuredMs,
-                kBps: bytes / 1024 / (measuredMs / 1000),
+                kBps: measuredMs > 0 ? bytes / 1024 / (measuredMs / 1000) : 0,
             };
         }
         finally {
@@ -4412,6 +4421,11 @@ class Shimmer3RClient extends BaseShimmerClient {
             throw new Error('Not connected (RX missing)');
         if (this._streaming) {
             throw new SdTransferError('SD transfer is unavailable while streaming', SD_STATUS.BUSY);
+        }
+        if (this._sdExpect) {
+            // A shared expectation slot: concurrent SD commands would race on it,
+            // so refuse deterministically — callers are expected to sequence
+            throw new SdTransferError('another SD command is already in flight', SD_STATUS.BUSY);
         }
         this._sdAcquire();
         try {
@@ -4560,7 +4574,12 @@ class Shimmer3RClient extends BaseShimmerClient {
                 this._sdCrcErrorListener = () => fail(new Error('SD data frame failed CRC check'));
                 this._sdFrameListener = (frame) => {
                     // Adopt the first session id that is not a leftover of the
-                    // previous window (e.g. its SUPERSEDED status frame)
+                    // previous window (late data frames or a SUPERSEDED/closing status
+                    // still draining from the firmware's TX ring). The tracker resets
+                    // on connect/disconnect; the residual 1-in-256 wrap collision
+                    // (new window randomly assigned the previous id) is recovered by
+                    // the stall watchdog + the caller's re-read retry, which advances
+                    // the firmware's session counter.
                     if (session === null) {
                         if (this._sdKnownSession !== null && frame.sessionId === this._sdKnownSession)
                             return;
