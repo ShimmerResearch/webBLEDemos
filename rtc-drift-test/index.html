@@ -1,745 +1,488 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Shimmer3R RTC Drift Test</title>
-    <style>
-      :root {
-        --bg: #14161a;
-        --panel: #1d2026;
-        --panel2: #232730;
-        --ink: #e8eaed;
-        --muted: #9aa0a6;
-        --accent: #ff6a2e;
-        --good: #4caf50;
-        --bad: #ef5350;
-        --line: #33383f;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        background: var(--bg);
-        color: var(--ink);
-        font:
-          14px/1.45 system-ui,
-          "Segoe UI",
-          Roboto,
-          sans-serif;
-      }
-      .wrap {
-        max-width: 980px;
-        margin: 0 auto;
-        padding: 20px 16px 48px;
-      }
-      h1 {
-        font-size: 20px;
-        margin: 0 0 2px;
-      }
-      h1 small {
-        color: var(--muted);
-        font-weight: 400;
-        font-size: 13px;
-      }
-      .sub {
-        color: var(--muted);
-        margin: 0 0 16px;
-        font-size: 13px;
-      }
-      .card {
-        background: #1d2026;
-        border: 1px solid var(--line);
-        border-radius: 10px;
-        padding: 14px 16px;
-        margin-bottom: 14px;
-      }
-      .row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        align-items: center;
-      }
-      button {
-        background: #2a2f38;
-        color: var(--ink);
-        border: 1px solid var(--line);
-        border-radius: 7px;
-        padding: 7px 14px;
-        font: inherit;
-        cursor: pointer;
-      }
-      button:hover:not(:disabled) {
-        border-color: var(--accent);
-      }
-      button.primary {
-        background: var(--accent);
-        border-color: var(--accent);
-        color: #fff;
-      }
-      button:disabled {
-        opacity: 0.45;
-        cursor: default;
-      }
-      input[type="number"] {
-        width: 70px;
-        background: #232730;
-        color: var(--ink);
-        border: 1px solid var(--line);
-        border-radius: 6px;
-        padding: 6px 8px;
-        font: inherit;
-      }
-      label {
-        color: var(--muted);
-      }
-      .stats {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-        gap: 10px;
-      }
-      .stat {
-        background: #232730;
-        border-radius: 8px;
-        padding: 10px 12px;
-      }
-      .stat .k {
-        color: var(--muted);
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-      }
-      .stat .v {
-        font-size: 19px;
-        font-variant-numeric: tabular-nums;
-        margin-top: 2px;
-      }
-      .stat .v.small {
-        font-size: 14px;
-      }
-      .ppm-good {
-        color: var(--good);
-      }
-      .ppm-bad {
-        color: var(--bad);
-      }
-      canvas {
-        width: 100%;
-        height: 180px;
-        background: #232730;
-        border-radius: 8px;
-      }
-      #log {
-        max-height: 220px;
-        overflow-y: auto;
-        font:
-          12px/1.5 ui-monospace,
-          Consolas,
-          monospace;
-        background: #232730;
-        border-radius: 8px;
-        padding: 10px 12px;
-        white-space: pre-wrap;
-      }
-      .note {
-        color: var(--muted);
-        font-size: 12px;
-        margin-top: 8px;
-      }
-      .pill {
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 99px;
-        font-size: 12px;
-        background: #232730;
-        border: 1px solid var(--line);
-        color: var(--muted);
-      }
-      .pill.on {
-        color: var(--good);
-        border-color: var(--good);
-      }
-    </style>
-  </head>
-  <body>
-    <div class="wrap">
-      <h1>
-        Shimmer3R RTC Drift Test
-        <small>DEV-866 · 32k LSE crystal error vs host clock</small>
-      </h1>
-      <p class="sub">
-        Samples the device real-world clock against this computer's clock and
-        fits the drift slope (ppm) — the same method as the Verisense console
-        drift monitor (DEV-844). Prefer the <b>dock/USB</b> connection: wired
-        round-trips have less jitter than BLE. A usable ppm estimate typically
-        appears within 1–2 hours; leave running longer for tighter confidence.
-        Keep this tab open, disable system sleep, and note that the fit
-        automatically rebaselines if the host clock is stepped by NTP.
-      </p>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shimmer3R RTC Drift Test</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2026; --panel2: #232730; --ink: #e8eaed;
+    --muted: #9aa0a6; --accent: #ff6a2e; --good: #4caf50; --bad: #ef5350; --line: #33383f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  h1 small { color: var(--muted); font-weight: 400; font-size: 13px; }
+  .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+  .card { background: #1d2026; border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button { background: #2a2f38; color: var(--ink); border: 1px solid var(--line);
+           border-radius: 7px; padding: 7px 14px; font: inherit; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  input[type=number] { width: 70px; background: #232730; color: var(--ink);
+           border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; }
+  label { color: var(--muted); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .stat { background: #232730; border-radius: 8px; padding: 10px 12px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat .v { font-size: 19px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .stat .v.small { font-size: 14px; }
+  .ppm-good { color: var(--good); } .ppm-bad { color: var(--bad); }
+  canvas { width: 100%; height: 180px; background: #232730; border-radius: 8px; }
+  #log { max-height: 220px; overflow-y: auto; font: 12px/1.5 ui-monospace, Consolas, monospace;
+         background: #232730; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 12px;
+          background: #232730; border: 1px solid var(--line); color: var(--muted); }
+  .pill.on { color: var(--good); border-color: var(--good); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Shimmer3R RTC Drift Test <small>DEV-866 · 32k LSE crystal error vs host clock</small></h1>
+  <p class="sub">
+    Samples the device real-world clock against this computer's clock and fits the drift
+    slope (ppm) — the same method as the Verisense console drift monitor (DEV-844).
+    Prefer the <b>dock/USB</b> connection: wired round-trips have less jitter than BLE.
+    A usable ppm estimate typically appears within 1–2 hours; leave running longer for
+    tighter confidence. Keep this tab open, disable system sleep, and note that the fit
+    automatically rebaselines if the host clock is stepped by NTP.
+  </p>
 
-      <div class="card">
-        <div class="row">
-          <button id="btnDock" class="primary">Connect dock (USB)</button>
-          <button id="btnBle">Connect BLE</button>
-          <button id="btnDisconnect" disabled>Disconnect</button>
-          <span id="connPill" class="pill">disconnected</span>
-          <span id="devInfo" class="note"></span>
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="row">
-          <label
-            >Sample every
-            <input id="intervalS" type="number" min="2" max="600" value="30" />
-            s</label
-          >
-          <button id="btnStart" disabled>Start</button>
-          <button id="btnStop" disabled>Stop</button>
-          <button
-            id="btnSync"
-            disabled
-            title="Write host time (UTC, stock Consensys convention) to the device RTC and restart the fit"
-          >
-            Sync RTC to host
-          </button>
-          <button
-            id="btnRebase"
-            disabled
-            title="Drop collected samples and restart the fit"
-          >
-            Reset baseline
-          </button>
-          <button id="btnCsv" disabled>Download CSV</button>
-          <span id="wakePill" class="pill">wake lock off</span>
-        </div>
-        <div class="note">
-          The RWC is driven by the 32k LSE, so its error shows here directly —
-          the LSE-only ground truth that S3R_TEST_0028's differential (LSE −
-          HSE) cannot give by itself. First hardware runs (2026-08-10, docked):
-          stock 12 pF Shimmer3R ≈ −9 ppm (near-spec — unlike the Verisense,
-          whose identical BOM ran +40…+65 fast), while a 22 pF-reworked unit ≈
-          −98 ppm (over-loaded). Docked units read a few ppm low from charge
-          self-heating; a battery/BLE run at ambient gives the spec-comparable
-          figure.
-        </div>
-      </div>
-
-      <div class="card">
-        <div class="stats">
-          <div class="stat">
-            <div class="k">Samples</div>
-            <div class="v" id="stSamples">0</div>
-          </div>
-          <div class="stat">
-            <div class="k">Elapsed</div>
-            <div class="v" id="stElapsed">–</div>
-          </div>
-          <div class="stat">
-            <div class="k">Drift fit</div>
-            <div class="v" id="stPpm">–</div>
-          </div>
-          <div class="stat">
-            <div class="k">≙ per day</div>
-            <div class="v" id="stPerDay">–</div>
-          </div>
-          <div class="stat">
-            <div class="k">Offset (dev − host)</div>
-            <div class="v small" id="stOffset">–</div>
-          </div>
-          <div class="stat">
-            <div class="k">Last RTT</div>
-            <div class="v small" id="stRtt">–</div>
-          </div>
-          <div class="stat">
-            <div class="k">Device steps</div>
-            <div class="v small" id="stDevSteps">0</div>
-          </div>
-          <div class="stat">
-            <div class="k">Host (NTP) steps</div>
-            <div class="v small" id="stHostSteps">0</div>
-          </div>
-        </div>
-        <div style="margin-top: 12px">
-          <canvas id="plot" width="940" height="180"></canvas>
-        </div>
-        <div class="note">
-          Offset drift since first sample (blue dots) with least-squares fit
-          (orange).
-        </div>
-      </div>
-
-      <div class="card">
-        <div
-          class="k"
-          style="color: var(--muted); font-size: 12px; margin-bottom: 6px"
-        >
-          Log
-        </div>
-        <div id="log"></div>
-      </div>
+  <div class="card">
+    <div class="row">
+      <button id="btnDock" class="primary">Connect dock (USB)</button>
+      <button id="btnBle">Connect BLE</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+      <span id="connPill" class="pill">disconnected</span>
+      <span id="devInfo" class="note"></span>
     </div>
+  </div>
 
-    <script type="module">
-      import {
-        Shimmer3RClient,
-        WiredShimmerClient,
-        WebSerialTransport,
-        RtcDriftMonitor,
-        UART_PROP,
-      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+  <div class="card">
+    <div class="row">
+      <label>Sample every <input id="intervalS" type="number" min="2" max="600" value="30" /> s</label>
+      <button id="btnStart" disabled>Start</button>
+      <button id="btnStop" disabled>Stop</button>
+      <button id="btnSync" disabled title="Write host time (UTC, stock Consensys convention) to the device RTC and restart the fit">Sync RTC to host</button>
+      <button id="btnRebase" disabled title="Drop collected samples and restart the fit">Reset baseline</button>
+      <button id="btnCsv" disabled>Download CSV</button>
+      <span id="wakePill" class="pill">wake lock off</span>
+    </div>
+    <div class="note">
+      The RWC is driven by the 32k LSE, so its error shows here directly — the LSE-only
+      ground truth that S3R_TEST_0028's differential (LSE − HSE) cannot give by itself.
+      First hardware runs (2026-08-10, docked): stock 12 pF Shimmer3R ≈ −9 ppm (near-spec —
+      unlike the Verisense, whose identical BOM ran +40…+65 fast), while a 22 pF-reworked
+      unit ≈ −98 ppm (over-loaded). Docked units read a few ppm low from charge self-heating;
+      a battery/BLE run at ambient gives the spec-comparable figure.
+    </div>
+  </div>
 
-      const $ = (id) => document.getElementById(id);
-      const els = {
-        dock: $("btnDock"),
-        ble: $("btnBle"),
-        disc: $("btnDisconnect"),
-        start: $("btnStart"),
-        stop: $("btnStop"),
-        sync: $("btnSync"),
-        rebase: $("btnRebase"),
-        csv: $("btnCsv"),
-        interval: $("intervalS"),
-        pill: $("connPill"),
-        wake: $("wakePill"),
-        devInfo: $("devInfo"),
-        log: $("log"),
-        samples: $("stSamples"),
-        elapsed: $("stElapsed"),
-        ppm: $("stPpm"),
-        perDay: $("stPerDay"),
-        offset: $("stOffset"),
-        rtt: $("stRtt"),
-        devSteps: $("stDevSteps"),
-        hostSteps: $("stHostSteps"),
-        plot: $("plot"),
-      };
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><div class="k">Samples</div><div class="v" id="stSamples">0</div></div>
+      <div class="stat"><div class="k">Elapsed</div><div class="v" id="stElapsed">–</div></div>
+      <div class="stat"><div class="k">Drift fit</div><div class="v" id="stPpm">–</div></div>
+      <div class="stat"><div class="k">≙ per day</div><div class="v" id="stPerDay">–</div></div>
+      <div class="stat"><div class="k">Offset (dev − host)</div><div class="v small" id="stOffset">–</div></div>
+      <div class="stat"><div class="k">Last RTT</div><div class="v small" id="stRtt">–</div></div>
+      <div class="stat"><div class="k">Device steps</div><div class="v small" id="stDevSteps">0</div></div>
+      <div class="stat"><div class="k">Host (NTP) steps</div><div class="v small" id="stHostSteps">0</div></div>
+    </div>
+    <div style="margin-top:12px"><canvas id="plot" width="940" height="180"></canvas></div>
+    <div class="note">Offset drift since first sample (blue dots) with least-squares fit (orange).</div>
+  </div>
 
-      const monitor = new RtcDriftMonitor();
-      let client = null; // Shimmer3RClient | WiredShimmerClient
-      let mode = null; // 'ble' | 'dock'
-      let timer = null;
-      let wakeLock = null;
-      let deviceLabel = "";
+  <div class="card">
+    <div class="k" style="color:var(--muted); font-size:12px; margin-bottom:6px">Log</div>
+    <div id="log"></div>
+  </div>
+</div>
 
-      function log(msg, cls) {
-        const t = new Date().toISOString().slice(11, 19);
-        els.log.textContent += `[${t}] ${msg}\n`;
-        els.log.scrollTop = els.log.scrollHeight;
+<script type="module">
+import {
+  Shimmer3RClient,
+  WiredShimmerClient,
+  WebSerialTransport,
+  RtcDriftMonitor,
+  UART_PROP,
+} from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  dock: $("btnDock"), ble: $("btnBle"), disc: $("btnDisconnect"),
+  start: $("btnStart"), stop: $("btnStop"), sync: $("btnSync"),
+  rebase: $("btnRebase"), csv: $("btnCsv"), interval: $("intervalS"),
+  pill: $("connPill"), wake: $("wakePill"), devInfo: $("devInfo"), log: $("log"),
+  samples: $("stSamples"), elapsed: $("stElapsed"), ppm: $("stPpm"),
+  perDay: $("stPerDay"), offset: $("stOffset"), rtt: $("stRtt"),
+  devSteps: $("stDevSteps"), hostSteps: $("stHostSteps"), plot: $("plot"),
+};
+
+const monitor = new RtcDriftMonitor();
+let client = null;          // Shimmer3RClient | WiredShimmerClient
+let mode = null;            // 'ble' | 'dock'
+let timer = null;
+let wakeLock = null;
+let deviceLabel = "";
+
+function log(msg, cls) {
+  const t = new Date().toISOString().slice(11, 19);
+  els.log.textContent += `[${t}] ${msg}\n`;
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
+function setConnected(on, label) {
+  els.pill.textContent = on ? `connected · ${label}` : "disconnected";
+  els.pill.classList.toggle("on", on);
+  els.dock.disabled = on; els.ble.disabled = on;
+  els.disc.disabled = !on;
+  els.start.disabled = !on || !!timer;
+  els.stop.disabled = !timer;
+  els.sync.disabled = !on;
+  els.rebase.disabled = !on;
+}
+
+// ---------------------------------------------------------------------------
+// Device time read — one sample, host timestamp at the round-trip midpoint
+// ---------------------------------------------------------------------------
+
+const TICKS_PER_SEC = 32768;
+
+function ticksFromBytes(u8) {
+  let t = 0n;
+  for (let i = 7; i >= 0; i--) t = (t << 8n) | BigInt(u8[i]);
+  return t;
+}
+
+async function readDeviceSeconds() {
+  // Raw device reading, no convention assumed: different tools set the RWC
+  // with different epoch bases (the Java dock driver / Consensys write UTC
+  // ms x 32.768; the Verisense console writes LOCAL civil time per DEV-900).
+  // The clock-base detection in takeSampleInner absorbs whichever base the
+  // device carries, so the offset stat always shows the true clock error.
+  if (mode === "dock") {
+    const raw = await client.getConfig(UART_PROP.MAIN_PROCESSOR.CURR_LOCAL_TIME);
+    if (!raw || raw.length < 8) throw new Error(`CURR_LOCAL_TIME returned ${raw?.length ?? 0} bytes`);
+    return Number(ticksFromBytes(raw)) / TICKS_PER_SEC;
+  }
+  const { unixMs } = await client.getRtcTime();
+  return unixMs / 1000;
+}
+
+// Whole-quarter-hour base between the device clock and host UTC, detected
+// from the first sample of a series: covers timezone conventions (any
+// 15-minute-grid zone) and time-set-tool differences without guessing. The
+// residual is the true clock error. Recomputed after any rebaseline/sync.
+let clockBaseSec = null;
+
+function fmtClockBase(sec) {
+  const sign = sec < 0 ? "-" : "+";
+  const a = Math.abs(sec);
+  return `${sign}${Math.floor(a / 3600)}:${String(Math.round((a % 3600) / 60)).padStart(2, "0")} h`;
+}
+
+let sampleInFlight = false;
+
+async function takeSample() {
+  // One sample at a time: a read slower than the interval (BLE latency,
+  // retries) must not overlap the next tick and interleave monitor updates.
+  if (sampleInFlight) return;
+  sampleInFlight = true;
+  try {
+    await takeSampleInner();
+  } finally {
+    sampleInFlight = false;
+  }
+}
+
+async function takeSampleInner() {
+  const p0 = performance.now();
+  let devSec;
+  try {
+    devSec = await readDeviceSeconds();
+  } catch (e) {
+    log(`sample failed: ${e.message}`);
+    return;
+  }
+  const p1 = performance.now();
+  const rttMs = p1 - p0;
+  // Host wall time at the midpoint of the round-trip (bounds latency to ±rtt/2).
+  const hostSec = (Date.now() - rttMs / 2) / 1000;
+  const perfMs = p0 + rttMs / 2;
+
+  if (clockBaseSec === null) {
+    const raw = devSec - hostSec;
+    const base = Math.round(raw / 900) * 900;
+    // Only treat the quarter-hour multiple as a timezone / time-set-convention
+    // base when the residual is small: a genuinely wrong clock (> ~2 min off
+    // the grid) must SHOW as wrong, not be folded into the base - otherwise a
+    // 10-minute error would display as its rounding remainder.
+    if (base !== 0 && Math.abs(raw - base) <= 120) {
+      clockBaseSec = base;
+      log(`clock base ${fmtClockBase(clockBaseSec)} detected (timezone / time-set convention) — offsets shown relative to it`);
+    } else {
+      clockBaseSec = 0;
+      if (Math.abs(raw) > 120) {
+        log(`device clock is ${raw >= 0 ? "+" : ""}${raw.toFixed(0)} s off host UTC — consider "Sync RTC to host" before a long run (drift fit is unaffected)`);
       }
+    }
+  }
+  devSec -= clockBaseSec;
 
-      function setConnected(on, label) {
-        els.pill.textContent = on ? `connected · ${label}` : "disconnected";
-        els.pill.classList.toggle("on", on);
-        els.dock.disabled = on;
-        els.ble.disabled = on;
-        els.disc.disabled = !on;
-        els.start.disabled = !on || !!timer;
-        els.stop.disabled = !timer;
-        els.sync.disabled = !on;
-        els.rebase.disabled = !on;
-      }
+  const ev = monitor.addSample({ hostSec, devSec, rttMs: Math.round(rttMs), perfMs });
+  if (ev.kind === "host-step") {
+    log(`HOST clock step (${ev.hostStepSec.toFixed(2)} s, NTP?) — fit rebaselined`);
+  } else if (ev.kind === "device-step") {
+    log(`DEVICE clock step: ${ev.deltaSec.toFixed(2)} s`);
+  }
+  render();
+}
 
-      // ---------------------------------------------------------------------------
-      // Device time read — one sample, host timestamp at the round-trip midpoint
-      // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// UI rendering
+// ---------------------------------------------------------------------------
 
-      const TICKS_PER_SEC = 32768;
+function fmtElapsed(min) {
+  if (min < 1) return `${Math.round(min * 60)} s`;
+  if (min < 90) return `${min.toFixed(1)} min`;
+  return `${(min / 60).toFixed(2)} h`;
+}
 
-      function ticksFromBytes(u8) {
-        let t = 0n;
-        for (let i = 7; i >= 0; i--) t = (t << 8n) | BigInt(u8[i]);
-        return t;
-      }
+function render() {
+  const s = monitor.samples;
+  els.samples.textContent = String(s.length);
+  els.elapsed.textContent = s.length ? fmtElapsed(monitor.elapsedMinutes()) : "–";
+  els.devSteps.textContent = String(monitor.deviceSteps);
+  els.hostSteps.textContent = String(monitor.hostSteps);
 
-      async function readDeviceSeconds() {
-        // Raw device reading, no convention assumed: different tools set the RWC
-        // with different epoch bases (the Java dock driver / Consensys write UTC
-        // ms x 32.768; the Verisense console writes LOCAL civil time per DEV-900).
-        // The clock-base detection in takeSampleInner absorbs whichever base the
-        // device carries, so the offset stat always shows the true clock error.
-        if (mode === "dock") {
-          const raw = await client.getConfig(
-            UART_PROP.MAIN_PROCESSOR.CURR_LOCAL_TIME,
-          );
-          if (!raw || raw.length < 8)
-            throw new Error(
-              `CURR_LOCAL_TIME returned ${raw?.length ?? 0} bytes`,
-            );
-          return Number(ticksFromBytes(raw)) / TICKS_PER_SEC;
-        }
-        const { unixMs } = await client.getRtcTime();
-        return unixMs / 1000;
-      }
+  if (s.length) {
+    const last = s[s.length - 1];
+    els.offset.textContent = `${last.offsetSec >= 0 ? "+" : ""}${last.offsetSec.toFixed(3)} s`;
+    els.rtt.textContent = `${last.rttMs} ms`;
+  }
 
-      // Whole-quarter-hour base between the device clock and host UTC, detected
-      // from the first sample of a series: covers timezone conventions (any
-      // 15-minute-grid zone) and time-set-tool differences without guessing. The
-      // residual is the true clock error. Recomputed after any rebaseline/sync.
-      let clockBaseSec = null;
+  const ppm = monitor.ppmFit();
+  if (ppm === null || monitor.elapsedMinutes() < 2) {
+    els.ppm.textContent = s.length >= 2 ? "collecting…" : "–";
+    els.perDay.textContent = "–";
+  } else {
+    const cls = Math.abs(ppm) <= 25 ? "ppm-good" : "ppm-bad";
+    els.ppm.innerHTML = `<span class="${cls}">${ppm >= 0 ? "+" : ""}${ppm.toFixed(1)} ppm</span>`;
+    const sPerDay = (ppm * 86400) / 1e6;
+    els.perDay.textContent = `${sPerDay >= 0 ? "+" : ""}${sPerDay.toFixed(2)} s/day`;
+  }
+  els.csv.disabled = s.length === 0;
+  drawPlot();
+}
 
-      function fmtClockBase(sec) {
-        const sign = sec < 0 ? "-" : "+";
-        const a = Math.abs(sec);
-        return `${sign}${Math.floor(a / 3600)}:${String(Math.round((a % 3600) / 60)).padStart(2, "0")} h`;
-      }
+function drawPlot() {
+  const c = els.plot, ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  const s = monitor.samples;
+  if (s.length < 2) return;
 
-      let sampleInFlight = false;
+  const t0 = s[0].hostSec, y0 = s[0].offsetSec;
+  const xs = s.map((p) => p.hostSec - t0);
+  const ys = s.map((p) => p.offsetSec - y0);
+  const xMax = Math.max(xs[xs.length - 1], 1);
+  let yMin = Math.min(...ys), yMax = Math.max(...ys);
+  if (yMax - yMin < 0.01) { yMax += 0.005; yMin -= 0.005; }
+  const pad = 26;
+  const X = (x) => pad + (x / xMax) * (W - 2 * pad);
+  const Y = (y) => H - pad - ((y - yMin) / (yMax - yMin)) * (H - 2 * pad);
 
-      async function takeSample() {
-        // One sample at a time: a read slower than the interval (BLE latency,
-        // retries) must not overlap the next tick and interleave monitor updates.
-        if (sampleInFlight) return;
-        sampleInFlight = true;
-        try {
-          await takeSampleInner();
-        } finally {
-          sampleInFlight = false;
-        }
-      }
+  // zero line + axis labels
+  ctx.strokeStyle = "#3a4048"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad, Y(0)); ctx.lineTo(W - pad, Y(0)); ctx.stroke();
+  ctx.fillStyle = "#9aa0a6"; ctx.font = "11px system-ui";
+  ctx.fillText(`${((yMax) * 1000).toFixed(0)} ms`, 4, Y(yMax) + 4);
+  ctx.fillText(`${((yMin) * 1000).toFixed(0)} ms`, 4, Y(yMin) + 4);
+  ctx.fillText(fmtElapsed(xMax / 60), W - pad - 40, H - 8);
 
-      async function takeSampleInner() {
-        const p0 = performance.now();
-        let devSec;
-        try {
-          devSec = await readDeviceSeconds();
-        } catch (e) {
-          log(`sample failed: ${e.message}`);
-          return;
-        }
-        const p1 = performance.now();
-        const rttMs = p1 - p0;
-        // Host wall time at the midpoint of the round-trip (bounds latency to ±rtt/2).
-        const hostSec = (Date.now() - rttMs / 2) / 1000;
-        const perfMs = p0 + rttMs / 2;
+  // fit line
+  const ppm = monitor.ppmFit();
+  if (ppm !== null) {
+    ctx.strokeStyle = "#ff6a2e"; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(X(0), Y(0));
+    ctx.lineTo(X(xMax), Y((ppm / 1e6) * xMax));
+    ctx.stroke();
+  }
 
-        if (clockBaseSec === null) {
-          const raw = devSec - hostSec;
-          const base = Math.round(raw / 900) * 900;
-          // Only treat the quarter-hour multiple as a timezone / time-set-convention
-          // base when the residual is small: a genuinely wrong clock (> ~2 min off
-          // the grid) must SHOW as wrong, not be folded into the base - otherwise a
-          // 10-minute error would display as its rounding remainder.
-          if (base !== 0 && Math.abs(raw - base) <= 120) {
-            clockBaseSec = base;
-            log(
-              `clock base ${fmtClockBase(clockBaseSec)} detected (timezone / time-set convention) — offsets shown relative to it`,
-            );
-          } else {
-            clockBaseSec = 0;
-            if (Math.abs(raw) > 120) {
-              log(
-                `device clock is ${raw >= 0 ? "+" : ""}${raw.toFixed(0)} s off host UTC — consider "Sync RTC to host" before a long run (drift fit is unaffected)`,
-              );
-            }
-          }
-        }
-        devSec -= clockBaseSec;
+  // samples
+  ctx.fillStyle = "#64b5f6";
+  for (let i = 0; i < xs.length; i++) {
+    ctx.beginPath(); ctx.arc(X(xs[i]), Y(ys[i]), 2.2, 0, Math.PI * 2); ctx.fill();
+  }
+}
 
-        const ev = monitor.addSample({
-          hostSec,
-          devSec,
-          rttMs: Math.round(rttMs),
-          perfMs,
-        });
-        if (ev.kind === "host-step") {
-          log(
-            `HOST clock step (${ev.hostStepSec.toFixed(2)} s, NTP?) — fit rebaselined`,
-          );
-        } else if (ev.kind === "device-step") {
-          log(`DEVICE clock step: ${ev.deltaSec.toFixed(2)} s`);
-        }
-        render();
-      }
+// ---------------------------------------------------------------------------
+// Connect / disconnect
+// ---------------------------------------------------------------------------
 
-      // ---------------------------------------------------------------------------
-      // UI rendering
-      // ---------------------------------------------------------------------------
+els.dock.onclick = async () => {
+  try {
+    const c = new WiredShimmerClient({ transport: new WebSerialTransport() });
+    await c.connect();
+    client = c; mode = "dock";
+    let label = "dock UART";
+    try {
+      const id = await c.identify();
+      const eb = id.expansionBoard;
+      const sr = eb ? `SR${eb.boardId}-${eb.boardRev}-${eb.specialRev}` : "no expansion ID";
+      const fw = id.firmwareVersion;
+      label = `${id.mac.slice(-4)} ${sr}`;
+      els.devInfo.textContent =
+        `MAC ${id.mac} · ${sr} · FW v${fw.firmwareVersionMajor}.${fw.firmwareVersionMinor}.${fw.firmwareVersionInternal}`;
+    } catch (e) {
+      log(`identify failed (continuing): ${e.message}`);
+    }
+    deviceLabel = label;
+    clockBaseSec = null;
+    setConnected(true, `dock · ${label}`);
+    log(`connected over dock UART (${label})`);
+  } catch (e) {
+    log(`dock connect failed: ${e.message}`);
+  }
+};
 
-      function fmtElapsed(min) {
-        if (min < 1) return `${Math.round(min * 60)} s`;
-        if (min < 90) return `${min.toFixed(1)} min`;
-        return `${(min / 60).toFixed(2)} h`;
-      }
+els.ble.onclick = async () => {
+  try {
+    const c = new Shimmer3RClient();
+    await c.connect();
+    client = c; mode = "ble";
+    deviceLabel = c.deviceName ?? "BLE";
+    clockBaseSec = null;
+    setConnected(true, `BLE · ${deviceLabel}`);
+    log(`connected over BLE (${deviceLabel}) — note: BLE round-trip jitter is larger than dock UART`);
+  } catch (e) {
+    log(`BLE connect failed: ${e.message}`);
+  }
+};
 
-      function render() {
-        const s = monitor.samples;
-        els.samples.textContent = String(s.length);
-        els.elapsed.textContent = s.length
-          ? fmtElapsed(monitor.elapsedMinutes())
-          : "–";
-        els.devSteps.textContent = String(monitor.deviceSteps);
-        els.hostSteps.textContent = String(monitor.hostSteps);
+els.disc.onclick = async () => {
+  stopSampling();
+  try { await client?.disconnect(); } catch { /* ignore */ }
+  client = null; mode = null;
+  els.devInfo.textContent = "";
+  setConnected(false);
+  log("disconnected");
+};
 
-        if (s.length) {
-          const last = s[s.length - 1];
-          els.offset.textContent = `${last.offsetSec >= 0 ? "+" : ""}${last.offsetSec.toFixed(3)} s`;
-          els.rtt.textContent = `${last.rttMs} ms`;
-        }
+// ---------------------------------------------------------------------------
+// Sampling control
+// ---------------------------------------------------------------------------
 
-        const ppm = monitor.ppmFit();
-        if (ppm === null || monitor.elapsedMinutes() < 2) {
-          els.ppm.textContent = s.length >= 2 ? "collecting…" : "–";
-          els.perDay.textContent = "–";
-        } else {
-          const cls = Math.abs(ppm) <= 25 ? "ppm-good" : "ppm-bad";
-          els.ppm.innerHTML = `<span class="${cls}">${ppm >= 0 ? "+" : ""}${ppm.toFixed(1)} ppm</span>`;
-          const sPerDay = (ppm * 86400) / 1e6;
-          els.perDay.textContent = `${sPerDay >= 0 ? "+" : ""}${sPerDay.toFixed(2)} s/day`;
-        }
-        els.csv.disabled = s.length === 0;
-        drawPlot();
-      }
-
-      function drawPlot() {
-        const c = els.plot,
-          ctx = c.getContext("2d");
-        const W = c.width,
-          H = c.height;
-        ctx.clearRect(0, 0, W, H);
-        const s = monitor.samples;
-        if (s.length < 2) return;
-
-        const t0 = s[0].hostSec,
-          y0 = s[0].offsetSec;
-        const xs = s.map((p) => p.hostSec - t0);
-        const ys = s.map((p) => p.offsetSec - y0);
-        const xMax = Math.max(xs[xs.length - 1], 1);
-        let yMin = Math.min(...ys),
-          yMax = Math.max(...ys);
-        if (yMax - yMin < 0.01) {
-          yMax += 0.005;
-          yMin -= 0.005;
-        }
-        const pad = 26;
-        const X = (x) => pad + (x / xMax) * (W - 2 * pad);
-        const Y = (y) => H - pad - ((y - yMin) / (yMax - yMin)) * (H - 2 * pad);
-
-        // zero line + axis labels
-        ctx.strokeStyle = "#3a4048";
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(pad, Y(0));
-        ctx.lineTo(W - pad, Y(0));
-        ctx.stroke();
-        ctx.fillStyle = "#9aa0a6";
-        ctx.font = "11px system-ui";
-        ctx.fillText(`${(yMax * 1000).toFixed(0)} ms`, 4, Y(yMax) + 4);
-        ctx.fillText(`${(yMin * 1000).toFixed(0)} ms`, 4, Y(yMin) + 4);
-        ctx.fillText(fmtElapsed(xMax / 60), W - pad - 40, H - 8);
-
-        // fit line
-        const ppm = monitor.ppmFit();
-        if (ppm !== null) {
-          ctx.strokeStyle = "#ff6a2e";
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.moveTo(X(0), Y(0));
-          ctx.lineTo(X(xMax), Y((ppm / 1e6) * xMax));
-          ctx.stroke();
-        }
-
-        // samples
-        ctx.fillStyle = "#64b5f6";
-        for (let i = 0; i < xs.length; i++) {
-          ctx.beginPath();
-          ctx.arc(X(xs[i]), Y(ys[i]), 2.2, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-
-      // ---------------------------------------------------------------------------
-      // Connect / disconnect
-      // ---------------------------------------------------------------------------
-
-      els.dock.onclick = async () => {
-        try {
-          const c = new WiredShimmerClient({
-            transport: new WebSerialTransport(),
-          });
-          await c.connect();
-          client = c;
-          mode = "dock";
-          let label = "dock UART";
-          try {
-            const id = await c.identify();
-            const eb = id.expansionBoard;
-            const sr = eb
-              ? `SR${eb.boardId}-${eb.boardRev}-${eb.specialRev}`
-              : "no expansion ID";
-            const fw = id.firmwareVersion;
-            label = `${id.mac.slice(-4)} ${sr}`;
-            els.devInfo.textContent = `MAC ${id.mac} · ${sr} · FW v${fw.firmwareVersionMajor}.${fw.firmwareVersionMinor}.${fw.firmwareVersionInternal}`;
-          } catch (e) {
-            log(`identify failed (continuing): ${e.message}`);
-          }
-          deviceLabel = label;
-          clockBaseSec = null;
-          setConnected(true, `dock · ${label}`);
-          log(`connected over dock UART (${label})`);
-        } catch (e) {
-          log(`dock connect failed: ${e.message}`);
-        }
-      };
-
-      els.ble.onclick = async () => {
-        try {
-          const c = new Shimmer3RClient();
-          await c.connect();
-          client = c;
-          mode = "ble";
-          deviceLabel = c.deviceName ?? "BLE";
-          clockBaseSec = null;
-          setConnected(true, `BLE · ${deviceLabel}`);
-          log(
-            `connected over BLE (${deviceLabel}) — note: BLE round-trip jitter is larger than dock UART`,
-          );
-        } catch (e) {
-          log(`BLE connect failed: ${e.message}`);
-        }
-      };
-
-      els.disc.onclick = async () => {
-        stopSampling();
-        try {
-          await client?.disconnect();
-        } catch {
-          /* ignore */
-        }
-        client = null;
-        mode = null;
-        els.devInfo.textContent = "";
-        setConnected(false);
-        log("disconnected");
-      };
-
-      // ---------------------------------------------------------------------------
-      // Sampling control
-      // ---------------------------------------------------------------------------
-
-      async function acquireWakeLock() {
-        try {
-          if ("wakeLock" in navigator) {
-            wakeLock = await navigator.wakeLock.request("screen");
-            els.wake.textContent = "wake lock on";
-            els.wake.classList.add("on");
-            wakeLock.addEventListener("release", () => {
-              // Clear the handle: the UA releases the lock when the tab is
-              // backgrounded, and re-acquisition (visibilitychange below) is
-              // gated on !wakeLock.
-              wakeLock = null;
-              els.wake.textContent = "wake lock off";
-              els.wake.classList.remove("on");
-            });
-          }
-        } catch {
-          /* not fatal */
-        }
-      }
-
-      document.addEventListener("visibilitychange", () => {
-        // Re-acquire the wake lock when the tab returns to the foreground.
-        if (document.visibilityState === "visible" && timer && !wakeLock)
-          acquireWakeLock();
-      });
-
-      function startSampling() {
-        const iv = Math.min(600, Math.max(2, Number(els.interval.value) || 30));
-        els.interval.value = String(iv);
-        timer = setInterval(takeSample, iv * 1000);
-        els.start.disabled = true;
-        els.stop.disabled = false;
-        els.interval.disabled = true;
-        acquireWakeLock();
-        log(
-          `sampling every ${iv} s — leave running (1–2 h for a first estimate; longer = tighter)`,
-        );
-        takeSample();
-      }
-
-      function stopSampling() {
-        if (timer) {
-          clearInterval(timer);
-          timer = null;
-        }
-        els.start.disabled = !client;
-        els.stop.disabled = true;
-        els.interval.disabled = false;
-        wakeLock?.release().catch(() => {});
+async function acquireWakeLock() {
+  try {
+    if ("wakeLock" in navigator) {
+      wakeLock = await navigator.wakeLock.request("screen");
+      els.wake.textContent = "wake lock on"; els.wake.classList.add("on");
+      wakeLock.addEventListener("release", () => {
+        // Clear the handle: the UA releases the lock when the tab is
+        // backgrounded, and re-acquisition (visibilitychange below) is
+        // gated on !wakeLock.
         wakeLock = null;
-      }
+        els.wake.textContent = "wake lock off"; els.wake.classList.remove("on");
+      });
+    }
+  } catch { /* not fatal */ }
+}
 
-      els.start.onclick = startSampling;
-      els.stop.onclick = () => {
-        stopSampling();
-        log("sampling stopped");
-      };
+document.addEventListener("visibilitychange", () => {
+  // Re-acquire the wake lock when the tab returns to the foreground.
+  if (document.visibilityState === "visible" && timer && !wakeLock) acquireWakeLock();
+});
 
-      els.sync.onclick = async () => {
-        try {
-          // Write UTC unix ms - the stock Shimmer3/3R convention (the Java dock
-          // driver and Consensys write System.currentTimeMillis() x 32.768). The
-          // Verisense console's local-civil-time convention (DEV-900) does NOT
-          // apply to Shimmer3R; hardware test confirmed Consensys-set boards hold
-          // UTC. Either way the clock-base detection keeps the offset display true.
-          const nowMs = Date.now();
-          if (mode === "dock") {
-            // The clock is SET by writing RTC_CFG_TIME (0x04) - the firmware's only
-            // UART_SET time property; CURR_LOCAL_TIME (0x05) is read-only (BAD_CMD).
-            await client.writeRtcFromHostTime(nowMs);
-          } else {
-            await client.setRtcTime(nowMs);
-          }
-          monitor.rebaseline();
-          clockBaseSec = null;
-          log(
-            "device RTC synced to host (UTC, stock Consensys convention) — fit rebaselined",
-          );
-          render();
-        } catch (e) {
-          log(`RTC sync failed: ${e.message}`);
-        }
-      };
+function startSampling() {
+  const iv = Math.min(600, Math.max(2, Number(els.interval.value) || 30));
+  els.interval.value = String(iv);
+  timer = setInterval(takeSample, iv * 1000);
+  els.start.disabled = true; els.stop.disabled = false; els.interval.disabled = true;
+  acquireWakeLock();
+  log(`sampling every ${iv} s — leave running (1–2 h for a first estimate; longer = tighter)`);
+  takeSample();
+}
 
-      els.rebase.onclick = () => {
-        monitor.rebaseline();
-        clockBaseSec = null;
-        log("baseline reset — fit restarted");
-        render();
-      };
+function stopSampling() {
+  if (timer) { clearInterval(timer); timer = null; }
+  els.start.disabled = !client; els.stop.disabled = true; els.interval.disabled = false;
+  wakeLock?.release().catch(() => {});
+  wakeLock = null;
+}
 
-      els.csv.onclick = () => {
-        const meta = [
-          `# Shimmer3R RTC drift test (DEV-866)`,
-          `# device: ${deviceLabel} · transport: ${mode}`,
-          `# exported: ${new Date().toISOString()}`,
-          `# ppm_fit: ${monitor.ppmFit()?.toFixed(2) ?? "n/a"} · device_steps: ${monitor.deviceSteps} · host_steps: ${monitor.hostSteps}`,
-          `# clock_base_s: ${clockBaseSec ?? 0} (whole-quarter-hour base subtracted from device_unix_s; timezone / time-set convention)`,
-        ];
-        const csv = meta.concat(monitor.toCsvRows()).join("\n");
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-        a.download = `s3r-rtc-drift_${deviceLabel.replace(/[^\w-]+/g, "_")}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
-        a.click();
-        // Delay revocation: revoking immediately after click() can cancel the
-        // download in some browsers (same pattern as consensys-export).
-        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-      };
+els.start.onclick = startSampling;
+els.stop.onclick = () => { stopSampling(); log("sampling stopped"); };
 
-      // Feature detection notices
-      if (!("serial" in navigator)) {
-        log(
-          "Web Serial not available in this browser — dock/USB path needs Chrome or Edge.",
-        );
-      }
-      if (!("bluetooth" in navigator)) {
-        log(
-          "Web Bluetooth not available in this browser — BLE path needs Chrome or Edge.",
-        );
-      }
-      setConnected(false);
-      render();
-    </script>
-  </body>
+els.sync.onclick = async () => {
+  try {
+    // Write UTC unix ms - the stock Shimmer3/3R convention (the Java dock
+    // driver and Consensys write System.currentTimeMillis() x 32.768). The
+    // Verisense console's local-civil-time convention (DEV-900) does NOT
+    // apply to Shimmer3R; hardware test confirmed Consensys-set boards hold
+    // UTC. Either way the clock-base detection keeps the offset display true.
+    const nowMs = Date.now();
+    if (mode === "dock") {
+      // The clock is SET by writing RTC_CFG_TIME (0x04) - the firmware's only
+      // UART_SET time property; CURR_LOCAL_TIME (0x05) is read-only (BAD_CMD).
+      await client.writeRtcFromHostTime(nowMs);
+    } else {
+      await client.setRtcTime(nowMs);
+    }
+    monitor.rebaseline();
+    clockBaseSec = null;
+    log("device RTC synced to host (UTC, stock Consensys convention) — fit rebaselined");
+    render();
+  } catch (e) {
+    log(`RTC sync failed: ${e.message}`);
+  }
+};
+
+els.rebase.onclick = () => {
+  monitor.rebaseline();
+  clockBaseSec = null;
+  log("baseline reset — fit restarted");
+  render();
+};
+
+els.csv.onclick = () => {
+  const meta = [
+    `# Shimmer3R RTC drift test (DEV-866)`,
+    `# device: ${deviceLabel} · transport: ${mode}`,
+    `# exported: ${new Date().toISOString()}`,
+    `# ppm_fit: ${monitor.ppmFit()?.toFixed(2) ?? "n/a"} · device_steps: ${monitor.deviceSteps} · host_steps: ${monitor.hostSteps}`,
+    `# clock_base_s: ${clockBaseSec ?? 0} (whole-quarter-hour base subtracted from device_unix_s; timezone / time-set convention)`,
+  ];
+  const csv = meta.concat(monitor.toCsvRows()).join("\n");
+  const a = document.createElement("a");
+  // UTF-8 BOM (explicit escape, not a literal, so formatters can't silently
+  // strip it): without it Excel opens the CSV as ANSI and the metadata's
+  // "·" separators render as "Â·" (seen in the first field CSV exports).
+  a.href = URL.createObjectURL(new Blob(["\ufeff", csv], { type: "text/csv;charset=utf-8" }));
+  a.download = `s3r-rtc-drift_${deviceLabel.replace(/[^\w-]+/g, "_")}_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+  a.click();
+  // Delay revocation: revoking immediately after click() can cancel the
+  // download in some browsers (same pattern as consensys-export).
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+};
+
+// Feature detection notices
+if (!("serial" in navigator)) {
+  log("Web Serial not available in this browser — dock/USB path needs Chrome or Edge.");
+}
+if (!("bluetooth" in navigator)) {
+  log("Web Bluetooth not available in this browser — BLE path needs Chrome or Edge.");
+}
+setConnected(false);
+render();
+</script>
+</body>
 </html>
