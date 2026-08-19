@@ -19,7 +19,10 @@ rythmgame-emggyro/   │  Shimmer3R demos
 video-ppg/           │
 spell-gyro/          │
 ShimmerCapture/      │
-consensys-export/    ┘
+consensys-export/    │
+rtc-drift-test/      │
+sd-download/         ┘
+eeprom-branding/     ←  Shimmer3/Shimmer3R advertising-name branding tool
 Verisense/           ←  Verisense demo
 shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpacked in Chrome)
 sdk-source.json      ←  Single source-of-truth for SDK source mode/version
@@ -51,10 +54,16 @@ The full Verisense control console now lives in a dedicated repository:
 | Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
 | Consensys trial export + Bluetooth RTC set | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) |
 | RTC drift test (32k crystal, DEV-866) | [rtc-drift-test](https://shimmerresearch.github.io/webBLEDemos/rtc-drift-test/) |
+| SD-card file browse + download | [sd-download](https://shimmerresearch.github.io/webBLEDemos/sd-download/) |
+| Advertising / product name branding | [eeprom-branding](https://shimmerresearch.github.io/webBLEDemos/eeprom-branding/) |
 
 **Consensys Export** packages a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zips it, and shares it. It also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
 
 **RTC Drift Test** measures the Shimmer3R real-world-clock drift against the host clock and least-squares fits the slope in ppm, with NTP host-step detection and CSV export. Also works over the dock UART (Web Serial — preferred, lower jitter than BLE).
+
+**SD Download** browses the Shimmer3R SD card and pulls logged files off it over BLE, either a selection or the whole card, with a live throughput readout and an abort control. Files can be saved in the Consensys import folder layout, and optionally deleted from the card once a download has been verified. **Requires Shimmer3R firmware v1.01.009 or later** — earlier firmware does not implement the SD file-transfer commands and the page will refuse to start a transfer.
+
+**EEPROM Branding** reads and writes the record in the sensor's EEPROM that holds its Bluetooth Classic, BLE and USB names, so a device can advertise a customer's branding instead of the Shimmer defaults. Works over **BLE** (Shimmer3R) or **USB / dock serial** (Shimmer3 in a base, Shimmer3R directly over USB-C — the browser cannot reach a Shimmer3 over Bluetooth). New names only take effect after a restart: over BLE the page can arm a soft reboot and trigger it by disconnecting, and on the wired path it walks you through a manual power-cycle. Writes are CRC-protected and a "restore stock defaults" control returns the device to its factory names. Requires firmware with EEPROM brand-record support.
 
 ### Verisense
 **Requirements:** Verisense device (IMU or Pulse+), Chrome/Edge
