@@ -1461,8 +1461,13 @@
       }; // knee flexes backward (+X)
       let LIM = LIM_ARM;
       const limitsChk = document.getElementById("limitsChk");
-      const clampDeg = (v, lo, hi) =>
-        Math.min(Math.max(v, (lo * Math.PI) / 180), (hi * Math.PI) / 180);
+      // Takes an angle in degrees and degree limits, and returns RADIANS, ready
+      // to assign straight back into a THREE.Euler field. Clamping has to happen
+      // before the conversion: comparing a degree value against radian bounds
+      // saturates almost immediately (-90 deg is below -150 deg expressed as
+      // -2.618 rad), which defeated the joint limits entirely.
+      const clampDeg = (deg, lo, hi) =>
+        (Math.min(Math.max(deg, lo), hi) * Math.PI) / 180;
 
       const qUpperTarget = new THREE.Quaternion();
       const qWristWorld = new THREE.Quaternion();

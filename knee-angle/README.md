@@ -18,7 +18,9 @@ administration layers, focused on the algorithm and a polished live readout.
 ## Use
 1. Mount one sensor on the thigh and one on the shank, sagittal axis aligned.
 2. **Connect** both sensors.
-3. Stand with a straight leg and press **Zero** — this defines 0°.
+3. Stand with a straight leg and press **Zero** — the straight-leg pose then
+   reads **180°**, and flexing to a right angle reads 90° (the anatomical
+   convention the gauge, the trace and the rep counter all use).
 4. Flex and extend the knee. The gauge, live trace, and rep counter update in real time.
 
 ## Structure

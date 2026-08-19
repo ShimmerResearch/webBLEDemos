@@ -1,24 +1,27 @@
 // kinematics.js
 // ---------------------------------------------------------------------------
-// Knee joint-angle estimation from two thigh-mounted IMUs (accelerometer +
-// gyroscope). Framework-agnostic: no DOM, no Web Bluetooth. Pure math you can
-// unit-test in isolation and reuse anywhere.
+// Shimmer3R sensor-frame primitives, plus complementary-filter joint kinematics.
+// Framework-agnostic: no DOM, no Web Bluetooth. Pure math you can unit-test in
+// isolation and reuse anywhere.
 //
-// This is a clean re-implementation of the sensor-fusion core of the original
-// "Shimmer Sirona" Android app (ShimmerKinematics / ComplementaryFilter /
-// JointAngle). The low-level packet parsing and per-channel calibration that
-// dominated the original are gone — Shimmer3RClient hands us raw sensor counts,
-// so all this module does is the part that was actually worth keeping:
+// In THIS folder the module is used for the first half only: fusion3d.js imports
+// ACCEL_SENS / GYRO_SENS / MAG_SENS, the ALIGN_*_3R matrices and calibrate() to
+// get raw counts into a common device frame before its Madgwick MARG filter runs.
+// The SegmentTracker / KneeTracker classes below are the scalar single-axis path
+// carried over from the knee-angle demo; robot-teach does not use them, and they
+// are kept so the two demos share one calibration source of truth.
 //
-//   raw counts --calibrate--> g / deg/s
+//   raw counts --calibrate--> g / deg/s / gauss   <-- what robot-teach uses
 //   accel      --inclineFromAccel--> absolute tilt angle (noisy, drift-free)
 //   gyro       --integrate--------> angle delta (smooth, drifts)
 //   fuse the two with a complementary filter --> per-segment angle
-//   knee angle = upper-segment angle - lower-segment angle
+//   joint angle = upper-segment angle - lower-segment angle
 //
-// Note on a fix vs. the original: the Android version fused `gyro*dt` (degrees)
-// with the accelerometer angle (radians) in the same equation — a latent unit
-// mismatch. Here everything is consistently in DEGREES.
+// The scalar path is a clean re-implementation of the sensor-fusion core of the
+// original "Shimmer Sirona" Android app (ShimmerKinematics / ComplementaryFilter
+// / JointAngle). Note one fix vs. the original: the Android version fused
+// `gyro*dt` (degrees) with the accelerometer angle (radians) in the same
+// equation — a latent unit mismatch. Here everything is consistently in DEGREES.
 // ---------------------------------------------------------------------------
 
 const RAD2DEG = 180 / Math.PI;
