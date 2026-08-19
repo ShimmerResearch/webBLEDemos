@@ -223,7 +223,11 @@
         fileBuffer = [];
         headerRow = [];
         sampleCounter = 0;
-        await shimmer.startStreamingandLogging();
+        // buildSignalList() is what repopulates headerRow, and onFrame only calls
+        // it while this is false — so without the reset a second BT+SD run saves
+        // a CSV with no header. The BT-only start/stop handlers already do this.
+        signalListInitialized = false;
+        await shimmer.startStreamingAndLogging();
         shimmer.onStreamFrame = onFrame;
         document.getElementById("status").textContent =
           "Streaming and SD Logging…";
@@ -232,7 +236,7 @@
       document.getElementById("stopSDBTBtn").onclick = async () => {
         isStreaming = false;
         try {
-          await shimmer.stopStreamingandLogging();
+          await shimmer.stopStreamingAndLogging();
           document.getElementById("status").textContent =
             "Streaming and SD Logging stopped.";
         } catch (e) {
