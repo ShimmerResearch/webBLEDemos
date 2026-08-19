@@ -223,7 +223,7 @@
         fileBuffer = [];
         headerRow = [];
         sampleCounter = 0;
-        await shimmer.startStreamingandLogging();
+        await shimmer.startStreamingAndLogging();
         shimmer.onStreamFrame = onFrame;
         document.getElementById("status").textContent =
           "Streaming and SD Logging…";
@@ -232,7 +232,7 @@
       document.getElementById("stopSDBTBtn").onclick = async () => {
         isStreaming = false;
         try {
-          await shimmer.stopStreamingandLogging();
+          await shimmer.stopStreamingAndLogging();
           document.getElementById("status").textContent =
             "Streaming and SD Logging stopped.";
         } catch (e) {
