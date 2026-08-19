@@ -1,1169 +1,1654 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <!-- Google tag (gtag.js) -->
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
-    gtag('js', new Date());
-    gtag('config', 'G-T26GWN0LJW');
-  </script>
-
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Arm &amp; Hand — Dual-IMU 3D Demo</title>
-  <style>
-    :root {
-      --bg: #0d1117;
-      --panel: rgba(22, 27, 34, 0.88);
-      --panel-2: #1c2430;
-      --border: #2a3441;
-      --text: #e6edf3;
-      --muted: #8b98a8;
-      --accent: #2dd4bf;
-      --accent-dim: #0f766e;
-      --flex: #f59e0b;
-      --good: #34d399;
-      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
-      color: var(--text); font-family: var(--font); }
-    #scene { position: fixed; inset: 0; display: block; }
-
-    .overlay { position: fixed; z-index: 10; }
-    header.overlay {
-      top: 0; left: 0; right: 0; padding: 14px 20px;
-      display: flex; align-items: baseline; gap: 12px; pointer-events: none;
-    }
-    header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
-    header .tag {
-      font-size: 11px; color: var(--accent); border: 1px solid var(--accent-dim);
-      padding: 2px 8px; border-radius: 999px;
-    }
-    header a { color: var(--muted); font-size: 12px; text-decoration: none; pointer-events: auto; }
-    header a:hover { color: var(--accent); }
-
-    .panel {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
-      padding: 14px 16px; backdrop-filter: blur(8px);
-    }
-    #controls.overlay { top: 60px; left: 16px; width: 300px; display: flex; flex-direction: column; gap: 12px; }
-
-    .sensor { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
-    .sensor:last-of-type { border-bottom: none; }
-    .led { width: 11px; height: 11px; border-radius: 50%; background: #3b4654; flex: none;
-      transition: background .2s, box-shadow .2s; }
-    .led.on { background: var(--good); box-shadow: 0 0 8px var(--good); }
-    .led.streaming { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
-    .sensor .info { flex: 1; min-width: 0; }
-    .sensor .role { font-weight: 600; font-size: 14px; }
-    .sensor .name { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-
-    button {
-      font-family: var(--font); font-size: 13px; font-weight: 600;
-      border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
-      padding: 8px 14px; border-radius: 9px; cursor: pointer;
-      transition: background .15s, border-color .15s, opacity .15s;
-    }
-    button:hover:not(:disabled) { border-color: var(--accent); }
-    button:disabled { opacity: 0.4; cursor: not-allowed; }
-    button.primary { background: var(--accent-dim); border-color: var(--accent-dim); }
-    button.primary:hover:not(:disabled) { background: var(--accent); color: #04201c; }
-    button.wide { width: 100%; padding: 10px; }
-
-    .limb-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-    .limb-grid button.active { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
-    .row-btns { display: flex; gap: 8px; }
-    .row-btns button { flex: 1; }
-    button.rec { background: #7f1d1d; border-color: #f87171; }
-
-    .row { display: flex; align-items: center; gap: 10px; }
-    .row label { font-size: 13px; color: var(--muted); }
-    h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
-      margin: 0 0 10px; font-weight: 600; }
-
-    #hud.overlay {
-      top: 60px; right: 16px; text-align: right; pointer-events: none;
-    }
-    #hud .val { font-size: 42px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
-    #hud .val span { font-size: 18px; color: var(--muted); }
-    #hud .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
-    #hud .sub { margin-top: 10px; }
-
-    #prompt.overlay {
-      top: 70px; left: 50%; transform: translateX(-50%);
-      font-size: 15px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase;
-      color: var(--muted); background: var(--panel); border: 1px solid var(--border);
-      padding: 8px 18px; border-radius: 999px; pointer-events: none;
-      transition: color .2s, border-color .2s;
-    }
-    #prompt.hold { color: var(--flex); border-color: var(--flex); }
-    #prompt.live { color: var(--good); border-color: var(--good); }
-
-    #hint.overlay {
-      bottom: 14px; left: 50%; transform: translateX(-50%);
-      font-size: 12px; color: var(--muted); pointer-events: none;
-      background: var(--panel); border: 1px solid var(--border);
-      border-radius: 999px; padding: 7px 16px; white-space: nowrap;
-      display: flex; gap: 14px; align-items: center;
-    }
-    #hint kbd {
-      font-family: var(--font); font-size: 11px; color: var(--text);
-      background: var(--panel-2); border: 1px solid var(--border);
-      border-radius: 5px; padding: 1px 7px; margin-right: 5px;
-    }
-
-    #console.overlay {
-      bottom: 40px; left: 16px; width: 340px; max-height: 110px; overflow-y: auto;
-      font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
-      color: var(--muted); background: rgba(13,17,23,.85); border: 1px solid var(--border);
-      border-radius: 10px; padding: 8px 10px; white-space: pre-wrap;
-    }
-  </style>
-  <script type="importmap">
-  {
-    "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-      "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
-    }
-  }
-  </script>
-</head>
-<body>
-  <canvas id="scene"></canvas>
-
-  <header class="overlay">
-    <h1>Arm &amp; Hand</h1>
-    <span class="tag">Dual-IMU · Madgwick · 3D</span>
-    <a href="index.html">← knee demo</a>
-  </header>
-
-  <div id="controls" class="overlay">
-    <div class="panel">
-      <h2>Sensors</h2>
-      <div class="sensor">
-        <div class="led" id="ledUpper"></div>
-        <div class="info">
-          <div class="role" id="roleProx">Upper arm</div>
-          <div class="name" id="nameUpper">Not connected</div>
-        </div>
-        <button id="connUpper" class="primary">Connect</button>
-      </div>
-      <div class="sensor">
-        <div class="led" id="ledWrist"></div>
-        <div class="info">
-          <div class="role" id="roleDist">Wrist</div>
-          <div class="name" id="nameWrist">Not connected</div>
-        </div>
-        <button id="connWrist" class="primary">Connect</button>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>Calibration</h2>
-      <button id="demoBtn" class="wide">▶ Demo the calibration</button>
-      <button id="calBtn" class="wide primary" disabled style="margin-top: 8px;">⦿ Calibrate — hold still, then swing</button>
-    </div>
-
-    <div class="panel">
-      <h2>Model — active limb</h2>
-      <div class="limb-grid" style="margin-bottom: 10px;">
-        <button data-limb="LA">Left arm</button>
-        <button data-limb="RA" class="active">Right arm</button>
-        <button data-limb="LL">Left leg</button>
-        <button data-limb="RL">Right leg</button>
-      </div>
-      <div class="row">
-        <input type="checkbox" id="limitsChk" />
-        <label for="limitsChk">Enforce biological joint limits</label>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>Session</h2>
-      <div class="row-btns">
-        <button id="recBtn" disabled>⏺ Record</button>
-        <button id="playBtn" disabled>▶ Play</button>
-      </div>
-      <div id="recInfo" style="font-size: 11px; color: var(--muted); margin-top: 8px;">no recording yet</div>
-    </div>
-  </div>
-
-  <div id="hud" class="overlay">
-    <div class="val"><span id="flexVal">––</span><span>°</span></div>
-    <div class="lbl" id="flexLbl">elbow flexion</div>
-    <div class="sub">
-      <div class="val" style="font-size: 28px;"><span id="twistVal">––</span><span>°</span></div>
-      <div class="lbl" id="twistLbl">forearm rotation</div>
-    </div>
-    <div class="sub">
-      <div class="val" style="font-size: 28px;"><span id="hitVal">0</span></div>
-      <div class="lbl">piñata hits</div>
-    </div>
-  </div>
-
-  <div id="prompt" class="overlay">connect both sensors</div>
-  <div id="hint" class="overlay">
-    <span><kbd>Left-drag</kbd>rotate camera</span>
-    <span><kbd>Scroll</kbd>zoom</span>
-    <span><kbd>Right-drag</kbd>pan</span>
-  </div>
-  <pre id="console" class="overlay"></pre>
-
-  <script type="module">
-    import * as THREE from 'three';
-    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-    import * as CANNON from 'cannon-es';
-    // ?v= busts stale HTTP caches — bump it whenever these modules change
-    import { Shimmer3RClient, SensorBitmapShimmer3 } from '../shimmer-extension/vendor/shimmer-web-sdk.esm.js';
-    import { ArmImu } from './fusion3d.js?v=4';
-
-    // --- config -----------------------------------------------------------
-    const SAMPLING_HZ = 128;
-    const DT = 1 / SAMPLING_HZ;
-    const SENSOR_MASK = (SensorBitmapShimmer3.SENSOR_D_ACCEL |
-                         SensorBitmapShimmer3.SENSOR_GYRO) >>> 0;
-    const ACCEL_RANGE_4G = 1;
-    const GYRO_RANGE_500DPS = 2;
-    const BETA_SETTLE = 0.6;    // fast gravity convergence before reference
-    const BETA_RUN = 0.05;      // smooth tracking after reference
-
-    // --- console ------------------------------------------------------------
-    const consoleEl = document.getElementById('console');
-    const log = (t) => {
-      consoleEl.textContent += t + '\n';
-      consoleEl.scrollTop = consoleEl.scrollHeight;
-    };
-
-    // --- fusion -------------------------------------------------------------
-    const imuUpper = new ArmImu({ beta: BETA_SETTLE });
-    const imuWrist = new ArmImu({ beta: BETA_SETTLE });
-
-    // --- BLE ----------------------------------------------------------------
-    class SensorLink {
-      constructor(role, imu, els) {
-        this.role = role;
-        this.imu = imu;
-        this.els = els;
-        this.streaming = false;
-        this.client = new Shimmer3RClient({ timestampFmt: 'u24', debug: false });
-        this.client.onStatus = (m) => log(`[${role}] ${m}`);
-        this.client.onStreamFrame = (oc) => {
-          const ax = oc.get('WR_ACCEL_X')?.value, ay = oc.get('WR_ACCEL_Y')?.value, az = oc.get('WR_ACCEL_Z')?.value;
-          const gx = oc.get('GYRO_X')?.value, gy = oc.get('GYRO_Y')?.value, gz = oc.get('GYRO_Z')?.value;
-          if ([ax, ay, az, gx, gy, gz].some(v => v === undefined)) return;
-          this.imu.update({ x: ax, y: ay, z: az }, { x: gx, y: gy, z: gz }, DT);
-        };
+  <head>
+    <!-- Google tag (gtag.js) -->
+    <script
+      async
+      src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"
+    ></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
       }
-      async connectAndStream() {
-        this.els.led.className = 'led';
-        await this.client.connect();
-        this.els.name.textContent = this.client.device?.name || 'Shimmer3R';
-        this.els.led.className = 'led on';
-        await this.client.setSamplingRate(SAMPLING_HZ);
-        await this.client.setAccelRange(ACCEL_RANGE_4G);
-        await this.client.setGyroRange(GYRO_RANGE_500DPS);
-        await this.client.setSensors(SENSOR_MASK);
-        const chans = this.client.schema?.fields?.map(f => f.name) ?? [];
-        log(`[${this.role}] channels: ${chans.join(', ') || '(schema unavailable)'}`);
-        await this.client.startStreaming();
-        this.els.led.className = 'led streaming';
-        this.streaming = true;
-        log(`[${this.role}] streaming @ ${SAMPLING_HZ} Hz, ±4g / 500dps`);
+      gtag("js", new Date());
+      gtag("config", "G-T26GWN0LJW");
+    </script>
+
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Arm &amp; Hand — Dual-IMU 3D Demo</title>
+    <style>
+      :root {
+        --bg: #0d1117;
+        --panel: rgba(22, 27, 34, 0.88);
+        --panel-2: #1c2430;
+        --border: #2a3441;
+        --text: #e6edf3;
+        --muted: #8b98a8;
+        --accent: #2dd4bf;
+        --accent-dim: #0f766e;
+        --flex: #f59e0b;
+        --good: #34d399;
+        --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          sans-serif;
       }
-    }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--font);
+      }
+      #scene {
+        position: fixed;
+        inset: 0;
+        display: block;
+      }
 
-    const upper = new SensorLink('upper', imuUpper, {
-      led: document.getElementById('ledUpper'), name: document.getElementById('nameUpper'),
-    });
-    const wrist = new SensorLink('wrist', imuWrist, {
-      led: document.getElementById('ledWrist'), name: document.getElementById('nameWrist'),
-    });
+      .overlay {
+        position: fixed;
+        z-index: 10;
+      }
+      header.overlay {
+        top: 0;
+        left: 0;
+        right: 0;
+        padding: 14px 20px;
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        pointer-events: none;
+      }
+      header h1 {
+        font-size: 18px;
+        margin: 0;
+        font-weight: 650;
+        letter-spacing: -0.01em;
+      }
+      header .tag {
+        font-size: 11px;
+        color: var(--accent);
+        border: 1px solid var(--accent-dim);
+        padding: 2px 8px;
+        border-radius: 999px;
+      }
+      header a {
+        color: var(--muted);
+        font-size: 12px;
+        text-decoration: none;
+        pointer-events: auto;
+      }
+      header a:hover {
+        color: var(--accent);
+      }
 
-    const calBtn = document.getElementById('calBtn');
-    const demoBtn = document.getElementById('demoBtn');
-    function wireConnect(btn, link) {
-      btn.addEventListener('click', async () => {
-        btn.disabled = true;
-        try {
-          await link.connectAndStream();
-          btn.textContent = 'Connected';
-          if (upper.streaming && wrist.streaming) calBtn.disabled = false;
-        } catch (e) {
-          log(`[${link.role}] ❌ ${e.message}`);
-          link.els.led.className = 'led';
-          btn.disabled = false;
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 14px 16px;
+        backdrop-filter: blur(8px);
+      }
+      #controls.overlay {
+        top: 60px;
+        left: 16px;
+        width: 300px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .sensor {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .sensor:last-of-type {
+        border-bottom: none;
+      }
+      .led {
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: #3b4654;
+        flex: none;
+        transition:
+          background 0.2s,
+          box-shadow 0.2s;
+      }
+      .led.on {
+        background: var(--good);
+        box-shadow: 0 0 8px var(--good);
+      }
+      .led.streaming {
+        background: var(--accent);
+        box-shadow: 0 0 8px var(--accent);
+      }
+      .sensor .info {
+        flex: 1;
+        min-width: 0;
+      }
+      .sensor .role {
+        font-weight: 600;
+        font-size: 14px;
+      }
+      .sensor .name {
+        font-size: 11px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      button {
+        font-family: var(--font);
+        font-size: 13px;
+        font-weight: 600;
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--text);
+        padding: 8px 14px;
+        border-radius: 9px;
+        cursor: pointer;
+        transition:
+          background 0.15s,
+          border-color 0.15s,
+          opacity 0.15s;
+      }
+      button:hover:not(:disabled) {
+        border-color: var(--accent);
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      button.primary {
+        background: var(--accent-dim);
+        border-color: var(--accent-dim);
+      }
+      button.primary:hover:not(:disabled) {
+        background: var(--accent);
+        color: #04201c;
+      }
+      button.wide {
+        width: 100%;
+        padding: 10px;
+      }
+
+      .limb-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+      .limb-grid button.active {
+        background: var(--accent-dim);
+        border-color: var(--accent-dim);
+        color: #fff;
+      }
+      .row-btns {
+        display: flex;
+        gap: 8px;
+      }
+      .row-btns button {
+        flex: 1;
+      }
+      button.rec {
+        background: #7f1d1d;
+        border-color: #f87171;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .row label {
+        font-size: 13px;
+        color: var(--muted);
+      }
+      h2 {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 0 0 10px;
+        font-weight: 600;
+      }
+
+      #hud.overlay {
+        top: 60px;
+        right: 16px;
+        text-align: right;
+        pointer-events: none;
+      }
+      #hud .val {
+        font-size: 42px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        line-height: 1.1;
+      }
+      #hud .val span {
+        font-size: 18px;
+        color: var(--muted);
+      }
+      #hud .lbl {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      #hud .sub {
+        margin-top: 10px;
+      }
+
+      #prompt.overlay {
+        top: 70px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 15px;
+        font-weight: 650;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--muted);
+        background: var(--panel);
+        border: 1px solid var(--border);
+        padding: 8px 18px;
+        border-radius: 999px;
+        pointer-events: none;
+        transition:
+          color 0.2s,
+          border-color 0.2s;
+      }
+      #prompt.hold {
+        color: var(--flex);
+        border-color: var(--flex);
+      }
+      #prompt.live {
+        color: var(--good);
+        border-color: var(--good);
+      }
+
+      #hint.overlay {
+        bottom: 14px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 12px;
+        color: var(--muted);
+        pointer-events: none;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 7px 16px;
+        white-space: nowrap;
+        display: flex;
+        gap: 14px;
+        align-items: center;
+      }
+      #hint kbd {
+        font-family: var(--font);
+        font-size: 11px;
+        color: var(--text);
+        background: var(--panel-2);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 1px 7px;
+        margin-right: 5px;
+      }
+
+      #console.overlay {
+        bottom: 40px;
+        left: 16px;
+        width: 340px;
+        max-height: 110px;
+        overflow-y: auto;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 11px;
+        color: var(--muted);
+        background: rgba(13, 17, 23, 0.85);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 8px 10px;
+        white-space: pre-wrap;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+          "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
         }
+      }
+    </script>
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+
+    <header class="overlay">
+      <h1>Arm &amp; Hand</h1>
+      <span class="tag">Dual-IMU · Madgwick · 3D</span>
+      <a href="index.html">← knee demo</a>
+    </header>
+
+    <div id="controls" class="overlay">
+      <div class="panel">
+        <h2>Sensors</h2>
+        <div class="sensor">
+          <div class="led" id="ledUpper"></div>
+          <div class="info">
+            <div class="role" id="roleProx">Upper arm</div>
+            <div class="name" id="nameUpper">Not connected</div>
+          </div>
+          <button id="connUpper" class="primary">Connect</button>
+        </div>
+        <div class="sensor">
+          <div class="led" id="ledWrist"></div>
+          <div class="info">
+            <div class="role" id="roleDist">Wrist</div>
+            <div class="name" id="nameWrist">Not connected</div>
+          </div>
+          <button id="connWrist" class="primary">Connect</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Calibration</h2>
+        <button id="demoBtn" class="wide">▶ Demo the calibration</button>
+        <button
+          id="calBtn"
+          class="wide primary"
+          disabled
+          style="margin-top: 8px"
+        >
+          ⦿ Calibrate — hold still, then swing
+        </button>
+      </div>
+
+      <div class="panel">
+        <h2>Model — active limb</h2>
+        <div class="limb-grid" style="margin-bottom: 10px">
+          <button data-limb="LA">Left arm</button>
+          <button data-limb="RA" class="active">Right arm</button>
+          <button data-limb="LL">Left leg</button>
+          <button data-limb="RL">Right leg</button>
+        </div>
+        <div class="row">
+          <input type="checkbox" id="limitsChk" />
+          <label for="limitsChk">Enforce biological joint limits</label>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Session</h2>
+        <div class="row-btns">
+          <button id="recBtn" disabled>⏺ Record</button>
+          <button id="playBtn" disabled>▶ Play</button>
+        </div>
+        <div
+          id="recInfo"
+          style="font-size: 11px; color: var(--muted); margin-top: 8px"
+        >
+          no recording yet
+        </div>
+      </div>
+    </div>
+
+    <div id="hud" class="overlay">
+      <div class="val"><span id="flexVal">––</span><span>°</span></div>
+      <div class="lbl" id="flexLbl">elbow flexion</div>
+      <div class="sub">
+        <div class="val" style="font-size: 28px">
+          <span id="twistVal">––</span><span>°</span>
+        </div>
+        <div class="lbl" id="twistLbl">forearm rotation</div>
+      </div>
+      <div class="sub">
+        <div class="val" style="font-size: 28px">
+          <span id="hitVal">0</span>
+        </div>
+        <div class="lbl">piñata hits</div>
+      </div>
+    </div>
+
+    <div id="prompt" class="overlay">connect both sensors</div>
+    <div id="hint" class="overlay">
+      <span><kbd>Left-drag</kbd>rotate camera</span>
+      <span><kbd>Scroll</kbd>zoom</span>
+      <span><kbd>Right-drag</kbd>pan</span>
+    </div>
+    <pre id="console" class="overlay"></pre>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import * as CANNON from "cannon-es";
+      // ?v= busts stale HTTP caches — bump it whenever these modules change
+      import {
+        Shimmer3RClient,
+        SensorBitmapShimmer3,
+      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+      import { ArmImu } from "./fusion3d.js?v=4";
+
+      // --- config -----------------------------------------------------------
+      const SAMPLING_HZ = 128;
+      const DT = 1 / SAMPLING_HZ;
+      const SENSOR_MASK =
+        (SensorBitmapShimmer3.SENSOR_D_ACCEL |
+          SensorBitmapShimmer3.SENSOR_GYRO) >>>
+        0;
+      const ACCEL_RANGE_4G = 1;
+      const GYRO_RANGE_500DPS = 2;
+      const BETA_SETTLE = 0.6; // fast gravity convergence before reference
+      const BETA_RUN = 0.05; // smooth tracking after reference
+
+      // --- console ------------------------------------------------------------
+      const consoleEl = document.getElementById("console");
+      const log = (t) => {
+        consoleEl.textContent += t + "\n";
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      };
+
+      // --- fusion -------------------------------------------------------------
+      const imuUpper = new ArmImu({ beta: BETA_SETTLE });
+      const imuWrist = new ArmImu({ beta: BETA_SETTLE });
+
+      // --- BLE ----------------------------------------------------------------
+      class SensorLink {
+        constructor(role, imu, els) {
+          this.role = role;
+          this.imu = imu;
+          this.els = els;
+          this.streaming = false;
+          this.client = new Shimmer3RClient({
+            timestampFmt: "u24",
+            debug: false,
+          });
+          this.client.onStatus = (m) => log(`[${role}] ${m}`);
+          this.client.onStreamFrame = (oc) => {
+            const ax = oc.get("WR_ACCEL_X")?.value,
+              ay = oc.get("WR_ACCEL_Y")?.value,
+              az = oc.get("WR_ACCEL_Z")?.value;
+            const gx = oc.get("GYRO_X")?.value,
+              gy = oc.get("GYRO_Y")?.value,
+              gz = oc.get("GYRO_Z")?.value;
+            if ([ax, ay, az, gx, gy, gz].some((v) => v === undefined)) return;
+            this.imu.update(
+              { x: ax, y: ay, z: az },
+              { x: gx, y: gy, z: gz },
+              DT,
+            );
+          };
+        }
+        async connectAndStream() {
+          this.els.led.className = "led";
+          await this.client.connect();
+          this.els.name.textContent = this.client.device?.name || "Shimmer3R";
+          this.els.led.className = "led on";
+          await this.client.setSamplingRate(SAMPLING_HZ);
+          await this.client.setAccelRange(ACCEL_RANGE_4G);
+          await this.client.setGyroRange(GYRO_RANGE_500DPS);
+          await this.client.setSensors(SENSOR_MASK);
+          const chans = this.client.schema?.fields?.map((f) => f.name) ?? [];
+          log(
+            `[${this.role}] channels: ${chans.join(", ") || "(schema unavailable)"}`,
+          );
+          await this.client.startStreaming();
+          this.els.led.className = "led streaming";
+          this.streaming = true;
+          log(`[${this.role}] streaming @ ${SAMPLING_HZ} Hz, ±4g / 500dps`);
+        }
+      }
+
+      const upper = new SensorLink("upper", imuUpper, {
+        led: document.getElementById("ledUpper"),
+        name: document.getElementById("nameUpper"),
       });
-    }
-    wireConnect(document.getElementById('connUpper'), upper);
-    wireConnect(document.getElementById('connWrist'), wrist);
+      const wrist = new SensorLink("wrist", imuWrist, {
+        led: document.getElementById("ledWrist"),
+        name: document.getElementById("nameWrist"),
+      });
 
-    // --- calibration flow ---------------------------------------------------
-    // Two-phase FUNCTIONAL calibration:
-    //   1. hold still           -> gyro bias + reference pose per device
-    //   2. swing the straight arm forward & back at the shoulder ×3
-    //      -> both sensors rotate about the same physical axis; measuring that
-    //         axis in each filter's earth frame yields the yaw offset between
-    //         the frames (strapping differences included) and defines
-    //         scene-forward. Re-run anytime to heal slow yaw drift.
-    const promptEl = document.getElementById('prompt');
-    const CAL_BTN_LABEL = '⦿ Calibrate — hold still, then swing';
-    let live = false;
-    let calPhase = 'idle';   // idle | still | swing
-    let calPending = 0;
-    let stillDeadline = 0;   // backstop: a stalled sensor stream must not hang the flow
-    let swingDeadline = 0;
-    let quietSince = null;   // swing phase ends on "enough swing, then hold still"
+      const calBtn = document.getElementById("calBtn");
+      const demoBtn = document.getElementById("demoBtn");
+      function wireConnect(btn, link) {
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          try {
+            await link.connectAndStream();
+            btn.textContent = "Connected";
+            if (upper.streaming && wrist.streaming) calBtn.disabled = false;
+          } catch (e) {
+            log(`[${link.role}] ❌ ${e.message}`);
+            link.els.led.className = "led";
+            btn.disabled = false;
+          }
+        });
+      }
+      wireConnect(document.getElementById("connUpper"), upper);
+      wireConnect(document.getElementById("connWrist"), wrist);
 
-    function setPrompt(text, cls = '') {
-      promptEl.style.transition = 'none';
-      promptEl.style.opacity = '1';
-      promptEl.textContent = text;
-      promptEl.className = 'overlay' + (cls ? ' ' + cls : '');
-    }
-    function fadePrompt(delayMs = 2500) {
-      setTimeout(() => {
-        promptEl.style.transition = 'opacity 1s';
-        promptEl.style.opacity = '0';
-      }, delayMs);
-    }
+      // --- calibration flow ---------------------------------------------------
+      // Two-phase FUNCTIONAL calibration:
+      //   1. hold still           -> gyro bias + reference pose per device
+      //   2. swing the straight arm forward & back at the shoulder ×3
+      //      -> both sensors rotate about the same physical axis; measuring that
+      //         axis in each filter's earth frame yields the yaw offset between
+      //         the frames (strapping differences included) and defines
+      //         scene-forward. Re-run anytime to heal slow yaw drift.
+      const promptEl = document.getElementById("prompt");
+      const CAL_BTN_LABEL = "⦿ Calibrate — hold still, then swing";
+      let live = false;
+      let calPhase = "idle"; // idle | still | swing
+      let calPending = 0;
+      let stillDeadline = 0; // backstop: a stalled sensor stream must not hang the flow
+      let swingDeadline = 0;
+      let quietSince = null; // swing phase ends on "enough swing, then hold still"
 
-    let calSnapshot = null;   // rollback state if a re-calibration fails
-    calBtn.addEventListener('click', () => {
-      if (calPhase !== 'idle') return;
-      stopAnim();   // in case the demo animation is playing
-      // Full reset: every calibration starts from first-run conditions.
-      // Snapshot first so a failed attempt can restore the previous state.
-      calSnapshot = [imuUpper.snapshotCalibration(), imuWrist.snapshotCalibration()];
-      imuUpper.resetCalibration();
-      imuWrist.resetCalibration();
-      imuUpper.filter.beta = BETA_SETTLE;   // scrub accumulated tilt error
-      imuWrist.filter.beta = BETA_SETTLE;   // during the hold-still window
-      calPhase = 'still';
-      calBtn.disabled = true;
-      calBtn.textContent = 'Hold still…';
-      setPrompt('1/2 — hold the limb still (hanging straight down)', 'hold');
-      calPending = 2;
-      stillDeadline = performance.now() / 1000 + 6.0;
-      imuUpper.startCalibration(Math.round(1.25 * SAMPLING_HZ));
-      imuWrist.startCalibration(Math.round(1.25 * SAMPLING_HZ));
-    });
+      function setPrompt(text, cls = "") {
+        promptEl.style.transition = "none";
+        promptEl.style.opacity = "1";
+        promptEl.textContent = text;
+        promptEl.className = "overlay" + (cls ? " " + cls : "");
+      }
+      function fadePrompt(delayMs = 2500) {
+        setTimeout(() => {
+          promptEl.style.transition = "opacity 1s";
+          promptEl.style.opacity = "0";
+        }, delayMs);
+      }
 
-    function rollbackCalibration() {
-      if (!calSnapshot) return;
-      imuUpper.restoreCalibration(calSnapshot[0]);
-      imuWrist.restoreCalibration(calSnapshot[1]);
-      if (live) {   // previous good calibration is back in force
+      let calSnapshot = null; // rollback state if a re-calibration fails
+      calBtn.addEventListener("click", () => {
+        if (calPhase !== "idle") return;
+        stopAnim(); // in case the demo animation is playing
+        // Full reset: every calibration starts from first-run conditions.
+        // Snapshot first so a failed attempt can restore the previous state.
+        calSnapshot = [
+          imuUpper.snapshotCalibration(),
+          imuWrist.snapshotCalibration(),
+        ];
+        imuUpper.resetCalibration();
+        imuWrist.resetCalibration();
+        imuUpper.filter.beta = BETA_SETTLE; // scrub accumulated tilt error
+        imuWrist.filter.beta = BETA_SETTLE; // during the hold-still window
+        calPhase = "still";
+        calBtn.disabled = true;
+        calBtn.textContent = "Hold still…";
+        setPrompt("1/2 — hold the limb still (hanging straight down)", "hold");
+        calPending = 2;
+        stillDeadline = performance.now() / 1000 + 6.0;
+        imuUpper.startCalibration(Math.round(1.25 * SAMPLING_HZ));
+        imuWrist.startCalibration(Math.round(1.25 * SAMPLING_HZ));
+      });
+
+      function rollbackCalibration() {
+        if (!calSnapshot) return;
+        imuUpper.restoreCalibration(calSnapshot[0]);
+        imuWrist.restoreCalibration(calSnapshot[1]);
+        if (live) {
+          // previous good calibration is back in force
+          imuUpper.filter.beta = BETA_RUN;
+          imuWrist.filter.beta = BETA_RUN;
+        }
+        calSnapshot = null;
+      }
+
+      const fmtBias = (b) =>
+        `${b.x.toFixed(1)},${b.y.toFixed(1)},${b.z.toFixed(1)}`;
+      function onImuCalibrated() {
+        if (--calPending > 0) return;
+        calPhase = "swing";
+        calBtn.textContent = "Swing forward & back ×3…";
+        swingDeadline = performance.now() / 1000 + 15; // generous backstop only
+        quietSince = null;
+        imuUpper.startSwingCapture();
+        imuWrist.startSwingCapture();
+        startGuide(); // the mannequin demonstrates the swing to mimic
+      }
+      imuUpper.onCalibrated = onImuCalibrated;
+      imuWrist.onCalibrated = onImuCalibrated;
+
+      // Called every frame: drives progress display, timeouts, and phase exits.
+      const SWING_TARGET = 160; // ~1.25s of >40deg/s rotation per device
+      function checkCalPhases() {
+        const t = performance.now() / 1000;
+
+        if (calPhase === "still") {
+          const pU = imuUpper.calProgress,
+            pW = imuWrist.calProgress;
+          const pct = Math.round(Math.min(pU ?? 1, pW ?? 1) * 100);
+          setPrompt(`1/2 — hold the arm still at your side · ${pct}%`, "hold");
+          if (t > stillDeadline) {
+            // a sensor stopped delivering samples
+            rollbackCalibration();
+            calPhase = "idle";
+            calPending = 0;
+            calBtn.disabled = false;
+            calBtn.textContent = CAL_BTN_LABEL;
+            setPrompt(
+              "calibration timed out — a sensor may have stopped streaming",
+            );
+            const p = (v) => (v === null ? "done" : `${Math.round(v * 100)}%`);
+            log(
+              `still-phase timeout — progress upper: ${p(pU)}, wrist: ${p(pW)}. Check both LEDs are teal / reconnect.`,
+            );
+          }
+          return;
+        }
+
+        if (calPhase !== "swing") return;
+        const cU = imuUpper.swingCount,
+          cW = imuWrist.swingCount;
+        const pct = Math.min(
+          100,
+          Math.round((Math.min(cU, cW) / SWING_TARGET) * 100),
+        );
+        setPrompt(
+          `2/2 — swing forward & back ×3, then hold still · ${pct}%`,
+          "hold",
+        );
+        // exit: enough swing collected on BOTH devices, then ~0.7s of stillness
+        const quiet =
+          (imuUpper.gyroMag ?? 99) < 25 && (imuWrist.gyroMag ?? 99) < 25;
+        if (!quiet) quietSince = null;
+        else if (quietSince === null) quietSince = t;
+        const settled =
+          cU >= SWING_TARGET &&
+          cW >= SWING_TARGET &&
+          quietSince !== null &&
+          t - quietSince > 0.7;
+        if (!settled && t < swingDeadline) return;
+
+        calPhase = "idle";
+        stopAnim();
+        const aU = imuUpper.finishSwingCapture();
+        const aW = imuWrist.finishSwingCapture();
+        calBtn.disabled = false;
+        if (!aU || !aW) {
+          rollbackCalibration();
+          calBtn.textContent = live ? "⦿ Re-calibrate" : CAL_BTN_LABEL;
+          setPrompt(
+            live
+              ? "not enough swing — previous calibration restored"
+              : "not enough swing detected — press Calibrate to retry",
+          );
+          log(
+            `functional calibration failed: swing samples upper ${cU}, wrist ${cW} (need ${SWING_TARGET} each)`,
+          );
+          return;
+        }
+        imuUpper.setYawFix(aU);
+        imuWrist.setYawFix(aW);
+        const yaw = (a) => (Math.atan2(a.y, a.x) * 180) / Math.PI;
+        const off = ((((yaw(aU) - yaw(aW)) % 360) + 540) % 360) - 180;
+        live = true;
         imuUpper.filter.beta = BETA_RUN;
         imuWrist.filter.beta = BETA_RUN;
-      }
-      calSnapshot = null;
-    }
-
-    const fmtBias = (b) => `${b.x.toFixed(1)},${b.y.toFixed(1)},${b.z.toFixed(1)}`;
-    function onImuCalibrated() {
-      if (--calPending > 0) return;
-      calPhase = 'swing';
-      calBtn.textContent = 'Swing forward & back ×3…';
-      swingDeadline = performance.now() / 1000 + 15;   // generous backstop only
-      quietSince = null;
-      imuUpper.startSwingCapture();
-      imuWrist.startSwingCapture();
-      startGuide();   // the mannequin demonstrates the swing to mimic
-    }
-    imuUpper.onCalibrated = onImuCalibrated;
-    imuWrist.onCalibrated = onImuCalibrated;
-
-    // Called every frame: drives progress display, timeouts, and phase exits.
-    const SWING_TARGET = 160;   // ~1.25s of >40deg/s rotation per device
-    function checkCalPhases() {
-      const t = performance.now() / 1000;
-
-      if (calPhase === 'still') {
-        const pU = imuUpper.calProgress, pW = imuWrist.calProgress;
-        const pct = Math.round(Math.min(pU ?? 1, pW ?? 1) * 100);
-        setPrompt(`1/2 — hold the arm still at your side · ${pct}%`, 'hold');
-        if (t > stillDeadline) {   // a sensor stopped delivering samples
-          rollbackCalibration();
-          calPhase = 'idle'; calPending = 0;
-          calBtn.disabled = false; calBtn.textContent = CAL_BTN_LABEL;
-          setPrompt('calibration timed out — a sensor may have stopped streaming');
-          const p = (v) => v === null ? 'done' : `${Math.round(v * 100)}%`;
-          log(`still-phase timeout — progress upper: ${p(pU)}, wrist: ${p(pW)}. Check both LEDs are teal / reconnect.`);
-        }
-        return;
-      }
-
-      if (calPhase !== 'swing') return;
-      const cU = imuUpper.swingCount, cW = imuWrist.swingCount;
-      const pct = Math.min(100, Math.round(Math.min(cU, cW) / SWING_TARGET * 100));
-      setPrompt(`2/2 — swing forward & back ×3, then hold still · ${pct}%`, 'hold');
-      // exit: enough swing collected on BOTH devices, then ~0.7s of stillness
-      const quiet = (imuUpper.gyroMag ?? 99) < 25 && (imuWrist.gyroMag ?? 99) < 25;
-      if (!quiet) quietSince = null;
-      else if (quietSince === null) quietSince = t;
-      const settled = cU >= SWING_TARGET && cW >= SWING_TARGET
-                      && quietSince !== null && (t - quietSince) > 0.7;
-      if (!settled && t < swingDeadline) return;
-
-      calPhase = 'idle';
-      stopAnim();
-      const aU = imuUpper.finishSwingCapture();
-      const aW = imuWrist.finishSwingCapture();
-      calBtn.disabled = false;
-      if (!aU || !aW) {
-        rollbackCalibration();
-        calBtn.textContent = live ? '⦿ Re-calibrate' : CAL_BTN_LABEL;
-        setPrompt(live
-          ? 'not enough swing — previous calibration restored'
-          : 'not enough swing detected — press Calibrate to retry');
-        log(`functional calibration failed: swing samples upper ${cU}, wrist ${cW} (need ${SWING_TARGET} each)`);
-        return;
-      }
-      imuUpper.setYawFix(aU);
-      imuWrist.setYawFix(aW);
-      const yaw = (a) => Math.atan2(a.y, a.x) * 180 / Math.PI;
-      const off = ((yaw(aU) - yaw(aW)) % 360 + 540) % 360 - 180;
-      live = true;
-      imuUpper.filter.beta = BETA_RUN;
-      imuWrist.filter.beta = BETA_RUN;
-      setArmDim(false);
-      calBtn.textContent = '⦿ Re-calibrate';
-      recBtn.disabled = false;
-      setPrompt('live — move your limb', 'live');
-      fadePrompt();
-      log(`calibrated: frame yaw offset ${off.toFixed(1)}° corrected`
-        + ` (gyro bias U: ${fmtBias(imuUpper.bias)} · W: ${fmtBias(imuWrist.bias)} deg/s)`);
-    }
-
-    // --- calibration animation (mannequin demonstrates the procedure) --------
-    // Timeline: hold still (2s) -> swing ×3 (6.6s) -> settle. The Demo button
-    // plays the whole thing with captions; during REAL calibration the swing
-    // segment loops as a guide to mimic.
-    const SWING_PERIOD = 2.2, SWING_CYCLES = 3;
-    const SWING_START = 2.0, SWING_END = SWING_START + SWING_PERIOD * SWING_CYCLES;
-    let anim = null;   // { t, mode: 'demo' | 'guide' }
-    const animQ = new THREE.Quaternion();
-    const X_AXIS = new THREE.Vector3(1, 0, 0);
-
-    function startDemo() {
-      if (calPhase !== 'idle' || anim) return;
-      anim = { t: 0, mode: 'demo' };
-      setArmDim(false);
-    }
-    demoBtn.addEventListener('click', startDemo);
-
-    function startGuide() {
-      anim = { t: SWING_START, mode: 'guide' };
-      setArmDim(false);
-    }
-
-    function stopAnim() {
-      if (!anim) return;
-      anim = null;
-      setArmDim(!live);
-      proxGroup.quaternion.identity();
-      distGroup.quaternion.identity();
-    }
-
-    function updateAnim(dt) {
-      if (!anim) return;
-      anim.t += dt;
-      let theta = 0;
-      if (anim.t < SWING_START) {
-        if (anim.mode === 'demo') setPrompt('demo 1/2 — hold the arm still at your side', 'hold');
-      } else if (anim.t < SWING_END) {
-        // forward-first swing (forward = rotation about -X in scene space)
-        theta = -70 * Math.PI / 180 * Math.sin(2 * Math.PI * (anim.t - SWING_START) / SWING_PERIOD);
-        if (anim.mode === 'demo') setPrompt('demo 2/2 — swing forward & back ×3, elbow straight', 'hold');
-      } else if (anim.mode === 'guide') {
-        anim.t = SWING_START;   // loop the swing until the real capture finishes
-      } else if (anim.t < SWING_END + 1.8) {
-        setPrompt("that's it — press Calibrate to do it for real", 'live');
-      } else {
-        stopAnim();
-        fadePrompt(400);
-        return;
-      }
-      animQ.setFromAxisAngle(X_AXIS, theta);
-      proxGroup.quaternion.copy(animQ);
-      distGroup.quaternion.identity();   // joint stays straight throughout
-    }
-
-    // --- three.js scene -----------------------------------------------------
-    const canvas = document.getElementById('scene');
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0d1117);
-    scene.fog = new THREE.Fog(0x0d1117, 2.5, 6);
-
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 20);
-    camera.position.set(0.85, 0.25, 1.15);
-
-    const controls = new OrbitControls(camera, canvas);
-    controls.target.set(0.1, -0.05, 0);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.08;
-    controls.minDistance = 0.5;
-    controls.maxDistance = 3.5;
-
-    scene.add(new THREE.HemisphereLight(0x4a5866, 0x0d1117, 1.4));
-    const key = new THREE.DirectionalLight(0xffffff, 2.2);
-    key.position.set(1.5, 2.5, 1.5);
-    key.castShadow = true;
-    key.shadow.mapSize.set(1024, 1024);
-    key.shadow.camera.left = -1.5; key.shadow.camera.right = 1.5;
-    key.shadow.camera.top = 1.5; key.shadow.camera.bottom = -1.5;
-    scene.add(key);
-    const rim = new THREE.PointLight(0x2dd4bf, 1.5, 4);
-    rim.position.set(-1.2, 0.4, -0.8);
-    scene.add(rim);
-    // back light: mirrors the key from behind so the model stays lit when the
-    // camera orbits around the rear (slightly cool, no shadows to keep one
-    // coherent shadow direction)
-    const back = new THREE.DirectionalLight(0xbdd4ff, 1.3);
-    back.position.set(-1.0, 2.0, -2.0);
-    scene.add(back);
-
-    const grid = new THREE.GridHelper(6, 30, 0x2a3441, 0x1c2430);
-    grid.position.y = -0.85;
-    scene.add(grid);
-    const shadowCatcher = new THREE.Mesh(
-      new THREE.PlaneGeometry(6, 6),
-      new THREE.ShadowMaterial({ opacity: 0.35 }),
-    );
-    shadowCatcher.rotation.x = -Math.PI / 2;
-    shadowCatcher.position.y = -0.849;
-    shadowCatcher.receiveShadow = true;
-    scene.add(shadowCatcher);
-
-    // materials are tracked per limb so each limb dims independently
-    function setLimbOpacity(key, o) {
-      for (const m of limbs[key].mats) m.opacity = o;
-    }
-    function setArmDim(dim) {   // calibration-state dimming of the ACTIVE limb
-      if (activeKey) setLimbOpacity(activeKey, dim ? 0.3 : 1);
-    }
-
-    // torso + head context — ghosted so the piñata stays visible behind the body
-    // (depthWrite off avoids transparency sorting artifacts with objects behind)
-    const torsoMat = new THREE.MeshStandardMaterial({
-      color: 0x1c2430, roughness: 0.8, metalness: 0.05,
-      transparent: true, opacity: 0.30, depthWrite: false,
-    });
-    const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.36, 8, 24), torsoMat);
-    torso.position.set(0, 0.08, 0);
-    scene.add(torso);
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.1, 24, 16), torsoMat);
-    head.position.set(0, 0.48, 0);
-    scene.add(head);
-
-    // --- articulated body (two IMUs drive whichever limb is selected) --------
-    // Per limb: root (at shoulder/hip) -> proxGroup (proximal IMU) ->
-    // jointPivot -> distGroup (relative IMU, clamped) -> hand/foot.
-    // Rest pose = limb hanging straight down = the calibration reference pose.
-    // The model faces +Z (toward the piñata), so its anatomical RIGHT is -X:
-    // seen from behind, the right limb is on the viewer's right (like a real
-    // person); seen from the front it mirrors, as when facing someone.
-    const LIMB_DEFS = {
-      LA: { label: 'Left arm', type: 'arm', side: +1 },
-      RA: { label: 'Right arm', type: 'arm', side: -1 },
-      LL: { label: 'Left leg', type: 'leg', side: +1 },
-      RL: { label: 'Right leg', type: 'leg', side: -1 },
-    };
-    const ARM_DIM = { joint: { x: 0.22, y: 0.30 }, prox: 0.28, dist: 0.25, girth: [0.038, 0.032] };
-    const LEG_DIM = { joint: { x: 0.10, y: -0.24 }, prox: 0.30, dist: 0.28, girth: [0.052, 0.042] };
-    const limbs = {};
-    let activeKey = null;
-    let proxGroup = null, distGroup = null;   // active-limb shortcuts (pose + anim)
-    let handMarker = null;                    // active end effector (palm / foot)
-    const handPrev = new THREE.Vector3(NaN, NaN, NaN);
-    const handVel = new THREE.Vector3();
-
-    function capsuleY(radius, length, material) {
-      // capsule along -Y from origin (joint at origin)
-      const mesh = new THREE.Mesh(new THREE.CapsuleGeometry(radius, length, 6, 16), material);
-      mesh.position.y = -length / 2;
-      mesh.castShadow = true;
-      return mesh;
-    }
-
-    function buildHand(handSide, material) {
-      const hand = new THREE.Group();
-      const palm = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.085, 0.075), material);
-      palm.position.y = -0.045;
-      palm.castShadow = true;
-      hand.add(palm);
-      // four fingers, slightly splayed
-      for (let i = 0; i < 4; i++) {
-        const f = new THREE.Mesh(new THREE.CapsuleGeometry(0.008, 0.06, 4, 8), material);
-        f.position.set(0, -0.115, -0.028 + i * 0.019);
-        f.rotation.x = (i - 1.5) * 0.05;
-        f.castShadow = true;
-        hand.add(f);
-      }
-      // thumb on the inner side (toward the torso)
-      const thumb = new THREE.Mesh(new THREE.CapsuleGeometry(0.009, 0.045, 4, 8), material);
-      thumb.position.set(-handSide * 0.02, -0.06, 0.045);
-      thumb.rotation.set(-0.7, 0, handSide * 0.5);
-      thumb.castShadow = true;
-      hand.add(thumb);
-      return hand;
-    }
-
-    function buildFoot(footSide, material) {
-      const foot = new THREE.Group();
-      const sole = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.045, 0.16), material);
-      sole.position.set(0, -0.02, 0.045);   // toes forward
-      sole.castShadow = true;
-      foot.add(sole);
-      return foot;
-    }
-
-    function buildLimb(key) {
-      const def = LIMB_DEFS[key];
-      const D = def.type === 'arm' ? ARM_DIM : LEG_DIM;
-      const mats = [];
-      const mat = (color, opts = {}) => {
-        const m = new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.15, transparent: true, ...opts });
-        mats.push(m);
-        return m;
-      };
-      const proxMat = mat(0x8b98a8);
-      const distMat = mat(0xe6edf3);
-      const jointMat = mat(0x2dd4bf, { roughness: 0.35 });
-
-      const root = new THREE.Group();
-      root.position.set(def.side * D.joint.x, D.joint.y, 0);
-      scene.add(root);
-
-      const ball = new THREE.Mesh(new THREE.SphereGeometry(D.girth[0] + 0.008, 20, 14), jointMat);
-      ball.castShadow = true;
-      root.add(ball);
-
-      const proxGrp = new THREE.Group();
-      root.add(proxGrp);
-      proxGrp.add(capsuleY(D.girth[0], D.prox - 0.06, proxMat));
-      // IMU puck on the proximal segment (visual nod to the hardware)
-      const puckP = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.045, 0.015), jointMat);
-      puckP.position.set(def.side * D.girth[0], -D.prox * 0.45, 0.02);
-      puckP.castShadow = true;
-      proxGrp.add(puckP);
-
-      const jointPivot = new THREE.Group();
-      jointPivot.position.y = -D.prox;
-      proxGrp.add(jointPivot);
-      const jball = new THREE.Mesh(new THREE.SphereGeometry(D.girth[1] + 0.006, 20, 14), jointMat);
-      jball.castShadow = true;
-      jointPivot.add(jball);
-
-      const distGrp = new THREE.Group();
-      jointPivot.add(distGrp);
-      distGrp.add(capsuleY(D.girth[1], D.dist - 0.05, distMat));
-      const puckD = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.04, 0.014), jointMat);
-      puckD.position.set(def.side * D.girth[1], -D.dist * 0.85, 0.018);
-      puckD.castShadow = true;
-      distGrp.add(puckD);
-
-      const effector = def.type === 'arm' ? buildHand(def.side, distMat) : buildFoot(def.side, distMat);
-      effector.position.y = -D.dist;
-      distGrp.add(effector);
-
-      // invisible marker at the palm / toe — tracked for piñata collisions
-      const marker = new THREE.Object3D();
-      marker.position.set(0, def.type === 'arm' ? -0.09 : -0.02, def.type === 'arm' ? 0 : 0.08);
-      effector.add(marker);
-
-      limbs[key] = { def, mats, proxGroup: proxGrp, distGroup: distGrp, marker };
-    }
-    for (const key in LIMB_DEFS) buildLimb(key);
-
-    // --- limb selection -------------------------------------------------------
-    const LIMB_KEY = 'armDemo.limb';
-    const limbBtns = [...document.querySelectorAll('[data-limb]')];
-    const roleProxEl = document.getElementById('roleProx');
-    const roleDistEl = document.getElementById('roleDist');
-    const flexLblEl = document.getElementById('flexLbl');
-    const twistLblEl = document.getElementById('twistLbl');
-
-    function selectLimb(key) {
-      if (!LIMB_DEFS[key]) key = 'RA';
-      activeKey = key;
-      const L = limbs[key], def = L.def;
-      proxGroup = L.proxGroup;
-      distGroup = L.distGroup;
-      handMarker = L.marker;
-      handPrev.set(NaN, NaN, NaN);
-      for (const k in limbs) setLimbOpacity(k, k === key ? (live ? 1 : 0.3) : 0.55);
-      for (const b of limbBtns) b.classList.toggle('active', b.dataset.limb === key);
-      roleProxEl.textContent = def.type === 'arm' ? 'Upper arm' : 'Thigh';
-      roleDistEl.textContent = def.type === 'arm' ? 'Wrist' : 'Ankle';
-      flexLblEl.textContent = def.type === 'arm' ? 'elbow flexion' : 'knee flexion';
-      twistLblEl.textContent = def.type === 'arm' ? 'forearm rotation' : 'shank rotation';
-      LIM = def.type === 'arm' ? LIM_ARM : LIM_LEG;
-      // hang the piñata within reach: chest height for arms, shin height for kicks
-      anchor.position.y = def.type === 'arm' ? 0.85 : 0.32;
-      restPos.set(anchor.position.x, anchor.position.y - PINATA.ropeLen, anchor.position.z);
-      respawnPinata();
-      controls.target.set(def.side * 0.12, def.type === 'arm' ? -0.05 : -0.40, 0);
-      localStorage.setItem(LIMB_KEY, key);
-    }
-    for (const b of limbBtns) b.addEventListener('click', () => selectLimb(b.dataset.limb));
-
-    // --- piñata (cannon-es rigid-body physics) -------------------------------
-    // Anchor -> 3-link rope chain (distance constraints, so the rope bends and
-    // jiggles) -> piñata rigid body. The hand is a kinematic sphere driven by
-    // the IMU pose carrying real velocity, so punches transfer genuine
-    // momentum. After enough solid hits the rope snaps: the piñata tumbles to
-    // the floor, bounces, can still be batted around, then respawns.
-    const PINATA = {
-      pivot: new THREE.Vector3(0, 0.85, 0.40),   // rope anchor
-      ropeLen: 0.62,
-      radius: 0.11,
-      hitCooldown: 0.25,  // s between registered hits
-      breakHits: 8,
-      palette: [0xf59e0b, 0x2dd4bf, 0xe879f9, 0x60a5fa, 0x34d399, 0xf87171],
-    };
-    const pin = {
-      hits: 0, lastHit: 0,
-      broken: false, respawnT: 0,
-      spawnT: 1,   // 0->1 scale-in on respawn
-      squash: 0,
-    };
-
-    function buildPinata() {
-      const g = new THREE.Group();
-      const core = new THREE.Mesh(
-        new THREE.IcosahedronGeometry(PINATA.radius, 1),
-        new THREE.MeshStandardMaterial({ color: 0xe879f9, flatShading: true, roughness: 0.7 }),
-      );
-      core.castShadow = true;
-      g.add(core);
-      // star cones on the six axes
-      const dirs = [[1,0,0], [-1,0,0], [0,1,0], [0,-1,0], [0,0,1], [0,0,-1]];
-      const up = new THREE.Vector3(0, 1, 0);
-      dirs.forEach((d, i) => {
-        const cone = new THREE.Mesh(
-          new THREE.ConeGeometry(0.045, 0.12, 8),
-          new THREE.MeshStandardMaterial({ color: PINATA.palette[i % PINATA.palette.length], flatShading: true, roughness: 0.7 }),
+        setArmDim(false);
+        calBtn.textContent = "⦿ Re-calibrate";
+        recBtn.disabled = false;
+        setPrompt("live — move your limb", "live");
+        fadePrompt();
+        log(
+          `calibrated: frame yaw offset ${off.toFixed(1)}° corrected` +
+            ` (gyro bias U: ${fmtBias(imuUpper.bias)} · W: ${fmtBias(imuWrist.bias)} deg/s)`,
         );
-        const dir = new THREE.Vector3(...d);
-        cone.position.copy(dir).multiplyScalar(PINATA.radius + 0.05);
-        cone.quaternion.setFromUnitVectors(up, dir);
-        cone.castShadow = true;
-        g.add(cone);
+      }
+
+      // --- calibration animation (mannequin demonstrates the procedure) --------
+      // Timeline: hold still (2s) -> swing ×3 (6.6s) -> settle. The Demo button
+      // plays the whole thing with captions; during REAL calibration the swing
+      // segment loops as a guide to mimic.
+      const SWING_PERIOD = 2.2,
+        SWING_CYCLES = 3;
+      const SWING_START = 2.0,
+        SWING_END = SWING_START + SWING_PERIOD * SWING_CYCLES;
+      let anim = null; // { t, mode: 'demo' | 'guide' }
+      const animQ = new THREE.Quaternion();
+      const X_AXIS = new THREE.Vector3(1, 0, 0);
+
+      function startDemo() {
+        if (calPhase !== "idle" || anim) return;
+        anim = { t: 0, mode: "demo" };
+        setArmDim(false);
+      }
+      demoBtn.addEventListener("click", startDemo);
+
+      function startGuide() {
+        anim = { t: SWING_START, mode: "guide" };
+        setArmDim(false);
+      }
+
+      function stopAnim() {
+        if (!anim) return;
+        anim = null;
+        setArmDim(!live);
+        proxGroup.quaternion.identity();
+        distGroup.quaternion.identity();
+      }
+
+      function updateAnim(dt) {
+        if (!anim) return;
+        anim.t += dt;
+        let theta = 0;
+        if (anim.t < SWING_START) {
+          if (anim.mode === "demo")
+            setPrompt("demo 1/2 — hold the arm still at your side", "hold");
+        } else if (anim.t < SWING_END) {
+          // forward-first swing (forward = rotation about -X in scene space)
+          theta =
+            ((-70 * Math.PI) / 180) *
+            Math.sin((2 * Math.PI * (anim.t - SWING_START)) / SWING_PERIOD);
+          if (anim.mode === "demo")
+            setPrompt(
+              "demo 2/2 — swing forward & back ×3, elbow straight",
+              "hold",
+            );
+        } else if (anim.mode === "guide") {
+          anim.t = SWING_START; // loop the swing until the real capture finishes
+        } else if (anim.t < SWING_END + 1.8) {
+          setPrompt("that's it — press Calibrate to do it for real", "live");
+        } else {
+          stopAnim();
+          fadePrompt(400);
+          return;
+        }
+        animQ.setFromAxisAngle(X_AXIS, theta);
+        proxGroup.quaternion.copy(animQ);
+        distGroup.quaternion.identity(); // joint stays straight throughout
+      }
+
+      // --- three.js scene -----------------------------------------------------
+      const canvas = document.getElementById("scene");
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0d1117);
+      scene.fog = new THREE.Fog(0x0d1117, 2.5, 6);
+
+      const camera = new THREE.PerspectiveCamera(45, 1, 0.05, 20);
+      camera.position.set(0.85, 0.25, 1.15);
+
+      const controls = new OrbitControls(camera, canvas);
+      controls.target.set(0.1, -0.05, 0);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.minDistance = 0.5;
+      controls.maxDistance = 3.5;
+
+      scene.add(new THREE.HemisphereLight(0x4a5866, 0x0d1117, 1.4));
+      const key = new THREE.DirectionalLight(0xffffff, 2.2);
+      key.position.set(1.5, 2.5, 1.5);
+      key.castShadow = true;
+      key.shadow.mapSize.set(1024, 1024);
+      key.shadow.camera.left = -1.5;
+      key.shadow.camera.right = 1.5;
+      key.shadow.camera.top = 1.5;
+      key.shadow.camera.bottom = -1.5;
+      scene.add(key);
+      const rim = new THREE.PointLight(0x2dd4bf, 1.5, 4);
+      rim.position.set(-1.2, 0.4, -0.8);
+      scene.add(rim);
+      // back light: mirrors the key from behind so the model stays lit when the
+      // camera orbits around the rear (slightly cool, no shadows to keep one
+      // coherent shadow direction)
+      const back = new THREE.DirectionalLight(0xbdd4ff, 1.3);
+      back.position.set(-1.0, 2.0, -2.0);
+      scene.add(back);
+
+      const grid = new THREE.GridHelper(6, 30, 0x2a3441, 0x1c2430);
+      grid.position.y = -0.85;
+      scene.add(grid);
+      const shadowCatcher = new THREE.Mesh(
+        new THREE.PlaneGeometry(6, 6),
+        new THREE.ShadowMaterial({ opacity: 0.35 }),
+      );
+      shadowCatcher.rotation.x = -Math.PI / 2;
+      shadowCatcher.position.y = -0.849;
+      shadowCatcher.receiveShadow = true;
+      scene.add(shadowCatcher);
+
+      // materials are tracked per limb so each limb dims independently
+      function setLimbOpacity(key, o) {
+        for (const m of limbs[key].mats) m.opacity = o;
+      }
+      function setArmDim(dim) {
+        // calibration-state dimming of the ACTIVE limb
+        if (activeKey) setLimbOpacity(activeKey, dim ? 0.3 : 1);
+      }
+
+      // torso + head context — ghosted so the piñata stays visible behind the body
+      // (depthWrite off avoids transparency sorting artifacts with objects behind)
+      const torsoMat = new THREE.MeshStandardMaterial({
+        color: 0x1c2430,
+        roughness: 0.8,
+        metalness: 0.05,
+        transparent: true,
+        opacity: 0.3,
+        depthWrite: false,
       });
-      return g;
-    }
-    const pinataMesh = buildPinata();
-    scene.add(pinataMesh);
+      const torso = new THREE.Mesh(
+        new THREE.CapsuleGeometry(0.16, 0.36, 8, 24),
+        torsoMat,
+      );
+      torso.position.set(0, 0.08, 0);
+      scene.add(torso);
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.1, 24, 16),
+        torsoMat,
+      );
+      head.position.set(0, 0.48, 0);
+      scene.add(head);
 
-    const N_LINKS = 3;
-    const ROPE_POINTS = N_LINKS + 2;   // anchor + links + attachment point
-    const ropeGeo = new THREE.BufferGeometry();
-    ropeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ROPE_POINTS * 3), 3));
-    const rope = new THREE.Line(ropeGeo, new THREE.LineBasicMaterial({ color: 0x8b98a8 }));
-    scene.add(rope);
+      // --- articulated body (two IMUs drive whichever limb is selected) --------
+      // Per limb: root (at shoulder/hip) -> proxGroup (proximal IMU) ->
+      // jointPivot -> distGroup (relative IMU, clamped) -> hand/foot.
+      // Rest pose = limb hanging straight down = the calibration reference pose.
+      // The model faces +Z (toward the piñata), so its anatomical RIGHT is -X:
+      // seen from behind, the right limb is on the viewer's right (like a real
+      // person); seen from the front it mirrors, as when facing someone.
+      const LIMB_DEFS = {
+        LA: { label: "Left arm", type: "arm", side: +1 },
+        RA: { label: "Right arm", type: "arm", side: -1 },
+        LL: { label: "Left leg", type: "leg", side: +1 },
+        RL: { label: "Right leg", type: "leg", side: -1 },
+      };
+      const ARM_DIM = {
+        joint: { x: 0.22, y: 0.3 },
+        prox: 0.28,
+        dist: 0.25,
+        girth: [0.038, 0.032],
+      };
+      const LEG_DIM = {
+        joint: { x: 0.1, y: -0.24 },
+        prox: 0.3,
+        dist: 0.28,
+        girth: [0.052, 0.042],
+      };
+      const limbs = {};
+      let activeKey = null;
+      let proxGroup = null,
+        distGroup = null; // active-limb shortcuts (pose + anim)
+      let handMarker = null; // active end effector (palm / foot)
+      const handPrev = new THREE.Vector3(NaN, NaN, NaN);
+      const handVel = new THREE.Vector3();
 
-    // physics world
-    const phys = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
-    phys.solver.iterations = 40;
-    phys.solver.tolerance = 1e-4;
-    phys.defaultContactMaterial.restitution = 0.35;
-    phys.defaultContactMaterial.friction = 0.3;
+      function capsuleY(radius, length, material) {
+        // capsule along -Y from origin (joint at origin)
+        const mesh = new THREE.Mesh(
+          new THREE.CapsuleGeometry(radius, length, 6, 16),
+          material,
+        );
+        mesh.position.y = -length / 2;
+        mesh.castShadow = true;
+        return mesh;
+      }
 
-    const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane() });
-    groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
-    groundBody.position.y = -0.849;
-    phys.addBody(groundBody);
+      function buildHand(handSide, material) {
+        const hand = new THREE.Group();
+        const palm = new THREE.Mesh(
+          new THREE.BoxGeometry(0.028, 0.085, 0.075),
+          material,
+        );
+        palm.position.y = -0.045;
+        palm.castShadow = true;
+        hand.add(palm);
+        // four fingers, slightly splayed
+        for (let i = 0; i < 4; i++) {
+          const f = new THREE.Mesh(
+            new THREE.CapsuleGeometry(0.008, 0.06, 4, 8),
+            material,
+          );
+          f.position.set(0, -0.115, -0.028 + i * 0.019);
+          f.rotation.x = (i - 1.5) * 0.05;
+          f.castShadow = true;
+          hand.add(f);
+        }
+        // thumb on the inner side (toward the torso)
+        const thumb = new THREE.Mesh(
+          new THREE.CapsuleGeometry(0.009, 0.045, 4, 8),
+          material,
+        );
+        thumb.position.set(-handSide * 0.02, -0.06, 0.045);
+        thumb.rotation.set(-0.7, 0, handSide * 0.5);
+        thumb.castShadow = true;
+        hand.add(thumb);
+        return hand;
+      }
 
-    const anchor = new CANNON.Body({ type: CANNON.Body.STATIC });
-    anchor.position.set(PINATA.pivot.x, PINATA.pivot.y, PINATA.pivot.z);
-    phys.addBody(anchor);
+      function buildFoot(footSide, material) {
+        const foot = new THREE.Group();
+        const sole = new THREE.Mesh(
+          new THREE.BoxGeometry(0.06, 0.045, 0.16),
+          material,
+        );
+        sole.position.set(0, -0.02, 0.045); // toes forward
+        sole.castShadow = true;
+        foot.add(sole);
+        return foot;
+      }
 
-    const attachLen = PINATA.radius + 0.02;
-    const segLen = (PINATA.ropeLen - attachLen) / N_LINKS;
-    const links = [];
-    for (let i = 0; i < N_LINKS; i++) {
-      const b = new CANNON.Body({ mass: 0.05, shape: new CANNON.Sphere(0.012), linearDamping: 0.25 });
-      b.position.set(PINATA.pivot.x, PINATA.pivot.y - segLen * (i + 1), PINATA.pivot.z);
-      phys.addBody(b);
-      links.push(b);
-    }
+      function buildLimb(key) {
+        const def = LIMB_DEFS[key];
+        const D = def.type === "arm" ? ARM_DIM : LEG_DIM;
+        const mats = [];
+        const mat = (color, opts = {}) => {
+          const m = new THREE.MeshStandardMaterial({
+            color,
+            roughness: 0.55,
+            metalness: 0.15,
+            transparent: true,
+            ...opts,
+          });
+          mats.push(m);
+          return m;
+        };
+        const proxMat = mat(0x8b98a8);
+        const distMat = mat(0xe6edf3);
+        const jointMat = mat(0x2dd4bf, { roughness: 0.35 });
 
-    const restPos = new CANNON.Vec3(PINATA.pivot.x, PINATA.pivot.y - PINATA.ropeLen, PINATA.pivot.z);
-    const pinataBody = new CANNON.Body({
-      mass: 0.8,
-      shape: new CANNON.Sphere(PINATA.radius + 0.03),
-      linearDamping: 0.06,
-      angularDamping: 0.25,
-    });
-    pinataBody.position.copy(restPos);
-    phys.addBody(pinataBody);
+        const root = new THREE.Group();
+        root.position.set(def.side * D.joint.x, D.joint.y, 0);
+        scene.add(root);
 
-    phys.addConstraint(new CANNON.DistanceConstraint(anchor, links[0], segLen));
-    for (let i = 0; i < N_LINKS - 1; i++) {
-      phys.addConstraint(new CANNON.DistanceConstraint(links[i], links[i + 1], segLen));
-    }
-    const tieConstraint = new CANNON.DistanceConstraint(links[N_LINKS - 1], pinataBody, attachLen);
-    phys.addConstraint(tieConstraint);
-    // stiffen the rope: default SPOOK regularization lets distance constraints
-    // stretch ~7cm under the piñata's weight; this brings it to ~2cm
-    for (const c of phys.constraints) {
-      c.equations.forEach((eq) => eq.setSpookParams(1e9, 3, 1 / 120));
-    }
-    let tieAttached = true;
+        const ball = new THREE.Mesh(
+          new THREE.SphereGeometry(D.girth[0] + 0.008, 20, 14),
+          jointMat,
+        );
+        ball.castShadow = true;
+        root.add(ball);
 
-    const handBody = new CANNON.Body({ type: CANNON.Body.KINEMATIC, shape: new CANNON.Sphere(0.075) });
-    handBody.position.set(0, -10, 0);   // parked until the arm reports a pose
-    phys.addBody(handBody);
+        const proxGrp = new THREE.Group();
+        root.add(proxGrp);
+        proxGrp.add(capsuleY(D.girth[0], D.prox - 0.06, proxMat));
+        // IMU puck on the proximal segment (visual nod to the hardware)
+        const puckP = new THREE.Mesh(
+          new THREE.BoxGeometry(0.03, 0.045, 0.015),
+          jointMat,
+        );
+        puckP.position.set(def.side * D.girth[0], -D.prox * 0.45, 0.02);
+        puckP.castShadow = true;
+        proxGrp.add(puckP);
 
-    pinataBody.addEventListener('collide', (e) => {
-      if (e.body !== handBody || pin.broken) return;
-      const now = performance.now() / 1000;
-      if (now - pin.lastHit < PINATA.hitCooldown) return;
-      const impact = Math.abs(e.contact.getImpactVelocityAlongNormal());
-      if (impact < 0.35) return;
-      pin.lastHit = now;
-      pin.squash = 1;
-      pin.hits++;
-      hitValEl.textContent = pin.hits;
-      const at = new THREE.Vector3().copy(pinataBody.position);
-      confetti(at, 60 + Math.min(90, impact * 35), 1 + impact * 0.35);
-      if (pin.hits >= PINATA.breakHits) breakPinata(at);
-    });
+        const jointPivot = new THREE.Group();
+        jointPivot.position.y = -D.prox;
+        proxGrp.add(jointPivot);
+        const jball = new THREE.Mesh(
+          new THREE.SphereGeometry(D.girth[1] + 0.006, 20, 14),
+          jointMat,
+        );
+        jball.castShadow = true;
+        jointPivot.add(jball);
 
-    function breakPinata(at) {
-      confetti(at, 350, 2.6);
-      pin.broken = true;
-      pin.respawnT = 3.5;
-      pin.hits = 0;
-      hitValEl.textContent = '0';
-      phys.removeConstraint(tieConstraint);   // rope snaps; the piñata tumbles
-      tieAttached = false;
-      pinataBody.angularVelocity.set(
-        (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10);
-      promptEl.style.transition = 'none';
-      promptEl.style.opacity = '1';
-      promptEl.textContent = '🎉 piñata down!';
-      promptEl.className = 'overlay live';
-      setTimeout(() => {
-        promptEl.style.transition = 'opacity 1s';
-        promptEl.style.opacity = '0';
-      }, 2200);
-    }
+        const distGrp = new THREE.Group();
+        jointPivot.add(distGrp);
+        distGrp.add(capsuleY(D.girth[1], D.dist - 0.05, distMat));
+        const puckD = new THREE.Mesh(
+          new THREE.BoxGeometry(0.028, 0.04, 0.014),
+          jointMat,
+        );
+        puckD.position.set(def.side * D.girth[1], -D.dist * 0.85, 0.018);
+        puckD.castShadow = true;
+        distGrp.add(puckD);
 
-    function respawnPinata() {
-      pin.broken = false;
-      pin.spawnT = 0;
-      pin.hits = 0;
-      hitValEl.textContent = '0';
+        const effector =
+          def.type === "arm"
+            ? buildHand(def.side, distMat)
+            : buildFoot(def.side, distMat);
+        effector.position.y = -D.dist;
+        distGrp.add(effector);
+
+        // invisible marker at the palm / toe — tracked for piñata collisions
+        const marker = new THREE.Object3D();
+        marker.position.set(
+          0,
+          def.type === "arm" ? -0.09 : -0.02,
+          def.type === "arm" ? 0 : 0.08,
+        );
+        effector.add(marker);
+
+        limbs[key] = {
+          def,
+          mats,
+          proxGroup: proxGrp,
+          distGroup: distGrp,
+          marker,
+        };
+      }
+      for (const key in LIMB_DEFS) buildLimb(key);
+
+      // --- limb selection -------------------------------------------------------
+      const LIMB_KEY = "armDemo.limb";
+      const limbBtns = [...document.querySelectorAll("[data-limb]")];
+      const roleProxEl = document.getElementById("roleProx");
+      const roleDistEl = document.getElementById("roleDist");
+      const flexLblEl = document.getElementById("flexLbl");
+      const twistLblEl = document.getElementById("twistLbl");
+
+      function selectLimb(key) {
+        if (!LIMB_DEFS[key]) key = "RA";
+        activeKey = key;
+        const L = limbs[key],
+          def = L.def;
+        proxGroup = L.proxGroup;
+        distGroup = L.distGroup;
+        handMarker = L.marker;
+        handPrev.set(NaN, NaN, NaN);
+        for (const k in limbs)
+          setLimbOpacity(k, k === key ? (live ? 1 : 0.3) : 0.55);
+        for (const b of limbBtns)
+          b.classList.toggle("active", b.dataset.limb === key);
+        roleProxEl.textContent = def.type === "arm" ? "Upper arm" : "Thigh";
+        roleDistEl.textContent = def.type === "arm" ? "Wrist" : "Ankle";
+        flexLblEl.textContent =
+          def.type === "arm" ? "elbow flexion" : "knee flexion";
+        twistLblEl.textContent =
+          def.type === "arm" ? "forearm rotation" : "shank rotation";
+        LIM = def.type === "arm" ? LIM_ARM : LIM_LEG;
+        // hang the piñata within reach: chest height for arms, shin height for kicks
+        anchor.position.y = def.type === "arm" ? 0.85 : 0.32;
+        restPos.set(
+          anchor.position.x,
+          anchor.position.y - PINATA.ropeLen,
+          anchor.position.z,
+        );
+        respawnPinata();
+        controls.target.set(
+          def.side * 0.12,
+          def.type === "arm" ? -0.05 : -0.4,
+          0,
+        );
+        localStorage.setItem(LIMB_KEY, key);
+      }
+      for (const b of limbBtns)
+        b.addEventListener("click", () => selectLimb(b.dataset.limb));
+
+      // --- piñata (cannon-es rigid-body physics) -------------------------------
+      // Anchor -> 3-link rope chain (distance constraints, so the rope bends and
+      // jiggles) -> piñata rigid body. The hand is a kinematic sphere driven by
+      // the IMU pose carrying real velocity, so punches transfer genuine
+      // momentum. After enough solid hits the rope snaps: the piñata tumbles to
+      // the floor, bounces, can still be batted around, then respawns.
+      const PINATA = {
+        pivot: new THREE.Vector3(0, 0.85, 0.4), // rope anchor
+        ropeLen: 0.62,
+        radius: 0.11,
+        hitCooldown: 0.25, // s between registered hits
+        breakHits: 8,
+        palette: [0xf59e0b, 0x2dd4bf, 0xe879f9, 0x60a5fa, 0x34d399, 0xf87171],
+      };
+      const pin = {
+        hits: 0,
+        lastHit: 0,
+        broken: false,
+        respawnT: 0,
+        spawnT: 1, // 0->1 scale-in on respawn
+        squash: 0,
+      };
+
+      function buildPinata() {
+        const g = new THREE.Group();
+        const core = new THREE.Mesh(
+          new THREE.IcosahedronGeometry(PINATA.radius, 1),
+          new THREE.MeshStandardMaterial({
+            color: 0xe879f9,
+            flatShading: true,
+            roughness: 0.7,
+          }),
+        );
+        core.castShadow = true;
+        g.add(core);
+        // star cones on the six axes
+        const dirs = [
+          [1, 0, 0],
+          [-1, 0, 0],
+          [0, 1, 0],
+          [0, -1, 0],
+          [0, 0, 1],
+          [0, 0, -1],
+        ];
+        const up = new THREE.Vector3(0, 1, 0);
+        dirs.forEach((d, i) => {
+          const cone = new THREE.Mesh(
+            new THREE.ConeGeometry(0.045, 0.12, 8),
+            new THREE.MeshStandardMaterial({
+              color: PINATA.palette[i % PINATA.palette.length],
+              flatShading: true,
+              roughness: 0.7,
+            }),
+          );
+          const dir = new THREE.Vector3(...d);
+          cone.position.copy(dir).multiplyScalar(PINATA.radius + 0.05);
+          cone.quaternion.setFromUnitVectors(up, dir);
+          cone.castShadow = true;
+          g.add(cone);
+        });
+        return g;
+      }
+      const pinataMesh = buildPinata();
+      scene.add(pinataMesh);
+
+      const N_LINKS = 3;
+      const ROPE_POINTS = N_LINKS + 2; // anchor + links + attachment point
+      const ropeGeo = new THREE.BufferGeometry();
+      ropeGeo.setAttribute(
+        "position",
+        new THREE.BufferAttribute(new Float32Array(ROPE_POINTS * 3), 3),
+      );
+      const rope = new THREE.Line(
+        ropeGeo,
+        new THREE.LineBasicMaterial({ color: 0x8b98a8 }),
+      );
+      scene.add(rope);
+
+      // physics world
+      const phys = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+      phys.solver.iterations = 40;
+      phys.solver.tolerance = 1e-4;
+      phys.defaultContactMaterial.restitution = 0.35;
+      phys.defaultContactMaterial.friction = 0.3;
+
+      const groundBody = new CANNON.Body({
+        type: CANNON.Body.STATIC,
+        shape: new CANNON.Plane(),
+      });
+      groundBody.quaternion.setFromAxisAngle(
+        new CANNON.Vec3(1, 0, 0),
+        -Math.PI / 2,
+      );
+      groundBody.position.y = -0.849;
+      phys.addBody(groundBody);
+
+      const anchor = new CANNON.Body({ type: CANNON.Body.STATIC });
+      anchor.position.set(PINATA.pivot.x, PINATA.pivot.y, PINATA.pivot.z);
+      phys.addBody(anchor);
+
+      const attachLen = PINATA.radius + 0.02;
+      const segLen = (PINATA.ropeLen - attachLen) / N_LINKS;
+      const links = [];
+      for (let i = 0; i < N_LINKS; i++) {
+        const b = new CANNON.Body({
+          mass: 0.05,
+          shape: new CANNON.Sphere(0.012),
+          linearDamping: 0.25,
+        });
+        b.position.set(
+          PINATA.pivot.x,
+          PINATA.pivot.y - segLen * (i + 1),
+          PINATA.pivot.z,
+        );
+        phys.addBody(b);
+        links.push(b);
+      }
+
+      const restPos = new CANNON.Vec3(
+        PINATA.pivot.x,
+        PINATA.pivot.y - PINATA.ropeLen,
+        PINATA.pivot.z,
+      );
+      const pinataBody = new CANNON.Body({
+        mass: 0.8,
+        shape: new CANNON.Sphere(PINATA.radius + 0.03),
+        linearDamping: 0.06,
+        angularDamping: 0.25,
+      });
       pinataBody.position.copy(restPos);
-      pinataBody.velocity.setZero();
-      pinataBody.angularVelocity.setZero();
-      pinataBody.quaternion.set(0, 0, 0, 1);
-      links.forEach((b, i) => {   // rope re-hangs from wherever the anchor now is
-        b.position.set(anchor.position.x, anchor.position.y - segLen * (i + 1), anchor.position.z);
-        b.velocity.setZero();
+      phys.addBody(pinataBody);
+
+      phys.addConstraint(
+        new CANNON.DistanceConstraint(anchor, links[0], segLen),
+      );
+      for (let i = 0; i < N_LINKS - 1; i++) {
+        phys.addConstraint(
+          new CANNON.DistanceConstraint(links[i], links[i + 1], segLen),
+        );
+      }
+      const tieConstraint = new CANNON.DistanceConstraint(
+        links[N_LINKS - 1],
+        pinataBody,
+        attachLen,
+      );
+      phys.addConstraint(tieConstraint);
+      // stiffen the rope: default SPOOK regularization lets distance constraints
+      // stretch ~7cm under the piñata's weight; this brings it to ~2cm
+      for (const c of phys.constraints) {
+        c.equations.forEach((eq) => eq.setSpookParams(1e9, 3, 1 / 120));
+      }
+      let tieAttached = true;
+
+      const handBody = new CANNON.Body({
+        type: CANNON.Body.KINEMATIC,
+        shape: new CANNON.Sphere(0.075),
       });
-      if (!tieAttached) {
-        phys.addConstraint(tieConstraint);
-        tieAttached = true;
-      }
-    }
+      handBody.position.set(0, -10, 0); // parked until the arm reports a pose
+      phys.addBody(handBody);
 
-    // --- confetti --------------------------------------------------------------
-    const bursts = [];
-    function confetti(pos, n = 100, speed = 1.6) {
-      n = Math.floor(n);   // fractional n overruns the typed arrays
-      const positions = new Float32Array(n * 3);
-      const colors = new Float32Array(n * 3);
-      const vels = [];
-      const c = new THREE.Color();
-      for (let i = 0; i < n; i++) {
-        positions.set([pos.x, pos.y, pos.z], i * 3);
-        c.set(PINATA.palette[(Math.random() * PINATA.palette.length) | 0]);
-        colors.set([c.r, c.g, c.b], i * 3);
-        const th = Math.random() * Math.PI * 2, ph = Math.acos(2 * Math.random() - 1);
-        const s = speed * (0.4 + Math.random() * 0.8);
-        vels.push(new THREE.Vector3(
-          s * Math.sin(ph) * Math.cos(th), s * Math.cos(ph) * 0.8 + 0.6, s * Math.sin(ph) * Math.sin(th)));
-      }
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-      const mat = new THREE.PointsMaterial({ size: 0.018, vertexColors: true, transparent: true, opacity: 1 });
-      const points = new THREE.Points(geo, mat);
-      scene.add(points);
-      bursts.push({ points, vels, t: 0, life: 1.3 });
-    }
-    function updateConfetti(dt) {
-      for (let i = bursts.length - 1; i >= 0; i--) {
-        const b = bursts[i];
-        b.t += dt;
-        const pos = b.points.geometry.attributes.position;
-        for (let j = 0; j < b.vels.length; j++) {
-          const v = b.vels[j];
-          v.y -= 3.2 * dt;
-          pos.array[j * 3] += v.x * dt;
-          pos.array[j * 3 + 1] += v.y * dt;
-          pos.array[j * 3 + 2] += v.z * dt;
-        }
-        pos.needsUpdate = true;
-        b.points.material.opacity = Math.max(0, 1 - b.t / b.life);
-        if (b.t >= b.life) {
-          scene.remove(b.points);
-          b.points.geometry.dispose();
-          b.points.material.dispose();
-          bursts.splice(i, 1);
-        }
-      }
-    }
-
-    const hitValEl = document.getElementById('hitVal');
-    const tmpV = new THREE.Vector3();
-    const windF = new CANNON.Vec3();
-
-    function updateHand(dt) {
-      if (!handMarker || dt <= 0) return;
-      handMarker.getWorldPosition(tmpV);
-      if (Number.isFinite(handPrev.x)) {
-        handVel.copy(tmpV).sub(handPrev).divideScalar(dt);
-        // teleports (arm rebuild, re-reference snap) must not read as punches
-        if (handVel.length() > 6) handVel.set(0, 0, 0);
-      } else {
-        handVel.set(0, 0, 0);
-      }
-      handPrev.copy(tmpV);
-    }
-
-    function stepPhysics(dt) {
-      // drive the kinematic hand collider from the IMU pose
-      if (Number.isFinite(handPrev.x)) {
-        handBody.position.set(handPrev.x, handPrev.y, handPrev.z);
-        handBody.velocity.set(handVel.x, handVel.y, handVel.z);
-      }
-
-      // a whisper of draught so the piñata never looks frozen
-      if (!pin.broken) {
-        const t = performance.now() / 1000;
-        windF.set(0.02 * Math.sin(t * 0.7), 0, 0.02 * Math.cos(t * 0.53));
-        pinataBody.applyForce(windF, pinataBody.position);
-      }
-
-      phys.step(1 / 120, dt, 5);
-
-      if (pin.broken) {
-        pin.respawnT -= dt;
-        if (pin.respawnT <= 0) respawnPinata();
-      }
-
-      // sync visuals: engine pose + squash pulse + respawn scale-in
-      pin.spawnT = Math.min(1, pin.spawnT + dt * 2.5);
-      pin.squash = Math.max(0, pin.squash - dt * 4);
-      const squish = 1 - 0.18 * Math.sin(pin.squash * Math.PI);
-      const s = 0.01 + 0.99 * pin.spawnT * pin.spawnT * (3 - 2 * pin.spawnT);
-      pinataMesh.scale.set(s * (1.5 - 0.5 * squish), s * squish, s * (1.5 - 0.5 * squish));
-      pinataMesh.position.copy(pinataBody.position);
-      pinataMesh.quaternion.copy(pinataBody.quaternion);
-
-      // rope polyline: anchor -> links -> attachment on the piñata
-      rope.visible = !pin.broken;
-      if (rope.visible) {
-        const rp = rope.geometry.attributes.position;
-        rp.setXYZ(0, anchor.position.x, anchor.position.y, anchor.position.z);
-        links.forEach((b, i) => rp.setXYZ(i + 1, b.position.x, b.position.y, b.position.z));
-        const last = links[N_LINKS - 1].position;
-        tmpV.set(last.x, last.y, last.z).sub(pinataMesh.position).normalize()
-            .multiplyScalar(attachLen * 0.85).add(pinataMesh.position);
-        rp.setXYZ(ROPE_POINTS - 1, tmpV.x, tmpV.y, tmpV.z);
-        rp.needsUpdate = true;
-      }
-    }
-
-    // --- orientation plumbing ----------------------------------------------
-    // Madgwick earth frame is Z-up; three.js world is Y-up. F maps between them.
-    const F = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
-    const Finv = F.clone().invert();
-    const tmpQ = new THREE.Quaternion();
-
-    function worldDelta(imu, out) {
-      const d = imu.deltaQ;
-      tmpQ.set(d.x, d.y, d.z, d.w);
-      return out.copy(F).multiply(tmpQ).multiply(Finv);
-    }
-
-    // biological joint limits (deg), applied to the relative rotation
-    const LIM_ARM = { flexMin: -150, flexMax: 5, twistMin: -90, twistMax: 90, devMin: -8, devMax: 8 };   // elbow flexes forward (-X)
-    const LIM_LEG = { flexMin: -5, flexMax: 150, twistMin: -45, twistMax: 45, devMin: -8, devMax: 8 };   // knee flexes backward (+X)
-    let LIM = LIM_ARM;
-    const limitsChk = document.getElementById('limitsChk');
-    const clampDeg = (v, lo, hi) => Math.min(Math.max(v, lo * Math.PI / 180), hi * Math.PI / 180);
-
-    const qUpperTarget = new THREE.Quaternion();
-    const qWristWorld = new THREE.Quaternion();
-    const qElbowTarget = new THREE.Quaternion();
-    const eElbow = new THREE.Euler(0, 0, 0, 'XYZ');
-    const flexValEl = document.getElementById('flexVal');
-    const twistValEl = document.getElementById('twistVal');
-
-    // Drive the active limb from a pair of world-frame orientation targets.
-    // Shared by the live IMU path and recorded-session playback.
-    function applyPose(quWorld, qdWorld, smooth) {
-      // joint = distal orientation expressed in the proximal segment's frame
-      qElbowTarget.copy(quWorld).invert().multiply(qdWorld);
-      eElbow.setFromQuaternion(qElbowTarget, 'XYZ');
-      if (limitsChk.checked) {
-        eElbow.x = clampDeg(eElbow.x * 180 / Math.PI, LIM.flexMin, LIM.flexMax);
-        eElbow.y = clampDeg(eElbow.y * 180 / Math.PI, LIM.twistMin, LIM.twistMax);
-        eElbow.z = clampDeg(eElbow.z * 180 / Math.PI, LIM.devMin, LIM.devMax);
-        qElbowTarget.setFromEuler(eElbow);
-      }
-
-      if (smooth) {   // hides BLE burstiness on the live path
-        proxGroup.quaternion.slerp(quWorld, 0.35);
-        distGroup.quaternion.slerp(qElbowTarget, 0.35);
-      } else {        // playback interpolates between keyframes itself
-        proxGroup.quaternion.copy(quWorld);
-        distGroup.quaternion.copy(qElbowTarget);
-      }
-
-      const flexSign = LIM === LIM_LEG ? 1 : -1;   // report flexion as positive
-      flexValEl.textContent = Math.round(flexSign * eElbow.x * 180 / Math.PI);
-      twistValEl.textContent = Math.round(eElbow.y * 180 / Math.PI);
-    }
-
-    function updatePose() {
-      if (!live || anim || playback) return;   // animation / playback owns the limb
-      worldDelta(imuUpper, qUpperTarget);
-      worldDelta(imuWrist, qWristWorld);
-      applyPose(qUpperTarget, qWristWorld, true);
-    }
-
-    // --- record & playback ----------------------------------------------------
-    // Records the world-frame orientation pair per rendered frame (post-fusion,
-    // post-calibration) and replays it through the same applyPose path — so
-    // joint limits, the HUD, and even piñata collisions work during playback.
-    const recBtn = document.getElementById('recBtn');
-    const playBtn = document.getElementById('playBtn');
-    const recInfoEl = document.getElementById('recInfo');
-    let recording = null;   // { t0, frames: [{ t, u: [xyzw], d: [xyzw] }] }
-    let recorded = null;    // finished session
-    let playback = null;    // { t0, idx }
-    const qPlayU = new THREE.Quaternion(), qPlayD = new THREE.Quaternion();
-    const qPlayU2 = new THREE.Quaternion(), qPlayD2 = new THREE.Quaternion();
-
-    recBtn.addEventListener('click', () => {
-      if (recording) {
-        recorded = recording.frames.length > 5 ? recording : null;
-        recording = null;
-        recBtn.textContent = '⏺ Record';
-        recBtn.classList.remove('rec');
-        playBtn.disabled = !recorded;
-        recInfoEl.textContent = recorded
-          ? `recorded ${recorded.frames[recorded.frames.length - 1].t.toFixed(1)}s (${recorded.frames.length} frames)`
-          : 'recording too short';
-      } else {
-        if (playback) stopPlayback();
-        recording = { t0: performance.now() / 1000, frames: [] };
-        recBtn.textContent = '⏹ Stop';
-        recBtn.classList.add('rec');
-      }
-    });
-
-    function stopPlayback() {
-      playback = null;
-      playBtn.textContent = '▶ Play';
-      if (recorded) {
-        recInfoEl.textContent = `recorded ${recorded.frames[recorded.frames.length - 1].t.toFixed(1)}s`;
-      }
-      setArmDim(!live);
-    }
-
-    playBtn.addEventListener('click', () => {
-      if (playback) { stopPlayback(); return; }
-      if (!recorded) return;
-      if (recording) recBtn.click();   // close an active recording first
-      playback = { t0: performance.now() / 1000, idx: 0 };
-      playBtn.textContent = '⏹ Stop';
-      setArmDim(false);
-    });
-
-    function captureFrame() {
-      if (!recording || !live || anim) return;
-      worldDelta(imuUpper, qPlayU);
-      worldDelta(imuWrist, qPlayD);
-      const t = performance.now() / 1000 - recording.t0;
-      recording.frames.push({
-        t,
-        u: [qPlayU.x, qPlayU.y, qPlayU.z, qPlayU.w],
-        d: [qPlayD.x, qPlayD.y, qPlayD.z, qPlayD.w],
+      pinataBody.addEventListener("collide", (e) => {
+        if (e.body !== handBody || pin.broken) return;
+        const now = performance.now() / 1000;
+        if (now - pin.lastHit < PINATA.hitCooldown) return;
+        const impact = Math.abs(e.contact.getImpactVelocityAlongNormal());
+        if (impact < 0.35) return;
+        pin.lastHit = now;
+        pin.squash = 1;
+        pin.hits++;
+        hitValEl.textContent = pin.hits;
+        const at = new THREE.Vector3().copy(pinataBody.position);
+        confetti(at, 60 + Math.min(90, impact * 35), 1 + impact * 0.35);
+        if (pin.hits >= PINATA.breakHits) breakPinata(at);
       });
-      recInfoEl.textContent = `recording… ${t.toFixed(1)}s`;
-    }
 
-    function updatePlayback() {
-      if (!playback) return;
-      const fr = recorded.frames;
-      const t = performance.now() / 1000 - playback.t0;
-      const tEnd = fr[fr.length - 1].t;
-      if (t >= tEnd) { stopPlayback(); return; }
-      while (playback.idx < fr.length - 2 && fr[playback.idx + 1].t <= t) playback.idx++;
-      const a = fr[playback.idx], b = fr[playback.idx + 1];
-      const alpha = Math.min(1, Math.max(0, (t - a.t) / Math.max(1e-6, b.t - a.t)));
-      qPlayU.set(a.u[0], a.u[1], a.u[2], a.u[3]);
-      qPlayU2.set(b.u[0], b.u[1], b.u[2], b.u[3]);
-      qPlayD.set(a.d[0], a.d[1], a.d[2], a.d[3]);
-      qPlayD2.set(b.d[0], b.d[1], b.d[2], b.d[3]);
-      qPlayU.slerp(qPlayU2, alpha);
-      qPlayD.slerp(qPlayD2, alpha);
-      applyPose(qPlayU, qPlayD, false);
-      recInfoEl.textContent = `playing ${t.toFixed(1)} / ${tEnd.toFixed(1)}s`;
-    }
+      function breakPinata(at) {
+        confetti(at, 350, 2.6);
+        pin.broken = true;
+        pin.respawnT = 3.5;
+        pin.hits = 0;
+        hitValEl.textContent = "0";
+        phys.removeConstraint(tieConstraint); // rope snaps; the piñata tumbles
+        tieAttached = false;
+        pinataBody.angularVelocity.set(
+          (Math.random() - 0.5) * 10,
+          (Math.random() - 0.5) * 10,
+          (Math.random() - 0.5) * 10,
+        );
+        promptEl.style.transition = "none";
+        promptEl.style.opacity = "1";
+        promptEl.textContent = "🎉 piñata down!";
+        promptEl.className = "overlay live";
+        setTimeout(() => {
+          promptEl.style.transition = "opacity 1s";
+          promptEl.style.opacity = "0";
+        }, 2200);
+      }
 
-    // restore last-used limb (also positions the piñata and camera target)
-    selectLimb(localStorage.getItem(LIMB_KEY) || 'RA');
+      function respawnPinata() {
+        pin.broken = false;
+        pin.spawnT = 0;
+        pin.hits = 0;
+        hitValEl.textContent = "0";
+        pinataBody.position.copy(restPos);
+        pinataBody.velocity.setZero();
+        pinataBody.angularVelocity.setZero();
+        pinataBody.quaternion.set(0, 0, 0, 1);
+        links.forEach((b, i) => {
+          // rope re-hangs from wherever the anchor now is
+          b.position.set(
+            anchor.position.x,
+            anchor.position.y - segLen * (i + 1),
+            anchor.position.z,
+          );
+          b.velocity.setZero();
+        });
+        if (!tieAttached) {
+          phys.addConstraint(tieConstraint);
+          tieAttached = true;
+        }
+      }
 
-    // --- render loop ---------------------------------------------------------
-    function resize() {
-      const w = innerWidth, h = innerHeight;
-      renderer.setSize(w, h, false);
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-    }
-    addEventListener('resize', resize);
-    resize();
+      // --- confetti --------------------------------------------------------------
+      const bursts = [];
+      function confetti(pos, n = 100, speed = 1.6) {
+        n = Math.floor(n); // fractional n overruns the typed arrays
+        const positions = new Float32Array(n * 3);
+        const colors = new Float32Array(n * 3);
+        const vels = [];
+        const c = new THREE.Color();
+        for (let i = 0; i < n; i++) {
+          positions.set([pos.x, pos.y, pos.z], i * 3);
+          c.set(PINATA.palette[(Math.random() * PINATA.palette.length) | 0]);
+          colors.set([c.r, c.g, c.b], i * 3);
+          const th = Math.random() * Math.PI * 2,
+            ph = Math.acos(2 * Math.random() - 1);
+          const s = speed * (0.4 + Math.random() * 0.8);
+          vels.push(
+            new THREE.Vector3(
+              s * Math.sin(ph) * Math.cos(th),
+              s * Math.cos(ph) * 0.8 + 0.6,
+              s * Math.sin(ph) * Math.sin(th),
+            ),
+          );
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+        const mat = new THREE.PointsMaterial({
+          size: 0.018,
+          vertexColors: true,
+          transparent: true,
+          opacity: 1,
+        });
+        const points = new THREE.Points(geo, mat);
+        scene.add(points);
+        bursts.push({ points, vels, t: 0, life: 1.3 });
+      }
+      function updateConfetti(dt) {
+        for (let i = bursts.length - 1; i >= 0; i--) {
+          const b = bursts[i];
+          b.t += dt;
+          const pos = b.points.geometry.attributes.position;
+          for (let j = 0; j < b.vels.length; j++) {
+            const v = b.vels[j];
+            v.y -= 3.2 * dt;
+            pos.array[j * 3] += v.x * dt;
+            pos.array[j * 3 + 1] += v.y * dt;
+            pos.array[j * 3 + 2] += v.z * dt;
+          }
+          pos.needsUpdate = true;
+          b.points.material.opacity = Math.max(0, 1 - b.t / b.life);
+          if (b.t >= b.life) {
+            scene.remove(b.points);
+            b.points.geometry.dispose();
+            b.points.material.dispose();
+            bursts.splice(i, 1);
+          }
+        }
+      }
 
-    const clock = new THREE.Clock();
-    function frame() {
-      const dt = Math.min(clock.getDelta(), 0.05);
-      updatePose();
-      updateAnim(dt);
-      checkCalPhases();
-      captureFrame();
-      updatePlayback();
-      updateHand(dt);
-      stepPhysics(dt);
-      updateConfetti(dt);
-      controls.update();
-      renderer.render(scene, camera);
+      const hitValEl = document.getElementById("hitVal");
+      const tmpV = new THREE.Vector3();
+      const windF = new CANNON.Vec3();
+
+      function updateHand(dt) {
+        if (!handMarker || dt <= 0) return;
+        handMarker.getWorldPosition(tmpV);
+        if (Number.isFinite(handPrev.x)) {
+          handVel.copy(tmpV).sub(handPrev).divideScalar(dt);
+          // teleports (arm rebuild, re-reference snap) must not read as punches
+          if (handVel.length() > 6) handVel.set(0, 0, 0);
+        } else {
+          handVel.set(0, 0, 0);
+        }
+        handPrev.copy(tmpV);
+      }
+
+      function stepPhysics(dt) {
+        // drive the kinematic hand collider from the IMU pose
+        if (Number.isFinite(handPrev.x)) {
+          handBody.position.set(handPrev.x, handPrev.y, handPrev.z);
+          handBody.velocity.set(handVel.x, handVel.y, handVel.z);
+        }
+
+        // a whisper of draught so the piñata never looks frozen
+        if (!pin.broken) {
+          const t = performance.now() / 1000;
+          windF.set(0.02 * Math.sin(t * 0.7), 0, 0.02 * Math.cos(t * 0.53));
+          pinataBody.applyForce(windF, pinataBody.position);
+        }
+
+        phys.step(1 / 120, dt, 5);
+
+        if (pin.broken) {
+          pin.respawnT -= dt;
+          if (pin.respawnT <= 0) respawnPinata();
+        }
+
+        // sync visuals: engine pose + squash pulse + respawn scale-in
+        pin.spawnT = Math.min(1, pin.spawnT + dt * 2.5);
+        pin.squash = Math.max(0, pin.squash - dt * 4);
+        const squish = 1 - 0.18 * Math.sin(pin.squash * Math.PI);
+        const s = 0.01 + 0.99 * pin.spawnT * pin.spawnT * (3 - 2 * pin.spawnT);
+        pinataMesh.scale.set(
+          s * (1.5 - 0.5 * squish),
+          s * squish,
+          s * (1.5 - 0.5 * squish),
+        );
+        pinataMesh.position.copy(pinataBody.position);
+        pinataMesh.quaternion.copy(pinataBody.quaternion);
+
+        // rope polyline: anchor -> links -> attachment on the piñata
+        rope.visible = !pin.broken;
+        if (rope.visible) {
+          const rp = rope.geometry.attributes.position;
+          rp.setXYZ(0, anchor.position.x, anchor.position.y, anchor.position.z);
+          links.forEach((b, i) =>
+            rp.setXYZ(i + 1, b.position.x, b.position.y, b.position.z),
+          );
+          const last = links[N_LINKS - 1].position;
+          tmpV
+            .set(last.x, last.y, last.z)
+            .sub(pinataMesh.position)
+            .normalize()
+            .multiplyScalar(attachLen * 0.85)
+            .add(pinataMesh.position);
+          rp.setXYZ(ROPE_POINTS - 1, tmpV.x, tmpV.y, tmpV.z);
+          rp.needsUpdate = true;
+        }
+      }
+
+      // --- orientation plumbing ----------------------------------------------
+      // Madgwick earth frame is Z-up; three.js world is Y-up. F maps between them.
+      const F = new THREE.Quaternion().setFromAxisAngle(
+        new THREE.Vector3(1, 0, 0),
+        -Math.PI / 2,
+      );
+      const Finv = F.clone().invert();
+      const tmpQ = new THREE.Quaternion();
+
+      function worldDelta(imu, out) {
+        const d = imu.deltaQ;
+        tmpQ.set(d.x, d.y, d.z, d.w);
+        return out.copy(F).multiply(tmpQ).multiply(Finv);
+      }
+
+      // biological joint limits (deg), applied to the relative rotation
+      const LIM_ARM = {
+        flexMin: -150,
+        flexMax: 5,
+        twistMin: -90,
+        twistMax: 90,
+        devMin: -8,
+        devMax: 8,
+      }; // elbow flexes forward (-X)
+      const LIM_LEG = {
+        flexMin: -5,
+        flexMax: 150,
+        twistMin: -45,
+        twistMax: 45,
+        devMin: -8,
+        devMax: 8,
+      }; // knee flexes backward (+X)
+      let LIM = LIM_ARM;
+      const limitsChk = document.getElementById("limitsChk");
+      const clampDeg = (v, lo, hi) =>
+        Math.min(Math.max(v, (lo * Math.PI) / 180), (hi * Math.PI) / 180);
+
+      const qUpperTarget = new THREE.Quaternion();
+      const qWristWorld = new THREE.Quaternion();
+      const qElbowTarget = new THREE.Quaternion();
+      const eElbow = new THREE.Euler(0, 0, 0, "XYZ");
+      const flexValEl = document.getElementById("flexVal");
+      const twistValEl = document.getElementById("twistVal");
+
+      // Drive the active limb from a pair of world-frame orientation targets.
+      // Shared by the live IMU path and recorded-session playback.
+      function applyPose(quWorld, qdWorld, smooth) {
+        // joint = distal orientation expressed in the proximal segment's frame
+        qElbowTarget.copy(quWorld).invert().multiply(qdWorld);
+        eElbow.setFromQuaternion(qElbowTarget, "XYZ");
+        if (limitsChk.checked) {
+          eElbow.x = clampDeg(
+            (eElbow.x * 180) / Math.PI,
+            LIM.flexMin,
+            LIM.flexMax,
+          );
+          eElbow.y = clampDeg(
+            (eElbow.y * 180) / Math.PI,
+            LIM.twistMin,
+            LIM.twistMax,
+          );
+          eElbow.z = clampDeg(
+            (eElbow.z * 180) / Math.PI,
+            LIM.devMin,
+            LIM.devMax,
+          );
+          qElbowTarget.setFromEuler(eElbow);
+        }
+
+        if (smooth) {
+          // hides BLE burstiness on the live path
+          proxGroup.quaternion.slerp(quWorld, 0.35);
+          distGroup.quaternion.slerp(qElbowTarget, 0.35);
+        } else {
+          // playback interpolates between keyframes itself
+          proxGroup.quaternion.copy(quWorld);
+          distGroup.quaternion.copy(qElbowTarget);
+        }
+
+        const flexSign = LIM === LIM_LEG ? 1 : -1; // report flexion as positive
+        flexValEl.textContent = Math.round(
+          (flexSign * eElbow.x * 180) / Math.PI,
+        );
+        twistValEl.textContent = Math.round((eElbow.y * 180) / Math.PI);
+      }
+
+      function updatePose() {
+        if (!live || anim || playback) return; // animation / playback owns the limb
+        worldDelta(imuUpper, qUpperTarget);
+        worldDelta(imuWrist, qWristWorld);
+        applyPose(qUpperTarget, qWristWorld, true);
+      }
+
+      // --- record & playback ----------------------------------------------------
+      // Records the world-frame orientation pair per rendered frame (post-fusion,
+      // post-calibration) and replays it through the same applyPose path — so
+      // joint limits, the HUD, and even piñata collisions work during playback.
+      const recBtn = document.getElementById("recBtn");
+      const playBtn = document.getElementById("playBtn");
+      const recInfoEl = document.getElementById("recInfo");
+      let recording = null; // { t0, frames: [{ t, u: [xyzw], d: [xyzw] }] }
+      let recorded = null; // finished session
+      let playback = null; // { t0, idx }
+      const qPlayU = new THREE.Quaternion(),
+        qPlayD = new THREE.Quaternion();
+      const qPlayU2 = new THREE.Quaternion(),
+        qPlayD2 = new THREE.Quaternion();
+
+      recBtn.addEventListener("click", () => {
+        if (recording) {
+          recorded = recording.frames.length > 5 ? recording : null;
+          recording = null;
+          recBtn.textContent = "⏺ Record";
+          recBtn.classList.remove("rec");
+          playBtn.disabled = !recorded;
+          recInfoEl.textContent = recorded
+            ? `recorded ${recorded.frames[recorded.frames.length - 1].t.toFixed(1)}s (${recorded.frames.length} frames)`
+            : "recording too short";
+        } else {
+          if (playback) stopPlayback();
+          recording = { t0: performance.now() / 1000, frames: [] };
+          recBtn.textContent = "⏹ Stop";
+          recBtn.classList.add("rec");
+        }
+      });
+
+      function stopPlayback() {
+        playback = null;
+        playBtn.textContent = "▶ Play";
+        if (recorded) {
+          recInfoEl.textContent = `recorded ${recorded.frames[recorded.frames.length - 1].t.toFixed(1)}s`;
+        }
+        setArmDim(!live);
+      }
+
+      playBtn.addEventListener("click", () => {
+        if (playback) {
+          stopPlayback();
+          return;
+        }
+        if (!recorded) return;
+        if (recording) recBtn.click(); // close an active recording first
+        playback = { t0: performance.now() / 1000, idx: 0 };
+        playBtn.textContent = "⏹ Stop";
+        setArmDim(false);
+      });
+
+      function captureFrame() {
+        if (!recording || !live || anim) return;
+        worldDelta(imuUpper, qPlayU);
+        worldDelta(imuWrist, qPlayD);
+        const t = performance.now() / 1000 - recording.t0;
+        recording.frames.push({
+          t,
+          u: [qPlayU.x, qPlayU.y, qPlayU.z, qPlayU.w],
+          d: [qPlayD.x, qPlayD.y, qPlayD.z, qPlayD.w],
+        });
+        recInfoEl.textContent = `recording… ${t.toFixed(1)}s`;
+      }
+
+      function updatePlayback() {
+        if (!playback) return;
+        const fr = recorded.frames;
+        const t = performance.now() / 1000 - playback.t0;
+        const tEnd = fr[fr.length - 1].t;
+        if (t >= tEnd) {
+          stopPlayback();
+          return;
+        }
+        while (playback.idx < fr.length - 2 && fr[playback.idx + 1].t <= t)
+          playback.idx++;
+        const a = fr[playback.idx],
+          b = fr[playback.idx + 1];
+        const alpha = Math.min(
+          1,
+          Math.max(0, (t - a.t) / Math.max(1e-6, b.t - a.t)),
+        );
+        qPlayU.set(a.u[0], a.u[1], a.u[2], a.u[3]);
+        qPlayU2.set(b.u[0], b.u[1], b.u[2], b.u[3]);
+        qPlayD.set(a.d[0], a.d[1], a.d[2], a.d[3]);
+        qPlayD2.set(b.d[0], b.d[1], b.d[2], b.d[3]);
+        qPlayU.slerp(qPlayU2, alpha);
+        qPlayD.slerp(qPlayD2, alpha);
+        applyPose(qPlayU, qPlayD, false);
+        recInfoEl.textContent = `playing ${t.toFixed(1)} / ${tEnd.toFixed(1)}s`;
+      }
+
+      // restore last-used limb (also positions the piñata and camera target)
+      selectLimb(localStorage.getItem(LIMB_KEY) || "RA");
+
+      // --- render loop ---------------------------------------------------------
+      function resize() {
+        const w = innerWidth,
+          h = innerHeight;
+        renderer.setSize(w, h, false);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+      }
+      addEventListener("resize", resize);
+      resize();
+
+      const clock = new THREE.Clock();
+      function frame() {
+        const dt = Math.min(clock.getDelta(), 0.05);
+        updatePose();
+        updateAnim(dt);
+        checkCalPhases();
+        captureFrame();
+        updatePlayback();
+        updateHand(dt);
+        stepPhysics(dt);
+        updateConfetti(dt);
+        controls.update();
+        renderer.render(scene, camera);
+        requestAnimationFrame(frame);
+      }
       requestAnimationFrame(frame);
-    }
-    requestAnimationFrame(frame);
 
-    addEventListener('beforeunload', () => {
-      upper.client.disconnect?.();
-      wrist.client.disconnect?.();
-    });
-  </script>
-</body>
+      addEventListener("beforeunload", () => {
+        upper.client.disconnect?.();
+        wrist.client.disconnect?.();
+      });
+    </script>
+  </body>
 </html>
