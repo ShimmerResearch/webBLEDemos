@@ -1,4 +1,4 @@
-import { Shimmer3RClient, SensorBitmapShimmer3 } from "./shimmer3r.js";
+import { Shimmer3RClient, SensorBitmapShimmer3 } from "./vendor/shimmer-web-sdk.esm.js";
 import { signIn, signOut, getAuth, uploadSession, DEFAULT_API_BASE } from "./cloudsync.js";
 import { WebcamAnalysis } from "./webcam.js";
 

@@ -1,482 +1,588 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <!-- Google tag (gtag.js) -->
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}
-    gtag('js', new Date());
-    gtag('config', 'G-T26GWN0LJW');
-  </script>
+  <head>
+    <!-- Google tag (gtag.js) -->
+    <script
+      async
+      src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"
+    ></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-T26GWN0LJW");
+    </script>
 
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Breakout Game</title>
-  <style>
-    body {
-      margin: 0;
-      padding: 0;
-      background: #000;
-      color: white;
-      font-family: sans-serif;
-      display: block;
-      overflow-y: auto;
-    }
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Breakout Game</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background: #000;
+        color: white;
+        font-family: sans-serif;
+        display: block;
+        overflow-y: auto;
+      }
 
-    button {
-      margin: 5px;
-      padding: 10px 16px;
-      font-size: 16px;
-      border-radius: 6px;
-      border: none;
-      cursor: pointer;
-    }
+      button {
+        margin: 5px;
+        padding: 10px 16px;
+        font-size: 16px;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+      }
 
-    #scanBtn { background: #2196F3; color: white; }
-    #configureBtn { background: #4CAF50; color: white; }
-    #streamBtn { background: #FFC107; color: black; }
-    #disconfigureBtn { background: #f44336; color: white; }
-    #startBtn { background: #9C27B0; color: white; }
+      #scanBtn {
+        background: #2196f3;
+        color: white;
+      }
 
-    #consoleOutput {
-      background: #000;
-      color: #0f0;
-      padding: 10px;
-      margin: 10px auto;
-      max-width: 480px;
-      font-family: monospace;
-      font-size: 14px;
-      border: 1px solid #0f0;
-      width: 90%;
-      /* limit to 3 lines */
-      line-height: 1.4em;
-      max-height: calc(1.4em * 3);
-      overflow-y: auto;
-    }
+      #configureBtn {
+        background: #4caf50;
+        color: white;
+      }
 
-    canvas {
-      background: #111;
-      border: 2px solid #fff;
-      width: 100%;
-      max-width: 480px;
-      height: auto;
-      max-height: 540px;
-      display: block;
-      margin: 20px auto;
-      box-sizing: border-box;
-    }
+      #streamBtn {
+        background: #ffc107;
+        color: black;
+      }
 
-    #controls {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: center;
-      align-items: center;
-      gap: 10px;
-      margin-top: 10px;
-      text-align: center;
-    }
+      #disconfigureBtn {
+        background: #f44336;
+        color: white;
+      }
 
-    #controls button, #controls p { margin: 5px; }
+      #startBtn {
+        background: #9c27b0;
+        color: white;
+      }
 
-    #banner {
-      width: 100%;
-      max-width: 1000px;
-      margin: 10px auto 0;
-      background-image: url('banner.png');
-      background-repeat: no-repeat;
-      background-position: center;
-      background-size: contain;
-      aspect-ratio: 3 / 1;
-    }
+      #consoleOutput {
+        background: #000;
+        color: #0f0;
+        padding: 10px;
+        margin: 10px auto;
+        max-width: 480px;
+        font-family: monospace;
+        font-size: 14px;
+        border: 1px solid #0f0;
+        width: 90%;
+        /* limit to 3 lines */
+        line-height: 1.4em;
+        max-height: calc(1.4em * 3);
+        overflow-y: auto;
+      }
 
-    #introOverlay {
-      position: fixed;
-      top: 0; left: 0;
-      width: 100%; height: 100%;
-      background: rgba(0,0,0,0.9);
-      color: #fff;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      z-index: 9999;
-    }
+      canvas {
+        background: #111;
+        border: 2px solid #fff;
+        width: 100%;
+        max-width: 480px;
+        height: auto;
+        max-height: 540px;
+        display: block;
+        margin: 20px auto;
+        box-sizing: border-box;
+      }
 
-    .introContent {
-      max-width: 500px;
-      padding: 20px;
-      background: #111;
-      border: 2px solid #fff;
-      border-radius: 10px;
-      text-align: left;
-      font-size: 16px;
-    }
-    .introContent h2 { margin-top: 0; color: #0f0; }
-    .introContent ul { padding-left: 20px; }
-    .introContent .btnHint {
-      background: #444;
-      padding: 2px 6px;
-      border-radius: 4px;
-      font-family: monospace;
-    }
-  </style>
-</head>
-<body>
-  <div id="introOverlay">
-    <div class="introContent">
-      <h2>🎮 Welcome to Breakout!</h2>
-      <p>Here's what you need to know to get started:</p>
-      <ul>
-        <li><strong>Connect your Bluetooth device:</strong> Click <span class="btnHint">🔍 Scan</span>, then <span class="btnHint">⚙️ Configure</span>.</li>
-        <li><strong>Start data stream:</strong> Tap <span class="btnHint">📡 Start Streaming</span> to enable motion-based control.</li>
-        <li><strong>Tilt to move:</strong> Rotate the device <strong>around the Z-axis</strong> to move the paddle.</li>
-        <li><strong>No Bluetooth?</strong> Use arrow keys or touch to control the paddle.</li>
-        <li><strong>Objective:</strong> Break all the bricks. Don’t let the ball fall!</li>
-        <li><strong>Start game:</strong> Click <span class="btnHint">▶️ Start Game</span>.</li>
-      </ul>
-      <p><strong>Requirements:</strong></p>
-      <ul>
-        <li><strong>Device:</strong> Shimmer3R</li>
-        <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
-      </ul>
-      <img src="shimmer3_coords.png" alt="Shimmer3 Axis Diagram" style="width: 100%; max-width: 300px; display: block; margin: 10px auto;" />
-      <p style="font-size: 14px; color: #aaa; text-align: center;">
-        ↺ Rotate the device clockwise (right) or counter-clockwise (left) around the <strong>Z-axis</strong> to control the paddle.
-      </p>
-      <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px;">
-        <input type="checkbox" id="dontShowAgain" />
-        <label for="dontShowAgain">Don't show this again</label>
+      #controls {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+        text-align: center;
+      }
+
+      #controls button,
+      #controls p {
+        margin: 5px;
+      }
+
+      #banner {
+        width: 100%;
+        max-width: 1000px;
+        margin: 10px auto 0;
+        background-image: url("banner.png");
+        background-repeat: no-repeat;
+        background-position: center;
+        background-size: contain;
+        aspect-ratio: 3 / 1;
+      }
+
+      #introOverlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.9);
+        color: #fff;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 9999;
+      }
+
+      .introContent {
+        max-width: 500px;
+        padding: 20px;
+        background: #111;
+        border: 2px solid #fff;
+        border-radius: 10px;
+        text-align: left;
+        font-size: 16px;
+      }
+
+      .introContent h2 {
+        margin-top: 0;
+        color: #0f0;
+      }
+
+      .introContent ul {
+        padding-left: 20px;
+      }
+
+      .introContent .btnHint {
+        background: #444;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-family: monospace;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="introOverlay">
+      <div class="introContent">
+        <h2>🎮 Welcome to Breakout!</h2>
+        <p>Here's what you need to know to get started:</p>
+        <ul>
+          <li>
+            <strong>Connect your Bluetooth device:</strong> Click
+            <span class="btnHint">🔍 Scan</span>, then
+            <span class="btnHint">⚙️ Configure</span>.
+          </li>
+          <li>
+            <strong>Start data stream:</strong> Tap
+            <span class="btnHint">📡 Start Streaming</span> to enable
+            motion-based control.
+          </li>
+          <li>
+            <strong>Tilt to move:</strong> Rotate the device
+            <strong>around the Z-axis</strong> to move the paddle.
+          </li>
+          <li>
+            <strong>No Bluetooth?</strong> Use arrow keys or touch to control
+            the paddle.
+          </li>
+          <li>
+            <strong>Objective:</strong> Break all the bricks. Don’t let the ball
+            fall!
+          </li>
+          <li>
+            <strong>Start game:</strong> Click
+            <span class="btnHint">▶️ Start Game</span>.
+          </li>
+        </ul>
+        <p><strong>Requirements:</strong></p>
+        <ul>
+          <li><strong>Device:</strong> Shimmer3R</li>
+          <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
+        </ul>
+        <img
+          src="shimmer3_coords.png"
+          alt="Shimmer3 Axis Diagram"
+          style="
+            width: 100%;
+            max-width: 300px;
+            display: block;
+            margin: 10px auto;
+          "
+        />
+        <p style="font-size: 14px; color: #aaa; text-align: center">
+          ↺ Rotate the device clockwise (right) or counter-clockwise (left)
+          around the <strong>Z-axis</strong> to control the paddle.
+        </p>
+        <div
+          style="
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+          "
+        >
+          <input type="checkbox" id="dontShowAgain" />
+          <label for="dontShowAgain">Don't show this again</label>
+        </div>
+        <button id="closeIntroBtn">Got it!</button>
       </div>
-      <button id="closeIntroBtn">Got it!</button>
     </div>
-  </div>
 
-  <div id="controls">
-    <button id="scanBtn">🔍 Scan Bluetooth</button>
-    <button id="configureBtn" disabled>⚙️ Configure</button>
-    <button id="streamBtn" disabled>📡 Start Streaming</button>
-    <button id="disconfigureBtn" disabled>❌ Disconnect</button>
-    <button id="startBtn">▶️ Start Game</button>
-    <button id="showTipBtn">💡 Show Tip</button>
-    <p id="deviceName">No device selected</p>
-  </div>
-  <div style="text-align: center; margin-top: 10px;">
-    <input type="checkbox" id="autoRestart" />
-    <label for="autoRestart">Auto-restart after Game Over (5s)</label>
-  </div>
+    <div id="controls">
+      <button id="scanBtn">🔍 Scan Bluetooth</button>
+      <button id="configureBtn" disabled>⚙️ Configure</button>
+      <button id="streamBtn" disabled>📡 Start Streaming</button>
+      <button id="disconfigureBtn" disabled>❌ Disconnect</button>
+      <button id="startBtn">▶️ Start Game</button>
+      <button id="showTipBtn">💡 Show Tip</button>
+      <p id="deviceName">No device selected</p>
+    </div>
+    <div style="text-align: center; margin-top: 10px">
+      <input type="checkbox" id="autoRestart" />
+      <label for="autoRestart">Auto-restart after Game Over (5s)</label>
+    </div>
 
-  <div id="consoleWrapper">
-    <pre id="consoleOutput"></pre>
-  </div>
-  <div id="banner"></div>
-  <canvas id="breakout"></canvas>
+    <div id="consoleWrapper">
+      <pre id="consoleOutput"></pre>
+    </div>
+    <div id="banner"></div>
+    <canvas id="breakout"></canvas>
 
-  <!-- Your game code (unchanged except the tiny helper below) -->
-  <script>
-    // Check intro overlay show/hide
-    window.addEventListener("DOMContentLoaded", () => {
-      if (localStorage.getItem("hideIntroOverlay") === "true") {
-        document.getElementById("introOverlay").style.display = "none";
+    <!-- Your game code (unchanged except the tiny helper below) -->
+    <script>
+      // Check intro overlay show/hide
+      window.addEventListener("DOMContentLoaded", () => {
+        if (localStorage.getItem("hideIntroOverlay") === "true") {
+          document.getElementById("introOverlay").style.display = "none";
+        }
+      });
+
+      const canvas = document.getElementById("breakout");
+      const ctx = canvas.getContext("2d");
+
+      function resizeCanvas() {
+        const maxWidth = 480;
+        const maxHeight = 540;
+        const scale = Math.min(
+          window.innerWidth / maxWidth,
+          window.innerHeight / maxHeight,
+        );
+        canvas.width = maxWidth;
+        canvas.height = maxHeight;
+        canvas.style.width = `${maxWidth * scale}px`;
+        canvas.style.height = `${maxHeight * scale}px`;
       }
-    });
+      resizeCanvas();
+      window.addEventListener("resize", resizeCanvas);
 
-    const canvas = document.getElementById("breakout");
-    const ctx = canvas.getContext("2d");
+      const paddleHeight = 10;
+      const paddleWidth = 75;
+      let paddleX = (canvas.width - paddleWidth) / 2;
 
-    function resizeCanvas() {
-      const maxWidth = 480;
-      const maxHeight = 540;
-      const scale = Math.min(window.innerWidth / maxWidth, window.innerHeight / maxHeight);
-      canvas.width = maxWidth;
-      canvas.height = maxHeight;
-      canvas.style.width = `${maxWidth * scale}px`;
-      canvas.style.height = `${maxHeight * scale}px`;
-    }
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas);
+      const ballRadius = 8;
+      let x = canvas.width / 2;
+      let y = canvas.height - 30;
+      let dx = 2;
+      let dy = -2;
 
-    const paddleHeight = 10;
-    const paddleWidth = 75;
-    let paddleX = (canvas.width - paddleWidth) / 2;
+      const brickRowCount = 5;
+      const brickColumnCount = 6;
+      const brickWidth = 60;
+      const brickHeight = 20;
+      const brickPadding = 10;
+      const brickOffsetTop = 30;
+      const brickOffsetLeft = 30;
 
-    const ballRadius = 8;
-    let x = canvas.width / 2;
-    let y = canvas.height - 30;
-    let dx = 2;
-    let dy = -2;
+      let rightPressed = false;
+      let leftPressed = false;
 
-    const brickRowCount = 5;
-    const brickColumnCount = 6;
-    const brickWidth = 60;
-    const brickHeight = 20;
-    const brickPadding = 10;
-    const brickOffsetTop = 30;
-    const brickOffsetLeft = 30;
+      // 👇 expose a safe setter so the module can steer without touching internals
+      window.setPaddleDir = (left, right) => {
+        leftPressed = !!left;
+        rightPressed = !!right;
+      };
 
-    let rightPressed = false;
-    let leftPressed = false;
-
-    // 👇 expose a safe setter so the module can steer without touching internals
-    window.setPaddleDir = (left, right) => {
-      leftPressed = !!left;
-      rightPressed = !!right;
-    };
-
-    const bricks = [];
-    for (let c = 0; c < brickColumnCount; c++) {
-      bricks[c] = [];
-      for (let r = 0; r < brickRowCount; r++) {
-        bricks[c][r] = { x: 0, y: 0, status: 1 };
-      }
-    }
-
-    document.addEventListener("keydown", e => {
-      if (e.key === "ArrowRight") rightPressed = true;
-      else if (e.key === "ArrowLeft") leftPressed = true;
-    });
-    document.addEventListener("keyup", e => {
-      if (e.key === "ArrowRight") rightPressed = false;
-      else if (e.key === "ArrowLeft") leftPressed = false;
-    });
-
-    canvas.addEventListener("touchstart", e => {
-      const touchX = e.touches[0].clientX;
-      if (touchX < canvas.width / 2) {
-        leftPressed = true; rightPressed = false;
-      } else {
-        rightPressed = true; leftPressed = false;
-      }
-      e.preventDefault();
-    });
-    canvas.addEventListener("touchend", () => {
-      leftPressed = false; rightPressed = false;
-    });
-
-    function collisionDetection() {
+      const bricks = [];
       for (let c = 0; c < brickColumnCount; c++) {
+        bricks[c] = [];
         for (let r = 0; r < brickRowCount; r++) {
-          const b = bricks[c][r];
-          if (b.status === 1) {
-            if (x > b.x && x < b.x + brickWidth && y > b.y && y < b.y + brickHeight) {
-              dy = -dy;
-              b.status = 0;
+          bricks[c][r] = { x: 0, y: 0, status: 1 };
+        }
+      }
+
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight") rightPressed = true;
+        else if (e.key === "ArrowLeft") leftPressed = true;
+      });
+      document.addEventListener("keyup", (e) => {
+        if (e.key === "ArrowRight") rightPressed = false;
+        else if (e.key === "ArrowLeft") leftPressed = false;
+      });
+
+      canvas.addEventListener("touchstart", (e) => {
+        const touchX = e.touches[0].clientX;
+        if (touchX < canvas.width / 2) {
+          leftPressed = true;
+          rightPressed = false;
+        } else {
+          rightPressed = true;
+          leftPressed = false;
+        }
+        e.preventDefault();
+      });
+      canvas.addEventListener("touchend", () => {
+        leftPressed = false;
+        rightPressed = false;
+      });
+
+      function collisionDetection() {
+        for (let c = 0; c < brickColumnCount; c++) {
+          for (let r = 0; r < brickRowCount; r++) {
+            const b = bricks[c][r];
+            if (b.status === 1) {
+              if (
+                x > b.x &&
+                x < b.x + brickWidth &&
+                y > b.y &&
+                y < b.y + brickHeight
+              ) {
+                dy = -dy;
+                b.status = 0;
+              }
             }
           }
         }
       }
-    }
 
-    function drawBall() {
-      ctx.beginPath();
-      ctx.arc(x, y, ballRadius, 0, Math.PI * 2);
-      ctx.fillStyle = "#f00";
-      ctx.fill();
-      ctx.closePath();
-    }
+      function drawBall() {
+        ctx.beginPath();
+        ctx.arc(x, y, ballRadius, 0, Math.PI * 2);
+        ctx.fillStyle = "#f00";
+        ctx.fill();
+        ctx.closePath();
+      }
 
-    function drawPaddle() {
-      ctx.beginPath();
-      ctx.rect(paddleX, canvas.height - paddleHeight, paddleWidth, paddleHeight);
-      ctx.fillStyle = "#00f";
-      ctx.fill();
-      ctx.closePath();
-    }
+      function drawPaddle() {
+        ctx.beginPath();
+        ctx.rect(
+          paddleX,
+          canvas.height - paddleHeight,
+          paddleWidth,
+          paddleHeight,
+        );
+        ctx.fillStyle = "#00f";
+        ctx.fill();
+        ctx.closePath();
+      }
 
-    function drawBricks() {
-      for (let c = 0; c < brickColumnCount; c++) {
-        for (let r = 0; r < brickRowCount; r++) {
-          if (bricks[c][r].status === 1) {
-            const brickX = c * (brickWidth + brickPadding) + brickOffsetLeft;
-            const brickY = r * (brickHeight + brickPadding) + brickOffsetTop;
-            bricks[c][r].x = brickX;
-            bricks[c][r].y = brickY;
-            ctx.beginPath();
-            ctx.rect(brickX, brickY, brickWidth, brickHeight);
-            ctx.fillStyle = "#0f0";
-            ctx.fill();
-            ctx.closePath();
+      function drawBricks() {
+        for (let c = 0; c < brickColumnCount; c++) {
+          for (let r = 0; r < brickRowCount; r++) {
+            if (bricks[c][r].status === 1) {
+              const brickX = c * (brickWidth + brickPadding) + brickOffsetLeft;
+              const brickY = r * (brickHeight + brickPadding) + brickOffsetTop;
+              bricks[c][r].x = brickX;
+              bricks[c][r].y = brickY;
+              ctx.beginPath();
+              ctx.rect(brickX, brickY, brickWidth, brickHeight);
+              ctx.fillStyle = "#0f0";
+              ctx.fill();
+              ctx.closePath();
+            }
           }
         }
       }
-    }
 
-    function resetGame() {
-      x = canvas.width / 2;
-      y = canvas.height - 30;
-      dx = 2;
-      dy = -2;
-      paddleX = (canvas.width - paddleWidth) / 2;
-      for (let c = 0; c < brickColumnCount; c++) {
-        for (let r = 0; r < brickRowCount; r++) {
-          bricks[c][r].status = 1;
+      function resetGame() {
+        x = canvas.width / 2;
+        y = canvas.height - 30;
+        dx = 2;
+        dy = -2;
+        paddleX = (canvas.width - paddleWidth) / 2;
+        for (let c = 0; c < brickColumnCount; c++) {
+          for (let r = 0; r < brickRowCount; r++) {
+            bricks[c][r].status = 1;
+          }
         }
       }
-    }
 
-    let animationId;
-    function startGame() {
-      resetGame();
-      cancelAnimationFrame(animationId);
-      animationId = requestAnimationFrame(draw);
-    }
+      let animationId;
+      function startGame() {
+        resetGame();
+        cancelAnimationFrame(animationId);
+        animationId = requestAnimationFrame(draw);
+      }
 
-    function draw() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      drawBricks();
-      drawBall();
-      drawPaddle();
-      collisionDetection();
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawBricks();
+        drawBall();
+        drawPaddle();
+        collisionDetection();
 
-      if (x + dx > canvas.width - ballRadius || x + dx < ballRadius) dx = -dx;
-      if (y + dy < ballRadius) dy = -dy;
-      else if (y + dy > canvas.height - ballRadius) {
-        if (x > paddleX && x < paddleX + paddleWidth) {
-          dy = -dy;
-        } else {
-          if (document.getElementById("autoRestart").checked) {
-            showCustomAlert("Game Over! Game will restart in 5 seconds", 4500);
-            setTimeout(() => { startGame(); }, 5000);
+        if (x + dx > canvas.width - ballRadius || x + dx < ballRadius) dx = -dx;
+        if (y + dy < ballRadius) dy = -dy;
+        else if (y + dy > canvas.height - ballRadius) {
+          if (x > paddleX && x < paddleX + paddleWidth) {
+            dy = -dy;
           } else {
-            showCustomAlert("Game Over! Press Start Game to restart.", 5000);
+            if (document.getElementById("autoRestart").checked) {
+              showCustomAlert(
+                "Game Over! Game will restart in 5 seconds",
+                4500,
+              );
+              setTimeout(() => {
+                startGame();
+              }, 5000);
+            } else {
+              showCustomAlert("Game Over! Press Start Game to restart.", 5000);
+            }
+            return;
           }
-          return;
         }
+
+        const moveStep = 3.5;
+        if (rightPressed && paddleX < canvas.width - paddleWidth)
+          paddleX += moveStep;
+        else if (leftPressed && paddleX > 0) paddleX -= moveStep;
+
+        x += dx;
+        y += dy;
+        requestAnimationFrame(draw);
       }
 
-      const moveStep = 3.5;
-      if (rightPressed && paddleX < canvas.width - paddleWidth) paddleX += moveStep;
-      else if (leftPressed && paddleX > 0) paddleX -= moveStep;
+      document.getElementById("startBtn").addEventListener("click", startGame);
+      document.getElementById("closeIntroBtn").addEventListener("click", () => {
+        const dontShow = document.getElementById("dontShowAgain").checked;
+        if (dontShow) localStorage.setItem("hideIntroOverlay", "true");
+        document.getElementById("introOverlay").style.display = "none";
+      });
+      document.getElementById("showTipBtn").addEventListener("click", () => {
+        document.getElementById("introOverlay").style.display = "flex";
+        localStorage.removeItem("hideIntroOverlay");
+      });
 
-      x += dx; y += dy;
-      requestAnimationFrame(draw);
-    }
-
-    document.getElementById("startBtn").addEventListener("click", startGame);
-    document.getElementById("closeIntroBtn").addEventListener("click", () => {
-      const dontShow = document.getElementById("dontShowAgain").checked;
-      if (dontShow) localStorage.setItem("hideIntroOverlay", "true");
-      document.getElementById("introOverlay").style.display = "none";
-    });
-    document.getElementById("showTipBtn").addEventListener("click", () => {
-      document.getElementById("introOverlay").style.display = "flex";
-      localStorage.removeItem("hideIntroOverlay");
-    });
-
-    function showCustomAlert(message, duration = 3000) {
-      const el = document.getElementById("customAlert");
-      el.textContent = message;
-      el.style.display = "block";
-      setTimeout(() => { el.style.display = "none"; }, duration);
-    }
-  </script>
-
-  <!-- Module that uses your Shimmer3RClient API (no API changes required) -->
-  <script type="module">
-    import { Shimmer3RClient } from '../ShimmerAPI/shimmer3r.js';
-
-    const scanBtn = document.getElementById("scanBtn");
-    const configureBtn = document.getElementById("configureBtn");
-    const streamBtn = document.getElementById("streamBtn");
-    const disconfigureBtn = document.getElementById("disconfigureBtn");
-    const deviceNameEl = document.getElementById("deviceName");
-    const consoleEl = document.getElementById("consoleOutput");
-
-    const log = (t) => {
-      consoleEl.textContent += t + "\n";
-      consoleEl.scrollTop = consoleEl.scrollHeight;
-    };
-
-    const client = new Shimmer3RClient({ timestampFmt: 'u24', debug: true });
-
-    client.onStatus = (msg) => log(msg);
-    client.onInquiry = (info) => log(`Inquiry → ${info.numChannels} ch @ ${info.samplingRateHz.toFixed(2)} Hz`);
-
-    // Use the already-exposed onStreamFrame from your API to read gyro without modifying the API
-    let lastPrint = 0;
-    client.onStreamFrame = (oc) => {
-      const gx = oc.get('GYRO_X')?.value;
-      const gy = oc.get('GYRO_Y')?.value;
-      const gz = oc.get('GYRO_Z')?.value;
-      if (gx === undefined || gy === undefined || gz === undefined) return;
-
-      const now = Date.now();
-      if (now - lastPrint >= 50) {
-        log(`GYRO ➤ x:${gx} y:${gy} z:${gz}`);
-        lastPrint = now;
+      function showCustomAlert(message, duration = 3000) {
+        const el = document.getElementById("customAlert");
+        el.textContent = message;
+        el.style.display = "block";
+        setTimeout(() => {
+          el.style.display = "none";
+        }, duration);
       }
+    </script>
 
-      // Z-axis steering with your thresholds
-      if (gz > 1000) {
-        window.setPaddleDir(false, true);
-      } else if (gz < -1000) {
-        window.setPaddleDir(true, false);
-      } else {
-        window.setPaddleDir(false, false);
-      }
-    };
+    <!-- Module that uses your Shimmer3RClient API (no API changes required) -->
+    <script type="module">
+      import { Shimmer3RClient } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
-    scanBtn.addEventListener("click", async () => {
-      try {
-        await client.connect(); // requestDevice + connect + start notifications
-        deviceNameEl.textContent = `Selected: ${client.device?.name || 'Shimmer3R'}`;
-        streamBtn.disabled = false;
-        disconfigureBtn.disabled = false;
-        configureBtn.disabled = false; // optional: not used in this flow
-        log("✅ Connected");
-      } catch (e) {
-        log(`❌ Connect failed: ${e.message}`);
-      }
-    });
+      const scanBtn = document.getElementById("scanBtn");
+      const configureBtn = document.getElementById("configureBtn");
+      const streamBtn = document.getElementById("streamBtn");
+      const disconfigureBtn = document.getElementById("disconfigureBtn");
+      const deviceNameEl = document.getElementById("deviceName");
+      const consoleEl = document.getElementById("consoleOutput");
 
-    configureBtn.addEventListener("click", async () => {
-      try {
-	    await client.setSamplingRate(51.2);
-        await client.setSensors(64);
-		await client.inquiry();
-		} catch (e) {
-        log(`❌ Connect failed: ${e.message}`);
-      }
-    });
+      const log = (t) => {
+        consoleEl.textContent += t + "\n";
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      };
 
-    streamBtn.addEventListener("click", async () => {
-      try {
-        
-        await client.startStreaming();
-        log("📡 Streaming (gyro-only)");
-      } catch (e) {
-        log(`❌ Stream failed: ${e.message}`);
-      }
-    });
+      const client = new Shimmer3RClient({ timestampFmt: "u24", debug: true });
 
-    disconfigureBtn.addEventListener("click", async () => {
-      try {
-        await client.disconnect();
-        deviceNameEl.textContent = "No device selected";
-        streamBtn.disabled = true;
-        disconfigureBtn.disabled = true;
-        window.setPaddleDir(false, false);
-        log("🔌 Disconnected");
-      } catch (e) {
-        log(`⚠️ Disconnect error: ${e.message}`);
-      }
-    });
-  </script>
+      client.onStatus = (msg) => log(msg);
+      client.onInquiry = (info) =>
+        log(
+          `Inquiry → ${info.numChannels} ch @ ${info.samplingRateHz.toFixed(2)} Hz`,
+        );
 
-  <div id="customAlert" style="
-    display: none;
-    position: fixed;
-    bottom: 20px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: #222;
-    color: #fff;
-    padding: 16px 24px;
-    border: 2px solid #f00;
-    border-radius: 10px;
-    font-size: 16px;
-    z-index: 9999;
-    text-align: center;">
-    Game Over! You can still move the paddle. Press Start Game to restart.
-  </div>
-</body>
+      // Use the already-exposed onStreamFrame from your API to read gyro without modifying the API
+      let lastPrint = 0;
+      client.onStreamFrame = (oc) => {
+        const gx = oc.get("GYRO_X")?.value;
+        const gy = oc.get("GYRO_Y")?.value;
+        const gz = oc.get("GYRO_Z")?.value;
+        if (gx === undefined || gy === undefined || gz === undefined) return;
+
+        const now = Date.now();
+        if (now - lastPrint >= 50) {
+          log(`GYRO ➤ x:${gx} y:${gy} z:${gz}`);
+          lastPrint = now;
+        }
+
+        // Z-axis steering with your thresholds
+        if (gz > 1000) {
+          window.setPaddleDir(false, true);
+        } else if (gz < -1000) {
+          window.setPaddleDir(true, false);
+        } else {
+          window.setPaddleDir(false, false);
+        }
+      };
+
+      scanBtn.addEventListener("click", async () => {
+        try {
+          await client.connect(); // requestDevice + connect + start notifications
+          deviceNameEl.textContent = `Selected: ${client.device?.name || "Shimmer3R"}`;
+          streamBtn.disabled = false;
+          disconfigureBtn.disabled = false;
+          configureBtn.disabled = false; // optional: not used in this flow
+          log("✅ Connected");
+        } catch (e) {
+          log(`❌ Connect failed: ${e.message}`);
+        }
+      });
+
+      configureBtn.addEventListener("click", async () => {
+        try {
+          await client.setSamplingRate(51.2);
+          await client.setSensors(64);
+          await client.inquiry();
+        } catch (e) {
+          log(`❌ Connect failed: ${e.message}`);
+        }
+      });
+
+      streamBtn.addEventListener("click", async () => {
+        try {
+          await client.startStreaming();
+          log("📡 Streaming (gyro-only)");
+        } catch (e) {
+          log(`❌ Stream failed: ${e.message}`);
+        }
+      });
+
+      disconfigureBtn.addEventListener("click", async () => {
+        try {
+          await client.disconnect();
+          deviceNameEl.textContent = "No device selected";
+          streamBtn.disabled = true;
+          disconfigureBtn.disabled = true;
+          window.setPaddleDir(false, false);
+          log("🔌 Disconnected");
+        } catch (e) {
+          log(`⚠️ Disconnect error: ${e.message}`);
+        }
+      });
+    </script>
+
+    <div
+      id="customAlert"
+      style="
+        display: none;
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #222;
+        color: #fff;
+        padding: 16px 24px;
+        border: 2px solid #f00;
+        border-radius: 10px;
+        font-size: 16px;
+        z-index: 9999;
+        text-align: center;
+      "
+    >
+      Game Over! You can still move the paddle. Press Start Game to restart.
+    </div>
+  </body>
 </html>
