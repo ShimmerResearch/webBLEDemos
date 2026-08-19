@@ -297,7 +297,7 @@
             id="inBt"
             type="text"
             maxlength="16"
-            placeholder="e.g. OUTPUT"
+            placeholder="e.g. YourBrand"
           />
           <div>
             <span class="preview" id="pvBt"></span>
@@ -370,6 +370,7 @@
     </div>
 
     <script type="module">
+      import * as sdkNs from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
       import {
         Shimmer3RClient,
         WiredShimmerClient,
@@ -605,7 +606,7 @@
           log(`connected over USB/dock serial (${label})`);
           await readAndShow().catch((e) =>
             log(
-              `record read failed: ${e.message} — check the firmware supports the brand record`,
+              `record read failed: ${readFailureHint(e)}`,
             ),
           );
         } catch (e) {
@@ -633,7 +634,7 @@
           log(`connected over BLE (${c.deviceName ?? "Shimmer3R"})`);
           await readAndShow().catch((e) =>
             log(
-              `record read failed: ${e.message} — check the firmware supports the brand record`,
+              `record read failed: ${readFailureHint(e)}`,
             ),
           );
         } catch (e) {
@@ -665,7 +666,7 @@
           els.banner.style.display = "none";
           await readAndShow();
         } catch (e) {
-          log(`record read failed: ${e.message}`);
+          log(`record read failed: ${readFailureHint(e)}`);
         }
       };
 
@@ -737,7 +738,29 @@
         }
       };
 
+      function readFailureHint(e) {
+        if (/response truncated/i.test(e.message)) {
+          return `${e.message} — BLE link dropped mid-response; retry, and check the sensor is in range`;
+        }
+        if (/returned \d+ of \d+ bytes/.test(e.message)) {
+          /* Pre-0.1.12 SDK wording: the vendored bundle predates BLE reassembly */
+          return `${e.message} — the page is running a stale SDK bundle (needs ≥ 0.1.12); hard-refresh (Ctrl+Shift+R) or re-vendor`;
+        }
+        return `${e.message} — check the firmware supports the brand record`;
+      }
+
       // Initial state
+      /* Log which SDK build this page actually runs — a stale vendored bundle is
+       * otherwise indistinguishable from a firmware fault. Accessed via the
+       * namespace object so a pre-0.1.12 bundle (no SDK_VERSION export) degrades
+       * to a warning instead of breaking the import. */
+      if (sdkNs.SDK_VERSION) {
+        log(`vendored shimmer-web-sdk v${sdkNs.SDK_VERSION}`);
+      } else {
+        log(
+          "WARNING: vendored shimmer-web-sdk predates v0.1.12 — BLE record reads will truncate; re-vendor the SDK bundle",
+        );
+      }
       setConnected(false);
       if (!("serial" in navigator)) {
         log(
