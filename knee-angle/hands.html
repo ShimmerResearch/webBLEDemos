@@ -493,7 +493,7 @@
           this.els.name.textContent = this.client.device?.name || "Shimmer3R";
           this.els.led.className = "led on";
           await this.client.setSamplingRate(SAMPLING_HZ);
-          await this.client.setAccelRange(ACCEL_RANGE_4G);
+          await this.client.setWrAccelRange(ACCEL_RANGE_4G);
           await this.client.setGyroRange(GYRO_RANGE_500DPS);
           await this.client.setSensors(SENSOR_MASK);
           const chans = this.client.schema?.fields?.map((f) => f.name) ?? [];
