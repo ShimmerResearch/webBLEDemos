@@ -1,383 +1,908 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-  <!-- Google tag (gtag.js) -->
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag(){dataLayer.push(arguments);}    
-    gtag('js', new Date());
-    gtag('config', 'G-T26GWN0LJW');
-  </script>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Breakout Game (EMG) — Shimmer3R API</title>
-  <style>
-    body { margin:0; padding:0; background:#000; color:white; font-family:sans-serif; display:block; overflow-y:auto; }
-    button { margin:5px; padding:10px 16px; font-size:16px; border-radius:6px; border:none; cursor:pointer; }
-    #scanBtn { background:#2196F3; color:white; }
-    #connectBtn { background:#4CAF50; color:white; }
-    #streamBtn { background:#FFC107; color:black; }
-    #disconnectBtn { background:#f44336; color:white; }
-    #startBtn { background:#9C27B0; color:white; }
-    #consoleOutput { background:#000; color:#0f0; padding:10px; margin:10px auto; max-width:480px; font-family:monospace; font-size:16px; border:1px solid #0f0; width:90%; line-height:1.4em; max-height:calc(1.4em * 12); overflow-y:auto; }
-    canvas { background:#111; border:2px solid #fff; width:100%; max-width:480px; height:auto; max-height:540px; display:block; margin:20px auto; box-sizing:border-box; }
-    #controls { display:flex; flex-wrap:wrap; justify-content:center; align-items:center; gap:10px; margin-top:10px; text-align:center; }
-    #controls button, #controls p { margin:5px; }
-    #banner { width:100%; max-width:1000px; margin:10px auto 0; background-image:url('banner.png'); background-repeat:no-repeat; background-position:center; background-size:contain; aspect-ratio:3 / 1; }
-    #introOverlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.9); color:white; display:flex; justify-content:center; align-items:center; z-index:9999; }
-    .introContent { max-width:550px; padding:20px; background:#111; border:2px solid white; border-radius:12px; overflow-y:auto; max-height:90vh; }
-  </style>
-</head>
-<body>
-<div id="introOverlay">
-  <div class="introContent">
-    <h2>🎮 EMG Wrist-Controlled Paddle Game</h2>
-    <p><strong>Requirements:</strong></p>
-    <ul>
-      <li><strong>Device:</strong> Shimmer3R (EMG)</li>
-      <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
-    </ul>
-    <hr />
-    <h3>⚡ EMG Electrode Placement</h3>
-    <p>This game uses <strong>wrist extension</strong> and <strong>wrist flexion</strong> to control the paddle. To get good signals, place electrodes on the belly of each muscle. For the right hand, use EMG1 (Ch1N red and Ch1P brown). Polarity doesn't matter because the signal is rectified.
-    Place the reference electrode (green) at an electrically neutral bony prominence (e.g., wrist).</p>
-    <a href="example.png" target="_blank" style="color:#0af; text-decoration:underline;">Example</a>
-    <a href="break-emg-demo.mp4" target="_blank" style="color:#0af; text-decoration:underline;">🎥 Demo Video</a>
+  <head>
+    <!-- Google tag (gtag.js) -->
+    <script
+      async
+      src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"
+    ></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-T26GWN0LJW");
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Breakout Game (EMG) — Shimmer3R API</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background: #000;
+        color: white;
+        font-family: sans-serif;
+        display: block;
+        overflow-y: auto;
+      }
 
-    <h4>✅ FLEXION — Locate Flexor Muscles</h4>
-    <ul><li>📍 <strong>Target:</strong> Flexor carpi radialis / ulnaris</li><li>🔘 <strong>Location:</strong> Inner forearm, 2–3 fingers below elbow</li></ul>
-    <ol><li>Sit with palm up</li><li>Bend wrist toward body</li><li>Place electrode on firm bulge</li></ol>
+      button {
+        margin: 5px;
+        padding: 10px 16px;
+        font-size: 16px;
+        border-radius: 6px;
+        border: none;
+        cursor: pointer;
+      }
 
-    <h4>✅ EXTENSION — Locate Extensor Muscles</h4>
-    <ul><li>📍 <strong>Target:</strong> Extensor carpi radialis longus</li><li>🔘 <strong>Location:</strong> Outer top of forearm, near elbow</li></ul>
-    <ol><li>Rest forearm palm-down</li><li>Lift hand upward</li><li>Place electrode on tightening band</li></ol>
+      #scanBtn {
+        background: #2196f3;
+        color: white;
+      }
 
-    <p style="font-size:14px;color:#ccc;">Tip: adjust the activation threshold slider to tune sensitivity.</p>
-    <div style="margin-top:10px; display:flex; align-items:center; gap:10px;">
-      <input type="checkbox" id="dontShowAgain" />
-      <label for="dontShowAgain">Don't show this again</label>
+      #connectBtn {
+        background: #4caf50;
+        color: white;
+      }
+
+      #streamBtn {
+        background: #ffc107;
+        color: black;
+      }
+
+      #disconnectBtn {
+        background: #f44336;
+        color: white;
+      }
+
+      #startBtn {
+        background: #9c27b0;
+        color: white;
+      }
+
+      #consoleOutput {
+        background: #000;
+        color: #0f0;
+        padding: 10px;
+        margin: 10px auto;
+        max-width: 480px;
+        font-family: monospace;
+        font-size: 16px;
+        border: 1px solid #0f0;
+        width: 90%;
+        line-height: 1.4em;
+        max-height: calc(1.4em * 12);
+        overflow-y: auto;
+      }
+
+      canvas {
+        background: #111;
+        border: 2px solid #fff;
+        width: 100%;
+        max-width: 480px;
+        height: auto;
+        max-height: 540px;
+        display: block;
+        margin: 20px auto;
+        box-sizing: border-box;
+      }
+
+      #controls {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+        text-align: center;
+      }
+
+      #controls button,
+      #controls p {
+        margin: 5px;
+      }
+
+      #banner {
+        width: 100%;
+        max-width: 1000px;
+        margin: 10px auto 0;
+        background-image: url("banner.png");
+        background-repeat: no-repeat;
+        background-position: center;
+        background-size: contain;
+        aspect-ratio: 3 / 1;
+      }
+
+      #introOverlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.9);
+        color: white;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 9999;
+      }
+
+      .introContent {
+        max-width: 550px;
+        padding: 20px;
+        background: #111;
+        border: 2px solid white;
+        border-radius: 12px;
+        overflow-y: auto;
+        max-height: 90vh;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="introOverlay">
+      <div class="introContent">
+        <h2>🎮 EMG Wrist-Controlled Paddle Game</h2>
+        <p><strong>Requirements:</strong></p>
+        <ul>
+          <li><strong>Device:</strong> Shimmer3R (EMG)</li>
+          <li><strong>Firmware:</strong> Version ≥ <code>v1.0.22</code></li>
+        </ul>
+        <hr />
+        <h3>⚡ EMG Electrode Placement</h3>
+        <p>
+          This game uses <strong>wrist extension</strong> and
+          <strong>wrist flexion</strong> to control the paddle. To get good
+          signals, place electrodes on the belly of each muscle. For the right
+          hand, use EMG1 (Ch1N red and Ch1P brown). Polarity doesn't matter
+          because the signal is rectified. Place the reference electrode (green)
+          at an electrically neutral bony prominence (e.g., wrist).
+        </p>
+        <a
+          href="example.png"
+          target="_blank"
+          style="color: #0af; text-decoration: underline"
+          >Example</a
+        >
+        <a
+          href="break-emg-demo.mp4"
+          target="_blank"
+          style="color: #0af; text-decoration: underline"
+          >🎥 Demo Video</a
+        >
+
+        <h4>✅ FLEXION — Locate Flexor Muscles</h4>
+        <ul>
+          <li>📍 <strong>Target:</strong> Flexor carpi radialis / ulnaris</li>
+          <li>
+            🔘 <strong>Location:</strong> Inner forearm, 2–3 fingers below elbow
+          </li>
+        </ul>
+        <ol>
+          <li>Sit with palm up</li>
+          <li>Bend wrist toward body</li>
+          <li>Place electrode on firm bulge</li>
+        </ol>
+
+        <h4>✅ EXTENSION — Locate Extensor Muscles</h4>
+        <ul>
+          <li>📍 <strong>Target:</strong> Extensor carpi radialis longus</li>
+          <li>
+            🔘 <strong>Location:</strong> Outer top of forearm, near elbow
+          </li>
+        </ul>
+        <ol>
+          <li>Rest forearm palm-down</li>
+          <li>Lift hand upward</li>
+          <li>Place electrode on tightening band</li>
+        </ol>
+
+        <p style="font-size: 14px; color: #ccc">
+          Tip: adjust the activation threshold slider to tune sensitivity.
+        </p>
+        <div
+          style="
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+          "
+        >
+          <input type="checkbox" id="dontShowAgain" />
+          <label for="dontShowAgain">Don't show this again</label>
+        </div>
+        <button id="closeIntroBtn">Got it!</button>
+      </div>
     </div>
-    <button id="closeIntroBtn">Got it!</button>
-  </div>
-</div>
 
-<div id="controls">
-  <button id="scanBtn">🔍 Scan / Connect (API)</button>
-  <button id="streamBtn" disabled>📡 Start Streaming</button>
-  <button id="disconnectBtn" disabled>❌ Disconnect</button>
-  <button id="showTipBtn">💡 Show Tip</button>
-  <p id="deviceName">No device selected</p>
-  <div style="text-align:center; margin-top:10px;">
-    <label for="onThreshSlider">Activation Threshold: <span id="threshLabel">3</span></label><br />
-    <input type="range" id="onThreshSlider" min="1" max="20" step="0.1" value="3" style="width:300px;" />
-  </div>
-  <div style="text-align:center; margin-top:10px;">
-    <label for="ballSpeedSlider">Ball Speed: <span id="ballSpeedLabel">175</span></label><br />
-    <input type="range" id="ballSpeedSlider" min="50" max="350" step="5" value="175" style="width:300px;" />
-  </div>
-</div>
+    <div id="controls">
+      <button id="scanBtn">🔍 Scan / Connect (API)</button>
+      <button id="streamBtn" disabled>📡 Start Streaming</button>
+      <button id="disconnectBtn" disabled>❌ Disconnect</button>
+      <button id="showTipBtn">💡 Show Tip</button>
+      <p id="deviceName">No device selected</p>
+      <div style="text-align: center; margin-top: 10px">
+        <label for="onThreshSlider"
+          >Activation Threshold: <span id="threshLabel">3</span></label
+        ><br />
+        <input
+          type="range"
+          id="onThreshSlider"
+          min="1"
+          max="20"
+          step="0.1"
+          value="3"
+          style="width: 300px"
+        />
+      </div>
+      <div style="text-align: center; margin-top: 10px">
+        <label for="ballSpeedSlider"
+          >Ball Speed: <span id="ballSpeedLabel">175</span></label
+        ><br />
+        <input
+          type="range"
+          id="ballSpeedSlider"
+          min="50"
+          max="350"
+          step="5"
+          value="175"
+          style="width: 300px"
+        />
+      </div>
+    </div>
 
-<div id="consoleWrapper"><pre id="consoleOutput"></pre></div>
-<div id="banner"></div>
-<div style="text-align:center; margin-top:20px;"><button id="startBtn">▶️ Start Game</button></div>
-<div style="text-align:center; margin-top:10px;"><input type="checkbox" id="autoRestart" /> <label for="autoRestart">Auto-restart after Game Over (5s)</label></div>
-<canvas id="breakout"></canvas>
-<div style="text-align:center; color:#0f0; font-family:monospace; font-size:16px;">📈 EMG Signal 1 (brown - red)</div>
-<canvas id="emg1Plot" width="480" height="100" style="background:#111; border:1px solid #0f0; display:block; margin:5px auto 20px;"></canvas>
-<div style="text-align:center; color:#f0f; font-family:monospace; font-size:16px;">📈 EMG Signal 2 (black - white)</div>
-<canvas id="emg2Plot" width="480" height="100" style="background:#111; border:1px solid #0f0; display:block; margin:5px auto 20px;"></canvas>
+    <div id="consoleWrapper">
+      <pre id="consoleOutput"></pre>
+    </div>
+    <div id="banner"></div>
+    <div style="text-align: center; margin-top: 20px">
+      <button id="startBtn">▶️ Start Game</button>
+    </div>
+    <div style="text-align: center; margin-top: 10px">
+      <input type="checkbox" id="autoRestart" />
+      <label for="autoRestart">Auto-restart after Game Over (5s)</label>
+    </div>
+    <canvas id="breakout"></canvas>
+    <div
+      style="
+        text-align: center;
+        color: #0f0;
+        font-family: monospace;
+        font-size: 16px;
+      "
+    >
+      📈 EMG Signal 1 (brown - red)
+    </div>
+    <canvas
+      id="emg1Plot"
+      width="480"
+      height="100"
+      style="
+        background: #111;
+        border: 1px solid #0f0;
+        display: block;
+        margin: 5px auto 20px;
+      "
+    ></canvas>
+    <div
+      style="
+        text-align: center;
+        color: #f0f;
+        font-family: monospace;
+        font-size: 16px;
+      "
+    >
+      📈 EMG Signal 2 (black - white)
+    </div>
+    <canvas
+      id="emg2Plot"
+      width="480"
+      height="100"
+      style="
+        background: #111;
+        border: 1px solid #0f0;
+        display: block;
+        margin: 5px auto 20px;
+      "
+    ></canvas>
 
-<!-- ===================== -->
-<!-- Core logic and game   -->
-<!-- ===================== -->
-<script type="module">
-  import { Shimmer3RClient,SensorBitmapShimmer3  } from '../ShimmerAPI/shimmer3r.js';
+    <!-- ===================== -->
+    <!-- Core logic and game   -->
+    <!-- ===================== -->
+    <script type="module">
+      import {
+        Shimmer3RClient,
+        SensorBitmapShimmer3,
+      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
-  // ===== Game buffers and globals (unchanged) =====
-  const emg1Buffer = new Array(256*5).fill(0);
-  const emg2Buffer = new Array(256*5).fill(0);
-  let emgIndex = 0;
-  let lastPrintedTime = 0;
-  let latestGyroSample = null;
-  let emgPrintCounter = 0;
-  let plotIntervalId = null;
+      // ===== Game buffers and globals (unchanged) =====
+      const emg1Buffer = new Array(256 * 5).fill(0);
+      const emg2Buffer = new Array(256 * 5).fill(0);
+      let emgIndex = 0;
+      let lastPrintedTime = 0;
+      let latestGyroSample = null;
+      let emgPrintCounter = 0;
+      let plotIntervalId = null;
 
-  let emg1Active = false;
-  let emg2Active = false;
-  let lastTime = null;
-  let gameOver = false;
-  let gameWon = false;
+      let emg1Active = false;
+      let emg2Active = false;
+      let lastTime = null;
+      let gameOver = false;
+      let gameWon = false;
 
-  // ===== New: Shimmer3R API client =====
-  const client = new Shimmer3RClient({ timestampFmt: 'u24', debug: true });
-  client.onStatus = (msg) => appendToConsole(msg);
+      // ===== New: Shimmer3R API client =====
+      const client = new Shimmer3RClient({ timestampFmt: "u24", debug: true });
+      client.onStatus = (msg) => appendToConsole(msg);
 
-  // When the API parses a frame, we get an ObjectCluster `oc`.
-  // We only use `oc.raw` (raw per-frame bytes) and keep the rest of your pipeline the same.
-// Replace your existing onStreamFrame + processRawFrame with this:
+      // When the API parses a frame, we get an ObjectCluster `oc`.
+      // We only use `oc.raw` (raw per-frame bytes) and keep the rest of your pipeline the same.
+      // Replace your existing onStreamFrame + processRawFrame with this:
 
-client.onStreamFrame = (oc) => {
-  // Pull parsed values by field name (as exposed by the new client)
-  const status = oc.get('Exg1_Status')?.value ?? 0;
-  const ch1    = oc.get('Exg1_CH1_16Bit')?.value;
-  const ch2    = oc.get('Exg1_CH2_16Bit')?.value;
+      client.onStreamFrame = (oc) => {
+        // Pull parsed values by field name (as exposed by the new client)
+        const status = oc.get("Exg1_Status")?.value ?? 0;
+        const ch1 = oc.get("Exg1_CH1_16Bit")?.value;
+        const ch2 = oc.get("Exg1_CH2_16Bit")?.value;
 
-  // If EXG isn’t enabled yet or fields aren’t present, bail.
-  if (typeof ch1 !== 'number' || typeof ch2 !== 'number') return;
+        // If EXG isn’t enabled yet or fields aren’t present, bail.
+        if (typeof ch1 !== "number" || typeof ch2 !== "number") return;
 
-  // === EMG1 filtering ===
-  emg1FIR[firIndex] = ch1; 
-  let filtered = 0;
-  for (let i=0;i<hpKernel.length;i++){
-    const idx=(firIndex - i + firLen) % firLen;
-    filtered += emg1FIR[idx]*hpKernel[i];
-  }
-  firIndex = (firIndex + 1) % firLen;
-  const rectified = Math.abs(filtered);
-  emg1Smooth[smoothIndex] = rectified;
-  smoothIndex = (smoothIndex + 1) % smoothWindow;
-  const smoothed = emg1Smooth.reduce((a,b)=>a+b,0) / smoothWindow;
+        // === EMG1 filtering ===
+        emg1FIR[firIndex] = ch1;
+        let filtered = 0;
+        for (let i = 0; i < hpKernel.length; i++) {
+          const idx = (firIndex - i + firLen) % firLen;
+          filtered += emg1FIR[idx] * hpKernel[i];
+        }
+        firIndex = (firIndex + 1) % firLen;
+        const rectified = Math.abs(filtered);
+        emg1Smooth[smoothIndex] = rectified;
+        smoothIndex = (smoothIndex + 1) % smoothWindow;
+        const smoothed = emg1Smooth.reduce((a, b) => a + b, 0) / smoothWindow;
 
-  // === EMG2 filtering ===
-  emg2FIR[firIndex2] = ch2; 
-  let filtered2 = 0;
-  for (let i=0;i<hpKernel2.length;i++){
-    const idx=(firIndex2 - i + firLen) % firLen;
-    filtered2 += emg2FIR[idx]*hpKernel2[i];
-  }
-  firIndex2 = (firIndex2 + 1) % firLen;
-  const rectified2 = Math.abs(filtered2);
-  emg2Smooth[smoothIndex2] = rectified2;
-  smoothIndex2 = (smoothIndex2 + 1) % smoothWindow;
-  const smoothed2 = emg2Smooth.reduce((a,b)=>a+b,0) / smoothWindow;
+        // === EMG2 filtering ===
+        emg2FIR[firIndex2] = ch2;
+        let filtered2 = 0;
+        for (let i = 0; i < hpKernel2.length; i++) {
+          const idx = (firIndex2 - i + firLen) % firLen;
+          filtered2 += emg2FIR[idx] * hpKernel2[i];
+        }
+        firIndex2 = (firIndex2 + 1) % firLen;
+        const rectified2 = Math.abs(filtered2);
+        emg2Smooth[smoothIndex2] = rectified2;
+        smoothIndex2 = (smoothIndex2 + 1) % smoothWindow;
+        const smoothed2 = emg2Smooth.reduce((a, b) => a + b, 0) / smoothWindow;
 
-  // Hysteresis + mutually-exclusive decision
-  if (!emg1Active && smoothed  >= onThresh) emg1Active = true;  else if (emg1Active && smoothed  < onThresh-1) emg1Active = false;
-  if (!emg2Active && smoothed2 >= onThresh) emg2Active = true;  else if (emg2Active && smoothed2 < onThresh-1) emg2Active = false;
-  if (emg1Active && emg2Active){
-    if (smoothed > smoothed2) emg2Active = false; else emg1Active = false;
-  }
+        // Hysteresis + mutually-exclusive decision
+        if (!emg1Active && smoothed >= onThresh) emg1Active = true;
+        else if (emg1Active && smoothed < onThresh - 1) emg1Active = false;
+        if (!emg2Active && smoothed2 >= onThresh) emg2Active = true;
+        else if (emg2Active && smoothed2 < onThresh - 1) emg2Active = false;
+        if (emg1Active && emg2Active) {
+          if (smoothed > smoothed2) emg2Active = false;
+          else emg1Active = false;
+        }
 
-  // Push to plot buffers
-  emg1Buffer[emgIndex] = smoothed;
-  emg2Buffer[emgIndex] = smoothed2;
-  emgIndex = (emgIndex + 1) % emg1Buffer.length;
+        // Push to plot buffers
+        emg1Buffer[emgIndex] = smoothed;
+        emg2Buffer[emgIndex] = smoothed2;
+        emgIndex = (emgIndex + 1) % emg1Buffer.length;
 
-  if (++emgPrintCounter >= 256){
-    appendToConsole(`EMG smoothed: ${status} | EMG1: ${smoothed.toFixed(2)} | EMG2: ${smoothed2.toFixed(2)}`);
-    appendToConsole(`EMG active:  ${status} | EMG1: ${emg1Active} | EMG2: ${emg2Active}`);
-    emgPrintCounter = 0;
-  }
-};
+        if (++emgPrintCounter >= 256) {
+          appendToConsole(
+            `EMG smoothed: ${status} | EMG1: ${smoothed.toFixed(2)} | EMG2: ${smoothed2.toFixed(2)}`,
+          );
+          appendToConsole(
+            `EMG active:  ${status} | EMG1: ${emg1Active} | EMG2: ${emg2Active}`,
+          );
+          emgPrintCounter = 0;
+        }
+      };
 
+      // ===== UI wiring using the API =====
+      const deviceNameEl = document.getElementById("deviceName");
 
-  // ===== UI wiring using the API =====
-  const deviceNameEl = document.getElementById('deviceName');
+      document.getElementById("scanBtn").addEventListener("click", async () => {
+        try {
+          await client.connect(); // requestDevice + GATT connect + start notifications
 
-  document.getElementById('scanBtn').addEventListener('click', async () => {
-    try {
-      await client.connect(); // requestDevice + GATT connect + start notifications
-	  
-	        // Apply equivalent config through the API
-      await client.setInternalExpPower(1);                // expansion power on
-      await sleep(200);
-      // Original divisor 0x0080 → ~256 Hz
-      await client.setSamplingRate(256);
-      await sleep(200);
-      // Sensor bitmask (matches your [0x08, 0x00, 0x00, 0x10]) → 0x00100000
-      await client.enableEMG16Bit();
-      await sleep(200);
-      // Optional: Inquiry to build schema (channels, timestamp width, etc.)
-      await client.inquiry();
-	  
-      deviceNameEl.textContent = `Selected: ${client.device?.name || 'Shimmer3R'}`;
-      document.getElementById('streamBtn').disabled = false;
-      document.getElementById('disconnectBtn').disabled = false;
-      appendToConsole('✅ Connected via API');
+          // Apply equivalent config through the API
+          await client.setInternalExpPower(1); // expansion power on
+          await sleep(200);
+          // Original divisor 0x0080 → ~256 Hz
+          await client.setSamplingRate(256);
+          await sleep(200);
+          // Sensor bitmask (matches your [0x08, 0x00, 0x00, 0x10]) → 0x00100000
+          await client.enableEMG16Bit();
+          await sleep(200);
+          // Optional: Inquiry to build schema (channels, timestamp width, etc.)
+          await client.inquiry();
 
-      // Paddle control timer (unchanged)
-      setInterval(() => {
-        const now = Date.now();
-        if ((now - lastPrintedTime) >= 10) {
-          lastPrintedTime = now;
+          deviceNameEl.textContent = `Selected: ${client.device?.name || "Shimmer3R"}`;
+          document.getElementById("streamBtn").disabled = false;
+          document.getElementById("disconnectBtn").disabled = false;
+          appendToConsole("✅ Connected via API");
+
+          // Paddle control timer (unchanged)
+          setInterval(() => {
+            const now = Date.now();
+            if (now - lastPrintedTime >= 10) {
+              lastPrintedTime = now;
+              rightPressed = false;
+              leftPressed = false;
+              if (emg1Active && !emg2Active) rightPressed = true;
+              else if (emg2Active && !emg1Active) leftPressed = true;
+              else if (emg1Active && emg2Active) rightPressed = true;
+            }
+          }, 50);
+        } catch (e) {
+          console.error(e);
+          appendToConsole("❌ Connect failed");
+        }
+      });
+
+      document
+        .getElementById("disconnectBtn")
+        .addEventListener("click", async () => {
+          try {
+            await client.disconnect();
+            appendToConsole("🔌 Disconnected");
+          } catch (e) {
+            console.warn("Disconnect error", e);
+          }
+          if (plotIntervalId) {
+            clearInterval(plotIntervalId);
+            plotIntervalId = null;
+          }
+          deviceNameEl.textContent = "No device selected";
+          document.getElementById("streamBtn").disabled = true;
+          document.getElementById("disconnectBtn").disabled = true;
           rightPressed = false;
           leftPressed = false;
-          if (emg1Active && !emg2Active) rightPressed = true;
-          else if (emg2Active && !emg1Active) leftPressed = true;
-          else if (emg1Active && emg2Active) rightPressed = true;
-        }
-      }, 50);
-    } catch (e) {
-      console.error(e);
-      appendToConsole('❌ Connect failed');
-    }
-  });
+        });
 
-  document.getElementById('disconnectBtn').addEventListener('click', async () => {
-    try {
-      await client.disconnect();
-      appendToConsole('🔌 Disconnected');
-    } catch (e) {
-      console.warn('Disconnect error', e);
-    }
-    if (plotIntervalId) { clearInterval(plotIntervalId); plotIntervalId = null; }
-    deviceNameEl.textContent = 'No device selected';
-    document.getElementById('streamBtn').disabled = true;
-    document.getElementById('disconnectBtn').disabled = true;
-    rightPressed = false; leftPressed = false;
-  });
+      document
+        .getElementById("streamBtn")
+        .addEventListener("click", async () => {
+          try {
+            await client.startStreaming();
+            appendToConsole("➡️ Streaming started (API)");
 
-  document.getElementById('streamBtn').addEventListener('click', async () => {
-    try {
+            if (!plotIntervalId) {
+              plotIntervalId = setInterval(() => {
+                drawEMG(document.getElementById("emg1Plot"), emg1Buffer);
+                drawEMG(document.getElementById("emg2Plot"), emg2Buffer);
+              }, 33);
+            }
+          } catch (err) {
+            console.error(err);
+            appendToConsole("❌ Failed to start streaming");
+          }
+        });
 
-      await client.startStreaming();
-      appendToConsole('➡️ Streaming started (API)');
-
-      if (!plotIntervalId) {
-        plotIntervalId = setInterval(() => {
-          drawEMG(document.getElementById('emg1Plot'), emg1Buffer);
-          drawEMG(document.getElementById('emg2Plot'), emg2Buffer);
-        }, 33);
+      // ====== Your existing helpers (mostly unchanged) ======
+      function appendToConsole(text) {
+        const el = document.getElementById("consoleOutput");
+        el.textContent += text + "\n";
+        el.scrollTop = el.scrollHeight;
       }
-    } catch (err) {
-      console.error(err);
-      appendToConsole('❌ Failed to start streaming');
-    }
-  });
+      function sleep(ms) {
+        return new Promise((r) => setTimeout(r, ms));
+      }
 
-  // ====== Your existing helpers (mostly unchanged) ======
-  function appendToConsole(text){
-    const el = document.getElementById('consoleOutput');
-    el.textContent += text + "\n";
-    el.scrollTop = el.scrollHeight;
-  }
-  function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+      function drawEMG(canvas, buffer) {
+        const ctx = canvas.getContext("2d");
+        const width = canvas.width,
+          height = canvas.height;
+        ctx.clearRect(0, 0, width, height);
+        const min = Math.min(...buffer),
+          max = Math.max(...buffer);
+        const range = max - min || 1;
+        ctx.beginPath();
+        for (let i = 0; i < buffer.length; i++) {
+          const x = (i / buffer.length) * width;
+          const normalized = (buffer[i] - min) / range;
+          const y = height - normalized * height;
+          ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = "#0f0";
+        ctx.stroke();
+      }
 
-  function drawEMG(canvas, buffer){
-    const ctx = canvas.getContext('2d');
-    const width = canvas.width, height = canvas.height;
-    ctx.clearRect(0,0,width,height);
-    const min = Math.min(...buffer), max = Math.max(...buffer);
-    const range = max - min || 1;
-    ctx.beginPath();
-    for (let i=0;i<buffer.length;i++){
-      const x = (i / buffer.length) * width;
-      const normalized = (buffer[i] - min) / range;
-      const y = height - normalized * height;
-      ctx.lineTo(x,y);
-    }
-    ctx.strokeStyle = '#0f0';
-    ctx.stroke();
-  }
+      // ===== Signal processing (unchanged) =====
+      function blackmanWindow(N) {
+        const a0 = 0.42,
+          a1 = 0.5,
+          a2 = 0.08;
+        return Array.from(
+          { length: N },
+          (_, n) =>
+            a0 -
+            a1 * Math.cos((2 * Math.PI * n) / (N - 1)) +
+            a2 * Math.cos((4 * Math.PI * n) / (N - 1)),
+        );
+      }
+      function sinc(x) {
+        return x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x);
+      }
+      function highPassKernel(N, cutoff, sampleRate) {
+        const fc = cutoff / sampleRate;
+        const mid = Math.floor(N / 2);
+        const window = blackmanWindow(N);
+        const kernel = [];
+        for (let i = 0; i < N; i++) {
+          const n = i - mid;
+          const low = 2 * fc * sinc(2 * fc * n);
+          const hp = (n === 0 ? 1 : 0) - low;
+          kernel[i] = hp * window[i];
+        }
+        return kernel;
+      }
 
-  // ===== Signal processing (unchanged) =====
-  function blackmanWindow(N){ const a0=0.42,a1=0.5,a2=0.08; return Array.from({length:N},(_,n)=> a0 - a1*Math.cos((2*Math.PI*n)/(N-1)) + a2*Math.cos((4*Math.PI*n)/(N-1))); }
-  function sinc(x){ return x===0 ? 1 : Math.sin(Math.PI*x)/(Math.PI*x); }
-  function highPassKernel(N, cutoff, sampleRate){ const fc=cutoff/sampleRate; const mid=Math.floor(N/2); const window=blackmanWindow(N); const kernel=[]; for(let i=0;i<N;i++){ const n=i-mid; const low=2*fc*sinc(2*fc*n); const hp=(n===0?1:0)-low; kernel[i]=hp*window[i]; } return kernel; }
+      const hpKernel = highPassKernel(51, 50, 256);
+      const hpKernel2 = highPassKernel(51, 50, 256);
+      const firLen = hpKernel.length;
+      const emg1FIR = new Array(firLen).fill(0);
+      let firIndex = 0;
+      const smoothWindow = 5;
+      const emg1Smooth = new Array(smoothWindow).fill(0);
+      let smoothIndex = 0;
+      const emg2FIR = new Array(firLen).fill(0);
+      let firIndex2 = 0;
+      const emg2Smooth = new Array(smoothWindow).fill(0);
+      let smoothIndex2 = 0;
 
-  const hpKernel = highPassKernel(51, 50, 256);
-  const hpKernel2 = highPassKernel(51, 50, 256);
-  const firLen = hpKernel.length;
-  const emg1FIR = new Array(firLen).fill(0); let firIndex = 0;
-  const smoothWindow = 5; const emg1Smooth = new Array(smoothWindow).fill(0); let smoothIndex = 0;
-  const emg2FIR = new Array(firLen).fill(0); let firIndex2 = 0;
-  const emg2Smooth = new Array(smoothWindow).fill(0); let smoothIndex2 = 0;
+      let onThresh = 3;
+      let offThresh = onThresh - 1;
+      const slider = document.getElementById("onThreshSlider");
+      const label = document.getElementById("threshLabel");
+      slider.addEventListener("input", () => {
+        onThresh = parseFloat(slider.value);
+        offThresh = onThresh - 1;
+        label.textContent = onThresh.toFixed(1);
+      });
 
-  let onThresh = 3; let offThresh = onThresh - 1;
-  const slider = document.getElementById('onThreshSlider');
-  const label = document.getElementById('threshLabel');
-  slider.addEventListener('input', ()=>{ onThresh = parseFloat(slider.value); offThresh = onThresh - 1; label.textContent = onThresh.toFixed(1); });
+      const ballSpeedSlider = document.getElementById("ballSpeedSlider");
+      const ballSpeedLabel = document.getElementById("ballSpeedLabel");
 
-  const ballSpeedSlider = document.getElementById('ballSpeedSlider');
-  const ballSpeedLabel = document.getElementById('ballSpeedLabel');
+      // ===== Input packet helpers (unchanged) =====
+      function calculateTwosComplement(signedData, bitLength) {
+        if (signedData >= 1 << (bitLength - 1)) {
+          return -((signedData ^ ((1 << bitLength) - 1)) + 1);
+        }
+        return signedData;
+      }
+      function parseSigned16bit(b0, b1) {
+        const xmsb = (b0 & 0xff) << 8;
+        const lsb = b1 & 0xff;
+        const combined = xmsb + lsb;
+        return calculateTwosComplement(combined, 16);
+      }
 
-  // ===== Input packet helpers (unchanged) =====
-  function calculateTwosComplement(signedData, bitLength){ if (signedData >= (1 << (bitLength - 1))) { return -((signedData ^ ((1 << bitLength) - 1)) + 1); } return signedData; }
-  function parseSigned16bit(b0,b1){ const xmsb=(b0 & 0xFF) << 8; const lsb=(b1 & 0xFF); const combined=xmsb + lsb; return calculateTwosComplement(combined,16); }
+      // ===== New: consume one API frame's raw bytes as a "packet" =====
+      function processRawFrame(packet) {
+        // Expected minimal frame: [0x00][u24 timestamp][status][emg1 LSB..MSB][emg2 LSB..MSB]
+        // If schema includes more channels, `packet` will be longer; we only read first 9 bytes.
+        if (!(packet && packet.length >= 9)) return;
+        if (packet[0] !== 0x00) return; // preamble guard
 
-  // ===== New: consume one API frame's raw bytes as a "packet" =====
-  function processRawFrame(packet){
-    // Expected minimal frame: [0x00][u24 timestamp][status][emg1 LSB..MSB][emg2 LSB..MSB]
-    // If schema includes more channels, `packet` will be longer; we only read first 9 bytes.
-    if (!(packet && packet.length >= 9)) return;
-    if (packet[0] !== 0x00) return; // preamble guard
+        const emgStatus = packet[4];
+        const emg1 = parseSigned16bit(packet[5], packet[6]);
+        const emg2 = parseSigned16bit(packet[7], packet[8]);
 
-    const emgStatus = packet[4];
-    const emg1 = parseSigned16bit(packet[5], packet[6]);
-    const emg2 = parseSigned16bit(packet[7], packet[8]);
+        // === EMG1 filtering ===
+        emg1FIR[firIndex] = emg1;
+        let filtered = 0;
+        for (let i = 0; i < hpKernel.length; i++) {
+          const idx = (firIndex - i + firLen) % firLen;
+          filtered += emg1FIR[idx] * hpKernel[i];
+        }
+        firIndex = (firIndex + 1) % firLen;
+        const rectified = Math.abs(filtered);
+        emg1Smooth[smoothIndex] = rectified;
+        smoothIndex = (smoothIndex + 1) % smoothWindow;
+        const smoothed = emg1Smooth.reduce((a, b) => a + b, 0) / smoothWindow;
 
-    // === EMG1 filtering ===
-    emg1FIR[firIndex] = emg1; let filtered = 0;
-    for (let i=0;i<hpKernel.length;i++){ const idx=(firIndex - i + firLen) % firLen; filtered += emg1FIR[idx]*hpKernel[i]; }
-    firIndex = (firIndex + 1) % firLen; const rectified = Math.abs(filtered);
-    emg1Smooth[smoothIndex] = rectified; smoothIndex = (smoothIndex + 1) % smoothWindow;
-    const smoothed = emg1Smooth.reduce((a,b)=>a+b,0) / smoothWindow;
+        // === EMG2 filtering ===
+        emg2FIR[firIndex2] = emg2;
+        let filtered2 = 0;
+        for (let i = 0; i < hpKernel2.length; i++) {
+          const idx = (firIndex2 - i + firLen) % firLen;
+          filtered2 += emg2FIR[idx] * hpKernel2[i];
+        }
+        firIndex2 = (firIndex2 + 1) % firLen;
+        const rectified2 = Math.abs(filtered2);
+        emg2Smooth[smoothIndex2] = rectified2;
+        smoothIndex2 = (smoothIndex2 + 1) % smoothWindow;
+        const smoothed2 = emg2Smooth.reduce((a, b) => a + b, 0) / smoothWindow;
 
-    // === EMG2 filtering ===
-    emg2FIR[firIndex2] = emg2; let filtered2 = 0;
-    for (let i=0;i<hpKernel2.length;i++){ const idx=(firIndex2 - i + firLen) % firLen; filtered2 += emg2FIR[idx]*hpKernel2[i]; }
-    firIndex2 = (firIndex2 + 1) % firLen; const rectified2 = Math.abs(filtered2);
-    emg2Smooth[smoothIndex2] = rectified2; smoothIndex2 = (smoothIndex2 + 1) % smoothWindow;
-    const smoothed2 = emg2Smooth.reduce((a,b)=>a+b,0) / smoothWindow;
+        // Hysteresis
+        if (!emg1Active && smoothed >= onThresh) emg1Active = true;
+        else if (emg1Active && smoothed < offThresh) emg1Active = false;
+        if (!emg2Active && smoothed2 >= onThresh) emg2Active = true;
+        else if (emg2Active && smoothed2 < offThresh) emg2Active = false;
+        if (emg1Active && emg2Active) {
+          if (smoothed > smoothed2) emg2Active = false;
+          else emg1Active = false;
+        }
 
-    // Hysteresis
-    if (!emg1Active && smoothed >= onThresh) emg1Active = true; else if (emg1Active && smoothed < offThresh) emg1Active = false;
-    if (!emg2Active && smoothed2 >= onThresh) emg2Active = true; else if (emg2Active && smoothed2 < offThresh) emg2Active = false;
-    if (emg1Active && emg2Active){ if (smoothed > smoothed2) emg2Active = false; else emg1Active = false; }
+        emg1Buffer[emgIndex] = smoothed;
+        emg2Buffer[emgIndex] = smoothed2;
+        emgIndex = (emgIndex + 1) % emg1Buffer.length;
 
-    emg1Buffer[emgIndex] = smoothed; emg2Buffer[emgIndex] = smoothed2; emgIndex = (emgIndex + 1) % emg1Buffer.length;
+        if (++emgPrintCounter >= 256) {
+          appendToConsole(
+            `EMG smoothed: ${emgStatus} | EMG1: ${smoothed} | EMG2: ${smoothed2}`,
+          );
+          appendToConsole(
+            `EMG active: ${emgStatus} | EMG1: ${emg1Active} | EMG2: ${emg2Active}`,
+          );
+          emgPrintCounter = 0;
+        }
+      }
 
-    if (++emgPrintCounter >= 256){
-      appendToConsole(`EMG smoothed: ${emgStatus} | EMG1: ${smoothed} | EMG2: ${smoothed2}`);
-      appendToConsole(`EMG active: ${emgStatus} | EMG1: ${emg1Active} | EMG2: ${emg2Active}`);
-      emgPrintCounter = 0;
-    }
-  }
+      // ====== Game (unchanged) ======
+      const canvas = document.getElementById("breakout");
+      const ctx = canvas.getContext("2d");
+      function resizeCanvas() {
+        const maxWidth = 480,
+          maxHeight = 540;
+        const scale = Math.min(
+          window.innerWidth / maxWidth,
+          window.innerHeight / maxHeight,
+        );
+        canvas.width = maxWidth;
+        canvas.height = maxHeight;
+        canvas.style.width = `${maxWidth * scale}px`;
+        canvas.style.height = `${maxHeight * scale}px`;
+      }
+      resizeCanvas();
+      window.addEventListener("resize", resizeCanvas);
 
-  // ====== Game (unchanged) ======
-  const canvas = document.getElementById('breakout');
-  const ctx = canvas.getContext('2d');
-  function resizeCanvas(){ const maxWidth=480, maxHeight=540; const scale=Math.min(window.innerWidth/maxWidth, window.innerHeight/maxHeight); canvas.width=maxWidth; canvas.height=maxHeight; canvas.style.width=`${maxWidth*scale}px`; canvas.style.height=`${maxHeight*scale}px`; }
-  resizeCanvas(); window.addEventListener('resize', resizeCanvas);
+      const paddleHeight = 10;
+      const paddleWidth = 75 * 1.25;
+      let paddleX = (canvas.width - paddleWidth) / 2;
+      const ballRadius = 8;
+      let x = canvas.width / 2;
+      let y = canvas.height - 30;
+      let ballSpeed = 175;
+      let speedX = ballSpeed;
+      let speedY = -ballSpeed;
+      let animationId = null;
+      const brickRowCount = 5,
+        brickColumnCount = 6,
+        brickWidth = 60,
+        brickHeight = 20,
+        brickPadding = 10,
+        brickOffsetTop = 30,
+        brickOffsetLeft = 30;
+      let rightPressed = false,
+        leftPressed = false;
+      const bricks = [];
+      for (let c = 0; c < brickColumnCount; c++) {
+        bricks[c] = [];
+        for (let r = 0; r < brickRowCount; r++) {
+          bricks[c][r] = { x: 0, y: 0, status: 1 };
+        }
+      }
 
-  const paddleHeight=10; const paddleWidth=75*1.25; let paddleX=(canvas.width - paddleWidth)/2;
-  const ballRadius=8; let x=canvas.width/2; let y=canvas.height-30; let ballSpeed=175; let speedX=ballSpeed; let speedY=-ballSpeed; let animationId=null;
-  const brickRowCount=5, brickColumnCount=6, brickWidth=60, brickHeight=20, brickPadding=10, brickOffsetTop=30, brickOffsetLeft=30;
-  let rightPressed=false, leftPressed=false;
-  const bricks=[]; for(let c=0;c<brickColumnCount;c++){ bricks[c]=[]; for(let r=0;r<brickRowCount;r++){ bricks[c][r]={x:0,y:0,status:1}; } }
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight") rightPressed = true;
+        else if (e.key === "ArrowLeft") leftPressed = true;
+      });
+      document.addEventListener("keyup", (e) => {
+        if (e.key === "ArrowRight") rightPressed = false;
+        else if (e.key === "ArrowLeft") leftPressed = false;
+      });
+      canvas.addEventListener("touchstart", (e) => {
+        const tx = e.touches[0].clientX;
+        if (tx < canvas.width / 2) {
+          leftPressed = true;
+          rightPressed = false;
+        } else {
+          rightPressed = true;
+          leftPressed = false;
+        }
+        e.preventDefault();
+      });
+      canvas.addEventListener("touchend", () => {
+        leftPressed = false;
+        rightPressed = false;
+      });
 
-  document.addEventListener('keydown', e=>{ if(e.key==='ArrowRight') rightPressed=true; else if(e.key==='ArrowLeft') leftPressed=true; });
-  document.addEventListener('keyup', e=>{ if(e.key==='ArrowRight') rightPressed=false; else if(e.key==='ArrowLeft') leftPressed=false; });
-  canvas.addEventListener('touchstart', e=>{ const tx=e.touches[0].clientX; if(tx < canvas.width/2){ leftPressed=true; rightPressed=false; } else { rightPressed=true; leftPressed=false; } e.preventDefault(); });
-  canvas.addEventListener('touchend', ()=>{ leftPressed=false; rightPressed=false; });
+      function collisionDetection() {
+        for (let c = 0; c < brickColumnCount; c++) {
+          for (let r = 0; r < brickRowCount; r++) {
+            const b = bricks[c][r];
+            if (b.status === 1) {
+              if (
+                x > b.x &&
+                x < b.x + brickWidth &&
+                y > b.y &&
+                y < b.y + brickHeight
+              ) {
+                speedY = -speedY;
+                b.status = 0;
+              }
+            }
+          }
+        }
+      }
+      function checkWin() {
+        for (let c = 0; c < brickColumnCount; c++) {
+          for (let r = 0; r < brickRowCount; r++) {
+            if (bricks[c][r].status === 1) return false;
+          }
+        }
+        return true;
+      }
+      function drawBall() {
+        ctx.beginPath();
+        ctx.arc(x, y, ballRadius, 0, Math.PI * 2);
+        ctx.fillStyle = "#f00";
+        ctx.fill();
+        ctx.closePath();
+      }
+      function drawPaddle() {
+        ctx.beginPath();
+        ctx.rect(
+          paddleX,
+          canvas.height - paddleHeight,
+          paddleWidth,
+          paddleHeight,
+        );
+        ctx.fillStyle = "#00f";
+        ctx.fill();
+        ctx.closePath();
+      }
+      function drawBricks() {
+        for (let c = 0; c < brickColumnCount; c++) {
+          for (let r = 0; r < brickRowCount; r++) {
+            if (bricks[c][r].status === 1) {
+              const brickX = c * (brickWidth + brickPadding) + brickOffsetLeft;
+              const brickY = r * (brickHeight + brickPadding) + brickOffsetTop;
+              bricks[c][r].x = brickX;
+              bricks[c][r].y = brickY;
+              ctx.beginPath();
+              ctx.rect(brickX, brickY, brickWidth, brickHeight);
+              ctx.fillStyle = "#0f0";
+              ctx.fill();
+              ctx.closePath();
+            }
+          }
+        }
+      }
 
-  function collisionDetection(){ for(let c=0;c<brickColumnCount;c++){ for(let r=0;r<brickRowCount;r++){ const b=bricks[c][r]; if(b.status===1){ if(x>b.x && x<b.x+brickWidth && y>b.y && y<b.y+brickHeight){ speedY=-speedY; b.status=0; } } } } }
-  function checkWin(){ for(let c=0;c<brickColumnCount;c++){ for(let r=0;r<brickRowCount;r++){ if(bricks[c][r].status===1) return false; } } return true; }
-  function drawBall(){ ctx.beginPath(); ctx.arc(x,y,ballRadius,0,Math.PI*2); ctx.fillStyle='#f00'; ctx.fill(); ctx.closePath(); }
-  function drawPaddle(){ ctx.beginPath(); ctx.rect(paddleX, canvas.height - paddleHeight, paddleWidth, paddleHeight); ctx.fillStyle='#00f'; ctx.fill(); ctx.closePath(); }
-  function drawBricks(){ for(let c=0;c<brickColumnCount;c++){ for(let r=0;r<brickRowCount;r++){ if(bricks[c][r].status===1){ const brickX=c*(brickWidth+brickPadding)+brickOffsetLeft; const brickY=r*(brickHeight+brickPadding)+brickOffsetTop; bricks[c][r].x=brickX; bricks[c][r].y=brickY; ctx.beginPath(); ctx.rect(brickX,brickY,brickWidth,brickHeight); ctx.fillStyle='#0f0'; ctx.fill(); ctx.closePath(); } } } }
+      function startGame() {
+        x = canvas.width / 2;
+        y = canvas.height - 30;
+        paddleX = (canvas.width - paddleWidth) / 2;
+        lastTime = null;
+        speedX = ballSpeed;
+        speedY = -ballSpeed;
+        cancelAnimationFrame(animationId);
+        animationId = requestAnimationFrame(draw);
+        gameOver = false;
+        gameWon = false;
+        for (let c = 0; c < brickColumnCount; c++) {
+          for (let r = 0; r < brickRowCount; r++) {
+            bricks[c][r].status = 1;
+          }
+        }
+      }
+      function draw(ts) {
+        if (!lastTime) lastTime = ts;
+        const dt = (ts - lastTime) / 1000;
+        lastTime = ts;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        drawBricks();
+        drawBall();
+        drawPaddle();
+        collisionDetection();
+        if (!gameWon && checkWin()) {
+          gameWon = true;
+          alert(
+            "🎉 You Win! You can still move the paddle. Press Start Game to restart.",
+          );
+        }
+        if (
+          x + speedX * dt > canvas.width - ballRadius ||
+          x + speedX * dt < ballRadius
+        )
+          speedX = -speedX;
+        if (y + speedY * dt < ballRadius) speedY = -speedY;
+        else if (y + speedY * dt > canvas.height - ballRadius) {
+          if (x > paddleX && x < paddleX + paddleWidth) {
+            speedY = -speedY;
+          } else if (!gameOver) {
+            gameOver = true;
+            if (document.getElementById("autoRestart").checked) {
+              showCustomAlert(
+                "Game Over! Game will restart in 5 seconds",
+                4500,
+              );
+              setTimeout(() => {
+                if (!gameOver && !gameWon) return;
+                startGame();
+              }, 5000);
+            } else {
+              showCustomAlert(
+                "Game Over! You can still move the paddle. Press Start Game to restart.",
+                5000,
+              );
+            }
+          }
+        }
+        const moveSpeed = 350;
+        if (rightPressed && paddleX < canvas.width - paddleWidth)
+          paddleX += moveSpeed * dt;
+        else if (leftPressed && paddleX > 0) paddleX -= moveSpeed * dt;
+        if (!gameOver && !gameWon) {
+          x += speedX * dt;
+          y += speedY * dt;
+        }
+        animationId = requestAnimationFrame(draw);
+      }
 
-  function startGame(){ x=canvas.width/2; y=canvas.height-30; paddleX=(canvas.width - paddleWidth)/2; lastTime=null; speedX=ballSpeed; speedY=-ballSpeed; cancelAnimationFrame(animationId); animationId=requestAnimationFrame(draw); gameOver=false; gameWon=false; for(let c=0;c<brickColumnCount;c++){ for(let r=0;r<brickRowCount;r++){ bricks[c][r].status=1; } } }
-  function draw(ts){ if(!lastTime) lastTime=ts; const dt=(ts - lastTime)/1000; lastTime=ts; ctx.clearRect(0,0,canvas.width,canvas.height); drawBricks(); drawBall(); drawPaddle(); collisionDetection(); if(!gameWon && checkWin()){ gameWon=true; alert('🎉 You Win! You can still move the paddle. Press Start Game to restart.'); }
-    if (x + speedX*dt > canvas.width - ballRadius || x + speedX*dt < ballRadius) speedX=-speedX; if (y + speedY*dt < ballRadius) speedY=-speedY; else if (y + speedY*dt > canvas.height - ballRadius){ if (x>paddleX && x<paddleX+paddleWidth){ speedY=-speedY; } else if (!gameOver){ gameOver=true; if (document.getElementById('autoRestart').checked){ showCustomAlert('Game Over! Game will restart in 5 seconds', 4500); setTimeout(()=>{ if(!gameOver && !gameWon) return; startGame(); }, 5000); } else { showCustomAlert('Game Over! You can still move the paddle. Press Start Game to restart.', 5000); } } }
-    const moveSpeed=350; if(rightPressed && paddleX < canvas.width - paddleWidth) paddleX += moveSpeed*dt; else if(leftPressed && paddleX > 0) paddleX -= moveSpeed*dt; if(!gameOver && !gameWon){ x += speedX*dt; y += speedY*dt; } animationId=requestAnimationFrame(draw); }
+      document.getElementById("startBtn").addEventListener("click", startGame);
+      ballSpeedSlider.addEventListener("input", () => {
+        ballSpeed = parseInt(ballSpeedSlider.value, 10);
+        ballSpeedLabel.textContent = ballSpeed;
+        const angle = Math.atan2(speedY, speedX);
+        speedX = ballSpeed * Math.cos(angle);
+        speedY = ballSpeed * Math.sin(angle);
+      });
 
-  document.getElementById('startBtn').addEventListener('click', startGame);
-  ballSpeedSlider.addEventListener('input', ()=>{ ballSpeed = parseInt(ballSpeedSlider.value,10); ballSpeedLabel.textContent = ballSpeed; const angle=Math.atan2(speedY, speedX); speedX = ballSpeed*Math.cos(angle); speedY = ballSpeed*Math.sin(angle); });
+      // Tip overlay controls
+      window.addEventListener("DOMContentLoaded", () => {
+        if (localStorage.getItem("hideIntroOverlay") === "true") {
+          document.getElementById("introOverlay").style.display = "none";
+        }
+      });
+      document.getElementById("closeIntroBtn").addEventListener("click", () => {
+        const dontShow = document.getElementById("dontShowAgain").checked;
+        if (dontShow) localStorage.setItem("hideIntroOverlay", "true");
+        document.getElementById("introOverlay").style.display = "none";
+      });
+      document.getElementById("showTipBtn").addEventListener("click", () => {
+        document.getElementById("introOverlay").style.display = "flex";
+        localStorage.removeItem("hideIntroOverlay");
+      });
 
-  // Tip overlay controls
-  window.addEventListener('DOMContentLoaded', () => { if (localStorage.getItem('hideIntroOverlay') === 'true') { document.getElementById('introOverlay').style.display='none'; } });
-  document.getElementById('closeIntroBtn').addEventListener('click', ()=>{ const dontShow=document.getElementById('dontShowAgain').checked; if(dontShow) localStorage.setItem('hideIntroOverlay','true'); document.getElementById('introOverlay').style.display='none'; });
-  document.getElementById('showTipBtn').addEventListener('click', ()=>{ document.getElementById('introOverlay').style.display='flex'; localStorage.removeItem('hideIntroOverlay'); });
+      // Custom alert (unchanged)
+      function showCustomAlert(message, duration = 3000) {
+        const el = document.getElementById("customAlert");
+        el.textContent = message;
+        el.style.display = "block";
+        setTimeout(() => {
+          el.style.display = "none";
+        }, duration);
+      }
 
-  // Custom alert (unchanged)
-  function showCustomAlert(message, duration=3000){ const el=document.getElementById('customAlert'); el.textContent=message; el.style.display='block'; setTimeout(()=>{ el.style.display='none'; }, duration); }
+      // Keyboard/gamepad flags
+    </script>
 
-  // Keyboard/gamepad flags
-  
-</script>
-
-<div id="customAlert" style="display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#222; color:#fff; padding:16px 24px; border:2px solid #f00; border-radius:10px; font-size:16px; z-index:9999; text-align:center;">Game Over! You can still move the paddle. Press Start Game to restart.</div>
-</body>
+    <div
+      id="customAlert"
+      style="
+        display: none;
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #222;
+        color: #fff;
+        padding: 16px 24px;
+        border: 2px solid #f00;
+        border-radius: 10px;
+        font-size: 16px;
+        z-index: 9999;
+        text-align: center;
+      "
+    >
+      Game Over! You can still move the paddle. Press Start Game to restart.
+    </div>
+  </body>
 </html>

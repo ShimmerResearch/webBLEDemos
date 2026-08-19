@@ -25,7 +25,7 @@ administration layers, focused on the algorithm and a polished live readout.
 | File | Responsibility |
 |------|----------------|
 | `kinematics.js` | **Pure algorithm module** — calibration, complementary filter, per-segment inclination, knee angle, rep counting. No DOM, no Bluetooth; unit-testable in isolation. |
-| `index.html` | UI + Web Bluetooth wiring. Imports `Shimmer3RClient` from `../ShimmerAPI/shimmer3r.js` and `KneeTracker` from `kinematics.js`. |
+| `index.html` | UI + Web Bluetooth wiring. Imports `Shimmer3RClient` from `../shimmer-extension/vendor/shimmer-web-sdk.esm.js` and `KneeTracker` from `kinematics.js`. |
 
 ## Algorithm
 Each sensor delivers raw accelerometer and gyroscope counts, which are calibrated

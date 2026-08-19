@@ -84,4 +84,4 @@ is required.
 |------|----------------|
 | `index.html` | Scene (human + robot stations, tilting platforms), cannon-es tray/bottle physics, disturbance generator, simulated demonstrator, UI. |
 | `fusion3d.js` | Madgwick MARG fusion + `ArmImu` calibration. |
-| `../ShimmerAPI/shimmer3r.js` | Shimmer3R Web Bluetooth client (reused). |
+| `../shimmer-extension/vendor/shimmer-web-sdk.esm.js` | Shimmer3R Web Bluetooth client from the vendored `shimmer-web-sdk` (reused). |

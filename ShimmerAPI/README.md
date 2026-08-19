@@ -1,1 +1,0 @@
-API for Shimmer3R
