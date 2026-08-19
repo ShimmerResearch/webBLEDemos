@@ -226,11 +226,11 @@
         <small>advertising / product name provisioning</small>
       </h1>
       <p class="sub">
-        Reads and writes the 64-byte brand record in the daughter-card EEPROM
-        that holds the device's Bluetooth Classic, BLE and USB name prefixes.
-        Firmware seeds the record with the stock defaults on first boot and uses
-        it as the single source of truth afterwards, so what you see below is
-        what the device actually advertises. Works over
+        Reads and writes the brand record in the sensor's EEPROM, which holds
+        the device's Bluetooth Classic, BLE and USB names. Firmware seeds the
+        record with the stock defaults on first boot and uses it as the single
+        source of truth afterwards, so what you see below is what the device
+        actually advertises. Works over
         <b>USB / dock serial</b> (Shimmer3 in a base, Shimmer3R directly over
         USB-C) and over <b>BLE</b> (Shimmer3R only — the browser cannot reach a
         Shimmer3 over Bluetooth). Requires firmware with DEV-949 brand-record
@@ -260,20 +260,30 @@
           Reboot required — the new names are stored but not yet advertised
         </h2>
         The Bluetooth module only picks up the name at Bluetooth initialisation,
-        and the BLE advertising name cannot change while advertising is running.
-        <ol>
-          <li>Disconnect this tool (button below or unplug).</li>
-          <li>
-            Power-cycle the sensor — Shimmer3: undock and re-dock it (or briefly
-            press the reset pin through the enclosure hole); Shimmer3R: hold the
-            button to power off, then on again, or undock/re-dock.
-          </li>
-          <li>
-            Reconnect here and press <b>Read record</b> to confirm, or check a
-            Bluetooth scan for the new name.
-          </li>
-        </ol>
-        <button id="btnBannerDisconnect">Disconnect now</button>
+        and the BLE advertising name cannot change while advertising is running,
+        so the device has to restart.
+        <div id="rebootAuto">
+          <b>Reboot now</b> arms a soft reboot and disconnects — the device
+          restarts by itself as the link drops, then advertises the new names.
+        </div>
+        <div id="rebootManual">
+          This connection cannot request a soft reboot (dock/USB serial has no
+          such command), so power-cycle the sensor by hand:
+          <ol>
+            <li>Disconnect this tool (button below or unplug).</li>
+            <li>
+              Shimmer3: undock and re-dock it (or briefly press the reset pin
+              through the enclosure hole). Shimmer3R: hold the button to power
+              off, then on again, or undock/re-dock.
+            </li>
+            <li>
+              Reconnect here and press <b>Read record</b> to confirm, or check a
+              Bluetooth scan for the new name.
+            </li>
+          </ol>
+        </div>
+        <button id="btnBannerReboot" class="primary">Reboot now</button>
+        <button id="btnBannerDisconnect">Disconnect only</button>
       </div>
 
       <div class="card">
@@ -288,8 +298,12 @@
             <div class="v" id="curBle">–</div>
           </div>
           <div class="stat">
-            <div class="k">USB / manufacturer</div>
-            <div class="v" id="curUsb">–</div>
+            <div class="k">USB product prefix</div>
+            <div class="v" id="curUsbProduct">–</div>
+          </div>
+          <div class="stat">
+            <div class="k">USB manufacturer</div>
+            <div class="v" id="curUsbManufacturer">–</div>
           </div>
           <div class="stat">
             <div class="k">Record type</div>
@@ -342,26 +356,30 @@
           </div>
         </div>
         <div class="formrow">
-          <label for="inUsb">USB / manufacturer</label>
+          <label for="inUsbProduct">USB product prefix</label>
           <input
-            id="inUsb"
+            id="inUsbProduct"
             type="text"
             maxlength="16"
             placeholder="derived from Classic BT if blank"
           />
           <div>
-            <span class="preview" id="pvUsb"></span>
-            <span class="err" id="errUsb"></span>
+            <span class="preview" id="pvUsbProduct"></span>
+            <span class="err" id="errUsbProduct"></span>
           </div>
         </div>
-        <div class="row">
-          <label
-            title="Marks the record as a deliberate customer brand. Firmware then (a) keeps it when the daughter card is moved between a Shimmer3 and a Shimmer3R instead of resetting it to that platform's stock names, and (b) applies the USB manufacturer string on Shimmer3R. It does NOT write-protect the record - it stays fully rewritable and erasable from this page."
-          >
-            <input id="inCustomer" type="checkbox" checked />
-            Customer brand (keep across platform swaps; also sets the USB
-            manufacturer)</label
-          >
+        <div class="formrow">
+          <label for="inUsbManufacturer">USB manufacturer</label>
+          <input
+            id="inUsbManufacturer"
+            type="text"
+            maxlength="24"
+            placeholder="e.g. YourBrand Ltd."
+          />
+          <div>
+            <span class="preview" id="pvUsbManufacturer"></span>
+            <span class="err" id="errUsbManufacturer"></span>
+          </div>
         </div>
         <div class="row" style="margin-top: 10px">
           <button id="btnWrite" class="primary" disabled>
@@ -377,16 +395,16 @@
           </button>
         </div>
         <div class="note">
-          <b>Customer brand</b> is a marker, not a lock: the record stays
-          rewritable and erasable from this page at any time. Leaving it
-          unticked means firmware treats the record as stock and will reset it
-          to platform defaults if the daughter card is moved between a Shimmer3
-          and a Shimmer3R. <br /><br />
-          Names: 1–16 printable ASCII characters, no commas. BLE prefix: max 10
-          (<b>Shimmer3: max 8</b> — the 31-byte BLE advertisement limit). The
-          firmware appends the MAC suffix automatically. Writes are
-          CRC-protected; a garbled record simply reverts to the stock defaults
-          at the next boot.
+          Printable ASCII, no commas. Max lengths: Classic BT and USB product
+          16, BLE 10 (<b>Shimmer3: 8</b> — the 31-byte BLE advertisement limit),
+          USB manufacturer 24. Firmware appends the MAC suffix to the Classic
+          BT, BLE and USB <i>product</i> names; the USB <b>manufacturer</b>
+          string is used verbatim, and a stock unit carries "Shimmer Research
+          Ltd." here.
+          <br /><br />
+          The record is never write-protected — it stays rewritable and erasable
+          from this page at any time. Writes are CRC-protected; a garbled record
+          simply reverts to the stock defaults at the next boot.
         </div>
       </div>
 
@@ -416,7 +434,8 @@
         BRAND_BT_CLASSIC_MAX_CHARS,
         BRAND_BLE_MAX_CHARS,
         BRAND_BLE_MAX_CHARS_SHIMMER3,
-        BRAND_USB_MAX_CHARS,
+        BRAND_USB_PRODUCT_MAX_CHARS,
+        BRAND_USB_MANUFACTURER_MAX_CHARS,
         BRAND_PLATFORM,
       } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
@@ -431,6 +450,9 @@
         write: $("btnWrite"),
         restore: $("btnRestore"),
         bannerDisc: $("btnBannerDisconnect"),
+        bannerReboot: $("btnBannerReboot"),
+        rebootAuto: $("rebootAuto"),
+        rebootManual: $("rebootManual"),
         bannerDismiss: $("btnBannerDismiss"),
         banner: $("rebootBanner"),
         pill: $("connPill"),
@@ -439,20 +461,23 @@
         log: $("log"),
         curBt: $("curBt"),
         curBle: $("curBle"),
-        curUsb: $("curUsb"),
+        curUsbProduct: $("curUsbProduct"),
+        curUsbManufacturer: $("curUsbManufacturer"),
         curType: $("curType"),
         curDev: $("curDev"),
         curMac: $("curMac"),
         inBt: $("inBt"),
         inBle: $("inBle"),
-        inUsb: $("inUsb"),
-        inCustomer: $("inCustomer"),
+        inUsbProduct: $("inUsbProduct"),
+        inUsbManufacturer: $("inUsbManufacturer"),
         pvBt: $("pvBt"),
         pvBle: $("pvBle"),
-        pvUsb: $("pvUsb"),
+        pvUsbProduct: $("pvUsbProduct"),
+        pvUsbManufacturer: $("pvUsbManufacturer"),
         errBt: $("errBt"),
         errBle: $("errBle"),
-        errUsb: $("errUsb"),
+        errUsbProduct: $("errUsbProduct"),
+        errUsbManufacturer: $("errUsbManufacturer"),
       };
 
       let client = null; // Shimmer3RClient | WiredShimmerClient
@@ -476,7 +501,33 @@
         refreshForm();
       }
 
+      /* Blank the provisioning inputs. Called after a successful erase so the
+       * form does not keep showing a brand that is no longer on the device. */
+      function clearBrandInputs() {
+        els.inBt.value = "";
+        els.inBle.value = "";
+        els.inUsbProduct.value = "";
+        els.inUsbManufacturer.value = "";
+        refreshForm();
+      }
+
+      /* Soft reboot is a Bluetooth command (SET_FEATURE), so it is only
+       * available on the BLE/BT client - the dock UART protocol has no
+       * equivalent property. */
+      function canSoftReboot() {
+        return (
+          mode === "ble" && typeof client?.setRebootOnDisconnect === "function"
+        );
+      }
+
       function showRebootBanner() {
+        const auto = canSoftReboot();
+        els.rebootAuto.style.display = auto ? "block" : "none";
+        els.rebootManual.style.display = auto ? "none" : "block";
+        els.bannerReboot.style.display = auto ? "" : "none";
+        els.bannerDisc.textContent = auto
+          ? "Disconnect only"
+          : "Disconnect now";
         els.banner.style.display = "block";
         els.banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }
@@ -506,62 +557,90 @@
       }
 
       // ---------------------------------------------------------------------------
-      // Effective form values: BLE and USB derive from the Classic BT prefix when
-      // left blank, so a customer only has to enter one name.
+      // Effective form values: the BLE and USB *product* prefixes derive from the
+      // Classic BT prefix when left blank, so a customer need only enter one
+      // advertising name. The USB *manufacturer* string is used verbatim by the
+      // descriptor and is never derived - it must be entered explicitly.
       // ---------------------------------------------------------------------------
 
       function effectiveFields() {
         const bt = els.inBt.value.trim();
         const ble = (els.inBle.value.trim() || bt).slice(0, bleCap());
-        const usb = (els.inUsb.value.trim() || bt).slice(
+        const usbProduct = (els.inUsbProduct.value.trim() || bt).slice(
           0,
-          BRAND_USB_MAX_CHARS,
+          BRAND_USB_PRODUCT_MAX_CHARS,
         );
-        return { bt, ble, usb };
+        const usbManufacturer = els.inUsbManufacturer.value.trim();
+        return { bt, ble, usbProduct, usbManufacturer };
       }
 
       function refreshForm() {
-        const { bt, ble, usb } = effectiveFields();
+        const { bt, ble, usbProduct, usbManufacturer } = effectiveFields();
         const btErr = bt
           ? brandNameProblem(bt, BRAND_BT_CLASSIC_MAX_CHARS)
           : "enter a name";
         const bleErr = ble ? brandNameProblem(ble, bleCap()) : "enter a name";
-        const usbErr = usb
-          ? brandNameProblem(usb, BRAND_USB_MAX_CHARS)
+        const productErr = usbProduct
+          ? brandNameProblem(usbProduct, BRAND_USB_PRODUCT_MAX_CHARS)
           : "enter a name";
+        const manufacturerErr = usbManufacturer
+          ? brandNameProblem(usbManufacturer, BRAND_USB_MANUFACTURER_MAX_CHARS)
+          : "enter a manufacturer name";
 
         els.errBt.textContent = bt && btErr ? btErr : "";
         els.errBle.textContent = ble && bleErr ? bleErr : "";
-        els.errUsb.textContent = usb && usbErr ? usbErr : "";
+        els.errUsbProduct.textContent =
+          usbProduct && productErr ? productErr : "";
+        els.errUsbManufacturer.textContent = usbManufacturer
+          ? manufacturerErr || ""
+          : "";
         els.inBt.classList.toggle("bad", !!(bt && btErr));
         els.inBle.classList.toggle("bad", !!(ble && bleErr));
-        els.inUsb.classList.toggle("bad", !!(usb && usbErr));
+        els.inUsbProduct.classList.toggle("bad", !!(usbProduct && productErr));
+        els.inUsbManufacturer.classList.toggle(
+          "bad",
+          !!(usbManufacturer && manufacturerErr),
+        );
 
         // Live preview of the advertised names with the real MAC suffix
         if (isShimmer3()) {
           els.pvBt.textContent = bt ? `→ ${bt}-${macSuffix}` : "";
           els.pvBle.textContent = ble ? `→ ${ble}-${macSuffix}` : "";
-          els.pvUsb.textContent = usb
-            ? `→ (BLE manufacturer string; Shimmer3 USB is via the dock)`
+          els.pvUsbProduct.textContent = usbProduct
+            ? "→ (unused on Shimmer3 — USB is via the dock's own bridge chip)"
+            : "";
+          els.pvUsbManufacturer.textContent = usbManufacturer
+            ? `→ BLE manufacturer "${usbManufacturer.slice(0, 7)}" (module field fits 7)`
             : "";
         } else {
           els.pvBt.textContent = bt ? `→ ${bt}-${macSuffix}-BT` : "";
           els.pvBle.textContent = ble ? `→ ${ble}-${macSuffix}-BLE` : "";
-          els.pvUsb.textContent = usb
-            ? `→ USB product "${usb} ${macSuffix}"`
+          els.pvUsbProduct.textContent = usbProduct
+            ? `→ USB product "${usbProduct} ${macSuffix}"`
+            : "";
+          els.pvUsbManufacturer.textContent = usbManufacturer
+            ? `→ USB manufacturer "${usbManufacturer}"`
             : "";
         }
 
         const connected = !!client;
-        els.write.disabled = !(connected && bt && !btErr && !bleErr && !usbErr);
+        els.write.disabled = !(
+          connected &&
+          bt &&
+          usbManufacturer &&
+          !btErr &&
+          !bleErr &&
+          !productErr &&
+          !manufacturerErr
+        );
         els.restore.disabled = !connected;
       }
 
       ["input", "change"].forEach((ev) => {
         els.inBt.addEventListener(ev, refreshForm);
         els.inBle.addEventListener(ev, refreshForm);
-        els.inUsb.addEventListener(ev, refreshForm);
-        els.inCustomer.addEventListener(ev, refreshForm);
+        els.inUsbProduct.addEventListener(ev, refreshForm);
+        els.inUsbManufacturer.addEventListener(ev, refreshForm);
       });
 
       // ---------------------------------------------------------------------------
@@ -581,22 +660,54 @@
         await client.writeDaughterCardMem(BRAND_RECORD_HOST_OFFSET, bytes);
       }
 
+      /* Factory defaults per platform, mirroring BRAND_DEFAULT_* in
+       * log-and-stream-common EEPROM/shimmer_eeprom.h. */
+      const STOCK_DEFAULTS = {
+        [HW_ID.SHIMMER3]: {
+          btClassic: "Shimmer3",
+          ble: "S3BLE",
+          usbProduct: "Shimmer",
+        },
+        [HW_ID.SHIMMER3R]: {
+          btClassic: "Shimmer3R",
+          ble: "Shimmer3R",
+          usbProduct: "Shimmer",
+        },
+      };
+      const STOCK_MANUFACTURER = "Shimmer Research Ltd.";
+
+      function isStockRecord(rec) {
+        const d = STOCK_DEFAULTS[hwVersion];
+        if (!d) return null; // hardware unknown - cannot judge
+        return (
+          rec.btClassic === d.btClassic &&
+          rec.ble === d.ble &&
+          rec.usbProduct === d.usbProduct &&
+          rec.usbManufacturer === STOCK_MANUFACTURER
+        );
+      }
+
       function showRecord(rec) {
         els.curBt.textContent = rec.btClassic || "–";
         els.curBle.textContent = rec.ble || "–";
-        els.curUsb.textContent = rec.usb || "–";
+        els.curUsbProduct.textContent = rec.usbProduct || "–";
+        els.curUsbManufacturer.textContent = rec.usbManufacturer || "–";
         const platform =
           Object.entries(BRAND_PLATFORM).find(
             ([, v]) => v === rec.seededPlatform,
           )?.[0] ?? "?";
         if (rec.valid) {
-          els.recPill.textContent = rec.customerBranded
-            ? "valid · customer brand"
-            : "valid · stock";
+          /* "Stock" vs "Custom" is derived by comparing against the factory
+           * defaults rather than read from a flag - firmware no longer stores
+           * one, since the stock manufacturer string lives in the record. */
+          const stock = isStockRecord(rec);
+          els.recPill.textContent = stock
+            ? "valid · stock"
+            : "valid · custom brand";
           els.recPill.className = "pill on";
-          els.curType.textContent = rec.customerBranded
-            ? "Customer-branded"
-            : `Stock (seeded by ${platform})`;
+          els.curType.textContent = stock
+            ? `Stock defaults (seeded by ${platform})`
+            : "Custom brand";
         } else {
           els.recPill.textContent = `invalid: ${rec.invalidReason}`;
           els.recPill.className = "pill warn";
@@ -613,7 +724,7 @@
         showRecord(rec);
         log(
           rec.valid
-            ? `record OK: BT "${rec.btClassic}" · BLE "${rec.ble}" · USB "${rec.usb}"${rec.customerBranded ? " · customer-branded" : ""}`
+            ? `record OK: BT "${rec.btClassic}" · BLE "${rec.ble}" · USB product "${rec.usbProduct}" · USB manufacturer "${rec.usbManufacturer}"`
             : `record invalid (${rec.invalidReason}) — device is using stock defaults`,
         );
         return rec;
@@ -702,6 +813,30 @@
       };
       els.bannerDismiss.onclick = () => hideRebootBanner();
 
+      els.bannerReboot.onclick = async () => {
+        try {
+          log("arming soft reboot on disconnect…");
+          await client.setRebootOnDisconnect(true);
+          log("armed — disconnecting so the device reboots");
+          await disconnect();
+          hideRebootBanner();
+          log(
+            "device should be restarting; reconnect in a few seconds and press Read record to confirm",
+          );
+        } catch (e) {
+          /* Firmware without FEATURE_REBOOT_ON_DISCONNECT NACKs the unknown
+           * feature id - fall back to the manual instructions rather than
+           * leaving the user thinking the reboot happened. */
+          log(
+            `soft reboot unavailable (${e.message}) — power-cycle the sensor by hand instead`,
+          );
+          els.rebootAuto.style.display = "none";
+          els.rebootManual.style.display = "block";
+          els.bannerReboot.style.display = "none";
+          els.bannerDisc.textContent = "Disconnect now";
+        }
+      };
+
       els.read.onclick = async () => {
         try {
           hideRebootBanner();
@@ -717,15 +852,15 @@
 
       els.write.onclick = async () => {
         try {
-          const { bt, ble, usb } = effectiveFields();
+          const { bt, ble, usbProduct, usbManufacturer } = effectiveFields();
           const bytes = buildBrandRecord({
             btClassic: bt,
             ble,
-            usb,
-            customerBranded: els.inCustomer.checked,
+            usbProduct,
+            usbManufacturer,
           });
           log(
-            `writing brand: BT "${bt}" · BLE "${ble}" · USB "${usb}"${els.inCustomer.checked ? " · customer-branded" : ""}`,
+            `writing brand: BT "${bt}" · BLE "${ble}" · USB product "${usbProduct}" · USB manufacturer "${usbManufacturer}"`,
           );
           await writeRecordBytes(bytes);
 
@@ -768,6 +903,7 @@
             log("VERIFY FAILED — record still reads as valid after erase");
             return;
           }
+          clearBrandInputs();
           log(
             "erase verified — stock defaults will be re-seeded at the next boot",
           );
