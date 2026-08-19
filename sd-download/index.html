@@ -97,6 +97,12 @@
         color: var(--err);
         border: 1px solid #5c1e21;
       }
+      .banner.info {
+        display: block;
+        background: #14202c;
+        color: #9ec4e8;
+        border: 1px solid #24425e;
+      }
       .banner.ok {
         display: block;
         background: #12291a;
@@ -200,11 +206,22 @@
       <section>
         <h2>Download</h2>
         <div class="row">
+          <label class="muted" for="layoutSelect">Folder layout</label>
+          <select id="layoutSelect">
+            <option value="consensysBackup" selected>
+              Consensys Backup (importable)
+            </option>
+            <option value="card">Mirror SD card structure</option>
+          </select>
+        </div>
+        <div class="banner info" id="pathHint"></div>
+        <div class="row">
           <button id="btnPickDest" class="secondary" disabled>
             Choose destination folder…
           </button>
           <span id="destLabel" class="muted">No folder selected</span>
         </div>
+        <div class="row muted" id="destPreview"></div>
         <div class="row">
           <label class="muted"
             ><input type="checkbox" id="chkDelete" /> Delete from card after
@@ -234,6 +251,7 @@
         Shimmer3RClient,
         enumerateSdTree,
         downloadSdTree,
+        formatSdImportStamp,
         SdTransferError,
       } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
@@ -253,6 +271,72 @@
         if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
         if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
         return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+      }
+
+      // Windows is the only platform where the Consensys workspace has a
+      // predictable location worth suggesting. The directory picker is
+      // Chromium-desktop only anyway, so Android never reaches this UI, and
+      // iOS browsers have no Web Bluetooth so the page cannot run there.
+      const IS_WINDOWS = /Windows/i.test(
+        navigator.userAgentData?.platform || navigator.userAgent,
+      );
+      const CONSENSYS_BACKUP_HINT =
+        String.raw`Tip: choose %USERPROFILE%\Shimmer_Workspace\Backup so Consensys can ` +
+        "import this directly (Application Settings → Manage Data → Import Data " +
+        "From Backup Directory). The folder is remembered for next time.";
+
+      // The picked folder handle is persisted so the user only chooses once;
+      // browsers never expose the absolute path, so remembering the handle is
+      // the only way to avoid re-picking.
+      const DB_NAME = "shimmer-sd-download";
+      const DB_STORE = "handles";
+      const DEST_KEY = "destRoot";
+
+      function openDb() {
+        return new Promise((resolve, reject) => {
+          const req = indexedDB.open(DB_NAME, 1);
+          req.onupgradeneeded = () => req.result.createObjectStore(DB_STORE);
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      }
+
+      async function rememberDest(handle) {
+        try {
+          const db = await openDb();
+          await new Promise((res, rej) => {
+            const tx = db.transaction(DB_STORE, "readwrite");
+            tx.objectStore(DB_STORE).put(handle, DEST_KEY);
+            tx.oncomplete = res;
+            tx.onerror = () => rej(tx.error);
+          });
+          db.close();
+        } catch (e) {
+          log(`Could not remember destination folder: ${e.message}`, true);
+        }
+      }
+
+      async function recallDest() {
+        try {
+          const db = await openDb();
+          const handle = await new Promise((res, rej) => {
+            const tx = db.transaction(DB_STORE, "readonly");
+            const r = tx.objectStore(DB_STORE).get(DEST_KEY);
+            r.onsuccess = () => res(r.result);
+            r.onerror = () => rej(r.error);
+          });
+          db.close();
+          return handle ?? null;
+        } catch {
+          return null;
+        }
+      }
+
+      /** Re-grant write access if needed. Must be called from a user gesture. */
+      async function ensureWritable(handle) {
+        const opts = { mode: "readwrite" };
+        if ((await handle.queryPermission(opts)) === "granted") return true;
+        return (await handle.requestPermission(opts)) === "granted";
       }
 
       let client = null;
@@ -286,6 +370,31 @@
         $("btnPickDest").disabled = !usable;
         $("btnLinkTest").disabled = !client || busy;
       }
+
+      function selectedLayout() {
+        return $("layoutSelect").value;
+      }
+
+      function refreshDestPreview() {
+        if (!destRoot) {
+          $("destPreview").textContent = "";
+          return;
+        }
+        const stamp = formatSdImportStamp();
+        $("destPreview").textContent =
+          selectedLayout() === "consensysBackup"
+            ? `Files will be written to ${destRoot.name}/${stamp}/<ShimmerName>/data/…`
+            : `Files will be written to ${destRoot.name}/data/…`;
+      }
+
+      function setDestLabel(remembered) {
+        $("destLabel").textContent = destRoot
+          ? `Saving into: ${destRoot.name}${remembered ? " (remembered)" : ""}`
+          : "No folder selected";
+        refreshDestPreview();
+      }
+
+      $("layoutSelect").onchange = refreshDestPreview;
 
       function fmtEta(seconds) {
         if (!isFinite(seconds) || seconds < 0) return "–";
@@ -446,8 +555,16 @@
           return;
         }
         try {
-          destRoot = await window.showDirectoryPicker({ mode: "readwrite" });
-          $("destLabel").textContent = `Saving into: ${destRoot.name}`;
+          // `id` makes the browser reopen in the same place next time; an
+          // absolute path cannot be supplied, so a previously-picked handle is
+          // the closest thing to a default location.
+          destRoot = await window.showDirectoryPicker({
+            mode: "readwrite",
+            id: "shimmer-consensys-backup",
+            startIn: destRoot ?? undefined,
+          });
+          setDestLabel(false);
+          await rememberDest(destRoot);
         } catch {
           /* user cancelled */
         }
@@ -461,6 +578,19 @@
             "Files will be DELETED from the SD card after each verified download.\n\nContinue?",
           );
           if (!ok) return;
+        }
+        // A remembered handle may need write access re-granted; this runs
+        // inside the click gesture, which is when the browser allows it.
+        if (!(await ensureWritable(destRoot))) {
+          log("Write access to the destination folder was not granted.", true);
+          return;
+        }
+        // One import folder for the whole run, so selecting several sessions
+        // still produces a single Consensys import.
+        const layout = selectedLayout();
+        const importStamp = formatSdImportStamp();
+        if (layout === "consensysBackup") {
+          log(`Writing Consensys import folder ${importStamp}/`);
         }
         abortCtl = new AbortController();
         updateDownloadButtons();
@@ -493,6 +623,8 @@
             const summary = await downloadSdTree(client, destRoot, {
               rootPath: root,
               deleteAfterVerify,
+              layout,
+              importStamp,
               signal: abortCtl.signal,
               onProgress: (p) => {
                 if (p.bytesTotal > 0) {
@@ -562,7 +694,22 @@
           "File System Access API unavailable — destination picking will not work in this browser.",
           true,
         );
+      } else if (IS_WINDOWS) {
+        $("pathHint").textContent = CONSENSYS_BACKUP_HINT;
       }
+
+      // Restore the folder chosen on a previous visit. Access is re-confirmed
+      // on the first download click rather than now, because the browser only
+      // grants permission from a user gesture.
+      void (async () => {
+        const saved = await recallDest();
+        if (saved) {
+          destRoot = saved;
+          setDestLabel(true);
+          log(`Destination folder restored: ${saved.name}`);
+        }
+        updateDownloadButtons();
+      })();
     </script>
   </body>
 </html>
