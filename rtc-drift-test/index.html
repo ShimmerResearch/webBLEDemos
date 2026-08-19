@@ -589,7 +589,7 @@
           await c.connect();
           client = c;
           mode = "ble";
-          deviceLabel = c.deviceName ?? "BLE";
+          deviceLabel = c.device?.name ?? "BLE";
           clockBaseSec = null;
           setConnected(true, `BLE · ${deviceLabel}`);
           log(
