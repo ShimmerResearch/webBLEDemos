@@ -224,8 +224,8 @@
         <div class="row muted" id="destPreview"></div>
         <div class="row">
           <label class="muted"
-            ><input type="checkbox" id="chkDelete" /> Delete from card after
-            verified download</label
+            ><input type="checkbox" id="chkDelete" checked /> Delete from card
+            after verified download</label
           >
         </div>
         <div class="row">
@@ -574,8 +574,23 @@
       async function runDownload(rootPaths) {
         const deleteAfterVerify = $("chkDelete").checked;
         if (deleteAfterVerify) {
+          // Deleting is the default, so state the scope rather than showing a
+          // generic warning that is easy to click through. Counts come from the
+          // last card listing; only files verified on this PC are deleted.
+          const doomed = (tree?.files ?? []).filter((f) =>
+            rootPaths.some((r) => f.path === r || f.path.startsWith(r + "/")),
+          );
+          const sessions = new Set(
+            doomed.map((f) => f.path.slice(0, f.path.lastIndexOf("/"))),
+          );
+          const doomedBytes = doomed.reduce((n, f) => n + f.size, 0);
           const ok = confirm(
-            "Files will be DELETED from the SD card after each verified download.\n\nContinue?",
+            "After each file is downloaded and verified it will be DELETED " +
+              "from the SD card.\n\nAbout to transfer, then delete:\n" +
+              `  ${doomed.length} file(s), ${fmtBytes(doomedBytes)}\n` +
+              `  ${sessions.size} session folder(s)\n\n` +
+              'Untick "Delete from card after verified download" to keep the ' +
+              "data on the card.\n\nContinue?",
           );
           if (!ok) return;
         }
