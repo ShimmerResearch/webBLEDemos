@@ -1,479 +1,818 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Shimmer EEPROM Branding Tool</title>
-<style>
-  :root {
-    --bg: #14161a; --panel: #1d2026; --panel2: #232730; --ink: #e8eaed;
-    --muted: #9aa0a6; --accent: #ff6a2e; --good: #4caf50; --bad: #ef5350;
-    --warn: #ffb74d; --line: #33383f;
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink);
-         font: 14px/1.45 system-ui, "Segoe UI", Roboto, sans-serif; }
-  .wrap { max-width: 980px; margin: 0 auto; padding: 20px 16px 48px; }
-  h1 { font-size: 20px; margin: 0 0 2px; }
-  h1 small { color: var(--muted); font-weight: 400; font-size: 13px; }
-  .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-          padding: 14px 16px; margin-bottom: 14px; }
-  .card h2 { font-size: 14px; margin: 0 0 10px; color: var(--ink); }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  button { background: #2a2f38; color: var(--ink); border: 1px solid var(--line);
-           border-radius: 7px; padding: 7px 14px; font: inherit; cursor: pointer; }
-  button:hover:not(:disabled) { border-color: var(--accent); }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
-  button:disabled { opacity: 0.45; cursor: default; }
-  input[type=text] { width: 220px; background: var(--panel2); color: var(--ink);
-           border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; }
-  input[type=text].bad { border-color: var(--bad); }
-  label { color: var(--muted); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
-  .stat { background: var(--panel2); border-radius: 8px; padding: 10px 12px; }
-  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
-  .stat .v { font-size: 16px; margin-top: 2px; overflow-wrap: anywhere; }
-  .formrow { display: grid; grid-template-columns: 170px 240px 1fr; gap: 10px;
-             align-items: center; margin-bottom: 10px; }
-  .formrow .preview { color: var(--muted); font: 13px ui-monospace, Consolas, monospace; }
-  .formrow .err { color: var(--bad); font-size: 12px; }
-  #log { max-height: 220px; overflow-y: auto; font: 12px/1.5 ui-monospace, Consolas, monospace;
-         background: var(--panel2); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; }
-  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
-  .pill { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 12px;
-          background: var(--panel2); border: 1px solid var(--line); color: var(--muted); }
-  .pill.on { color: var(--good); border-color: var(--good); }
-  .pill.warn { color: var(--warn); border-color: var(--warn); }
-  .pill.bad { color: var(--bad); border-color: var(--bad); }
-  #rebootBanner { display: none; border: 1px solid var(--warn); background: #2a2415;
-                  border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
-  #rebootBanner h2 { color: var(--warn); margin: 0 0 6px; font-size: 15px; }
-  #rebootBanner ol { margin: 6px 0 10px 18px; padding: 0; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>Shimmer EEPROM Branding Tool <small>advertising / product name provisioning</small></h1>
-  <p class="sub">
-    Reads and writes the 64-byte brand record in the daughter-card EEPROM that holds the
-    device's Bluetooth Classic, BLE and USB name prefixes. Firmware seeds the record with the
-    stock defaults on first boot and uses it as the single source of truth afterwards, so
-    what you see below is what the device actually advertises. Works over
-    <b>USB / dock serial</b> (Shimmer3 in a base, Shimmer3R directly over USB-C) and over
-    <b>BLE</b> (Shimmer3R only — the browser cannot reach a Shimmer3 over Bluetooth).
-    Requires firmware with DEV-949 brand-record support.
-  </p>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shimmer EEPROM Branding Tool</title>
+    <style>
+      :root {
+        --bg: #14161a;
+        --panel: #1d2026;
+        --panel2: #232730;
+        --ink: #e8eaed;
+        --muted: #9aa0a6;
+        --accent: #ff6a2e;
+        --good: #4caf50;
+        --bad: #ef5350;
+        --warn: #ffb74d;
+        --line: #33383f;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font:
+          14px/1.45 system-ui,
+          "Segoe UI",
+          Roboto,
+          sans-serif;
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 20px 16px 48px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0 0 2px;
+      }
+      h1 small {
+        color: var(--muted);
+        font-weight: 400;
+        font-size: 13px;
+      }
+      .sub {
+        color: var(--muted);
+        margin: 0 0 16px;
+        font-size: 13px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 14px;
+      }
+      .card h2 {
+        font-size: 14px;
+        margin: 0 0 10px;
+        color: var(--ink);
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+      button {
+        background: #2a2f38;
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 7px 14px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) {
+        border-color: var(--accent);
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+      }
+      button.danger:hover:not(:disabled) {
+        border-color: var(--bad);
+        color: var(--bad);
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      input[type="text"] {
+        width: 220px;
+        background: var(--panel2);
+        color: var(--ink);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font: inherit;
+      }
+      input[type="text"].bad {
+        border-color: var(--bad);
+      }
+      label {
+        color: var(--muted);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 10px;
+      }
+      .stat {
+        background: var(--panel2);
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+      .stat .k {
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .stat .v {
+        font-size: 16px;
+        margin-top: 2px;
+        overflow-wrap: anywhere;
+      }
+      .formrow {
+        display: grid;
+        grid-template-columns: 170px 240px 1fr;
+        gap: 10px;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      .formrow .preview {
+        color: var(--muted);
+        font:
+          13px ui-monospace,
+          Consolas,
+          monospace;
+      }
+      .formrow .err {
+        color: var(--bad);
+        font-size: 12px;
+      }
+      #log {
+        max-height: 220px;
+        overflow-y: auto;
+        font:
+          12px/1.5 ui-monospace,
+          Consolas,
+          monospace;
+        background: var(--panel2);
+        border-radius: 8px;
+        padding: 10px 12px;
+        white-space: pre-wrap;
+      }
+      .note {
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 8px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 99px;
+        font-size: 12px;
+        background: var(--panel2);
+        border: 1px solid var(--line);
+        color: var(--muted);
+      }
+      .pill.on {
+        color: var(--good);
+        border-color: var(--good);
+      }
+      .pill.warn {
+        color: var(--warn);
+        border-color: var(--warn);
+      }
+      .pill.bad {
+        color: var(--bad);
+        border-color: var(--bad);
+      }
+      #rebootBanner {
+        display: none;
+        position: relative;
+        border: 1px solid var(--warn);
+        background: #2a2415;
+        border-radius: 10px;
+        padding: 14px 16px;
+        margin-bottom: 14px;
+      }
+      #rebootBanner h2 {
+        color: var(--warn);
+        margin: 0 40px 6px 0;
+        font-size: 15px;
+      }
+      #rebootBanner ol {
+        margin: 6px 0 10px 18px;
+        padding: 0;
+      }
+      button.dismiss {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        background: none;
+        border: none;
+        color: var(--muted);
+        font-size: 20px;
+        line-height: 1;
+        padding: 2px 8px;
+      }
+      button.dismiss:hover {
+        color: var(--warn);
+        border: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>
+        Shimmer EEPROM Branding Tool
+        <small>advertising / product name provisioning</small>
+      </h1>
+      <p class="sub">
+        Reads and writes the 64-byte brand record in the daughter-card EEPROM
+        that holds the device's Bluetooth Classic, BLE and USB name prefixes.
+        Firmware seeds the record with the stock defaults on first boot and uses
+        it as the single source of truth afterwards, so what you see below is
+        what the device actually advertises. Works over
+        <b>USB / dock serial</b> (Shimmer3 in a base, Shimmer3R directly over
+        USB-C) and over <b>BLE</b> (Shimmer3R only — the browser cannot reach a
+        Shimmer3 over Bluetooth). Requires firmware with DEV-949 brand-record
+        support.
+      </p>
 
-  <div class="card">
-    <div class="row">
-      <button id="btnSerial" class="primary">Connect USB / dock</button>
-      <button id="btnBle">Connect BLE (Shimmer3R)</button>
-      <button id="btnDisconnect" disabled>Disconnect</button>
-      <span id="connPill" class="pill">disconnected</span>
-      <span id="devInfo" class="note"></span>
+      <div class="card">
+        <div class="row">
+          <button id="btnBle" class="primary">Connect BLE (Shimmer3R)</button>
+          <button id="btnSerial">Connect USB / dock</button>
+          <button id="btnDisconnect" disabled>Disconnect</button>
+          <span id="connPill" class="pill">disconnected</span>
+          <span id="devInfo" class="note"></span>
+        </div>
+      </div>
+
+      <div id="rebootBanner">
+        <button
+          id="btnBannerDismiss"
+          class="dismiss"
+          title="Dismiss this reminder"
+          aria-label="Dismiss reboot reminder"
+        >
+          &times;
+        </button>
+        <h2>
+          Reboot required — the new names are stored but not yet advertised
+        </h2>
+        The Bluetooth module only picks up the name at Bluetooth initialisation,
+        and the BLE advertising name cannot change while advertising is running.
+        <ol>
+          <li>Disconnect this tool (button below or unplug).</li>
+          <li>
+            Power-cycle the sensor — Shimmer3: undock and re-dock it (or briefly
+            press the reset pin through the enclosure hole); Shimmer3R: hold the
+            button to power off, then on again, or undock/re-dock.
+          </li>
+          <li>
+            Reconnect here and press <b>Read record</b> to confirm, or check a
+            Bluetooth scan for the new name.
+          </li>
+        </ol>
+        <button id="btnBannerDisconnect">Disconnect now</button>
+      </div>
+
+      <div class="card">
+        <h2>Current record <span id="recPill" class="pill">not read</span></h2>
+        <div class="grid">
+          <div class="stat">
+            <div class="k">Classic BT prefix</div>
+            <div class="v" id="curBt">–</div>
+          </div>
+          <div class="stat">
+            <div class="k">BLE prefix</div>
+            <div class="v" id="curBle">–</div>
+          </div>
+          <div class="stat">
+            <div class="k">USB / manufacturer</div>
+            <div class="v" id="curUsb">–</div>
+          </div>
+          <div class="stat">
+            <div class="k">Record type</div>
+            <div class="v" id="curType">–</div>
+          </div>
+          <div class="stat">
+            <div class="k">Device</div>
+            <div class="v" id="curDev">–</div>
+          </div>
+          <div class="stat">
+            <div class="k">MAC suffix</div>
+            <div class="v" id="curMac">–</div>
+          </div>
+        </div>
+        <div class="row" style="margin-top: 10px">
+          <button id="btnRead" disabled>Read record</button>
+        </div>
+        <div class="note">
+          An <i>invalid</i> or <i>blank</i> record is not an error state:
+          firmware replaces it with the stock defaults at the next boot.
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Provision new branding</h2>
+        <div class="formrow">
+          <label for="inBt">Classic BT prefix</label>
+          <input
+            id="inBt"
+            type="text"
+            maxlength="16"
+            placeholder="e.g. YourBrand"
+          />
+          <div>
+            <span class="preview" id="pvBt"></span>
+            <span class="err" id="errBt"></span>
+          </div>
+        </div>
+        <div class="formrow">
+          <label for="inBle">BLE prefix</label>
+          <input
+            id="inBle"
+            type="text"
+            maxlength="10"
+            placeholder="derived from Classic BT if blank"
+          />
+          <div>
+            <span class="preview" id="pvBle"></span>
+            <span class="err" id="errBle"></span>
+          </div>
+        </div>
+        <div class="formrow">
+          <label for="inUsb">USB / manufacturer</label>
+          <input
+            id="inUsb"
+            type="text"
+            maxlength="16"
+            placeholder="derived from Classic BT if blank"
+          />
+          <div>
+            <span class="preview" id="pvUsb"></span>
+            <span class="err" id="errUsb"></span>
+          </div>
+        </div>
+        <div class="row">
+          <label
+            title="Marks the record as a deliberate customer brand. Firmware then (a) keeps it when the daughter card is moved between a Shimmer3 and a Shimmer3R instead of resetting it to that platform's stock names, and (b) applies the USB manufacturer string on Shimmer3R. It does NOT write-protect the record - it stays fully rewritable and erasable from this page."
+          >
+            <input id="inCustomer" type="checkbox" checked />
+            Customer brand (keep across platform swaps; also sets the USB
+            manufacturer)</label
+          >
+        </div>
+        <div class="row" style="margin-top: 10px">
+          <button id="btnWrite" class="primary" disabled>
+            Write to EEPROM
+          </button>
+          <button
+            id="btnRestore"
+            class="danger"
+            disabled
+            title="Erases the brand record (0xFF). Firmware re-seeds the stock defaults at the next boot."
+          >
+            Restore stock defaults
+          </button>
+        </div>
+        <div class="note">
+          <b>Customer brand</b> is a marker, not a lock: the record stays
+          rewritable and erasable from this page at any time. Leaving it
+          unticked means firmware treats the record as stock and will reset it
+          to platform defaults if the daughter card is moved between a Shimmer3
+          and a Shimmer3R. <br /><br />
+          Names: 1–16 printable ASCII characters, no commas. BLE prefix: max 10
+          (<b>Shimmer3: max 8</b> — the 31-byte BLE advertisement limit). The
+          firmware appends the MAC suffix automatically. Writes are
+          CRC-protected; a garbled record simply reverts to the stock defaults
+          at the next boot.
+        </div>
+      </div>
+
+      <div class="card">
+        <div
+          class="k"
+          style="color: var(--muted); font-size: 12px; margin-bottom: 6px"
+        >
+          Log
+        </div>
+        <div id="log"></div>
+      </div>
     </div>
-  </div>
 
-  <div id="rebootBanner">
-    <h2>Reboot required — the new names are stored but not yet advertised</h2>
-    The Bluetooth module only picks up the name at Bluetooth initialisation, and the BLE
-    advertising name cannot change while advertising is running.
-    <ol>
-      <li>Disconnect this tool (button below or unplug).</li>
-      <li>Power-cycle the sensor — Shimmer3: undock and re-dock it (or briefly press the
-          reset pin through the enclosure hole); Shimmer3R: hold the button to power off,
-          then on again, or undock/re-dock.</li>
-      <li>Reconnect here and press <b>Read record</b> to confirm, or check a Bluetooth
-          scan for the new name.</li>
-    </ol>
-    <button id="btnBannerDisconnect">Disconnect now</button>
-  </div>
+    <script type="module">
+      import * as sdkNs from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+      import {
+        Shimmer3RClient,
+        WiredShimmerClient,
+        WebSerialTransport,
+        parseBrandRecord,
+        buildBrandRecord,
+        buildBlankBrandRecord,
+        brandNameProblem,
+        BRAND_RECORD_HOST_OFFSET,
+        BRAND_RECORD_SIZE,
+        BRAND_BT_CLASSIC_MAX_CHARS,
+        BRAND_BLE_MAX_CHARS,
+        BRAND_BLE_MAX_CHARS_SHIMMER3,
+        BRAND_USB_MAX_CHARS,
+        BRAND_PLATFORM,
+      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
-  <div class="card">
-    <h2>Current record <span id="recPill" class="pill">not read</span></h2>
-    <div class="grid">
-      <div class="stat"><div class="k">Classic BT prefix</div><div class="v" id="curBt">–</div></div>
-      <div class="stat"><div class="k">BLE prefix</div><div class="v" id="curBle">–</div></div>
-      <div class="stat"><div class="k">USB / manufacturer</div><div class="v" id="curUsb">–</div></div>
-      <div class="stat"><div class="k">Record type</div><div class="v" id="curType">–</div></div>
-      <div class="stat"><div class="k">Device</div><div class="v" id="curDev">–</div></div>
-      <div class="stat"><div class="k">MAC suffix</div><div class="v" id="curMac">–</div></div>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <button id="btnRead" disabled>Read record</button>
-    </div>
-    <div class="note">
-      An <i>invalid</i> or <i>blank</i> record is not an error state: firmware replaces it
-      with the stock defaults at the next boot.
-    </div>
-  </div>
+      const HW_ID = { SHIMMER3: 3, SHIMMER3R: 10 };
 
-  <div class="card">
-    <h2>Provision new branding</h2>
-    <div class="formrow">
-      <label for="inBt">Classic BT prefix</label>
-      <input id="inBt" type="text" maxlength="16" placeholder="e.g. YourBrand" />
-      <div><span class="preview" id="pvBt"></span> <span class="err" id="errBt"></span></div>
-    </div>
-    <div class="formrow">
-      <label for="inBle">BLE prefix</label>
-      <input id="inBle" type="text" maxlength="10" placeholder="derived from Classic BT if blank" />
-      <div><span class="preview" id="pvBle"></span> <span class="err" id="errBle"></span></div>
-    </div>
-    <div class="formrow">
-      <label for="inUsb">USB / manufacturer</label>
-      <input id="inUsb" type="text" maxlength="16" placeholder="derived from Classic BT if blank" />
-      <div><span class="preview" id="pvUsb"></span> <span class="err" id="errUsb"></span></div>
-    </div>
-    <div class="row">
-      <label><input id="inCustomer" type="checkbox" checked />
-        Customer-branded (protects the record from platform re-seeding)</label>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <button id="btnWrite" class="primary" disabled>Write to EEPROM</button>
-      <button id="btnRestore" class="danger" disabled
-              title="Erases the brand record (0xFF). Firmware re-seeds the stock defaults at the next boot.">
-        Restore stock defaults</button>
-    </div>
-    <div class="note">
-      Names: 1–16 printable ASCII characters, no commas. BLE prefix: max 10
-      (<b>Shimmer3: max 8</b> — the 31-byte BLE advertisement limit). The firmware appends
-      the MAC suffix automatically. Writes are CRC-protected; a garbled record simply
-      reverts to the stock defaults at the next boot.
-    </div>
-  </div>
+      const $ = (id) => document.getElementById(id);
+      const els = {
+        serial: $("btnSerial"),
+        ble: $("btnBle"),
+        disc: $("btnDisconnect"),
+        read: $("btnRead"),
+        write: $("btnWrite"),
+        restore: $("btnRestore"),
+        bannerDisc: $("btnBannerDisconnect"),
+        bannerDismiss: $("btnBannerDismiss"),
+        banner: $("rebootBanner"),
+        pill: $("connPill"),
+        recPill: $("recPill"),
+        devInfo: $("devInfo"),
+        log: $("log"),
+        curBt: $("curBt"),
+        curBle: $("curBle"),
+        curUsb: $("curUsb"),
+        curType: $("curType"),
+        curDev: $("curDev"),
+        curMac: $("curMac"),
+        inBt: $("inBt"),
+        inBle: $("inBle"),
+        inUsb: $("inUsb"),
+        inCustomer: $("inCustomer"),
+        pvBt: $("pvBt"),
+        pvBle: $("pvBle"),
+        pvUsb: $("pvUsb"),
+        errBt: $("errBt"),
+        errBle: $("errBle"),
+        errUsb: $("errUsb"),
+      };
 
-  <div class="card">
-    <div class="k" style="color:var(--muted); font-size:12px; margin-bottom:6px">Log</div>
-    <div id="log"></div>
-  </div>
-</div>
+      let client = null; // Shimmer3RClient | WiredShimmerClient
+      let mode = null; // 'ble' | 'serial'
+      let hwVersion = null; // 3 | 10 | null (unknown)
+      let macSuffix = "XXXX";
 
-<script type="module">
-import * as sdkNs from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
-import {
-  Shimmer3RClient,
-  WiredShimmerClient,
-  WebSerialTransport,
-  parseBrandRecord,
-  buildBrandRecord,
-  buildBlankBrandRecord,
-  brandNameProblem,
-  BRAND_RECORD_HOST_OFFSET,
-  BRAND_RECORD_SIZE,
-  BRAND_BT_CLASSIC_MAX_CHARS,
-  BRAND_BLE_MAX_CHARS,
-  BRAND_BLE_MAX_CHARS_SHIMMER3,
-  BRAND_USB_MAX_CHARS,
-  BRAND_PLATFORM,
-} from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+      function log(msg) {
+        const t = new Date().toISOString().slice(11, 19);
+        els.log.textContent += `[${t}] ${msg}\n`;
+        els.log.scrollTop = els.log.scrollHeight;
+      }
 
-const HW_ID = { SHIMMER3: 3, SHIMMER3R: 10 };
+      function setConnected(on, label) {
+        els.pill.textContent = on ? label : "disconnected";
+        els.pill.classList.toggle("on", on);
+        els.serial.disabled = on;
+        els.ble.disabled = on;
+        els.disc.disabled = !on;
+        els.read.disabled = !on;
+        refreshForm();
+      }
 
-const $ = (id) => document.getElementById(id);
-const els = {
-  serial: $("btnSerial"), ble: $("btnBle"), disc: $("btnDisconnect"),
-  read: $("btnRead"), write: $("btnWrite"), restore: $("btnRestore"),
-  bannerDisc: $("btnBannerDisconnect"), banner: $("rebootBanner"),
-  pill: $("connPill"), recPill: $("recPill"), devInfo: $("devInfo"), log: $("log"),
-  curBt: $("curBt"), curBle: $("curBle"), curUsb: $("curUsb"),
-  curType: $("curType"), curDev: $("curDev"), curMac: $("curMac"),
-  inBt: $("inBt"), inBle: $("inBle"), inUsb: $("inUsb"), inCustomer: $("inCustomer"),
-  pvBt: $("pvBt"), pvBle: $("pvBle"), pvUsb: $("pvUsb"),
-  errBt: $("errBt"), errBle: $("errBle"), errUsb: $("errUsb"),
-};
+      function showRebootBanner() {
+        els.banner.style.display = "block";
+        els.banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
 
-let client = null;      // Shimmer3RClient | WiredShimmerClient
-let mode = null;        // 'ble' | 'serial'
-let hwVersion = null;   // 3 | 10 | null (unknown)
-let macSuffix = "XXXX";
+      function hideRebootBanner() {
+        els.banner.style.display = "none";
+      }
 
-function log(msg) {
-  const t = new Date().toISOString().slice(11, 19);
-  els.log.textContent += `[${t}] ${msg}\n`;
-  els.log.scrollTop = els.log.scrollHeight;
-}
+      function isShimmer3() {
+        return hwVersion === HW_ID.SHIMMER3;
+      }
 
-function setConnected(on, label) {
-  els.pill.textContent = on ? label : "disconnected";
-  els.pill.classList.toggle("on", on);
-  els.serial.disabled = on;
-  els.ble.disabled = on;
-  els.disc.disabled = !on;
-  els.read.disabled = !on;
-  refreshForm();
-}
+      function deviceLabelForHw() {
+        if (hwVersion === HW_ID.SHIMMER3) return "Shimmer3";
+        if (hwVersion === HW_ID.SHIMMER3R) return "Shimmer3R";
+        return "unknown";
+      }
 
-function isShimmer3() {
-  return hwVersion === HW_ID.SHIMMER3;
-}
+      function bleCap() {
+        // Only allow the full field width when the device is positively identified
+        // as a Shimmer3R. If identify() failed (hwVersion null), stay conservative
+        // with the Shimmer3 8-char cap so an unidentified Shimmer3 can't be given a
+        // BLE prefix that its firmware would truncate on air.
+        return hwVersion === HW_ID.SHIMMER3R
+          ? BRAND_BLE_MAX_CHARS
+          : BRAND_BLE_MAX_CHARS_SHIMMER3;
+      }
 
-function deviceLabelForHw() {
-  if (hwVersion === HW_ID.SHIMMER3) return "Shimmer3";
-  if (hwVersion === HW_ID.SHIMMER3R) return "Shimmer3R";
-  return "unknown";
-}
+      // ---------------------------------------------------------------------------
+      // Effective form values: BLE and USB derive from the Classic BT prefix when
+      // left blank, so a customer only has to enter one name.
+      // ---------------------------------------------------------------------------
 
-function bleCap() {
-  // Only allow the full field width when the device is positively identified
-  // as a Shimmer3R. If identify() failed (hwVersion null), stay conservative
-  // with the Shimmer3 8-char cap so an unidentified Shimmer3 can't be given a
-  // BLE prefix that its firmware would truncate on air.
-  return hwVersion === HW_ID.SHIMMER3R ? BRAND_BLE_MAX_CHARS : BRAND_BLE_MAX_CHARS_SHIMMER3;
-}
+      function effectiveFields() {
+        const bt = els.inBt.value.trim();
+        const ble = (els.inBle.value.trim() || bt).slice(0, bleCap());
+        const usb = (els.inUsb.value.trim() || bt).slice(
+          0,
+          BRAND_USB_MAX_CHARS,
+        );
+        return { bt, ble, usb };
+      }
 
-// ---------------------------------------------------------------------------
-// Effective form values: BLE and USB derive from the Classic BT prefix when
-// left blank, so a customer only has to enter one name.
-// ---------------------------------------------------------------------------
+      function refreshForm() {
+        const { bt, ble, usb } = effectiveFields();
+        const btErr = bt
+          ? brandNameProblem(bt, BRAND_BT_CLASSIC_MAX_CHARS)
+          : "enter a name";
+        const bleErr = ble ? brandNameProblem(ble, bleCap()) : "enter a name";
+        const usbErr = usb
+          ? brandNameProblem(usb, BRAND_USB_MAX_CHARS)
+          : "enter a name";
 
-function effectiveFields() {
-  const bt = els.inBt.value.trim();
-  const ble = (els.inBle.value.trim() || bt).slice(0, bleCap());
-  const usb = (els.inUsb.value.trim() || bt).slice(0, BRAND_USB_MAX_CHARS);
-  return { bt, ble, usb };
-}
+        els.errBt.textContent = bt && btErr ? btErr : "";
+        els.errBle.textContent = ble && bleErr ? bleErr : "";
+        els.errUsb.textContent = usb && usbErr ? usbErr : "";
+        els.inBt.classList.toggle("bad", !!(bt && btErr));
+        els.inBle.classList.toggle("bad", !!(ble && bleErr));
+        els.inUsb.classList.toggle("bad", !!(usb && usbErr));
 
-function refreshForm() {
-  const { bt, ble, usb } = effectiveFields();
-  const btErr = bt ? brandNameProblem(bt, BRAND_BT_CLASSIC_MAX_CHARS) : "enter a name";
-  const bleErr = ble ? brandNameProblem(ble, bleCap()) : "enter a name";
-  const usbErr = usb ? brandNameProblem(usb, BRAND_USB_MAX_CHARS) : "enter a name";
+        // Live preview of the advertised names with the real MAC suffix
+        if (isShimmer3()) {
+          els.pvBt.textContent = bt ? `→ ${bt}-${macSuffix}` : "";
+          els.pvBle.textContent = ble ? `→ ${ble}-${macSuffix}` : "";
+          els.pvUsb.textContent = usb
+            ? `→ (BLE manufacturer string; Shimmer3 USB is via the dock)`
+            : "";
+        } else {
+          els.pvBt.textContent = bt ? `→ ${bt}-${macSuffix}-BT` : "";
+          els.pvBle.textContent = ble ? `→ ${ble}-${macSuffix}-BLE` : "";
+          els.pvUsb.textContent = usb
+            ? `→ USB product "${usb} ${macSuffix}"`
+            : "";
+        }
 
-  els.errBt.textContent = bt && btErr ? btErr : "";
-  els.errBle.textContent = ble && bleErr ? bleErr : "";
-  els.errUsb.textContent = usb && usbErr ? usbErr : "";
-  els.inBt.classList.toggle("bad", !!(bt && btErr));
-  els.inBle.classList.toggle("bad", !!(ble && bleErr));
-  els.inUsb.classList.toggle("bad", !!(usb && usbErr));
+        const connected = !!client;
+        els.write.disabled = !(connected && bt && !btErr && !bleErr && !usbErr);
+        els.restore.disabled = !connected;
+      }
 
-  // Live preview of the advertised names with the real MAC suffix
-  if (isShimmer3()) {
-    els.pvBt.textContent = bt ? `→ ${bt}-${macSuffix}` : "";
-    els.pvBle.textContent = ble ? `→ ${ble}-${macSuffix}` : "";
-    els.pvUsb.textContent = usb ? `→ (BLE manufacturer string; Shimmer3 USB is via the dock)` : "";
-  } else {
-    els.pvBt.textContent = bt ? `→ ${bt}-${macSuffix}-BT` : "";
-    els.pvBle.textContent = ble ? `→ ${ble}-${macSuffix}-BLE` : "";
-    els.pvUsb.textContent = usb ? `→ USB product "${usb} ${macSuffix}"` : "";
-  }
+      ["input", "change"].forEach((ev) => {
+        els.inBt.addEventListener(ev, refreshForm);
+        els.inBle.addEventListener(ev, refreshForm);
+        els.inUsb.addEventListener(ev, refreshForm);
+        els.inCustomer.addEventListener(ev, refreshForm);
+      });
 
-  const connected = !!client;
-  els.write.disabled = !(connected && bt && !btErr && !bleErr && !usbErr);
-  els.restore.disabled = !connected;
-}
+      // ---------------------------------------------------------------------------
+      // Record I/O
+      // ---------------------------------------------------------------------------
 
-["input", "change"].forEach((ev) => {
-  els.inBt.addEventListener(ev, refreshForm);
-  els.inBle.addEventListener(ev, refreshForm);
-  els.inUsb.addEventListener(ev, refreshForm);
-  els.inCustomer.addEventListener(ev, refreshForm);
-});
+      async function readRecordBytes() {
+        // Same call over both transports: WiredShimmerClient and Shimmer3RClient
+        // expose an identical readDaughterCardMem(hostOffset, length).
+        return client.readDaughterCardMem(
+          BRAND_RECORD_HOST_OFFSET,
+          BRAND_RECORD_SIZE,
+        );
+      }
 
-// ---------------------------------------------------------------------------
-// Record I/O
-// ---------------------------------------------------------------------------
+      async function writeRecordBytes(bytes) {
+        await client.writeDaughterCardMem(BRAND_RECORD_HOST_OFFSET, bytes);
+      }
 
-async function readRecordBytes() {
-  // Same call over both transports: WiredShimmerClient and Shimmer3RClient
-  // expose an identical readDaughterCardMem(hostOffset, length).
-  return client.readDaughterCardMem(BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_SIZE);
-}
+      function showRecord(rec) {
+        els.curBt.textContent = rec.btClassic || "–";
+        els.curBle.textContent = rec.ble || "–";
+        els.curUsb.textContent = rec.usb || "–";
+        const platform =
+          Object.entries(BRAND_PLATFORM).find(
+            ([, v]) => v === rec.seededPlatform,
+          )?.[0] ?? "?";
+        if (rec.valid) {
+          els.recPill.textContent = rec.customerBranded
+            ? "valid · customer brand"
+            : "valid · stock";
+          els.recPill.className = "pill on";
+          els.curType.textContent = rec.customerBranded
+            ? "Customer-branded"
+            : `Stock (seeded by ${platform})`;
+        } else {
+          els.recPill.textContent = `invalid: ${rec.invalidReason}`;
+          els.recPill.className = "pill warn";
+          els.curType.textContent = `Invalid — stock defaults apply (${rec.invalidReason})`;
+        }
+      }
 
-async function writeRecordBytes(bytes) {
-  await client.writeDaughterCardMem(BRAND_RECORD_HOST_OFFSET, bytes);
-}
+      async function readAndShow() {
+        log(
+          `reading ${BRAND_RECORD_SIZE} B @ host offset ${BRAND_RECORD_HOST_OFFSET}…`,
+        );
+        const bytes = await readRecordBytes();
+        const rec = parseBrandRecord(bytes);
+        showRecord(rec);
+        log(
+          rec.valid
+            ? `record OK: BT "${rec.btClassic}" · BLE "${rec.ble}" · USB "${rec.usb}"${rec.customerBranded ? " · customer-branded" : ""}`
+            : `record invalid (${rec.invalidReason}) — device is using stock defaults`,
+        );
+        return rec;
+      }
 
-function showRecord(rec) {
-  els.curBt.textContent = rec.btClassic || "–";
-  els.curBle.textContent = rec.ble || "–";
-  els.curUsb.textContent = rec.usb || "–";
-  const platform =
-    Object.entries(BRAND_PLATFORM).find(([, v]) => v === rec.seededPlatform)?.[0] ?? "?";
-  if (rec.valid) {
-    els.recPill.textContent = rec.customerBranded ? "valid · customer brand" : "valid · stock";
-    els.recPill.className = "pill on";
-    els.curType.textContent = rec.customerBranded
-      ? "Customer-branded"
-      : `Stock (seeded by ${platform})`;
-  } else {
-    els.recPill.textContent = `invalid: ${rec.invalidReason}`;
-    els.recPill.className = "pill warn";
-    els.curType.textContent = `Invalid — stock defaults apply (${rec.invalidReason})`;
-  }
-}
+      // ---------------------------------------------------------------------------
+      // Connect / disconnect
+      // ---------------------------------------------------------------------------
 
-async function readAndShow() {
-  log(`reading ${BRAND_RECORD_SIZE} B @ host offset ${BRAND_RECORD_HOST_OFFSET}…`);
-  const bytes = await readRecordBytes();
-  const rec = parseBrandRecord(bytes);
-  showRecord(rec);
-  log(rec.valid
-    ? `record OK: BT "${rec.btClassic}" · BLE "${rec.ble}" · USB "${rec.usb}"${rec.customerBranded ? " · customer-branded" : ""}`
-    : `record invalid (${rec.invalidReason}) — device is using stock defaults`);
-  return rec;
-}
+      els.serial.onclick = async () => {
+        try {
+          hideRebootBanner();
+          const c = new WiredShimmerClient({
+            transport: new WebSerialTransport(),
+          });
+          await c.connect();
+          client = c;
+          mode = "serial";
+          let label = "serial";
+          try {
+            const id = await c.identify();
+            hwVersion = id.hardwareVersion;
+            macSuffix = id.mac.slice(-4);
+            const fw = id.firmwareVersion;
+            label = `${deviceLabelForHw()} ${macSuffix}`;
+            els.devInfo.textContent = `MAC ${id.mac} · HW ${id.hardwareVersion} (${deviceLabelForHw()}) · FW v${fw.firmwareVersionMajor}.${fw.firmwareVersionMinor}.${fw.firmwareVersionInternal}`;
+          } catch (e) {
+            log(`identify failed (continuing): ${e.message}`);
+          }
+          els.curDev.textContent = deviceLabelForHw();
+          els.curMac.textContent = macSuffix;
+          setConnected(true, `serial · ${label}`);
+          log(`connected over USB/dock serial (${label})`);
+          await readAndShow().catch((e) =>
+            log(`record read failed: ${readFailureHint(e)}`),
+          );
+        } catch (e) {
+          log(`serial connect failed: ${e.message}`);
+        }
+      };
 
-// ---------------------------------------------------------------------------
-// Connect / disconnect
-// ---------------------------------------------------------------------------
+      els.ble.onclick = async () => {
+        try {
+          hideRebootBanner();
+          const c = new Shimmer3RClient();
+          await c.connect();
+          client = c;
+          mode = "ble";
+          hwVersion = HW_ID.SHIMMER3R; // the BLE service is Shimmer3R-only
+          try {
+            const mac = await c.getMacAddress();
+            macSuffix = mac.slice(-4);
+            els.devInfo.textContent = `MAC ${mac} · Shimmer3R (BLE)`;
+          } catch (e) {
+            log(`MAC read failed (continuing): ${e.message}`);
+          }
+          els.curDev.textContent = deviceLabelForHw();
+          els.curMac.textContent = macSuffix;
+          setConnected(true, `BLE · ${c.deviceName ?? "Shimmer3R"}`);
+          log(`connected over BLE (${c.deviceName ?? "Shimmer3R"})`);
+          await readAndShow().catch((e) =>
+            log(`record read failed: ${readFailureHint(e)}`),
+          );
+        } catch (e) {
+          log(`BLE connect failed: ${e.message}`);
+        }
+      };
 
-els.serial.onclick = async () => {
-  try {
-    const c = new WiredShimmerClient({ transport: new WebSerialTransport() });
-    await c.connect();
-    client = c; mode = "serial";
-    let label = "serial";
-    try {
-      const id = await c.identify();
-      hwVersion = id.hardwareVersion;
-      macSuffix = id.mac.slice(-4);
-      const fw = id.firmwareVersion;
-      label = `${deviceLabelForHw()} ${macSuffix}`;
-      els.devInfo.textContent =
-        `MAC ${id.mac} · HW ${id.hardwareVersion} (${deviceLabelForHw()}) · FW v${fw.firmwareVersionMajor}.${fw.firmwareVersionMinor}.${fw.firmwareVersionInternal}`;
-    } catch (e) {
-      log(`identify failed (continuing): ${e.message}`);
-    }
-    els.curDev.textContent = deviceLabelForHw();
-    els.curMac.textContent = macSuffix;
-    setConnected(true, `serial · ${label}`);
-    log(`connected over USB/dock serial (${label})`);
-    await readAndShow().catch((e) => log(`record read failed: ${readFailureHint(e)}`));
-  } catch (e) {
-    log(`serial connect failed: ${e.message}`);
-  }
-};
+      async function disconnect() {
+        try {
+          await client?.disconnect();
+        } catch {
+          /* ignore */
+        }
+        client = null;
+        mode = null;
+        hwVersion = null;
+        macSuffix = "XXXX";
+        els.devInfo.textContent = "";
+        setConnected(false);
+        log("disconnected");
+      }
+      els.disc.onclick = disconnect;
+      els.bannerDisc.onclick = async () => {
+        await disconnect();
+      };
+      els.bannerDismiss.onclick = () => hideRebootBanner();
 
-els.ble.onclick = async () => {
-  try {
-    const c = new Shimmer3RClient();
-    await c.connect();
-    client = c; mode = "ble";
-    hwVersion = HW_ID.SHIMMER3R; // the BLE service is Shimmer3R-only
-    try {
-      const mac = await c.getMacAddress();
-      macSuffix = mac.slice(-4);
-      els.devInfo.textContent = `MAC ${mac} · Shimmer3R (BLE)`;
-    } catch (e) {
-      log(`MAC read failed (continuing): ${e.message}`);
-    }
-    els.curDev.textContent = deviceLabelForHw();
-    els.curMac.textContent = macSuffix;
-    setConnected(true, `BLE · ${c.deviceName ?? "Shimmer3R"}`);
-    log(`connected over BLE (${c.deviceName ?? "Shimmer3R"})`);
-    await readAndShow().catch((e) => log(`record read failed: ${readFailureHint(e)}`));
-  } catch (e) {
-    log(`BLE connect failed: ${e.message}`);
-  }
-};
+      els.read.onclick = async () => {
+        try {
+          hideRebootBanner();
+          await readAndShow();
+        } catch (e) {
+          log(`record read failed: ${readFailureHint(e)}`);
+        }
+      };
 
-async function disconnect() {
-  try { await client?.disconnect(); } catch { /* ignore */ }
-  client = null; mode = null; hwVersion = null; macSuffix = "XXXX";
-  els.devInfo.textContent = "";
-  setConnected(false);
-  log("disconnected");
-}
-els.disc.onclick = disconnect;
-els.bannerDisc.onclick = async () => { await disconnect(); };
+      // ---------------------------------------------------------------------------
+      // Write / restore
+      // ---------------------------------------------------------------------------
 
-els.read.onclick = async () => {
-  try {
-    els.banner.style.display = "none";
-    await readAndShow();
-  } catch (e) {
-    log(`record read failed: ${readFailureHint(e)}`);
-  }
-};
+      els.write.onclick = async () => {
+        try {
+          const { bt, ble, usb } = effectiveFields();
+          const bytes = buildBrandRecord({
+            btClassic: bt,
+            ble,
+            usb,
+            customerBranded: els.inCustomer.checked,
+          });
+          log(
+            `writing brand: BT "${bt}" · BLE "${ble}" · USB "${usb}"${els.inCustomer.checked ? " · customer-branded" : ""}`,
+          );
+          await writeRecordBytes(bytes);
 
-// ---------------------------------------------------------------------------
-// Write / restore
-// ---------------------------------------------------------------------------
+          // Read back and byte-compare before declaring success
+          const verify = await readRecordBytes();
+          let mismatch = -1;
+          for (let i = 0; i < BRAND_RECORD_SIZE; i++) {
+            if (bytes[i] !== verify[i]) {
+              mismatch = i;
+              break;
+            }
+          }
+          if (mismatch >= 0) {
+            log(
+              `VERIFY FAILED at byte ${mismatch} — record NOT provisioned correctly, retry the write`,
+            );
+            return;
+          }
+          showRecord(parseBrandRecord(verify));
+          log("write verified OK (read-back matches byte-for-byte)");
+          showRebootBanner();
+        } catch (e) {
+          log(`write failed: ${e.message}`);
+        }
+      };
 
-els.write.onclick = async () => {
-  try {
-    const { bt, ble, usb } = effectiveFields();
-    const bytes = buildBrandRecord({
-      btClassic: bt,
-      ble,
-      usb,
-      customerBranded: els.inCustomer.checked,
-    });
-    log(`writing brand: BT "${bt}" · BLE "${ble}" · USB "${usb}"${els.inCustomer.checked ? " · customer-branded" : ""}`);
-    await writeRecordBytes(bytes);
+      els.restore.onclick = async () => {
+        if (
+          !confirm(
+            "Erase the brand record? The device reverts to its stock Shimmer names at the next reboot.",
+          )
+        ) {
+          return;
+        }
+        try {
+          log("erasing brand record (writing 0xFF)…");
+          await writeRecordBytes(buildBlankBrandRecord());
+          const rec = await readAndShow();
+          if (rec.valid) {
+            log("VERIFY FAILED — record still reads as valid after erase");
+            return;
+          }
+          log(
+            "erase verified — stock defaults will be re-seeded at the next boot",
+          );
+          showRebootBanner();
+        } catch (e) {
+          log(`erase failed: ${e.message}`);
+        }
+      };
 
-    // Read back and byte-compare before declaring success
-    const verify = await readRecordBytes();
-    let mismatch = -1;
-    for (let i = 0; i < BRAND_RECORD_SIZE; i++) {
-      if (bytes[i] !== verify[i]) { mismatch = i; break; }
-    }
-    if (mismatch >= 0) {
-      log(`VERIFY FAILED at byte ${mismatch} — record NOT provisioned correctly, retry the write`);
-      return;
-    }
-    showRecord(parseBrandRecord(verify));
-    log("write verified OK (read-back matches byte-for-byte)");
-    els.banner.style.display = "block";
-    els.banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  } catch (e) {
-    log(`write failed: ${e.message}`);
-  }
-};
+      function readFailureHint(e) {
+        if (/response truncated/i.test(e.message)) {
+          return `${e.message} — BLE link dropped mid-response; retry, and check the sensor is in range`;
+        }
+        if (/returned \d+ of \d+ bytes/.test(e.message)) {
+          /* Pre-0.1.12 SDK wording: the vendored bundle predates BLE reassembly */
+          return `${e.message} — the page is running a stale SDK bundle (needs ≥ 0.1.12); hard-refresh (Ctrl+Shift+R) or re-vendor`;
+        }
+        return `${e.message} — check the firmware supports the brand record`;
+      }
 
-els.restore.onclick = async () => {
-  if (!confirm("Erase the brand record? The device reverts to its stock Shimmer names at the next reboot.")) {
-    return;
-  }
-  try {
-    log("erasing brand record (writing 0xFF)…");
-    await writeRecordBytes(buildBlankBrandRecord());
-    const rec = await readAndShow();
-    if (rec.valid) {
-      log("VERIFY FAILED — record still reads as valid after erase");
-      return;
-    }
-    log("erase verified — stock defaults will be re-seeded at the next boot");
-    els.banner.style.display = "block";
-    els.banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  } catch (e) {
-    log(`erase failed: ${e.message}`);
-  }
-};
-
-function readFailureHint(e) {
-  if (/response truncated/i.test(e.message)) {
-    return `${e.message} — BLE link dropped mid-response; retry, and check the sensor is in range`;
-  }
-  if (/returned \d+ of \d+ bytes/.test(e.message)) {
-    /* Pre-0.1.12 SDK wording: the vendored bundle predates BLE reassembly */
-    return `${e.message} — the page is running a stale SDK bundle (needs ≥ 0.1.12); hard-refresh (Ctrl+Shift+R) or re-vendor`;
-  }
-  return `${e.message} — check the firmware supports the brand record`;
-}
-
-// Initial state
-/* Log which SDK build this page actually runs — a stale vendored bundle is
- * otherwise indistinguishable from a firmware fault. Accessed via the
- * namespace object so a pre-0.1.12 bundle (no SDK_VERSION export) degrades
- * to a warning instead of breaking the import. */
-if (sdkNs.SDK_VERSION) {
-  log(`vendored shimmer-web-sdk v${sdkNs.SDK_VERSION}`);
-} else {
-  log("WARNING: vendored shimmer-web-sdk predates v0.1.12 — BLE record reads will truncate; re-vendor the SDK bundle");
-}
-setConnected(false);
-if (!("serial" in navigator)) {
-  log("note: Web Serial not available in this browser (USB/dock connect disabled)");
-  els.serial.disabled = true;
-}
-if (!("bluetooth" in navigator)) {
-  log("note: Web Bluetooth not available in this browser (BLE connect disabled)");
-  els.ble.disabled = true;
-}
-</script>
-</body>
+      // Initial state
+      /* Log which SDK build this page actually runs — a stale vendored bundle is
+       * otherwise indistinguishable from a firmware fault. Accessed via the
+       * namespace object so a pre-0.1.12 bundle (no SDK_VERSION export) degrades
+       * to a warning instead of breaking the import. */
+      if (sdkNs.SDK_VERSION) {
+        log(`vendored shimmer-web-sdk v${sdkNs.SDK_VERSION}`);
+      } else {
+        log(
+          "WARNING: vendored shimmer-web-sdk predates v0.1.12 — BLE record reads will truncate; re-vendor the SDK bundle",
+        );
+      }
+      setConnected(false);
+      if (!("serial" in navigator)) {
+        log(
+          "note: Web Serial not available in this browser (USB/dock connect disabled)",
+        );
+        els.serial.disabled = true;
+      }
+      if (!("bluetooth" in navigator)) {
+        log(
+          "note: Web Bluetooth not available in this browser (BLE connect disabled)",
+        );
+        els.ble.disabled = true;
+      }
+    </script>
+  </body>
 </html>
