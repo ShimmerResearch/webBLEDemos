@@ -375,6 +375,7 @@
             type="text"
             maxlength="24"
             placeholder="e.g. YourBrand Ltd."
+            title="Defaults to the factory string. Change it only if the customer wants their own name on the USB device descriptor."
           />
           <div>
             <span class="preview" id="pvUsbManufacturer"></span>
@@ -440,6 +441,11 @@
       } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
       const HW_ID = { SHIMMER3: 3, SHIMMER3R: 10 };
+      /* Factory USB manufacturer string, matching BRAND_DEFAULT_USB_MANUFACTURER
+       * in log-and-stream-common EEPROM/shimmer_eeprom.h. Pre-filled into the
+       * form so rebranding only the advertising name needs no retyping, and used
+       * to tell a stock record from a custom one. */
+      const STOCK_MANUFACTURER = "Shimmer Research Ltd.";
 
       const $ = (id) => document.getElementById(id);
       const els = {
@@ -507,7 +513,7 @@
         els.inBt.value = "";
         els.inBle.value = "";
         els.inUsbProduct.value = "";
-        els.inUsbManufacturer.value = "";
+        els.inUsbManufacturer.value = STOCK_MANUFACTURER;
         refreshForm();
       }
 
@@ -591,16 +597,14 @@
         els.errBle.textContent = ble && bleErr ? bleErr : "";
         els.errUsbProduct.textContent =
           usbProduct && productErr ? productErr : "";
-        els.errUsbManufacturer.textContent = usbManufacturer
-          ? manufacturerErr || ""
-          : "";
+        /* Unlike the other fields, a blank manufacturer is reported: it is
+         * pre-filled with the factory string, so an empty one means the user
+         * deliberately cleared it and needs to know why Write is disabled. */
+        els.errUsbManufacturer.textContent = manufacturerErr || "";
         els.inBt.classList.toggle("bad", !!(bt && btErr));
         els.inBle.classList.toggle("bad", !!(ble && bleErr));
         els.inUsbProduct.classList.toggle("bad", !!(usbProduct && productErr));
-        els.inUsbManufacturer.classList.toggle(
-          "bad",
-          !!(usbManufacturer && manufacturerErr),
-        );
+        els.inUsbManufacturer.classList.toggle("bad", !!manufacturerErr);
 
         // Live preview of the advertised names with the real MAC suffix
         if (isShimmer3()) {
@@ -674,7 +678,6 @@
           usbProduct: "Shimmer",
         },
       };
-      const STOCK_MANUFACTURER = "Shimmer Research Ltd.";
 
       function isStockRecord(rec) {
         const d = STOCK_DEFAULTS[hwVersion];
@@ -925,6 +928,7 @@
       }
 
       // Initial state
+      els.inUsbManufacturer.value = STOCK_MANUFACTURER;
       /* Log which SDK build this page actually runs — a stale vendored bundle is
        * otherwise indistinguishable from a firmware fault. Accessed via the
        * namespace object so a pre-0.1.12 bundle (no SDK_VERSION export) degrades
