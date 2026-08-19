@@ -685,12 +685,30 @@ class RtcDriftMonitor {
         return (s[s.length - 1].hostSec - s[0].hostSec) / 60;
     }
     /**
-     * CSV rows (header first) of the current series, matching the DEV-844
-     * export format: host ISO time, host/device unix seconds, offset, rtt,
-     * monotonic seconds.
+     * CSV rows of the current series, matching the DEV-844 export format: a
+     * header row (host ISO time, host/device unix seconds, offset, rtt,
+     * monotonic seconds) followed by one row per sample.
+     *
+     * Optional `metadata` is emitted as `# key: value` comment lines BEFORE the
+     * header (so the header is no longer row 0 when metadata is supplied), so a
+     * saved file records what it came from (device, transport, the fit result,
+     * etc.) - the S3R drift tool established this preamble and the console
+     * adopts it. Each value has newlines collapsed so every entry stays a single
+     * comment line; a caller can read the fit via
+     * {@link ppmFit}/{@link deviceSteps}/{@link hostSteps} to build the map.
      */
-    toCsvRows() {
-        const rows = ['host_iso,host_unix_s,device_unix_s,offset_s,rtt_ms,perf_monotonic_s'];
+    toCsvRows(metadata) {
+        const rows = [];
+        if (metadata) {
+            for (const [k, v] of Object.entries(metadata)) {
+                // Keep each entry a single clean comment line.
+                const clean = String(v)
+                    .replace(/[\r\n]+/g, ' ')
+                    .trim();
+                rows.push(`# ${k}: ${clean}`);
+            }
+        }
+        rows.push('host_iso,host_unix_s,device_unix_s,offset_s,rtt_ms,perf_monotonic_s');
         for (const p of this.samples) {
             rows.push(`${new Date(p.hostSec * 1000).toISOString()},${p.hostSec.toFixed(3)},${p.devSec.toFixed(5)},${p.offsetSec.toFixed(3)},${p.rttMs},${(p.perfMs / 1000).toFixed(3)}`);
         }
@@ -1355,7 +1373,7 @@ function concatU8(a, b) {
     return out;
 }
 /** Read a 16-bit unsigned integer, little-endian. */
-function u16le$2(b, o) {
+function u16le$3(b, o) {
     return (b[o] | (b[o + 1] << 8)) >>> 0;
 }
 /** Read a 16-bit unsigned integer, big-endian. */
@@ -3127,6 +3145,53 @@ class Shimmer3RClient extends BaseShimmerClient {
         this.gsrRangeSetting = gsrRange;
         return { gsrRange, ackRemainder };
     }
+    /**
+     * Set the wide-range accelerometer (LIS2DW12) range.
+     *
+     * Also updates {@link imuRanges} so streaming calibration picks the matching
+     * sensitivity straight away. An inquiry would refresh it from the config word
+     * anyway, but callers are free to set the range after their last inquiry.
+     *
+     * @param wrAccelRange 0 = ±2 g, 1 = ±4 g, 2 = ±8 g, 3 = ±16 g.
+     */
+    async setWrAccelRange(wrAccelRange) {
+        if (!Number.isInteger(wrAccelRange) || wrAccelRange < 0 || wrAccelRange > 3) {
+            throw new Error('wrAccelRange must be 0–3 (±2/4/8/16 g)');
+        }
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        const cmd = new Uint8Array([OPCODES.SET_WR_ACCEL_RANGE_COMMAND, wrAccelRange & 0xff]);
+        this._emitStatus('SET_WR_ACCEL_RANGE → waiting for ACK…');
+        const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+        this._emitStatus('SET_WR_ACCEL_RANGE (ACK received).');
+        this.imuRanges = { ...this.imuRanges, wrAccel: wrAccelRange };
+        return { wrAccelRange, ackRemainder };
+    }
+    /**
+     * Set the gyroscope (LSM6DSV) range.
+     *
+     * Also updates {@link imuRanges}, as {@link setWrAccelRange} does.
+     *
+     * Note the firmware splits this setting across two config-setup bits when it
+     * reports back in an inquiry (LSB pair plus one MSB bit), but the command
+     * itself takes the full 0–5 index in one byte.
+     *
+     * @param gyroRange 0 = ±125, 1 = ±250, 2 = ±500, 3 = ±1000, 4 = ±2000,
+     *   5 = ±4000 dps. (Shimmer3 supports only 0–3: ±250/500/1000/2000 dps.)
+     */
+    async setGyroRange(gyroRange) {
+        if (!Number.isInteger(gyroRange) || gyroRange < 0 || gyroRange > 5) {
+            throw new Error('gyroRange must be 0–5 (±125/250/500/1000/2000/4000 dps)');
+        }
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        const cmd = new Uint8Array([OPCODES.SET_GYRO_RANGE_COMMAND, gyroRange & 0xff]);
+        this._emitStatus('SET_GYRO_RANGE → waiting for ACK…');
+        const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+        this._emitStatus('SET_GYRO_RANGE (ACK received).');
+        this.imuRanges = { ...this.imuRanges, gyro: gyroRange };
+        return { gyroRange, ackRemainder };
+    }
     getInternalExpPower() {
         return this.ExpPower;
     }
@@ -3525,7 +3590,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         let base = 0;
         if (u8[0] === OPCODES.INQUIRY_RESPONSE && u8.length >= 2)
             base = 1;
-        const adcRaw = u16le$2(u8, base + 0);
+        const adcRaw = u16le$3(u8, base + 0);
         const samplingRateHz = 32768 / adcRaw;
         this.samplingRateHz = samplingRateHz;
         const cfg = BigInt(u8[base + 2]) |
@@ -3695,8 +3760,8 @@ class Shimmer3RClient extends BaseShimmerClient {
             if (buf[0] === preamble && buf[frameBytes] === preamble) {
                 let ts1, ts2;
                 try {
-                    ts1 = tsBytes === 2 ? u16le$2(buf, 1) : u24le$1(buf, 1);
-                    ts2 = tsBytes === 2 ? u16le$2(buf, frameBytes + 1) : u24le$1(buf, frameBytes + 1);
+                    ts1 = tsBytes === 2 ? u16le$3(buf, 1) : u24le$1(buf, 1);
+                    ts2 = tsBytes === 2 ? u16le$3(buf, frameBytes + 1) : u24le$1(buf, frameBytes + 1);
                 }
                 catch {
                     buf = buf.subarray(1);
@@ -3713,7 +3778,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 try {
                     let cursor = 1;
                     const oc = new ObjectCluster(this._deviceLabel());
-                    const ts = tsBytes === 2 ? u16le$2(frame, cursor) : u24le$1(frame, cursor);
+                    const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le$1(frame, cursor);
                     cursor += tsBytes;
                     oc.add('TIMESTAMP', ts, 'ticks', 'raw');
                     for (const f of sch.fields) {
@@ -3723,10 +3788,10 @@ class Shimmer3RClient extends BaseShimmerClient {
                         let v;
                         switch (f.fmt) {
                             case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$2(frame, cursor));
+                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$3(frame, cursor));
                                 break;
                             case 'u16':
-                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$2(frame, cursor);
+                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$3(frame, cursor);
                                 break;
                             case 'i24':
                                 v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
@@ -3745,7 +3810,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                                 v = frame[cursor];
                                 break;
                             default:
-                                v = u16le$2(frame, cursor);
+                                v = u16le$3(frame, cursor);
                         }
                         cursor += f.sizeBytes;
                         oc.add(f.name, v, null, 'raw');
@@ -4010,7 +4075,7 @@ function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24') {
     let base = 0;
     if (u8[0] === OPCODES.INQUIRY_RESPONSE)
         base = 1;
-    const adcRaw = u16le$2(u8, base + 0);
+    const adcRaw = u16le$3(u8, base + 0);
     const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
     // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
     const configByte0 = ((u8[base + 2] | (u8[base + 3] << 8) | (u8[base + 4] << 16) | (u8[base + 5] << 24)) >>> 0) >>>
@@ -4738,17 +4803,17 @@ class Shimmer3Client extends BaseShimmerClient {
                     const frame = buf.subarray(0, frameBytes);
                     let cursor = 1;
                     const oc = new ObjectCluster(this._deviceLabel());
-                    const ts = tsBytes === 2 ? u16le$2(frame, cursor) : u24le$1(frame, cursor);
+                    const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le$1(frame, cursor);
                     cursor += tsBytes;
                     oc.add('TIMESTAMP', ts, 'ticks', 'raw');
                     for (const f of sch.fields) {
                         let v;
                         switch (f.fmt) {
                             case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$2(frame, cursor));
+                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$3(frame, cursor));
                                 break;
                             case 'u16':
-                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$2(frame, cursor);
+                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$3(frame, cursor);
                                 break;
                             case 'i24':
                                 v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
@@ -4765,7 +4830,7 @@ class Shimmer3Client extends BaseShimmerClient {
                                 v = frame[cursor];
                                 break;
                             default:
-                                v = u16le$2(frame, cursor);
+                                v = u16le$3(frame, cursor);
                         }
                         cursor += f.sizeBytes;
                         oc.add(f.name, v, null, 'raw');
@@ -7973,7 +8038,7 @@ const VERISENSE_STREAM_SENSOR_LABELS = Object.freeze({
 });
 
 /** Read a 16-bit unsigned integer, little-endian. */
-function u16le$1(b0, b1) {
+function u16le$2(b0, b1) {
     return (b1 << 8) | b0;
 }
 /** Format a single byte as an uppercase `0xNN` string. */
@@ -8637,6 +8702,10 @@ function parseStatusPayload(response, sourceStatusProperty = 'status1') {
                                     ? 'CHARGER_STATUS_NOT_READ'
                                     : 'CHARGER_STATUS_UNKNOWN';
     }
+    // Second status-flags byte (byte 65; the byte-26 flags are full). Null
+    // (unknown) when the firmware predates it — never defaulted to false, which
+    // would wrongly steer users away from USB DFU on a capable unit.
+    const usbDfuBootloader = response.length >= 66 ? (response[65] & 0x01) !== 0 : null;
     return {
         uniqueIdentifier,
         sourceStatusProperty,
@@ -8656,6 +8725,7 @@ function parseStatusPayload(response, sourceStatusProperty = 'status1') {
         chargerPresent,
         chargerStatusCode,
         chargerStatusName,
+        usbDfuBootloader,
     };
 }
 /** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
@@ -9309,7 +9379,7 @@ function parseMessage(msg) {
     if (msg.length < 3)
         throw new Error('Invalid Verisense message: header is incomplete');
     const header = msg[0];
-    const payloadLength = u16le$1(msg[1], msg[2]);
+    const payloadLength = u16le$2(msg[1], msg[2]);
     if (msg.length !== payloadLength + 3) {
         throw new Error(`Invalid Verisense message: length=${payloadLength}, actualPayload=${Math.max(0, msg.length - 3)}`);
     }
@@ -13064,7 +13134,7 @@ class SensorVD6283 extends SensorBase {
 SensorVD6283.NUM_CHANNELS = 6;
 SensorVD6283.BYTES_PER_SAMPLE = 18;
 
-function u16le(bytes, off) {
+function u16le$1(bytes, off) {
     return (bytes[off] & 0xff) | ((bytes[off + 1] & 0xff) << 8);
 }
 /**
@@ -13099,9 +13169,9 @@ class SensorMAX32674 extends SensorBase {
                         i16le(sensorPayloadBytes, base + 4),
                     ],
                 },
-                hr: u16le(sensorPayloadBytes, base + 6),
+                hr: u16le$1(sensorPayloadBytes, base + 6),
                 hrConfidence: sensorPayloadBytes[base + 8] ?? 0,
-                spo2: u16le(sensorPayloadBytes, base + 9),
+                spo2: u16le$1(sensorPayloadBytes, base + 9),
                 spo2Confidence: sensorPayloadBytes[base + 11] ?? 0,
                 activityClass: sensorPayloadBytes[base + 12] ?? 0,
                 scdContactState: sensorPayloadBytes[base + 13] ?? 0,
@@ -13975,6 +14045,26 @@ class VerisenseBleDevice extends BaseShimmerClient {
      * {@link rebootToDfuBootloader}) become available on the connection.
      */
     async enableDfuServiceOnNextDisconnect() {
+        await this.writeProperty(ASM_PROPERTY.DFU_MODE, []);
+    }
+    /**
+     * Request a reboot straight into the DFU bootloader over the USB serial
+     * transport.
+     *
+     * Writes the same ASM `DFU_MODE` property, but the firmware's USB handling
+     * differs from BLE: it ACKs and resets into the bootloader ~300 ms later
+     * (the delay lets the ACK drain), after which THIS serial port disappears
+     * and the bootloader enumerates as its own USB CDC device (0x1915/0x521F,
+     * "Verisense DFU" — see `VERISENSE_USB_DFU_PORT_FILTERS`). Expect the
+     * transport to drop shortly after this resolves.
+     *
+     * Firmware running on a BLE-only (v2) bootloader NACKs instead of
+     * rebooting (`isUsbDfuUnsupportedError` classifies the rejection); fall
+     * back to the BLE DFU flow there. Only meaningful on a serial connection —
+     * over BLE the same property write follows the
+     * {@link enableDfuServiceOnNextDisconnect} semantics.
+     */
+    async requestUsbDfuBootloaderReboot() {
         await this.writeProperty(ASM_PROPERTY.DFU_MODE, []);
     }
     /**
@@ -15470,13 +15560,22 @@ const VERISENSE_DFU_SET_MODE_TIMEOUT_MS = 30000;
 const VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS = 10;
 const VERISENSE_DFU_FAST_PACKET_DELAY_MS = 0;
 /**
- * The Verisense bootloader advertises as "Verisense-BL..."; app-mode sensors
- * ("Verisense-..." without the -BL) are deliberately excluded from DFU device
- * pickers to keep them unambiguous. The DFU service UUID is not advertised in
- * app mode, so it cannot be used to widen the filter; it still needs to be
- * granted via `optionalServices` for the GATT connection.
+ * The Verisense bootloader advertises with a MAC-suffixed name; app-mode
+ * sensors ("Verisense-..." without the marker) are deliberately excluded from
+ * DFU device pickers to keep them unambiguous. The DFU service UUID is not
+ * advertised in app mode, so it cannot be used to widen the filter; it still
+ * needs to be granted via `optionalServices` for the GATT connection.
+ *
+ * Two prefixes exist across the fleet: v3 (BLE+USB) bootloaders advertise
+ * "Verisense-DFU-XXXX" — harmonised with their USB product string so the same
+ * name identifies a unit on either transport — while fielded v2 (BLE-only)
+ * bootloaders advertise "Verisense-BL-XXXX" forever. Pickers must match both.
  */
 const VERISENSE_DFU_BOOTLOADER_NAME_PREFIX = 'Verisense-BL';
+const VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES = Object.freeze([
+    'Verisense-DFU',
+    'Verisense-BL',
+]);
 /**
  * The library's routine object-retransmission notices (e.g. "object failed to
  * validate"). Over Web Bluetooth, firmware packets are written without
@@ -15599,12 +15698,12 @@ function isSafeFirmwareArchiveName(name) {
 /**
  * `navigator.bluetooth.requestDevice()` options for picking a Verisense
  * bootloader (replaces the DFU library's `acceptAllDevices`; see
- * {@link VERISENSE_DFU_BOOTLOADER_NAME_PREFIX} for why name-prefix only).
- * Pass the vendored library's `SecureDfu.SERVICE_UUID`.
+ * {@link VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES} for why name-prefix only and
+ * why there are two). Pass the vendored library's `SecureDfu.SERVICE_UUID`.
  */
 function buildVerisenseDfuRequestDeviceOptions(dfuServiceUuid) {
     return {
-        filters: [{ namePrefix: VERISENSE_DFU_BOOTLOADER_NAME_PREFIX }],
+        filters: VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES.map((namePrefix) => ({ namePrefix })),
         optionalServices: [dfuServiceUuid],
     };
 }
@@ -15714,6 +15813,458 @@ async function runVerisenseDfuUpdate(dfu, device, dfuPackage, options = {}) {
     if (appImage) {
         options.onStatus?.(`Updating ${appImage.type}: ${appImage.imageFile}...`);
         await updateVerisenseDfuImageWithRetry(dfu, device, appImage, options);
+    }
+}
+
+/**
+ * Verisense Nordic Secure-DFU over USB CDC serial (Web Serial).
+ *
+ * The combined BLE+USB bootloader (v3) exposes Nordic's serial DFU transport
+ * on its own USB CDC port (VID 0x1915 / PID 0x521F, product "Verisense DFU"),
+ * carrying the same secure-DFU request handler as BLE — same signed `.zip`
+ * packages, same object/CRC/execute protocol — but framed with SLIP
+ * (RFC 1055) instead of GATT characteristics.
+ *
+ * This module is self-contained (no dependency on the vendored
+ * `web-bluetooth-dfu` scripts): SLIP codec, CRC-32, and the serial secure-DFU
+ * state machine. The byte transport is injected structurally and
+ * {@link WebSerialTransport} satisfies it directly. Package parsing stays with
+ * the vendored `SecureDfuPackage` (see `VerisenseDfuPackage` in `dfu.ts`) —
+ * the `initData`/`imageData` buffers it yields are exactly what
+ * {@link VerisenseSerialDfu.update} consumes.
+ *
+ * Flow (mirrors nrfutil's `dfu usb-serial`): ping → PRN 0 → MTU → command
+ * object (init packet) → data objects (firmware, `max_size` chunks, each
+ * CRC-validated before Execute). Writes carry no per-write response at PRN 0 —
+ * USB CDC is a reliable stream — so validation happens per object via CRC_GET.
+ * Interrupted transfers resume from the last completed object when the
+ * device-reported CRC matches ours.
+ */
+// ── SLIP framing (RFC 1055, as used by Nordic's serial DFU) ────────────────
+const SLIP_END = 0xc0;
+const SLIP_ESC = 0xdb;
+const SLIP_ESC_END = 0xdc;
+const SLIP_ESC_ESC = 0xdd;
+/** SLIP-encode one frame (terminating END appended; none prepended, matching
+ * Nordic's encoder). */
+function slipEncode(frame) {
+    const out = [];
+    for (const byte of frame) {
+        if (byte === SLIP_END)
+            out.push(SLIP_ESC, SLIP_ESC_END);
+        else if (byte === SLIP_ESC)
+            out.push(SLIP_ESC, SLIP_ESC_ESC);
+        else
+            out.push(byte);
+    }
+    out.push(SLIP_END);
+    return Uint8Array.from(out);
+}
+/**
+ * Streaming SLIP decoder: feed arbitrary chunks, get back completed frames.
+ * Empty frames (back-to-back ENDs) are dropped, matching Nordic's decoder.
+ */
+class SlipDecoder {
+    constructor() {
+        this._frame = [];
+        this._escaped = false;
+    }
+    /** Decode a chunk; returns every frame completed by it (possibly none). */
+    push(chunk) {
+        const frames = [];
+        for (const byte of chunk) {
+            if (this._escaped) {
+                this._escaped = false;
+                if (byte === SLIP_ESC_END)
+                    this._frame.push(SLIP_END);
+                else if (byte === SLIP_ESC_ESC)
+                    this._frame.push(SLIP_ESC);
+                // Invalid escape: RFC 1055 leaves the byte in place; keep it so a
+                // corrupt frame fails its response check rather than desyncing.
+                else
+                    this._frame.push(byte);
+            }
+            else if (byte === SLIP_ESC) {
+                this._escaped = true;
+            }
+            else if (byte === SLIP_END) {
+                if (this._frame.length > 0)
+                    frames.push(Uint8Array.from(this._frame));
+                this._frame = [];
+            }
+            else {
+                this._frame.push(byte);
+            }
+        }
+        return frames;
+    }
+    reset() {
+        this._frame = [];
+        this._escaped = false;
+    }
+}
+// ── CRC-32 (IEEE 802.3, the polynomial Nordic's DFU uses) ──────────────────
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++)
+            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        table[n] = c >>> 0;
+    }
+    return table;
+})();
+/** CRC-32 of `data`, continuing from `seed` (pass a previous crc32 result to
+ * extend it). Returns an unsigned 32-bit value. */
+function crc32(data, seed = 0) {
+    let c = ~seed >>> 0;
+    for (let i = 0; i < data.length; i++) {
+        c = CRC32_TABLE[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+    }
+    return ~c >>> 0;
+}
+// ── Serial secure-DFU protocol constants ────────────────────────────────────
+/** Request opcodes (identical to the BLE control-point opcodes; over serial,
+ * data writes are the explicit OBJECT_WRITE opcode instead of a second
+ * characteristic). */
+const SERIAL_DFU_OP = Object.freeze({
+    OBJECT_CREATE: 0x01,
+    RECEIPT_NOTIF_SET: 0x02,
+    CRC_GET: 0x03,
+    OBJECT_EXECUTE: 0x04,
+    OBJECT_SELECT: 0x06,
+    MTU_GET: 0x07,
+    OBJECT_WRITE: 0x08,
+    PING: 0x09,
+    RESPONSE: 0x60,
+});
+const SERIAL_DFU_OBJECT_TYPE = Object.freeze({
+    COMMAND: 0x01, // init packet
+    DATA: 0x02, // firmware image
+});
+/** Result codes carried in responses (nrf_dfu_response_t). */
+const SERIAL_DFU_RESULT_NAMES = Object.freeze({
+    0x00: 'Invalid opcode',
+    0x01: 'Success',
+    0x02: 'Opcode not supported',
+    0x03: 'Invalid parameter',
+    0x04: 'Insufficient resources',
+    0x05: 'Invalid object',
+    0x07: 'Unsupported object type',
+    0x08: 'Operation not permitted',
+    0x0a: 'Operation failed',
+    0x0b: 'Extended error',
+});
+/** Extended-error codes (nrf_dfu_ext_error_code_t) that follow result 0x0B. */
+const SERIAL_DFU_EXTENDED_ERROR_NAMES = Object.freeze({
+    0x00: 'No error',
+    0x01: 'Invalid error code',
+    0x02: 'Wrong command format',
+    0x03: 'Unknown command',
+    0x04: 'Init command invalid',
+    0x05: 'Firmware version too low',
+    0x06: 'Hardware version mismatch',
+    0x07: 'SoftDevice version mismatch',
+    0x08: 'Signature missing',
+    0x09: 'Wrong hash type',
+    0x0a: 'Hash calculation failed',
+    0x0b: 'Wrong signature type',
+    0x0c: 'Signature verification failed',
+    0x0d: 'Insufficient space',
+});
+/**
+ * The v3 bootloader's USB identity in DFU mode. Deliberately distinct from
+ * the application's CDC port (0x1915/0x520F) so a Web Serial picker — which
+ * can only filter on VID/PID — shows exactly the bootloader.
+ */
+const VERISENSE_USB_DFU_VID = 0x1915;
+const VERISENSE_USB_DFU_PID = 0x521f;
+/** `navigator.serial.requestPort()` filters for the bootloader's DFU port. */
+const VERISENSE_USB_DFU_PORT_FILTERS = Object.freeze([
+    Object.freeze({ usbVendorId: VERISENSE_USB_DFU_VID, usbProductId: VERISENSE_USB_DFU_PID }),
+]);
+/**
+ * After the firmware ACKs a `DFU_MODE` request received over USB it reboots
+ * ~300 ms later (the delay lets the ACK drain), the application port
+ * disappears, and the bootloader enumerates as 0x1915/0x521F. Give the OS a
+ * moment to enumerate before offering the picker.
+ */
+const VERISENSE_USB_DFU_REENUMERATION_DELAY_MS = 2000;
+/**
+ * True when a `DFU_MODE` property-write rejection means the unit cannot enter
+ * DFU mode from USB: firmware on a BLE-only (v2) bootloader NACKs the request
+ * (the reboot would strand the device off the bus until the bootloader's
+ * inactivity timeout). The caller should fall back to the BLE DFU flow.
+ *
+ * Keyed on the DFU_MODE property code (0x6) in the client's NACK message
+ * ("Device returned NACK command=0x.. property=0x6", unpadded hex — see
+ * `validatePendingResponse` in requestValidation.ts) so NACKs from unrelated
+ * requests are never misclassified as "USB DFU unsupported".
+ */
+function isUsbDfuUnsupportedError(error) {
+    return /NACK.*property=0x0?6\b/i.test(String(error));
+}
+const VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS = 15000;
+const VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS = 3;
+function u16le(value) {
+    return [value & 0xff, (value >>> 8) & 0xff];
+}
+function u32le(value) {
+    return [value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff];
+}
+function readU32le(bytes, offset) {
+    return ((bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16)) +
+        bytes[offset + 3] * 0x1000000);
+}
+function opcodeName(opcode) {
+    for (const [name, value] of Object.entries(SERIAL_DFU_OP)) {
+        if (value === opcode)
+            return name;
+    }
+    return `0x${opcode.toString(16)}`;
+}
+/**
+ * Nordic secure DFU over a SLIP-framed serial byte stream.
+ *
+ * One instance drives one transfer session; construct it around a connected
+ * transport whose port is the bootloader's DFU port (see
+ * {@link VERISENSE_USB_DFU_PORT_FILTERS}) and call {@link update} with the
+ * `initData`/`imageData` of each image in the package (base image first when
+ * present, application after — same ordering as `runVerisenseDfuUpdate`).
+ */
+class VerisenseSerialDfu {
+    constructor(transport, options = {}) {
+        this._decoder = new SlipDecoder();
+        this._pending = null;
+        this._unsubscribe = null;
+        this._mtu = 0;
+        this._transport = transport;
+        this._options = options;
+    }
+    /** Max unencoded bytes per OBJECT_WRITE frame: worst-case SLIP encoding
+     * doubles every byte, plus the terminating END, minus the opcode byte
+     * (matches nrfutil's `(mtu - 1) // 2 - 1`). */
+    get maxWriteSize() {
+        return Math.floor((this._mtu - 1) / 2) - 1;
+    }
+    /**
+     * Transfer one image (init packet + firmware binary). Resolves when the
+     * final Execute is acknowledged — for an application image that is the
+     * point where the bootloader resets to activate it, which also drops the
+     * serial port; the caller should expect the port to disappear.
+     */
+    async update(init, image) {
+        if (this._unsubscribe)
+            throw new Error('A transfer is already in progress');
+        this._decoder.reset();
+        this._unsubscribe = this._transport.onNotify((chunk) => this._onData(chunk));
+        try {
+            await this._handshake();
+            await this._transferInit(new Uint8Array(init));
+            await this._transferFirmware(new Uint8Array(image));
+        }
+        finally {
+            this._unsubscribe?.();
+            this._unsubscribe = null;
+            const pending = this._pending;
+            this._pending = null;
+            pending?.reject(new Error('Transfer closed'));
+        }
+    }
+    // ── protocol steps ────────────────────────────────────────────────────────
+    async _handshake() {
+        const pingId = Math.floor(Math.random() * 256);
+        const pong = await this._request(SERIAL_DFU_OP.PING, [pingId]);
+        if (pong.length < 1 || pong[0] !== pingId) {
+            throw new Error(`DFU ping mismatch (sent ${pingId}, got ${pong[0] ?? 'nothing'})`);
+        }
+        // PRN 0: no per-write receipts — USB CDC is reliable; objects are
+        // CRC-validated explicitly before Execute.
+        await this._request(SERIAL_DFU_OP.RECEIPT_NOTIF_SET, u16le(0));
+        const mtuRsp = await this._request(SERIAL_DFU_OP.MTU_GET);
+        if (mtuRsp.length < 2)
+            throw new Error('DFU MTU response too short');
+        this._mtu = mtuRsp[0] | (mtuRsp[1] << 8);
+        if (this.maxWriteSize < 1)
+            throw new Error(`DFU MTU unusable (${this._mtu})`);
+        this._options.onLog?.(`serial DFU ready: mtu=${this._mtu} maxWrite=${this.maxWriteSize}`);
+    }
+    async _transferInit(init) {
+        this._options.onStatus?.('Transferring init packet...');
+        const sel = await this._select(SERIAL_DFU_OBJECT_TYPE.COMMAND);
+        if (sel.offset === init.length && sel.crc === crc32(init)) {
+            // Same init packet already transferred (interrupted attempt): just
+            // (re-)execute it.
+            this._options.onLog?.('init packet already transferred; executing');
+            await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+            return;
+        }
+        if (init.length > sel.maxSize) {
+            throw new Error(`Init packet too large (${init.length} > ${sel.maxSize})`);
+        }
+        await this._request(SERIAL_DFU_OP.OBJECT_CREATE, [
+            SERIAL_DFU_OBJECT_TYPE.COMMAND,
+            ...u32le(init.length),
+        ]);
+        await this._writeData(init, 'init', init.length, 0);
+        const { offset, crc } = await this._crcGet();
+        if (offset !== init.length || crc !== crc32(init)) {
+            throw new Error(`Init packet CRC mismatch (offset ${offset}/${init.length}, crc 0x${crc.toString(16)})`);
+        }
+        await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+    }
+    async _transferFirmware(image) {
+        const sel = await this._select(SERIAL_DFU_OBJECT_TYPE.DATA);
+        const attempts = this._options.objectAttempts ?? VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS;
+        // Resume: trust the device-reported offset only when our CRC of that
+        // prefix matches. The write position cannot be rewound arbitrarily —
+        // OBJECT_CREATE always (re)creates at the device's current position, so
+        // only the current (unexecuted) object can be rolled back. That is also
+        // sufficient: executed objects were CRC-validated before Execute, and
+        // executing a *different* image's init packet resets the stored progress
+        // to zero, so a mismatch can only live in the unexecuted tail (any deeper
+        // corruption surfaces as an object CRC failure below).
+        let startOffset = 0;
+        if (sel.offset > 0 && sel.offset <= image.length) {
+            const prefixMatches = crc32(image.subarray(0, sel.offset)) === sel.crc;
+            if (prefixMatches && sel.offset === image.length) {
+                this._options.onLog?.('firmware already transferred; executing');
+                await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+                return;
+            }
+            if (prefixMatches) {
+                // Partial object: re-create it from its boundary. Boundary offset:
+                // continue with the next object.
+                startOffset = sel.offset - (sel.offset % sel.maxSize);
+            }
+            else {
+                const remainder = sel.offset % sel.maxSize;
+                startOffset =
+                    sel.offset - (remainder !== 0 ? remainder : Math.min(sel.maxSize, sel.offset));
+                this._options.onLog?.(`device-reported firmware CRC mismatch at ${sel.offset}; rolling back to ${startOffset}`);
+            }
+            if (startOffset > 0) {
+                this._options.onStatus?.(`Resuming firmware transfer at ${startOffset} bytes...`);
+            }
+        }
+        this._options.onStatus?.('Transferring firmware image...');
+        this._options.onProgress?.({
+            object: 'firmware',
+            totalBytes: image.length,
+            currentBytes: startOffset,
+        });
+        for (let offset = startOffset; offset < image.length; offset += sel.maxSize) {
+            const chunk = image.subarray(offset, Math.min(offset + sel.maxSize, image.length));
+            let lastError = null;
+            let done = false;
+            for (let attempt = 1; attempt <= attempts && !done; attempt++) {
+                if (attempt > 1) {
+                    this._options.onLog?.(`re-sending object at ${offset} (attempt ${attempt} of ${attempts})`);
+                }
+                await this._request(SERIAL_DFU_OP.OBJECT_CREATE, [
+                    SERIAL_DFU_OBJECT_TYPE.DATA,
+                    ...u32le(chunk.length),
+                ]);
+                await this._writeData(chunk, 'firmware', image.length, offset);
+                const { offset: devOffset, crc } = await this._crcGet();
+                const expectedCrc = crc32(image.subarray(0, offset + chunk.length));
+                if (devOffset === offset + chunk.length && crc === expectedCrc) {
+                    await this._request(SERIAL_DFU_OP.OBJECT_EXECUTE);
+                    done = true;
+                }
+                else {
+                    lastError = new Error(`Object CRC mismatch at ${offset} (device offset ${devOffset}, crc 0x${crc.toString(16)})`);
+                }
+            }
+            if (!done)
+                throw lastError ?? new Error(`Object transfer failed at ${offset}`);
+        }
+        this._options.onStatus?.('Firmware transfer complete.');
+    }
+    // ── plumbing ──────────────────────────────────────────────────────────────
+    async _writeData(data, object, totalBytes, baseOffset) {
+        const sliceSize = this.maxWriteSize;
+        for (let pos = 0; pos < data.length; pos += sliceSize) {
+            const slice = data.subarray(pos, Math.min(pos + sliceSize, data.length));
+            const frame = new Uint8Array(1 + slice.length);
+            frame[0] = SERIAL_DFU_OP.OBJECT_WRITE;
+            frame.set(slice, 1);
+            await this._transport.write(slipEncode(frame));
+            this._options.onProgress?.({
+                object,
+                totalBytes,
+                currentBytes: baseOffset + pos + slice.length,
+            });
+        }
+    }
+    async _select(objectType) {
+        const rsp = await this._request(SERIAL_DFU_OP.OBJECT_SELECT, [objectType]);
+        if (rsp.length < 12)
+            throw new Error('DFU select response too short');
+        return { maxSize: readU32le(rsp, 0), offset: readU32le(rsp, 4), crc: readU32le(rsp, 8) };
+    }
+    async _crcGet() {
+        const rsp = await this._request(SERIAL_DFU_OP.CRC_GET);
+        if (rsp.length < 8)
+            throw new Error('DFU CRC response too short');
+        return { offset: readU32le(rsp, 0), crc: readU32le(rsp, 4) };
+    }
+    _request(opcode, params = [], timeoutMs) {
+        if (this._pending) {
+            return Promise.reject(new Error('A DFU request is already pending'));
+        }
+        const effectiveTimeout = timeoutMs ?? this._options.requestTimeoutMs ?? VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS;
+        const frame = new Uint8Array(1 + params.length);
+        frame[0] = opcode;
+        frame.set(params instanceof Uint8Array ? params : Uint8Array.from(params), 1);
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this._pending = null;
+                reject(new Error(`DFU ${opcodeName(opcode)} timed out after ${effectiveTimeout}ms`));
+            }, effectiveTimeout);
+            this._pending = {
+                opcode,
+                resolve: (payload) => {
+                    clearTimeout(timer);
+                    this._pending = null;
+                    resolve(payload);
+                },
+                reject: (error) => {
+                    clearTimeout(timer);
+                    this._pending = null;
+                    reject(error);
+                },
+            };
+            this._transport.write(slipEncode(frame)).catch((error) => {
+                this._pending?.reject(new Error(`DFU ${opcodeName(opcode)} write failed: ${error}`));
+            });
+        });
+    }
+    _onData(chunk) {
+        for (const frame of this._decoder.push(chunk)) {
+            const pending = this._pending;
+            if (!pending) {
+                this._options.onLog?.(`unexpected DFU frame (${frame.length} bytes) with no request`);
+                continue;
+            }
+            if (frame.length < 3 || frame[0] !== SERIAL_DFU_OP.RESPONSE || frame[1] !== pending.opcode) {
+                this._options.onLog?.(`ignoring DFU frame [${Array.from(frame.slice(0, 4))
+                    .map((b) => `0x${b.toString(16)}`)
+                    .join(', ')}...] while waiting for ${opcodeName(pending.opcode)}`);
+                continue;
+            }
+            const result = frame[2];
+            if (result === 0x01) {
+                pending.resolve(frame.subarray(3));
+                continue;
+            }
+            let message = SERIAL_DFU_RESULT_NAMES[result] ?? `Unknown result 0x${result.toString(16)}`;
+            if (result === 0x0b && frame.length >= 4) {
+                const ext = frame[3];
+                message = `${SERIAL_DFU_EXTENDED_ERROR_NAMES[ext] ?? `Extended error 0x${ext.toString(16)}`}`;
+            }
+            pending.reject(new Error(`DFU ${opcodeName(pending.opcode)} failed: ${message}`));
+        }
     }
 }
 
@@ -15933,6 +16484,670 @@ function getVerisenseCalibrationSensorAvailability(support) {
     };
 }
 
+/** The firmware release that renumbered the tests. */
+const RENUMBER_VERSION = { major: 2, minor: 0, internal: 10 };
+/**
+ * Line starts that may appear glued onto the end of a previous line.
+ *
+ * The firmware assembles each line in a shared 128-byte buffer, and the
+ * WS_TEST_0003 WARNING text is longer than that: `snprintf` truncates it and
+ * the trailing CRLF is lost, so whatever is written next runs straight on. We
+ * re-split on these anchors and note the repair.
+ */
+const REPAIR_ANCHORS = [
+    / - WS_TEST_\d{4} - /g,
+    /LED test \(WS_TEST_\d{4}\):/g,
+    /(?:MCU|I\/O status|Battery|Shimmer model|TWIM0|TWIM1 \(part ?\d\)|SPIM2|SPIM3):/g,
+    /Overall Result\s*=/g,
+    /\/\/\*+/g,
+];
+/**
+ * Matched in order against the text following the `WS_TEST_00NN` prefix; first
+ * hit wins. Every pattern keys on wording the firmware has printed stably
+ * across the renumbering, not on the test number.
+ */
+const CLASSIFIERS = [
+    {
+        name: 'vcore',
+        label: 'VCore',
+        match: /VCore/i,
+        extract: (body, out) => {
+            const m = /VCore\s*=\s*(-?\d+)\s*mV(?:\s*\(\s*(\d+)\s*-\s*(\d+)\s*mV\s*\))?/i.exec(body);
+            if (!m)
+                return;
+            setNum(out, 'vcore_mv', m[1]);
+            setNum(out, 'vcore_limit_low_mv', m[2]);
+            setNum(out, 'vcore_limit_high_mv', m[3]);
+        },
+    },
+    {
+        name: 'mcu_temp',
+        label: 'MCU temperature',
+        match: /Temperature\s*=\s*-?\d/i,
+        extract: (body, out) => {
+            setNum(out, 'mcu_temp_c', /Temperature\s*=\s*(-?\d+)/i.exec(body)?.[1]);
+        },
+    },
+    {
+        name: 'lfclk',
+        label: 'LF crystal',
+        match: /LF crystal/i,
+        extract: (body, out) => {
+            setNum(out, 'lfclk_ppm', /error\s*=\s*([+-]?\d+(?:\.\d+)?)\s*ppm/i.exec(body)?.[1]);
+            setNum(out, 'lfclk_s_per_day', /\(\s*([+-]?\d+(?:\.\d+)?)\s*s\/day\s*\)/i.exec(body)?.[1]);
+            setNum(out, 'lfclk_limit_ppm', /limit\s*\+\/-\s*(\d+(?:\.\d+)?)\s*ppm/i.exec(body)?.[1]);
+            setStr(out, 'lfclk_src', /LFCLK\s*src\s*=\s*([A-Za-z]+)/i.exec(body)?.[1]);
+            setStr(out, 'lfclk_fail_reason', /not measurable\s*\(([^,)]+)/i.exec(body)?.[1]);
+        },
+    },
+    {
+        name: 'usb_power',
+        label: 'USB power good',
+        match: /USB (?:power good|not applicable)/i,
+        extract: (body, out) => {
+            const m = /USB power good\s*:\s*(Yes|No)/i.exec(body);
+            if (m)
+                out.usb_power_good = /yes/i.test(m[1]);
+        },
+    },
+    { name: 'eeprom', label: 'CAT24M01 EEPROM', match: /EEPROM/i },
+    {
+        name: 'model',
+        label: 'Shimmer model',
+        match: /production config|^\s*(?:PASS|FAIL)\s*$/i,
+    },
+    {
+        name: 'battery',
+        label: 'VBatt',
+        match: /VBatt/i,
+        resultKey: 'vbatt_result',
+        extract: (body, out) => {
+            const m = /VBatt\s*=\s*(-?\d+)\s*mV(?:\s*\(\s*(\d+)\s*-\s*(\d+)\s*mV\s*\))?/i.exec(body);
+            if (m) {
+                setNum(out, 'vbatt_mv', m[1]);
+                setNum(out, 'vbatt_limit_low_mv', m[2]);
+                setNum(out, 'vbatt_limit_high_mv', m[3]);
+            }
+            // Percentage is only printed when the unit is not charging.
+            setNum(out, 'batt_pct', /,\s*(\d+)\s*%/.exec(body)?.[1]);
+        },
+    },
+    {
+        name: 'charger',
+        label: 'Charger status',
+        match: /Charger/i,
+        extract: (body, out) => {
+            setStr(out, 'charger_status', /Charger status\s*:\s*(.+?)\s*$/i.exec(body)?.[1]);
+        },
+    },
+    {
+        name: 'light',
+        label: 'VD6283TX Light sensor',
+        match: /VD6283|Light sensor/i,
+        extract: (body, out) => {
+            setNum(out, 'lux', /([\d.]+)\s*Lux/i.exec(body)?.[1]);
+            setNum(out, 'cct_k', /CCT\s*:\s*(\d+)\s*K/i.exec(body)?.[1]);
+            const flicker = /Flicker\s*:\s*([\d.]+)\s*Hz\s*,\s*(\d+)\s*%\s*mod/i.exec(body);
+            if (flicker) {
+                setNum(out, 'flicker_hz', flicker[1]);
+                setNum(out, 'flicker_mod_pct', flicker[2]);
+                out.flicker_status = 'detected';
+            }
+            else if (/Flicker\s*:\s*link OK/i.test(body)) {
+                out.flicker_status = 'link_ok_none_detected';
+            }
+            else if (/Flicker\s*:\s*FAIL\s*-\s*no signal/i.test(body)) {
+                out.flicker_status = 'no_signal';
+            }
+            else if (/Flicker\s*:\s*FAIL\s*-\s*no capture/i.test(body)) {
+                out.flicker_status = 'no_capture';
+            }
+        },
+    },
+    {
+        name: 'skin_temp',
+        label: 'Thermal sensor',
+        // The firmware prints MLX90640; the part actually fitted is an MLX90632.
+        match: /MLX906|Thermal sensor/i,
+        extract: (body, out) => {
+            setNum(out, 'mlx_ambient_c', /Ambient\s*=\s*(-?\d+)/i.exec(body)?.[1]);
+            setNum(out, 'mlx_object_c', /Object\s*=\s*(-?\d+)/i.exec(body)?.[1]);
+        },
+    },
+    {
+        name: 'algo_hub',
+        label: 'MAX32674C Algorithm hub',
+        match: /MAX32674|Algorithm hub/i,
+        resultKey: 'hub_result',
+        extract: (body, out) => {
+            setStr(out, 'hub_fw_version', /\(\s*v([\d.]+)\s*\)/i.exec(body)?.[1]);
+            if (/Incorrect FW/i.test(body))
+                out.hub_fail_reason = 'incorrect_fw';
+            else if (/bootloader mode/i.test(body))
+                out.hub_fail_reason = 'bootloader_mode';
+            else if (/not responding/i.test(body))
+                out.hub_fail_reason = 'not_responding';
+            else if (/not detected/i.test(body))
+                out.hub_fail_reason = 'not_detected';
+        },
+    },
+    {
+        name: 'ppg_afe',
+        label: 'MAX86176 Pulse oximeter',
+        match: /MAX86|Pulse oximeter/i,
+        extract: (body, out) => chipDetail(body, out, 'ppg_afe'),
+    },
+    {
+        name: 'accel2',
+        label: 'LIS2DW12 Accelerometer',
+        match: /LIS2DW12/i,
+        extract: (body, out) => chipDetail(body, out, 'accel2'),
+    },
+    {
+        name: 'imu',
+        label: 'IMU',
+        match: /LSM6DS/i,
+        extract: (body, out) => chipDetail(body, out, 'imu'),
+    },
+    {
+        name: 'mag',
+        label: 'LIS2MDL Magnetometer',
+        match: /LIS2MDL/i,
+        extract: (body, out) => chipDetail(body, out, 'mag'),
+    },
+    {
+        name: 'nand_health',
+        label: 'NAND health test',
+        match: /NAND health/i,
+    },
+    {
+        name: 'nand',
+        label: 'Main flash test',
+        match: /Main flash test|read flash device ID/i,
+    },
+    { name: 'stf1', label: 'STF1 Flash test', match: /STF1/i },
+    { name: 'stf2', label: 'STF2 Flash test', match: /STF2/i },
+    { name: 'led', label: 'LED test', match: /LED test/i },
+];
+/** Shared shape of the IMU-class self-test lines: optional temperature in
+ * parentheses plus an optional failure-reason suffix. */
+function chipDetail(body, out, prefix) {
+    setNum(out, `${prefix}_temp_c`, /\(\s*(-?\d+)\s*°?\s*C\s*\)/i.exec(body)?.[1]);
+    const reason = /-\s*(Chip not detected|Signal issue|Temperature issue|DRDY\/INT issue|Unknown)/i.exec(body)?.[1];
+    if (reason)
+        out[`${prefix}_fail_reason`] = reason.trim();
+}
+function num(value) {
+    if (value == null || value === '')
+        return undefined;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : undefined;
+}
+function setNum(out, key, value) {
+    const n = num(value);
+    if (n !== undefined)
+        out[key] = n;
+}
+function setStr(out, key, value) {
+    const s = value?.trim();
+    if (s)
+        out[key] = s;
+}
+/**
+ * Fold the several ways a degree sign can reach us into a single `°`.
+ *
+ * The firmware emits a bare `0xB0` on some builds and UTF-8 `0xC2 0xB0` on
+ * others; depending on how the transport decoded the bytes we see `°`, the
+ * mojibake `Â°`, or the Unicode replacement character.
+ */
+function normalizeReportText(text) {
+    return String(text ?? '')
+        .replace(/Â°/g, '°')
+        .replace(/�/g, '°');
+}
+/** Split into lines, dropping the NAND health progress dots and re-splitting
+ * lines that the firmware's 128-byte buffer glued together. */
+function toLines(text, warnings) {
+    const out = [];
+    let stripped = 0;
+    for (const raw of text.split(/\r\n|\r|\n/)) {
+        // The NAND health test streams bare dots to keep the host's idle timer
+        // alive; they arrive with no newline of their own.
+        if (/^[.\s]*$/.test(raw) && /\./.test(raw)) {
+            stripped += 1;
+            continue;
+        }
+        const line = raw.replace(/\.{3,}\s*$/, '');
+        for (const piece of repairLine(line, warnings)) {
+            if (piece.trim())
+                out.push(piece);
+        }
+    }
+    if (stripped)
+        warnings.push(`stripped ${stripped} progress-dot line(s)`);
+    return out;
+}
+/** Re-split one physical line wherever a known line start appears mid-line. */
+function repairLine(line, warnings) {
+    let earliest = -1;
+    for (const anchor of REPAIR_ANCHORS) {
+        anchor.lastIndex = 0;
+        let m;
+        while ((m = anchor.exec(line)) !== null) {
+            if (m.index > 0 && (earliest < 0 || m.index < earliest))
+                earliest = m.index;
+        }
+    }
+    if (earliest <= 0)
+        return [line];
+    warnings.push(`repaired a line truncated by the firmware buffer near column ${earliest}`);
+    const head = line.slice(0, earliest);
+    return [head, ...repairLine(line.slice(earliest), warnings)];
+}
+/** Read the verdict keyword, if any, off the text following the test id. */
+function readVerdict(body) {
+    const m = /^\s*(PASS|FAIL|WARNING)\b/i.exec(body);
+    if (m)
+        return m[1].toUpperCase();
+    if (/not applicable/i.test(body))
+        return 'NOT_APPLICABLE';
+    if (body.trim())
+        return 'INFO';
+    return 'UNKNOWN';
+}
+/** Derive the numbering scheme from the reported firmware version. */
+function readIdScheme(version) {
+    if (!version)
+        return 'unknown';
+    const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+    if (!m)
+        return 'unknown';
+    const triple = {
+        major: Number(m[1]),
+        minor: Number(m[2]),
+        internal: Number(m[3]),
+    };
+    return compareVerisenseFirmwareVersion(triple, RENUMBER_VERSION) >= 0 ? 'v2_00_010' : 'legacy';
+}
+function emptyResult() {
+    return {
+        ok: false,
+        complete: false,
+        firmwareVersion: null,
+        idScheme: 'unknown',
+        overall: { result: null, failMaskHex: null, failMask: null, failedTestNames: [] },
+        mcu: {
+            macId: null,
+            deviceId: null,
+            part: null,
+            variant: null,
+            lastResetHex: null,
+            lastResetReasons: null,
+            bootCount: null,
+        },
+        model: null,
+        tests: [],
+        metrics: {},
+        unparsedLines: [],
+        parserWarnings: [],
+    };
+}
+/**
+ * Parse a full factory test report into structured metrics.
+ *
+ * Never throws: malformed or unrecognized input comes back with `ok: false`
+ * and/or its lines preserved in `unparsedLines`.
+ */
+function parseVerisenseFactoryTestReport(text) {
+    const result = emptyResult();
+    try {
+        parseInto(normalizeReportText(text), result);
+    }
+    catch (err) {
+        result.parserWarnings.push(`parser error: ${String(err?.message ?? err)}`);
+    }
+    return result;
+}
+function parseInto(text, result) {
+    const warnings = result.parserWarnings;
+    const lines = toLines(text, warnings);
+    const metrics = result.metrics;
+    /** Canonical name of the test each printed id was seen against, so the fail
+     * mask can be decoded under whichever numbering this report used. */
+    const nameById = new Map();
+    let ledSeen = 0;
+    /** Held in an object so the assignment inside `pushTest` stays visible to
+     * the type checker at every use site. */
+    const open = { test: null };
+    const pushTest = (test) => {
+        result.tests.push(test);
+        if (test.id != null)
+            nameById.set(test.id, test.name);
+        open.test = test;
+    };
+    const addDetail = (line) => {
+        const test = open.test;
+        if (!test)
+            return;
+        test.detail = test.detail ? `${test.detail} | ${line.trim()}` : line.trim();
+    };
+    for (const line of lines) {
+        const trimmed = line.trim();
+        if (/TEST START/.test(trimmed)) {
+            result.ok = true;
+            continue;
+        }
+        if (/TEST END/.test(trimmed)) {
+            result.complete = true;
+            continue;
+        }
+        const fw = /^Firmware version\s*:\s*v?([\d.]+)/i.exec(trimmed);
+        if (fw) {
+            result.firmwareVersion = fw[1];
+            result.idScheme = readIdScheme(fw[1]);
+            metrics.fw_version = fw[1];
+            continue;
+        }
+        const range = /Temperature pass range set to\s*(-?\d+)\s*-\s*(-?\d+)/i.exec(trimmed);
+        if (range) {
+            setNum(metrics, 'temp_range_low_c', range[1]);
+            setNum(metrics, 'temp_range_high_c', range[2]);
+            continue;
+        }
+        const overall = /^Overall Result\s*=\s*(PASS|FAIL)(?:\s*\(\s*(0x[0-9A-Fa-f]+)\s*\))?/i.exec(trimmed);
+        if (overall) {
+            result.overall.result = overall[1].toUpperCase();
+            metrics.overall_result = result.overall.result;
+            if (overall[2]) {
+                result.overall.failMaskHex = overall[2].toUpperCase().replace('0X', '0x');
+                result.overall.failMask = Number.parseInt(overall[2], 16);
+                metrics.fail_mask_hex = result.overall.failMaskHex;
+            }
+            continue;
+        }
+        // Section headers (`MCU:`, `SPIM3:` …) carry no data but end the previous
+        // test's sub-line run.
+        if (/^(?:MCU|I\/O status|Battery|Shimmer model|TWIM0|TWIM1 \(part ?\d\)|SPIM2|SPIM3)\s*:$/i.test(trimmed)) {
+            open.test = null;
+            continue;
+        }
+        if (readMcuHeaderLine(trimmed, result, metrics))
+            continue;
+        // `LED test (WS_TEST_0019):` — the first such block is the operational
+        // status LED, the second the battery LED. Ordering survives renumbering.
+        const ledHeader = /^LED test\s*\(\s*WS_TEST_(\d{4})\s*\)\s*:/i.exec(trimmed);
+        if (ledHeader) {
+            const name = ledSeen === 0 ? 'led_status' : 'led_batt';
+            ledSeen += 1;
+            pushTest({
+                id: Number(ledHeader[1]),
+                name,
+                label: name === 'led_status' ? 'LED test - operational status' : 'LED test - battery status',
+                verdict: 'INFO',
+                detail: '',
+                metrics: {},
+            });
+            // Deliberately no `<name>_result` metric: an INFO verdict carries no
+            // data (the LED test is operator-visual narration), and which suite ran
+            // is already recorded by the caller's factory-test-type column. The
+            // verdict is still on the tests[] entry for anyone who wants it.
+            continue;
+        }
+        const idLine = /^-?\s*WS_TEST_(\d{4})\s*-\s*(.*)$/i.exec(trimmed.replace(/^-\s*/, '- '));
+        if (idLine) {
+            const id = Number(idLine[1]);
+            const body = idLine[2] ?? '';
+            const verdict = readVerdict(body);
+            const classifier = CLASSIFIERS.find((c) => c.match.test(body));
+            let name = classifier?.name ?? `ws_test_${idLine[1]}`;
+            let label = classifier?.label ?? `WS_TEST_${idLine[1]}`;
+            if (name === 'led') {
+                // Not-applicable LED lines come through the id path rather than as a
+                // `LED test (…):` header.
+                name = ledSeen === 0 ? 'led_status' : 'led_batt';
+                label =
+                    name === 'led_status' ? 'LED test - operational status' : 'LED test - battery status';
+                ledSeen += 1;
+            }
+            const testMetrics = {};
+            classifier?.extract?.(body, testMetrics);
+            if (!classifier)
+                scrapeGenericMetrics(body, name, testMetrics);
+            // A verdict column is only worth a spreadsheet cell when it can vary:
+            // PASS/FAIL/WARNING record an outcome and NOT_APPLICABLE records a
+            // model gate, but INFO just means "an informational line printed" — its
+            // substance is already in that line's own metrics (usb_power_good,
+            // charger_status, ...), so emitting it would waste a column per test.
+            if (verdict !== 'INFO') {
+                const resultKey = classifier?.resultKey ?? `${name}_result`;
+                testMetrics[resultKey] = verdict;
+            }
+            pushTest({ id, name, label, verdict, detail: body.trim(), metrics: testMetrics });
+            Object.assign(metrics, testMetrics);
+            continue;
+        }
+        if (readSubLine(trimmed, result, metrics, open.test, addDetail))
+            continue;
+        // LED narration (`- All LEDs off`, `- Left Red LED on`) belongs to the LED
+        // test currently open.
+        if (open.test && /^-\s*(All|Left|Right)\b.*LED/i.test(trimmed)) {
+            addDetail(trimmed.replace(/^-\s*/, ''));
+            continue;
+        }
+        result.unparsedLines.push(line);
+    }
+    // Decode the fail mask through the ids this report actually used.
+    if (result.overall.failMask != null) {
+        const names = [];
+        for (let bit = 0; bit < 32; bit += 1) {
+            if (!(result.overall.failMask & (1 << bit)))
+                continue;
+            const id = bit + 1;
+            names.push(nameById.get(id) ?? `ws_test_${String(id).padStart(4, '0')}`);
+        }
+        result.overall.failedTestNames = names;
+    }
+}
+/** MCU identification lines printed above the first test. */
+function readMcuHeaderLine(trimmed, result, metrics) {
+    const mac = /^-?\s*MAC ID\s*:\s*([0-9A-Fa-f]+)/.exec(trimmed);
+    if (mac) {
+        result.mcu.macId = mac[1].toUpperCase();
+        // Named ble_mac, not mac_id: this is the full 12-hex BLE MAC from the
+        // report, distinct from the production config's 4-hex "MAC ID" suffix that
+        // callers pass as a mac_id meta column. Sharing the name collided the two.
+        metrics.ble_mac = result.mcu.macId;
+        return true;
+    }
+    const dev = /^Device ID\s*:\s*(\S+)/i.exec(trimmed);
+    if (dev) {
+        result.mcu.deviceId = dev[1];
+        metrics.device_id = dev[1];
+        return true;
+    }
+    const part = /^Part\s*:\s*(\S+?)\s*,\s*Variant\s*:\s*(\S+)/i.exec(trimmed);
+    if (part) {
+        result.mcu.part = part[1];
+        result.mcu.variant = part[2];
+        metrics.mcu_part = part[1];
+        metrics.mcu_variant = part[2];
+        return true;
+    }
+    const reset = /^Last reset\s*:\s*(0x[0-9A-Fa-f]+)\s*(.*?)\s*,\s*boot count\s*=\s*(\d+)/i.exec(trimmed);
+    if (reset) {
+        result.mcu.lastResetHex = reset[1];
+        result.mcu.lastResetReasons = reset[2].replace(/^\(|\)$/g, '').trim() || null;
+        result.mcu.bootCount = Number(reset[3]);
+        metrics.last_reset_hex = reset[1];
+        if (result.mcu.lastResetReasons)
+            metrics.last_reset_reasons = result.mcu.lastResetReasons;
+        setNum(metrics, 'boot_count', reset[3]);
+        return true;
+    }
+    return false;
+}
+/**
+ * Indented continuation lines, dispatched on their own wording rather than on
+ * which test is open. A value always lands in the GLOBAL metrics map under its
+ * own name, so the flat map is correct even when the parent line went missing;
+ * it is additionally attached to the currently open test's entry when one
+ * exists, so a stray sub-line after an unrelated test would show up on that
+ * test's `metrics`/`detail` (the tests[] attachment is best-effort context,
+ * not the source of truth).
+ */
+function readSubLine(trimmed, result, metrics, current, addDetail) {
+    const put = (key, value) => {
+        metrics[key] = value;
+        if (current)
+            current.metrics[key] = value;
+    };
+    // --- Shimmer model block ---
+    const name = /^Name\s*:\s*(.+?)(?:\s*\(\s*(SR[\d-]+)\s*\))?\s*$/i.exec(trimmed);
+    if (name) {
+        result.model ?? (result.model = emptyModel());
+        result.model.name = name[1].trim();
+        put('model_name', result.model.name);
+        if (name[2]) {
+            result.model.srRevision = name[2];
+            put('model_sr_revision', name[2]);
+        }
+        addDetail(trimmed);
+        return true;
+    }
+    const mo = /^Manufacturing Order\s*\|\s*MAC\s*:\s*([0-9A-Fa-f]+)\s*\|\s*([0-9A-Fa-f]+)/i.exec(trimmed);
+    if (mo) {
+        result.model ?? (result.model = emptyModel());
+        result.model.manufacturingOrder = mo[1].toUpperCase();
+        result.model.macSuffix = mo[2].toUpperCase();
+        put('model_mo', result.model.manufacturingOrder);
+        put('model_mac_suffix', result.model.macSuffix);
+        addDetail(trimmed);
+        return true;
+    }
+    const advPrefix = /^Advertising Prefix\s*:\s*(.+?)\s*$/i.exec(trimmed);
+    if (advPrefix) {
+        result.model ?? (result.model = emptyModel());
+        result.model.advertisingPrefix = advPrefix[1];
+        put('adv_prefix', advPrefix[1]);
+        addDetail(trimmed);
+        return true;
+    }
+    const passkeyId = /^Passkey ID\s*:\s*(\S+)\s*(?:\(([^)]*)\))?/i.exec(trimmed);
+    if (passkeyId) {
+        result.model ?? (result.model = emptyModel());
+        result.model.passkeyId = passkeyId[1];
+        put('passkey_id', passkeyId[1]);
+        if (passkeyId[2]) {
+            result.model.passkeyKind = passkeyId[2].trim();
+            put('passkey_kind', result.model.passkeyKind);
+        }
+        addDetail(trimmed);
+        return true;
+    }
+    // The passkey value itself is a device secret — record only that one is set.
+    if (/^Passkey\s*:/i.test(trimmed)) {
+        addDetail('Passkey: (not recorded)');
+        return true;
+    }
+    // --- Main flash geometry ---
+    const manufacturer = /^Manufacturer\s*=\s*(.+?)\s*$/i.exec(trimmed);
+    if (manufacturer) {
+        put('nand_manufacturer', manufacturer[1]);
+        addDetail(trimmed);
+        return true;
+    }
+    const model = /^Model\s*=\s*(.+?)\s*$/i.exec(trimmed);
+    if (model) {
+        put('nand_model', model[1]);
+        addDetail(trimmed);
+        return true;
+    }
+    const size = /^Size\s*=\s*(\d+)\s*MB/i.exec(trimmed);
+    if (size) {
+        put('nand_size_mb', Number(size[1]));
+        addDetail(trimmed);
+        return true;
+    }
+    // --- NAND health ---
+    const census = /^Bad-block census\s*=\s*(\d+)\s*of\s*(\d+)\s*\(\s*limit\s*(\d+)\s*\)/i.exec(trimmed);
+    if (census) {
+        put('nand_bad_blocks', Number(census[1]));
+        put('nand_bad_block_total', Number(census[2]));
+        put('nand_bad_block_limit', Number(census[3]));
+        addDetail(trimmed);
+        return true;
+    }
+    const stress = /^Stress\s*=\s*(\d+)\s*blocks\s*\/\s*(\d+)\s*page checks(?:\s*\(\s*(\d+)\s*sampled blocks skipped bad\s*\))?/i.exec(trimmed);
+    if (stress) {
+        put('nand_stress_blocks', Number(stress[1]));
+        put('nand_page_checks', Number(stress[2]));
+        if (stress[3] != null)
+            put('nand_blocks_skipped', Number(stress[3]));
+        addDetail(trimmed);
+        return true;
+    }
+    const pages = /^Corrupt pages\s*=\s*(\d+)\s*,\s*unstable pages\s*=\s*(\d+)\s*,\s*erase\/write fails\s*=\s*(\d+)\s*\/\s*(\d+)/i.exec(trimmed);
+    if (pages) {
+        put('nand_corrupt_pages', Number(pages[1]));
+        put('nand_unstable_pages', Number(pages[2]));
+        put('nand_erase_write_fails', `${pages[3]}/${pages[4]}`);
+        addDetail(trimmed);
+        return true;
+    }
+    // Progress line for the health test; the verdict follows separately.
+    if (/^NAND health\s*:/i.test(trimmed))
+        return true;
+    return false;
+}
+function emptyModel() {
+    return {
+        name: null,
+        srRevision: null,
+        manufacturingOrder: null,
+        macSuffix: null,
+        advertisingPrefix: null,
+        passkeyId: null,
+        passkeyKind: null,
+    };
+}
+/**
+ * Fallback for a test this build of the SDK has never seen: keep any
+ * `Key = value` pairs so a firmware change still lands data in the sheet.
+ */
+function scrapeGenericMetrics(body, name, out) {
+    const re = /([A-Za-z][A-Za-z0-9 _-]{0,40}?)\s*=\s*([-+]?\d+(?:\.\d+)?)/g;
+    let m;
+    while ((m = re.exec(body)) !== null) {
+        const key = `${name}_${m[1]
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '_')}`;
+        setNum(out, key, m[2]);
+    }
+}
+/**
+ * Render a parsed report as two CSV rows (header, values): the caller's `meta`
+ * columns first, then the parsed metrics sorted by name. A metric whose name
+ * collides with a meta column is dropped in favour of the meta value — the
+ * caller's identity columns are authoritative, and a duplicated header name
+ * breaks most CSV consumers.
+ */
+function verisenseFactoryTestReportToCsvRows(parsed, meta = {}) {
+    // Normalized once and used for both key discovery and value lookup, so a
+    // null/undefined `parsed` from a plain-JS caller cannot throw here.
+    const metrics = parsed?.metrics ?? {};
+    const metaKeys = Object.keys(meta);
+    const metaKeySet = new Set(metaKeys);
+    const metricKeys = Object.keys(metrics)
+        .filter((k) => !metaKeySet.has(k))
+        .sort();
+    const header = [...metaKeys, ...metricKeys].map(csvCell).join(',');
+    const values = [...metaKeys.map((k) => meta[k]), ...metricKeys.map((k) => metrics[k])]
+        .map(csvCell)
+        .join(',');
+    return [header, values];
+}
+
 exports.ASM_COMMAND = ASM_COMMAND;
 exports.ASM_PROPERTY = ASM_PROPERTY;
 exports.BASE_HARDWARE_IDS = BASE_HARDWARE_IDS;
@@ -15984,6 +17199,10 @@ exports.SDLOG_HW_ID = SDLOG_HW_ID;
 exports.SDLOG_SYNC_BLOCK_LENGTH = SDLOG_SYNC_BLOCK_LENGTH;
 exports.SDLOG_SYNC_OFFSET_LENGTH = SDLOG_SYNC_OFFSET_LENGTH;
 exports.SDLogHeaderBitmask = SDLogHeaderBitmask;
+exports.SERIAL_DFU_EXTENDED_ERROR_NAMES = SERIAL_DFU_EXTENDED_ERROR_NAMES;
+exports.SERIAL_DFU_OBJECT_TYPE = SERIAL_DFU_OBJECT_TYPE;
+exports.SERIAL_DFU_OP = SERIAL_DFU_OP;
+exports.SERIAL_DFU_RESULT_NAMES = SERIAL_DFU_RESULT_NAMES;
 exports.SHIMMER3R_DEFAULTS = SHIMMER3R_DEFAULTS;
 exports.SHIMMER3_ACK = ACK;
 exports.SHIMMER3_DEFAULTS = SHIMMER3_DEFAULTS;
@@ -16016,6 +17235,7 @@ exports.SensorPPG = SensorPPG;
 exports.SensorVD6283 = SensorVD6283;
 exports.Shimmer3Client = Shimmer3Client;
 exports.Shimmer3RClient = Shimmer3RClient;
+exports.SlipDecoder = SlipDecoder;
 exports.SmartDockClient = SmartDockClient;
 exports.StreamStatsTracker = StreamStatsTracker;
 exports.TEST_MODE_ID = TEST_MODE_ID;
@@ -16032,6 +17252,7 @@ exports.VERISENSE_BLE_SYNC_SCHEDULES = VERISENSE_BLE_SYNC_SCHEDULES;
 exports.VERISENSE_CALIBRATION_MIN_FW = VERISENSE_CALIBRATION_MIN_FW;
 exports.VERISENSE_DEFAULT_PASSKEY_BY_ID = VERISENSE_DEFAULT_PASSKEY_BY_ID;
 exports.VERISENSE_DFU_BOOTLOADER_NAME_PREFIX = VERISENSE_DFU_BOOTLOADER_NAME_PREFIX;
+exports.VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES = VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES;
 exports.VERISENSE_DFU_CONNECT_ATTEMPTS = VERISENSE_DFU_CONNECT_ATTEMPTS;
 exports.VERISENSE_DFU_FAST_PACKET_DELAY_MS = VERISENSE_DFU_FAST_PACKET_DELAY_MS;
 exports.VERISENSE_DFU_REBOOT_DELAY_MS = VERISENSE_DFU_REBOOT_DELAY_MS;
@@ -16049,8 +17270,15 @@ exports.VERISENSE_OPERATIONAL_FIELD_SCHEMA = VERISENSE_OPERATIONAL_FIELD_SCHEMA;
 exports.VERISENSE_OP_CONFIG_BYTE_SIZE = VERISENSE_OP_CONFIG_BYTE_SIZE;
 exports.VERISENSE_SENSOR_ENABLE_FIELDS = VERISENSE_SENSOR_ENABLE_FIELDS;
 exports.VERISENSE_SENSOR_RATE_DEFAULT_GROUPS = VERISENSE_SENSOR_RATE_DEFAULT_GROUPS;
+exports.VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS = VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS;
+exports.VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS = VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS;
 exports.VERISENSE_STREAM_SENSOR_LABELS = VERISENSE_STREAM_SENSOR_LABELS;
+exports.VERISENSE_USB_DFU_PID = VERISENSE_USB_DFU_PID;
+exports.VERISENSE_USB_DFU_PORT_FILTERS = VERISENSE_USB_DFU_PORT_FILTERS;
+exports.VERISENSE_USB_DFU_REENUMERATION_DELAY_MS = VERISENSE_USB_DFU_REENUMERATION_DELAY_MS;
+exports.VERISENSE_USB_DFU_VID = VERISENSE_USB_DFU_VID;
 exports.VerisenseBleDevice = VerisenseBleDevice;
+exports.VerisenseSerialDfu = VerisenseSerialDfu;
 exports.WIRED_DEFAULTS = WIRED_DEFAULTS;
 exports.WIRED_NEED_MORE = NEED_MORE$1;
 exports.WIRED_RESYNC = RESYNC$1;
@@ -16093,6 +17321,7 @@ exports.classifyVerisenseDfuError = classifyVerisenseDfuError;
 exports.compareVerisenseFirmwareVersion = compareVerisenseFirmwareVersion;
 exports.computeVerisensePairingPin = computeVerisensePairingPin;
 exports.crc16_ccitt_false = crc16_ccitt_false;
+exports.crc32 = crc32;
 exports.createBlankVerisenseOperationalConfig = createBlankVerisenseOperationalConfig;
 exports.csvCell = csvCell;
 exports.decodeSdLogFile = decodeSdLogFile;
@@ -16151,6 +17380,7 @@ exports.isSupportedMpl = isSupportedMpl;
 exports.isSupportedRtcConfigViaUart = isSupportedRtcConfigViaUart;
 exports.isSupportedSdLogSync = isSupportedSdLogSync;
 exports.isUniformByteArray = isUniformByteArray;
+exports.isUsbDfuUnsupportedError = isUsbDfuUnsupportedError;
 exports.isVerisenseGsrSupportedHardware = isVerisenseGsrSupportedHardware;
 exports.isVerisenseLightDarkChannelEnabled = isVerisenseLightDarkChannelEnabled;
 exports.isVerisenseLipoBatteryHardware = isVerisenseLipoBatteryHardware;
@@ -16196,6 +17426,7 @@ exports.parseSmartDockVersion = parseSmartDockVersion;
 exports.parseStatusPayload = parseStatusPayload;
 exports.parseUartPacket = parseUartPacket;
 exports.parseVerisenseAdvertisedName = parseVerisenseAdvertisedName;
+exports.parseVerisenseFactoryTestReport = parseVerisenseFactoryTestReport;
 exports.parseVersionInfo = parseVersionInfo;
 exports.patchSecureDfuSendOperation = patchSecureDfuSendOperation;
 exports.promiseWithTimeout = promiseWithTimeout;
@@ -16212,6 +17443,7 @@ exports.shimmerUartCrcByte = shimmerUartCrcByte;
 exports.shimmerUartCrcCalc = shimmerUartCrcCalc;
 exports.shimmerUartCrcCheck = shimmerUartCrcCheck;
 exports.shouldOverrideCalibration = shouldOverrideCalibration;
+exports.slipEncode = slipEncode;
 exports.supportsVerisenseCalibration = supportsVerisenseCalibration;
 exports.supportsVerisenseMagnetometer = supportsVerisenseMagnetometer;
 exports.unixSecondsToAsmRtcBytes = unixSecondsToAsmRtcBytes;
@@ -16220,6 +17452,7 @@ exports.updateVerisenseDfuImageWithRetry = updateVerisenseDfuImageWithRetry;
 exports.utcToLocalCivilMillis = utcToLocalCivilMillis;
 exports.verisenseDeviceFileTag = verisenseDeviceFileTag;
 exports.verisenseDfuAttemptLabel = verisenseDfuAttemptLabel;
+exports.verisenseFactoryTestReportToCsvRows = verisenseFactoryTestReportToCsvRows;
 exports.wiredPacketLength = wiredPacketLength;
 exports.writeVerisenseOperationalFieldValue = writeVerisenseOperationalFieldValue;
 //# sourceMappingURL=shimmer-web-sdk.cjs.map

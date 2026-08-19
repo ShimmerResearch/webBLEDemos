@@ -598,11 +598,19 @@ declare class RtcDriftMonitor {
     /** Elapsed span of the current sample series in minutes (0 when empty). */
     elapsedMinutes(): number;
     /**
-     * CSV rows (header first) of the current series, matching the DEV-844
-     * export format: host ISO time, host/device unix seconds, offset, rtt,
-     * monotonic seconds.
+     * CSV rows of the current series, matching the DEV-844 export format: a
+     * header row (host ISO time, host/device unix seconds, offset, rtt,
+     * monotonic seconds) followed by one row per sample.
+     *
+     * Optional `metadata` is emitted as `# key: value` comment lines BEFORE the
+     * header (so the header is no longer row 0 when metadata is supplied), so a
+     * saved file records what it came from (device, transport, the fit result,
+     * etc.) - the S3R drift tool established this preamble and the console
+     * adopts it. Each value has newlines collapsed so every entry stays a single
+     * comment line; a caller can read the fit via
+     * {@link ppmFit}/{@link deviceSteps}/{@link hostSteps} to build the map.
      */
-    toCsvRows(): string[];
+    toCsvRows(metadata?: Record<string, string | number>): string[];
 }
 
 /**
@@ -1349,6 +1357,35 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     setGSRRange(gsrRange: number): Promise<{
         gsrRange: number;
+        ackRemainder: Uint8Array | null;
+    }>;
+    /**
+     * Set the wide-range accelerometer (LIS2DW12) range.
+     *
+     * Also updates {@link imuRanges} so streaming calibration picks the matching
+     * sensitivity straight away. An inquiry would refresh it from the config word
+     * anyway, but callers are free to set the range after their last inquiry.
+     *
+     * @param wrAccelRange 0 = ±2 g, 1 = ±4 g, 2 = ±8 g, 3 = ±16 g.
+     */
+    setWrAccelRange(wrAccelRange: number): Promise<{
+        wrAccelRange: number;
+        ackRemainder: Uint8Array | null;
+    }>;
+    /**
+     * Set the gyroscope (LSM6DSV) range.
+     *
+     * Also updates {@link imuRanges}, as {@link setWrAccelRange} does.
+     *
+     * Note the firmware splits this setting across two config-setup bits when it
+     * reports back in an inquiry (LSB pair plus one MSB bit), but the command
+     * itself takes the full 0–5 index in one byte.
+     *
+     * @param gyroRange 0 = ±125, 1 = ±250, 2 = ±500, 3 = ±1000, 4 = ±2000,
+     *   5 = ±4000 dps. (Shimmer3 supports only 0–3: ±250/500/1000/2000 dps.)
+     */
+    setGyroRange(gyroRange: number): Promise<{
+        gyroRange: number;
         ackRemainder: Uint8Array | null;
     }>;
     getInternalExpPower(): number;
@@ -4383,6 +4420,14 @@ interface VerisenseStatusPayload {
     chargerStatusCode: number | null;
     /** Decoded charger status enum label from chargerStatusCode. */
     chargerStatusName: 'CHARGER_STATUS_BAD_BATTERY' | 'CHARGER_STATUS_CHARGING' | 'CHARGER_STATUS_CHARGING_COMPLETE' | 'CHARGER_STATUS_POWER_DOWN' | 'CHARGER_STATUS_TRICKLE_CHARGING' | 'CHARGER_STATUS_NOT_READ' | 'CHARGER_STATUS_UNKNOWN' | null;
+    /**
+     * Byte 65 bit0 (second status-flags byte — byte 26's flags are full): the
+     * installed bootloader's DFU mode has the USB CDC transport (settings page
+     * reports bootloader version >= 3), so USB DFU is available on this unit.
+     * Null when the firmware predates the field (payload < 66 bytes) — treat
+     * as unknown, not as unsupported.
+     */
+    usbDfuBootloader: boolean | null;
 }
 interface VerisenseUnixAndHumanTimestamp {
     unix: number;
@@ -6273,6 +6318,24 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
      */
     enableDfuServiceOnNextDisconnect(): Promise<void>;
     /**
+     * Request a reboot straight into the DFU bootloader over the USB serial
+     * transport.
+     *
+     * Writes the same ASM `DFU_MODE` property, but the firmware's USB handling
+     * differs from BLE: it ACKs and resets into the bootloader ~300 ms later
+     * (the delay lets the ACK drain), after which THIS serial port disappears
+     * and the bootloader enumerates as its own USB CDC device (0x1915/0x521F,
+     * "Verisense DFU" — see `VERISENSE_USB_DFU_PORT_FILTERS`). Expect the
+     * transport to drop shortly after this resolves.
+     *
+     * Firmware running on a BLE-only (v2) bootloader NACKs instead of
+     * rebooting (`isUsbDfuUnsupportedError` classifies the rejection); fall
+     * back to the BLE DFU flow there. Only meaningful on a serial connection —
+     * over BLE the same property write follows the
+     * {@link enableDfuServiceOnNextDisconnect} semantics.
+     */
+    requestUsbDfuBootloaderReboot(): Promise<void>;
+    /**
      * Reboot the device straight into the Nordic Secure DFU bootloader using the
      * buttonless DFU service.
      *
@@ -6524,13 +6587,19 @@ declare const VERISENSE_DFU_SET_MODE_TIMEOUT_MS = 30000;
 declare const VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS = 10;
 declare const VERISENSE_DFU_FAST_PACKET_DELAY_MS = 0;
 /**
- * The Verisense bootloader advertises as "Verisense-BL..."; app-mode sensors
- * ("Verisense-..." without the -BL) are deliberately excluded from DFU device
- * pickers to keep them unambiguous. The DFU service UUID is not advertised in
- * app mode, so it cannot be used to widen the filter; it still needs to be
- * granted via `optionalServices` for the GATT connection.
+ * The Verisense bootloader advertises with a MAC-suffixed name; app-mode
+ * sensors ("Verisense-..." without the marker) are deliberately excluded from
+ * DFU device pickers to keep them unambiguous. The DFU service UUID is not
+ * advertised in app mode, so it cannot be used to widen the filter; it still
+ * needs to be granted via `optionalServices` for the GATT connection.
+ *
+ * Two prefixes exist across the fleet: v3 (BLE+USB) bootloaders advertise
+ * "Verisense-DFU-XXXX" — harmonised with their USB product string so the same
+ * name identifies a unit on either transport — while fielded v2 (BLE-only)
+ * bootloaders advertise "Verisense-BL-XXXX" forever. Pickers must match both.
  */
 declare const VERISENSE_DFU_BOOTLOADER_NAME_PREFIX = "Verisense-BL";
+declare const VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES: readonly string[];
 /**
  * The library's routine object-retransmission notices (e.g. "object failed to
  * validate"). Over Web Bluetooth, firmware packets are written without
@@ -6646,8 +6715,8 @@ declare function isSafeFirmwareArchiveName(name: unknown): name is string;
 /**
  * `navigator.bluetooth.requestDevice()` options for picking a Verisense
  * bootloader (replaces the DFU library's `acceptAllDevices`; see
- * {@link VERISENSE_DFU_BOOTLOADER_NAME_PREFIX} for why name-prefix only).
- * Pass the vendored library's `SecureDfu.SERVICE_UUID`.
+ * {@link VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES} for why name-prefix only and
+ * why there are two). Pass the vendored library's `SecureDfu.SERVICE_UUID`.
  */
 declare function buildVerisenseDfuRequestDeviceOptions(dfuServiceUuid: string | number): {
     filters: {
@@ -6713,6 +6782,146 @@ declare function setVerisenseDfuModeWithRetry(dfu: SecureDfuLike, device: Blueto
  * it through {@link classifyVerisenseDfuError} for display).
  */
 declare function runVerisenseDfuUpdate(dfu: SecureDfuLike, device: BluetoothDevice, dfuPackage: VerisenseDfuPackage, options?: VerisenseDfuFlowOptions): Promise<void>;
+
+/** SLIP-encode one frame (terminating END appended; none prepended, matching
+ * Nordic's encoder). */
+declare function slipEncode(frame: Uint8Array | number[]): Uint8Array;
+/**
+ * Streaming SLIP decoder: feed arbitrary chunks, get back completed frames.
+ * Empty frames (back-to-back ENDs) are dropped, matching Nordic's decoder.
+ */
+declare class SlipDecoder {
+    private _frame;
+    private _escaped;
+    /** Decode a chunk; returns every frame completed by it (possibly none). */
+    push(chunk: Uint8Array): Uint8Array[];
+    reset(): void;
+}
+/** CRC-32 of `data`, continuing from `seed` (pass a previous crc32 result to
+ * extend it). Returns an unsigned 32-bit value. */
+declare function crc32(data: Uint8Array, seed?: number): number;
+/** Request opcodes (identical to the BLE control-point opcodes; over serial,
+ * data writes are the explicit OBJECT_WRITE opcode instead of a second
+ * characteristic). */
+declare const SERIAL_DFU_OP: Readonly<{
+    OBJECT_CREATE: 1;
+    RECEIPT_NOTIF_SET: 2;
+    CRC_GET: 3;
+    OBJECT_EXECUTE: 4;
+    OBJECT_SELECT: 6;
+    MTU_GET: 7;
+    OBJECT_WRITE: 8;
+    PING: 9;
+    RESPONSE: 96;
+}>;
+declare const SERIAL_DFU_OBJECT_TYPE: Readonly<{
+    COMMAND: 1;
+    DATA: 2;
+}>;
+/** Result codes carried in responses (nrf_dfu_response_t). */
+declare const SERIAL_DFU_RESULT_NAMES: Readonly<Record<number, string>>;
+/** Extended-error codes (nrf_dfu_ext_error_code_t) that follow result 0x0B. */
+declare const SERIAL_DFU_EXTENDED_ERROR_NAMES: Readonly<Record<number, string>>;
+/**
+ * The v3 bootloader's USB identity in DFU mode. Deliberately distinct from
+ * the application's CDC port (0x1915/0x520F) so a Web Serial picker — which
+ * can only filter on VID/PID — shows exactly the bootloader.
+ */
+declare const VERISENSE_USB_DFU_VID = 6421;
+declare const VERISENSE_USB_DFU_PID = 21023;
+/** `navigator.serial.requestPort()` filters for the bootloader's DFU port. */
+declare const VERISENSE_USB_DFU_PORT_FILTERS: ReadonlyArray<{
+    usbVendorId: number;
+    usbProductId: number;
+}>;
+/**
+ * After the firmware ACKs a `DFU_MODE` request received over USB it reboots
+ * ~300 ms later (the delay lets the ACK drain), the application port
+ * disappears, and the bootloader enumerates as 0x1915/0x521F. Give the OS a
+ * moment to enumerate before offering the picker.
+ */
+declare const VERISENSE_USB_DFU_REENUMERATION_DELAY_MS = 2000;
+/**
+ * True when a `DFU_MODE` property-write rejection means the unit cannot enter
+ * DFU mode from USB: firmware on a BLE-only (v2) bootloader NACKs the request
+ * (the reboot would strand the device off the bus until the bootloader's
+ * inactivity timeout). The caller should fall back to the BLE DFU flow.
+ *
+ * Keyed on the DFU_MODE property code (0x6) in the client's NACK message
+ * ("Device returned NACK command=0x.. property=0x6", unpadded hex — see
+ * `validatePendingResponse` in requestValidation.ts) so NACKs from unrelated
+ * requests are never misclassified as "USB DFU unsupported".
+ */
+declare function isUsbDfuUnsupportedError(error: unknown): boolean;
+/** The slice of {@link WebSerialTransport} this module drives (structural, so
+ * tests can supply a mock and no import cycle is created). */
+interface SerialDfuTransportLike {
+    write(data: Uint8Array): Promise<void>;
+    onNotify(cb: (data: Uint8Array) => void): () => void;
+}
+interface VerisenseSerialDfuProgress {
+    object: 'init' | 'firmware';
+    totalBytes: number;
+    currentBytes: number;
+}
+interface VerisenseSerialDfuOptions {
+    /** User-facing progress text (same role as the BLE flow's onStatus). */
+    onStatus?: (message: string) => void;
+    /** Byte-level transfer progress (same field names as the vendored
+     * `SecureDfu` "progress" events, so UI code is shared). */
+    onProgress?: (progress: VerisenseSerialDfuProgress) => void;
+    /** Diagnostic log lines (protocol chatter; not for end users). */
+    onLog?: (message: string) => void;
+    /**
+     * Bound on each request/response exchange. Execute of the final data object
+     * covers the bootloader's signature verification and can take several
+     * seconds; the default is generous because USB itself is not the
+     * bottleneck.
+     */
+    requestTimeoutMs?: number;
+    /** Attempts per data object before giving up (a CRC mismatch re-creates and
+     * re-sends just that object). */
+    objectAttempts?: number;
+}
+declare const VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS = 15000;
+declare const VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS = 3;
+/**
+ * Nordic secure DFU over a SLIP-framed serial byte stream.
+ *
+ * One instance drives one transfer session; construct it around a connected
+ * transport whose port is the bootloader's DFU port (see
+ * {@link VERISENSE_USB_DFU_PORT_FILTERS}) and call {@link update} with the
+ * `initData`/`imageData` of each image in the package (base image first when
+ * present, application after — same ordering as `runVerisenseDfuUpdate`).
+ */
+declare class VerisenseSerialDfu {
+    private readonly _transport;
+    private readonly _options;
+    private readonly _decoder;
+    private _pending;
+    private _unsubscribe;
+    private _mtu;
+    constructor(transport: SerialDfuTransportLike, options?: VerisenseSerialDfuOptions);
+    /** Max unencoded bytes per OBJECT_WRITE frame: worst-case SLIP encoding
+     * doubles every byte, plus the terminating END, minus the opcode byte
+     * (matches nrfutil's `(mtu - 1) // 2 - 1`). */
+    get maxWriteSize(): number;
+    /**
+     * Transfer one image (init packet + firmware binary). Resolves when the
+     * final Execute is acknowledged — for an application image that is the
+     * point where the bootloader resets to activate it, which also drops the
+     * serial port; the caller should expect the port to disappear.
+     */
+    update(init: ArrayBuffer, image: ArrayBuffer): Promise<void>;
+    private _handshake;
+    private _transferInit;
+    private _transferFirmware;
+    private _writeData;
+    private _select;
+    private _crcGet;
+    private _request;
+    private _onData;
+}
 
 /**
  * Verisense calibration defaults, hardware/firmware gating, and timestamp helpers.
@@ -6787,5 +6996,115 @@ type VerisenseCalibrationAvailability = 'enabled' | 'disabled' | 'hidden';
  */
 declare function getVerisenseCalibrationSensorAvailability(support: VerisenseHardwareSensorSupport | null | undefined): Record<number, VerisenseCalibrationAvailability>;
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SHIMMER3R_DEFAULTS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, WIRED_DEFAULTS, NEED_MORE as WIRED_NEED_MORE, RESYNC as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, buildBaseCommand, buildDefaultVerisenseCalibrationSet, buildHeader, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseCalibDump, parseCalibrationBlob, parseEventLogPayload, parseExpansionBoard, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, wiredPacketLength, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemContext, InfoMemDeviceConfig, InfoMemLayout, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+/**
+ * Parser for the plain-text factory test report streamed by the Verisense
+ * firmware (`Includes/ASM_common_source/Test/hal_factoryTest.c`), turning it
+ * into a flat map of named metrics suitable for a spreadsheet row.
+ *
+ * Two properties drive the whole design:
+ *
+ * 1. **Tests are identified by line content, never by the printed
+ *    `WS_TEST_00NN` number.** The IDs were renumbered at firmware v2.00.010
+ *    (the LF-crystal test took 0003 and everything from the old 0003 up to
+ *    0019 shifted by one), so the same number means different tests across
+ *    builds while the descriptive text stayed stable. Printed IDs are still
+ *    recorded per test and collected into an observed id-to-name map, which is
+ *    what decodes the `Overall Result = FAIL (0x…)` bitmask — so the mask is
+ *    read correctly under either numbering.
+ *
+ * 2. **The report format is unversioned and still changing.** Nothing here
+ *    throws: unrecognized test lines become generic entries, unrecognized text
+ *    is preserved verbatim in `unparsedLines`, and the caller keeps the raw
+ *    report alongside the parse.
+ */
+/** Verdict carried by a single report line. */
+type VerisenseFactoryTestVerdict = 'PASS' | 'FAIL' | 'WARNING' | 'NOT_APPLICABLE' | 'INFO' | 'UNKNOWN';
+/** A value extracted from the report, as it should land in a spreadsheet cell. */
+type VerisenseFactoryTestMetricValue = number | string | boolean;
+/** One test as it appeared in the report. */
+interface VerisenseFactoryTestResult {
+    /** The `WS_TEST_00NN` number printed in *this* report, or null if the line
+     * carried none. Not stable across firmware versions — see `name`. */
+    id: number | null;
+    /** Canonical snake_case key derived from the line's content. Stable across
+     * firmware versions; this is what column names are built from. */
+    name: string;
+    /** Human-readable test name, e.g. `'VD6283TX Light sensor'`. */
+    label: string;
+    verdict: VerisenseFactoryTestVerdict;
+    /** The report text for this test, sub-lines joined with `' | '`. */
+    detail: string;
+    metrics: Record<string, VerisenseFactoryTestMetricValue>;
+}
+/** MCU header block printed above the first test. */
+interface VerisenseFactoryTestMcuInfo {
+    macId: string | null;
+    deviceId: string | null;
+    part: string | null;
+    variant: string | null;
+    lastResetHex: string | null;
+    lastResetReasons: string | null;
+    bootCount: number | null;
+}
+/** The indented production-config block printed by the Shimmer model test. */
+interface VerisenseFactoryTestModelInfo {
+    name: string | null;
+    srRevision: string | null;
+    manufacturingOrder: string | null;
+    macSuffix: string | null;
+    advertisingPrefix: string | null;
+    passkeyId: string | null;
+    passkeyKind: string | null;
+}
+/** Overall verdict block printed just before the TEST END banner. */
+interface VerisenseFactoryTestOverall {
+    /** null when the report never reached its footer (e.g. a blank board aborts
+     * the run at the Shimmer model test). */
+    result: 'PASS' | 'FAIL' | null;
+    failMaskHex: string | null;
+    failMask: number | null;
+    /** Canonical names of the tests whose bits are set, resolved through the ids
+     * actually observed in this report. */
+    failedTestNames: string[];
+}
+/** Everything a single report yields. */
+interface VerisenseFactoryTestReportParsed {
+    /** The TEST START banner was found. */
+    ok: boolean;
+    /** The TEST END banner was found — a report can be valid but truncated. */
+    complete: boolean;
+    /** Dotted firmware version from the `Firmware version:` line, e.g. `'2.00.024'`. */
+    firmwareVersion: string | null;
+    /** Which `WS_TEST_00NN` numbering this report uses, derived from the firmware
+     * version. Informational: parsing never depends on it. */
+    idScheme: 'legacy' | 'v2_00_010' | 'unknown';
+    overall: VerisenseFactoryTestOverall;
+    mcu: VerisenseFactoryTestMcuInfo;
+    model: VerisenseFactoryTestModelInfo | null;
+    /** Tests in the order they were printed. */
+    tests: VerisenseFactoryTestResult[];
+    /** Every metric merged into one flat map — one spreadsheet column per key. */
+    metrics: Record<string, VerisenseFactoryTestMetricValue>;
+    /** Lines no rule recognized. Never dropped, so nothing is silently lost. */
+    unparsedLines: string[];
+    /** Anomalies worth surfacing (repaired truncation, stripped progress dots…). */
+    parserWarnings: string[];
+}
+/**
+ * Parse a full factory test report into structured metrics.
+ *
+ * Never throws: malformed or unrecognized input comes back with `ok: false`
+ * and/or its lines preserved in `unparsedLines`.
+ */
+declare function parseVerisenseFactoryTestReport(text: string): VerisenseFactoryTestReportParsed;
+/**
+ * Render a parsed report as two CSV rows (header, values): the caller's `meta`
+ * columns first, then the parsed metrics sorted by name. A metric whose name
+ * collides with a meta column is dropped in favour of the meta value — the
+ * caller's identity columns are authoritative, and a duplicated header name
+ * breaks most CSV consumers.
+ */
+declare function verisenseFactoryTestReportToCsvRows(parsed: VerisenseFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
+
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE as WIRED_NEED_MORE, RESYNC as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, buildBaseCommand, buildDefaultVerisenseCalibrationSet, buildHeader, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseCalibDump, parseCalibrationBlob, parseEventLogPayload, parseExpansionBoard, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemContext, InfoMemDeviceConfig, InfoMemLayout, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
