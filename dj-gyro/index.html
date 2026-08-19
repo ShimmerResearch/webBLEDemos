@@ -618,8 +618,18 @@
       //  Console / toast helpers
       // =====================================================================
       const consoleEl = document.getElementById("consoleOutput");
+      // A kiosk/Auto-DJ session can run for hours, so keep only the tail rather
+      // than growing one unbounded string.
+      const CONSOLE_MAX_CHARS = 20000;
       function log(t) {
-        consoleEl.textContent += t + "\n";
+        let text = consoleEl.textContent + t + "\n";
+        if (text.length > CONSOLE_MAX_CHARS) {
+          text = text.slice(text.length - CONSOLE_MAX_CHARS);
+          // Drop the partial first line so the view never starts mid-message.
+          const nl = text.indexOf("\n");
+          if (nl !== -1) text = text.slice(nl + 1);
+        }
+        consoleEl.textContent = text;
         consoleEl.scrollTop = consoleEl.scrollHeight;
       }
       function toast(msg, ms = 2600) {
@@ -1107,8 +1117,15 @@
           this.rec = false; this.bufL = []; this.bufR = [];
           this.port.onmessage = (e) => {
             if (e.data.rec !== undefined) {
+              const wasRec = this.rec;
               this.rec = e.data.rec;
-              if (!this.rec) this.flush();
+              if (!this.rec) {
+                this.flush();
+                // Port messages keep their order, so the main thread sees this
+                // after the final { recL, recR } above — that is what makes
+                // finishRecording() safe to run on it.
+                if (wasRec) this.port.postMessage({ recDone: true });
+              }
             }
           };
         }
@@ -1206,6 +1223,7 @@
           });
           recorderNode.port.onmessage = (e) => {
             if (e.data.recL) onRecChunk(e.data.recL, e.data.recR);
+            if (e.data.recDone) finishRecording();
           };
 
           workletNode.connect(analyser);
@@ -1227,12 +1245,15 @@
       //  RECORDING — tap on the master bus → 16-bit stereo WAV download
       // =====================================================================
       const REC_MAX_SECONDS = 600; // 10 min ≈ 230 MB of float32 — hard cap
+      const REC_FLUSH_TIMEOUT_MS = 2000; // only if the worklet never acknowledges
       const rec = {
         on: false,
         chunksL: [],
         chunksR: [],
         samples: 0,
         startedAt: 0,
+        flushTimer: 0,
+        finishing: false,
       };
 
       function onRecChunk(L, R) {
@@ -1253,6 +1274,7 @@
           rec.chunksR = [];
           rec.samples = 0;
           rec.on = true;
+          rec.finishing = false;
           rec.startedAt = performance.now();
           recorderNode.port.postMessage({ rec: true });
           btn.classList.add("on");
@@ -1260,12 +1282,25 @@
         } else {
           rec.on = false;
           recorderNode.port.postMessage({ rec: false });
-          // final flush from the worklet arrives async — give it a beat
-          setTimeout(finishRecording, 150);
+          // finishRecording() runs on the worklet's { recDone } reply, which is
+          // queued behind its final flush. A fixed delay could beat that last
+          // chunk on a loaded machine and truncate the WAV; this timer is only a
+          // fallback for a worklet that never answers at all.
+          clearTimeout(rec.flushTimer);
+          rec.flushTimer = setTimeout(() => {
+            log("⚠️ Recorder flush timed out — saving what arrived");
+            finishRecording();
+          }, REC_FLUSH_TIMEOUT_MS);
         }
       }
 
       function finishRecording() {
+        // Reachable from both the worklet reply and the fallback timer.
+        if (rec.finishing) return;
+        rec.finishing = true;
+        clearTimeout(rec.flushTimer);
+        rec.flushTimer = 0;
+
         const btn = document.getElementById("recordBtn");
         btn.classList.remove("on");
         btn.textContent = "⏺ Record";
@@ -2316,12 +2351,15 @@
           );
         } catch (e) {
           log(`❌ ${e.message}`);
-          scanBtn.disabled = false;
-          gyroRangeSelect.disabled = false;
+          await resetToDisconnected();
         }
       });
 
-      disconnectBtn.addEventListener("click", async () => {
+      // Best-effort close the link and put the UI back to "no device". Shared by
+      // the Disconnect button and the scan flow's error path, so a failure part
+      // way through configuration cannot leave the page reading as connected
+      // with the BLE link still open.
+      async function resetToDisconnected(reason) {
         try {
           await client.disconnect();
         } catch (e) {
@@ -2333,7 +2371,11 @@
         scanBtn.disabled = false;
         gyroRangeSelect.disabled = false;
         disconnectBtn.disabled = true;
-        log("🔌 Disconnected");
+        if (reason) log(reason);
+      }
+
+      disconnectBtn.addEventListener("click", async () => {
+        await resetToDisconnected("🔌 Disconnected");
       });
 
       // =====================================================================
