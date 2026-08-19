@@ -1,0 +1,9 @@
+.vs/
+**/.vs/
+
+# Extension signing keys — the private key must never be committed.
+# (The PUBLIC key lives in manifest.json "key" and is fine to commit.)
+*.pem
+*.p12
+*.pfx
+*-private-key*
