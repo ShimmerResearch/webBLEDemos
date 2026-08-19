@@ -1,0 +1,31 @@
+name: Format HTML
+
+on:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  format-html:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    env:
+      PRETTIER_VERSION: 3.3.3
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Format HTML files
+        run: npx --yes prettier@${{ env.PRETTIER_VERSION }} --write "**/*.html"
+
+      - name: Commit formatted files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: format HTML files"
+          file_pattern: "**/*.html"

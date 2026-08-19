@@ -1,399 +1,568 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Shimmer3R SD Download</title>
-<style>
-  :root {
-    --bg: #101418;
-    --panel: #1a2026;
-    --border: #2c343c;
-    --text: #e8ecef;
-    --muted: #9aa5ad;
-    --accent: #fe5000;
-    --accent-fill: #cf3f00;
-    --ok: #3fb950;
-    --err: #f85149;
-    font-family: "Segoe UI", system-ui, sans-serif;
-  }
-  body { margin: 0; background: var(--bg); color: var(--text); }
-  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-  header h1 { font-size: 18px; margin: 0; }
-  main { padding: 16px 20px; display: grid; gap: 16px; max-width: 1100px; }
-  section { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
-  section h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
-  button { background: var(--accent-fill); color: #fff; border: none; border-radius: 6px; padding: 7px 14px; font-size: 14px; cursor: pointer; }
-  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
-  button.danger { background: #7d1a1a; }
-  button:disabled { opacity: 0.45; cursor: not-allowed; }
-  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
-  .muted { color: var(--muted); font-size: 13px; }
-  .banner { padding: 8px 12px; border-radius: 6px; font-size: 14px; display: none; }
-  .banner.err { display: block; background: #3a1214; color: var(--err); border: 1px solid #5c1e21; }
-  .banner.ok { display: block; background: #12291a; color: var(--ok); border: 1px solid #1e4429; }
-  #tree { font-family: Consolas, monospace; font-size: 13px; line-height: 1.7; max-height: 420px; overflow: auto; }
-  #tree ul { list-style: none; margin: 0; padding-left: 22px; }
-  #tree label { cursor: pointer; }
-  #tree .size { color: var(--muted); margin-left: 8px; }
-  progress { width: 100%; height: 14px; accent-color: var(--accent); }
-  #log { font-family: Consolas, monospace; font-size: 12px; max-height: 180px; overflow: auto; white-space: pre-wrap; color: var(--muted); }
-  .statgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
-  .stat { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; }
-  .stat b { display: block; font-size: 17px; }
-  .stat span { font-size: 12px; color: var(--muted); }
-</style>
-</head>
-<body>
-<header>
-  <h1>Shimmer3R SD Download</h1>
-  <button id="btnConnect">Connect</button>
-  <button id="btnDisconnect" class="secondary" disabled>Disconnect</button>
-  <span id="connState" class="muted">Not connected</span>
-</header>
-<main>
-  <div id="fwBanner" class="banner"></div>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shimmer3R SD Download</title>
+    <style>
+      :root {
+        --bg: #101418;
+        --panel: #1a2026;
+        --border: #2c343c;
+        --text: #e8ecef;
+        --muted: #9aa5ad;
+        --accent: #fe5000;
+        --accent-fill: #cf3f00;
+        --ok: #3fb950;
+        --err: #f85149;
+        font-family: "Segoe UI", system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+      }
+      header {
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        flex-wrap: wrap;
+      }
+      header h1 {
+        font-size: 18px;
+        margin: 0;
+      }
+      main {
+        padding: 16px 20px;
+        display: grid;
+        gap: 16px;
+        max-width: 1100px;
+      }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 14px 16px;
+      }
+      section h2 {
+        margin: 0 0 10px;
+        font-size: 14px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+      button {
+        background: var(--accent-fill);
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 7px 14px;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button.secondary {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--text);
+      }
+      button.danger {
+        background: #7d1a1a;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+        margin: 6px 0;
+      }
+      .muted {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .banner {
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 14px;
+        display: none;
+      }
+      .banner.err {
+        display: block;
+        background: #3a1214;
+        color: var(--err);
+        border: 1px solid #5c1e21;
+      }
+      .banner.ok {
+        display: block;
+        background: #12291a;
+        color: var(--ok);
+        border: 1px solid #1e4429;
+      }
+      #tree {
+        font-family: Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.7;
+        max-height: 420px;
+        overflow: auto;
+      }
+      #tree ul {
+        list-style: none;
+        margin: 0;
+        padding-left: 22px;
+      }
+      #tree label {
+        cursor: pointer;
+      }
+      #tree .size {
+        color: var(--muted);
+        margin-left: 8px;
+      }
+      progress {
+        width: 100%;
+        height: 14px;
+        accent-color: var(--accent);
+      }
+      #log {
+        font-family: Consolas, monospace;
+        font-size: 12px;
+        max-height: 180px;
+        overflow: auto;
+        white-space: pre-wrap;
+        color: var(--muted);
+      }
+      .statgrid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 10px;
+      }
+      .stat {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px 12px;
+      }
+      .stat b {
+        display: block;
+        font-size: 17px;
+      }
+      .stat span {
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Shimmer3R SD Download</h1>
+      <button id="btnConnect">Connect</button>
+      <button id="btnDisconnect" class="secondary" disabled>Disconnect</button>
+      <span id="connState" class="muted">Not connected</span>
+    </header>
+    <main>
+      <div id="fwBanner" class="banner"></div>
 
-  <section>
-    <h2>Card</h2>
-    <div class="statgrid">
-      <div class="stat"><b id="statFree">–</b><span>free on card</span></div>
-      <div class="stat"><b id="statTotal">–</b><span>card capacity</span></div>
-      <div class="stat"><b id="statFiles">–</b><span>files under data/</span></div>
-      <div class="stat"><b id="statBytes">–</b><span>total data size</span></div>
-      <div class="stat"><b id="statLink">–</b><span>measured link speed</span></div>
-    </div>
-    <div class="row">
-      <button id="btnRefresh" class="secondary" disabled>Refresh card contents</button>
-      <button id="btnLinkTest" class="secondary" disabled>Measure link speed (5 s)</button>
-      <span id="treeState" class="muted"></span>
-    </div>
-    <div id="tree"></div>
-  </section>
+      <section>
+        <h2>Card</h2>
+        <div class="statgrid">
+          <div class="stat">
+            <b id="statFree">–</b><span>free on card</span>
+          </div>
+          <div class="stat">
+            <b id="statTotal">–</b><span>card capacity</span>
+          </div>
+          <div class="stat">
+            <b id="statFiles">–</b><span>files under data/</span>
+          </div>
+          <div class="stat">
+            <b id="statBytes">–</b><span>total data size</span>
+          </div>
+          <div class="stat">
+            <b id="statLink">–</b><span>measured link speed</span>
+          </div>
+        </div>
+        <div class="row">
+          <button id="btnRefresh" class="secondary" disabled>
+            Refresh card contents
+          </button>
+          <button id="btnLinkTest" class="secondary" disabled>
+            Measure link speed (5 s)
+          </button>
+          <span id="treeState" class="muted"></span>
+        </div>
+        <div id="tree"></div>
+      </section>
 
-  <section>
-    <h2>Download</h2>
-    <div class="row">
-      <button id="btnPickDest" class="secondary" disabled>Choose destination folder…</button>
-      <span id="destLabel" class="muted">No folder selected</span>
-    </div>
-    <div class="row">
-      <label class="muted"><input type="checkbox" id="chkDelete" /> Delete from card after verified download</label>
-    </div>
-    <div class="row">
-      <button id="btnDownloadSel" disabled>Download selected</button>
-      <button id="btnDownloadAll" disabled>Download all</button>
-      <button id="btnAbort" class="danger" disabled>Abort</button>
-    </div>
-    <div class="row"><progress id="progTotal" max="100" value="0"></progress></div>
-    <div class="row muted" id="progLabel">Idle</div>
-    <div class="row muted" id="fileLabel"></div>
-  </section>
+      <section>
+        <h2>Download</h2>
+        <div class="row">
+          <button id="btnPickDest" class="secondary" disabled>
+            Choose destination folder…
+          </button>
+          <span id="destLabel" class="muted">No folder selected</span>
+        </div>
+        <div class="row">
+          <label class="muted"
+            ><input type="checkbox" id="chkDelete" /> Delete from card after
+            verified download</label
+          >
+        </div>
+        <div class="row">
+          <button id="btnDownloadSel" disabled>Download selected</button>
+          <button id="btnDownloadAll" disabled>Download all</button>
+          <button id="btnAbort" class="danger" disabled>Abort</button>
+        </div>
+        <div class="row">
+          <progress id="progTotal" max="100" value="0"></progress>
+        </div>
+        <div class="row muted" id="progLabel">Idle</div>
+        <div class="row muted" id="fileLabel"></div>
+      </section>
 
-  <section>
-    <h2>Log</h2>
-    <div id="log"></div>
-  </section>
-</main>
+      <section>
+        <h2>Log</h2>
+        <div id="log"></div>
+      </section>
+    </main>
 
-<script type="module">
-import {
-  Shimmer3RClient,
-  enumerateSdTree,
-  downloadSdTree,
-  SdTransferError,
-} from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+    <script type="module">
+      import {
+        Shimmer3RClient,
+        enumerateSdTree,
+        downloadSdTree,
+        SdTransferError,
+      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
-const $ = (id) => document.getElementById(id);
-const logEl = $("log");
+      const $ = (id) => document.getElementById(id);
+      const logEl = $("log");
 
-function log(msg, isErr = false) {
-  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
-  logEl.textContent += line + "\n";
-  logEl.scrollTop = logEl.scrollHeight;
-  (isErr ? console.error : console.log)(line);
-}
+      function log(msg, isErr = false) {
+        const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        logEl.textContent += line + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+        (isErr ? console.error : console.log)(line);
+      }
 
-function fmtBytes(n) {
-  if (n == null) return "–";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
+      function fmtBytes(n) {
+        if (n == null) return "–";
+        if (n < 1024) return `${n} B`;
+        if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+        if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+        return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+      }
 
-let client = null;
-let destRoot = null;
-let tree = null;
-let abortCtl = null;
-let sdSupported = false;
-let linkTesting = false;
+      let client = null;
+      let destRoot = null;
+      let tree = null;
+      let abortCtl = null;
+      let sdSupported = false;
+      let linkTesting = false;
 
-function setConnected(connected) {
-  $("btnConnect").disabled = connected;
-  $("btnDisconnect").disabled = !connected;
-  updateDownloadButtons();
-  $("connState").textContent = connected ? "Connected" : "Not connected";
-  if (!connected) {
-    $("fwBanner").className = "banner";
-    $("tree").innerHTML = "";
-    tree = null;
-    sdSupported = false;
-  }
-}
+      function setConnected(connected) {
+        $("btnConnect").disabled = connected;
+        $("btnDisconnect").disabled = !connected;
+        updateDownloadButtons();
+        $("connState").textContent = connected ? "Connected" : "Not connected";
+        if (!connected) {
+          $("fwBanner").className = "banner";
+          $("tree").innerHTML = "";
+          tree = null;
+          sdSupported = false;
+        }
+      }
 
-function updateDownloadButtons() {
-  const busy = abortCtl !== null || linkTesting;
-  const usable = client && sdSupported && !busy;
-  const ready = usable && destRoot && tree;
-  $("btnDownloadSel").disabled = !ready || selectedPaths().length === 0;
-  $("btnDownloadAll").disabled = !ready;
-  $("btnAbort").disabled = abortCtl === null;
-  $("btnRefresh").disabled = !usable;
-  $("btnPickDest").disabled = !usable;
-  $("btnLinkTest").disabled = !client || busy;
-}
+      function updateDownloadButtons() {
+        const busy = abortCtl !== null || linkTesting;
+        const usable = client && sdSupported && !busy;
+        const ready = usable && destRoot && tree;
+        $("btnDownloadSel").disabled = !ready || selectedPaths().length === 0;
+        $("btnDownloadAll").disabled = !ready;
+        $("btnAbort").disabled = abortCtl === null;
+        $("btnRefresh").disabled = !usable;
+        $("btnPickDest").disabled = !usable;
+        $("btnLinkTest").disabled = !client || busy;
+      }
 
-function fmtEta(seconds) {
-  if (!isFinite(seconds) || seconds < 0) return "–";
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds % 60);
-  return m ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
-}
+      function fmtEta(seconds) {
+        if (!isFinite(seconds) || seconds < 0) return "–";
+        const m = Math.floor(seconds / 60);
+        const s = Math.round(seconds % 60);
+        return m ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
+      }
 
-$("btnLinkTest").onclick = async () => {
-  linkTesting = true;
-  updateDownloadButtons();
-  log("Measuring raw BLE link speed (5 s, firmware data-rate test)…");
-  try {
-    const res = await client.runDataRateTest(5000, (bytes, elapsedMs) => {
-      $("statLink").textContent = `${(bytes / 1024 / (elapsedMs / 1000)).toFixed(1)} KB/s`;
-    });
-    $("statLink").textContent = `${res.kBps.toFixed(1)} KB/s`;
-    log(`Raw link speed: ${res.kBps.toFixed(1)} KB/s (${fmtBytes(res.bytesReceived)} in ${(res.durationMs / 1000).toFixed(1)}s).`);
-    log(
-      `As a guide (file transfer adds ~2% framing overhead): ` +
-      `1 MB ≈ ${fmtEta((1 * 1024) / res.kBps)}, ` +
-      `5 MB ≈ ${fmtEta((5 * 1024) / res.kBps)}, ` +
-      `20 MB ≈ ${fmtEta((20 * 1024) / res.kBps)}.`,
-    );
-    if (tree && tree.totalBytes > 0) {
-      log(`Everything currently on this card (${fmtBytes(tree.totalBytes)}) ≈ ${fmtEta(tree.totalBytes / 1024 / res.kBps)}.`);
-    }
-  } catch (e) {
-    log(`Link speed test failed: ${e.message}`, true);
-  } finally {
-    linkTesting = false;
-    updateDownloadButtons();
-  }
-};
-
-$("btnConnect").onclick = async () => {
-  try {
-    client = new Shimmer3RClient({ debug: false });
-    client.onStatus = (s) => log(s);
-    await client.connect();
-    setConnected(true);
-
-    sdSupported = await client.supportsSdTransfer();
-    const v = await client.readFwVersion().catch(() => null);
-    const verStr = v ? `v${v.major}.${String(v.minor).padStart(2, "0")}.${String(v.patch).padStart(3, "0")}` : "unknown";
-    const banner = $("fwBanner");
-    if (!sdSupported) {
-      banner.className = "banner err";
-      banner.textContent = `Firmware ${verStr} does not support SD file transfer (needs LogAndStream_Shimmer3R v1.01.009 or later).`;
-      updateDownloadButtons();
-      return;
-    }
-    updateDownloadButtons();
-    banner.className = "banner ok";
-    banner.textContent = `Firmware ${verStr} — SD file transfer supported.`;
-
-    try {
-      const space = await client.sdGetFreeSpace();
-      $("statFree").textContent = fmtBytes(space.freeKB * 1024);
-      $("statTotal").textContent = fmtBytes(space.totalKB * 1024);
-    } catch (e) {
-      log(`Free-space query failed: ${e.message}`, true);
-    }
-    await refreshTree();
-  } catch (e) {
-    log(`Connect failed: ${e.message}`, true);
-    setConnected(false);
-    client = null;
-  }
-};
-
-$("btnDisconnect").onclick = async () => {
-  try { abortCtl?.abort(); } catch {}
-  try { await client?.disconnect(); } catch {}
-  client = null;
-  setConnected(false);
-};
-
-async function refreshTree() {
-  $("treeState").textContent = "Listing card…";
-  try {
-    tree = await enumerateSdTree(client, "data");
-    renderTree();
-    $("statFiles").textContent = String(tree.files.length);
-    $("statBytes").textContent = fmtBytes(tree.totalBytes);
-    $("treeState").textContent = "";
-  } catch (e) {
-    tree = null;
-    $("tree").innerHTML = "";
-    $("treeState").textContent =
-      e instanceof SdTransferError ? `Cannot list card: ${e.message}` : `Listing failed: ${e.message}`;
-    log($("treeState").textContent, true);
-  }
-  updateDownloadButtons();
-}
-$("btnRefresh").onclick = refreshTree;
-
-/** Group files by their session directory for a compact selectable tree. */
-function renderTree() {
-  const container = $("tree");
-  container.innerHTML = "";
-  const bySession = new Map();
-  for (const f of tree.files) {
-    const dir = f.path.slice(0, f.path.lastIndexOf("/"));
-    if (!bySession.has(dir)) bySession.set(dir, { files: [], bytes: 0 });
-    const s = bySession.get(dir);
-    s.files.push(f);
-    s.bytes += f.size;
-  }
-  const ul = document.createElement("ul");
-  for (const [dir, info] of bySession) {
-    const li = document.createElement("li");
-    const label = document.createElement("label");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.dataset.path = dir;
-    cb.onchange = updateDownloadButtons;
-    label.append(cb, ` ${dir}`);
-    const size = document.createElement("span");
-    size.className = "size";
-    size.textContent = `${info.files.length} file(s), ${fmtBytes(info.bytes)}`;
-    li.append(label, size);
-    ul.append(li);
-  }
-  if (!bySession.size) {
-    const li = document.createElement("li");
-    li.textContent = "No data files on card.";
-    ul.append(li);
-  }
-  container.append(ul);
-}
-
-function selectedPaths() {
-  return Array.from(document.querySelectorAll("#tree input:checked")).map((c) => c.dataset.path);
-}
-
-$("btnPickDest").onclick = async () => {
-  if (!("showDirectoryPicker" in window)) {
-    log("File System Access API unavailable in this browser — cannot pick a destination folder.", true);
-    return;
-  }
-  try {
-    destRoot = await window.showDirectoryPicker({ mode: "readwrite" });
-    $("destLabel").textContent = `Saving into: ${destRoot.name}`;
-  } catch {
-    /* user cancelled */
-  }
-  updateDownloadButtons();
-};
-
-async function runDownload(rootPaths) {
-  const deleteAfterVerify = $("chkDelete").checked;
-  if (deleteAfterVerify) {
-    const ok = confirm(
-      "Files will be DELETED from the SD card after each verified download.\n\nContinue?",
-    );
-    if (!ok) return;
-  }
-  abortCtl = new AbortController();
-  updateDownloadButtons();
-  $("progTotal").max = 100;
-  $("progTotal").value = 0;
-  $("progLabel").textContent = "Listing card…";
-  $("fileLabel").textContent = "";
-  const startedAt = Date.now();
-  let downloaded = 0, skipped = 0, failed = 0, bytes = 0;
-
-  // Rolling throughput over the last ~5 s of progress events; returns null
-  // (no rate shown) when there is no recent sample pair to compute from
-  const samples = [];
-  const rollingRate = (bytesDone) => {
-    const now = Date.now();
-    samples.push({ t: now, b: bytesDone });
-    while (samples.length >= 2 && now - samples[0].t > 5000) samples.shift();
-    if (samples.length < 2) return null;
-    const dt = (now - samples[0].t) / 1000;
-    return dt > 0.5 ? (bytesDone - samples[0].b) / 1024 / dt : null;
-  };
-
-  try {
-    for (const root of rootPaths) {
-      log(`Downloading ${root}…`);
-      const summary = await downloadSdTree(client, destRoot, {
-        rootPath: root,
-        deleteAfterVerify,
-        signal: abortCtl.signal,
-        onProgress: (p) => {
-          if (p.bytesTotal > 0) {
-            $("progTotal").max = p.bytesTotal;
-            $("progTotal").value = p.bytesDone;
+      $("btnLinkTest").onclick = async () => {
+        linkTesting = true;
+        updateDownloadButtons();
+        log("Measuring raw BLE link speed (5 s, firmware data-rate test)…");
+        try {
+          const res = await client.runDataRateTest(5000, (bytes, elapsedMs) => {
+            $("statLink").textContent =
+              `${(bytes / 1024 / (elapsedMs / 1000)).toFixed(1)} KB/s`;
+          });
+          $("statLink").textContent = `${res.kBps.toFixed(1)} KB/s`;
+          log(
+            `Raw link speed: ${res.kBps.toFixed(1)} KB/s (${fmtBytes(res.bytesReceived)} in ${(res.durationMs / 1000).toFixed(1)}s).`,
+          );
+          log(
+            `As a guide (file transfer adds ~2% framing overhead): ` +
+              `1 MB ≈ ${fmtEta((1 * 1024) / res.kBps)}, ` +
+              `5 MB ≈ ${fmtEta((5 * 1024) / res.kBps)}, ` +
+              `20 MB ≈ ${fmtEta((20 * 1024) / res.kBps)}.`,
+          );
+          if (tree && tree.totalBytes > 0) {
+            log(
+              `Everything currently on this card (${fmtBytes(tree.totalBytes)}) ≈ ${fmtEta(tree.totalBytes / 1024 / res.kBps)}.`,
+            );
           }
-          const rate = p.phase === "download" ? rollingRate(p.bytesDone) : null;
-          const eta = rate ? fmtEta((p.bytesTotal - p.bytesDone) / 1024 / rate) : "–";
-          $("progLabel").textContent =
-            `${p.phase}: ${p.filesDone}/${p.filesTotal} files, ` +
-            `${fmtBytes(p.bytesDone)} / ${fmtBytes(p.bytesTotal)}` +
-            (rate ? ` @ ${rate.toFixed(1)} KB/s, ETA ${eta}` : "");
-          $("fileLabel").textContent = p.currentFile
-            ? `${p.currentFile} (${fmtBytes(p.fileBytesDone)} / ${fmtBytes(p.fileBytesTotal)})`
-            : "";
-        },
-      });
-      downloaded += summary.filesDownloaded;
-      skipped += summary.filesSkipped;
-      failed += summary.filesFailed.length;
-      bytes += summary.bytesDownloaded;
-      for (const f of summary.filesFailed) log(`FAILED ${f.path}: ${f.error}`, true);
-      for (const d of summary.deletedFromCard) log(`Deleted from card: ${d}`);
-    }
-    const elapsedS = (Date.now() - startedAt) / 1000;
-    const avg = bytes > 0 && elapsedS > 0 ? ` (avg ${(bytes / 1024 / elapsedS).toFixed(1)} KB/s)` : "";
-    log(`Done in ${elapsedS.toFixed(1)}s — ${downloaded} downloaded, ${skipped} already up to date, ${failed} failed, ${fmtBytes(bytes)} transferred${avg}.`);
-    $("progLabel").textContent = "Done";
-    $("fileLabel").textContent = "";
-    await refreshTree();
-  } catch (e) {
-    if (e.name === "AbortError") {
-      log("Download aborted. Re-run to resume from where it stopped.");
-      $("progLabel").textContent = "Aborted (resumable)";
-    } else {
-      log(`Download failed: ${e.message}`, true);
-      $("progLabel").textContent = `Failed: ${e.message}`;
-    }
-  } finally {
-    abortCtl = null;
-    updateDownloadButtons();
-  }
-}
+        } catch (e) {
+          log(`Link speed test failed: ${e.message}`, true);
+        } finally {
+          linkTesting = false;
+          updateDownloadButtons();
+        }
+      };
 
-$("btnDownloadSel").onclick = () => runDownload(selectedPaths());
-$("btnDownloadAll").onclick = () => runDownload(["data"]);
-$("btnAbort").onclick = () => abortCtl?.abort();
+      $("btnConnect").onclick = async () => {
+        try {
+          client = new Shimmer3RClient({ debug: false });
+          client.onStatus = (s) => log(s);
+          await client.connect();
+          setConnected(true);
 
-if (!("bluetooth" in navigator)) {
-  const banner = $("fwBanner");
-  banner.className = "banner err";
-  banner.textContent = "Web Bluetooth is not available in this browser (use Chrome or Edge on desktop).";
-}
-if (!("showDirectoryPicker" in window)) {
-  log("File System Access API unavailable — destination picking will not work in this browser.", true);
-}
-</script>
-</body>
+          sdSupported = await client.supportsSdTransfer();
+          const v = await client.readFwVersion().catch(() => null);
+          const verStr = v
+            ? `v${v.major}.${String(v.minor).padStart(2, "0")}.${String(v.patch).padStart(3, "0")}`
+            : "unknown";
+          const banner = $("fwBanner");
+          if (!sdSupported) {
+            banner.className = "banner err";
+            banner.textContent = `Firmware ${verStr} does not support SD file transfer (needs LogAndStream_Shimmer3R v1.01.009 or later).`;
+            updateDownloadButtons();
+            return;
+          }
+          updateDownloadButtons();
+          banner.className = "banner ok";
+          banner.textContent = `Firmware ${verStr} — SD file transfer supported.`;
+
+          try {
+            const space = await client.sdGetFreeSpace();
+            $("statFree").textContent = fmtBytes(space.freeKB * 1024);
+            $("statTotal").textContent = fmtBytes(space.totalKB * 1024);
+          } catch (e) {
+            log(`Free-space query failed: ${e.message}`, true);
+          }
+          await refreshTree();
+        } catch (e) {
+          log(`Connect failed: ${e.message}`, true);
+          setConnected(false);
+          client = null;
+        }
+      };
+
+      $("btnDisconnect").onclick = async () => {
+        try {
+          abortCtl?.abort();
+        } catch {}
+        try {
+          await client?.disconnect();
+        } catch {}
+        client = null;
+        setConnected(false);
+      };
+
+      async function refreshTree() {
+        $("treeState").textContent = "Listing card…";
+        try {
+          tree = await enumerateSdTree(client, "data");
+          renderTree();
+          $("statFiles").textContent = String(tree.files.length);
+          $("statBytes").textContent = fmtBytes(tree.totalBytes);
+          $("treeState").textContent = "";
+        } catch (e) {
+          tree = null;
+          $("tree").innerHTML = "";
+          $("treeState").textContent =
+            e instanceof SdTransferError
+              ? `Cannot list card: ${e.message}`
+              : `Listing failed: ${e.message}`;
+          log($("treeState").textContent, true);
+        }
+        updateDownloadButtons();
+      }
+      $("btnRefresh").onclick = refreshTree;
+
+      /** Group files by their session directory for a compact selectable tree. */
+      function renderTree() {
+        const container = $("tree");
+        container.innerHTML = "";
+        const bySession = new Map();
+        for (const f of tree.files) {
+          const dir = f.path.slice(0, f.path.lastIndexOf("/"));
+          if (!bySession.has(dir)) bySession.set(dir, { files: [], bytes: 0 });
+          const s = bySession.get(dir);
+          s.files.push(f);
+          s.bytes += f.size;
+        }
+        const ul = document.createElement("ul");
+        for (const [dir, info] of bySession) {
+          const li = document.createElement("li");
+          const label = document.createElement("label");
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.dataset.path = dir;
+          cb.onchange = updateDownloadButtons;
+          label.append(cb, ` ${dir}`);
+          const size = document.createElement("span");
+          size.className = "size";
+          size.textContent = `${info.files.length} file(s), ${fmtBytes(info.bytes)}`;
+          li.append(label, size);
+          ul.append(li);
+        }
+        if (!bySession.size) {
+          const li = document.createElement("li");
+          li.textContent = "No data files on card.";
+          ul.append(li);
+        }
+        container.append(ul);
+      }
+
+      function selectedPaths() {
+        return Array.from(document.querySelectorAll("#tree input:checked")).map(
+          (c) => c.dataset.path,
+        );
+      }
+
+      $("btnPickDest").onclick = async () => {
+        if (!("showDirectoryPicker" in window)) {
+          log(
+            "File System Access API unavailable in this browser — cannot pick a destination folder.",
+            true,
+          );
+          return;
+        }
+        try {
+          destRoot = await window.showDirectoryPicker({ mode: "readwrite" });
+          $("destLabel").textContent = `Saving into: ${destRoot.name}`;
+        } catch {
+          /* user cancelled */
+        }
+        updateDownloadButtons();
+      };
+
+      async function runDownload(rootPaths) {
+        const deleteAfterVerify = $("chkDelete").checked;
+        if (deleteAfterVerify) {
+          const ok = confirm(
+            "Files will be DELETED from the SD card after each verified download.\n\nContinue?",
+          );
+          if (!ok) return;
+        }
+        abortCtl = new AbortController();
+        updateDownloadButtons();
+        $("progTotal").max = 100;
+        $("progTotal").value = 0;
+        $("progLabel").textContent = "Listing card…";
+        $("fileLabel").textContent = "";
+        const startedAt = Date.now();
+        let downloaded = 0,
+          skipped = 0,
+          failed = 0,
+          bytes = 0;
+
+        // Rolling throughput over the last ~5 s of progress events; returns null
+        // (no rate shown) when there is no recent sample pair to compute from
+        const samples = [];
+        const rollingRate = (bytesDone) => {
+          const now = Date.now();
+          samples.push({ t: now, b: bytesDone });
+          while (samples.length >= 2 && now - samples[0].t > 5000)
+            samples.shift();
+          if (samples.length < 2) return null;
+          const dt = (now - samples[0].t) / 1000;
+          return dt > 0.5 ? (bytesDone - samples[0].b) / 1024 / dt : null;
+        };
+
+        try {
+          for (const root of rootPaths) {
+            log(`Downloading ${root}…`);
+            const summary = await downloadSdTree(client, destRoot, {
+              rootPath: root,
+              deleteAfterVerify,
+              signal: abortCtl.signal,
+              onProgress: (p) => {
+                if (p.bytesTotal > 0) {
+                  $("progTotal").max = p.bytesTotal;
+                  $("progTotal").value = p.bytesDone;
+                }
+                const rate =
+                  p.phase === "download" ? rollingRate(p.bytesDone) : null;
+                const eta = rate
+                  ? fmtEta((p.bytesTotal - p.bytesDone) / 1024 / rate)
+                  : "–";
+                $("progLabel").textContent =
+                  `${p.phase}: ${p.filesDone}/${p.filesTotal} files, ` +
+                  `${fmtBytes(p.bytesDone)} / ${fmtBytes(p.bytesTotal)}` +
+                  (rate ? ` @ ${rate.toFixed(1)} KB/s, ETA ${eta}` : "");
+                $("fileLabel").textContent = p.currentFile
+                  ? `${p.currentFile} (${fmtBytes(p.fileBytesDone)} / ${fmtBytes(p.fileBytesTotal)})`
+                  : "";
+              },
+            });
+            downloaded += summary.filesDownloaded;
+            skipped += summary.filesSkipped;
+            failed += summary.filesFailed.length;
+            bytes += summary.bytesDownloaded;
+            for (const f of summary.filesFailed)
+              log(`FAILED ${f.path}: ${f.error}`, true);
+            for (const d of summary.deletedFromCard)
+              log(`Deleted from card: ${d}`);
+          }
+          const elapsedS = (Date.now() - startedAt) / 1000;
+          const avg =
+            bytes > 0 && elapsedS > 0
+              ? ` (avg ${(bytes / 1024 / elapsedS).toFixed(1)} KB/s)`
+              : "";
+          log(
+            `Done in ${elapsedS.toFixed(1)}s — ${downloaded} downloaded, ${skipped} already up to date, ${failed} failed, ${fmtBytes(bytes)} transferred${avg}.`,
+          );
+          $("progLabel").textContent = "Done";
+          $("fileLabel").textContent = "";
+          await refreshTree();
+        } catch (e) {
+          if (e.name === "AbortError") {
+            log("Download aborted. Re-run to resume from where it stopped.");
+            $("progLabel").textContent = "Aborted (resumable)";
+          } else {
+            log(`Download failed: ${e.message}`, true);
+            $("progLabel").textContent = `Failed: ${e.message}`;
+          }
+        } finally {
+          abortCtl = null;
+          updateDownloadButtons();
+        }
+      }
+
+      $("btnDownloadSel").onclick = () => runDownload(selectedPaths());
+      $("btnDownloadAll").onclick = () => runDownload(["data"]);
+      $("btnAbort").onclick = () => abortCtl?.abort();
+
+      if (!("bluetooth" in navigator)) {
+        const banner = $("fwBanner");
+        banner.className = "banner err";
+        banner.textContent =
+          "Web Bluetooth is not available in this browser (use Chrome or Edge on desktop).";
+      }
+      if (!("showDirectoryPicker" in window)) {
+        log(
+          "File System Access API unavailable — destination picking will not work in this browser.",
+          true,
+        );
+      }
+    </script>
+  </body>
 </html>
