@@ -268,7 +268,12 @@
       apiBaseUrlInput.value = localStorage.getItem(API_BASE_URL_KEY) || "";
 
       function getApiBaseUrl() {
-        return apiBaseUrlInput.value.trim().replace(/\/$/, "");
+        const raw = apiBaseUrlInput.value.trim().replace(/\/+$/, "");
+        if (!raw) return "";
+        // A bare host:port — the shape the placeholder suggests — would make
+        // fetch() read the whole string as a relative path, so default the
+        // scheme rather than issuing a request to /localhost:5002/...
+        return /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
       }
 
       async function uploadCsvFile(file) {
@@ -288,6 +293,8 @@
           if (!apiBaseUrl) {
             throw new Error("Enter the Shimmer API base URL first.");
           }
+          // Reflect the normalized URL so it is obvious what was requested.
+          apiBaseUrlInput.value = apiBaseUrl;
           localStorage.setItem(API_BASE_URL_KEY, apiBaseUrl);
 
           const customPath = document
@@ -297,7 +304,7 @@
           if (customPath) {
             s3FilePath = customPath.endsWith(".csv")
               ? customPath
-              : `${customPath}/${file.name}`;
+              : `${customPath.replace(/\/+$/, "")}/${file.name}`;
           } else {
             s3FilePath = file.name || `shimmer_${Date.now()}.csv`;
           }
@@ -532,7 +539,7 @@
         background: #fafafa;
         display: flex;
         flex-wrap: wrap;
-        align-items: end;
+        align-items: flex-end;
         gap: 10px 12px;
       }
 
@@ -543,7 +550,8 @@
         min-width: 260px;
       }
 
-      .uploadField label {
+      .uploadField label,
+      .uploadField .uploadStatusLabel {
         font-size: 0.85em;
         color: #444;
       }
@@ -625,7 +633,7 @@
         <input
           id="apiBaseUrlInput"
           type="text"
-          placeholder="e.g. localhost:5002"
+          placeholder="e.g. http://localhost:5002"
         />
       </div>
       <div class="uploadField">
@@ -638,8 +646,8 @@
       </div>
       <button id="uploadBtn">Upload CSV File</button>
       <div class="uploadField uploadStatus">
-        <label for="status">Status: </label>
-        <div id="status"></div>
+        <span class="uploadStatusLabel">Status:</span>
+        <div id="status" role="status" aria-live="polite"></div>
       </div>
     </div>
 
