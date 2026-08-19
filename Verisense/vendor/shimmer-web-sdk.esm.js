@@ -1,4 +1,13 @@
 /**
+ * SDK version, exported so consumers (e.g. the webBLEDemos pages, which vendor
+ * the built bundle) can log which build they are actually running — a stale
+ * vendored copy is otherwise indistinguishable from a firmware fault.
+ *
+ * Kept in sync with package.json by tests/core/version.test.ts.
+ */
+const SDK_VERSION = '0.1.13';
+
+/**
  * Container for a single decoded sensor frame.
  *
  * Mirrors the ObjectCluster concept from the Shimmer C# SDK:
@@ -995,6 +1004,24 @@ class StreamStatsTracker {
  * Shimmer3R BLE protocol opcodes.
  * Values taken directly from the Shimmer3 firmware header.
  */
+/**
+ * Feature ids for the SET_FEATURE (0xB7) command: `[0xB7][featureId][value]`.
+ * Mirrors the FEATURE_* enum in log-and-stream-common
+ * `Comms/shimmer_bt_uart.h`.
+ */
+const BT_FEATURE = Object.freeze({
+    NONE: 0,
+    /** Shimmer3 RN4678 error LEDs. */
+    RN4678_ERROR_LEDS: 1,
+    /**
+     * Arm a one-shot soft reboot that fires when the host disconnects. Lets a
+     * host apply settings only read at boot (e.g. the EEPROM brand record's
+     * advertising names) without the user power-cycling the device. Firmware
+     * skips the reboot while sensing, so an armed request can never truncate an
+     * active SD recording.
+     */
+    REBOOT_ON_DISCONNECT: 2,
+});
 const OPCODES = Object.freeze({
     DATA_PACKET: 0x00,
     INQUIRY_COMMAND: 0x01,
@@ -2888,6 +2915,372 @@ function checkConfigBytesValid(bytes) {
     return false;
 }
 
+/**
+ * Wire protocol for Shimmer3R SD-card file transfer over BLE.
+ *
+ * Mirrors the firmware implementation in
+ * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.009).
+ *
+ * Command/response shapes (all multi-byte fields little-endian):
+ *
+ *   SD_LIST_DIR_COMMAND  0xCC: [startIdx u16][maxEntries u8][pathLen u8][path]
+ *   SD_LIST_DIR_RESPONSE 0xC1: [status][startIdx u16][entriesLen u16][nEntries][flags][entries…]
+ *       entry: [attr][size u32][fdate u16][ftime u16][nameLen][name…]
+ *   SD_FILE_STAT_COMMAND 0xC2: [pathLen u8][path]
+ *   SD_FILE_STAT_RESPONSE 0xC3: [status][size u32][fdate u16][ftime u16][attr]
+ *   SD_FILE_READ_COMMAND 0xC4: [offset u32][windowLen u32][blockPayloadLen u16][pathLen u8][path]
+ *   SD_FREE_SPACE_COMMAND 0xC8 / RESPONSE 0xC9: [status][freeKB u32][totalKB u32]
+ *   SD_DELETE_COMMAND 0xCA / RESPONSE 0xCB: [status]
+ *   SD_TRANSFER_ABORT_COMMAND 0xC7: no args
+ *
+ * Streamed frames (always self-CRC'd, independent of the global CRC mode):
+ *   data:   [0x8A][0xC5][sessionId][seq u16][len u16][payload…][crc16 u16]
+ *   status: [0x8A][0xC6][sessionId][status][nextOffset u32][crc16 u16]
+ */
+const SD_TRANSFER_OPCODES = {
+    // Command opcodes must avoid the CYW20820 EZ-Serial SOF bytes 0x80/0xC0/
+    // 0xD0 (the firmware's UART RX demux would route them to the EZ-Serial
+    // parser instead of the Shimmer command parser) — hence LIST sits at 0xCC.
+    LIST_DIR_COMMAND: 0xcc,
+    LIST_DIR_RESPONSE: 0xc1,
+    FILE_STAT_COMMAND: 0xc2,
+    FILE_STAT_RESPONSE: 0xc3,
+    FILE_READ_COMMAND: 0xc4,
+    FILE_DATA_RESPONSE: 0xc5,
+    FILE_STATUS_RESPONSE: 0xc6,
+    TRANSFER_ABORT_COMMAND: 0xc7,
+    FREE_SPACE_COMMAND: 0xc8,
+    FREE_SPACE_RESPONSE: 0xc9,
+    DELETE_COMMAND: 0xca,
+    DELETE_RESPONSE: 0xcb,
+};
+/** Prefix byte shared with the firmware's other instream responses. */
+const SD_INSTREAM_BYTE = 0x8a;
+/** Status byte of the one-shot responses. 0x01–0x13 are raw FatFs FRESULTs. */
+const SD_STATUS = {
+    OK: 0x00,
+    SD_UNAVAILABLE: 0xf0,
+    BUSY: 0xf1,
+    BAD_ARGS: 0xf2,
+};
+/** Codes carried in SD_FILE_STATUS_RESPONSE frames. */
+const SD_XFER = {
+    WINDOW_COMPLETE: 0,
+    EOF: 1,
+    HOST_ABORT: 2,
+    SD_LOST: 3,
+    FS_ERROR: 4,
+    SUPERSEDED: 5,
+    DENIED: 6,
+    NOT_FOUND: 7,
+};
+const SD_ATTR_DIR = 0x01;
+const SD_ATTR_NAME_TRUNCATED = 0x02;
+const SD_MAX_PATH_LEN = 96;
+const SD_LIST_MAX_ENTRIES = 16;
+const SD_BLOCK_PAYLOAD_MIN = 64;
+const SD_BLOCK_PAYLOAD_MAX = 1024;
+const SD_BLOCK_PAYLOAD_DEFAULT = 512;
+const DATA_FRAME_HEADER_LEN = 7;
+const FRAME_CRC_LEN = 2;
+const STATUS_FRAME_LEN = 8 + FRAME_CRC_LEN;
+const LIST_RSP_HDR_LEN = 8;
+/** Error carrying the in-band status byte of a refused/failed SD command. */
+class SdTransferError extends Error {
+    constructor(message, status) {
+        super(message);
+        this.status = status;
+        this.name = 'SdTransferError';
+    }
+}
+function sdStatusToString(status) {
+    switch (status) {
+        case SD_STATUS.OK:
+            return 'OK';
+        case SD_STATUS.SD_UNAVAILABLE:
+            return 'SD unavailable (docked, USB-C plugged, no card or bad card)';
+        case SD_STATUS.BUSY:
+            return 'device busy (sensing/logging/streaming)';
+        case SD_STATUS.BAD_ARGS:
+            return 'bad arguments';
+        default:
+            return `FatFs error ${status}`;
+    }
+}
+function sdXferStatusToString(status) {
+    switch (status) {
+        case SD_XFER.WINDOW_COMPLETE:
+            return 'window complete';
+        case SD_XFER.EOF:
+            return 'end of file';
+        case SD_XFER.HOST_ABORT:
+            return 'aborted by host';
+        case SD_XFER.SD_LOST:
+            return 'SD card lost (docked or USB-C plugged)';
+        case SD_XFER.FS_ERROR:
+            return 'filesystem error';
+        case SD_XFER.SUPERSEDED:
+            return 'superseded by a newer read';
+        case SD_XFER.DENIED:
+            return 'denied (busy or bad arguments)';
+        case SD_XFER.NOT_FOUND:
+            return 'file not found';
+        default:
+            return `unknown transfer status ${status}`;
+    }
+}
+// ---------------------------------------------------------------------------
+// CRC16 — mirrors the firmware's ShimSwCrc (init 0xB0CA, odd-length zero pad)
+// ---------------------------------------------------------------------------
+const SD_CRC_INIT = 0xb0ca;
+function crcByte(crc, b) {
+    crc = (((crc >> 8) & 0xff) | (crc << 8)) & 0xffff;
+    crc ^= b & 0xff;
+    crc ^= (crc & 0xff) >> 4;
+    crc = (crc ^ (crc << 12)) & 0xffff;
+    crc = (crc ^ ((crc & 0xff) << 5)) & 0xffff;
+    return crc;
+}
+/** Shimmer CRC16 over `len` bytes of `data` (defaults to all of it). */
+function sdCrc16(data, len = data.length) {
+    let crc = SD_CRC_INIT;
+    for (let i = 0; i < len; i++)
+        crc = crcByte(crc, data[i]);
+    if (len % 2)
+        crc = crcByte(crc, 0x00);
+    return crc;
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function u16(buf, off) {
+    return buf[off] | (buf[off + 1] << 8);
+}
+function u32(buf, off) {
+    return (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
+}
+/** Encode and validate a card path (ASCII, 1..96 bytes). */
+function encodeSdPath(path) {
+    if (path.length === 0 || path.length > SD_MAX_PATH_LEN) {
+        throw new SdTransferError(`path must be 1..${SD_MAX_PATH_LEN} characters, got ${path.length}`, SD_STATUS.BAD_ARGS);
+    }
+    const out = new Uint8Array(path.length);
+    for (let i = 0; i < path.length; i++) {
+        const c = path.charCodeAt(i);
+        if (c < 0x20 || c > 0x7e) {
+            throw new SdTransferError(`path contains non-ASCII character at index ${i}`, SD_STATUS.BAD_ARGS);
+        }
+        out[i] = c;
+    }
+    return out;
+}
+/** Decode a FAT date/time pair; null when unset or invalid. */
+function fatDateTimeToDate(fdate, ftime) {
+    if (!fdate)
+        return null;
+    const year = 1980 + ((fdate >> 9) & 0x7f);
+    const month = (fdate >> 5) & 0x0f;
+    const day = fdate & 0x1f;
+    const hours = (ftime >> 11) & 0x1f;
+    const minutes = (ftime >> 5) & 0x3f;
+    const seconds = (ftime & 0x1f) * 2;
+    if (month < 1 || month > 12 || day < 1 || day > 31)
+        return null;
+    if (hours > 23 || minutes > 59 || seconds > 59)
+        return null;
+    return new Date(year, month - 1, day, hours, minutes, seconds);
+}
+// ---------------------------------------------------------------------------
+// Command builders
+// ---------------------------------------------------------------------------
+function buildListDirCmd(path, startIdx = 0, maxEntries = SD_LIST_MAX_ENTRIES) {
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(5 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.LIST_DIR_COMMAND;
+    cmd[1] = startIdx & 0xff;
+    cmd[2] = (startIdx >> 8) & 0xff;
+    cmd[3] = maxEntries & 0xff;
+    cmd[4] = p.length;
+    cmd.set(p, 5);
+    return cmd;
+}
+function buildStatCmd(path) {
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(2 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.FILE_STAT_COMMAND;
+    cmd[1] = p.length;
+    cmd.set(p, 2);
+    return cmd;
+}
+function buildDeleteCmd(path) {
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(2 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.DELETE_COMMAND;
+    cmd[1] = p.length;
+    cmd.set(p, 2);
+    return cmd;
+}
+function buildFreeSpaceCmd() {
+    return new Uint8Array([SD_TRANSFER_OPCODES.FREE_SPACE_COMMAND]);
+}
+function buildAbortCmd() {
+    return new Uint8Array([SD_TRANSFER_OPCODES.TRANSFER_ABORT_COMMAND]);
+}
+function buildReadCmd(path, offset, windowLen, blockPayloadLen = SD_BLOCK_PAYLOAD_DEFAULT) {
+    if (blockPayloadLen < SD_BLOCK_PAYLOAD_MIN || blockPayloadLen > SD_BLOCK_PAYLOAD_MAX) {
+        throw new SdTransferError(`blockPayloadLen must be ${SD_BLOCK_PAYLOAD_MIN}..${SD_BLOCK_PAYLOAD_MAX}, got ${blockPayloadLen}`, SD_STATUS.BAD_ARGS);
+    }
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(12 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.FILE_READ_COMMAND;
+    new DataView(cmd.buffer).setUint32(1, offset >>> 0, true);
+    new DataView(cmd.buffer).setUint32(5, windowLen >>> 0, true);
+    new DataView(cmd.buffer).setUint16(9, blockPayloadLen, true);
+    cmd[11] = p.length;
+    cmd.set(p, 12);
+    return cmd;
+}
+function parseListDirRsp(buf) {
+    if (buf.length < LIST_RSP_HDR_LEN || buf[0] !== SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE) {
+        throw new Error('malformed SD_LIST_DIR_RESPONSE');
+    }
+    const status = buf[1];
+    const startIdx = u16(buf, 2);
+    const entriesLen = u16(buf, 4);
+    const nEntries = buf[6];
+    const hasMore = (buf[7] & 0x01) !== 0;
+    const entries = [];
+    let off = LIST_RSP_HDR_LEN;
+    const end = LIST_RSP_HDR_LEN + entriesLen;
+    if (buf.length < end)
+        throw new Error('truncated SD_LIST_DIR_RESPONSE');
+    while (off < end && entries.length < nEntries) {
+        const attr = buf[off];
+        const size = u32(buf, off + 1);
+        const fdate = u16(buf, off + 5);
+        const ftime = u16(buf, off + 7);
+        const nameLen = buf[off + 9];
+        const nameBytes = buf.subarray(off + 10, off + 10 + nameLen);
+        entries.push({
+            name: String.fromCharCode(...nameBytes),
+            isDir: (attr & SD_ATTR_DIR) !== 0,
+            nameTruncated: (attr & SD_ATTR_NAME_TRUNCATED) !== 0,
+            size,
+            fdate,
+            ftime,
+            mtime: fatDateTimeToDate(fdate, ftime),
+        });
+        off += 10 + nameLen;
+    }
+    return { status, startIdx, entries, hasMore };
+}
+function parseStatRsp(buf) {
+    if (buf.length < 11 || buf[0] !== SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE) {
+        throw new Error('malformed SD_FILE_STAT_RESPONSE');
+    }
+    const fdate = u16(buf, 6);
+    const ftime = u16(buf, 8);
+    return {
+        status: buf[1],
+        stat: {
+            size: u32(buf, 2),
+            fdate,
+            ftime,
+            mtime: fatDateTimeToDate(fdate, ftime),
+            isDir: (buf[10] & SD_ATTR_DIR) !== 0,
+        },
+    };
+}
+function parseFreeSpaceRsp(buf) {
+    if (buf.length < 10 || buf[0] !== SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE) {
+        throw new Error('malformed SD_FREE_SPACE_RESPONSE');
+    }
+    return { status: buf[1], space: { freeKB: u32(buf, 2), totalKB: u32(buf, 6) } };
+}
+function parseDeleteRsp(buf) {
+    if (buf.length < 2 || buf[0] !== SD_TRANSFER_OPCODES.DELETE_RESPONSE) {
+        throw new Error('malformed SD_DELETE_RESPONSE');
+    }
+    return { status: buf[1] };
+}
+// ---------------------------------------------------------------------------
+// Incremental extractor
+// ---------------------------------------------------------------------------
+/** Expected total length of a one-shot response, or 0 if `buf` is too short
+ * to tell yet, or -1 if buf[0] is not a known one-shot response opcode. */
+function oneShotLength(buf) {
+    switch (buf[0]) {
+        case SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE:
+            if (buf.length < 6)
+                return 0;
+            return LIST_RSP_HDR_LEN + u16(buf, 4);
+        case SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE:
+            return 11;
+        case SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE:
+            return 10;
+        case SD_TRANSFER_OPCODES.DELETE_RESPONSE:
+            return 2;
+        default:
+            return -1;
+    }
+}
+/**
+ * Try to extract one SD-transfer message from the front of `buf`.
+ * Unknown bytes are skipped one at a time (resync) so interleaved traffic
+ * (e.g. unsolicited instream status responses) cannot jam the stream.
+ */
+function tryExtractSdMessage(buf) {
+    if (buf.length === 0)
+        return { consumed: 0 };
+    if (buf[0] === SD_INSTREAM_BYTE) {
+        if (buf.length < 2)
+            return { consumed: 0 };
+        if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
+            if (buf.length < DATA_FRAME_HEADER_LEN)
+                return { consumed: 0 };
+            const len = u16(buf, 5);
+            if (len === 0 || len > SD_BLOCK_PAYLOAD_MAX)
+                return { consumed: 1 };
+            const total = DATA_FRAME_HEADER_LEN + len + FRAME_CRC_LEN;
+            if (buf.length < total)
+                return { consumed: 0 };
+            const crcOk = sdCrc16(buf, DATA_FRAME_HEADER_LEN + len) === u16(buf, DATA_FRAME_HEADER_LEN + len);
+            if (!crcOk)
+                return { consumed: 1, crcError: true };
+            return {
+                consumed: total,
+                msg: {
+                    kind: 'data',
+                    sessionId: buf[2],
+                    seq: u16(buf, 3),
+                    payload: buf.slice(DATA_FRAME_HEADER_LEN, DATA_FRAME_HEADER_LEN + len),
+                    crcOk,
+                },
+            };
+        }
+        if (buf[1] === SD_TRANSFER_OPCODES.FILE_STATUS_RESPONSE) {
+            if (buf.length < STATUS_FRAME_LEN)
+                return { consumed: 0 };
+            const crcOk = sdCrc16(buf, 8) === u16(buf, 8);
+            if (!crcOk)
+                return { consumed: 1, crcError: true };
+            return {
+                consumed: STATUS_FRAME_LEN,
+                msg: { kind: 'status', sessionId: buf[2], status: buf[3], nextOffset: u32(buf, 4), crcOk },
+            };
+        }
+        /* An instream response that is not part of the SD-transfer protocol
+         * (e.g. an unsolicited status response) — resync past it. */
+        return { consumed: 1 };
+    }
+    const len = oneShotLength(buf);
+    if (len === -1)
+        return { consumed: 1 };
+    if (len === 0 || buf.length < len)
+        return { consumed: 0 };
+    return { consumed: len, msg: { kind: 'oneshot', opcode: buf[0], body: buf.slice(0, len) } };
+}
+
 // ---------------------------------------------------------------------------
 // InfoMem constants
 // ---------------------------------------------------------------------------
@@ -2975,6 +3368,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         /** Handle an unexpected / requested transport disconnect. */
         this._handleTransportDisconnect = () => {
             this._streaming = false;
+            this._sdKnownSession = null;
             this._emitStatus('Device disconnected');
         };
         // ---------------------------------------------------------------------------
@@ -3024,6 +3418,64 @@ class Shimmer3RClient extends BaseShimmerClient {
                 }
             }
         };
+        // ---------------------------------------------------------------------------
+        // Firmware version (feature gating)
+        // ---------------------------------------------------------------------------
+        this._fwVersionCache = null;
+        // ---------------------------------------------------------------------------
+        // SD-card file transfer (FW >= v1.01.009)
+        //
+        // A dedicated, self-resynchronising RX pipeline: while any SD operation is
+        // active, a persistent temp handler accumulates notification chunks and
+        // extracts length-delimited SD messages from them (multi-notification
+        // reassembly). Unknown bytes are skipped one at a time so interleaved
+        // traffic (e.g. unsolicited instream status responses) cannot jam it.
+        // ---------------------------------------------------------------------------
+        this._sdRx = new Uint8Array(0);
+        this._sdUsers = 0;
+        this._sdHandlerAttached = false;
+        this._sdExpect = null;
+        this._sdFrameListener = null;
+        this._sdCrcErrorListener = null;
+        this._sdKnownSession = null;
+        this._sdChunkHandler = (chunk) => {
+            // Lone ACKs are consumed by the command flow, not the SD pipeline
+            if (chunk.length === 1 && chunk[0] === OPCODES.ACK_COMMAND_PROCESSED)
+                return;
+            this._sdRx = concatU8(this._sdRx, chunk);
+            for (;;) {
+                const r = tryExtractSdMessage(this._sdRx);
+                if (r.crcError) {
+                    try {
+                        this._sdCrcErrorListener?.();
+                    }
+                    catch (e) {
+                        this._log('sd crc listener error', e);
+                    }
+                }
+                if (r.consumed === 0)
+                    break;
+                this._sdRx = this._sdRx.slice(r.consumed);
+                const m = r.msg;
+                if (!m)
+                    continue;
+                if (m.kind === 'oneshot') {
+                    if (this._sdExpect && m.opcode === this._sdExpect.opcode) {
+                        const e = this._sdExpect;
+                        this._sdExpect = null;
+                        e.resolve(m.body);
+                    }
+                }
+                else {
+                    try {
+                        this._sdFrameListener?.(m);
+                    }
+                    catch (e) {
+                        this._log('sd frame listener error', e);
+                    }
+                }
+            }
+        };
         this.serviceUUID = opts.serviceUUID ?? SHIMMER3R_DEFAULTS.SERVICE_UUID;
         this.rxUUID = opts.rxUUID ?? SHIMMER3R_DEFAULTS.CHAR_RX_UUID;
         this.txUUID = opts.txUUID ?? SHIMMER3R_DEFAULTS.CHAR_TX_UUID;
@@ -3069,6 +3521,8 @@ class Shimmer3RClient extends BaseShimmerClient {
     async connect(transport) {
         const t = transport ?? this._injectedTransport ?? this._makeWebTransport();
         this._transport = t;
+        // The firmware's SD session counter restarts with the connection
+        this._sdKnownSession = null;
         this._notifyUnsub = t.onNotify(this._handleNotify);
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         this._emitStatus('Requesting Bluetooth device…');
@@ -3098,6 +3552,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._streaming = false;
             this.ExpPower = 0;
             this._deviceCalibrations = {};
+            this._sdKnownSession = null;
             this._emitStatus('Disconnected');
         }
     }
@@ -3274,6 +3729,59 @@ class Shimmer3RClient extends BaseShimmerClient {
      * 16-bit), matching readMem()/GET_INFOMEM_COMMAND in the Shimmer Java driver.
      * @returns the raw bytes read
      */
+    /**
+     * Issue a command and read back a length-prefixed response
+     * (`[opcode][len][data...]`), reassembling it across BLE notifications.
+     *
+     * A notification carries at most one ATT payload — around 42 bytes at the
+     * MTU the CYW20820 negotiates — and the transport surfaces one notification
+     * per chunk, so any response longer than that arrives split. Firmware writes
+     * the logical response contiguously, so the fragments simply concatenate in
+     * order: accumulate until `expectedLen` data bytes have arrived instead of
+     * assuming the first chunk holds the whole response.
+     *
+     * Firmware always emits the length byte after the opcode, but its absence is
+     * tolerated (older/variant firmware) by treating the first byte as a prefix
+     * only when it equals the requested length.
+     */
+    async _readLengthPrefixedResponse(cmd, respOpcode, expectedLen, label, ackTimeoutMs = 1500, responseTimeoutMs = 2000) {
+        const remainder = await this._writeExpectingAck(cmd, ackTimeoutMs);
+        const first = remainder && remainder[0] === respOpcode
+            ? remainder
+            : await this._waitForResponse(respOpcode, responseTimeoutMs);
+        /* Bytes after the response opcode. */
+        let acc = first[0] === respOpcode ? first.subarray(1) : first;
+        const dataOf = (buf) => buf.length >= 1 && buf[0] === expectedLen ? buf.subarray(1) : buf;
+        if (dataOf(acc).length >= expectedLen) {
+            return dataOf(acc).slice(0, expectedLen);
+        }
+        /* Response is fragmented — collect the continuation chunks, which carry
+         * raw payload bytes with no opcode of their own. */
+        return new Promise((resolve, reject) => {
+            const t = setTimeout(() => {
+                this._offTemp(handler);
+                reject(new Error(`${label} returned ${dataOf(acc).length} of ${expectedLen} bytes (response truncated).`));
+            }, responseTimeoutMs);
+            const handler = (chunk) => {
+                if (!chunk || chunk.length === 0)
+                    return;
+                /* Every chunk from here is continuation payload — deliberately NOT
+                 * filtering a lone 0xFF as a stray ACK, because a payload byte can be
+                 * 0xFF and dropping it would silently corrupt the record. The ACK for
+                 * this command was already consumed before this handler was registered,
+                 * and commands are issued one at a time, so no other ACK can arrive
+                 * mid-response. */
+                acc = concatU8(acc, chunk);
+                const data = dataOf(acc);
+                if (data.length >= expectedLen) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    resolve(data.slice(0, expectedLen));
+                }
+            };
+            this._onTemp(handler);
+        });
+    }
     async readInfoMem(address, length) {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
@@ -3290,27 +3798,84 @@ class Shimmer3RClient extends BaseShimmerClient {
             address & 0xff,
             (address >> 8) & 0xff,
         ]);
-        const remainder = await this._writeExpectingAck(cmd, 1500);
-        const rsp = remainder && remainder[0] === OPCODES.INFOMEM_RESPONSE
-            ? remainder
-            : await this._waitForResponse(OPCODES.INFOMEM_RESPONSE, 2000);
-        // Response is [INFOMEM_RSP][length][data...] — the opcode is guaranteed by the
-        // selection above (firmware always opcode-frames InfoMem responses, matching
-        // readMem() in the Shimmer Java driver); only the length byte is optional and
-        // is skipped when present and consistent. Deliberately NOT accepting
-        // opcode-less chunks: a raw chunk could be an unrelated notification (e.g. a
-        // 0x00-preamble data frame while streaming) and must not be mis-captured as
-        // InfoMem payload.
-        let off = 0;
-        if (rsp[off] === OPCODES.INFOMEM_RESPONSE)
-            off++;
-        if (rsp.length > off && rsp[off] === length && rsp.length >= off + 1 + length)
-            off++;
-        const data = rsp.slice(off, off + length);
-        if (data.length < length) {
-            throw new Error(`InfoMem read returned ${data.length} of ${length} bytes.`);
+        /* Response is [INFOMEM_RSP][length][data...]. The opcode is required (a raw
+         * opcode-less chunk could be an unrelated notification, e.g. a 0x00-preamble
+         * data frame, and must not be mis-captured as InfoMem payload); the length
+         * byte is optional. Reads longer than one BLE notification are reassembled. */
+        return this._readLengthPrefixedResponse(cmd, OPCODES.INFOMEM_RESPONSE, length, 'InfoMem read');
+    }
+    /**
+     * Arm a one-shot soft reboot that the device performs as soon as this host
+     * disconnects (SET_FEATURE / FEATURE_REBOOT_ON_DISCONNECT).
+     *
+     * Settings that firmware only reads at boot - notably the EEPROM brand
+     * record's advertising names - otherwise need a manual power-cycle. The
+     * reboot cannot happen while still connected, because the link has to drop
+     * for the Bluetooth module to re-read its name; so the sequence is: write
+     * settings, call this, then {@link disconnect}.
+     *
+     * Firmware skips the reboot while sensing so that it can never truncate an
+     * active SD recording, and clears the request either way - it is strictly
+     * one-shot and never carries into a later disconnect.
+     *
+     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; older
+     * firmware NACKs the unknown feature id.
+     */
+    async setRebootOnDisconnect(enabled) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        this._emitStatus(`SET_FEATURE reboot-on-disconnect=${enabled ? 1 : 0} → waiting for ACK…`);
+        await this._writeExpectingAck(new Uint8Array([OPCODES.SET_FEATURE, BT_FEATURE.REBOOT_ON_DISCONNECT, enabled ? 1 : 0]), 1500);
+        this._emitStatus(`Reboot-on-disconnect ${enabled ? 'armed' : 'cleared'}`);
+    }
+    /**
+     * Read from the daughter-card (expansion board) EEPROM memory. `offset` is a
+     * HOST offset — firmware maps it past the first (HW details) EEPROM page, so
+     * host offsets 0..2031 cover absolute EEPROM bytes 16..2047.
+     */
+    async readDaughterCardMem(offset, length) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (!Number.isInteger(offset) || offset < 0 || offset > 2031) {
+            throw new Error('Daughter-card mem offset must be an integer in 0..2031.');
         }
-        return data;
+        if (!Number.isInteger(length) || length < 1 || length > 128 || offset + length > 2032) {
+            throw new Error('Daughter-card mem read must be 1..128 bytes within 0..2031.');
+        }
+        this._emitStatus(`GET_DAUGHTER_CARD_MEM ${length}B @ ${offset} → waiting for ACK then RSP…`);
+        const cmd = new Uint8Array([
+            OPCODES.GET_DAUGHTER_CARD_MEM_COMMAND,
+            length & 0xff,
+            offset & 0xff,
+            (offset >> 8) & 0xff,
+        ]);
+        /* Response is [DAUGHTER_CARD_MEM_RSP][length][data...] — same framing
+         * rationale as readInfoMem() above. The 64-byte brand record exceeds one
+         * BLE notification, so the reassembly in the helper is load-bearing here. */
+        return this._readLengthPrefixedResponse(cmd, OPCODES.DAUGHTER_CARD_MEM_RESPONSE, length, 'Daughter-card mem read');
+    }
+    /**
+     * Write to the daughter-card (expansion board) EEPROM memory. `offset` is a
+     * HOST offset (see {@link readDaughterCardMem}). Max 128 bytes per write.
+     */
+    async writeDaughterCardMem(offset, data) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (!Number.isInteger(offset) || offset < 0 || offset > 2031) {
+            throw new Error('Daughter-card mem offset must be an integer in 0..2031.');
+        }
+        if (data.length < 1 || data.length > 128 || offset + data.length > 2032) {
+            throw new Error('Daughter-card mem write must be 1..128 bytes within 0..2031.');
+        }
+        this._emitStatus(`SET_DAUGHTER_CARD_MEM ${data.length}B @ ${offset} → waiting for ACK…`);
+        const cmd = new Uint8Array(4 + data.length);
+        cmd[0] = OPCODES.SET_DAUGHTER_CARD_MEM_COMMAND;
+        cmd[1] = data.length & 0xff;
+        cmd[2] = offset & 0xff;
+        cmd[3] = (offset >> 8) & 0xff;
+        cmd.set(data, 4);
+        await this._writeExpectingAck(cmd, 1500);
+        this._emitStatus('Daughter-card mem write ACKed');
     }
     /**
      * Read the device's MAC address from InfoMem and return it as 12 uppercase hex
@@ -3933,3882 +4498,541 @@ class Shimmer3RClient extends BaseShimmerClient {
             }
         });
     }
-}
-
-/**
- * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
- *
- * Classic Shimmer3 speaks the same LiteProtocol command set as the Shimmer3R
- * (see `../shimmer3r/constants.ts`), but over an **unframed RFCOMM byte stream**
- * rather than framed BLE notifications, and with a **different inquiry-response
- * layout** (a 4-byte config word instead of Shimmer3R's 7-byte word). Everything
- * in this file is a side-effect-free function so it can be unit-tested without a
- * transport.
- *
- * Ported from the Shimmer Java driver:
- *   com.shimmerresearch.driver.ShimmerObject#interpretInqResponse (HW_ID.SHIMMER_3 branch)
- *   com.shimmerresearch.bluetooth.ShimmerBluetooth (response byte layouts + handshake)
- */
-/** The Shimmer3 acknowledgement byte (LiteProtocol). Shared with Shimmer3R. */
-const ACK = OPCODES.ACK_COMMAND_PROCESSED; // 0xFF
-/** The Shimmer3 negative-acknowledgement byte (LiteProtocol). */
-const NACK = OPCODES.NACK_COMMAND_PROCESSED; // 0xFE
-/**
- * Well-known SPP (Serial Port Profile) service UUID used to open an RFCOMM
- * socket to a classic Shimmer3. Documented here for the platform transport
- * (e.g. the React Native Android module calls
- * `createRfcommSocketToServiceRecord(SPP_UUID)`); the SDK client itself is
- * transport-agnostic and never touches it.
- */
-const SHIMMER3_SPP_UUID = '00001101-0000-1000-8000-00805f9b34fb';
-// ---------------------------------------------------------------------------
-// Inquiry-response layout — THE key protocol difference vs Shimmer3R
-// ---------------------------------------------------------------------------
-//
-// Byte layout of an INQUIRY_RESPONSE, INCLUDING the 0x02 opcode byte
-// (ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch works on the
-// opcode-stripped buffer, so every index below is the Java index + 1):
-//
-//   [0]      = 0x02  INQUIRY_RESPONSE opcode
-//   [1..2]   = sampling-rate divisor, 16-bit little-endian
-//   [3..6]   = config word (configByte0), 4 bytes little-endian   <-- 4, not 7
-//   [7]      = numChannels
-//   [8]      = bufferSize
-//   [9..]    = numChannels channel/signal-ID bytes
-//
-// Shimmer3R differs: its config word is 7 bytes (indices [3..9]), numChannels at
-// [10], bufferSize at [11], channels from [12]. That single width difference is
-// why this cannot reuse Shimmer3RClient's inquiry parser.
-/** 0-based offset (within the opcode-prefixed message) of the config word. */
-const SHIMMER3_INQ_CONFIG_OFFSET = 3;
-/** Config word width in bytes (Shimmer3 = 4; Shimmer3R = 7). */
-const SHIMMER3_INQ_CONFIG_LENGTH = 4;
-/** Offset of the numChannels byte within the opcode-prefixed message. */
-const SHIMMER3_INQ_NUM_CHANNELS_OFFSET = SHIMMER3_INQ_CONFIG_OFFSET + SHIMMER3_INQ_CONFIG_LENGTH; // 7
-/** Offset of the first channel-ID byte within the opcode-prefixed message. */
-const SHIMMER3_INQ_CHANNELS_OFFSET = SHIMMER3_INQ_NUM_CHANNELS_OFFSET + 2; // 9
-/** The sampling clock frequency (Hz) used for divisor↔rate conversion. */
-// ShimmerDevice#getSamplingClockFreq() returns 32768.0 for Shimmer3 and Shimmer3R.
-const SHIMMER3_SAMPLING_CLOCK_FREQ = 32768;
-/**
- * Build a stream schema from the channel-ID list reported by the inquiry.
- *
- * Mirrors ShimmerObject#interpretDataPacketFormat (the channel→format mapping is
- * identical for Shimmer3 and Shimmer3R, so `CHANNEL_FORMATS` and
- * `SensorBitmapShimmer3` are reused verbatim). The only Shimmer3-relevant knob is
- * the timestamp width (u24 for firmware code ≥ 6, else u16 — see
- * ShimmerObject#updateTimestampByteLength).
- */
-function buildShimmer3Schema(channelIds, timestampFmt) {
-    const fields = [];
-    const ts = timestampFmt === 'u24' ? TIMESTAMP_FIELD.u24 : TIMESTAMP_FIELD.u16;
-    let frameBytes = 1 + ts.sizeBytes; // 1 = DATA_PACKET (0x00) preamble
-    let enabledSensors = 0;
-    for (const id of channelIds) {
-        const fmt = CHANNEL_FORMATS[id];
-        if (!fmt) {
-            fields.push({ id, name: `CH_${hex2(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
-            frameBytes += 2;
-            continue;
-        }
-        fields.push({ id, ...fmt });
-        frameBytes += fmt.sizeBytes ?? 2;
-        enabledSensors |= channelIdToSensorBit(id);
-    }
-    return { timestampFmt, fields, frameBytes, enabledSensors, dataPreambleByte: 0x00 };
-}
-/** Map a channel/signal ID to its SensorBitmapShimmer3 enable bit (0 if none). */
-function channelIdToSensorBit(id) {
-    switch (id) {
-        case 0x00:
-        case 0x01:
-        case 0x02:
-            return SensorBitmapShimmer3.SENSOR_A_ACCEL;
-        case 0x04:
-        case 0x05:
-        case 0x06:
-            return SensorBitmapShimmer3.SENSOR_D_ACCEL;
-        case 0x14:
-        case 0x15:
-        case 0x16:
-            return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
-        case 0x07:
-        case 0x08:
-        case 0x09:
-            return SensorBitmapShimmer3.SENSOR_MAG;
-        case 0x0a:
-        case 0x0b:
-        case 0x0c:
-            return SensorBitmapShimmer3.SENSOR_GYRO;
-        case 0x12:
-            return SensorBitmapShimmer3.SENSOR_INT_A1;
-        case 0x1c:
-            return SensorBitmapShimmer3.SENSOR_GSR;
-        case 0x23:
-        case 0x24:
-            return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
-        case 0x25:
-        case 0x26:
-            return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
-        case 0x1e:
-        case 0x1f:
-            return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
-        case 0x21:
-        case 0x22:
-            return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
-        default:
-            return 0;
-    }
-}
-/**
- * Decode an INQUIRY_RESPONSE using the Shimmer3 (classic) layout.
- *
- * Accepts the message with or without the leading 0x02 opcode byte (the
- * byte-stream parser always includes it; a caller passing a bare body also
- * works, matching Shimmer3RClient's `base` handling).
- *
- * Ported from ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch.
- */
-function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24') {
-    let base = 0;
-    if (u8[0] === OPCODES.INQUIRY_RESPONSE)
-        base = 1;
-    const adcRaw = u16le$3(u8, base + 0);
-    const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
-    // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
-    const configByte0 = ((u8[base + 2] | (u8[base + 3] << 8) | (u8[base + 4] << 16) | (u8[base + 5] << 24)) >>> 0) >>>
-        0;
-    const accelRange = (configByte0 & 0xc) >>> 2;
-    const gyroRange = (configByte0 & 0x30000) >>> 16;
-    const magRange = (configByte0 & 0xe00000) >>> 21;
-    const gsrRange = (configByte0 >>> 25) & 0x7;
-    const internalExpPower = (configByte0 >>> 24) & 0x1;
-    const numChannels = u8[base + 6] ?? 0;
-    const bufferSize = u8[base + 7] ?? 0;
-    const chStart = base + 8;
-    const channelIds = [...u8.slice(chStart, chStart + numChannels)];
-    const schema = buildShimmer3Schema(channelIds, timestampFmt);
-    return {
-        opcode: u8[0],
-        adcRaw,
-        samplingRateHz,
-        configByte0,
-        gsrRange,
-        internalExpPower,
-        accelRange,
-        gyroRange,
-        magRange,
-        numChannels,
-        bufferSize,
-        channelIds,
-        schema,
-        bytes: u8.slice(0),
-    };
-}
-/** Decode a DEVICE_VERSION_RESPONSE (0x25) — 1 payload byte = HW version.
- *  Ported from ShimmerBluetooth (GET_SHIMMER_VERSION_RESPONSE handler). */
-function parseShimmer3DeviceVersionResponse(u8) {
-    const base = u8[0] === OPCODES.DEVICE_VERSION_RESPONSE ? 1 : 0;
-    return { hardwareVersion: u8[base] ?? 0 };
-}
-/**
- * Firmware identifier (type) values, from
- * com.shimmerresearch.driverUtilities.ShimmerVerDetails.FW_ID.
- */
-const FW_ID = Object.freeze({
-    BTSTREAM: 1,
-    SDLOG: 2,
-    LOGANDSTREAM: 3,
-});
-/**
- * Decode a FW_VERSION_RESPONSE (0x2F) — 6 payload bytes.
- * Ported from ShimmerBluetooth (FW_VERSION_RESPONSE handler):
- *   id  = b1<<8 | b0   (little-endian)
- *   maj = b3<<8 | b2
- *   min = b4
- *   int = b5
- */
-function parseShimmer3FwVersionResponse(u8) {
-    const base = u8[0] === OPCODES.FW_VERSION_RESPONSE ? 1 : 0;
-    const b = (i) => u8[base + i] ?? 0;
-    return {
-        firmwareIdentifier: (b(1) << 8) | b(0),
-        major: (b(3) << 8) | b(2),
-        minor: b(4),
-        internal: b(5),
-    };
-}
-/**
- * Whether streaming data frames use a 3-byte (u24) timestamp for this firmware.
- *
- * The Java driver widens the timestamp to 3 bytes when the derived firmware
- * version code is ≥ 6 (ShimmerObject#updateTimestampByteLength). That code is a
- * per-firmware-type version ladder (ShimmerVerObject); code ≥ 6 corresponds to
- * LogAndStream ≥ 0.5.4, BtStream ≥ 0.7.3, and SDLog ≥ 0.11.5. Anything at or
- * above those (and any firmware type we don't recognise, assumed modern) uses
- * u24; older firmware uses u16.
- */
-function shimmer3UsesThreeByteTimestamp(v) {
-    const atLeast = (maj, min, int) => v.major > maj || (v.major === maj && (v.minor > min || (v.minor === min && v.internal >= int)));
-    switch (v.firmwareIdentifier) {
-        case FW_ID.LOGANDSTREAM:
-            return atLeast(0, 5, 4);
-        case FW_ID.BTSTREAM:
-            return atLeast(0, 7, 3);
-        case FW_ID.SDLOG:
-            return atLeast(0, 11, 5);
-        default:
-            return true; // unknown/newer firmware type — default to modern u24
-    }
-}
-// ---------------------------------------------------------------------------
-// Unframed-stream control-message framing
-// ---------------------------------------------------------------------------
-/**
- * Fixed payload lengths (bytes AFTER the opcode) for the control responses the
- * v1 client consumes. INQUIRY_RESPONSE is variable and handled specially in
- * {@link shimmer3ControlMessageLength}. Extend this table to teach the
- * byte-stream parser about further GET responses.
- *
- * Lengths taken from the `readBytes(n, ...)` calls in ShimmerBluetooth and the
- * LiteProtocol instruction-set response_size annotations.
- */
-const SHIMMER3_RESPONSE_PAYLOAD_LENGTHS = Object.freeze({
-    [OPCODES.SAMPLING_RATE_RESPONSE]: 2, // 0x04
-    [OPCODES.FW_VERSION_RESPONSE]: 6, // 0x2F
-    [OPCODES.DEVICE_VERSION_RESPONSE]: 1, // 0x25
-    [OPCODES.GSR_RANGE_RESPONSE]: 1, // 0x22
-    [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
-});
-/** Sentinel: need more bytes before the message length can be determined. */
-const NEED_MORE = -1;
-/** Sentinel: leading byte is not a recognised control opcode — caller resyncs. */
-const RESYNC = 0;
-/**
- * Given the head of the accumulated RFCOMM byte buffer, return the total length
- * (INCLUDING the leading opcode) of the complete control message it starts with,
- * or {@link NEED_MORE} if not enough bytes have arrived yet, or {@link RESYNC}
- * if the leading byte is not a control opcode we understand (garbage / a data
- * byte leaked into the control plane — the caller should drop one byte and
- * retry).
- *
- * This is the primitive that makes the unframed RFCOMM stream tractable: unlike
- * BLE (one notification == one message), RFCOMM delivers bytes split or
- * coalesced arbitrarily, so the client cannot assume `chunk[0]` is a whole
- * message. The Java driver solves the same problem with blocking `readBytes(n)`
- * calls that know each response's length up front (ShimmerBluetooth); this
- * expresses that length knowledge as a pure function.
- *
- * ACK (0xFF) and NACK (0xFE) are 1-byte messages. INQUIRY_RESPONSE (0x02) is
- * `9 + numChannels` bytes, and numChannels lives at index 7, so at least 8 bytes
- * are needed to compute the length.
- */
-function shimmer3ControlMessageLength(buf) {
-    if (buf.length === 0)
-        return NEED_MORE;
-    const opcode = buf[0];
-    if (opcode === ACK || opcode === NACK)
-        return 1;
-    if (opcode === OPCODES.INQUIRY_RESPONSE) {
-        if (buf.length <= SHIMMER3_INQ_NUM_CHANNELS_OFFSET)
-            return NEED_MORE; // need index 7 present
-        const numChannels = buf[SHIMMER3_INQ_NUM_CHANNELS_OFFSET];
-        // Sanity bound: a stray stream-data byte 0x02 can masquerade as an
-        // INQUIRY_RESPONSE whose "numChannels" comes from garbage, swallowing up to
-        // 264 bytes of real control traffic (including ACK/NACK). No real Shimmer3
-        // has anywhere near 32 channels — treat implausible values as garbage and
-        // resync instead.
-        if (numChannels > 32)
-            return RESYNC;
-        return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
-    }
-    const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
-    if (payload === undefined)
-        return RESYNC;
-    return 1 + payload;
-}
-
-/**
- * Classic-Bluetooth (RFCOMM/SPP) Shimmer3 constants.
- *
- * The LiteProtocol opcode set, sensor bitmap, channel formats and timestamp
- * descriptors are byte-for-byte identical to the Shimmer3R, so they are
- * re-exported from `../shimmer3r/` rather than duplicated. Only the values that
- * are genuinely Shimmer3-classic-specific live here.
- */
-// Re-export the shared LiteProtocol surface so Shimmer3 consumers import from one
-// module (these are identical across the two device families).
-/**
- * Connect-handshake defaults, ported from the timings/sequence in
- * com.shimmerresearch.bluetooth.ShimmerBluetooth.
- */
-const SHIMMER3_DEFAULTS = Object.freeze({
-    /**
-     * How long to drain-and-discard bytes after the dummy read that flushes the
-     * RFCOMM buffer on connect. ShimmerBluetooth's dummy read polls the serial
-     * buffer with short sleeps; 250 ms comfortably covers an ACK + response at
-     * classic-BT latencies.
-     */
-    DUMMY_READ_DRAIN_MS: 250,
-    /** Per-command ACK timeout (ms). */
-    ACK_TIMEOUT_MS: 1500,
-    /** Response (post-ACK) timeout (ms). */
-    RESPONSE_TIMEOUT_MS: 2000,
-    /**
-     * Default streaming timestamp width. Classic Shimmer3 LogAndStream firmware
-     * with version code ≥ 6 uses a 3-byte timestamp
-     * (ShimmerObject#updateTimestampByteLength); older firmware uses 2 bytes.
-     */
-    TIMESTAMP_FMT: 'u24',
-});
-
-// ---------------------------------------------------------------------------
-// Shimmer3Client
-// ---------------------------------------------------------------------------
-/**
- * Client for the **classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
- *
- * Shimmer3 speaks the same LiteProtocol as the Shimmer3R (shared opcodes, sensor
- * bitmap, channel formats — all reused from `../shimmer3r/`), with two
- * differences this client owns:
- *
- * 1. **Unframed byte stream.** RFCOMM has no MTU and no message framing: bytes
- *    arrive split or coalesced arbitrarily. Rather than assume "one notification
- *    = one message" (as the BLE {@link Shimmer3RClient} does), this client
- *    accumulates inbound bytes and extracts complete control messages with a
- *    length-aware parser ({@link shimmer3ControlMessageLength}). This mirrors the
- *    Java driver's blocking `readBytes(n)` approach (ShimmerBluetooth) but as a
- *    non-blocking accumulator.
- * 2. **Inquiry-response layout.** Shimmer3's config word is 4 bytes vs
- *    Shimmer3R's 7 (see {@link interpretShimmer3InquiryResponse}).
- *
- * Transport injection is mandatory — `connect()` with no transport throws.
- *
- * @example
- * ```ts
- * const client = new Shimmer3Client({ transport: rfcommTransport });
- * client.onStatus = (m) => console.log(m);
- * await client.connect();               // handshake: flush → HW version → FW version
- * await client.setSamplingRate(51.2);
- * await client.setSensors(SensorBitmapShimmer3.SENSOR_GYRO);
- * await client.setGSRRange(2);
- * await client.startStreaming();
- * ```
- */
-class Shimmer3Client extends BaseShimmerClient {
-    constructor(opts = {}) {
-        super(opts);
-        // Transport (byte pipe). Always injected — never built by this client.
-        this._injectedTransport = null;
-        this._transport = null;
-        this._notifyUnsub = null;
-        this._disconnectUnsub = null;
-        // Protocol state
-        this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
-        this.schema = null;
-        this._streaming = false;
-        this._streamStarting = false;
-        this._lastTs = 0;
-        /** Bumped once per inbound transport chunk — used for quiescence detection. */
-        this._rxSeq = 0;
-        /** While true, {@link _handleNotify} only accumulates; a drain loop owns `_rxBuf`. */
-        this._drainingResidual = false;
-        /** Number of {@link _waitForResponse} calls currently awaiting an INQUIRY_RESPONSE. */
-        this._awaitInq = 0;
-        /**
-         * Number of command handlers ({@link _waitForAck} / {@link _waitForResponse})
-         * currently awaiting a response. Gates NACK framing in {@link _drainControl}
-         * so a stray 0xFE arriving with no command in flight cannot fabricate a NACK.
-         */
-        this._awaitCmd = 0;
-        // Cached device info from the connect handshake
-        this.deviceVersion = null;
-        this.firmwareVersion = null;
-        // Cached device configuration
-        this.enabledSensors = 0x000000;
-        this.samplingRateHz = 0;
-        this.gsrRangeSetting = 0;
-        this.ExpPower = 0;
-        /** Inertial-sensor hardware ranges, refreshed from each inquiry's config word. */
-        this.imuRanges = {
-            lnAccel: 0, // Kionix KXRB LN accel is fixed-range on Shimmer3
-            wrAccel: 0,
-            gyro: 0,
-            mag: 0,
-            altAccel: 0,
-            altMag: 0,
+    /** Read (and cache) the firmware version via GET_FW_VERSION_COMMAND. */
+    async readFwVersion() {
+        if (this._fwVersionCache)
+            return this._fwVersionCache;
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        const cmd = new Uint8Array([OPCODES.GET_FW_VERSION_COMMAND]);
+        const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+        const rsp = ackRemainder && ackRemainder[0] === OPCODES.FW_VERSION_RESPONSE
+            ? ackRemainder
+            : await this._waitForResponse(OPCODES.FW_VERSION_RESPONSE, 1500);
+        if (rsp.length < 7)
+            throw new Error('short FW_VERSION_RESPONSE');
+        this._fwVersionCache = {
+            fwId: rsp[1] | (rsp[2] << 8),
+            major: rsp[3] | (rsp[4] << 8),
+            minor: rsp[5],
+            patch: rsp[6],
         };
-        /** When false, inertial channels are emitted raw-only (no `'cal'` field). Default true. */
-        this.emitCalibratedInertial = true;
-        this._deviceCalibrations = {};
-        /** Minimum valid GSR conductance in µS (below this, connectivity = "Disconnected"). */
-        this.LIMIT_MIN_VALID_USIEMENS = 0.03;
-        // Callbacks
-        this.onInquiry = null;
-        this.onExpPowerChanged = null;
-        this._handleTransportDisconnect = () => {
-            this._streaming = false;
-            this._streamStarting = false;
-            this._emitStatus('Device disconnected');
-        };
-        // ---------------------------------------------------------------------------
-        // Notify handler — accumulate + parse an UNFRAMED byte stream
-        // ---------------------------------------------------------------------------
-        this._handleNotify = (chunk) => {
-            if (!chunk || chunk.length === 0)
-                return;
-            this._log('Notify len=', chunk.length, 'data=', chunk);
-            this._rxSeq += 1; // for quiescence detection
-            this._rxBuf = concatU8(this._rxBuf, chunk);
-            // While a residual-drain is in progress the drain loop owns the buffer:
-            // just accumulate, so stale stream bytes never reach the control parser.
-            if (this._drainingResidual)
-                return;
-            if (this._streaming) {
-                this._parseStream();
-            }
-            else {
-                this._drainControl();
-            }
-        };
-        this._injectedTransport = opts.transport ?? null;
-        this._forceTimestampFmt = opts.timestampFmt;
-        this._timestampFmt = opts.timestampFmt ?? SHIMMER3_DEFAULTS.TIMESTAMP_FMT;
-        this._stopStreamingOnConnect = opts.stopStreamingOnConnect ?? true;
-        this._imuFamily = opts.imuGeneration === 'new' ? 'shimmer3-new' : 'shimmer3-old';
-        this.emitCalibratedInertial = opts.emitCalibratedInertial ?? true;
+        return this._fwVersionCache;
     }
-    _log(...args) {
-        if (this.debug)
-            console.log('[Shimmer3]', ...args);
-    }
-    /** Best-effort label for `ObjectCluster`s and status messages. */
-    _deviceLabel() {
-        return this._transport?.deviceName ?? 'Shimmer3';
-    }
-    /** The streaming timestamp width currently in effect. */
-    get timestampFmt() {
-        return this._timestampFmt;
-    }
-    // ---------------------------------------------------------------------------
-    // Connection management + handshake
-    // ---------------------------------------------------------------------------
     /**
-     * Open the RFCOMM connection and run the classic-Shimmer3 connect handshake.
-     *
-     * A transport is REQUIRED (constructor option or this parameter); classic
-     * Bluetooth cannot run in a browser, so there is no default. Calling without
-     * one throws.
-     *
-     * Handshake (ported from ShimmerBluetooth#initialize → readShimmerVersionNew →
-     * readFWVersion):
-     *   1. best-effort STOP_STREAMING (safety on reconnect; opt-out via options),
-     *   2. dummy GET_SAMPLING_RATE write + drain to flush the RFCOMM buffer,
-     *   3. GET_DEVICE_VERSION_COMMAND (0x3F) → DEVICE_VERSION_RESPONSE (HW version),
-     *   4. GET_FW_VERSION_COMMAND (0x2E) → FW_VERSION_RESPONSE (firmware version),
-     *   then the streaming timestamp width is derived from the firmware code.
+     * True when the connected firmware serves the SD file-transfer commands
+     * (LogAndStream_Shimmer3R >= v1.01.009). Older firmware silently ignores
+     * unknown opcodes, so version gating is the only reliable probe.
      */
-    async connect(transport) {
-        const t = transport ?? this._injectedTransport;
-        if (!t) {
-            throw new Error('Shimmer3Client requires an injected transport: classic Bluetooth (RFCOMM/SPP) ' +
-                'is not available in browsers. Pass a ShimmerTransport via the constructor ' +
-                '({ transport }) or connect(transport).');
-        }
-        this._transport = t;
-        this._notifyUnsub = t.onNotify(this._handleNotify);
-        this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
-        this._emitStatus('Opening RFCOMM connection…');
-        await t.connect();
-        this._emitStatus(`Connected: ${this._deviceLabel()}`);
-        await this._handshake();
-    }
-    async _handshake() {
-        // 2) Flush the serial buffer with a dummy read (ShimmerBluetooth#dummyReadSamplingRate:
-        //    "it actually acts to clear the write buffer"). A best-effort STOP first
-        //    ensures a device left streaming from a previous session is quiesced.
-        if (this._stopStreamingOnConnect) {
-            try {
-                await this._write(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]));
-            }
-            catch {
-                /* ignore */
-            }
-        }
-        this._rxBuf = new Uint8Array(0);
-        this._emitStatus('Flushing RFCOMM buffer (dummy read)…');
+    async supportsSdTransfer() {
         try {
-            await this._write(new Uint8Array([OPCODES.GET_SAMPLING_RATE_COMMAND]));
+            const v = await this.readFwVersion();
+            return v.major * 1000000 + v.minor * 1000 + v.patch >= 1001009;
         }
         catch {
-            /* ignore */
-        }
-        await new Promise((r) => setTimeout(r, SHIMMER3_DEFAULTS.DUMMY_READ_DRAIN_MS));
-        this._rxBuf = new Uint8Array(0); // discard whatever the dummy read produced
-        // 3) HW version. Responses may or may not be ACK-prefixed on classic firmware,
-        //    so wait for the response opcode directly (any leading ACK is ignored).
-        this._emitStatus('GET_DEVICE_VERSION → waiting for response…');
-        await this._write(new Uint8Array([OPCODES.GET_DEVICE_VERSION_COMMAND]));
-        const verBytes = await this._waitForResponse(OPCODES.DEVICE_VERSION_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
-        this.deviceVersion = parseShimmer3DeviceVersionResponse(verBytes);
-        this._emitStatus(`HW version = ${this.deviceVersion.hardwareVersion}`);
-        // 4) FW version.
-        this._emitStatus('GET_FW_VERSION → waiting for response…');
-        await this._write(new Uint8Array([OPCODES.GET_FW_VERSION_COMMAND]));
-        const fwBytes = await this._waitForResponse(OPCODES.FW_VERSION_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
-        this.firmwareVersion = parseShimmer3FwVersionResponse(fwBytes);
-        this._emitStatus(`FW version = ${this.firmwareVersion.major}.${this.firmwareVersion.minor}.${this.firmwareVersion.internal} (type ${this.firmwareVersion.firmwareIdentifier})`);
-        // Derive timestamp width from firmware unless the caller forced one.
-        if (this._forceTimestampFmt === undefined) {
-            this._timestampFmt = shimmer3UsesThreeByteTimestamp(this.firmwareVersion) ? 'u24' : 'u16';
-        }
-        this._emitStatus(`Handshake complete (timestamp = ${this._timestampFmt}).`);
-    }
-    async disconnect() {
-        try {
-            this._notifyUnsub?.();
-            this._disconnectUnsub?.();
-            await this._transport?.disconnect();
-        }
-        catch {
-            /* ignore */
-        }
-        finally {
-            this._notifyUnsub = this._disconnectUnsub = null;
-            this._transport = null;
-            this._rxBuf = new Uint8Array(0);
-            this.schema = null;
-            this._streaming = false;
-            this._streamStarting = false;
-            this.ExpPower = 0;
-            this._deviceCalibrations = {};
-            this._emitStatus('Disconnected');
-        }
-    }
-    /**
-     * Extract every complete control message currently buffered and dispatch each
-     * to the temp handlers, then keep the incomplete tail for the next chunk. This
-     * is what makes the unframed RFCOMM stream behave like framed BLE for the
-     * ACK/response machinery below.
-     */
-    _drainControl() {
-        let buf = this._rxBuf;
-        for (;;) {
-            if (buf.length === 0)
-                break;
-            // While a stream is (about to be) live, DATA_PACKET (0x00) bytes belong to
-            // the stream parser, not the control plane — leave them buffered.
-            if ((this._streaming || this._streamStarting) && buf[0] === OPCODES.DATA_PACKET)
-                break;
-            // Only frame 0x02 as an INQUIRY_RESPONSE when an inquiry is actually
-            // awaited; an unexpected 0x02 is a stray/stream byte and framing it would
-            // swallow real control bytes. Drop it instead.
-            if (buf[0] === OPCODES.INQUIRY_RESPONSE && this._awaitInq <= 0) {
-                this._log('drainControl: dropping 0x02 — no INQUIRY awaited');
-                buf = buf.subarray(1);
-                continue;
-            }
-            // Same guard for NACK (0xFE): only frame it as a control message while a
-            // command is genuinely awaiting a response (_awaitCmd > 0). A stray 0xFE —
-            // e.g. a late residual byte arriving after the stop-drain returned early —
-            // is dropped instead of framed. This diverges from the Java driver
-            // (ShimmerObject processes every 0xFE unconditionally) but strictly reduces
-            // the risk of a leaked stream byte being mistaken for a NACK, mirroring the
-            // 0x02 gate above. Defence-in-depth: today _onTemp handlers are added only
-            // while _awaitCmd > 0, so an ungated stray 0xFE would emit to no listener;
-            // this guard keeps that invariant explicit and survives refactors that add
-            // a longer-lived control listener.
-            if (buf[0] === NACK && this._awaitCmd <= 0) {
-                this._log('drainControl: dropping 0xFE — no command awaited');
-                buf = buf.subarray(1);
-                continue;
-            }
-            const len = shimmer3ControlMessageLength(buf);
-            if (len === NEED_MORE)
-                break;
-            if (len === RESYNC) {
-                this._log(`resync: dropping unexpected control byte 0x${buf[0].toString(16)}`);
-                buf = buf.subarray(1);
-                continue;
-            }
-            if (buf.length < len)
-                break; // full message not here yet
-            this._emitTemp(new Uint8Array(buf.subarray(0, len)));
-            buf = buf.subarray(len);
-        }
-        this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
-    }
-    // ---------------------------------------------------------------------------
-    // Configuration commands
-    // ---------------------------------------------------------------------------
-    getEnabledSensors() {
-        return this.enabledSensors;
-    }
-    getInternalExpPower() {
-        return this.ExpPower;
-    }
-    /**
-     * Enable sensors via a 24-bit bitmask (SET_SENSORS_COMMAND). Automatically
-     * re-inquires after the ACK to rebuild the stream schema, matching
-     * {@link Shimmer3RClient.setSensors}.
-     */
-    async setSensors(sensors) {
-        if (!Number.isFinite(sensors))
-            throw new Error('sensors must be a finite number');
-        if (!this._transport)
-            throw new Error('Not connected');
-        sensors = (sensors >>> 0) & 0xffffff;
-        const cmd = new Uint8Array([
-            OPCODES.SET_SENSORS_COMMAND,
-            sensors & 0xff,
-            (sensors >>> 8) & 0xff,
-            (sensors >>> 16) & 0xff,
-        ]);
-        this._emitStatus(`SET_SENSORS → 0x${sensors.toString(16).toUpperCase().padStart(6, '0')} waiting for ACK…`);
-        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
-        this._emitStatus('Sensors ACKed; re-inquiring to refresh schema…');
-        try {
-            const info = await this.inquiry();
-            this.enabledSensors = info.schema.enabledSensors;
-        }
-        catch (err) {
-            this._emitStatus(`Inquiry after setSensors failed: ${err.message}`);
-        }
-        return { sensors, enabledSensors: this.enabledSensors };
-    }
-    /**
-     * Set the sampling rate (SET_SAMPLING_RATE_COMMAND). The firmware takes a
-     * 16-bit divisor `floor(32768 / rateHz)`; identical to Shimmer3R.
-     */
-    async setSamplingRate(rateHz) {
-        if (!Number.isFinite(rateHz) || rateHz <= 0) {
-            throw new Error('Sampling rate must be a positive number (Hz)');
-        }
-        if (!this._transport)
-            throw new Error('Not connected');
-        let divisor = Math.floor(32768 / rateHz);
-        divisor = Math.max(1, Math.min(0xffff, divisor));
-        const cmd = new Uint8Array([
-            OPCODES.SET_SAMPLING_RATE_COMMAND,
-            divisor & 0xff,
-            (divisor >> 8) & 0xff,
-        ]);
-        this._emitStatus(`SET_SAMPLING_RATE → ${rateHz} Hz (divisor=${divisor}) waiting for ACK…`);
-        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
-        const appliedHz = 32768 / divisor;
-        this.samplingRateHz = appliedHz;
-        this._emitStatus(`Sampling rate ACKed. Applied ≈ ${appliedHz.toFixed(3)} Hz`);
-        return { requestedHz: rateHz, appliedHz, divisor };
-    }
-    /**
-     * Set the GSR measurement range (SET_GSR_RANGE_COMMAND).
-     * @param gsrRange 0 = 8–63 kΩ, 1 = 63–220 kΩ, 2 = 220–680 kΩ, 3 = 680–4700 kΩ, 4 = Auto.
-     */
-    async setGSRRange(gsrRange) {
-        if (!Number.isInteger(gsrRange) || gsrRange < 0 || gsrRange > 4) {
-            throw new Error('gsrRange must be 0–4');
-        }
-        if (!this._transport)
-            throw new Error('Not connected');
-        const cmd = new Uint8Array([OPCODES.SET_GSR_RANGE_COMMAND, gsrRange & 0xff]);
-        this._emitStatus('SET_GSR_RANGE → waiting for ACK…');
-        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
-        this.gsrRangeSetting = gsrRange;
-        this._emitStatus('SET_GSR_RANGE (ACK received).');
-        return { gsrRange };
-    }
-    /**
-     * Control the internal expansion power rail (required for ExG/EMG/ECG).
-     * @param expPower 0 = disable, 1 = enable.
-     */
-    async setInternalExpPower(expPower) {
-        if (expPower !== 0 && expPower !== 1)
-            throw new Error('expPower must be 0 or 1');
-        if (!this._transport)
-            throw new Error('Not connected');
-        const cmd = new Uint8Array([OPCODES.SET_INTERNAL_EXP_POWER_ENABLE_COMMAND, expPower]);
-        this._emitStatus(`SET_INTERNAL_EXP_POWER → ${expPower ? 'ON' : 'OFF'} waiting for ACK…`);
-        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
-        this.ExpPower = expPower;
-        try {
-            this.onExpPowerChanged?.(expPower);
-        }
-        catch (e) {
-            this._log('onExpPowerChanged handler error', e);
-        }
-        return { expPower };
-    }
-    // ---------------------------------------------------------------------------
-    // Inquiry
-    // ---------------------------------------------------------------------------
-    /**
-     * Send INQUIRY_COMMAND and parse the (Shimmer3-layout) response, building the
-     * stream schema. Tolerant of an optional leading ACK before the response.
-     */
-    async inquiry() {
-        if (!this._transport)
-            throw new Error('Not connected');
-        this._emitStatus('INQUIRY → waiting for response…');
-        await this._write(new Uint8Array([OPCODES.INQUIRY_COMMAND]));
-        const rsp = await this._waitForResponse(OPCODES.INQUIRY_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
-        const info = interpretShimmer3InquiryResponse(rsp, this._timestampFmt);
-        this.schema = info.schema;
-        this.samplingRateHz = info.samplingRateHz;
-        this.enabledSensors = info.schema.enabledSensors;
-        this.gsrRangeSetting = info.gsrRange;
-        this.ExpPower = info.internalExpPower;
-        // Inertial ranges from the config word (interpretShimmer3InquiryResponse):
-        // accelRange = WR accel (LSM303), gyroRange = MPU gyro, magRange = LSM303 mag.
-        // LN accel (Kionix) is fixed-range → 0.
-        this.imuRanges = {
-            lnAccel: 0,
-            wrAccel: info.accelRange,
-            gyro: info.gyroRange,
-            mag: info.magRange,
-            altAccel: 0,
-            altMag: 0,
-        };
-        this._emitStatus(`Inquiry: ${info.numChannels} ch, ${info.samplingRateHz.toFixed(2)} Hz, ` +
-            `sensors=0x${info.schema.enabledSensors.toString(16).toUpperCase()}`);
-        try {
-            this.onInquiry?.(info);
-        }
-        catch (e) {
-            this._log('onInquiry handler error', e);
-        }
-        return info;
-    }
-    // ---------------------------------------------------------------------------
-    // Streaming
-    // ---------------------------------------------------------------------------
-    async startStreaming() {
-        if (!this._transport)
-            throw new Error('Not connected');
-        if (!this.schema)
-            this._emitStatus('Starting stream without schema (not recommended).');
-        // Stale buffered bytes (e.g. residual post-stop stream data) would desync
-        // the ACK wait for START — drain to quiescence and discard them first. A
-        // clean state (empty buffer) skips this entirely.
-        if (this._rxBuf.length > 0) {
-            this._drainingResidual = true;
-            try {
-                await this._drainQuiescent(300, 2000);
-            }
-            finally {
-                this._drainingResidual = false;
-            }
-            this._log('start: discarded', this._rxBuf.length, 'stale byte(s) pre-START');
-            this._rxBuf = new Uint8Array(0);
-        }
-        this._streamStarting = true;
-        this._lastTs = 0;
-        this._emitStatus('START_STREAMING → waiting for ACK…');
-        try {
-            await this._writeExpectingAck(new Uint8Array([OPCODES.START_STREAMING_COMMAND]), SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
-        }
-        catch (e) {
-            this._streamStarting = false;
-            throw e;
-        }
-        this._streaming = true;
-        this._streamStarting = false;
-        // Bytes that arrived after the ACK are the first data — parse them now.
-        this._parseStream();
-        this._emitStatus('START_STREAMING ACK received; frames should follow.');
-    }
-    async stopStreaming() {
-        this._emitStatus('STOP_STREAMING → sending, then draining residual stream…');
-        try {
-            await this._write(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]));
-        }
-        catch (err) {
-            this._emitStatus(`STOP_STREAMING write failed: ${err.message}`);
-        }
-        // In-flight stream packets keep arriving for hundreds of ms after STOP.
-        // Flipping to control mode instantly would let residual data hit
-        // _drainControl, where a stray 0xFE fabricates a NACK and a stray 0x02
-        // swallows real bytes (including ACKs). Keep the stream parser active while
-        // draining (or accumulate-only if we weren't in streaming mode — e.g.
-        // quiescing a device left streaming unattended), and only re-enable the
-        // control plane once the pipe has been quiet for ~300 ms.
-        this._streamStarting = false;
-        if (!this._streaming)
-            this._drainingResidual = true;
-        try {
-            await this._drainQuiescent(300, 3000);
-        }
-        finally {
-            this._drainingResidual = false;
-        }
-        if (this._rxBuf.length) {
-            this._log('stop drain: discarding', this._rxBuf.length, 'residual byte(s)');
-        }
-        this._streaming = false;
-        this._rxBuf = new Uint8Array(0);
-        this._emitStatus('Streaming stopped.');
-    }
-    /**
-     * Resolve once no bytes have arrived for `quietMs` (checked every 50 ms via
-     * the `_rxSeq` counter bumped in {@link _handleNotify}), or `maxMs` overall.
-     *
-     * HEURISTIC (hardware QA, please probe): the Shimmer3 streaming protocol has
-     * no end-of-stream handshake — STOP_STREAMING is ACKed but the firmware does
-     * not signal when the last data frame has been flushed over RFCOMM. Draining
-     * "until quiet" is therefore best-effort: the 300 ms quiet window / 3 s cap
-     * are tuned guesses, not protocol guarantees. Too short and a late residual
-     * frame leaks into the next command's control parsing; too long and stop()
-     * stalls. Values may need adjusting against real BT latency/buffering.
-     */
-    async _drainQuiescent(quietMs, maxMs) {
-        const start = Date.now();
-        let lastSeq = this._rxSeq;
-        let quietSince = Date.now();
-        for (;;) {
-            await new Promise((r) => setTimeout(r, 50));
-            if (this._rxSeq !== lastSeq) {
-                lastSeq = this._rxSeq;
-                quietSince = Date.now();
-            }
-            if (Date.now() - quietSince >= quietMs)
-                return;
-            if (Date.now() - start >= maxMs) {
-                this._log('drainQuiescent: max wait reached with pipe still active');
-                return;
-            }
-        }
-    }
-    // ---------------------------------------------------------------------------
-    // Stream frame parser (schema-driven; double-preamble resync)
-    // ---------------------------------------------------------------------------
-    //
-    // Minimal v1 parser — the streaming data path is a later phase, but building a
-    // working parser here proves the schema and keeps streaming from being
-    // precluded. The frame layout (0x00 preamble + timestamp + channels) is
-    // identical to Shimmer3R (ShimmerObject#interpretDataPacketFormat), so this
-    // follows the same double-preamble sync as Shimmer3RClient.
-    _parseStream() {
-        if (!this.schema)
-            return;
-        const sch = this.schema;
-        const preamble = sch.dataPreambleByte;
-        const frameBytes = sch.frameBytes >>> 0;
-        const tsBytes = sch.timestampFmt === 'u16' ? 2 : 3;
-        let buf = this._rxBuf;
-        while (buf.length >= frameBytes * 2) {
-            if (buf[0] === preamble && buf[frameBytes] === preamble) {
-                try {
-                    const frame = buf.subarray(0, frameBytes);
-                    let cursor = 1;
-                    const oc = new ObjectCluster(this._deviceLabel());
-                    const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le$1(frame, cursor);
-                    cursor += tsBytes;
-                    oc.add('TIMESTAMP', ts, 'ticks', 'raw');
-                    for (const f of sch.fields) {
-                        let v;
-                        switch (f.fmt) {
-                            case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$3(frame, cursor));
-                                break;
-                            case 'u16':
-                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$3(frame, cursor);
-                                break;
-                            case 'i24':
-                                v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
-                                break;
-                            case 'u24':
-                                v = f.endian === 'be' ? u24be(frame, cursor) : u24le$1(frame, cursor);
-                                break;
-                            case 'i12*': {
-                                const raw12 = ((frame[cursor] & 0xff) << 4) | ((frame[cursor + 1] & 0xff) >> 4);
-                                v = raw12 & 0x800 ? raw12 - 0x1000 : raw12;
-                                break;
-                            }
-                            case 'u8':
-                                v = frame[cursor];
-                                break;
-                            default:
-                                v = u16le$3(frame, cursor);
-                        }
-                        cursor += f.sizeBytes;
-                        oc.add(f.name, v, null, 'raw');
-                    }
-                    this._lastTs = ts;
-                    this._calibrateData(oc);
-                    this.onStreamFrame?.(oc);
-                    buf = buf.subarray(frameBytes);
-                }
-                catch (e) {
-                    this._log('frame decode error → sliding 1 byte', e.message);
-                    buf = buf.subarray(1);
-                }
-                continue;
-            }
-            buf = buf.subarray(1); // resync
-        }
-        this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
-    }
-    /** Inline GSR calibration, matching Shimmer3RClient. */
-    _calibrateData(oc) {
-        for (const field of [...oc.fields]) {
-            if (field.name !== GSR_NAME)
-                continue;
-            const gsrraw = oc.get(GSR_NAME, 'raw')?.value ?? null;
-            if (gsrraw === null)
-                continue;
-            let adc12 = gsrraw & 0x0fff;
-            let currentRange = this.gsrRangeSetting;
-            if (currentRange === 4)
-                currentRange = (gsrraw >> 14) & 0x03;
-            if (currentRange === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3)
-                adc12 = GSR_UNCAL_LIMIT_RANGE3;
-            let gsrkOhm = calibrateGsrDataToResistanceFromAmplifierEq(adc12, currentRange);
-            gsrkOhm = nudgeGsrResistance(gsrkOhm, this.gsrRangeSetting);
-            oc.add(GSR_NAME, (1.0 / gsrkOhm) * 1000, 'uSiemens', 'cal');
-        }
-        // Inertial calibration (LN/WR accel, gyro, mag): device calibration from
-        // readCalibration() when available, else the range-selected default.
-        if (this.emitCalibratedInertial) {
-            applyStreamingCalibration(oc, {
-                family: this._imuFamily,
-                ranges: this.imuRanges,
-                device: this._deviceCalibrations,
-            });
-        }
-    }
-    /**
-     * Fetch the device's per-sensor kinematic calibration over RFCOMM and upgrade
-     * the active streaming calibration (overriding the range-selected defaults).
-     * Opt-in and non-fatal: a group that times out or NACKs keeps its default.
-     *
-     * Uses the per-sensor GET calibration commands (each answers with
-     * `[responseOpcode][21-byte block]`), chosen over the 0x9A GET_CALIB_DUMP
-     * because the per-sensor path is unambiguous in the Java oracle.
-     *
-     * HARDWARE-VERIFY: no real Shimmer3 radio has exercised this path.
-     *
-     * @returns the groups whose calibration was successfully read.
-     */
-    async readCalibration(timeoutMs = SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        const plan = [
-            {
-                group: 'lnAccel',
-                get: OPCODES.GET_LN_ACCEL_CALIBRATION_COMMAND,
-                resp: OPCODES.LN_ACCEL_CALIBRATION_RESPONSE,
-            },
-            {
-                group: 'gyro',
-                get: OPCODES.GET_GYRO_CALIBRATION_COMMAND,
-                resp: OPCODES.GYRO_CALIBRATION_RESPONSE,
-            },
-            {
-                group: 'mag',
-                get: OPCODES.GET_MAG_CALIBRATION_COMMAND,
-                resp: OPCODES.MAG_CALIBRATION_RESPONSE,
-            },
-            {
-                group: 'wrAccel',
-                get: OPCODES.GET_WR_ACCEL_CALIBRATION_COMMAND,
-                resp: OPCODES.WR_ACCEL_CALIBRATION_RESPONSE,
-            },
-        ];
-        const done = [];
-        for (const { group, get, resp } of plan) {
-            try {
-                await this._write(new Uint8Array([get]));
-                const rsp = await this._waitForResponse(resp, timeoutMs);
-                if (rsp.length < 22)
-                    continue; // opcode + 21-byte block
-                const scale = getGroupDefaults(this._imuFamily, group)?.sensitivityScale ?? 1;
-                const cal = parseKinematicCalibBlock(rsp.subarray(1, 22), { sensitivityScale: scale });
-                if (cal) {
-                    this._deviceCalibrations[group] = cal;
-                    done.push(group);
-                }
-            }
-            catch (err) {
-                this._emitStatus(`readCalibration(${group}) skipped: ${err.message}`);
-            }
-        }
-        return done;
-    }
-    // ---------------------------------------------------------------------------
-    // Low-level transport + ACK/response helpers
-    // ---------------------------------------------------------------------------
-    async _write(u8) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        this._log('Write', u8);
-        await this._transport.write(u8);
-    }
-    async _writeExpectingAck(u8, ackTimeoutMs) {
-        await this._write(u8);
-        await this._waitForAck(ackTimeoutMs);
-    }
-    /** Resolve on the next ACK control message; reject on NACK or timeout. */
-    _waitForAck(timeoutMs) {
-        return new Promise((resolve, reject) => {
-            // Mark a command in flight so _drainControl frames NACK (0xFE) only while
-            // this window is open; balanced on every settle path below.
-            this._awaitCmd += 1;
-            const settle = () => {
-                this._awaitCmd = Math.max(0, this._awaitCmd - 1);
-            };
-            const t = setTimeout(() => {
-                settle();
-                this._offTemp(handler);
-                reject(new Error('ACK timeout'));
-            }, timeoutMs);
-            const handler = (msg) => {
-                if (msg.length === 0)
-                    return;
-                if (msg[0] === ACK) {
-                    clearTimeout(t);
-                    settle();
-                    this._offTemp(handler);
-                    resolve();
-                }
-                else if (msg[0] === NACK) {
-                    clearTimeout(t);
-                    settle();
-                    this._offTemp(handler);
-                    reject(new Error('NACK received'));
-                }
-            };
-            this._onTemp(handler);
-        });
-    }
-    /**
-     * Resolve on the next control message whose opcode matches `expectedOpcode`.
-     * Leading ACKs are ignored (classic firmware may or may not ACK-prefix a
-     * response); a NACK rejects.
-     */
-    _waitForResponse(expectedOpcode, timeoutMs) {
-        return new Promise((resolve, reject) => {
-            // Track that an INQUIRY_RESPONSE is genuinely awaited so _drainControl
-            // only frames 0x02 while this window is open. _awaitCmd (bumped for every
-            // command) gates NACK framing the same way.
-            if (expectedOpcode === OPCODES.INQUIRY_RESPONSE)
-                this._awaitInq += 1;
-            this._awaitCmd += 1;
-            const settleInq = () => {
-                if (expectedOpcode === OPCODES.INQUIRY_RESPONSE) {
-                    this._awaitInq = Math.max(0, this._awaitInq - 1);
-                }
-                this._awaitCmd = Math.max(0, this._awaitCmd - 1);
-            };
-            const t = setTimeout(() => {
-                settleInq();
-                this._offTemp(handler);
-                reject(new Error(`Response timeout (opcode 0x${expectedOpcode.toString(16)})`));
-            }, timeoutMs);
-            const handler = (msg) => {
-                if (msg.length === 0)
-                    return;
-                if (msg[0] === ACK)
-                    return; // tolerate optional ACK prefix
-                if (msg[0] === NACK) {
-                    clearTimeout(t);
-                    settleInq();
-                    this._offTemp(handler);
-                    reject(new Error('NACK received'));
-                    return;
-                }
-                if (msg[0] === expectedOpcode) {
-                    clearTimeout(t);
-                    settleInq();
-                    this._offTemp(handler);
-                    resolve(msg);
-                }
-            };
-            this._onTemp(handler);
-        });
-    }
-    _onTemp(fn) {
-        this._temps.add(fn);
-    }
-    _offTemp(fn) {
-        this._temps.delete(fn);
-    }
-    _emitTemp(buf) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(buf);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
-    }
-}
-
-/**
- * InfoMem → {@link InfoMemDeviceConfig} decode.
- *
- * Ported from `ShimmerObject#configBytesParse` (ShimmerObject.java:4931-5111)
- * and `#parseEnabledDerivedSensorsForMaps` (:5113-5149). Pure and byte-exact:
- * offsets come from {@link resolveInfoMemLayout}, field semantics from the Java
- * accessors.
- */
-/**
- * Sampling clock frequency for the InfoMem sampling-rate field. The crystal
- * (non-TCXO) 32768 Hz is used, matching the Java SD-log sampling-rate math
- * (`getSamplingClockFreq()` resolves to the crystal for a fresh parse where the
- * TCXO flag is not yet known). See `ShimmerObject#getSamplingClockFreq`.
- */
-const INFOMEM_SAMPLING_CLOCK_FREQ = 32768;
-const bit = (byte, shift, mask) => (byte >> shift) & mask;
-/** True for a printable ASCII byte (Apache commons `isAsciiPrintable`: [0x20,0x7E]). */
-function isAsciiPrintable(b) {
-    return b >= 0x20 && b < 0x7f;
-}
-/** Decode an ASCII name field, stopping at the first non-printable byte. */
-function parseName(bytes, offset, length) {
-    let s = '';
-    for (let i = 0; i < length; i++) {
-        const b = bytes[offset + i];
-        if (b === undefined || !isAsciiPrintable(b))
-            break;
-        s += String.fromCharCode(b);
-    }
-    return s;
-}
-/** 12-char UPPERCASE hex, in device byte order (UtilShimmer.bytesToHexString). */
-function macToHex(bytes, offset) {
-    let s = '';
-    for (let i = 0; i < MAC_LENGTH; i++) {
-        s += (bytes[offset + i] ?? 0).toString(16).toUpperCase().padStart(2, '0');
-    }
-    return s;
-}
-/** Parse the enabled + derived sensor bitmaps (parseEnabledDerivedSensorsForMaps). */
-function parseSensors(bytes, layout) {
-    let enabled = (bytes[layout.idxSensors0] & 0xff) +
-        (bytes[layout.idxSensors1] & 0xff) * 2 ** 8 +
-        (bytes[layout.idxSensors2] & 0xff) * 2 ** 16;
-    if (layout.supportsMpl) {
-        enabled += (bytes[layout.idxSensors3] & 0xff) * 2 ** 24;
-        enabled += (bytes[layout.idxSensors4] & 0xff) * 2 ** 32;
-    }
-    let derived = 0n;
-    // Compatible only when the derived offsets are present (>0) and not 0xFF.
-    if (layout.idxDerivedSensors0 > 0 &&
-        bytes[layout.idxDerivedSensors0] !== MASK.DERIVED_BYTE &&
-        layout.idxDerivedSensors1 > 0 &&
-        bytes[layout.idxDerivedSensors1] !== MASK.DERIVED_BYTE) {
-        derived |= BigInt(bytes[layout.idxDerivedSensors0] & 0xff);
-        derived |= BigInt(bytes[layout.idxDerivedSensors1] & 0xff) << 8n;
-        if (layout.idxDerivedSensors2 > 0) {
-            derived |= BigInt(bytes[layout.idxDerivedSensors2] & 0xff) << 16n;
-        }
-        if (layout.supportsEightByteDerived) {
-            derived |= BigInt(bytes[layout.idxDerivedSensors3] & 0xff) << 24n;
-            derived |= BigInt(bytes[layout.idxDerivedSensors4] & 0xff) << 32n;
-            derived |= BigInt(bytes[layout.idxDerivedSensors5] & 0xff) << 40n;
-            derived |= BigInt(bytes[layout.idxDerivedSensors6] & 0xff) << 48n;
-            derived |= BigInt(bytes[layout.idxDerivedSensors7] & 0xff) << 56n;
-        }
-    }
-    return { enabledSensors: enabled, derivedSensors: derived };
-}
-/** A neutral (all-default) config, used for an unconfigured (invalid) InfoMem. */
-function emptyConfig(raw) {
-    return {
-        samplingRateHz: 0,
-        enabledSensors: 0,
-        derivedSensors: 0n,
-        gsrRange: 0,
-        expPowerEnabled: false,
-        deviceName: '',
-        trialName: '',
-        configTime: 0,
-        trial: {
-            id: 0,
-            numShimmers: 0,
-            syncWhenLogging: false,
-            masterShimmer: false,
-            buttonStart: false,
-            singleTouch: false,
-            tcxo: false,
-            disableBluetooth: false,
-        },
-        btBaudRate: 0,
-        macAddress: '',
-        exg1: new Uint8Array(EXG_BANK_LENGTH),
-        exg2: new Uint8Array(EXG_BANK_LENGTH),
-        raw,
-        valid: false,
-    };
-}
-/**
- * Decode a Shimmer3/3R InfoMem byte array into a {@link InfoMemDeviceConfig}.
- *
- * When the first 6 bytes are all 0xFF the InfoMem is unconfigured: the returned
- * config has `valid = false` and neutral defaults (the Java driver loads
- * defaults in this case), with the raw bytes preserved.
- *
- * @param bytes the full InfoMem (≥ {@link INFOMEM_SIZE} bytes recommended;
- *   shorter input is tolerated but out-of-range fields read as 0).
- * @param ctx   firmware/hardware identity selecting the byte layout.
- */
-function parseInfoMem(bytes, ctx) {
-    const raw = new Uint8Array(bytes);
-    if (!checkConfigBytesValid(raw)) {
-        return emptyConfig(raw);
-    }
-    const layout = resolveInfoMemLayout(ctx);
-    // Sampling rate (LSB-first divider).
-    const divider = (raw[layout.idxSamplingRate] & 0xff) + ((raw[layout.idxSamplingRate + 1] & 0xff) << 8);
-    const samplingRateHz = divider === 0 ? 0 : INFOMEM_SAMPLING_CLOCK_FREQ / divider;
-    const { enabledSensors, derivedSensors } = parseSensors(raw, layout);
-    const cfg3 = raw[layout.idxConfigSetupByte3] & 0xff;
-    const gsrRange = bit(cfg3, BIT_SHIFT.GSR_RANGE, MASK.GSR_RANGE);
-    const expPowerEnabled = bit(cfg3, BIT_SHIFT.EXP_POWER, MASK.EXP_POWER) === 1;
-    const exg1 = raw.slice(layout.idxExg1, layout.idxExg1 + EXG_BANK_LENGTH);
-    const exg2 = raw.slice(layout.idxExg2, layout.idxExg2 + EXG_BANK_LENGTH);
-    const btBaudRate = raw[layout.idxBtCommBaudRate] & 0xff;
-    const deviceName = parseName(raw, layout.idxSDShimmerName, NAME_LENGTH);
-    const trialName = parseName(raw, layout.idxSDEXPIDName, NAME_LENGTH);
-    // Config time (big-endian).
-    let configTime = 0;
-    for (let x = 0; x < CONFIG_TIME_LENGTH; x++) {
-        configTime += (raw[layout.idxSDConfigTime0 + x] & 0xff) * 2 ** CONFIG_TIME_BIT_SHIFTS[x];
-    }
-    const cfg0 = raw[layout.idxSDExperimentConfig0] & 0xff;
-    const cfg1 = raw[layout.idxSDExperimentConfig1] & 0xff;
-    // Experiment-config fields gated on firmware family / SD-log-sync support,
-    // matching the Java parse guards.
-    const buttonStart = layout.isSdLoggingFirmware && bit(cfg0, BIT_SHIFT.BUTTON_START, MASK.ONE_BIT) === 1;
-    const disableBluetooth = layout.isSdLoggingFirmware && bit(cfg0, BIT_SHIFT.DISABLE_BLUETOOTH, MASK.ONE_BIT) === 1;
-    const tcxo = layout.isSdLoggingFirmware && bit(cfg1, BIT_SHIFT.TCXO, MASK.ONE_BIT) === 1;
-    const syncWhenLogging = layout.supportsSdLogSync && bit(cfg0, BIT_SHIFT.SYNC_WHEN_LOGGING, MASK.ONE_BIT) === 1;
-    const masterShimmer = layout.supportsSdLogSync && bit(cfg0, BIT_SHIFT.MASTER_SHIMMER, MASK.ONE_BIT) === 1;
-    const singleTouch = layout.supportsSdLogSync && bit(cfg1, BIT_SHIFT.SINGLE_TOUCH, MASK.ONE_BIT) === 1;
-    const id = layout.supportsSdLogSync ? raw[layout.idxSDMyTrialID] & 0xff : 0;
-    const numShimmers = layout.supportsSdLogSync ? raw[layout.idxSDNumOfShimmers] & 0xff : 0;
-    const macAddress = macToHex(raw, layout.idxMacAddress);
-    return {
-        samplingRateHz,
-        enabledSensors,
-        derivedSensors,
-        gsrRange,
-        expPowerEnabled,
-        deviceName,
-        trialName,
-        configTime,
-        trial: {
-            id,
-            numShimmers,
-            syncWhenLogging,
-            masterShimmer,
-            buttonStart,
-            singleTouch,
-            tcxo,
-            disableBluetooth,
-        },
-        btBaudRate,
-        macAddress,
-        exg1,
-        exg2,
-        raw,
-        valid: true,
-    };
-}
-
-/**
- * {@link InfoMemDeviceConfig} → InfoMem byte array.
- *
- * Ported from `ShimmerObject#configBytesGenerate` (ShimmerObject.java:5162-5380).
- *
- * Byte-layout, endianness and field gating are byte-exact against the Java
- * oracle. One deliberate structural refinement: the Java generate rebuilds the
- * whole InfoMem from scratch (0x00-filled) because a full `ShimmerObject`
- * carries every sub-setting (sensor rates/ranges, calibration blocks, sync-node
- * list) and rewrites them via per-sensor `configBytesGenerate`. This codec
- * intentionally models only the subset in {@link InfoMemDeviceConfig}, so it
- * instead layers the modelled fields over a BASE byte array (read-modify-write),
- * preserving every unmodelled region (sensor rate/range bytes, calibration
- * blocks, sync-node MAC list, showErrorLeds / low-batt bits). This matches the
- * real configure-while-docked flow (read InfoMem → change a field → write back)
- * and the spec requirement that "unknown regions must be preserved from a base
- * byte array".
- *
- * HARDWARE-VERIFY: the device-write finalization — forcing the MAC to all-0xFF
- * (so firmware re-reads it from the BT transceiver) and setting the
- * config-file-creation flag in the config-delay byte (so firmware regenerates
- * its SD config on undock/power-cycle) — is faithfully ported, but whether the
- * device accepts and applies the written InfoMem can only be confirmed on real
- * hardware.
- */
-/** Overwrite a contiguous byte range. */
-function setBytes(out, offset, src) {
-    for (let i = 0; i < src.length; i++)
-        out[offset + i] = src[i] & 0xff;
-}
-/** Read-modify-write a single bit-field within a byte, preserving other bits. */
-function setBitField(out, offset, shift, mask, value) {
-    const cleared = out[offset] & ~(mask << shift) & 0xff;
-    out[offset] = (cleared | ((value & mask) << shift)) & 0xff;
-}
-/**
- * Encode a {@link InfoMemDeviceConfig} to a {@link INFOMEM_SIZE}-byte InfoMem
- * array ready to write to the device (128-byte chunks) or store.
- */
-function generateInfoMem(config, ctx, opts = {}) {
-    const layout = resolveInfoMemLayout(ctx);
-    const out = new Uint8Array(INFOMEM_SIZE); // 0x00-filled
-    // Preserve unmodelled regions from the base (or the config's own raw bytes).
-    const base = opts.base ?? config.raw;
-    if (base && base.length > 0) {
-        out.set(base.subarray(0, Math.min(base.length, INFOMEM_SIZE)), 0);
-    }
-    writeModelledFields(out, config, layout);
-    if (opts.forDeviceWrite && layout.isSdLoggingFirmware) {
-        applyDeviceWriteFinalization(out, config, layout);
-    }
-    return out;
-}
-function writeModelledFields(out, config, layout) {
-    // Sampling rate (LSB-first divider = round(clock / Hz)).
-    const divider = config.samplingRateHz > 0 ? Math.round(INFOMEM_SAMPLING_CLOCK_FREQ / config.samplingRateHz) : 0;
-    out[layout.idxSamplingRate] = divider & 0xff;
-    out[layout.idxSamplingRate + 1] = (divider >> 8) & 0xff;
-    // Buffer size forced to 1 (BtStream rejects InfoMem otherwise) — ShimmerObject.java:5192.
-    out[layout.idxBufferSize] = 1;
-    // Enabled sensors: bytes 0-2 (bits 0-23). Bytes 3-4 (MPL) are written by the
-    // Java per-sensor generate, not the main path, so they are left to base.
-    out[layout.idxSensors0] = config.enabledSensors & 0xff;
-    out[layout.idxSensors1] = (config.enabledSensors >>> 8) & 0xff;
-    out[layout.idxSensors2] = (config.enabledSensors >>> 16) & 0xff;
-    // GSR range + expansion-board power (ConfigSetupByte3 bits 1-3 / bit 0),
-    // read-modify-write so the byte's other bits (pressure/accel range) survive.
-    setBitField(out, layout.idxConfigSetupByte3, BIT_SHIFT.GSR_RANGE, MASK.GSR_RANGE, config.gsrRange);
-    setBitField(out, layout.idxConfigSetupByte3, BIT_SHIFT.EXP_POWER, MASK.EXP_POWER, config.expPowerEnabled ? 1 : 0);
-    // EXG register banks (10 bytes each).
-    setBytes(out, layout.idxExg1, exgBank(config.exg1));
-    setBytes(out, layout.idxExg2, exgBank(config.exg2));
-    // Bluetooth baud.
-    out[layout.idxBtCommBaudRate] = config.btBaudRate & 0xff;
-    // Derived sensors (only when the layout has them, matching parse gating).
-    if (layout.idxDerivedSensors0 > 0 && layout.idxDerivedSensors1 > 0) {
-        const d = config.derivedSensors;
-        out[layout.idxDerivedSensors0] = derivedByte(d, 0n);
-        out[layout.idxDerivedSensors1] = derivedByte(d, 8n);
-        if (layout.idxDerivedSensors2 > 0)
-            out[layout.idxDerivedSensors2] = derivedByte(d, 16n);
-        if (layout.supportsEightByteDerived) {
-            out[layout.idxDerivedSensors3] = derivedByte(d, 24n);
-            out[layout.idxDerivedSensors4] = derivedByte(d, 32n);
-            out[layout.idxDerivedSensors5] = derivedByte(d, 40n);
-            out[layout.idxDerivedSensors6] = derivedByte(d, 48n);
-            out[layout.idxDerivedSensors7] = derivedByte(d, 56n);
-        }
-    }
-    // Names: up to 12 ASCII chars, remaining bytes padded 0xFF.
-    writeName(out, layout.idxSDShimmerName, config.deviceName);
-    writeName(out, layout.idxSDEXPIDName, config.trialName);
-    // Config time (big-endian).
-    for (let x = 0; x < CONFIG_TIME_LENGTH; x++) {
-        out[layout.idxSDConfigTime0 + x] =
-            Math.floor(config.configTime / 2 ** CONFIG_TIME_BIT_SHIFTS[x]) & 0xff;
-    }
-    // Experiment-config bit-fields (read-modify-write, gated like the Java parse/generate).
-    const t = config.trial;
-    if (layout.isSdLoggingFirmware) {
-        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.BUTTON_START, MASK.ONE_BIT, t.buttonStart ? 1 : 0);
-        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.DISABLE_BLUETOOTH, MASK.ONE_BIT, t.disableBluetooth ? 1 : 0);
-        setBitField(out, layout.idxSDExperimentConfig1, BIT_SHIFT.TCXO, MASK.ONE_BIT, t.tcxo ? 1 : 0);
-    }
-    if (layout.supportsSdLogSync) {
-        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.SYNC_WHEN_LOGGING, MASK.ONE_BIT, t.syncWhenLogging ? 1 : 0);
-        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.MASTER_SHIMMER, MASK.ONE_BIT, t.masterShimmer ? 1 : 0);
-        setBitField(out, layout.idxSDExperimentConfig1, BIT_SHIFT.SINGLE_TOUCH, MASK.ONE_BIT, t.singleTouch ? 1 : 0);
-        out[layout.idxSDMyTrialID] = t.id & 0xff;
-        out[layout.idxSDNumOfShimmers] = t.numShimmers & 0xff;
-    }
-}
-/**
- * Device-write finalization (ShimmerObject.java:5320-5339): force the MAC to
- * all-0xFF and set the config-file-creation flag. These are the ONLY bytes that
- * intentionally diverge from a plain round-trip after a device write — see
- * {@link deviceWriteDivergentRanges}.
- */
-function applyDeviceWriteFinalization(out, config, layout) {
-    // MAC → invalid (0xFF×6): firmware re-reads it from the BT transceiver.
-    for (let i = 0; i < MAC_LENGTH; i++)
-        out[layout.idxMacAddress + i] = 0xff;
-    // Config-delay byte: set the config-file-write flag bit when requested.
-    out[layout.idxSDConfigDelayFlag] = 0;
-    // We always request a new SD config on undock (mirrors mConfigFileCreationFlag=true
-    // in the desktop write path). HARDWARE-VERIFY: this flag is what makes the FW
-    // regenerate its SD config on undock/power-cycle.
-    const flag = MASK.SD_CFG_FILE_WRITE_FLAG << BIT_SHIFT.SD_CFG_FILE_WRITE_FLAG;
-    out[layout.idxSDConfigDelayFlag] |= flag;
-}
-/**
- * Byte ranges that {@link generateInfoMem} with `forDeviceWrite` intentionally
- * leaves diverged from the input config — used by the write-back verify to
- * exclude them from the byte comparison.
- */
-function deviceWriteDivergentRanges(ctx) {
-    const layout = resolveInfoMemLayout(ctx);
-    return {
-        mac: { start: layout.idxMacAddress, length: MAC_LENGTH },
-        configDelayFlag: { start: layout.idxSDConfigDelayFlag, length: 1 },
-    };
-}
-function exgBank(bank) {
-    if (bank.length === EXG_BANK_LENGTH)
-        return bank;
-    const b = new Uint8Array(EXG_BANK_LENGTH);
-    b.set(bank.subarray(0, EXG_BANK_LENGTH), 0);
-    return b;
-}
-function derivedByte(value, shift) {
-    return Number((value >> shift) & 0xffn);
-}
-function writeName(out, offset, name) {
-    for (let i = 0; i < NAME_LENGTH; i++) {
-        out[offset + i] = i < name.length ? name.charCodeAt(i) & 0xff : 0xff;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WiredShimmerClient
-// ---------------------------------------------------------------------------
-/**
- * Client for a Shimmer sitting in a BasicDock/Base, talking over the dock's
- * FTDI **UART** (host↔device). This is the wired/dock protocol
- * (`com.shimmerresearch.comms.wiredProtocol`), which is entirely separate from
- * the Bluetooth LiteProtocol used by {@link Shimmer3Client} /
- * `Shimmer3RClient` — different framing (`$`-header packets with a component +
- * property address, length, payload and a Shimmer-specific CRC), a different
- * request/response state machine, and a different CRC (`./crc.ts`).
- *
- * Scope (phase D1): identify + status + property-level config for a single
- * docked device. NO mass-storage/SD, NO firmware flashing, NO multi-slot Base
- * state machine (those are later phases). Streaming is not part of the dock
- * protocol.
- *
- * Robustness: the dock UART is an unframed byte stream (serial has no message
- * boundaries), so — exactly like {@link Shimmer3Client} — this client
- * accumulates inbound bytes and extracts complete packets with a length-aware
- * parser ({@link wiredPacketLength}), tolerant of packets split, dribbled or
- * coalesced arbitrarily. A packet whose CRC fails triggers a single-byte
- * resync, matching the Java `parseSinglePacket` recovery path.
- *
- * Transport injection is mandatory — `connect()` with no transport throws.
- *
- * @example
- * ```ts
- * const client = new WiredShimmerClient({ transport: dockSerialTransport });
- * await client.connect();
- * const id = await client.identify();     // { mac, hwVersion, firmwareVersion, expansionBoard }
- * const status = await client.getStatus(); // { voltage, percentage, chargingStatus, ... }
- * const range = await client.getConfig(UART_PROP.GSR.RANGE);
- * await client.setConfig(UART_PROP.GSR.RANGE, new Uint8Array([2]));
- * ```
- */
-class WiredShimmerClient extends BaseShimmerClient {
-    constructor(opts = {}) {
-        super(opts);
-        this._injectedTransport = null;
-        this._transport = null;
-        this._notifyUnsub = null;
-        this._disconnectUnsub = null;
-        this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
-        /**
-         * Serialization queue. Every public command method chains onto this so that
-         * only one request/response exchange is in flight at a time — the docked
-         * Shimmer speaks a strictly sequential request/response protocol and the
-         * Java driver clears pending ACKs before each command
-         * (AbstractCommsProtocolWired.java:318,358). Without this, overlapping
-         * commands could cross-resolve on the shared temp-handler set (e.g. one
-         * command's ACK satisfying another's {@link _waitForAck}), masking a failed
-         * write. See {@link _serialize}.
-         */
-        this._queue = Promise.resolve();
-        // Cached device info
-        this.identity = null;
-        this._handleTransportDisconnect = () => {
-            this._emitStatus('Dock disconnected');
-        };
-        // ---------------------------------------------------------------------------
-        // RX: accumulate an unframed byte stream, extract complete packets
-        // ---------------------------------------------------------------------------
-        this._handleNotify = (chunk) => {
-            if (!chunk || chunk.length === 0)
-                return;
-            this._log('Notify len=', chunk.length);
-            this._rxBuf = concatU8(this._rxBuf, chunk);
-            this._drain();
-        };
-        this._injectedTransport = opts.transport ?? null;
-    }
-    _log(...args) {
-        if (this.debug)
-            console.log('[WiredDock]', ...args);
-    }
-    _deviceLabel() {
-        return this._transport?.deviceName ?? 'Shimmer(dock)';
-    }
-    // ---------------------------------------------------------------------------
-    // Connection management
-    // ---------------------------------------------------------------------------
-    /**
-     * Open the dock UART connection. A transport is REQUIRED (constructor option
-     * or this parameter). Mirrors `BasicDock#setupDock` (open port); the identify
-     * / status reads are exposed as explicit methods rather than run implicitly,
-     * so callers control ordering (the Java auto-read order is preserved in
-     * {@link identify}).
-     */
-    async connect(transport) {
-        const t = transport ?? this._injectedTransport;
-        if (!t) {
-            throw new Error('WiredShimmerClient requires an injected transport: a docked Shimmer is only ' +
-                'reachable over the dock UART. Pass a ShimmerTransport via the constructor ' +
-                '({ transport }) or connect(transport).');
-        }
-        this._transport = t;
-        this._notifyUnsub = t.onNotify(this._handleNotify);
-        this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
-        this._emitStatus('Opening dock UART connection…');
-        await t.connect();
-        this._rxBuf = new Uint8Array(0);
-        this._emitStatus(`Connected: ${this._deviceLabel()}`);
-    }
-    async disconnect() {
-        try {
-            this._notifyUnsub?.();
-            this._disconnectUnsub?.();
-            await this._transport?.disconnect();
-        }
-        catch {
-            /* ignore */
-        }
-        finally {
-            this._notifyUnsub = this._disconnectUnsub = null;
-            this._transport = null;
-            this._rxBuf = new Uint8Array(0);
-            this._temps.clear();
-            this._emitStatus('Disconnected');
-        }
-    }
-    /**
-     * Discard any buffered inbound bytes, resyncing the byte stream. Used by
-     * {@link SmartDockClient} after a SmartDock slot change: switching the active
-     * slot re-routes the per-Shimmer UART to a different device, so any bytes left
-     * over from the previous slot must be dropped before the next request. (The
-     * `_drain` parser is already tolerant of leading garbage / bad CRC, so this is
-     * belt-and-braces rather than strictly required.)
-     */
-    resyncStream() {
-        this._rxBuf = new Uint8Array(0);
-    }
-    /** Streaming is not part of the dock UART protocol. */
-    async startStreaming() {
-        throw new Error('Streaming is not supported over the dock UART (use the Bluetooth client).');
-    }
-    async stopStreaming() {
-        /* no-op: the dock protocol has no stream to stop */
-    }
-    // ---------------------------------------------------------------------------
-    // High-level operations
-    // ---------------------------------------------------------------------------
-    /**
-     * Read the docked device's identity. Follows the order of
-     * `BasicDock#internalReadShimmerDetails` (MAC → HW/FW version → daughter-card
-     * ID). Battery is read separately via {@link getStatus}. The three reads run
-     * as one atomic serialized unit (see {@link _serialize}).
-     */
-    async identify() {
-        return this._serialize(() => this._identifyImpl());
-    }
-    async _identifyImpl() {
-        const mac = await this._readMacImpl();
-        const firmwareVersion = await this._readVersionImpl();
-        const expansionBoard = await this._readExpansionBoardImpl().catch(() => null);
-        const id = {
-            mac,
-            hardwareVersion: firmwareVersion.hardwareVersion,
-            firmwareVersion,
-            expansionBoard,
-        };
-        this.identity = id;
-        this._emitStatus(`Identified ${mac} HW=${id.hardwareVersion} FW=${firmwareVersion.firmwareVersionMajor}.` +
-            `${firmwareVersion.firmwareVersionMinor}.${firmwareVersion.firmwareVersionInternal} ` +
-            `(type ${firmwareVersion.firmwareIdentifier})`);
-        return id;
-    }
-    /** Read battery voltage / % / charging state (BAT.VALUE). */
-    async getStatus() {
-        return this._serialize(() => this._getStatusImpl());
-    }
-    async _getStatusImpl() {
-        const payload = await this._read(UART_PROP.BAT.VALUE);
-        const status = parseBatteryStatus(payload);
-        this._emitStatus(`Battery ${status.voltage.toFixed(3)} V` +
-            (status.percentage !== null ? ` (~${status.percentage.toFixed(0)}%)` : '') +
-            ` — ${status.chargingStatus}`);
-        return status;
-    }
-    /**
-     * Read the MAC address (MAIN_PROCESSOR.MAC), retrying a total of
-     * `WIRED_DEFAULTS.MAC_READ_RETRIES` (= 2) attempts as the Java dock does
-     * (`AbstractDock.readMacId`, AbstractDock.java:1153 `for(i=0;i<
-     * READ_MAC_RETRY_ATTEMPTS;i++)` → 2 total attempts).
-     */
-    async readMac() {
-        return this._serialize(() => this._readMacImpl());
-    }
-    async _readMacImpl() {
-        let lastErr;
-        for (let attempt = 0; attempt < WIRED_DEFAULTS.MAC_READ_RETRIES; attempt++) {
-            try {
-                const payload = await this._read(UART_PROP.MAIN_PROCESSOR.MAC);
-                return parseMacId(payload);
-            }
-            catch (err) {
-                lastErr = err;
-                this._log(`readMac attempt ${attempt + 1} failed: ${err.message}`);
-            }
-        }
-        throw lastErr instanceof Error ? lastErr : new Error('readMac failed');
-    }
-    /** Read the HW/FW version (MAIN_PROCESSOR.VER). */
-    async readVersion() {
-        return this._serialize(() => this._readVersionImpl());
-    }
-    async _readVersionImpl() {
-        const payload = await this._read(UART_PROP.MAIN_PROCESSOR.VER);
-        return parseVersionInfo(payload);
-    }
-    /**
-     * Read the daughter-card (expansion board) ID — the first 16 bytes of the
-     * card memory (`DAUGHTER_CARD.CARD_ID`, address 0). Returns null when no board
-     * is fitted. Cheap enough to include in {@link identify}.
-     */
-    async readExpansionBoard() {
-        return this._serialize(() => this._readExpansionBoardImpl());
-    }
-    async _readExpansionBoardImpl() {
-        const payload = await this._readMem(UART_PROP.DAUGHTER_CARD.CARD_ID, 0, 16);
-        return parseExpansionBoard(payload);
-    }
-    // ---------------------------------------------------------------------------
-    // Property-level config
-    // ---------------------------------------------------------------------------
-    /** Read one config property's raw payload (READ). */
-    async getConfig(arg) {
-        if (arg.permission === 'WRITE_ONLY') {
-            throw new Error(`Property ${arg.name} is write-only`);
-        }
-        return this._serialize(() => this._read(arg));
-    }
-    /** Write one config property (WRITE), resolving on ACK. */
-    async setConfig(arg, value) {
-        if (arg.permission === 'READ_ONLY') {
-            throw new Error(`Property ${arg.name} is read-only`);
-        }
-        return this._serialize(async () => {
-            await this._write(arg, value);
-            this._emitStatus(`SET ${arg.name} ACKed`);
-        });
-    }
-    /**
-     * Read every property in `UART_CONFIG_COMMANDS` (the Java
-     * `mListOfUartCommandsConfig` order). Individual reads that error (e.g. a
-     * property the docked firmware does not implement) are captured rather than
-     * aborting the batch — the returned map's value is the raw payload or the
-     * Error for that property.
-     */
-    async getConfigAll() {
-        return this._serialize(() => this._getConfigAllImpl());
-    }
-    async _getConfigAllImpl() {
-        const out = new Map();
-        for (const arg of UART_CONFIG_COMMANDS) {
-            if (arg.permission === 'WRITE_ONLY')
-                continue;
-            try {
-                out.set(arg, await this._read(arg));
-            }
-            catch (err) {
-                out.set(arg, err instanceof Error ? err : new Error(String(err)));
-            }
-        }
-        return out;
-    }
-    // ---------------------------------------------------------------------------
-    // Low-level InfoMem escape hatch (raw read/write; no layout interpretation)
-    // ---------------------------------------------------------------------------
-    /**
-     * Raw InfoMem read (`MAIN_PROCESSOR.INFOMEM`). Returns `size` bytes from
-     * `address`. The InfoMem *layout* is deliberately NOT interpreted in D1 — this
-     * is a byte-level escape hatch.
-     */
-    async readInfoMem(address, size) {
-        return this._serialize(() => this._readMem(UART_PROP.MAIN_PROCESSOR.INFOMEM, address, size));
-    }
-    /** Raw InfoMem write (`MAIN_PROCESSOR.INFOMEM`), resolving on ACK. */
-    async writeInfoMem(address, data) {
-        return this._serialize(async () => {
-            const payload = buildMemWritePayload(UART_PROP.MAIN_PROCESSOR.INFOMEM, address, data);
-            await this._writeRaw(UART_PROP.MAIN_PROCESSOR.INFOMEM, payload);
-        });
-    }
-    // ---------------------------------------------------------------------------
-    // InfoMem configuration (configure-while-docked, phase P2)
-    // ---------------------------------------------------------------------------
-    /**
-     * Read the full {@link INFOMEM_SIZE}-byte InfoMem in 128-byte page chunks
-     * (D → C → B), reassembled in order. The page addresses sent depend on the
-     * firmware/hardware (legacy MSP430 0x1800/… vs. flat 0/128/256), resolved
-     * from the cached {@link identity} — call {@link identify} (or
-     * {@link readVersion}) first.
-     */
-    async readInfoMemBytes() {
-        return this._serialize(() => this._readInfoMemBytesImpl(this._infoMemCtx()));
-    }
-    /**
-     * Write the full {@link INFOMEM_SIZE}-byte InfoMem in 128-byte page chunks,
-     * each resolving on its per-chunk ACK (the write guarantee is per-chunk
-     * CRC + ACK). Requires a cached {@link identity} for the page addressing.
-     */
-    async writeInfoMemBytes(bytes) {
-        if (bytes.length !== INFOMEM_SIZE) {
-            throw new Error(`writeInfoMemBytes expects ${INFOMEM_SIZE} bytes, got ${bytes.length}`);
-        }
-        return this._serialize(() => this._writeInfoMemBytesImpl(this._infoMemCtx(), bytes));
-    }
-    /**
-     * Read + decode the docked device's configuration. Uses the cached
-     * {@link identity} (already-read version info) as the {@link InfoMemContext}.
-     */
-    async readInfoMemConfig() {
-        return this._serialize(async () => {
-            const ctx = this._infoMemCtx();
-            const bytes = await this._readInfoMemBytesImpl(ctx);
-            return parseInfoMem(bytes, ctx);
-        });
-    }
-    /**
-     * Write the docked device's real-world clock from a host timestamp
-     * (`MAIN_PROCESSOR.RTC_CFG_TIME`), resolving on ACK. Port of
-     * `CommsProtocolWiredShimmerViaDock.writeRealWorldClockFromPcTime`
-     * (CommsProtocolWiredShimmerViaDock.java:138-153), which calls
-     * `writeRealWorldClock(System.currentTimeMillis())`.
-     *
-     * `nowMs` (UNIX epoch ms) is injectable for testability; it defaults to
-     * `Date.now()` — captured at call time, matching the Java's use of the current
-     * PC time. The payload is the 8-byte, LSB-first 32.768 kHz tick count
-     * ({@link msToRtcBytesLE}).
-     *
-     * NB the target property is `RTC_CFG_TIME` (0x04) — hardware-confirmed
-     * (DEV-866 drift tool bring-up): the firmware's UART_SET handler implements
-     * a time write ONLY for this property (RTC_setTimeFromTicksPtr), while a
-     * SET on CURR_LOCAL_TIME (0x05) is answered with BAD_CMD. The Java props
-     * table's READ_ONLY flag on 0x04 was wrong; the SDK table now says
-     * READ_WRITE, matching the firmware.
-     */
-    async writeRtcFromHostTime(nowMs) {
-        return this._serialize(() => this._writeRtcFromHostTimeImpl(nowMs ?? Date.now()));
-    }
-    /** Non-serialized RTC write — callers must already hold the queue. */
-    async _writeRtcFromHostTimeImpl(nowMs) {
-        const payload = msToRtcBytesLE(nowMs); // HARDWARE-VERIFY: ms × 32.768 ticks, 8 bytes LSB-first
-        await this._write(UART_PROP.MAIN_PROCESSOR.RTC_CFG_TIME, payload);
-        this._emitStatus('RTC set from host time');
-    }
-    /**
-     * Encode + write a configuration to the docked device. The MAC is forced to
-     * all-0xFF and the config-file-creation flag is set (device-write semantics),
-     * so the firmware re-reads its MAC from the BT transceiver and regenerates the
-     * SD config on undock/power-cycle.
-     *
-     * When `opts.setRtc` (default `true`, matching desktop), the device's
-     * real-world clock is written FIRST from the host time, then the InfoMem — the
-     * exact order of desktop `CallableWriteConfig.call()`
-     * (BasicDock.java:1556-1587): (1) RTC write when `isSupportedRtcConfigViaUart`,
-     * (2) chunked InfoMem write. The RTC write and InfoMem write are one atomic
-     * queued unit. RTC failure ABORTS the config write (the InfoMem write is NOT
-     * attempted) — desktop rethrows the RTC `ExecutionException` before reaching
-     * the InfoMem write (BasicDock.java:1564-1573), so this is deliberately NOT
-     * best-effort. On an identity that does not support RTC-via-UART the RTC write
-     * is SKIPPED (not failed), also matching desktop.
-     *
-     * Finalization (plain config write): there is NO reboot/poll/rewrite here — the
-     * device applies the new config and regenerates its SD config file on the next
-     * undock / power-cycle. This is identical for Shimmer3 and Shimmer3R. The
-     * reboot-then-rewrite dance is a DFU (firmware-update) concern only and is out
-     * of scope for a plain config write (BasicDock.java:1556).
-     *
-     * With `opts.verify`, the InfoMem is read back and byte-compared against the
-     * written bytes, EXCLUDING the intentionally-divergent ranges (the MAC bytes,
-     * forced to 0xFF, and the config-delay/flag byte). Returns
-     * `{ verified: boolean }` when verify was requested, or `{ verified: null }`
-     * otherwise.
-     *
-     * HARDWARE-VERIFY: whether the device accepts and applies the write (and
-     * regenerates its SD config on undock) can only be confirmed on real hardware.
-     */
-    async writeInfoMemConfig(config, opts = {}) {
-        return this._serialize(async () => {
-            const ctx = this._infoMemCtx();
-            // (1) RTC write first, exactly as desktop CallableWriteConfig orders it.
-            //     Skipped (not failed) on unsupported identities; a failure here aborts
-            //     before the InfoMem write, matching the Java rethrow semantics.
-            const setRtc = opts.setRtc ?? true;
-            if (setRtc && isSupportedRtcConfigViaUart(ctx.hardwareVersion, ctx.firmwareId)) {
-                await this._writeRtcFromHostTimeImpl(Date.now());
-            }
-            // (2) chunked InfoMem write.
-            const bytes = generateInfoMem(config, ctx, { base: config.raw, forDeviceWrite: true });
-            await this._writeInfoMemBytesImpl(ctx, bytes);
-            if (!opts.verify)
-                return { verified: null };
-            const readback = await this._readInfoMemBytesImpl(ctx);
-            const verified = compareInfoMemExcluding(bytes, readback, deviceWriteDivergentRanges(ctx));
-            return { verified };
-        });
-    }
-    /** Build the InfoMem layout context from the cached identity (requires identify/readVersion). */
-    _infoMemCtx() {
-        const id = this.identity;
-        if (!id) {
-            throw new Error('InfoMem operations need the device version: call identify() (or readVersion()) first.');
-        }
-        const fv = id.firmwareVersion;
-        return {
-            hardwareVersion: id.hardwareVersion,
-            firmwareId: fv.firmwareIdentifier,
-            firmwareVersion: {
-                major: fv.firmwareVersionMajor,
-                minor: fv.firmwareVersionMinor,
-                internal: fv.firmwareVersionInternal,
-            },
-        };
-    }
-    /** Non-serialized chunked read (D/C/B pages) — callers must already hold the queue. */
-    async _readInfoMemBytesImpl(ctx) {
-        const layout = resolveInfoMemLayout(ctx);
-        const pageAddrs = [layout.addrD, layout.addrC, layout.addrB];
-        const out = new Uint8Array(INFOMEM_SIZE);
-        for (let i = 0; i < pageAddrs.length; i++) {
-            const chunk = await this._readMem(UART_PROP.MAIN_PROCESSOR.INFOMEM, pageAddrs[i], INFOMEM_PAGE_SIZE);
-            if (chunk.length < INFOMEM_PAGE_SIZE) {
-                throw new Error(`InfoMem page ${i} short read: expected ${INFOMEM_PAGE_SIZE} bytes, got ${chunk.length}`);
-            }
-            out.set(chunk.subarray(0, INFOMEM_PAGE_SIZE), i * INFOMEM_PAGE_SIZE);
-        }
-        return out;
-    }
-    /** Non-serialized chunked write (D/C/B pages) — callers must already hold the queue. */
-    async _writeInfoMemBytesImpl(ctx, bytes) {
-        const layout = resolveInfoMemLayout(ctx);
-        const pageAddrs = [layout.addrD, layout.addrC, layout.addrB];
-        for (let i = 0; i < pageAddrs.length; i++) {
-            const page = bytes.subarray(i * INFOMEM_PAGE_SIZE, (i + 1) * INFOMEM_PAGE_SIZE);
-            const payload = buildMemWritePayload(UART_PROP.MAIN_PROCESSOR.INFOMEM, pageAddrs[i], page);
-            await this._writeRaw(UART_PROP.MAIN_PROCESSOR.INFOMEM, payload);
-        }
-    }
-    // ---------------------------------------------------------------------------
-    // Serialization
-    // ---------------------------------------------------------------------------
-    /**
-     * Run `fn` after every previously-queued operation has settled, so all public
-     * command methods execute strictly one-at-a-time (see {@link _queue}). The
-     * queue itself never rejects — a failed op does not poison later ones — while
-     * the caller still receives `fn`'s own resolution/rejection.
-     */
-    _serialize(fn) {
-        const run = this._queue.then(() => fn());
-        this._queue = run.then(() => undefined, () => undefined);
-        return run;
-    }
-    // ---------------------------------------------------------------------------
-    // Request/response core
-    // ---------------------------------------------------------------------------
-    /** Send a READ and await the matching DATA_RESPONSE payload. */
-    async _read(arg, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        await this._transport.write(buildReadPacket(arg));
-        return this._waitForDataResponse(arg, timeoutMs);
-    }
-    /** Send a memory READ and await the matching DATA_RESPONSE payload. */
-    async _readMem(arg, address, size, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        const payload = buildMemReadPayload(arg, address, size);
-        await this._transport.write(buildUartPacket(UART_PACKET_CMD.READ, arg, payload));
-        return this._waitForDataResponse(arg, timeoutMs);
-    }
-    /** Send a WRITE with a value and await ACK. */
-    async _write(arg, value, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        await this._transport.write(buildWritePacket(arg, value));
-        await this._waitForAck(timeoutMs);
-    }
-    /** Send a WRITE with a pre-built payload (e.g. mem write) and await ACK. */
-    async _writeRaw(arg, payload, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        await this._transport.write(buildUartPacket(UART_PACKET_CMD.WRITE, arg, payload));
-        await this._waitForAck(timeoutMs);
-    }
-    /** Resolve with the payload of a DATA_RESPONSE matching comp+prop; reject on bad/timeout. */
-    _waitForDataResponse(arg, timeoutMs) {
-        return new Promise((resolve, reject) => {
-            const t = setTimeout(() => {
-                this._offTemp(handler);
-                reject(new Error(`Response timeout (READ ${arg.name})`));
-            }, timeoutMs);
-            const handler = (pkt) => {
-                if (isBadResponse(pkt.command)) {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    reject(new Error(`Device error: ${badResponseReason(pkt.command)} (READ ${arg.name})`));
-                    return;
-                }
-                if (pkt.command === UART_PACKET_CMD.DATA_RESPONSE &&
-                    pkt.component === arg.component &&
-                    pkt.property === arg.property) {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    resolve(pkt.payload);
-                }
-            };
-            this._onTemp(handler);
-        });
-    }
-    /** Resolve on the next ACK; reject on bad response or timeout. */
-    _waitForAck(timeoutMs) {
-        return new Promise((resolve, reject) => {
-            const t = setTimeout(() => {
-                this._offTemp(handler);
-                reject(new Error('ACK timeout'));
-            }, timeoutMs);
-            const handler = (pkt) => {
-                if (pkt.command === UART_PACKET_CMD.ACK_RESPONSE) {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    resolve();
-                }
-                else if (isBadResponse(pkt.command)) {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    reject(new Error(`Device error: ${badResponseReason(pkt.command)}`));
-                }
-            };
-            this._onTemp(handler);
-        });
-    }
-    /**
-     * Extract every complete packet currently buffered and dispatch each to the
-     * temp handlers, keeping the incomplete tail for the next chunk. A packet
-     * whose CRC fails is dropped one byte at a time to resync (matching the Java
-     * `parseSinglePacket` CRC-fail path).
-     */
-    _drain() {
-        let buf = this._rxBuf;
-        for (;;) {
-            if (buf.length === 0)
-                break;
-            const len = wiredPacketLength(buf);
-            if (len === NEED_MORE$1)
-                break;
-            if (len === RESYNC$1) {
-                this._log(`resync: dropping byte 0x${buf[0].toString(16)}`);
-                buf = buf.subarray(1);
-                continue;
-            }
-            if (buf.length < len)
-                break; // full packet not here yet
-            let pkt;
-            try {
-                pkt = parseUartPacket(buf);
-            }
-            catch {
-                buf = buf.subarray(1); // malformed — resync
-                continue;
-            }
-            if (!pkt.crcOk) {
-                this._log('bad CRC → dropping 1 byte to resync');
-                buf = buf.subarray(1);
-                continue;
-            }
-            this._emitTemp(pkt);
-            buf = buf.subarray(pkt.length);
-        }
-        this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
-    }
-    _onTemp(fn) {
-        this._temps.add(fn);
-    }
-    _offTemp(fn) {
-        this._temps.delete(fn);
-    }
-    _emitTemp(pkt) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(pkt);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
-    }
-}
-/**
- * Byte-compare `written` against `readback` over the full InfoMem, ignoring the
- * ranges that a device write intentionally leaves diverged (the MAC bytes,
- * forced to 0xFF, and the config-delay/flag byte the firmware may rewrite).
- */
-function compareInfoMemExcluding(written, readback, ranges) {
-    if (written.length !== readback.length)
-        return false;
-    const excluded = new Set();
-    for (const r of [ranges.mac, ranges.configDelayFlag]) {
-        for (let i = 0; i < r.length; i++)
-            excluded.add(r.start + i);
-    }
-    for (let i = 0; i < written.length; i++) {
-        if (excluded.has(i))
-            continue;
-        if (written[i] !== readback[i])
             return false;
-    }
-    return true;
-}
-
-/**
- * Pure codec for the Shimmer **SmartDock** (Base-6 / Base-15) multi-slot base
- * command layer.
- *
- * This is the *base-level* protocol a SmartDock speaks over its FTDI UART — it
- * is entirely distinct from the per-Shimmer binary `$`-header UART protocol in
- * `./protocol.ts` (D1). The base commands are short **ASCII** strings
- * terminated with `$`; the base replies with `\r\n`-terminated ASCII lines. The
- * SmartDock switches which physical slot (docked Shimmer) is routed onto the
- * *separate* per-Shimmer UART channel, so multi-slot support is: drive these
- * ASCII base commands to enumerate/select a slot, then speak the D1 binary
- * protocol to the now-active slot.
- *
- * Ported from the Java driver (read-only oracle):
- *   com.shimmerresearch.managers.dockManager.SmartDockUart
- *     (SmartDockUart.java:44-65   — BASE_CMD ASCII command strings)
- *     (SmartDockUart.java:194-242 — set active slot / connection type)
- *     (SmartDockUart.java:793-869 — version / active-slot response parse)
- *   com.shimmerresearch.managers.dockManager.SmartDockUartListener
- *     (SmartDockUartListener.java:62-296 — `\r\n` line framing + response
- *      classification by leading char; the `Q,<map>` / `V,...` / `P,NN` shapes)
- *   com.shimmerresearch.comms.wiredProtocol.SmartDockActiveSlotDetails
- *     (SmartDockActiveSlotDetails.java:13-26 — connection types)
- *   com.shimmerresearch.managers.dockManager.SmartDockVerInfoDetails
- *     (SmartDockVerInfoDetails.java:11-31 — HW/FW version fields)
- *   com.shimmerresearch.driverUtilities.HwDriverShimmerDeviceDetails
- *     (HwDriverShimmerDeviceDetails.java:248-250 BASE_HARDWARE_IDS; :313-321
- *      slot counts BASE15→15, BASE6→6)
- *
- * Everything here is side-effect-free so it can be unit-tested with fixtures and
- * reused by {@link SmartDockClient} regardless of the byte pipe underneath.
- */
-/** ASCII carriage-return + line-feed — every base response line ends with this. */
-const SMARTDOCK_LINE_TERMINATOR = '\r\n';
-/**
- * SmartDock connection type for a slot select (SmartDockActiveSlotDetails.java:13-15).
- * D2 is read-only and only ever uses `WITHOUT_SD_CARD` (partial connect, enough
- * to read the docked Shimmer over the per-Shimmer UART); `WITH_SD_CARD` (full
- * connect for mass-storage) is defined for completeness but NOT driven.
- */
-const SMARTDOCK_CONNECTION_TYPE = Object.freeze({
-    DISCONNECTED: 0,
-    WITH_SD_CARD: 1,
-    WITHOUT_SD_CARD: 2,
-});
-/**
- * SmartDock base ASCII commands (SmartDockUart.java:44-65). Each is sent as-is
- * over the base UART; a `$` terminates the command. Slot-select commands append
- * `,NN$` (two-digit zero-padded slot, `%02d`, SmartDockUart.java:231).
- *
- * Only the READ-ONLY subset needed for D2 (version, occupancy query, slot
- * select without SD, disconnect) is surfaced as a driven command; the BSL-mask
- * / GPIO / reset / indicator-LED commands in the Java table are deliberately
- * omitted (out of scope, and several are write/flash-adjacent).
- */
-const SMARTDOCK_BASE_CMD = Object.freeze({
-    /** `SDV$` → version info. */
-    GET_VERSION: 'SDV$',
-    /** `SDQ$` → per-slot occupancy bitmap. */
-    QUERY_CONNECTED_SLOTS: 'SDQ$',
-    /** `SDP$` → current active slot (without-SD form). */
-    GET_ACTIVE_SLOT: 'SDP$',
-    /** `SDP` prefix → set active slot WITHOUT SD access (append `,NN$`). */
-    SET_SLOT_WITHOUT_SD: 'SDP',
-    /** `SDC` prefix → set active slot WITH SD access (append `,NN$`). Not driven in D2. */
-    SET_SLOT_WITH_SD: 'SDC',
-    /** `SDD$` → disconnect all slots. */
-    DISCONNECT_ALL: 'SDD$',
-});
-/**
- * SmartDock request/response timing, ported from
- * com.shimmerresearch.managers.dockManager.SmartDock (SmartDock.java):
- * - `SMARTDOCK_RESPONSE_TIMEOUT` = 1000 ms (:66) — normal base command reply.
- * - `SMARTDOCK_RESPONSE_TIMEOUT_SLOT_CHANGE` = 10000 ms (:67) — slot switch.
- * and com.shimmerresearch.managers.dockManager.AbstractDock:
- * - `SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD` = 1500 ms (AbstractDock.java:96) —
- *   settle delay after a without-SD slot change before talking to the Shimmer.
- * - `CMD_RETRY_ATTEMPTS` = 2 (SmartDockUart.java:30).
- */
-const SMARTDOCK_DEFAULTS = Object.freeze({
-    RESPONSE_TIMEOUT_MS: 1000,
-    SLOT_CHANGE_TIMEOUT_MS: 10000,
-    SLOT_CHANGEOVER_DELAY_MS: 1500,
-    CMD_RETRY_ATTEMPTS: 2,
-});
-/**
- * Base hardware IDs from the version response's hardware-version field
- * (HwDriverShimmerDeviceDetails.java:248-250 `BASE_HARDWARE_IDS`).
- */
-const BASE_HARDWARE_IDS = Object.freeze({
-    BASE15U: 1,
-    BASE6U: 2,
-});
-/**
- * Map a base hardware-version byte to a family + slot count
- * (HwDriverShimmerDeviceDetails.java:313-321: BASE15→15 slots, BASE6→6 slots,
- * BASICDOCK→1). NB: in the Java driver the slot count actually comes from the
- * USB device descriptor, not the version byte — see the SmartDock README
- * hardware-verify note.
- */
-function baseHardwareType(hardwareVersion) {
-    switch (hardwareVersion) {
-        case BASE_HARDWARE_IDS.BASE15U:
-            return { hardwareType: 'base15', slotCount: 15 };
-        case BASE_HARDWARE_IDS.BASE6U:
-            return { hardwareType: 'base6', slotCount: 6 };
-        default:
-            return { hardwareType: 'unknown', slotCount: 0 };
-    }
-}
-// ---------------------------------------------------------------------------
-// TX — command assembly
-// ---------------------------------------------------------------------------
-const ASCII = new TextEncoder();
-/** Encode a base ASCII command string to bytes (UTF-8 == ASCII for this set). */
-function buildBaseCommand(cmd) {
-    return ASCII.encode(cmd);
-}
-/**
- * Build a slot-select command: `SDP,NN$` (without SD) or `SDC,NN$` (with SD),
- * or `SDD$` (disconnect all). Slot is formatted `%02d`
- * (SmartDockUart.java:194-231). Slot values 1..15 (1-based, matching the UI /
- * the Java `SmartDockActiveSlotDetails.mSlot`).
- */
-function buildSelectSlotCommand(slot, connectionType) {
-    if (connectionType === SMARTDOCK_CONNECTION_TYPE.DISCONNECTED) {
-        return buildBaseCommand(SMARTDOCK_BASE_CMD.DISCONNECT_ALL);
-    }
-    const prefix = connectionType === SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD
-        ? SMARTDOCK_BASE_CMD.SET_SLOT_WITH_SD
-        : SMARTDOCK_BASE_CMD.SET_SLOT_WITHOUT_SD;
-    const nn = String(slot).padStart(2, '0');
-    return buildBaseCommand(`${prefix},${nn}$`);
-}
-// ---------------------------------------------------------------------------
-// RX — `\r\n` line framing over the unframed serial byte stream
-// ---------------------------------------------------------------------------
-const ASCII_DECODER = new TextDecoder('utf-8', { fatal: false });
-/**
- * Extract the first complete `\r\n`-terminated line from an accumulated ASCII
- * buffer, returning the line (WITHOUT the terminator) and the remaining bytes,
- * or null when no complete line is buffered yet.
- *
- * This is the base-channel analogue of the D1 `wiredPacketLength` framing: the
- * SmartDock UART is an unframed serial byte stream, so the client accumulates
- * inbound bytes and pulls out whole lines. Mirrors the `indexOf("\r\n")` split
- * in SmartDockUartListener.java:62-67.
- */
-function extractBaseLine(buf) {
-    // Find CR LF (0x0d 0x0a).
-    for (let i = 0; i + 1 < buf.length; i++) {
-        if (buf[i] === 0x0d && buf[i + 1] === 0x0a) {
-            const line = ASCII_DECODER.decode(buf.subarray(0, i));
-            const rest = buf.subarray(i + 2);
-            return { line, rest: rest.length ? new Uint8Array(rest) : new Uint8Array(0) };
         }
     }
-    return null;
-}
-/**
- * Classify a base response line by its leading character
- * (SmartDockUartListener.java:71-296). Used to route a line to the awaiting
- * operation and to discard unrelated / garbage lines (resync discipline).
- */
-function classifyBaseResponse(line) {
-    if (line.length === 0)
-        return 'unknown';
-    if (line === 'E')
-        return 'error';
-    const c = line.charAt(0);
-    const hasComma = line.charAt(1) === ',';
-    if (c === 'V' && hasComma)
-        return 'version';
-    if (c === 'Q' && hasComma)
-        return 'occupancy';
-    if (c === 'S' && hasComma)
-        return 'occupancy'; // auto-notify slot map, same shape
-    if (c === 'P' && hasComma)
-        return 'slotWithoutSd';
-    if (c === 'C' && hasComma)
-        return 'slotWithSd';
-    if (c === 'C' || c === 'D')
-        return 'disconnected';
-    if (line.includes('Shimmer SmartDock Initialised'))
-        return 'boot';
-    return 'unknown';
-}
-/**
- * Parse a `V,<hw>,<fwId>,<major>,<minor>,<internal>` version line
- * (SmartDockUart.java:796-806). Returns null when malformed (wrong prefix or not
- * exactly 5 comma-separated integers after `V,`).
- */
-function parseSmartDockVersion(line) {
-    if (classifyBaseResponse(line) !== 'version')
-        return null;
-    const parts = line.slice(2).split(',');
-    if (parts.length !== 5)
-        return null;
-    const nums = parts.map((p) => Number.parseInt(p, 10));
-    if (nums.some((n) => Number.isNaN(n)))
-        return null;
-    return {
-        hardwareVersion: nums[0],
-        firmwareIdentifier: nums[1],
-        firmwareVersionMajor: nums[2],
-        firmwareVersionMinor: nums[3],
-        firmwareVersionInternal: nums[4],
-    };
-}
-/**
- * Parse a slot-occupancy line `Q,<map>` (or auto-notify `S,<map>`) into a
- * per-slot boolean array (SmartDockUartListener.java:140-181). Each map char is
- * ASCII `'0'`/`'1'`; index 0 → slot 1, etc. The map length is the base's slot
- * count. Returns null when malformed.
- *
- * NB: the Java `remapSlotsSmartDockToUi` remap for the BASE15U *prototype*
- * board (firmware 1.0.0.≤5) is deliberately NOT applied here — it only affects
- * pre-production hardware; see the README hardware-verify note.
- */
-function parseSlotOccupancy(line) {
-    if (classifyBaseResponse(line) !== 'occupancy')
-        return null;
-    const map = line.slice(2);
-    if (map.length === 0)
-        return null;
-    const out = [];
-    for (const ch of map) {
-        if (ch !== '0' && ch !== '1')
-            return null;
-        out.push(ch === '1');
-    }
-    return out;
-}
-/**
- * Parse an active-slot response line into slot + connection type
- * (SmartDockUart.java:810-869):
- * - `P,NN` → WITHOUT_SD, slot NN
- * - `C,NN` → WITH_SD, slot NN
- * - `C` / `D` → DISCONNECTED, slot -1
- * Returns null when the numeric slot is malformed.
- */
-function parseActiveSlot(line) {
-    const kind = classifyBaseResponse(line);
-    if (kind === 'disconnected') {
-        return { slot: -1, connectionType: SMARTDOCK_CONNECTION_TYPE.DISCONNECTED };
-    }
-    if (kind === 'slotWithoutSd' || kind === 'slotWithSd') {
-        const slotStr = line.slice(2);
-        if (!/^\d+$/.test(slotStr))
-            return null;
-        return {
-            slot: Number.parseInt(slotStr, 10),
-            connectionType: kind === 'slotWithSd'
-                ? SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD
-                : SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD,
-        };
-    }
-    return null;
-}
-
-/**
- * Thrown by {@link SmartDockClient} when a base command reply does not arrive
- * within the timeout. Distinguished from an explicit `E` error response so the
- * retry logic re-sends on timeout only (SmartDockUart.java:526-537: a timeout
- * from `waitForSmartDockResponse` triggers a re-send, whereas an error response
- * throws immediately).
- */
-class SmartDockTimeoutError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = 'SmartDockTimeoutError';
-    }
-}
-// ---------------------------------------------------------------------------
-// SmartDockClient
-// ---------------------------------------------------------------------------
-/**
- * Client for a **SmartDock** multi-slot base (Base-6 / Base-15) — phase **D2**
- * of dock support, building on D1's single-device {@link WiredShimmerClient}.
- *
- * A SmartDock exposes two logical channels over (two) FTDI serial ports:
- *   1. a **base control** channel speaking short ASCII `SDx$` commands (this
- *      client), used to read the base version, query per-slot occupancy, and
- *      switch which slot is *active*; and
- *   2. a **per-Shimmer** UART channel onto which the base routes the active
- *      slot, spoken with the D1 binary `$`-header protocol.
- *
- * Multi-slot support is therefore: select a slot on the base channel, then talk
- * to the docked Shimmer on the per-Shimmer channel. This client **composes**
- * (does not duplicate) {@link WiredShimmerClient} for the per-Shimmer half —
- * see {@link identifyDockedShimmer} / {@link getDockedShimmerStatus}.
- *
- * Scope (D2): **READ-ONLY**. Dock info, occupancy, slot select, and per-slot
- * identify/status. NO config writes, NO SD/mass-storage (the `SDC` with-SD
- * connect and `getSDMountDelay` path exist in the Java oracle but are not
- * driven), NO bootloader/flashing.
- *
- * Robustness: the base UART is an unframed byte stream, so — like D1 — this
- * client accumulates inbound bytes and extracts complete `\r\n`-terminated
- * lines ({@link extractBaseLine}); unrecognised / partial lines are ignored,
- * which naturally resyncs after garbage. Per-op timeouts are ported from Java
- * (normal 1000 ms; slot change 10000 ms).
- *
- * Transport injection is mandatory — `connect()` with no base transport throws.
- *
- * @example
- * ```ts
- * const dock = new SmartDockClient({ transport: baseSerial, shimmerTransport: shimmerSerial });
- * await dock.connect();
- * const info = await dock.getDockInfo();       // { hardwareType, firmwareVersion, slotCount }
- * const slots = await dock.getSlotOccupancy(); // [{ slot: 1, occupied: true }, ...]
- * const id = await dock.identifyDockedShimmer(1);   // selects slot 1, then D1 identify()
- * const st = await dock.getDockedShimmerStatus(1);  // selects slot 1, then D1 getStatus()
- * ```
- */
-class SmartDockClient extends BaseShimmerClient {
-    constructor(opts = {}) {
-        super(opts);
-        this._injectedTransport = null;
-        this._transport = null;
-        this._notifyUnsub = null;
-        this._disconnectUnsub = null;
-        this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
-        /**
-         * Serialization queue: all public operations chain onto this so slot
-         * select + per-slot reads run as atomic, non-interleaved units. Concurrent
-         * `selectSlot` / `identifyDockedShimmer` / `getDockedShimmerStatus` otherwise
-         * race on the shared {@link activeSlot} and single {@link _wired} client,
-         * mis-attributing one slot's data to another. See {@link _serialize}.
-         */
-        this._queue = Promise.resolve();
-        this._wired = null;
-        this._wiredConnected = false;
-        /** Cached dock info (from the last {@link getDockInfo}). */
-        this.dockInfo = null;
-        /** The last active slot confirmed by {@link selectSlot} (1-based; -1 when disconnected). */
-        this.activeSlot = -1;
-        this._handleTransportDisconnect = () => {
-            this._emitStatus('SmartDock disconnected');
-        };
-        // ---------------------------------------------------------------------------
-        // RX: accumulate the unframed byte stream, extract complete `\r\n` lines
-        // ---------------------------------------------------------------------------
-        this._handleNotify = (chunk) => {
-            if (!chunk || chunk.length === 0)
-                return;
-            this._log('Notify len=', chunk.length);
-            this._rxBuf = concatU8(this._rxBuf, chunk);
-            this._drain();
-        };
-        this._injectedTransport = opts.transport ?? null;
-        this._shimmerTransport = opts.shimmerTransport ?? null;
-        this._responseTimeoutMs =
-            opts.timeouts?.responseTimeoutMs ?? SMARTDOCK_DEFAULTS.RESPONSE_TIMEOUT_MS;
-        this._slotChangeTimeoutMs =
-            opts.timeouts?.slotChangeTimeoutMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGE_TIMEOUT_MS;
-        this._slotChangeoverDelayMs =
-            opts.timeouts?.slotChangeoverDelayMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGEOVER_DELAY_MS;
-    }
-    _log(...args) {
-        if (this.debug)
-            console.log('[SmartDock]', ...args);
-    }
-    _deviceLabel() {
-        return this._transport?.deviceName ?? 'SmartDock';
-    }
-    // ---------------------------------------------------------------------------
-    // Connection management
-    // ---------------------------------------------------------------------------
     /**
-     * Open the SmartDock base UART connection. A base transport is REQUIRED
-     * (constructor option or this parameter). The per-Shimmer transport (if
-     * supplied) is opened lazily on the first docked-Shimmer op.
+     * Measure raw BLE link throughput with the firmware's data-rate test
+     * (SET_DATA_RATE_TEST): the device free-runs 5-byte counter packets as
+     * fast as the link drains them and we count notification bytes for
+     * `durationMs`. This measures the pipe itself (connection interval, MTU,
+     * module buffering) independent of the SD/file-transfer protocol, so it
+     * gives an upper bound for transfer rates on a given host/adapter/OS.
+     * The device must be idle (the firmware NACKs the test while sensing).
      */
-    async connect(transport) {
-        const t = transport ?? this._injectedTransport;
-        if (!t) {
-            throw new Error('SmartDockClient requires an injected transport: a SmartDock is only reachable ' +
-                'over the base UART. Pass a ShimmerTransport via the constructor ({ transport }) ' +
-                'or connect(transport).');
-        }
-        this._transport = t;
-        this._notifyUnsub = t.onNotify(this._handleNotify);
-        this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
-        this._emitStatus('Opening SmartDock base UART connection…');
-        await t.connect();
-        this._rxBuf = new Uint8Array(0);
-        this._emitStatus(`Connected: ${this._deviceLabel()}`);
-    }
-    async disconnect() {
+    async runDataRateTest(durationMs = 5000, onProgress) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming)
+            throw new Error('Data-rate test unavailable while streaming');
+        let counting = false;
+        let bytes = 0;
+        const counter = (chunk) => {
+            if (counting)
+                bytes += chunk.length;
+        };
+        this._onTemp(counter);
         try {
-            if (this._wired && this._wiredConnected) {
-                await this._wired.disconnect().catch(() => undefined);
+            await this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 1]), 2000);
+            const startedAt = Date.now();
+            counting = true;
+            let elapsed = 0;
+            while (elapsed < durationMs) {
+                await new Promise((r) => setTimeout(r, Math.min(250, durationMs - elapsed)));
+                elapsed = Date.now() - startedAt;
+                onProgress?.(bytes, elapsed);
             }
-            this._notifyUnsub?.();
-            this._disconnectUnsub?.();
-            await this._transport?.disconnect();
-        }
-        catch {
-            /* ignore */
+            counting = false;
+            const measuredMs = Date.now() - startedAt;
+            return {
+                bytesReceived: bytes,
+                durationMs: measuredMs,
+                kBps: measuredMs > 0 ? bytes / 1024 / (measuredMs / 1000) : 0,
+            };
         }
         finally {
-            this._wiredConnected = false;
-            this._wired = null;
-            this._notifyUnsub = this._disconnectUnsub = null;
-            this._transport = null;
+            this._offTemp(counter);
+            try {
+                await this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 0]), 2000);
+            }
+            catch {
+                /* the stop ACK can be indistinguishable from residual test bytes */
+            }
+            // Drop any test bytes that were mistaken for stream data
             this._rxBuf = new Uint8Array(0);
-            this._temps.clear();
-            this._emitStatus('Disconnected');
         }
     }
-    /** Streaming is not part of the SmartDock protocol. */
-    async startStreaming() {
-        throw new Error('Streaming is not supported over the SmartDock UART.');
+    _sdAcquire() {
+        this._sdUsers++;
+        if (!this._sdHandlerAttached) {
+            this._onTemp(this._sdChunkHandler);
+            this._sdHandlerAttached = true;
+        }
     }
-    async stopStreaming() {
-        /* no-op */
+    _sdRelease() {
+        this._sdUsers = Math.max(0, this._sdUsers - 1);
+        if (this._sdUsers === 0 && this._sdHandlerAttached) {
+            this._offTemp(this._sdChunkHandler);
+            this._sdHandlerAttached = false;
+            this._sdRx = new Uint8Array(0);
+        }
     }
-    // ---------------------------------------------------------------------------
-    // High-level base operations
-    // ---------------------------------------------------------------------------
-    /**
-     * Read the base HW/FW version and derive its family + slot count. Sends
-     * `SDV$` and parses the `V,<hw>,<fwId>,<major>,<minor>,<internal>` reply
-     * (SmartDockUart.java:148-157, :796-806).
-     */
-    async getDockInfo() {
-        return this._serialize(() => this._getDockInfoImpl());
-    }
-    async _getDockInfoImpl() {
-        const line = await this._command(SMARTDOCK_BASE_CMD.GET_VERSION, 'version', this._responseTimeoutMs);
-        const firmwareVersion = parseSmartDockVersion(line);
-        if (!firmwareVersion)
-            throw new Error(`Malformed SmartDock version response: "${line}"`);
-        const { hardwareType, slotCount } = baseHardwareType(firmwareVersion.hardwareVersion);
-        const info = { hardwareType, firmwareVersion, slotCount };
-        this.dockInfo = info;
-        this._emitStatus(`SmartDock ${hardwareType} (${slotCount} slots) FW ${firmwareVersion.firmwareVersionMajor}.` +
-            `${firmwareVersion.firmwareVersionMinor}.${firmwareVersion.firmwareVersionInternal}`);
-        return info;
-    }
-    /**
-     * Query which slots are occupied. Sends `SDQ$` and parses the
-     * `Q,<map>` bitmap (one ASCII `0`/`1` per slot) into per-slot occupancy
-     * (SmartDockUart.java:162-171, SmartDockUartListener.java:140-181). The number
-     * of entries is the base's slot count as reported on the wire.
-     */
-    async getSlotOccupancy() {
-        return this._serialize(() => this._getSlotOccupancyImpl());
-    }
-    async _getSlotOccupancyImpl() {
-        const line = await this._command(SMARTDOCK_BASE_CMD.QUERY_CONNECTED_SLOTS, 'occupancy', this._responseTimeoutMs);
-        const map = parseSlotOccupancy(line);
-        if (!map)
-            throw new Error(`Malformed SmartDock occupancy response: "${line}"`);
-        return map.map((occupied, i) => ({ slot: i + 1, occupied }));
-    }
-    /**
-     * Select the active slot (WITHOUT SD access — the read path). Sends
-     * `SDP,NN$`, awaits the `P,NN` confirmation with the ported ~10 s slot-change
-     * timeout, verifies the returned slot matches the request (Java throws
-     * `DOCK_CMD_ERR_FAIL_SET` on mismatch, SmartDockUart.java:233-241), then waits
-     * the ported settle delay (1500 ms) before the per-Shimmer UART is usable
-     * (SmartDock.java:674-691). Finally resyncs the per-Shimmer byte stream (the
-     * slot re-route may leave stale bytes) — reusing D1's
-     * {@link WiredShimmerClient.resyncStream}.
-     *
-     * @param slotNumber 1-based slot (1..slotCount).
-     */
-    async selectSlot(slotNumber) {
-        return this._serialize(() => this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD));
-    }
-    /** Disconnect all slots (`SDD$`); no slot is active afterwards. */
-    async disconnectAllSlots() {
-        return this._serialize(() => this._disconnectAllSlotsImpl());
-    }
-    async _disconnectAllSlotsImpl() {
-        await this._command(SMARTDOCK_BASE_CMD.DISCONNECT_ALL, 'disconnected', this._slotChangeTimeoutMs);
-        this.activeSlot = -1;
-        this._emitStatus('All slots disconnected');
-    }
-    async _selectSlotInternal(slotNumber, connectionType) {
+    /** Send an SD command and await its reassembled one-shot response. */
+    async _sdCommand(cmd, rspOpcode, timeoutMs = 5000) {
         if (!this._transport)
-            throw new Error('Not connected');
-        const cmd = buildSelectSlotCommand(slotNumber, connectionType);
-        // The reply is `P,NN` (without SD) or `C,NN` (with SD).
-        const wantKind = connectionType === SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD ? 'slotWithSd' : 'slotWithoutSd';
-        const line = await this._sendWithRetry(cmd, [wantKind, 'disconnected'], this._slotChangeTimeoutMs, `select slot ${slotNumber}`);
-        const active = parseActiveSlot(line);
-        if (!active || active.slot !== slotNumber) {
-            throw new Error(`SmartDock slot select failed: requested ${slotNumber}, got "${line}" (DOCK_CMD_ERR_FAIL_SET)`);
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming) {
+            throw new SdTransferError('SD transfer is unavailable while streaming', SD_STATUS.BUSY);
         }
-        this.activeSlot = active.slot;
-        this._emitStatus(`Active slot ${active.slot} selected; settling ${this._slotChangeoverDelayMs}ms`);
-        await this._delay(this._slotChangeoverDelayMs);
-        // Resync the per-Shimmer stream for the newly routed slot.
-        this._wired?.resyncStream();
-    }
-    // ---------------------------------------------------------------------------
-    // Per-slot docked-Shimmer ops (compose D1 WiredShimmerClient)
-    // ---------------------------------------------------------------------------
-    /**
-     * Select `slotNumber`, then read the docked Shimmer's identity by delegating
-     * to the D1 {@link WiredShimmerClient.identify} over the per-Shimmer UART. The
-     * per-Shimmer protocol (MAC/HW/FW/expansion) is NOT re-implemented here.
-     */
-    async identifyDockedShimmer(slotNumber) {
-        return this._serialize(async () => {
-            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
-            const wired = await this._ensureWired();
-            return wired.identify();
-        });
-    }
-    /**
-     * Select `slotNumber`, then read the docked Shimmer's battery/charging status
-     * by delegating to the D1 {@link WiredShimmerClient.getStatus}.
-     */
-    async getDockedShimmerStatus(slotNumber) {
-        return this._serialize(async () => {
-            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
-            const wired = await this._ensureWired();
-            return wired.getStatus();
-        });
-    }
-    /**
-     * Select `slotNumber`, then read + decode the docked Shimmer's InfoMem
-     * configuration (configure-while-docked, phase P2). Slot-select and the
-     * per-Shimmer identify + InfoMem read run as one atomic unit under this
-     * client's queue, so concurrent calls for different slots cannot interleave.
-     * The docked device is (re)identified after the slot change to resolve the
-     * correct InfoMem byte layout for that slot.
-     */
-    async readInfoMemConfig(slotNumber) {
-        return this._serialize(async () => {
-            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
-            const wired = await this._ensureWired();
-            await wired.identify();
-            return wired.readInfoMemConfig();
-        });
-    }
-    /**
-     * Select `slotNumber`, then encode + write a configuration to the docked
-     * Shimmer's InfoMem, atomically. See
-     * {@link WiredShimmerClient.writeInfoMemConfig} for the device-write, RTC
-     * (`opts.setRtc`, default true) and verify semantics.
-     */
-    async writeInfoMemConfig(slotNumber, config, opts = {}) {
-        return this._serialize(async () => {
-            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
-            const wired = await this._ensureWired();
-            await wired.identify();
-            return wired.writeInfoMemConfig(config, opts);
-        });
-    }
-    /** Lazily build + connect the composed D1 client over the per-Shimmer transport. */
-    async _ensureWired() {
-        if (!this._shimmerTransport) {
-            throw new Error('SmartDockClient.identifyDockedShimmer / getDockedShimmerStatus require a per-Shimmer ' +
-                'transport: a SmartDock routes the active slot onto a separate FTDI UART port. Pass ' +
-                'it via the constructor ({ shimmerTransport }).');
+        if (this._sdExpect) {
+            // A shared expectation slot: concurrent SD commands would race on it,
+            // so refuse deterministically — callers are expected to sequence
+            throw new SdTransferError('another SD command is already in flight', SD_STATUS.BUSY);
         }
-        if (!this._wired) {
-            this._wired = new WiredShimmerClient({
-                debug: this.debug,
-                transport: this._shimmerTransport,
+        this._sdAcquire();
+        try {
+            return await new Promise((resolve, reject) => {
+                const t = setTimeout(() => {
+                    this._sdExpect = null;
+                    reject(new Error(`SD response 0x${rspOpcode.toString(16)} timeout`));
+                }, timeoutMs);
+                this._sdExpect = {
+                    opcode: rspOpcode,
+                    resolve: (b) => {
+                        clearTimeout(t);
+                        resolve(b);
+                    },
+                };
+                this._writeExpectingAck(cmd, timeoutMs)
+                    .then((ackRemainder) => {
+                    // When the ACK and the response share a notification the command
+                    // flow consumes the remainder — feed it back into the SD pipeline
+                    if (ackRemainder && ackRemainder.length)
+                        this._sdChunkHandler(ackRemainder);
+                })
+                    .catch((e) => {
+                    clearTimeout(t);
+                    this._sdExpect = null;
+                    reject(e);
+                });
             });
         }
-        if (!this._wiredConnected) {
-            await this._wired.connect();
-            this._wiredConnected = true;
+        finally {
+            this._sdRelease();
         }
-        return this._wired;
-    }
-    // ---------------------------------------------------------------------------
-    // Request/response core (base ASCII channel)
-    // ---------------------------------------------------------------------------
-    /** Send an ASCII base command and await a response of one of `kinds`. */
-    async _command(cmd, kind, timeoutMs) {
-        return this._sendWithRetry(buildBaseCommand(cmd), [kind], timeoutMs, cmd);
     }
     /**
-     * Write `cmdBytes` and await a matching response, re-sending the command on a
-     * missed reply for a total of `SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS` (= 2)
-     * attempts before failing — mirroring SmartDockUart.java:526-537
-     * (`txBytesAndWaitForReply`). Retries on TIMEOUT ONLY; an explicit `E` error
-     * response ({@link SmartDockTimeoutError} is not thrown for it) propagates
-     * immediately, matching the Java path where `waitForSmartDockResponse` throws
-     * on an error instead of returning false.
+     * List a directory on the SD card, transparently following the firmware's
+     * startIdx paging. Path example: `'data'` or
+     * `'data/DefaultTrial_123/Shimmer_ABCD-000'`.
      */
-    async _sendWithRetry(cmdBytes, kinds, timeoutMs, label) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        let lastErr;
-        for (let attempt = 0; attempt < SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS; attempt++) {
-            await this._transport.write(cmdBytes);
-            try {
-                return await this._waitForResponse(kinds, timeoutMs, label);
-            }
-            catch (err) {
-                // Only a timeout is retryable; an error response fails fast.
-                if (err instanceof SmartDockTimeoutError) {
-                    lastErr = err;
-                    this._log(`command "${label}" timed out (attempt ${attempt + 1}); re-sending`);
-                    continue;
-                }
-                throw err;
-            }
-        }
-        throw lastErr instanceof Error ? lastErr : new SmartDockTimeoutError(`timeout (${label})`);
-    }
-    /**
-     * Resolve with the first response line whose classification is in `kinds`;
-     * reject on an `E` error line or timeout. Lines of any other kind (including
-     * `unknown`/garbage) are ignored — this is the resync discipline.
-     */
-    _waitForResponse(kinds, timeoutMs, label) {
-        return new Promise((resolve, reject) => {
-            const t = setTimeout(() => {
-                this._offTemp(handler);
-                reject(new SmartDockTimeoutError(`SmartDock response timeout (${label})`));
-            }, timeoutMs);
-            const handler = (line) => {
-                const k = classifyBaseResponse(line);
-                if (k === 'error') {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    reject(new Error(`SmartDock error response (${label})`));
-                    return;
-                }
-                if (kinds.includes(k)) {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    resolve(line);
-                }
-                // else: ignore (unrelated line / garbage) and keep waiting.
-            };
-            this._onTemp(handler);
-        });
-    }
-    _delay(ms) {
-        return new Promise((r) => setTimeout(r, ms));
-    }
-    /**
-     * Run `fn` after every previously-queued operation has settled, so all public
-     * operations execute strictly one-at-a-time (see {@link _queue}). The queue
-     * never rejects — a failed op does not poison later ones — while the caller
-     * still receives `fn`'s own resolution/rejection.
-     */
-    _serialize(fn) {
-        const run = this._queue.then(() => fn());
-        this._queue = run.then(() => undefined, () => undefined);
-        return run;
-    }
-    _drain() {
+    async sdListDir(path, opts = {}) {
+        const entries = [];
+        let startIdx = 0;
         for (;;) {
-            const res = extractBaseLine(this._rxBuf);
-            if (!res)
-                break;
-            this._rxBuf = res.rest;
-            if (res.line.length > 0)
-                this._emitTemp(res.line);
-        }
-    }
-    _onTemp(fn) {
-        this._temps.add(fn);
-    }
-    _offTemp(fn) {
-        this._temps.delete(fn);
-    }
-    _emitTemp(line) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(line);
+            const body = await this._sdCommand(buildListDirCmd(path, startIdx, opts.maxEntriesPerPage ?? SD_LIST_MAX_ENTRIES), SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE);
+            const page = parseListDirRsp(body);
+            if (page.status !== SD_STATUS.OK) {
+                throw new SdTransferError(`list '${path}': ${sdStatusToString(page.status)}`, page.status);
             }
-            catch (e) {
-                this._log('temp handler error', e);
+            entries.push(...page.entries);
+            if (!page.hasMore)
+                return entries;
+            if (page.entries.length === 0) {
+                throw new Error(`list '${path}': paging made no progress at index ${startIdx}`);
             }
-        });
-    }
-}
-
-/**
- * Constants for the Shimmer3 / Shimmer3R binary SD-log file format.
- *
- * Ported from the Shimmer Java driver:
- *   com.shimmerresearch.binaryfile.ShimmerSDLog (header layout + read loop)
- *   com.shimmerresearch.driver.ShimmerObject.SDLogHeader (sensor bitmasks)
- *   com.shimmerresearch.driverUtilities.ShimmerVerDetails (HW_ID / FW_ID)
- */
-/** Shimmer hardware identifiers (ShimmerVerDetails.HW_ID). */
-const SDLOG_HW_ID = Object.freeze({
-    SHIMMER_3: 3,
-    SHIMMER_3R: 10,
-});
-/** Firmware identifiers (ShimmerVerDetails.FW_ID). */
-const SDLOG_FW_ID = Object.freeze({
-    BTSTREAM: 1,
-    SDLOG: 2,
-    LOGANDSTREAM: 3,
-    GQ_BLE: 5,
-    GQ_802154: 9,
-    STROKARE: 15,
-});
-/** SD-log header lengths in bytes, keyed by generation. */
-const SDLOG_HEADER_LENGTH = Object.freeze({
-    /** SDLog v0.5.x (unsupported — rejected with LEGACY_UNSUPPORTED). */
-    LEGACY: 178,
-    /** Modern Shimmer3 (SDLog >= 0.8.69, LogAndStream >= 0.5.0). */
-    SHIMMER3: 256,
-    /** Shimmer3R. */
-    SHIMMER3R: 384,
-});
-/** The 32 kHz sampling/RTC clock frequency shared by Shimmer3 and Shimmer3R. */
-const SDLOG_CLOCK_FREQ = 32768;
-/**
- * Length in bytes of the sync timestamp-offset field prefixed to the first
- * sample of each 512-byte block when "sync when logging" is enabled
- * (ShimmerObject.OFFSET_LENGTH — always 9 for modern firmware; the 5-byte
- * variant only exists on legacy SDLog 0.5.x, which is out of scope).
- */
-const SDLOG_SYNC_OFFSET_LENGTH = 9;
-/** SD sector size used for the sync-when-logging block framing. */
-const SDLOG_SYNC_BLOCK_LENGTH = 512;
-/**
- * Enabled-sensor bitmasks as stored in SD-log header bytes 3-7 (40-bit,
- * LSB-first). Ported verbatim from ShimmerObject.SDLogHeader (values > 2^31
- * are plain numbers — always test them with {@link hasSensorBit}, never with
- * 32-bit bitwise operators).
- */
-const SDLogHeaderBitmask = Object.freeze({
-    ACCEL_LN: 1 << 7,
-    GYRO: 1 << 6,
-    MAG: 1 << 5,
-    EXG1_24BIT: 1 << 4,
-    EXG2_24BIT: 1 << 3,
-    GSR: 1 << 2,
-    EXT_EXP_A7: 1 << 1,
-    EXT_EXP_A6: 1 << 0,
-    BRIDGE_AMP: 1 << 15,
-    ECG_TO_HR_FW: 1 << 14,
-    BATTERY: 1 << 13,
-    ACCEL_WR: 1 << 12,
-    EXT_EXP_A15: 1 << 11,
-    INT_EXP_A1: 1 << 10,
-    INT_EXP_A12: 1 << 9,
-    INT_EXP_A13: 1 << 8,
-    INT_EXP_A14: 1 << 23,
-    ACCEL_MPU: 1 << 22,
-    MAG_MPU: 1 << 21,
-    EXG1_16BIT: 1 << 20,
-    EXG2_16BIT: 1 << 19,
-    BMPX80: 1 << 18,
-    MPL_TEMPERATURE: 1 << 17,
-    MPL_QUAT_6DOF: 2 ** 31,
-    MPL_QUAT_9DOF: 1 << 30,
-    MPL_EULER_6DOF: 1 << 29,
-    MPL_EULER_9DOF: 1 << 28,
-    MPL_HEADING: 1 << 27,
-    MPL_PEDOMETER: 1 << 26,
-    MPL_TAP: 1 << 25,
-    MPL_MOTION_ORIENT: 1 << 24,
-    GYRO_MPU_MPL: 2 ** 39,
-    ACCEL_MPU_MPL: 2 ** 38,
-    MAG_MPU_MPL: 2 ** 37,
-    MPL_QUAT_6DOF_RAW: 2 ** 36,
-});
-/**
- * Test a bit in the (up to 40-bit) enabled-sensors value. JavaScript bitwise
- * operators truncate to 32 bits, so masks >= 2^31 must be tested arithmetically.
- */
-function hasSensorBit(enabledSensors, mask) {
-    return Math.floor(enabledSensors / mask) % 2 === 1;
-}
-/**
- * Expansion-board hardware SR codes used by the "new IMU" detection
- * (ShimmerVerDetails.HW_ID_SR_CODES).
- */
-const SDLOG_EXP_BRD_ID = Object.freeze({
-    SHIMMER3: 31,
-    PROTO3_MINI: 36,
-    PROTO3_DELUXE: 38,
-    ADXL377_ACCEL_200G: 44,
-    EXG_UNIFIED: 47,
-    GSR_UNIFIED: 48,
-    BR_AMP_UNIFIED: 49,
-});
-
-/**
- * Public types for the Shimmer3 / Shimmer3R binary SD-log decoder.
- */
-/** Typed error thrown by the SD-log parsing/decoding entry points. */
-class SdLogFormatError extends Error {
-    constructor(code, message) {
-        super(message);
-        this.name = 'SdLogFormatError';
-        this.code = code;
-    }
-}
-
-/**
- * SD-log channel tables and raw datatype decoding.
- *
- * Ported from the Shimmer Java driver:
- *   ShimmerSDLog#interpretdatapacketformat  — Shimmer3 enabled-sensors channel order
- *   ShimmerObject#interpretDataPacketFormat(nChannels, signalIds) — Shimmer3R
- *     dynamic signal-ID table (HW_ID.SHIMMER_3R branches)
- *   UtilParseData#parseData(byte[], String[]) — datatype byte semantics
- *
- * Datatype string conventions (UtilParseData): suffix `r` = big-endian,
- * otherwise little-endian; `i` = signed two's complement, `u` = unsigned;
- * `i12*>` = Shimmer3R high-g accel packing (MSB << 4 | LSB >> 4).
- */
-const SDLOG_DATA_TYPE_BYTES = Object.freeze({
-    u8: 1,
-    u12: 2,
-    u14: 2,
-    u16: 2,
-    u16r: 2,
-    i16: 2,
-    i16r: 2,
-    u24: 3,
-    u24r: 3,
-    i24r: 3,
-    u32r: 4,
-    i32r: 4,
-    'i12*>': 2,
-});
-function sign(value, bits) {
-    return value >= 2 ** (bits - 1) ? value - 2 ** bits : value;
-}
-/**
- * Decode one channel value at `off` in `bytes`.
- *
- * Mirrors UtilParseData.parseData(byte[], String[]) exactly — including the
- * quirk that `u12`/`u14` are read as full unsigned 16-bit little-endian values
- * with no masking (the firmware guarantees the upper bits are zero).
- */
-function decodeSdLogValue(bytes, off, type) {
-    switch (type) {
-        case 'u8':
-            return bytes[off];
-        case 'u12':
-        case 'u14':
-        case 'u16':
-            return bytes[off] | (bytes[off + 1] << 8);
-        case 'u16r':
-            return (bytes[off] << 8) | bytes[off + 1];
-        case 'i16':
-            return sign(bytes[off] | (bytes[off + 1] << 8), 16);
-        case 'i16r':
-            return sign((bytes[off] << 8) | bytes[off + 1], 16);
-        case 'u24':
-            return bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16);
-        case 'u24r':
-            return (bytes[off] << 16) | (bytes[off + 1] << 8) | bytes[off + 2];
-        case 'i24r':
-            return sign((bytes[off] << 16) | (bytes[off + 1] << 8) | bytes[off + 2], 24);
-        case 'u32r':
-            return bytes[off] * 2 ** 24 + (bytes[off + 1] << 16) + (bytes[off + 2] << 8) + bytes[off + 3];
-        case 'i32r':
-            // JS 32-bit bitwise OR yields the signed two's-complement result directly.
-            return (bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3];
-        case 'i12*>':
-            // Shimmer3R high-g accel: MSB byte << 4 OR'd with upper nibble of the
-            // LSB byte, then 12-bit two's complement (UtilParseData "i12*>").
-            return sign((bytes[off] << 4) | (bytes[off + 1] >> 4), 12);
-    }
-}
-const uncal = (name, dataType) => ({
-    name,
-    unit: null,
-    calibrated: false,
-    dataType,
-    sizeBytes: SDLOG_DATA_TYPE_BYTES[dataType],
-});
-/**
- * GSR is the one channel with a reusable calibration path in this SDK (the
- * amplifier-equation conversion shared by Shimmer3Client/Shimmer3RClient), so
- * the decoder emits it calibrated, in µS.
- */
-const gsrChannel = () => ({
-    name: 'GSR',
-    unit: 'uSiemens',
-    calibrated: true,
-    dataType: 'u16',
-    sizeBytes: 2,
-});
-/**
- * Build the Shimmer3 (256-byte header) channel list from the enabled-sensors
- * value. The order and datatypes replicate the "modern Shimmer3" branch of
- * ShimmerSDLog#interpretdatapacketformat (ShimmerSDLog.java lines 817-1271)
- * exactly, including the legacy-magnetometer X, Z, Y ordering.
- *
- * @param enabledSensors 40-bit enabled-sensors value from the header.
- * @param newImuSensors  True when the expansion-board bytes identify a
- *   new-IMU board (LSM303AHTR/MPU9250/BMP280 generation) — flips the mag
- *   channels to little-endian X, Y, Z and renames the BMP channels.
- */
-function buildShimmer3SdLogChannels(enabledSensors, newImuSensors) {
-    const has = (mask) => hasSensorBit(enabledSensors, mask);
-    const ch = [];
-    if (has(SDLogHeaderBitmask.ACCEL_LN)) {
-        ch.push(uncal('LN_ACCEL_X', 'u12'), uncal('LN_ACCEL_Y', 'u12'), uncal('LN_ACCEL_Z', 'u12'));
-    }
-    if (has(SDLogHeaderBitmask.BATTERY))
-        ch.push(uncal('BATTERY', 'u12'));
-    if (has(SDLogHeaderBitmask.EXT_EXP_A7))
-        ch.push(uncal('EXT_EXP_ADC_A7', 'u12'));
-    if (has(SDLogHeaderBitmask.EXT_EXP_A6))
-        ch.push(uncal('EXT_EXP_ADC_A6', 'u12'));
-    if (has(SDLogHeaderBitmask.EXT_EXP_A15))
-        ch.push(uncal('EXT_EXP_ADC_A15', 'u12'));
-    if (has(SDLogHeaderBitmask.INT_EXP_A12))
-        ch.push(uncal('INT_EXP_ADC_A12', 'u12'));
-    if (has(SDLogHeaderBitmask.INT_EXP_A13))
-        ch.push(uncal('INT_EXP_ADC_A13', 'u12'));
-    if (has(SDLogHeaderBitmask.INT_EXP_A14))
-        ch.push(uncal('INT_EXP_ADC_A14', 'u12'));
-    if (has(SDLogHeaderBitmask.BRIDGE_AMP)) {
-        ch.push(uncal('BRIDGE_AMP_HIGH', 'u12'), uncal('BRIDGE_AMP_LOW', 'u12'));
-    }
-    if (has(SDLogHeaderBitmask.GSR))
-        ch.push(gsrChannel());
-    if (has(SDLogHeaderBitmask.INT_EXP_A1))
-        ch.push(uncal('INT_EXP_ADC_A1', 'u12'));
-    if (has(SDLogHeaderBitmask.GYRO)) {
-        // Modern (non-legacy) SD logs store the MPU gyro big-endian.
-        ch.push(uncal('GYRO_X', 'i16r'), uncal('GYRO_Y', 'i16r'), uncal('GYRO_Z', 'i16r'));
-    }
-    if (has(SDLogHeaderBitmask.ACCEL_WR)) {
-        ch.push(uncal('WR_ACCEL_X', 'i16'), uncal('WR_ACCEL_Y', 'i16'), uncal('WR_ACCEL_Z', 'i16'));
-    }
-    if (has(SDLogHeaderBitmask.MAG)) {
-        if (newImuSensors) {
-            // LSM303AHTR: little-endian, natural X, Y, Z order.
-            ch.push(uncal('MAG_X', 'i16'), uncal('MAG_Y', 'i16'), uncal('MAG_Z', 'i16'));
-        }
-        else {
-            // LSM303DLHC: big-endian, X, Z, Y on-disk order.
-            // HARDWARE-VERIFY: old-IMU mag channel order (X, Z, Y) and endianness
-            // taken from ShimmerSDLog.java:980-990; verify against a real SR31<6 log.
-            ch.push(uncal('MAG_X', 'i16r'), uncal('MAG_Z', 'i16r'), uncal('MAG_Y', 'i16r'));
+            startIdx += page.entries.length;
         }
     }
-    if (has(SDLogHeaderBitmask.ACCEL_MPU)) {
-        ch.push(uncal('ACCEL_MPU_X', 'i16r'), uncal('ACCEL_MPU_Y', 'i16r'), uncal('ACCEL_MPU_Z', 'i16r'));
+    /** Stat one file or directory on the SD card. */
+    async sdStatFile(path) {
+        const body = await this._sdCommand(buildStatCmd(path), SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE);
+        const { status, stat } = parseStatRsp(body);
+        if (status !== SD_STATUS.OK) {
+            throw new SdTransferError(`stat '${path}': ${sdStatusToString(status)}`, status);
+        }
+        return stat;
     }
-    if (has(SDLogHeaderBitmask.MAG_MPU)) {
-        ch.push(uncal('MAG_MPU_X', 'i16'), uncal('MAG_MPU_Y', 'i16'), uncal('MAG_MPU_Z', 'i16'));
+    /** Query free/total space on the SD card (in KB). */
+    async sdGetFreeSpace() {
+        // First call on a large FAT32 card can scan the FAT — allow extra time
+        const body = await this._sdCommand(buildFreeSpaceCmd(), SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE, 15000);
+        const { status, space } = parseFreeSpaceRsp(body);
+        if (status !== SD_STATUS.OK) {
+            throw new SdTransferError(`free space: ${sdStatusToString(status)}`, status);
+        }
+        return space;
     }
-    if (has(SDLogHeaderBitmask.BMPX80)) {
-        const suffix = newImuSensors ? 'BMP280' : 'BMP180';
-        ch.push(uncal(`TEMPERATURE_${suffix}`, 'u16r'));
-        ch.push(uncal(`PRESSURE_${suffix}`, 'u24r'));
+    /**
+     * Delete one file (or empty directory) on the SD card. The firmware only
+     * permits paths strictly under `data/`.
+     */
+    async sdDeletePath(path) {
+        const body = await this._sdCommand(buildDeleteCmd(path), SD_TRANSFER_OPCODES.DELETE_RESPONSE);
+        const { status } = parseDeleteRsp(body);
+        if (status !== SD_STATUS.OK) {
+            throw new SdTransferError(`delete '${path}': ${sdStatusToString(status)}`, status);
+        }
     }
-    if (has(SDLogHeaderBitmask.EXG1_24BIT)) {
-        ch.push(uncal('Exg1_Status', 'u8'), uncal('Exg1_CH1_24Bit', 'i24r'), uncal('Exg1_CH2_24Bit', 'i24r'));
+    /** Ask the firmware to abandon the in-flight read window, if any. */
+    async sdAbortTransfer() {
+        if (!this._transport)
+            return;
+        await this._writeExpectingAck(buildAbortCmd(), 2000);
     }
-    if (has(SDLogHeaderBitmask.EXG2_24BIT)) {
-        ch.push(uncal('Exg2_Status', 'u8'), uncal('Exg2_CH1_24Bit', 'i24r'), uncal('Exg2_CH2_24Bit', 'i24r'));
+    /**
+     * Read one window of a file. The firmware streams the window as CRC'd
+     * blocks; `onBlock` is invoked for each verified block in order. Resolves
+     * with the closing status frame. Rejects on stall, CRC failure or sequence
+     * gap — the caller re-requests from its last good offset (the firmware is
+     * stateless, so a fresh window is always a valid resume).
+     */
+    async sdReadFileWindow(path, offset, windowLen, opts = {}) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming) {
+            throw new SdTransferError('SD transfer is unavailable while streaming', SD_STATUS.BUSY);
+        }
+        if (this._sdFrameListener) {
+            // The frame/CRC listeners are single-slot instance fields, so a second
+            // overlapping window would hijack the first one's frames. Refuse
+            // deterministically; the firmware serves one window at a time anyway.
+            throw new SdTransferError('another SD read window is already in flight', SD_STATUS.BUSY);
+        }
+        const blockLen = opts.blockPayloadLen ?? SD_BLOCK_PAYLOAD_DEFAULT;
+        const stallTimeoutMs = opts.stallTimeoutMs ?? 6000;
+        this._sdAcquire();
+        try {
+            return await new Promise((resolve, reject) => {
+                let session = null;
+                let expectedSeq = 0;
+                let bytesReceived = 0;
+                let stallTimer = null;
+                let settled = false;
+                const cleanup = () => {
+                    if (stallTimer)
+                        clearTimeout(stallTimer);
+                    this._sdFrameListener = null;
+                    this._sdCrcErrorListener = null;
+                    opts.signal?.removeEventListener('abort', onAbort);
+                };
+                const fail = (err) => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanup();
+                    reject(err);
+                };
+                const succeed = (status, nextOffset) => {
+                    if (settled)
+                        return;
+                    settled = true;
+                    cleanup();
+                    resolve({ status, nextOffset, bytesReceived });
+                };
+                const kickStall = () => {
+                    if (stallTimer)
+                        clearTimeout(stallTimer);
+                    stallTimer = setTimeout(() => fail(new Error(`SD read stalled (no frames for ${stallTimeoutMs} ms)`)), stallTimeoutMs);
+                };
+                const onAbort = () => {
+                    void this.sdAbortTransfer().catch(() => { });
+                    fail(new DOMException('SD read aborted', 'AbortError'));
+                };
+                this._sdCrcErrorListener = () => fail(new Error('SD data frame failed CRC check'));
+                this._sdFrameListener = (frame) => {
+                    // Adopt the first session id that is not a leftover of the
+                    // previous window (late data frames or a SUPERSEDED/closing status
+                    // still draining from the firmware's TX ring). The tracker resets
+                    // on connect/disconnect; the residual 1-in-256 wrap collision
+                    // (new window randomly assigned the previous id) is recovered by
+                    // the stall watchdog + the caller's re-read retry, which advances
+                    // the firmware's session counter.
+                    if (session === null) {
+                        if (this._sdKnownSession !== null && frame.sessionId === this._sdKnownSession)
+                            return;
+                        session = frame.sessionId;
+                        this._sdKnownSession = frame.sessionId;
+                    }
+                    if (frame.sessionId !== session)
+                        return;
+                    kickStall();
+                    if (frame.kind === 'data') {
+                        if (frame.seq !== expectedSeq) {
+                            fail(new Error(`SD block sequence gap (expected ${expectedSeq}, got ${frame.seq})`));
+                            return;
+                        }
+                        expectedSeq++;
+                        try {
+                            opts.onBlock?.(frame.payload, offset + bytesReceived);
+                        }
+                        catch (e) {
+                            fail(e instanceof Error ? e : new Error(String(e)));
+                            return;
+                        }
+                        bytesReceived += frame.payload.length;
+                    }
+                    else {
+                        succeed(frame.status, frame.nextOffset);
+                    }
+                };
+                if (opts.signal) {
+                    if (opts.signal.aborted) {
+                        onAbort();
+                        return;
+                    }
+                    opts.signal.addEventListener('abort', onAbort, { once: true });
+                }
+                kickStall();
+                this._writeExpectingAck(buildReadCmd(path, offset, windowLen, blockLen), 3000)
+                    .then((ackRemainder) => {
+                    // The ACK can coalesce with the first data frame in one notification
+                    if (ackRemainder && ackRemainder.length)
+                        this._sdChunkHandler(ackRemainder);
+                })
+                    .catch((e) => fail(e instanceof Error ? e : new Error(String(e))));
+            });
+        }
+        finally {
+            this._sdRelease();
+        }
     }
-    if (has(SDLogHeaderBitmask.EXG1_16BIT)) {
-        ch.push(uncal('Exg1_Status', 'u8'), uncal('Exg1_CH1_16Bit', 'i16r'), uncal('Exg1_CH2_16Bit', 'i16r'));
-    }
-    if (has(SDLogHeaderBitmask.EXG2_16BIT)) {
-        ch.push(uncal('Exg2_Status', 'u8'), uncal('Exg2_CH1_16Bit', 'i16r'), uncal('Exg2_CH2_16Bit', 'i16r'));
-    }
-    if (has(SDLogHeaderBitmask.MPL_QUAT_6DOF)) {
-        ch.push(uncal('QUAT_MPL_6DOF_W', 'i32r'), uncal('QUAT_MPL_6DOF_X', 'i32r'), uncal('QUAT_MPL_6DOF_Y', 'i32r'), uncal('QUAT_MPL_6DOF_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.MPL_QUAT_9DOF)) {
-        ch.push(uncal('QUAT_MPL_9DOF_W', 'i32r'), uncal('QUAT_MPL_9DOF_X', 'i32r'), uncal('QUAT_MPL_9DOF_Y', 'i32r'), uncal('QUAT_MPL_9DOF_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.MPL_EULER_6DOF)) {
-        ch.push(uncal('EULER_MPL_6DOF_X', 'i32r'), uncal('EULER_MPL_6DOF_Y', 'i32r'), uncal('EULER_MPL_6DOF_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.MPL_EULER_9DOF)) {
-        ch.push(uncal('EULER_MPL_9DOF_X', 'i32r'), uncal('EULER_MPL_9DOF_Y', 'i32r'), uncal('EULER_MPL_9DOF_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.MPL_HEADING))
-        ch.push(uncal('MPL_HEADING', 'i32r'));
-    if (has(SDLogHeaderBitmask.MPL_TEMPERATURE))
-        ch.push(uncal('MPL_TEMPERATURE', 'i32r'));
-    if (has(SDLogHeaderBitmask.MPL_PEDOMETER)) {
-        ch.push(uncal('MPL_PEDOM_CNT', 'u32r'), uncal('MPL_PEDOM_TIME', 'u32r'));
-    }
-    if (has(SDLogHeaderBitmask.MPL_TAP))
-        ch.push(uncal('TAPDIRANDTAPCNT', 'u8'));
-    if (has(SDLogHeaderBitmask.MPL_MOTION_ORIENT))
-        ch.push(uncal('MOTIONANDORIENT', 'u8'));
-    if (has(SDLogHeaderBitmask.GYRO_MPU_MPL)) {
-        ch.push(uncal('GYRO_MPU_MPL_X', 'i32r'), uncal('GYRO_MPU_MPL_Y', 'i32r'), uncal('GYRO_MPU_MPL_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.ACCEL_MPU_MPL)) {
-        ch.push(uncal('ACCEL_MPU_MPL_X', 'i32r'), uncal('ACCEL_MPU_MPL_Y', 'i32r'), uncal('ACCEL_MPU_MPL_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.MAG_MPU_MPL)) {
-        ch.push(uncal('MAG_MPU_MPL_X', 'i32r'), uncal('MAG_MPU_MPL_Y', 'i32r'), uncal('MAG_MPU_MPL_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.MPL_QUAT_6DOF_RAW)) {
-        ch.push(uncal('QUAT_DMP_6DOF_W', 'i32r'), uncal('QUAT_DMP_6DOF_X', 'i32r'), uncal('QUAT_DMP_6DOF_Y', 'i32r'), uncal('QUAT_DMP_6DOF_Z', 'i32r'));
-    }
-    if (has(SDLogHeaderBitmask.ECG_TO_HR_FW))
-        ch.push(uncal('ECG_TO_HR_FW', 'u8'));
-    return ch;
-}
-/**
- * Shimmer3R signal-ID → channel mapping, replicating the HW_ID.SHIMMER_3R
- * branches of ShimmerObject#interpretDataPacketFormat(nChannels, signalIds).
- * Names follow the SDK's streaming CHANNEL_FORMATS where an equivalent exists.
- */
-const SHIMMER3R_SIGNAL_ID_TABLE = Object.freeze({
-    0x00: uncal('LN_ACCEL_X', 'i16'),
-    0x01: uncal('LN_ACCEL_Y', 'i16'),
-    0x02: uncal('LN_ACCEL_Z', 'i16'),
-    // HARDWARE-VERIFY: the Shimmer3R dynamic table types BATTERY as signed i16
-    // (ShimmerObject.java:3030-3033) even though the ADC value is unsigned —
-    // ported as-is; confirm against a real Shimmer3R log with battery enabled.
-    0x03: uncal('BATTERY', 'i16'),
-    0x04: uncal('WR_ACCEL_X', 'i16'),
-    0x05: uncal('WR_ACCEL_Y', 'i16'),
-    0x06: uncal('WR_ACCEL_Z', 'i16'),
-    0x07: uncal('MAG_X', 'i16'),
-    0x08: uncal('MAG_Y', 'i16'),
-    0x09: uncal('MAG_Z', 'i16'),
-    0x0a: uncal('GYRO_X', 'i16'),
-    0x0b: uncal('GYRO_Y', 'i16'),
-    0x0c: uncal('GYRO_Z', 'i16'),
-    0x0d: uncal('EXT_ADC_0', 'u14'),
-    0x0e: uncal('EXT_ADC_1', 'u14'),
-    0x0f: uncal('EXT_ADC_2', 'u14'),
-    0x10: uncal('INT_ADC_3', 'u14'),
-    0x11: uncal('INT_ADC_0', 'u14'),
-    0x12: uncal('INT_ADC_1', 'u14'),
-    0x13: uncal('INT_ADC_2', 'u14'),
-    0x14: uncal('HG_ACCEL_X', 'i12*>'),
-    0x15: uncal('HG_ACCEL_Y', 'i12*>'),
-    0x16: uncal('HG_ACCEL_Z', 'i12*>'),
-    0x17: uncal('ALT_MAG_X', 'i16'),
-    0x18: uncal('ALT_MAG_Y', 'i16'),
-    0x19: uncal('ALT_MAG_Z', 'i16'),
-    0x1a: uncal('TEMPERATURE_BMP390', 'u24'),
-    0x1b: uncal('PRESSURE_BMP390', 'u24'),
-    0x1c: gsrChannel(),
-    0x1d: uncal('Exg1_Status', 'u8'),
-    0x1e: uncal('Exg1_CH1_24Bit', 'i24r'),
-    0x1f: uncal('Exg1_CH2_24Bit', 'i24r'),
-    0x20: uncal('Exg2_Status', 'u8'),
-    0x21: uncal('Exg2_CH1_24Bit', 'i24r'),
-    0x22: uncal('Exg2_CH2_24Bit', 'i24r'),
-    0x23: uncal('Exg1_CH1_16Bit', 'i16r'),
-    0x24: uncal('Exg1_CH2_16Bit', 'i16r'),
-    0x25: uncal('Exg2_CH1_16Bit', 'i16r'),
-    0x26: uncal('Exg2_CH2_16Bit', 'i16r'),
-    0x27: uncal('BRIDGE_AMP_HIGH', 'u12'),
-    0x28: uncal('BRIDGE_AMP_LOW', 'u12'),
-});
-/**
- * Build the Shimmer3R (384-byte header) channel list from the dynamic
- * channel table stored in the header (byte 314 = nChannels, bytes 315.. =
- * signal IDs). Unknown IDs fall back to a `u12` channel named after the ID,
- * matching the Java catch-all (ShimmerObject.java:3579-3583).
- */
-function buildShimmer3RSdLogChannels(signalIds) {
-    const ch = [];
-    for (let i = 0; i < signalIds.length; i++) {
-        const id = signalIds[i];
-        const spec = SHIMMER3R_SIGNAL_ID_TABLE[id];
-        ch.push(spec ? { ...spec } : uncal(String(id), 'u12'));
-    }
-    return ch;
 }
 
 /**
- * SD-log header parsing for modern Shimmer3 (256-byte) and Shimmer3R
- * (384-byte) binary log files.
+ * EEPROM brand (advertising name) record.
  *
- * Ported from the Shimmer Java driver:
- *   ShimmerSDLog#processSDLogHeader / #parseHwFwVerForMaps /
- *   #parseEnabledDerivedSensorsForMaps / #readSdConfigHeader
- *   ShimmerVerObject (firmware version-code ladder → timestamp byte width)
- *   ShimmerObject#isSupportedNewImuSensors / ShimmerVerObject
- *   #isSupportedExpansionBrdIdInSdHeader / #isSupportedEightByteDerivedSensors
+ * Shimmer3/Shimmer3R firmware stores the effective BT/BLE/USB name prefixes in
+ * a 64-byte record in the daughter-card EEPROM (log-and-stream-common
+ * `EEPROM/shimmer_eeprom.h`, `gEepromBrandDetails`). On boot, firmware seeds
+ * the record with its compile-time defaults when it is blank or invalid and
+ * treats it as the single source of truth from then on — so hosts can always
+ * read the current effective names back, and can rebrand a unit by writing a
+ * new record (the new names apply at the next Bluetooth init / reboot).
+ *
+ * The record lives at HOST daughter-card-memory offset 1952 (absolute EEPROM
+ * bytes 1968–2031 — host offsets skip the first, HW-details, EEPROM page).
+ * Reachable over BLE/BT via GET/SET_DAUGHTER_CARD_MEM and over the dock UART /
+ * USB-C via `UART_PROP.DAUGHTER_CARD.CARD_MEM` — both take host offsets.
+ *
+ * Layout v2 (all multi-byte fields little-endian, names NOT NUL-terminated):
+ * ```
+ * offset  size  field
+ *      0     2  magic 0x5342 ("SB": bytes 0x42,0x53 on the wire)
+ *      2     1  layoutVer (2)
+ *      3     1  flags: bit0 reserved, bits1-2 seededPlatform
+ *      4     1  btClassicLen        5     1  bleLen
+ *      6     1  usbProductLen       7     1  usbManufacturerLen
+ *      8    16  btClassic       (Classic BT name prefix)
+ *     24    10  ble             (BLE name prefix)
+ *     34    16  usbProduct      (USB product prefix)
+ *     50    24  usbManufacturer (USB iManufacturer string)
+ *     74     4  padding (zero)
+ *     78     2  CRC over bytes 0..77 — Shimmer UART CRC, LSB first
+ * ```
+ *
+ * The stock record carries the factory USB manufacturer string
+ * ("Shimmer Research Ltd."), so firmware applies the record unconditionally
+ * and an unbranded unit reports exactly what it always did. There is no
+ * "customer branded" flag: bit 0 of `flags` is reserved.
  */
-const atLeast = (v, major, minor, internal) => v.major > major ||
-    (v.major === major && (v.minor > minor || (v.minor === minor && v.internal >= internal)));
+/** Host expansion-board-memory offset of the record (absolute EEPROM 1952). */
+const BRAND_RECORD_HOST_OFFSET = 1936;
+const BRAND_RECORD_SIZE = 80;
+const BRAND_RECORD_MAGIC = 0x5342;
+const BRAND_RECORD_LAYOUT_VER = 2;
+const BRAND_BT_CLASSIC_MAX_CHARS = 16;
+const BRAND_BLE_MAX_CHARS = 10;
+const BRAND_USB_PRODUCT_MAX_CHARS = 16;
+/** Long enough for the stock "Shimmer Research Ltd." (21 chars). */
+const BRAND_USB_MANUFACTURER_MAX_CHARS = 24;
 /**
- * Whether SD packets carry a 3-byte (u24) timestamp for this firmware.
- * Derived from the ShimmerVerObject firmware-version-code ladder
- * (ShimmerVerObject.java:263-312) fed into
- * `ShimmerObject#updateTimestampByteLength` (:4725-4736): version code >= 6
- * selects 3 bytes, otherwise 2. Combinations that match no rule in the ladder
- * fall through to code -1 (< 6) → 2 bytes.
- *
- * Relevant rules for the HW/FW combos this decoder supports (Shimmer3 /
- * Shimmer3R × SDLog / LogAndStream):
- *   - Shimmer3R + LogAndStream >= 0.0.1  → code 8 → 3 bytes
- *   - Shimmer3R + SDLog                  → no rule → code -1 → 2 bytes
- *   - Shimmer3  + SDLog        >= 0.11.5 → code 6 (or 8 >= 0.20.1) → 3 bytes; else 2
- *   - Shimmer3  + LogAndStream >= 0.5.4  → code 6 (or higher) → 3 bytes; else 2
+ * Shimmer3 firmware truncates the BLE prefix to 8 chars so "<prefix>-XXXX"
+ * fits the RN4678's 31-byte advertisement payload. Shimmer3R allows the full
+ * field width.
  */
-function sdTimestampBytes(hw, fwId, v) {
-    if (hw === SDLOG_HW_ID.SHIMMER_3R) {
-        // The Java ladder only maps Shimmer3R+LogAndStream (→ code 8, u24). A
-        // Shimmer3R+SDLog file matches no rule → code -1 → 2-byte timestamp.
-        // HARDWARE-VERIFY: a Shimmer3R+SDLog SD log likely does not exist in the
-        // wild; oracle fidelity (ShimmerVerObject.java:270-273) is the tiebreak.
-        if (fwId === SDLOG_FW_ID.LOGANDSTREAM)
-            return atLeast(v, 0, 0, 1) ? 3 : 2;
-        return 2;
+const BRAND_BLE_MAX_CHARS_SHIMMER3 = 8;
+/** `flags` bits 1-2: which platform seeded a stock (non-customer) record. */
+const BRAND_PLATFORM = Object.freeze({
+    UNKNOWN: 0,
+    SHIMMER3: 1,
+    SHIMMER3R: 2,
+    SHIMMER4_SDK: 3,
+});
+const PLATFORM_MASK = 0x06;
+const PLATFORM_SHIFT = 1;
+const OFF_MAGIC = 0;
+const OFF_LAYOUT_VER = 2;
+const OFF_FLAGS = 3;
+const OFF_BT_CLASSIC_LEN = 4;
+const OFF_BLE_LEN = 5;
+const OFF_USB_PRODUCT_LEN = 6;
+const OFF_USB_MANUFACTURER_LEN = 7;
+const OFF_BT_CLASSIC = 8;
+const OFF_BLE = OFF_BT_CLASSIC + BRAND_BT_CLASSIC_MAX_CHARS; // 24
+const OFF_USB_PRODUCT = OFF_BLE + BRAND_BLE_MAX_CHARS; // 34
+const OFF_USB_MANUFACTURER = OFF_USB_PRODUCT + BRAND_USB_PRODUCT_MAX_CHARS; // 50
+const OFF_CRC = BRAND_RECORD_SIZE - 2; // 78
+/**
+ * Firmware-mirrored character rule: 1..max printable ASCII (0x20–0x7E),
+ * comma excluded (it would corrupt the RN4X `S-,<name>` command).
+ * Returns null when OK, else a human-readable reason.
+ */
+function brandNameProblem(name, maxChars) {
+    if (name.length === 0)
+        return 'name is empty';
+    if (name.length > maxChars)
+        return `longer than ${maxChars} characters`;
+    for (const ch of name) {
+        const c = ch.charCodeAt(0);
+        if (c < 0x20 || c > 0x7e)
+            return `unsupported character "${ch}" (printable ASCII only)`;
+        if (c === 0x2c)
+            return 'commas are not allowed';
     }
-    if (fwId === SDLOG_FW_ID.SDLOG)
-        return atLeast(v, 0, 11, 5) ? 3 : 2;
-    if (fwId === SDLOG_FW_ID.LOGANDSTREAM)
-        return atLeast(v, 0, 5, 4) ? 3 : 2;
-    return 3;
+    return null;
 }
-/**
- * Sampling clock frequency used for the SD wall-clock (RTC) timestamp
- * (`ShimmerObject#getSamplingClockFreq`, ShimmerObject.java:10868-10896):
- *   - TCXO + the 20 MHz EXG-unified rev-1.1 board → 20 MHz / 64 = 312500 Hz
- *   - TCXO otherwise                              → 16.369 MHz / 64 = 255765.625 Hz
- *   - no TCXO                                     → 32768 Hz (crystal)
- * NB: only the RTC (wall-clock) conversion uses this frequency. The
- * device-clock timestamp uses `getRtcClockFreq()` = 32768 Hz always
- * (ShimmerObject.java:2824, ShimmerDevice.java:4723), and the sampling-rate
- * field is likewise divided by 32768 here — matching the Java driver, whose
- * SD-log sampling-rate math also uses the (non-TCXO) crystal for these logs.
- */
-function samplingClockFreq(tcxo, hw, expBrd) {
-    if (!tcxo)
-        return SDLOG_CLOCK_FREQ;
-    // isTcxoClock20MHz (ShimmerObject.java:10882-10896): Shimmer3/3R + EXG
-    // unified board id 47, rev 1, revSpecial 1.
-    const is20MHz = (hw === SDLOG_HW_ID.SHIMMER_3 || hw === SDLOG_HW_ID.SHIMMER_3R) &&
-        expBrd !== null &&
-        expBrd.id === SDLOG_EXP_BRD_ID.EXG_UNIFIED &&
-        expBrd.rev === 1 &&
-        expBrd.revSpecial === 1;
-    return is20MHz ? 312500.0 : 255765.625;
-}
-/**
- * "New IMU sensors" detection for Shimmer3 (LSM303AHTR / MPU9250 / BMP280
- * generation) — controls mag channel order/endianness and BMP naming.
- * Port of ShimmerObject.isSupportedNewImuSensors(svo, expansionBoardDetails);
- * a Shimmer3R always qualifies, a Shimmer3 without expansion-board info in
- * the header never does (Java passes a LOG_FILE placeholder board → false).
- */
-function isNewImuSensors(hw, expBrd) {
-    if (hw === SDLOG_HW_ID.SHIMMER_3R)
-        return true;
-    if (hw !== SDLOG_HW_ID.SHIMMER_3 || expBrd === null)
-        return false;
-    const { id, rev, revSpecial } = expBrd;
-    // HARDWARE-VERIFY: new-IMU expansion-board revision thresholds copied from
-    // Configuration.Shimmer3.NEW_IMU_EXP_REV; only verifiable against real
-    // boards of each revision.
-    return ((id === SDLOG_EXP_BRD_ID.EXG_UNIFIED && rev >= 3) ||
-        (id === SDLOG_EXP_BRD_ID.GSR_UNIFIED && rev >= 3) ||
-        (id === SDLOG_EXP_BRD_ID.BR_AMP_UNIFIED && rev >= 3) ||
-        (id === SDLOG_EXP_BRD_ID.SHIMMER3 && rev >= 6) ||
-        revSpecial === 171 ||
-        (id === SDLOG_EXP_BRD_ID.PROTO3_DELUXE && rev >= 3) ||
-        (id === SDLOG_EXP_BRD_ID.PROTO3_MINI && rev >= 3));
-}
-/**
- * Whether the sync-when-logging 512-byte block framing applies. Port of the
- * guard used throughout ShimmerSDLog (interpretdatapacketformat / setup /
- * readPacketMsg): SDLog firmware always frames when the trial-config sync
- * bit is set; LogAndStream only from 0.16.11 on Shimmer3 and from any
- * version on Shimmer3R (Configuration.Shimmer3.CompatibilityInfoForMaps).
- */
-function usesSyncBlockFraming(syncWhenLogging, hw, fwId, v) {
-    if (!syncWhenLogging)
-        return false;
-    if (fwId === SDLOG_FW_ID.SDLOG)
-        return true;
-    if (fwId === SDLOG_FW_ID.LOGANDSTREAM) {
-        if (hw === SDLOG_HW_ID.SHIMMER_3R)
-            return true;
-        return atLeast(v, 0, 16, 11);
-    }
-    return false;
-}
-/**
- * Decode the inertial-sensor hardware ranges from the SD config setup bytes.
- *
- * The four config setup bytes live at SD header bytes 8-11 (setup0-3): the
- * existing GSR-range read from byte 11 (setup3) fixes this mapping. Bit
- * positions are ported from ConfigByteLayoutShimmer3
- * (com.shimmerresearch.driver.shimmer2r3):
- *   - WR accel range : setup0 (byte 8) bits 2-3, mask 0x03
- *       (SensorLSM303.configByteArrayParse / SensorLIS2DW12 both use
- *        bitShiftLSM303DLHCAccelRange = 2)
- *   - gyro range LSB : setup2 (byte 10) bits 0-1, mask 0x03
- *       (bitShiftMPU9150GyroRange = 0; SensorLSM6DSV reuses the same LSB field)
- *   - mag range      : setup2 (byte 10) bits 5-7, mask 0x07
- *       (bitShiftLSM303DLHCMagRange = 5)
- *   - LN accel range : setup3 (byte 11) bits 6-7, mask 0x03 — Shimmer3R
- *       (SensorLSM6DSV LN accel, bitShiftMPU9150AccelRange = 6). On Shimmer3 the
- *       LN accel is the fixed-range Kionix KXRB, so this is forced to 0 there.
- *   - gyro range MSB : setup4 (byte 12) bit 2, mask 0x01 — Shimmer3R only.
- *       The LSM6DSV has 6 gyro ranges (0-5); the MSB lives in config setup byte 4
- *       and is combined with the 2-bit LSB as `lsb | (msb << 2)`. Ported from
- *       ShimmerSDLog.processSDLogHeader 3R branch:
- *         int gyroRange    = (byteArrayInfo[10]) & 03;      // LSB (byte 10)
- *         int msbGyroRange = (byteArrayInfo[12] >> 2) & 01; // MSB (byte 12 bit 2)
- *         setGyroRange(gyroRange + (msbGyroRange << 2));
- *       This matches the streaming path (Shimmer3RClient.ts, gyroLsb | gyroMsb<<2,
- *       cfg bit 34 == setup4 bit 2) and ShimmerObject.interpretInqResponse.
- *
- * HARDWARE-VERIFY: no real Shimmer3R SD card has been available to confirm the
- * byte-12 MSB placement; the offset is taken from the Java oracle only. The
- * alt-accel (high-g) and alt-mag ranges are likewise not decoded from the SD
- * header (defaulted to 0); their per-device calibration blocks, when present,
- * override the default anyway.
- */
-function parseImuRanges(bytes, hw) {
-    const setup0 = bytes[8] ?? 0;
-    const setup2 = bytes[10] ?? 0;
-    const setup3 = bytes[11] ?? 0;
-    const setup4 = bytes[12] ?? 0;
-    const wrAccel = (setup0 >> 2) & 0x03;
-    const gyroLsb = setup2 & 0x03;
-    // Shimmer3R gyro (LSM6DSV) has 6 ranges (0-5); the MSB rides in setup4 bit 2.
-    // Shimmer3 gyro (MPU9x50) has only 4 ranges (0-3), so no MSB there.
-    const gyro = hw === SDLOG_HW_ID.SHIMMER_3R ? gyroLsb | (((setup4 >> 2) & 0x01) << 2) : gyroLsb;
-    const mag = (setup2 >> 5) & 0x07;
-    const lnAccel = hw === SDLOG_HW_ID.SHIMMER_3R ? (setup3 >> 6) & 0x03 : 0;
-    return { lnAccel, wrAccel, gyro, mag, altAccel: 0, altMag: 0 };
-}
-function macFromBytes(b) {
+function readField(bytes, off, len) {
     let s = '';
-    for (let i = 24; i <= 29; i++)
-        s += b[i].toString(16).padStart(2, '0');
+    for (let i = 0; i < len; i++)
+        s += String.fromCharCode(bytes[off + i]);
     return s;
 }
-/**
- * Parse an SD-log file header, including layout details needed by the packet
- * decoder. Throws {@link SdLogFormatError} for anything outside the supported
- * modern Shimmer3 / Shimmer3R formats.
- */
-function parseSdLog(bytes) {
-    if (bytes.length < 40) {
-        throw new SdLogFormatError('TOO_SMALL', `File is ${bytes.length} bytes — too small to contain SD-log version fields (need 40).`);
-    }
-    // Version fields live at fixed offsets in every header generation
-    // (ShimmerSDLog#readSDVersionFromHeader).
-    const hardwareVersion = (bytes[30] << 8) | bytes[31];
-    const firmwareId = (bytes[34] << 8) | bytes[35];
-    const fwVersion = {
-        major: (bytes[36] << 8) | bytes[37],
-        minor: bytes[38],
-        internal: bytes[39],
+/** Decode and validate a brand record read from the device. */
+function parseBrandRecord(bytes) {
+    const rec = {
+        valid: false,
+        btClassic: '',
+        ble: '',
+        usbProduct: '',
+        usbManufacturer: '',
+        seededPlatform: BRAND_PLATFORM.UNKNOWN,
     };
-    if (firmwareId === SDLOG_FW_ID.SDLOG && fwVersion.major === 0 && fwVersion.minor === 5) {
-        throw new SdLogFormatError('LEGACY_UNSUPPORTED', `Legacy SDLog v0.5.x file (178-byte header) is not supported.`);
+    if (bytes.length < BRAND_RECORD_SIZE) {
+        rec.invalidReason = `record is ${bytes.length} bytes, expected ${BRAND_RECORD_SIZE}`;
+        return rec;
     }
-    if (hardwareVersion !== SDLOG_HW_ID.SHIMMER_3 && hardwareVersion !== SDLOG_HW_ID.SHIMMER_3R) {
-        throw new SdLogFormatError('UNSUPPORTED_DEVICE', `Unsupported hardware version ${hardwareVersion} — only Shimmer3 (3) and Shimmer3R (10) SD logs are supported.`);
+    const magic = bytes[OFF_MAGIC] | (bytes[OFF_MAGIC + 1] << 8);
+    const flags = bytes[OFF_FLAGS];
+    rec.seededPlatform = (flags & PLATFORM_MASK) >> PLATFORM_SHIFT;
+    const btLen = bytes[OFF_BT_CLASSIC_LEN];
+    const bleLen = bytes[OFF_BLE_LEN];
+    const usbProductLen = bytes[OFF_USB_PRODUCT_LEN];
+    const usbManufacturerLen = bytes[OFF_USB_MANUFACTURER_LEN];
+    if (btLen >= 1 && btLen <= BRAND_BT_CLASSIC_MAX_CHARS) {
+        rec.btClassic = readField(bytes, OFF_BT_CLASSIC, btLen);
     }
-    if (firmwareId !== SDLOG_FW_ID.SDLOG && firmwareId !== SDLOG_FW_ID.LOGANDSTREAM) {
-        throw new SdLogFormatError('UNSUPPORTED_DEVICE', `Unsupported firmware id ${firmwareId} — only SDLog (2) and LogAndStream (3) logs are supported.`);
+    if (bleLen >= 1 && bleLen <= BRAND_BLE_MAX_CHARS) {
+        rec.ble = readField(bytes, OFF_BLE, bleLen);
     }
-    // Support floors for the 256-byte-header era on Shimmer3: SDLog >= 0.8.69,
-    // LogAndStream >= 0.5.0. Shimmer3R firmware versioning restarted at 0.x and
-    // always writes the modern 384-byte header, so no floor applies there.
-    if (hardwareVersion === SDLOG_HW_ID.SHIMMER_3) {
-        if (firmwareId === SDLOG_FW_ID.SDLOG && !atLeast(fwVersion, 0, 8, 69)) {
-            throw new SdLogFormatError('LEGACY_UNSUPPORTED', `SDLog v${fwVersion.major}.${fwVersion.minor}.${fwVersion.internal} predates the supported floor (0.8.69).`);
-        }
-        if (firmwareId === SDLOG_FW_ID.LOGANDSTREAM && !atLeast(fwVersion, 0, 5, 0)) {
-            throw new SdLogFormatError('LEGACY_UNSUPPORTED', `LogAndStream v${fwVersion.major}.${fwVersion.minor}.${fwVersion.internal} predates the supported floor (0.5.0).`);
-        }
+    if (usbProductLen >= 1 && usbProductLen <= BRAND_USB_PRODUCT_MAX_CHARS) {
+        rec.usbProduct = readField(bytes, OFF_USB_PRODUCT, usbProductLen);
     }
-    const headerLengthBytes = hardwareVersion === SDLOG_HW_ID.SHIMMER_3R
-        ? SDLOG_HEADER_LENGTH.SHIMMER3R
-        : SDLOG_HEADER_LENGTH.SHIMMER3;
-    if (bytes.length < headerLengthBytes) {
-        throw new SdLogFormatError('TOO_SMALL', `File is ${bytes.length} bytes but the header alone is ${headerLengthBytes} bytes.`);
+    if (usbManufacturerLen >= 1 && usbManufacturerLen <= BRAND_USB_MANUFACTURER_MAX_CHARS) {
+        rec.usbManufacturer = readField(bytes, OFF_USB_MANUFACTURER, usbManufacturerLen);
     }
-    // Bytes 0-1: sampling divider, LSB-first. Hz = 32768 / divider.
-    const rawSamplingDivider = bytes[0] | (bytes[1] << 8);
-    if (rawSamplingDivider === 0) {
-        throw new SdLogFormatError('BAD_HEADER', 'Sampling-rate divider is 0.');
+    if (magic !== BRAND_RECORD_MAGIC) {
+        rec.invalidReason = bytes.every((b) => b === 0xff) ? 'blank (erased) record' : 'bad magic';
+        return rec;
     }
-    const samplingRateHz = SDLOG_CLOCK_FREQ / rawSamplingDivider;
-    // Bytes 3-7: enabled sensors, 40-bit LSB-first, with the firmware-specific
-    // masking from ShimmerSDLog#parseEnabledDerivedSensorsForMaps.
-    const enabledBytes = [bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]];
-    const mpu9150Dmp = ((bytes[12] >> 7) & 0x01) === 1;
-    if (mpu9150Dmp || firmwareId === SDLOG_FW_ID.LOGANDSTREAM) {
-        enabledBytes[2] &= -3; // disable MPU temperature (MPL_TEMPERATURE bit)
-        enabledBytes[3] = 0;
-        enabledBytes[4] = 0;
+    if (bytes[OFF_LAYOUT_VER] !== BRAND_RECORD_LAYOUT_VER) {
+        rec.invalidReason = `unsupported layout version ${bytes[OFF_LAYOUT_VER]}`;
+        return rec;
     }
-    let enabledSensors = enabledBytes[0] +
-        enabledBytes[1] * 2 ** 8 +
-        enabledBytes[2] * 2 ** 16 +
-        enabledBytes[3] * 2 ** 24 +
-        enabledBytes[4] * 2 ** 32;
-    if (firmwareId !== SDLOG_FW_ID.SDLOG) {
-        enabledSensors = enabledSensors % 2 ** 24; // & 0xFFFFFF
-    }
-    // Bytes 40-42 (+217-221 on newer firmware): derived sensors, LSB-first.
-    // Computed with BigInt because bytes 220-221 reach bit 56, beyond the 2^53
-    // exact-integer range of a JS number (Java uses a `long`). `derivedSensors`
-    // (number) stays exact through byte 219 / bit 47; `derivedSensorsBig`
-    // (bigint) carries the full 8-byte fidelity.
-    let derivedBig = BigInt(bytes[40]) + (BigInt(bytes[41]) << 8n) + (BigInt(bytes[42]) << 16n);
-    const eightByteDerived = (firmwareId === SDLOG_FW_ID.SDLOG && atLeast(fwVersion, 0, 13, 1)) ||
-        (firmwareId === SDLOG_FW_ID.LOGANDSTREAM && atLeast(fwVersion, 0, 7, 1));
-    if (eightByteDerived) {
-        for (let i = 0; i < 5; i++) {
-            derivedBig += BigInt(bytes[217 + i]) << BigInt(8 * (3 + i));
-        }
-    }
-    const derivedSensorsBig = derivedBig;
-    const derivedSensors = Number(derivedBig);
-    // Byte 16: trial config A.
-    const buttonStart = ((bytes[16] >> 5) & 0x01) === 1;
-    const syncWhenLogging = ((bytes[16] >> 2) & 0x01) === 1;
-    const masterShimmer = ((bytes[16] >> 1) & 0x01) === 1;
-    // Byte 17 bit 4: TCXO (temperature-compensated crystal oscillator) flag —
-    // ShimmerSDLog#processSDLogHeader sets it identically on both the Shimmer3
-    // (:303) and Shimmer3R (:233) branches. It only affects the SD wall-clock
-    // (RTC) conversion frequency (see samplingClockFreq).
-    const tcxo = ((bytes[17] >> 4) & 0x01) === 1;
-    // Byte 11 bits 1-3: GSR range (0-3 fixed, 4 = auto) — same offset on both
-    // the Shimmer3 and Shimmer3R header layouts.
-    const gsrRange = (bytes[11] >> 1) & 0x07;
-    // Bytes 44-51: RTC difference, signed 64-bit MSB-first.
-    let rtc = 0n;
-    for (let i = 44; i <= 51; i++)
-        rtc = (rtc << 8n) | BigInt(bytes[i]);
-    const rtcDifferenceTicks = BigInt.asIntN(64, rtc);
-    // Bytes 52-55: config time (Unix seconds), 32-bit MSB-first.
-    const configTime = bytes[52] * 2 ** 24 + bytes[53] * 2 ** 16 + bytes[54] * 2 ** 8 + bytes[55];
-    // Bytes 251-255: initial timestamp ticks in the firmware's non-sequential
-    // order: b[251]<<32 | b[255]<<24 | b[254]<<16 | b[253]<<8 | b[252].
-    // HARDWARE-VERIFY: byte order matches ShimmerSDLog.java:419-426; only a
-    // real SD card can confirm it end-to-end.
-    const initialTimestampTicks = bytes[251] * 2 ** 32 +
-        bytes[255] * 2 ** 24 +
-        bytes[254] * 2 ** 16 +
-        bytes[253] * 2 ** 8 +
-        bytes[252];
-    // Bytes 214-216: expansion board id/rev/special-rev, only stored by
-    // SDLog >= 0.12.4 / LogAndStream >= 0.6.13
-    // (ShimmerVerObject#isSupportedExpansionBrdIdInSdHeader).
-    const expBrdInHeader = (firmwareId === SDLOG_FW_ID.SDLOG && atLeast(fwVersion, 0, 12, 4)) ||
-        (firmwareId === SDLOG_FW_ID.LOGANDSTREAM && atLeast(fwVersion, 0, 6, 13));
-    const expansionBoard = expBrdInHeader
-        ? { id: bytes[214], rev: bytes[215], revSpecial: bytes[216] }
-        : null;
-    const newImu = isNewImuSensors(hardwareVersion, expansionBoard);
-    // Calibration parameter blocks (kept raw — see SdLogCalibrationBytes).
-    const pressureLen = newImu ? 24 : 22;
-    const pressure = new Uint8Array(pressureLen);
-    pressure.set(bytes.slice(160, 182), 0);
-    if (newImu)
-        pressure.set(bytes.slice(222, 224), 22); // BMP280/BMP390 extra bytes
-    const calibrationBytes = {
-        wrAccel: bytes.slice(76, 97),
-        gyro: bytes.slice(97, 118),
-        mag: bytes.slice(118, 139),
-        lnAccel: bytes.slice(139, 160),
-        pressure,
-    };
-    // Channel table.
-    let channels;
-    if (hardwareVersion === SDLOG_HW_ID.SHIMMER_3R) {
-        calibrationBytes.altAccel = bytes.slice(256, 277);
-        calibrationBytes.altMag = bytes.slice(285, 306);
-        const nChannels = bytes[314];
-        if (315 + nChannels > headerLengthBytes) {
-            throw new SdLogFormatError('BAD_HEADER', `Shimmer3R channel table overruns the header (nChannels=${nChannels}).`);
-        }
-        channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels));
-    }
-    else {
-        channels = buildShimmer3SdLogChannels(enabledSensors, newImu);
-    }
-    if (channels.length === 0) {
-        throw new SdLogFormatError('BAD_HEADER', 'Header enables no data channels.');
-    }
-    const timestampBytes = sdTimestampBytes(hardwareVersion, firmwareId, fwVersion);
-    const packetSizeBytes = timestampBytes + channels.reduce((sum, c) => sum + c.sizeBytes, 0);
-    const syncFraming = usesSyncBlockFraming(syncWhenLogging, hardwareVersion, firmwareId, fwVersion);
-    // ShimmerSDLog#setup(): floor((512 - OFFSET_LENGTH) / sensorPacketSize),
-    // where the Java mPacketSize includes the offset field and ours does not.
-    const samplesPerBlock = syncFraming
-        ? Math.floor((SDLOG_SYNC_BLOCK_LENGTH - SDLOG_SYNC_OFFSET_LENGTH) / packetSizeBytes)
-        : 0;
-    if (syncFraming && samplesPerBlock < 1) {
-        throw new SdLogFormatError('BAD_HEADER', `Packet size ${packetSizeBytes} does not fit a 512-byte sync block.`);
-    }
-    const wallClockFreqHz = samplingClockFreq(tcxo, hardwareVersion, expansionBoard);
-    const header = {
-        hardwareVersion,
-        firmwareId,
-        firmwareVersion: fwVersion,
-        samplingRateHz,
-        macAddress: macFromBytes(bytes),
-        enabledSensors,
-        derivedSensors,
-        derivedSensorsBig,
-        tcxo,
-        configTime,
-        rtcDifferenceTicks,
-        initialTimestampTicks,
-        trial: {
-            id: bytes[32],
-            numShimmers: bytes[33],
-            syncWhenLogging,
-            masterShimmer,
-            buttonStart,
-        },
-        headerLengthBytes,
-        timestampBytes,
-        packetSizeBytes,
-        channels,
-        calibrationBytes,
-        gsrRange,
-        expansionBoard,
-        imuRanges: parseImuRanges(bytes, hardwareVersion),
-        calibration: [],
-    };
-    return { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz };
-}
-/**
- * Parse an SD-log file header (first 256 bytes for Shimmer3, 384 bytes for
- * Shimmer3R). The whole file may be passed — only the header is read.
- */
-function parseSdLogHeader(bytes) {
-    return parseSdLog(bytes).header;
-}
-
-/**
- * SD-log inertial calibration planning.
- *
- * For a decoded SD-log file this builds one {@link CalibPlanEntry} per inertial
- * channel group (LN accel, WR accel, gyro, mag, and the Shimmer3R alt-accel /
- * alt-mag), choosing the per-device calibration block from the header when it
- * is valid and falling back to the range-selected default otherwise — exactly
- * the CalibDetailsKinematic behaviour (a stored block overrides the default;
- * an all-0xFF/all-0x00 block keeps the default). It also flips the affected
- * channel specs to `calibrated:true` with the right unit, so the decoder can
- * emit calibrated values.
- */
-function familyOf(header) {
-    if (header.hardwareVersion === SDLOG_HW_ID.SHIMMER_3R)
-        return 'shimmer3r';
-    return isNewImuSensors(header.hardwareVersion, header.expansionBoard)
-        ? 'shimmer3-new'
-        : 'shimmer3-old';
-}
-function groupSpecsFor(header) {
-    const cb = header.calibrationBytes;
-    const r = header.imuRanges;
-    if (header.hardwareVersion === SDLOG_HW_ID.SHIMMER_3R) {
-        return [
-            {
-                group: 'lnAccel',
-                axisNames: ['LN_ACCEL_X', 'LN_ACCEL_Y', 'LN_ACCEL_Z'],
-                block: cb.lnAccel,
-                range: r.lnAccel,
-            },
-            {
-                group: 'wrAccel',
-                axisNames: ['WR_ACCEL_X', 'WR_ACCEL_Y', 'WR_ACCEL_Z'],
-                block: cb.wrAccel,
-                range: r.wrAccel,
-            },
-            { group: 'gyro', axisNames: ['GYRO_X', 'GYRO_Y', 'GYRO_Z'], block: cb.gyro, range: r.gyro },
-            { group: 'mag', axisNames: ['MAG_X', 'MAG_Y', 'MAG_Z'], block: cb.mag, range: r.mag },
-            {
-                group: 'altAccel',
-                axisNames: ['HG_ACCEL_X', 'HG_ACCEL_Y', 'HG_ACCEL_Z'],
-                block: cb.altAccel,
-                range: r.altAccel,
-            },
-            {
-                group: 'altMag',
-                axisNames: ['ALT_MAG_X', 'ALT_MAG_Y', 'ALT_MAG_Z'],
-                block: cb.altMag,
-                range: r.altMag,
-            },
-        ];
-    }
-    // Shimmer3 (old + new IMU).
-    return [
-        {
-            group: 'lnAccel',
-            axisNames: ['LN_ACCEL_X', 'LN_ACCEL_Y', 'LN_ACCEL_Z'],
-            block: cb.lnAccel,
-            range: r.lnAccel,
-        },
-        {
-            group: 'wrAccel',
-            axisNames: ['WR_ACCEL_X', 'WR_ACCEL_Y', 'WR_ACCEL_Z'],
-            block: cb.wrAccel,
-            range: r.wrAccel,
-        },
-        { group: 'gyro', axisNames: ['GYRO_X', 'GYRO_Y', 'GYRO_Z'], block: cb.gyro, range: r.gyro },
-        { group: 'mag', axisNames: ['MAG_X', 'MAG_Y', 'MAG_Z'], block: cb.mag, range: r.mag },
+    const fieldChecks = [
+        ['Classic BT name', rec.btClassic, BRAND_BT_CLASSIC_MAX_CHARS],
+        ['BLE name', rec.ble, BRAND_BLE_MAX_CHARS],
+        ['USB product name', rec.usbProduct, BRAND_USB_PRODUCT_MAX_CHARS],
+        ['USB manufacturer name', rec.usbManufacturer, BRAND_USB_MANUFACTURER_MAX_CHARS],
     ];
-}
-/**
- * Build the calibration plan for a file and mark the calibrated channel specs.
- * `channels` is the same array referenced by `header.channels`, so the
- * `calibrated`/`unit` flips are visible to consumers of the header.
- */
-function buildSdLogCalibPlan(header, channels) {
-    const family = familyOf(header);
-    const nameToIndex = new Map();
-    channels.forEach((c, i) => nameToIndex.set(c.name, i));
-    const entries = [];
-    const info = [];
-    for (const spec of groupSpecsFor(header)) {
-        const xi = nameToIndex.get(spec.axisNames[0]);
-        const yi = nameToIndex.get(spec.axisNames[1]);
-        const zi = nameToIndex.get(spec.axisNames[2]);
-        if (xi === undefined || yi === undefined || zi === undefined)
-            continue; // group not present
-        const def = getDefaultCalibration(family, spec.group, spec.range);
-        if (!def)
-            continue; // family has no such group
-        // A valid per-device block overrides the default (CalibDetailsKinematic
-        // parseCalParamByteArray: all-FF/all-00 → keep default).
-        const parsed = spec.block
-            ? parseKinematicCalibBlock(spec.block, { sensitivityScale: def.sensitivityScale })
-            : null;
-        const usingDefault = parsed === null;
-        const calibration = parsed ?? def.calibration;
-        entries.push({ indices: [xi, yi, zi], calibration });
-        info.push({
-            group: spec.group,
-            unit: def.unit,
-            usingDefaultCalibration: usingDefault,
-            source: usingDefault ? 'default' : 'sd-header',
-            range: spec.range,
-        });
-        for (const idx of [xi, yi, zi]) {
-            channels[idx].calibrated = true;
-            channels[idx].unit = def.unit;
+    for (const [label, value, max] of fieldChecks) {
+        const problem = brandNameProblem(value, max);
+        if (problem) {
+            rec.invalidReason = `${label}: ${problem}`;
+            return rec;
         }
     }
-    return { entries, info };
-}
-/** Apply a calibration plan in place to one record's `values` array. */
-function applyCalibPlan(values, plan) {
-    for (const e of plan) {
-        const [xi, yi, zi] = e.indices;
-        const [cx, cy, cz] = calibrateTriple(values[xi], values[yi], values[zi], e.calibration);
-        values[xi] = cx;
-        values[yi] = cy;
-        values[zi] = cz;
+    const [crcLo, crcHi] = shimmerUartCrcCalc(bytes, OFF_CRC);
+    if (bytes[OFF_CRC] !== crcLo || bytes[OFF_CRC + 1] !== crcHi) {
+        rec.invalidReason = 'CRC mismatch';
+        return rec;
     }
+    rec.valid = true;
+    return rec;
 }
-function calibrateTriple(x, y, z, cal) {
-    const d0 = x - cal.offset[0];
-    const d1 = y - cal.offset[1];
-    const d2 = z - cal.offset[2];
-    const m = cal.m;
-    return [
-        m[0] * d0 + m[1] * d1 + m[2] * d2,
-        m[3] * d0 + m[4] * d1 + m[5] * d2,
-        m[6] * d0 + m[7] * d1 + m[8] * d2,
+/**
+ * Serialise a brand record ready to write to the device. Throws on names that
+ * the firmware would reject (so callers surface errors before writing).
+ */
+function buildBrandRecord(fields) {
+    const checks = [
+        ['btClassic', fields.btClassic, BRAND_BT_CLASSIC_MAX_CHARS],
+        ['ble', fields.ble, BRAND_BLE_MAX_CHARS],
+        ['usbProduct', fields.usbProduct, BRAND_USB_PRODUCT_MAX_CHARS],
+        ['usbManufacturer', fields.usbManufacturer, BRAND_USB_MANUFACTURER_MAX_CHARS],
     ];
-}
-
-/**
- * SD-log packet decoding — single file and multi-file session.
- *
- * Ported from the Shimmer Java driver:
- *   ShimmerSDLog#readPacketMsg / #isEndOfFile — read loop and sync-block
- *     accounting (the 9-byte timestamp-offset field before the first packet
- *     of each 512-byte block is consumed and DISCARDED; porting the sync
- *     algorithm itself is out of scope)
- *   ShimmerObject#unwrapTimeStamp / #parseTimestampShimmer3 — rollover
- *     unwrapping and tick→ms conversion
- *   ParserLoggedDataToDatabase#createMapOfFiles / #parseDataToDB /
- *   #compareSDHeader — numeric file ordering + cross-file consistency
- *     (modern files are self-contained: each restarts its own unwrap state
- *     and carries its own initial timestamp; only legacy 0.5.x — out of
- *     scope — carried rollover state across files)
- */
-/**
- * Convert a raw GSR sample to conductance in µS, reusing the streaming
- * clients' amplifier-equation path (Shimmer3Client/Shimmer3RClient
- * #_calibrateData) seeded with the header's GSR range setting.
- */
-// HARDWARE-VERIFY: GSR amplifier-equation calibration is shared by the SDK's
-// Shimmer3 and Shimmer3R streaming clients; confirm it holds for SD-logged
-// GSR data on older (pre-GSR+) Shimmer3 expansion boards.
-function calibrateGsr(raw, gsrRangeSetting) {
-    let adc12 = raw & 0x0fff;
-    let range = gsrRangeSetting;
-    if (range === 4) {
-        range = (raw >> 14) & 0x03; // auto-range: range travels in bits 14-15
+    for (const [label, value, max] of checks) {
+        const problem = brandNameProblem(value, max);
+        if (problem)
+            throw new Error(`${label}: ${problem}`);
     }
-    if (range === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3) {
-        adc12 = GSR_UNCAL_LIMIT_RANGE3;
+    const platform = fields.seededPlatform ?? BRAND_PLATFORM.UNKNOWN;
+    if (!Number.isInteger(platform) || platform < 0 || platform > 3) {
+        throw new Error(`seededPlatform: must be a BRAND_PLATFORM value (0..3), got ${platform}`);
     }
-    let gsrkOhm = calibrateGsrDataToResistanceFromAmplifierEq(adc12, range);
-    gsrkOhm = nudgeGsrResistance(gsrkOhm, gsrRangeSetting);
-    return (1.0 / gsrkOhm) * 1000;
-}
-function decodeRecordsFromFile(bytes, parsed, out, budget) {
-    const { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz } = parsed;
-    // Build the inertial calibration plan once per file. This also flips the
-    // affected channel specs to calibrated:true / unit and records per-group
-    // metadata on the header (header.calibration), mirroring how GSR is emitted
-    // calibrated. LN accel, WR accel, gyro, mag (+ Shimmer3R alt accel/mag).
-    const calibPlan = buildSdLogCalibPlan(header, channels);
-    header.calibration = calibPlan.info;
-    const packetSize = header.packetSizeBytes;
-    const tsBytes = header.timestampBytes;
-    const maxTicks = 2 ** (8 * tsBytes);
-    const initialTicks = header.initialTimestampTicks;
-    const rtcTicks = Number(header.rtcDifferenceTicks);
-    const hasRtc = header.rtcDifferenceTicks !== 0n;
-    // Per-file rollover state (ShimmerObject#unwrapTimeStamp): modern files
-    // restart from cycle 0 with their own header initial timestamp.
-    let cycle = 0;
-    let lastUnwrapped = 0;
-    // ShimmerObject#parseTimestampShimmer3 subtracts the FIRST packet's raw
-    // timestamp before adding the header's initial timestamp: on modern
-    // firmware the 5-byte initial timestamp is the full clock at the first
-    // packet, whose low bytes are that packet's raw timestamp — without the
-    // subtraction those low bytes would be double-counted
-    // (mFirstTsOffsetFromInitialTsTicks in the Java driver).
-    let firstRawTicks = null;
-    let pos = header.headerLengthBytes;
-    let samplesInBlock = 0;
-    while (budget.remaining > 0) {
-        // ShimmerSDLog#readPacketMsg: the first packet of the file and the first
-        // packet after every `samplesPerBlock` packets is prefixed by the 9-byte
-        // sync timestamp-offset field, which is read and discarded here.
-        const withOffset = syncFraming && (samplesInBlock === 0 || samplesInBlock === samplesPerBlock);
-        const need = withOffset ? SDLOG_SYNC_OFFSET_LENGTH + packetSize : packetSize;
-        if (pos + need > bytes.length)
-            break; // trailing partial packet is dropped (Java EOF)
-        let p = pos;
-        if (withOffset) {
-            p += SDLOG_SYNC_OFFSET_LENGTH; // discard the offset value
-            samplesInBlock = 0;
-        }
-        // Timestamp: u16/u24 little-endian, unwrapped against rollovers.
-        let rawTs = bytes[p] | (bytes[p + 1] << 8);
-        if (tsBytes === 3)
-            rawTs |= bytes[p + 2] << 16;
-        p += tsBytes;
-        let unwrapped = rawTs + maxTicks * cycle;
-        if (unwrapped < lastUnwrapped) {
-            cycle += 1;
-            unwrapped = rawTs + maxTicks * cycle;
-        }
-        lastUnwrapped = unwrapped;
-        if (firstRawTicks === null)
-            firstRawTicks = rawTs;
-        const values = new Array(channels.length);
-        for (let c = 0; c < channels.length; c++) {
-            const spec = channels[c];
-            const raw = decodeSdLogValue(bytes, p, spec.dataType);
-            // GSR is calibrated inline (amplifier equation). Inertial channels are
-            // marked calibrated by the plan but keep their raw value here and are
-            // calibrated together (per triple) by applyCalibPlan below.
-            values[c] = spec.name === 'GSR' && spec.calibrated ? calibrateGsr(raw, header.gsrRange) : raw;
-            p += spec.sizeBytes;
-        }
-        if (calibPlan.entries.length)
-            applyCalibPlan(values, calibPlan.entries);
-        const absoluteTicks = initialTicks + unwrapped - firstRawTicks;
-        out.push({
-            // Device-clock timestamp always divides by the 32768 Hz RTC clock
-            // (ShimmerObject#getRtcClockFreq); only the wall-clock (RTC) conversion
-            // below honours the TCXO sampling clock (ShimmerObject#getSamplingClockFreq).
-            timestampMs: (absoluteTicks / SDLOG_CLOCK_FREQ) * 1000,
-            wallClockMs: hasRtc ? ((absoluteTicks + rtcTicks) / wallClockFreqHz) * 1000 : null,
-            values,
-        });
-        samplesInBlock += 1;
-        pos += need;
-        budget.remaining -= 1;
+    const bytes = new Uint8Array(BRAND_RECORD_SIZE); // zero-filled, incl. padding
+    bytes[OFF_MAGIC] = BRAND_RECORD_MAGIC & 0xff;
+    bytes[OFF_MAGIC + 1] = (BRAND_RECORD_MAGIC >> 8) & 0xff;
+    bytes[OFF_LAYOUT_VER] = BRAND_RECORD_LAYOUT_VER;
+    bytes[OFF_FLAGS] = (platform << PLATFORM_SHIFT) & PLATFORM_MASK;
+    bytes[OFF_BT_CLASSIC_LEN] = fields.btClassic.length;
+    bytes[OFF_BLE_LEN] = fields.ble.length;
+    bytes[OFF_USB_PRODUCT_LEN] = fields.usbProduct.length;
+    bytes[OFF_USB_MANUFACTURER_LEN] = fields.usbManufacturer.length;
+    for (let i = 0; i < fields.btClassic.length; i++) {
+        bytes[OFF_BT_CLASSIC + i] = fields.btClassic.charCodeAt(i);
     }
-    if (budget.remaining === 0) {
-        const nextWithOffset = syncFraming && (samplesInBlock === 0 || samplesInBlock === samplesPerBlock);
-        const nextNeed = nextWithOffset ? SDLOG_SYNC_OFFSET_LENGTH + packetSize : packetSize;
-        if (pos + nextNeed <= bytes.length) {
-            budget.truncated = true;
-        }
+    for (let i = 0; i < fields.ble.length; i++)
+        bytes[OFF_BLE + i] = fields.ble.charCodeAt(i);
+    for (let i = 0; i < fields.usbProduct.length; i++) {
+        bytes[OFF_USB_PRODUCT + i] = fields.usbProduct.charCodeAt(i);
     }
+    for (let i = 0; i < fields.usbManufacturer.length; i++) {
+        bytes[OFF_USB_MANUFACTURER + i] = fields.usbManufacturer.charCodeAt(i);
+    }
+    const [crcLo, crcHi] = shimmerUartCrcCalc(bytes, OFF_CRC);
+    bytes[OFF_CRC] = crcLo;
+    bytes[OFF_CRC + 1] = crcHi;
+    return bytes;
 }
 /**
- * Decode a single SD-log binary file (e.g. `000`) into typed records.
- *
- * @throws SdLogFormatError `NO_DATA` when the file contains only a header.
+ * An all-0xFF (erased) record. Writing this restores the platform defaults:
+ * firmware re-seeds them at the next boot.
  */
-function decodeSdLogFile(bytes, opts) {
-    const parsed = parseSdLog(bytes);
-    if (bytes.length <= parsed.header.headerLengthBytes) {
-        throw new SdLogFormatError('NO_DATA', `File contains only the ${parsed.header.headerLengthBytes}-byte header — no sample data.`);
-    }
-    const records = [];
-    const budget = {
-        remaining: opts?.maxRecords ?? Number.POSITIVE_INFINITY,
-        truncated: false,
-    };
-    decodeRecordsFromFile(bytes, parsed, records, budget);
-    return { header: parsed.header, records, truncated: budget.truncated };
-}
-const isDataFileName = (name) => !name.includes('.');
-/**
- * Decode a multi-file SD session (files `000`, `001`, … within one
- * `<ShimmerName>-<SessionNumber>` folder).
- *
- * - Files whose names contain a `.` are ignored (UtilDock's "a log file is a
- *   name containing no dot" rule); remaining names must be numeric.
- * - Files are concatenated in ascending numeric order.
- * - Headers must agree on MAC address, sampling rate, enabled sensors and
- *   trial id (ParserLoggedDataToDatabase#compareSDHeader), otherwise
- *   `INCONSISTENT_SESSION` is thrown.
- * - Each file restarts its own timestamp-unwrap state and uses its own
- *   header's initial timestamp, so absolute times remain continuous across
- *   file boundaries on modern firmware.
- */
-function decodeSdSession(files, opts) {
-    const dataFiles = files.filter((f) => isDataFileName(f.name));
-    if (dataFiles.length === 0) {
-        throw new SdLogFormatError('NO_DATA', 'No SD-log data files (dot-free numeric names) given.');
-    }
-    const numbered = dataFiles.map((f) => {
-        if (!/^\d+$/.test(f.name)) {
-            throw new SdLogFormatError('BAD_HEADER', `"${f.name}" is not a valid SD-log data file name (expected digits only, e.g. "000").`);
-        }
-        return { num: parseInt(f.name, 10), file: f };
-    });
-    numbered.sort((a, b) => a.num - b.num);
-    for (let i = 1; i < numbered.length; i++) {
-        if (numbered[i].num === numbered[i - 1].num) {
-            throw new SdLogFormatError('INCONSISTENT_SESSION', `Duplicate log file number ${numbered[i].num} in session.`);
-        }
-    }
-    const parsedFiles = numbered.map(({ file }) => ({
-        name: file.name,
-        bytes: file.bytes,
-        parsed: parseSdLog(file.bytes),
-    }));
-    const first = parsedFiles[0].parsed.header;
-    // Populate the returned header's calibration metadata (and calibrated channel
-    // flags) even if the first file turns out to be header-only.
-    first.calibration = buildSdLogCalibPlan(first, parsedFiles[0].parsed.channels).info;
-    for (const { name, parsed } of parsedFiles) {
-        const h = parsed.header;
-        if (h.macAddress !== first.macAddress ||
-            h.samplingRateHz !== first.samplingRateHz ||
-            h.enabledSensors !== first.enabledSensors ||
-            h.trial.id !== first.trial.id) {
-            throw new SdLogFormatError('INCONSISTENT_SESSION', `Header of file "${name}" does not match the session's first file (MAC/rate/sensors/trial id).`);
-        }
-    }
-    const withData = parsedFiles.filter((f) => f.bytes.length > f.parsed.header.headerLengthBytes);
-    if (withData.length === 0) {
-        throw new SdLogFormatError('NO_DATA', 'No file in the session contains sample data.');
-    }
-    const records = [];
-    const budget = {
-        remaining: opts?.maxRecords ?? Number.POSITIVE_INFINITY,
-        truncated: false,
-    };
-    for (const f of withData) {
-        if (budget.remaining <= 0) {
-            budget.truncated = true;
-            break;
-        }
-        decodeRecordsFromFile(f.bytes, f.parsed, records, budget);
-    }
-    return { header: first, records, truncated: budget.truncated };
-}
-
-/**
- * SD-card directory naming helpers.
- *
- * The SD layout written by SDLog/LogAndStream firmware is:
- *
- *   <root>/data/<TrialName>_<ConfigTime>/<ShimmerName>-<SessionNumber>/000, 001, …
- *
- * with 3-digit numeric log-file names (no extension). Ported from
- * UtilDock#splitFileName (trial folder splits on the LAST `_`) and
- * ShimmerSDLog#parseSessionNameAndNumber (session folder splits on the
- * LAST `-`). Unlike the Java (which produces garbage or throws on malformed
- * names), these helpers validate and throw a typed BAD_HEADER error.
- */
-/**
- * Split a session folder name (`<ShimmerName>-<SessionNumber>`) on its last
- * `-`. The Shimmer name may itself contain dashes.
- */
-function parseSdSessionName(folder) {
-    const idx = folder.lastIndexOf('-');
-    if (idx <= 0 || idx === folder.length - 1) {
-        throw new SdLogFormatError('BAD_HEADER', `"${folder}" is not a valid session folder name (expected <ShimmerName>-<SessionNumber>).`);
-    }
-    const numberPart = folder.slice(idx + 1);
-    if (!/^\d+$/.test(numberPart)) {
-        throw new SdLogFormatError('BAD_HEADER', `"${folder}" has a non-numeric session number ("${numberPart}").`);
-    }
-    return { shimmerName: folder.slice(0, idx), sessionNumber: parseInt(numberPart, 10) };
-}
-/**
- * Split a trial folder name (`<TrialName>_<ConfigTime>`) on its last `_`.
- * The trial name may itself contain underscores; the config time is kept as
- * the raw string written by the firmware.
- */
-function parseSdTrialFolderName(folder) {
-    const idx = folder.lastIndexOf('_');
-    if (idx <= 0 || idx === folder.length - 1) {
-        throw new SdLogFormatError('BAD_HEADER', `"${folder}" is not a valid trial folder name (expected <TrialName>_<ConfigTime>).`);
-    }
-    return { trialName: folder.slice(0, idx), configTime: folder.slice(idx + 1) };
+function buildBlankBrandRecord() {
+    return new Uint8Array(BRAND_RECORD_SIZE).fill(0xff);
 }
 
 // ---------------------------------------------------------------------------
@@ -9046,6 +6270,4384 @@ function verisenseDeviceFileTag(idOrName) {
     return hex.length >= 4 ? hex.slice(-4).toUpperCase() : '';
 }
 
+function pad2(n) {
+    return Math.trunc(n).toString().padStart(2, '0');
+}
+function pad5(n) {
+    return Math.trunc(n).toString().padStart(5, '0');
+}
+function dateToYyMMddHHmmss(date) {
+    const yy = pad2(date.getUTCFullYear() % 100);
+    const mm = pad2(date.getUTCMonth() + 1);
+    const dd = pad2(date.getUTCDate());
+    const hh = pad2(date.getUTCHours());
+    const min = pad2(date.getUTCMinutes());
+    const ss = pad2(date.getUTCSeconds());
+    return `${yy}${mm}${dd}_${hh}${min}${ss}`;
+}
+/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
+function buildUploadBinaryFileName(uploadDate, firstPayloadIndex) {
+    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
+        throw new Error('buildUploadBinaryFileName: firstPayloadIndex must be in range 0..65535');
+    }
+    return `${dateToYyMMddHHmmss(uploadDate)}_${pad5(firstPayloadIndex)}.bin`;
+}
+/**
+ * Ensure a nested directory path exists under a root directory handle, creating
+ * each level as needed, and return the leaf handle. Browser-only (File System
+ * Access API) — the app obtains `root` from `showDirectoryPicker()` when the
+ * user selects an output location at transfer start.
+ */
+async function ensureDirectoryPath(root, segments) {
+    let dir = root;
+    for (const seg of segments) {
+        dir = await dir.getDirectoryHandle(seg, { create: true });
+    }
+    return dir;
+}
+/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
+function buildParsedCsvFileName(startDate, dataSource, firstPayloadIndex) {
+    if (!dataSource || !String(dataSource).trim()) {
+        throw new Error('buildParsedCsvFileName: dataSource must be a non-empty string');
+    }
+    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
+        throw new Error('buildParsedCsvFileName: firstPayloadIndex must be in range 0..65535');
+    }
+    return `${dateToYyMMddHHmmss(startDate)}_${String(dataSource).trim()}_${pad5(firstPayloadIndex)}.csv`;
+}
+/** Add duplicate suffix like " (2)" before extension. */
+function applyDuplicateSuffix(fileName, duplicateIndex) {
+    if (duplicateIndex < 2) {
+        throw new Error('applyDuplicateSuffix: duplicateIndex must be >= 2');
+    }
+    const idx = fileName.lastIndexOf('.');
+    if (idx <= 0)
+        return `${fileName} (${duplicateIndex})`;
+    const stem = fileName.slice(0, idx);
+    const ext = fileName.slice(idx);
+    return `${stem} (${duplicateIndex})${ext}`;
+}
+/** Return first non-colliding duplicate name for a target file name. */
+function nextAvailableDuplicateFileName(fileName, existingNames) {
+    const existing = new Set(existingNames);
+    if (!existing.has(fileName))
+        return fileName;
+    let i = 2;
+    while (true) {
+        const candidate = applyDuplicateSuffix(fileName, i);
+        if (!existing.has(candidate))
+            return candidate;
+        i++;
+    }
+}
+/** Parse first payload index (uint16 LE) from a payload byte array. */
+function getFirstPayloadIndex(payload) {
+    if (payload.length < 2) {
+        throw new Error('getFirstPayloadIndex: payload must contain at least 2 bytes');
+    }
+    return u16le_at(payload, 0);
+}
+/**
+ * Evaluate whether parsed CSV output should roll to a new file.
+ * Rules mirror ASM-DES08 split conditions.
+ */
+function evaluateParsedFileSplit(input) {
+    const reasons = [];
+    const prev = input.prevTimestampSec;
+    const curr = input.currTimestampSec;
+    // Split when crossing 12:00am or 12:00pm boundaries.
+    const prevHalfDay = Math.floor(prev / (12 * 60 * 60));
+    const currHalfDay = Math.floor(curr / (12 * 60 * 60));
+    if (currHalfDay !== prevHalfDay)
+        reasons.push('midday-midnight-boundary');
+    if ((input.prevConfigSignature ?? null) !== (input.currConfigSignature ?? null)) {
+        reasons.push('config-change');
+    }
+    if (input.expectedDeltaSec != null) {
+        const tol = Math.max(0, input.timestampToleranceSec ?? 0);
+        const delta = curr - prev;
+        if (Math.abs(delta - input.expectedDeltaSec) > tol) {
+            reasons.push('timestamp-discontinuity');
+        }
+    }
+    if (input.powerResetDetected) {
+        reasons.push('power-reset');
+    }
+    return { shouldSplit: reasons.length > 0, reasons };
+}
+
+/**
+ * Public types for the Shimmer3 / Shimmer3R binary SD-log decoder.
+ */
+/** Typed error thrown by the SD-log parsing/decoding entry points. */
+class SdLogFormatError extends Error {
+    constructor(code, message) {
+        super(message);
+        this.name = 'SdLogFormatError';
+        this.code = code;
+    }
+}
+
+/**
+ * SD-card directory naming helpers.
+ *
+ * The SD layout written by SDLog/LogAndStream firmware is:
+ *
+ *   <root>/data/<TrialName>_<ConfigTime>/<ShimmerName>-<SessionNumber>/000, 001, …
+ *
+ * with 3-digit numeric log-file names (no extension). Ported from
+ * UtilDock#splitFileName (trial folder splits on the LAST `_`) and
+ * ShimmerSDLog#parseSessionNameAndNumber (session folder splits on the
+ * LAST `-`). Unlike the Java (which produces garbage or throws on malformed
+ * names), these helpers validate and throw a typed BAD_HEADER error.
+ */
+/**
+ * Split a session folder name (`<ShimmerName>-<SessionNumber>`) on its last
+ * `-`. The Shimmer name may itself contain dashes.
+ */
+function parseSdSessionName(folder) {
+    const idx = folder.lastIndexOf('-');
+    if (idx <= 0 || idx === folder.length - 1) {
+        throw new SdLogFormatError('BAD_HEADER', `"${folder}" is not a valid session folder name (expected <ShimmerName>-<SessionNumber>).`);
+    }
+    const numberPart = folder.slice(idx + 1);
+    if (!/^\d+$/.test(numberPart)) {
+        throw new SdLogFormatError('BAD_HEADER', `"${folder}" has a non-numeric session number ("${numberPart}").`);
+    }
+    return { shimmerName: folder.slice(0, idx), sessionNumber: parseInt(numberPart, 10) };
+}
+/**
+ * Split a trial folder name (`<TrialName>_<ConfigTime>`) on its last `_`.
+ * The trial name may itself contain underscores; the config time is kept as
+ * the raw string written by the firmware.
+ */
+function parseSdTrialFolderName(folder) {
+    const idx = folder.lastIndexOf('_');
+    if (idx <= 0 || idx === folder.length - 1) {
+        throw new SdLogFormatError('BAD_HEADER', `"${folder}" is not a valid trial folder name (expected <TrialName>_<ConfigTime>).`);
+    }
+    return { trialName: folder.slice(0, idx), configTime: folder.slice(idx + 1) };
+}
+
+/**
+ * High-level SD-card download orchestration for the Shimmer3R.
+ *
+ * Walks the on-card tree with the client's SD commands, mirrors the directory
+ * structure on the host via the File System Access API, and pulls each file
+ * down in windows with resume-from-on-disk-size semantics — the same shape as
+ * the field-proven Verisense `transferLoggedData` flow.
+ */
+/** Device-name folder used when a session folder is not `<Name>-<NNN>`. */
+const CONSENSYS_UNKNOWN_DEVICE = 'Unknown_Shimmer';
+/**
+ * Format an import-time folder name as Consensys does: `yyyy-MM-dd_HH.mm.ss`
+ * in local time (e.g. `2025-06-25_15.30.36`).
+ */
+function formatSdImportStamp(date = new Date()) {
+    const p = (n) => String(n).padStart(2, '0');
+    return (`${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}` +
+        `_${p(date.getHours())}.${p(date.getMinutes())}.${p(date.getSeconds())}`);
+}
+/**
+ * Map a card directory chain to its Consensys Backup destination.
+ *
+ * The device name is taken from the session folder (`<ShimmerName>-<NNN>`)
+ * rather than from the connected device, so sessions recorded under a previous
+ * device name - or on a card that has been moved between devices - still file
+ * under the name they were recorded with, which is what Consensys shows.
+ */
+function consensysBackupSegments(cardDirSegments, importStamp) {
+    let shimmerName = CONSENSYS_UNKNOWN_DEVICE;
+    const sessionDir = cardDirSegments[cardDirSegments.length - 1];
+    if (sessionDir) {
+        try {
+            shimmerName = parseSdSessionName(sessionDir).shimmerName;
+        }
+        catch {
+            /* not a <ShimmerName>-<NNN> folder - fall back to the placeholder */
+        }
+    }
+    return [importStamp, shimmerName, ...cardDirSegments];
+}
+function throwIfAborted(signal) {
+    if (signal?.aborted)
+        throw new DOMException('SD download aborted', 'AbortError');
+}
+/** Recursively enumerate the on-card tree below `rootPath` (depth-first). */
+async function enumerateSdTree(client, rootPath = 'data', opts = {}) {
+    const dirs = [];
+    const files = [];
+    const maxDepth = opts.maxDepth ?? 8;
+    const walk = async (path, depth) => {
+        throwIfAborted(opts.signal);
+        if (depth > maxDepth)
+            return;
+        const entries = await client.sdListDir(path);
+        for (const e of entries) {
+            throwIfAborted(opts.signal);
+            if (e.nameTruncated)
+                continue; // cannot be addressed by path
+            const childPath = `${path}/${e.name}`;
+            if (e.isDir) {
+                dirs.push(childPath);
+                await walk(childPath, depth + 1);
+            }
+            else {
+                files.push({ path: childPath, size: e.size, mtime: e.mtime });
+            }
+        }
+    };
+    await walk(rootPath, 0);
+    return { dirs, files, totalBytes: files.reduce((n, f) => n + f.size, 0) };
+}
+/**
+ * Download the card's `rootPath` tree into `destRoot`, recreating the on-card
+ * directory structure. Re-running with the same destination resumes: complete
+ * files are skipped and partial files continue from their on-disk size.
+ */
+async function downloadSdTree(client, destRoot, opts = {}) {
+    const rootPath = opts.rootPath ?? 'data';
+    const windowLen = opts.windowLen ?? 128 * 1024;
+    const blockPayloadLen = opts.blockPayloadLen ?? SD_BLOCK_PAYLOAD_DEFAULT;
+    const resume = opts.resume ?? true;
+    const skipExisting = opts.skipExisting ?? true;
+    const maxRetriesPerFile = opts.maxRetriesPerFile ?? 3;
+    const layout = opts.layout ?? 'card';
+    const importStamp = opts.importStamp ?? formatSdImportStamp();
+    const summary = {
+        importStamp: layout === 'consensysBackup' ? importStamp : undefined,
+        filesDownloaded: 0,
+        filesSkipped: 0,
+        filesFailed: [],
+        bytesDownloaded: 0,
+        deletedFromCard: [],
+    };
+    opts.onProgress?.({
+        phase: 'enumerate',
+        bytesDone: 0,
+        bytesTotal: 0,
+        filesDone: 0,
+        filesTotal: 0,
+    });
+    const tree = await enumerateSdTree(client, rootPath, { signal: opts.signal });
+    let bytesDone = 0;
+    let filesDone = 0;
+    const fullyDownloaded = [];
+    const emit = (extra = {}) => {
+        opts.onProgress?.({
+            phase: 'download',
+            bytesDone,
+            bytesTotal: tree.totalBytes,
+            filesDone,
+            filesTotal: tree.files.length,
+            ...extra,
+        });
+    };
+    for (const file of tree.files) {
+        throwIfAborted(opts.signal);
+        const segments = file.path.split('/');
+        const name = segments.pop();
+        try {
+            const destSegments = layout === 'consensysBackup' ? consensysBackupSegments(segments, importStamp) : segments;
+            const dir = await ensureDirectoryPath(destRoot, destSegments);
+            const handle = await dir.getFileHandle(name, { create: true });
+            const existingSize = (await handle.getFile()).size;
+            if (skipExisting && existingSize === file.size) {
+                summary.filesSkipped++;
+                fullyDownloaded.push(file.path);
+                bytesDone += file.size;
+                filesDone++;
+                emit({ currentFile: file.path, fileBytesDone: file.size, fileBytesTotal: file.size });
+                continue;
+            }
+            const start = resume && existingSize < file.size ? existingSize : 0;
+            const writable = await handle.createWritable({ keepExistingData: start > 0 });
+            let offset = start;
+            let retries = 0;
+            const startedAt = Date.now();
+            const startedFrom = start;
+            try {
+                while (offset < file.size) {
+                    throwIfAborted(opts.signal);
+                    // Ordered write chain, so block writes never interleave out of order
+                    let chain = Promise.resolve();
+                    let chainError = null;
+                    try {
+                        const res = await client.sdReadFileWindow(file.path, offset, Math.min(windowLen, file.size - offset), {
+                            blockPayloadLen,
+                            stallTimeoutMs: opts.stallTimeoutMs,
+                            signal: opts.signal,
+                            onBlock: (payload, absOffset) => {
+                                // Positioned writes keep window retries idempotent: a
+                                // half-received window that is re-requested simply
+                                // overwrites the same byte range
+                                chain = chain
+                                    .then(() => writable.write({
+                                    type: 'write',
+                                    position: absOffset,
+                                    data: toArrayBuffer(payload),
+                                }))
+                                    .catch((e) => {
+                                    chainError = e instanceof Error ? e : new Error(String(e));
+                                });
+                            },
+                        });
+                        await chain;
+                        if (chainError)
+                            throw chainError;
+                        if (res.status !== SD_XFER.WINDOW_COMPLETE && res.status !== SD_XFER.EOF) {
+                            throw new SdTransferError(`read '${file.path}': ${sdXferStatusToString(res.status)}`, res.status);
+                        }
+                        if (res.nextOffset <= offset) {
+                            throw new Error(`read '${file.path}': no progress at offset ${offset}`);
+                        }
+                        bytesDone += res.nextOffset - offset;
+                        summary.bytesDownloaded += res.nextOffset - offset;
+                        offset = res.nextOffset;
+                        retries = 0;
+                        const elapsedS = (Date.now() - startedAt) / 1000;
+                        emit({
+                            currentFile: file.path,
+                            fileBytesDone: offset,
+                            fileBytesTotal: file.size,
+                            kbps: elapsedS > 0 ? (offset - startedFrom) / 1024 / elapsedS : undefined,
+                        });
+                        if (res.status === SD_XFER.EOF)
+                            break; // card holds less than listed
+                    }
+                    catch (e) {
+                        await chain.catch(() => { });
+                        // In-band refusals (busy, SD lost, not found) are not retryable;
+                        // CRC / sequence-gap / stall errors are — from the same offset
+                        if (e instanceof SdTransferError || e instanceof DOMException)
+                            throw e;
+                        if (++retries > maxRetriesPerFile)
+                            throw e;
+                    }
+                }
+            }
+            finally {
+                await writable.close().catch(() => { });
+            }
+            const finalSize = (await handle.getFile()).size;
+            if (finalSize >= file.size) {
+                summary.filesDownloaded++;
+                fullyDownloaded.push(file.path);
+            }
+            else {
+                summary.filesFailed.push({
+                    path: file.path,
+                    error: `incomplete (${finalSize}/${file.size} bytes)`,
+                });
+            }
+        }
+        catch (e) {
+            if (e instanceof DOMException && e.name === 'AbortError')
+                throw e;
+            summary.filesFailed.push({
+                path: file.path,
+                error: e instanceof Error ? e.message : String(e),
+            });
+        }
+        filesDone++;
+        emit();
+    }
+    if (opts.deleteAfterVerify && fullyDownloaded.length) {
+        opts.onProgress?.({
+            phase: 'delete',
+            bytesDone,
+            bytesTotal: tree.totalBytes,
+            filesDone,
+            filesTotal: tree.files.length,
+        });
+        summary.deletedFromCard = await deleteDownloadedFromCard(client, fullyDownloaded, tree.dirs, {
+            signal: opts.signal,
+        });
+    }
+    return summary;
+}
+/**
+ * Delete verified files from the card (files first, then any directories that
+ * emptied out, deepest first). Only paths under `data/` are accepted by the
+ * firmware. Returns the paths actually deleted; failures are skipped.
+ */
+async function deleteDownloadedFromCard(client, filePaths, dirPaths = [], opts = {}) {
+    const deleted = [];
+    for (const p of filePaths) {
+        throwIfAborted(opts.signal);
+        try {
+            await client.sdDeletePath(p);
+            deleted.push(p);
+        }
+        catch {
+            /* leave the file on the card; the caller can retry */
+        }
+    }
+    // Deepest directories first so empty parents can follow
+    const dirs = [...dirPaths].sort((a, b) => b.split('/').length - a.split('/').length);
+    for (const d of dirs) {
+        throwIfAborted(opts.signal);
+        try {
+            await client.sdDeletePath(d);
+            deleted.push(d);
+        }
+        catch {
+            /* non-empty (something was skipped or new) — leave it */
+        }
+    }
+    return deleted;
+}
+
+/**
+ * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
+ *
+ * Classic Shimmer3 speaks the same LiteProtocol command set as the Shimmer3R
+ * (see `../shimmer3r/constants.ts`), but over an **unframed RFCOMM byte stream**
+ * rather than framed BLE notifications, and with a **different inquiry-response
+ * layout** (a 4-byte config word instead of Shimmer3R's 7-byte word). Everything
+ * in this file is a side-effect-free function so it can be unit-tested without a
+ * transport.
+ *
+ * Ported from the Shimmer Java driver:
+ *   com.shimmerresearch.driver.ShimmerObject#interpretInqResponse (HW_ID.SHIMMER_3 branch)
+ *   com.shimmerresearch.bluetooth.ShimmerBluetooth (response byte layouts + handshake)
+ */
+/** The Shimmer3 acknowledgement byte (LiteProtocol). Shared with Shimmer3R. */
+const ACK = OPCODES.ACK_COMMAND_PROCESSED; // 0xFF
+/** The Shimmer3 negative-acknowledgement byte (LiteProtocol). */
+const NACK = OPCODES.NACK_COMMAND_PROCESSED; // 0xFE
+/**
+ * Well-known SPP (Serial Port Profile) service UUID used to open an RFCOMM
+ * socket to a classic Shimmer3. Documented here for the platform transport
+ * (e.g. the React Native Android module calls
+ * `createRfcommSocketToServiceRecord(SPP_UUID)`); the SDK client itself is
+ * transport-agnostic and never touches it.
+ */
+const SHIMMER3_SPP_UUID = '00001101-0000-1000-8000-00805f9b34fb';
+// ---------------------------------------------------------------------------
+// Inquiry-response layout — THE key protocol difference vs Shimmer3R
+// ---------------------------------------------------------------------------
+//
+// Byte layout of an INQUIRY_RESPONSE, INCLUDING the 0x02 opcode byte
+// (ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch works on the
+// opcode-stripped buffer, so every index below is the Java index + 1):
+//
+//   [0]      = 0x02  INQUIRY_RESPONSE opcode
+//   [1..2]   = sampling-rate divisor, 16-bit little-endian
+//   [3..6]   = config word (configByte0), 4 bytes little-endian   <-- 4, not 7
+//   [7]      = numChannels
+//   [8]      = bufferSize
+//   [9..]    = numChannels channel/signal-ID bytes
+//
+// Shimmer3R differs: its config word is 7 bytes (indices [3..9]), numChannels at
+// [10], bufferSize at [11], channels from [12]. That single width difference is
+// why this cannot reuse Shimmer3RClient's inquiry parser.
+/** 0-based offset (within the opcode-prefixed message) of the config word. */
+const SHIMMER3_INQ_CONFIG_OFFSET = 3;
+/** Config word width in bytes (Shimmer3 = 4; Shimmer3R = 7). */
+const SHIMMER3_INQ_CONFIG_LENGTH = 4;
+/** Offset of the numChannels byte within the opcode-prefixed message. */
+const SHIMMER3_INQ_NUM_CHANNELS_OFFSET = SHIMMER3_INQ_CONFIG_OFFSET + SHIMMER3_INQ_CONFIG_LENGTH; // 7
+/** Offset of the first channel-ID byte within the opcode-prefixed message. */
+const SHIMMER3_INQ_CHANNELS_OFFSET = SHIMMER3_INQ_NUM_CHANNELS_OFFSET + 2; // 9
+/** The sampling clock frequency (Hz) used for divisor↔rate conversion. */
+// ShimmerDevice#getSamplingClockFreq() returns 32768.0 for Shimmer3 and Shimmer3R.
+const SHIMMER3_SAMPLING_CLOCK_FREQ = 32768;
+/**
+ * Build a stream schema from the channel-ID list reported by the inquiry.
+ *
+ * Mirrors ShimmerObject#interpretDataPacketFormat (the channel→format mapping is
+ * identical for Shimmer3 and Shimmer3R, so `CHANNEL_FORMATS` and
+ * `SensorBitmapShimmer3` are reused verbatim). The only Shimmer3-relevant knob is
+ * the timestamp width (u24 for firmware code ≥ 6, else u16 — see
+ * ShimmerObject#updateTimestampByteLength).
+ */
+function buildShimmer3Schema(channelIds, timestampFmt) {
+    const fields = [];
+    const ts = timestampFmt === 'u24' ? TIMESTAMP_FIELD.u24 : TIMESTAMP_FIELD.u16;
+    let frameBytes = 1 + ts.sizeBytes; // 1 = DATA_PACKET (0x00) preamble
+    let enabledSensors = 0;
+    for (const id of channelIds) {
+        const fmt = CHANNEL_FORMATS[id];
+        if (!fmt) {
+            fields.push({ id, name: `CH_${hex2(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
+            frameBytes += 2;
+            continue;
+        }
+        fields.push({ id, ...fmt });
+        frameBytes += fmt.sizeBytes ?? 2;
+        enabledSensors |= channelIdToSensorBit(id);
+    }
+    return { timestampFmt, fields, frameBytes, enabledSensors, dataPreambleByte: 0x00 };
+}
+/** Map a channel/signal ID to its SensorBitmapShimmer3 enable bit (0 if none). */
+function channelIdToSensorBit(id) {
+    switch (id) {
+        case 0x00:
+        case 0x01:
+        case 0x02:
+            return SensorBitmapShimmer3.SENSOR_A_ACCEL;
+        case 0x04:
+        case 0x05:
+        case 0x06:
+            return SensorBitmapShimmer3.SENSOR_D_ACCEL;
+        case 0x14:
+        case 0x15:
+        case 0x16:
+            return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
+        case 0x07:
+        case 0x08:
+        case 0x09:
+            return SensorBitmapShimmer3.SENSOR_MAG;
+        case 0x0a:
+        case 0x0b:
+        case 0x0c:
+            return SensorBitmapShimmer3.SENSOR_GYRO;
+        case 0x12:
+            return SensorBitmapShimmer3.SENSOR_INT_A1;
+        case 0x1c:
+            return SensorBitmapShimmer3.SENSOR_GSR;
+        case 0x23:
+        case 0x24:
+            return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
+        case 0x25:
+        case 0x26:
+            return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
+        case 0x1e:
+        case 0x1f:
+            return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
+        case 0x21:
+        case 0x22:
+            return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
+        default:
+            return 0;
+    }
+}
+/**
+ * Decode an INQUIRY_RESPONSE using the Shimmer3 (classic) layout.
+ *
+ * Accepts the message with or without the leading 0x02 opcode byte (the
+ * byte-stream parser always includes it; a caller passing a bare body also
+ * works, matching Shimmer3RClient's `base` handling).
+ *
+ * Ported from ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch.
+ */
+function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24') {
+    let base = 0;
+    if (u8[0] === OPCODES.INQUIRY_RESPONSE)
+        base = 1;
+    const adcRaw = u16le$3(u8, base + 0);
+    const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
+    // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
+    const configByte0 = ((u8[base + 2] | (u8[base + 3] << 8) | (u8[base + 4] << 16) | (u8[base + 5] << 24)) >>> 0) >>>
+        0;
+    const accelRange = (configByte0 & 0xc) >>> 2;
+    const gyroRange = (configByte0 & 0x30000) >>> 16;
+    const magRange = (configByte0 & 0xe00000) >>> 21;
+    const gsrRange = (configByte0 >>> 25) & 0x7;
+    const internalExpPower = (configByte0 >>> 24) & 0x1;
+    const numChannels = u8[base + 6] ?? 0;
+    const bufferSize = u8[base + 7] ?? 0;
+    const chStart = base + 8;
+    const channelIds = [...u8.slice(chStart, chStart + numChannels)];
+    const schema = buildShimmer3Schema(channelIds, timestampFmt);
+    return {
+        opcode: u8[0],
+        adcRaw,
+        samplingRateHz,
+        configByte0,
+        gsrRange,
+        internalExpPower,
+        accelRange,
+        gyroRange,
+        magRange,
+        numChannels,
+        bufferSize,
+        channelIds,
+        schema,
+        bytes: u8.slice(0),
+    };
+}
+/** Decode a DEVICE_VERSION_RESPONSE (0x25) — 1 payload byte = HW version.
+ *  Ported from ShimmerBluetooth (GET_SHIMMER_VERSION_RESPONSE handler). */
+function parseShimmer3DeviceVersionResponse(u8) {
+    const base = u8[0] === OPCODES.DEVICE_VERSION_RESPONSE ? 1 : 0;
+    return { hardwareVersion: u8[base] ?? 0 };
+}
+/**
+ * Firmware identifier (type) values, from
+ * com.shimmerresearch.driverUtilities.ShimmerVerDetails.FW_ID.
+ */
+const FW_ID = Object.freeze({
+    BTSTREAM: 1,
+    SDLOG: 2,
+    LOGANDSTREAM: 3,
+});
+/**
+ * Decode a FW_VERSION_RESPONSE (0x2F) — 6 payload bytes.
+ * Ported from ShimmerBluetooth (FW_VERSION_RESPONSE handler):
+ *   id  = b1<<8 | b0   (little-endian)
+ *   maj = b3<<8 | b2
+ *   min = b4
+ *   int = b5
+ */
+function parseShimmer3FwVersionResponse(u8) {
+    const base = u8[0] === OPCODES.FW_VERSION_RESPONSE ? 1 : 0;
+    const b = (i) => u8[base + i] ?? 0;
+    return {
+        firmwareIdentifier: (b(1) << 8) | b(0),
+        major: (b(3) << 8) | b(2),
+        minor: b(4),
+        internal: b(5),
+    };
+}
+/**
+ * Whether streaming data frames use a 3-byte (u24) timestamp for this firmware.
+ *
+ * The Java driver widens the timestamp to 3 bytes when the derived firmware
+ * version code is ≥ 6 (ShimmerObject#updateTimestampByteLength). That code is a
+ * per-firmware-type version ladder (ShimmerVerObject); code ≥ 6 corresponds to
+ * LogAndStream ≥ 0.5.4, BtStream ≥ 0.7.3, and SDLog ≥ 0.11.5. Anything at or
+ * above those (and any firmware type we don't recognise, assumed modern) uses
+ * u24; older firmware uses u16.
+ */
+function shimmer3UsesThreeByteTimestamp(v) {
+    const atLeast = (maj, min, int) => v.major > maj || (v.major === maj && (v.minor > min || (v.minor === min && v.internal >= int)));
+    switch (v.firmwareIdentifier) {
+        case FW_ID.LOGANDSTREAM:
+            return atLeast(0, 5, 4);
+        case FW_ID.BTSTREAM:
+            return atLeast(0, 7, 3);
+        case FW_ID.SDLOG:
+            return atLeast(0, 11, 5);
+        default:
+            return true; // unknown/newer firmware type — default to modern u24
+    }
+}
+// ---------------------------------------------------------------------------
+// Unframed-stream control-message framing
+// ---------------------------------------------------------------------------
+/**
+ * Fixed payload lengths (bytes AFTER the opcode) for the control responses the
+ * v1 client consumes. INQUIRY_RESPONSE is variable and handled specially in
+ * {@link shimmer3ControlMessageLength}. Extend this table to teach the
+ * byte-stream parser about further GET responses.
+ *
+ * Lengths taken from the `readBytes(n, ...)` calls in ShimmerBluetooth and the
+ * LiteProtocol instruction-set response_size annotations.
+ */
+const SHIMMER3_RESPONSE_PAYLOAD_LENGTHS = Object.freeze({
+    [OPCODES.SAMPLING_RATE_RESPONSE]: 2, // 0x04
+    [OPCODES.FW_VERSION_RESPONSE]: 6, // 0x2F
+    [OPCODES.DEVICE_VERSION_RESPONSE]: 1, // 0x25
+    [OPCODES.GSR_RANGE_RESPONSE]: 1, // 0x22
+    [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
+});
+/** Sentinel: need more bytes before the message length can be determined. */
+const NEED_MORE = -1;
+/** Sentinel: leading byte is not a recognised control opcode — caller resyncs. */
+const RESYNC = 0;
+/**
+ * Given the head of the accumulated RFCOMM byte buffer, return the total length
+ * (INCLUDING the leading opcode) of the complete control message it starts with,
+ * or {@link NEED_MORE} if not enough bytes have arrived yet, or {@link RESYNC}
+ * if the leading byte is not a control opcode we understand (garbage / a data
+ * byte leaked into the control plane — the caller should drop one byte and
+ * retry).
+ *
+ * This is the primitive that makes the unframed RFCOMM stream tractable: unlike
+ * BLE (one notification == one message), RFCOMM delivers bytes split or
+ * coalesced arbitrarily, so the client cannot assume `chunk[0]` is a whole
+ * message. The Java driver solves the same problem with blocking `readBytes(n)`
+ * calls that know each response's length up front (ShimmerBluetooth); this
+ * expresses that length knowledge as a pure function.
+ *
+ * ACK (0xFF) and NACK (0xFE) are 1-byte messages. INQUIRY_RESPONSE (0x02) is
+ * `9 + numChannels` bytes, and numChannels lives at index 7, so at least 8 bytes
+ * are needed to compute the length.
+ */
+function shimmer3ControlMessageLength(buf) {
+    if (buf.length === 0)
+        return NEED_MORE;
+    const opcode = buf[0];
+    if (opcode === ACK || opcode === NACK)
+        return 1;
+    if (opcode === OPCODES.INQUIRY_RESPONSE) {
+        if (buf.length <= SHIMMER3_INQ_NUM_CHANNELS_OFFSET)
+            return NEED_MORE; // need index 7 present
+        const numChannels = buf[SHIMMER3_INQ_NUM_CHANNELS_OFFSET];
+        // Sanity bound: a stray stream-data byte 0x02 can masquerade as an
+        // INQUIRY_RESPONSE whose "numChannels" comes from garbage, swallowing up to
+        // 264 bytes of real control traffic (including ACK/NACK). No real Shimmer3
+        // has anywhere near 32 channels — treat implausible values as garbage and
+        // resync instead.
+        if (numChannels > 32)
+            return RESYNC;
+        return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
+    }
+    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE) {
+        // Variable length: [0x68][length][data...]. Firmware caps daughter-card
+        // memory reads at 128 bytes — treat larger "lengths" as garbage and resync.
+        if (buf.length < 2)
+            return NEED_MORE;
+        const dcLen = buf[1];
+        if (dcLen > 128)
+            return RESYNC;
+        return 2 + dcLen;
+    }
+    const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
+    if (payload === undefined)
+        return RESYNC;
+    return 1 + payload;
+}
+
+/**
+ * Classic-Bluetooth (RFCOMM/SPP) Shimmer3 constants.
+ *
+ * The LiteProtocol opcode set, sensor bitmap, channel formats and timestamp
+ * descriptors are byte-for-byte identical to the Shimmer3R, so they are
+ * re-exported from `../shimmer3r/` rather than duplicated. Only the values that
+ * are genuinely Shimmer3-classic-specific live here.
+ */
+// Re-export the shared LiteProtocol surface so Shimmer3 consumers import from one
+// module (these are identical across the two device families).
+/**
+ * Connect-handshake defaults, ported from the timings/sequence in
+ * com.shimmerresearch.bluetooth.ShimmerBluetooth.
+ */
+const SHIMMER3_DEFAULTS = Object.freeze({
+    /**
+     * How long to drain-and-discard bytes after the dummy read that flushes the
+     * RFCOMM buffer on connect. ShimmerBluetooth's dummy read polls the serial
+     * buffer with short sleeps; 250 ms comfortably covers an ACK + response at
+     * classic-BT latencies.
+     */
+    DUMMY_READ_DRAIN_MS: 250,
+    /** Per-command ACK timeout (ms). */
+    ACK_TIMEOUT_MS: 1500,
+    /** Response (post-ACK) timeout (ms). */
+    RESPONSE_TIMEOUT_MS: 2000,
+    /**
+     * Default streaming timestamp width. Classic Shimmer3 LogAndStream firmware
+     * with version code ≥ 6 uses a 3-byte timestamp
+     * (ShimmerObject#updateTimestampByteLength); older firmware uses 2 bytes.
+     */
+    TIMESTAMP_FMT: 'u24',
+});
+
+// ---------------------------------------------------------------------------
+// Shimmer3Client
+// ---------------------------------------------------------------------------
+/**
+ * Client for the **classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
+ *
+ * Shimmer3 speaks the same LiteProtocol as the Shimmer3R (shared opcodes, sensor
+ * bitmap, channel formats — all reused from `../shimmer3r/`), with two
+ * differences this client owns:
+ *
+ * 1. **Unframed byte stream.** RFCOMM has no MTU and no message framing: bytes
+ *    arrive split or coalesced arbitrarily. Rather than assume "one notification
+ *    = one message" (as the BLE {@link Shimmer3RClient} does), this client
+ *    accumulates inbound bytes and extracts complete control messages with a
+ *    length-aware parser ({@link shimmer3ControlMessageLength}). This mirrors the
+ *    Java driver's blocking `readBytes(n)` approach (ShimmerBluetooth) but as a
+ *    non-blocking accumulator.
+ * 2. **Inquiry-response layout.** Shimmer3's config word is 4 bytes vs
+ *    Shimmer3R's 7 (see {@link interpretShimmer3InquiryResponse}).
+ *
+ * Transport injection is mandatory — `connect()` with no transport throws.
+ *
+ * @example
+ * ```ts
+ * const client = new Shimmer3Client({ transport: rfcommTransport });
+ * client.onStatus = (m) => console.log(m);
+ * await client.connect();               // handshake: flush → HW version → FW version
+ * await client.setSamplingRate(51.2);
+ * await client.setSensors(SensorBitmapShimmer3.SENSOR_GYRO);
+ * await client.setGSRRange(2);
+ * await client.startStreaming();
+ * ```
+ */
+class Shimmer3Client extends BaseShimmerClient {
+    constructor(opts = {}) {
+        super(opts);
+        // Transport (byte pipe). Always injected — never built by this client.
+        this._injectedTransport = null;
+        this._transport = null;
+        this._notifyUnsub = null;
+        this._disconnectUnsub = null;
+        // Protocol state
+        this._rxBuf = new Uint8Array(0);
+        this._temps = new Set();
+        this.schema = null;
+        this._streaming = false;
+        this._streamStarting = false;
+        this._lastTs = 0;
+        /** Bumped once per inbound transport chunk — used for quiescence detection. */
+        this._rxSeq = 0;
+        /** While true, {@link _handleNotify} only accumulates; a drain loop owns `_rxBuf`. */
+        this._drainingResidual = false;
+        /** Number of {@link _waitForResponse} calls currently awaiting an INQUIRY_RESPONSE. */
+        this._awaitInq = 0;
+        /**
+         * Number of command handlers ({@link _waitForAck} / {@link _waitForResponse})
+         * currently awaiting a response. Gates NACK framing in {@link _drainControl}
+         * so a stray 0xFE arriving with no command in flight cannot fabricate a NACK.
+         */
+        this._awaitCmd = 0;
+        // Cached device info from the connect handshake
+        this.deviceVersion = null;
+        this.firmwareVersion = null;
+        // Cached device configuration
+        this.enabledSensors = 0x000000;
+        this.samplingRateHz = 0;
+        this.gsrRangeSetting = 0;
+        this.ExpPower = 0;
+        /** Inertial-sensor hardware ranges, refreshed from each inquiry's config word. */
+        this.imuRanges = {
+            lnAccel: 0, // Kionix KXRB LN accel is fixed-range on Shimmer3
+            wrAccel: 0,
+            gyro: 0,
+            mag: 0,
+            altAccel: 0,
+            altMag: 0,
+        };
+        /** When false, inertial channels are emitted raw-only (no `'cal'` field). Default true. */
+        this.emitCalibratedInertial = true;
+        this._deviceCalibrations = {};
+        /** Minimum valid GSR conductance in µS (below this, connectivity = "Disconnected"). */
+        this.LIMIT_MIN_VALID_USIEMENS = 0.03;
+        // Callbacks
+        this.onInquiry = null;
+        this.onExpPowerChanged = null;
+        this._handleTransportDisconnect = () => {
+            this._streaming = false;
+            this._streamStarting = false;
+            this._emitStatus('Device disconnected');
+        };
+        // ---------------------------------------------------------------------------
+        // Notify handler — accumulate + parse an UNFRAMED byte stream
+        // ---------------------------------------------------------------------------
+        this._handleNotify = (chunk) => {
+            if (!chunk || chunk.length === 0)
+                return;
+            this._log('Notify len=', chunk.length, 'data=', chunk);
+            this._rxSeq += 1; // for quiescence detection
+            this._rxBuf = concatU8(this._rxBuf, chunk);
+            // While a residual-drain is in progress the drain loop owns the buffer:
+            // just accumulate, so stale stream bytes never reach the control parser.
+            if (this._drainingResidual)
+                return;
+            if (this._streaming) {
+                this._parseStream();
+            }
+            else {
+                this._drainControl();
+            }
+        };
+        this._injectedTransport = opts.transport ?? null;
+        this._forceTimestampFmt = opts.timestampFmt;
+        this._timestampFmt = opts.timestampFmt ?? SHIMMER3_DEFAULTS.TIMESTAMP_FMT;
+        this._stopStreamingOnConnect = opts.stopStreamingOnConnect ?? true;
+        this._imuFamily = opts.imuGeneration === 'new' ? 'shimmer3-new' : 'shimmer3-old';
+        this.emitCalibratedInertial = opts.emitCalibratedInertial ?? true;
+    }
+    _log(...args) {
+        if (this.debug)
+            console.log('[Shimmer3]', ...args);
+    }
+    /** Best-effort label for `ObjectCluster`s and status messages. */
+    _deviceLabel() {
+        return this._transport?.deviceName ?? 'Shimmer3';
+    }
+    /** The streaming timestamp width currently in effect. */
+    get timestampFmt() {
+        return this._timestampFmt;
+    }
+    // ---------------------------------------------------------------------------
+    // Connection management + handshake
+    // ---------------------------------------------------------------------------
+    /**
+     * Open the RFCOMM connection and run the classic-Shimmer3 connect handshake.
+     *
+     * A transport is REQUIRED (constructor option or this parameter); classic
+     * Bluetooth cannot run in a browser, so there is no default. Calling without
+     * one throws.
+     *
+     * Handshake (ported from ShimmerBluetooth#initialize → readShimmerVersionNew →
+     * readFWVersion):
+     *   1. best-effort STOP_STREAMING (safety on reconnect; opt-out via options),
+     *   2. dummy GET_SAMPLING_RATE write + drain to flush the RFCOMM buffer,
+     *   3. GET_DEVICE_VERSION_COMMAND (0x3F) → DEVICE_VERSION_RESPONSE (HW version),
+     *   4. GET_FW_VERSION_COMMAND (0x2E) → FW_VERSION_RESPONSE (firmware version),
+     *   then the streaming timestamp width is derived from the firmware code.
+     */
+    async connect(transport) {
+        const t = transport ?? this._injectedTransport;
+        if (!t) {
+            throw new Error('Shimmer3Client requires an injected transport: classic Bluetooth (RFCOMM/SPP) ' +
+                'is not available in browsers. Pass a ShimmerTransport via the constructor ' +
+                '({ transport }) or connect(transport).');
+        }
+        this._transport = t;
+        this._notifyUnsub = t.onNotify(this._handleNotify);
+        this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
+        this._emitStatus('Opening RFCOMM connection…');
+        await t.connect();
+        this._emitStatus(`Connected: ${this._deviceLabel()}`);
+        await this._handshake();
+    }
+    async _handshake() {
+        // 2) Flush the serial buffer with a dummy read (ShimmerBluetooth#dummyReadSamplingRate:
+        //    "it actually acts to clear the write buffer"). A best-effort STOP first
+        //    ensures a device left streaming from a previous session is quiesced.
+        if (this._stopStreamingOnConnect) {
+            try {
+                await this._write(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]));
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        this._rxBuf = new Uint8Array(0);
+        this._emitStatus('Flushing RFCOMM buffer (dummy read)…');
+        try {
+            await this._write(new Uint8Array([OPCODES.GET_SAMPLING_RATE_COMMAND]));
+        }
+        catch {
+            /* ignore */
+        }
+        await new Promise((r) => setTimeout(r, SHIMMER3_DEFAULTS.DUMMY_READ_DRAIN_MS));
+        this._rxBuf = new Uint8Array(0); // discard whatever the dummy read produced
+        // 3) HW version. Responses may or may not be ACK-prefixed on classic firmware,
+        //    so wait for the response opcode directly (any leading ACK is ignored).
+        this._emitStatus('GET_DEVICE_VERSION → waiting for response…');
+        await this._write(new Uint8Array([OPCODES.GET_DEVICE_VERSION_COMMAND]));
+        const verBytes = await this._waitForResponse(OPCODES.DEVICE_VERSION_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
+        this.deviceVersion = parseShimmer3DeviceVersionResponse(verBytes);
+        this._emitStatus(`HW version = ${this.deviceVersion.hardwareVersion}`);
+        // 4) FW version.
+        this._emitStatus('GET_FW_VERSION → waiting for response…');
+        await this._write(new Uint8Array([OPCODES.GET_FW_VERSION_COMMAND]));
+        const fwBytes = await this._waitForResponse(OPCODES.FW_VERSION_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
+        this.firmwareVersion = parseShimmer3FwVersionResponse(fwBytes);
+        this._emitStatus(`FW version = ${this.firmwareVersion.major}.${this.firmwareVersion.minor}.${this.firmwareVersion.internal} (type ${this.firmwareVersion.firmwareIdentifier})`);
+        // Derive timestamp width from firmware unless the caller forced one.
+        if (this._forceTimestampFmt === undefined) {
+            this._timestampFmt = shimmer3UsesThreeByteTimestamp(this.firmwareVersion) ? 'u24' : 'u16';
+        }
+        this._emitStatus(`Handshake complete (timestamp = ${this._timestampFmt}).`);
+    }
+    async disconnect() {
+        try {
+            this._notifyUnsub?.();
+            this._disconnectUnsub?.();
+            await this._transport?.disconnect();
+        }
+        catch {
+            /* ignore */
+        }
+        finally {
+            this._notifyUnsub = this._disconnectUnsub = null;
+            this._transport = null;
+            this._rxBuf = new Uint8Array(0);
+            this.schema = null;
+            this._streaming = false;
+            this._streamStarting = false;
+            this.ExpPower = 0;
+            this._deviceCalibrations = {};
+            this._emitStatus('Disconnected');
+        }
+    }
+    /**
+     * Extract every complete control message currently buffered and dispatch each
+     * to the temp handlers, then keep the incomplete tail for the next chunk. This
+     * is what makes the unframed RFCOMM stream behave like framed BLE for the
+     * ACK/response machinery below.
+     */
+    _drainControl() {
+        let buf = this._rxBuf;
+        for (;;) {
+            if (buf.length === 0)
+                break;
+            // While a stream is (about to be) live, DATA_PACKET (0x00) bytes belong to
+            // the stream parser, not the control plane — leave them buffered.
+            if ((this._streaming || this._streamStarting) && buf[0] === OPCODES.DATA_PACKET)
+                break;
+            // Only frame 0x02 as an INQUIRY_RESPONSE when an inquiry is actually
+            // awaited; an unexpected 0x02 is a stray/stream byte and framing it would
+            // swallow real control bytes. Drop it instead.
+            if (buf[0] === OPCODES.INQUIRY_RESPONSE && this._awaitInq <= 0) {
+                this._log('drainControl: dropping 0x02 — no INQUIRY awaited');
+                buf = buf.subarray(1);
+                continue;
+            }
+            // Same guard for NACK (0xFE): only frame it as a control message while a
+            // command is genuinely awaiting a response (_awaitCmd > 0). A stray 0xFE —
+            // e.g. a late residual byte arriving after the stop-drain returned early —
+            // is dropped instead of framed. This diverges from the Java driver
+            // (ShimmerObject processes every 0xFE unconditionally) but strictly reduces
+            // the risk of a leaked stream byte being mistaken for a NACK, mirroring the
+            // 0x02 gate above. Defence-in-depth: today _onTemp handlers are added only
+            // while _awaitCmd > 0, so an ungated stray 0xFE would emit to no listener;
+            // this guard keeps that invariant explicit and survives refactors that add
+            // a longer-lived control listener.
+            if (buf[0] === NACK && this._awaitCmd <= 0) {
+                this._log('drainControl: dropping 0xFE — no command awaited');
+                buf = buf.subarray(1);
+                continue;
+            }
+            const len = shimmer3ControlMessageLength(buf);
+            if (len === NEED_MORE)
+                break;
+            if (len === RESYNC) {
+                this._log(`resync: dropping unexpected control byte 0x${buf[0].toString(16)}`);
+                buf = buf.subarray(1);
+                continue;
+            }
+            if (buf.length < len)
+                break; // full message not here yet
+            this._emitTemp(new Uint8Array(buf.subarray(0, len)));
+            buf = buf.subarray(len);
+        }
+        this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
+    }
+    // ---------------------------------------------------------------------------
+    // Configuration commands
+    // ---------------------------------------------------------------------------
+    getEnabledSensors() {
+        return this.enabledSensors;
+    }
+    getInternalExpPower() {
+        return this.ExpPower;
+    }
+    /**
+     * Enable sensors via a 24-bit bitmask (SET_SENSORS_COMMAND). Automatically
+     * re-inquires after the ACK to rebuild the stream schema, matching
+     * {@link Shimmer3RClient.setSensors}.
+     */
+    async setSensors(sensors) {
+        if (!Number.isFinite(sensors))
+            throw new Error('sensors must be a finite number');
+        if (!this._transport)
+            throw new Error('Not connected');
+        sensors = (sensors >>> 0) & 0xffffff;
+        const cmd = new Uint8Array([
+            OPCODES.SET_SENSORS_COMMAND,
+            sensors & 0xff,
+            (sensors >>> 8) & 0xff,
+            (sensors >>> 16) & 0xff,
+        ]);
+        this._emitStatus(`SET_SENSORS → 0x${sensors.toString(16).toUpperCase().padStart(6, '0')} waiting for ACK…`);
+        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        this._emitStatus('Sensors ACKed; re-inquiring to refresh schema…');
+        try {
+            const info = await this.inquiry();
+            this.enabledSensors = info.schema.enabledSensors;
+        }
+        catch (err) {
+            this._emitStatus(`Inquiry after setSensors failed: ${err.message}`);
+        }
+        return { sensors, enabledSensors: this.enabledSensors };
+    }
+    /**
+     * Set the sampling rate (SET_SAMPLING_RATE_COMMAND). The firmware takes a
+     * 16-bit divisor `floor(32768 / rateHz)`; identical to Shimmer3R.
+     */
+    async setSamplingRate(rateHz) {
+        if (!Number.isFinite(rateHz) || rateHz <= 0) {
+            throw new Error('Sampling rate must be a positive number (Hz)');
+        }
+        if (!this._transport)
+            throw new Error('Not connected');
+        let divisor = Math.floor(32768 / rateHz);
+        divisor = Math.max(1, Math.min(0xffff, divisor));
+        const cmd = new Uint8Array([
+            OPCODES.SET_SAMPLING_RATE_COMMAND,
+            divisor & 0xff,
+            (divisor >> 8) & 0xff,
+        ]);
+        this._emitStatus(`SET_SAMPLING_RATE → ${rateHz} Hz (divisor=${divisor}) waiting for ACK…`);
+        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        const appliedHz = 32768 / divisor;
+        this.samplingRateHz = appliedHz;
+        this._emitStatus(`Sampling rate ACKed. Applied ≈ ${appliedHz.toFixed(3)} Hz`);
+        return { requestedHz: rateHz, appliedHz, divisor };
+    }
+    /**
+     * Set the GSR measurement range (SET_GSR_RANGE_COMMAND).
+     * @param gsrRange 0 = 8–63 kΩ, 1 = 63–220 kΩ, 2 = 220–680 kΩ, 3 = 680–4700 kΩ, 4 = Auto.
+     */
+    async setGSRRange(gsrRange) {
+        if (!Number.isInteger(gsrRange) || gsrRange < 0 || gsrRange > 4) {
+            throw new Error('gsrRange must be 0–4');
+        }
+        if (!this._transport)
+            throw new Error('Not connected');
+        const cmd = new Uint8Array([OPCODES.SET_GSR_RANGE_COMMAND, gsrRange & 0xff]);
+        this._emitStatus('SET_GSR_RANGE → waiting for ACK…');
+        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        this.gsrRangeSetting = gsrRange;
+        this._emitStatus('SET_GSR_RANGE (ACK received).');
+        return { gsrRange };
+    }
+    /**
+     * Control the internal expansion power rail (required for ExG/EMG/ECG).
+     * @param expPower 0 = disable, 1 = enable.
+     */
+    async setInternalExpPower(expPower) {
+        if (expPower !== 0 && expPower !== 1)
+            throw new Error('expPower must be 0 or 1');
+        if (!this._transport)
+            throw new Error('Not connected');
+        const cmd = new Uint8Array([OPCODES.SET_INTERNAL_EXP_POWER_ENABLE_COMMAND, expPower]);
+        this._emitStatus(`SET_INTERNAL_EXP_POWER → ${expPower ? 'ON' : 'OFF'} waiting for ACK…`);
+        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        this.ExpPower = expPower;
+        try {
+            this.onExpPowerChanged?.(expPower);
+        }
+        catch (e) {
+            this._log('onExpPowerChanged handler error', e);
+        }
+        return { expPower };
+    }
+    // ---------------------------------------------------------------------------
+    // Inquiry
+    // ---------------------------------------------------------------------------
+    /**
+     * Send INQUIRY_COMMAND and parse the (Shimmer3-layout) response, building the
+     * stream schema. Tolerant of an optional leading ACK before the response.
+     */
+    async inquiry() {
+        if (!this._transport)
+            throw new Error('Not connected');
+        this._emitStatus('INQUIRY → waiting for response…');
+        await this._write(new Uint8Array([OPCODES.INQUIRY_COMMAND]));
+        const rsp = await this._waitForResponse(OPCODES.INQUIRY_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
+        const info = interpretShimmer3InquiryResponse(rsp, this._timestampFmt);
+        this.schema = info.schema;
+        this.samplingRateHz = info.samplingRateHz;
+        this.enabledSensors = info.schema.enabledSensors;
+        this.gsrRangeSetting = info.gsrRange;
+        this.ExpPower = info.internalExpPower;
+        // Inertial ranges from the config word (interpretShimmer3InquiryResponse):
+        // accelRange = WR accel (LSM303), gyroRange = MPU gyro, magRange = LSM303 mag.
+        // LN accel (Kionix) is fixed-range → 0.
+        this.imuRanges = {
+            lnAccel: 0,
+            wrAccel: info.accelRange,
+            gyro: info.gyroRange,
+            mag: info.magRange,
+            altAccel: 0,
+            altMag: 0,
+        };
+        this._emitStatus(`Inquiry: ${info.numChannels} ch, ${info.samplingRateHz.toFixed(2)} Hz, ` +
+            `sensors=0x${info.schema.enabledSensors.toString(16).toUpperCase()}`);
+        try {
+            this.onInquiry?.(info);
+        }
+        catch (e) {
+            this._log('onInquiry handler error', e);
+        }
+        return info;
+    }
+    /**
+     * Arm a one-shot soft reboot that the device performs as soon as this host
+     * disconnects (SET_FEATURE / FEATURE_REBOOT_ON_DISCONNECT).
+     *
+     * Settings that firmware only reads at boot - notably the EEPROM brand
+     * record's advertising names - otherwise need a manual power-cycle. The
+     * reboot cannot happen while still connected, because the link has to drop
+     * for the Bluetooth module to re-read its name; so the sequence is: write
+     * settings, call this, then {@link disconnect}.
+     *
+     * Firmware skips the reboot while sensing so that it can never truncate an
+     * active SD recording, and clears the request either way - it is strictly
+     * one-shot and never carries into a later disconnect.
+     *
+     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; older
+     * firmware NACKs the unknown feature id.
+     */
+    async setRebootOnDisconnect(enabled) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        this._emitStatus(`SET_FEATURE reboot-on-disconnect=${enabled ? 1 : 0} → waiting for ACK…`);
+        await this._writeExpectingAck(new Uint8Array([OPCODES.SET_FEATURE, BT_FEATURE.REBOOT_ON_DISCONNECT, enabled ? 1 : 0]), SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        this._emitStatus(`Reboot-on-disconnect ${enabled ? 'armed' : 'cleared'}`);
+    }
+    // ---------------------------------------------------------------------------
+    // Daughter-card (expansion board) EEPROM memory
+    // ---------------------------------------------------------------------------
+    /**
+     * Read from the daughter-card EEPROM memory. `offset` is a HOST offset —
+     * firmware maps it past the first (HW details) EEPROM page, so host offsets
+     * 0..2031 cover absolute EEPROM bytes 16..2047.
+     */
+    async readDaughterCardMem(offset, length) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        if (!Number.isInteger(offset) || offset < 0 || offset > 2031) {
+            throw new Error('Daughter-card mem offset must be an integer in 0..2031.');
+        }
+        if (!Number.isInteger(length) || length < 1 || length > 128 || offset + length > 2032) {
+            throw new Error('Daughter-card mem read must be 1..128 bytes within 0..2031.');
+        }
+        this._emitStatus(`GET_DAUGHTER_CARD_MEM ${length}B @ ${offset} → waiting for RSP…`);
+        const cmd = new Uint8Array([
+            OPCODES.GET_DAUGHTER_CARD_MEM_COMMAND,
+            length & 0xff,
+            offset & 0xff,
+            (offset >> 8) & 0xff,
+        ]);
+        await this._write(cmd);
+        const rsp = await this._waitForResponse(OPCODES.DAUGHTER_CARD_MEM_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
+        /* Response is [DAUGHTER_CARD_MEM_RSP][length][data...]; the opcode and
+         * length bytes are skipped when present and consistent. */
+        let off = 0;
+        if (rsp[off] === OPCODES.DAUGHTER_CARD_MEM_RESPONSE)
+            off++;
+        if (rsp.length > off && rsp[off] === length && rsp.length >= off + 1 + length)
+            off++;
+        const data = rsp.slice(off, off + length);
+        if (data.length < length) {
+            throw new Error(`Daughter-card mem read returned ${data.length} of ${length} bytes.`);
+        }
+        return data;
+    }
+    /**
+     * Write to the daughter-card EEPROM memory. `offset` is a HOST offset (see
+     * {@link readDaughterCardMem}). Max 128 bytes per write.
+     */
+    async writeDaughterCardMem(offset, data) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        if (!Number.isInteger(offset) || offset < 0 || offset > 2031) {
+            throw new Error('Daughter-card mem offset must be an integer in 0..2031.');
+        }
+        if (data.length < 1 || data.length > 128 || offset + data.length > 2032) {
+            throw new Error('Daughter-card mem write must be 1..128 bytes within 0..2031.');
+        }
+        this._emitStatus(`SET_DAUGHTER_CARD_MEM ${data.length}B @ ${offset} → waiting for ACK…`);
+        const cmd = new Uint8Array(4 + data.length);
+        cmd[0] = OPCODES.SET_DAUGHTER_CARD_MEM_COMMAND;
+        cmd[1] = data.length & 0xff;
+        cmd[2] = offset & 0xff;
+        cmd[3] = (offset >> 8) & 0xff;
+        cmd.set(data, 4);
+        await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        this._emitStatus('Daughter-card mem write ACKed');
+    }
+    // ---------------------------------------------------------------------------
+    // Streaming
+    // ---------------------------------------------------------------------------
+    async startStreaming() {
+        if (!this._transport)
+            throw new Error('Not connected');
+        if (!this.schema)
+            this._emitStatus('Starting stream without schema (not recommended).');
+        // Stale buffered bytes (e.g. residual post-stop stream data) would desync
+        // the ACK wait for START — drain to quiescence and discard them first. A
+        // clean state (empty buffer) skips this entirely.
+        if (this._rxBuf.length > 0) {
+            this._drainingResidual = true;
+            try {
+                await this._drainQuiescent(300, 2000);
+            }
+            finally {
+                this._drainingResidual = false;
+            }
+            this._log('start: discarded', this._rxBuf.length, 'stale byte(s) pre-START');
+            this._rxBuf = new Uint8Array(0);
+        }
+        this._streamStarting = true;
+        this._lastTs = 0;
+        this._emitStatus('START_STREAMING → waiting for ACK…');
+        try {
+            await this._writeExpectingAck(new Uint8Array([OPCODES.START_STREAMING_COMMAND]), SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        }
+        catch (e) {
+            this._streamStarting = false;
+            throw e;
+        }
+        this._streaming = true;
+        this._streamStarting = false;
+        // Bytes that arrived after the ACK are the first data — parse them now.
+        this._parseStream();
+        this._emitStatus('START_STREAMING ACK received; frames should follow.');
+    }
+    async stopStreaming() {
+        this._emitStatus('STOP_STREAMING → sending, then draining residual stream…');
+        try {
+            await this._write(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]));
+        }
+        catch (err) {
+            this._emitStatus(`STOP_STREAMING write failed: ${err.message}`);
+        }
+        // In-flight stream packets keep arriving for hundreds of ms after STOP.
+        // Flipping to control mode instantly would let residual data hit
+        // _drainControl, where a stray 0xFE fabricates a NACK and a stray 0x02
+        // swallows real bytes (including ACKs). Keep the stream parser active while
+        // draining (or accumulate-only if we weren't in streaming mode — e.g.
+        // quiescing a device left streaming unattended), and only re-enable the
+        // control plane once the pipe has been quiet for ~300 ms.
+        this._streamStarting = false;
+        if (!this._streaming)
+            this._drainingResidual = true;
+        try {
+            await this._drainQuiescent(300, 3000);
+        }
+        finally {
+            this._drainingResidual = false;
+        }
+        if (this._rxBuf.length) {
+            this._log('stop drain: discarding', this._rxBuf.length, 'residual byte(s)');
+        }
+        this._streaming = false;
+        this._rxBuf = new Uint8Array(0);
+        this._emitStatus('Streaming stopped.');
+    }
+    /**
+     * Resolve once no bytes have arrived for `quietMs` (checked every 50 ms via
+     * the `_rxSeq` counter bumped in {@link _handleNotify}), or `maxMs` overall.
+     *
+     * HEURISTIC (hardware QA, please probe): the Shimmer3 streaming protocol has
+     * no end-of-stream handshake — STOP_STREAMING is ACKed but the firmware does
+     * not signal when the last data frame has been flushed over RFCOMM. Draining
+     * "until quiet" is therefore best-effort: the 300 ms quiet window / 3 s cap
+     * are tuned guesses, not protocol guarantees. Too short and a late residual
+     * frame leaks into the next command's control parsing; too long and stop()
+     * stalls. Values may need adjusting against real BT latency/buffering.
+     */
+    async _drainQuiescent(quietMs, maxMs) {
+        const start = Date.now();
+        let lastSeq = this._rxSeq;
+        let quietSince = Date.now();
+        for (;;) {
+            await new Promise((r) => setTimeout(r, 50));
+            if (this._rxSeq !== lastSeq) {
+                lastSeq = this._rxSeq;
+                quietSince = Date.now();
+            }
+            if (Date.now() - quietSince >= quietMs)
+                return;
+            if (Date.now() - start >= maxMs) {
+                this._log('drainQuiescent: max wait reached with pipe still active');
+                return;
+            }
+        }
+    }
+    // ---------------------------------------------------------------------------
+    // Stream frame parser (schema-driven; double-preamble resync)
+    // ---------------------------------------------------------------------------
+    //
+    // Minimal v1 parser — the streaming data path is a later phase, but building a
+    // working parser here proves the schema and keeps streaming from being
+    // precluded. The frame layout (0x00 preamble + timestamp + channels) is
+    // identical to Shimmer3R (ShimmerObject#interpretDataPacketFormat), so this
+    // follows the same double-preamble sync as Shimmer3RClient.
+    _parseStream() {
+        if (!this.schema)
+            return;
+        const sch = this.schema;
+        const preamble = sch.dataPreambleByte;
+        const frameBytes = sch.frameBytes >>> 0;
+        const tsBytes = sch.timestampFmt === 'u16' ? 2 : 3;
+        let buf = this._rxBuf;
+        while (buf.length >= frameBytes * 2) {
+            if (buf[0] === preamble && buf[frameBytes] === preamble) {
+                try {
+                    const frame = buf.subarray(0, frameBytes);
+                    let cursor = 1;
+                    const oc = new ObjectCluster(this._deviceLabel());
+                    const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le$1(frame, cursor);
+                    cursor += tsBytes;
+                    oc.add('TIMESTAMP', ts, 'ticks', 'raw');
+                    for (const f of sch.fields) {
+                        let v;
+                        switch (f.fmt) {
+                            case 'i16':
+                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$3(frame, cursor));
+                                break;
+                            case 'u16':
+                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$3(frame, cursor);
+                                break;
+                            case 'i24':
+                                v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
+                                break;
+                            case 'u24':
+                                v = f.endian === 'be' ? u24be(frame, cursor) : u24le$1(frame, cursor);
+                                break;
+                            case 'i12*': {
+                                const raw12 = ((frame[cursor] & 0xff) << 4) | ((frame[cursor + 1] & 0xff) >> 4);
+                                v = raw12 & 0x800 ? raw12 - 0x1000 : raw12;
+                                break;
+                            }
+                            case 'u8':
+                                v = frame[cursor];
+                                break;
+                            default:
+                                v = u16le$3(frame, cursor);
+                        }
+                        cursor += f.sizeBytes;
+                        oc.add(f.name, v, null, 'raw');
+                    }
+                    this._lastTs = ts;
+                    this._calibrateData(oc);
+                    this.onStreamFrame?.(oc);
+                    buf = buf.subarray(frameBytes);
+                }
+                catch (e) {
+                    this._log('frame decode error → sliding 1 byte', e.message);
+                    buf = buf.subarray(1);
+                }
+                continue;
+            }
+            buf = buf.subarray(1); // resync
+        }
+        this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
+    }
+    /** Inline GSR calibration, matching Shimmer3RClient. */
+    _calibrateData(oc) {
+        for (const field of [...oc.fields]) {
+            if (field.name !== GSR_NAME)
+                continue;
+            const gsrraw = oc.get(GSR_NAME, 'raw')?.value ?? null;
+            if (gsrraw === null)
+                continue;
+            let adc12 = gsrraw & 0x0fff;
+            let currentRange = this.gsrRangeSetting;
+            if (currentRange === 4)
+                currentRange = (gsrraw >> 14) & 0x03;
+            if (currentRange === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3)
+                adc12 = GSR_UNCAL_LIMIT_RANGE3;
+            let gsrkOhm = calibrateGsrDataToResistanceFromAmplifierEq(adc12, currentRange);
+            gsrkOhm = nudgeGsrResistance(gsrkOhm, this.gsrRangeSetting);
+            oc.add(GSR_NAME, (1.0 / gsrkOhm) * 1000, 'uSiemens', 'cal');
+        }
+        // Inertial calibration (LN/WR accel, gyro, mag): device calibration from
+        // readCalibration() when available, else the range-selected default.
+        if (this.emitCalibratedInertial) {
+            applyStreamingCalibration(oc, {
+                family: this._imuFamily,
+                ranges: this.imuRanges,
+                device: this._deviceCalibrations,
+            });
+        }
+    }
+    /**
+     * Fetch the device's per-sensor kinematic calibration over RFCOMM and upgrade
+     * the active streaming calibration (overriding the range-selected defaults).
+     * Opt-in and non-fatal: a group that times out or NACKs keeps its default.
+     *
+     * Uses the per-sensor GET calibration commands (each answers with
+     * `[responseOpcode][21-byte block]`), chosen over the 0x9A GET_CALIB_DUMP
+     * because the per-sensor path is unambiguous in the Java oracle.
+     *
+     * HARDWARE-VERIFY: no real Shimmer3 radio has exercised this path.
+     *
+     * @returns the groups whose calibration was successfully read.
+     */
+    async readCalibration(timeoutMs = SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        const plan = [
+            {
+                group: 'lnAccel',
+                get: OPCODES.GET_LN_ACCEL_CALIBRATION_COMMAND,
+                resp: OPCODES.LN_ACCEL_CALIBRATION_RESPONSE,
+            },
+            {
+                group: 'gyro',
+                get: OPCODES.GET_GYRO_CALIBRATION_COMMAND,
+                resp: OPCODES.GYRO_CALIBRATION_RESPONSE,
+            },
+            {
+                group: 'mag',
+                get: OPCODES.GET_MAG_CALIBRATION_COMMAND,
+                resp: OPCODES.MAG_CALIBRATION_RESPONSE,
+            },
+            {
+                group: 'wrAccel',
+                get: OPCODES.GET_WR_ACCEL_CALIBRATION_COMMAND,
+                resp: OPCODES.WR_ACCEL_CALIBRATION_RESPONSE,
+            },
+        ];
+        const done = [];
+        for (const { group, get, resp } of plan) {
+            try {
+                await this._write(new Uint8Array([get]));
+                const rsp = await this._waitForResponse(resp, timeoutMs);
+                if (rsp.length < 22)
+                    continue; // opcode + 21-byte block
+                const scale = getGroupDefaults(this._imuFamily, group)?.sensitivityScale ?? 1;
+                const cal = parseKinematicCalibBlock(rsp.subarray(1, 22), { sensitivityScale: scale });
+                if (cal) {
+                    this._deviceCalibrations[group] = cal;
+                    done.push(group);
+                }
+            }
+            catch (err) {
+                this._emitStatus(`readCalibration(${group}) skipped: ${err.message}`);
+            }
+        }
+        return done;
+    }
+    // ---------------------------------------------------------------------------
+    // Low-level transport + ACK/response helpers
+    // ---------------------------------------------------------------------------
+    async _write(u8) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        this._log('Write', u8);
+        await this._transport.write(u8);
+    }
+    async _writeExpectingAck(u8, ackTimeoutMs) {
+        await this._write(u8);
+        await this._waitForAck(ackTimeoutMs);
+    }
+    /** Resolve on the next ACK control message; reject on NACK or timeout. */
+    _waitForAck(timeoutMs) {
+        return new Promise((resolve, reject) => {
+            // Mark a command in flight so _drainControl frames NACK (0xFE) only while
+            // this window is open; balanced on every settle path below.
+            this._awaitCmd += 1;
+            const settle = () => {
+                this._awaitCmd = Math.max(0, this._awaitCmd - 1);
+            };
+            const t = setTimeout(() => {
+                settle();
+                this._offTemp(handler);
+                reject(new Error('ACK timeout'));
+            }, timeoutMs);
+            const handler = (msg) => {
+                if (msg.length === 0)
+                    return;
+                if (msg[0] === ACK) {
+                    clearTimeout(t);
+                    settle();
+                    this._offTemp(handler);
+                    resolve();
+                }
+                else if (msg[0] === NACK) {
+                    clearTimeout(t);
+                    settle();
+                    this._offTemp(handler);
+                    reject(new Error('NACK received'));
+                }
+            };
+            this._onTemp(handler);
+        });
+    }
+    /**
+     * Resolve on the next control message whose opcode matches `expectedOpcode`.
+     * Leading ACKs are ignored (classic firmware may or may not ACK-prefix a
+     * response); a NACK rejects.
+     */
+    _waitForResponse(expectedOpcode, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            // Track that an INQUIRY_RESPONSE is genuinely awaited so _drainControl
+            // only frames 0x02 while this window is open. _awaitCmd (bumped for every
+            // command) gates NACK framing the same way.
+            if (expectedOpcode === OPCODES.INQUIRY_RESPONSE)
+                this._awaitInq += 1;
+            this._awaitCmd += 1;
+            const settleInq = () => {
+                if (expectedOpcode === OPCODES.INQUIRY_RESPONSE) {
+                    this._awaitInq = Math.max(0, this._awaitInq - 1);
+                }
+                this._awaitCmd = Math.max(0, this._awaitCmd - 1);
+            };
+            const t = setTimeout(() => {
+                settleInq();
+                this._offTemp(handler);
+                reject(new Error(`Response timeout (opcode 0x${expectedOpcode.toString(16)})`));
+            }, timeoutMs);
+            const handler = (msg) => {
+                if (msg.length === 0)
+                    return;
+                if (msg[0] === ACK)
+                    return; // tolerate optional ACK prefix
+                if (msg[0] === NACK) {
+                    clearTimeout(t);
+                    settleInq();
+                    this._offTemp(handler);
+                    reject(new Error('NACK received'));
+                    return;
+                }
+                if (msg[0] === expectedOpcode) {
+                    clearTimeout(t);
+                    settleInq();
+                    this._offTemp(handler);
+                    resolve(msg);
+                }
+            };
+            this._onTemp(handler);
+        });
+    }
+    _onTemp(fn) {
+        this._temps.add(fn);
+    }
+    _offTemp(fn) {
+        this._temps.delete(fn);
+    }
+    _emitTemp(buf) {
+        this._temps.forEach((fn) => {
+            try {
+                fn(buf);
+            }
+            catch (e) {
+                this._log('temp handler error', e);
+            }
+        });
+    }
+}
+
+/**
+ * InfoMem → {@link InfoMemDeviceConfig} decode.
+ *
+ * Ported from `ShimmerObject#configBytesParse` (ShimmerObject.java:4931-5111)
+ * and `#parseEnabledDerivedSensorsForMaps` (:5113-5149). Pure and byte-exact:
+ * offsets come from {@link resolveInfoMemLayout}, field semantics from the Java
+ * accessors.
+ */
+/**
+ * Sampling clock frequency for the InfoMem sampling-rate field. The crystal
+ * (non-TCXO) 32768 Hz is used, matching the Java SD-log sampling-rate math
+ * (`getSamplingClockFreq()` resolves to the crystal for a fresh parse where the
+ * TCXO flag is not yet known). See `ShimmerObject#getSamplingClockFreq`.
+ */
+const INFOMEM_SAMPLING_CLOCK_FREQ = 32768;
+const bit = (byte, shift, mask) => (byte >> shift) & mask;
+/** True for a printable ASCII byte (Apache commons `isAsciiPrintable`: [0x20,0x7E]). */
+function isAsciiPrintable(b) {
+    return b >= 0x20 && b < 0x7f;
+}
+/** Decode an ASCII name field, stopping at the first non-printable byte. */
+function parseName(bytes, offset, length) {
+    let s = '';
+    for (let i = 0; i < length; i++) {
+        const b = bytes[offset + i];
+        if (b === undefined || !isAsciiPrintable(b))
+            break;
+        s += String.fromCharCode(b);
+    }
+    return s;
+}
+/** 12-char UPPERCASE hex, in device byte order (UtilShimmer.bytesToHexString). */
+function macToHex(bytes, offset) {
+    let s = '';
+    for (let i = 0; i < MAC_LENGTH; i++) {
+        s += (bytes[offset + i] ?? 0).toString(16).toUpperCase().padStart(2, '0');
+    }
+    return s;
+}
+/** Parse the enabled + derived sensor bitmaps (parseEnabledDerivedSensorsForMaps). */
+function parseSensors(bytes, layout) {
+    let enabled = (bytes[layout.idxSensors0] & 0xff) +
+        (bytes[layout.idxSensors1] & 0xff) * 2 ** 8 +
+        (bytes[layout.idxSensors2] & 0xff) * 2 ** 16;
+    if (layout.supportsMpl) {
+        enabled += (bytes[layout.idxSensors3] & 0xff) * 2 ** 24;
+        enabled += (bytes[layout.idxSensors4] & 0xff) * 2 ** 32;
+    }
+    let derived = 0n;
+    // Compatible only when the derived offsets are present (>0) and not 0xFF.
+    if (layout.idxDerivedSensors0 > 0 &&
+        bytes[layout.idxDerivedSensors0] !== MASK.DERIVED_BYTE &&
+        layout.idxDerivedSensors1 > 0 &&
+        bytes[layout.idxDerivedSensors1] !== MASK.DERIVED_BYTE) {
+        derived |= BigInt(bytes[layout.idxDerivedSensors0] & 0xff);
+        derived |= BigInt(bytes[layout.idxDerivedSensors1] & 0xff) << 8n;
+        if (layout.idxDerivedSensors2 > 0) {
+            derived |= BigInt(bytes[layout.idxDerivedSensors2] & 0xff) << 16n;
+        }
+        if (layout.supportsEightByteDerived) {
+            derived |= BigInt(bytes[layout.idxDerivedSensors3] & 0xff) << 24n;
+            derived |= BigInt(bytes[layout.idxDerivedSensors4] & 0xff) << 32n;
+            derived |= BigInt(bytes[layout.idxDerivedSensors5] & 0xff) << 40n;
+            derived |= BigInt(bytes[layout.idxDerivedSensors6] & 0xff) << 48n;
+            derived |= BigInt(bytes[layout.idxDerivedSensors7] & 0xff) << 56n;
+        }
+    }
+    return { enabledSensors: enabled, derivedSensors: derived };
+}
+/** A neutral (all-default) config, used for an unconfigured (invalid) InfoMem. */
+function emptyConfig(raw) {
+    return {
+        samplingRateHz: 0,
+        enabledSensors: 0,
+        derivedSensors: 0n,
+        gsrRange: 0,
+        expPowerEnabled: false,
+        deviceName: '',
+        trialName: '',
+        configTime: 0,
+        trial: {
+            id: 0,
+            numShimmers: 0,
+            syncWhenLogging: false,
+            masterShimmer: false,
+            buttonStart: false,
+            singleTouch: false,
+            tcxo: false,
+            disableBluetooth: false,
+        },
+        btBaudRate: 0,
+        macAddress: '',
+        exg1: new Uint8Array(EXG_BANK_LENGTH),
+        exg2: new Uint8Array(EXG_BANK_LENGTH),
+        raw,
+        valid: false,
+    };
+}
+/**
+ * Decode a Shimmer3/3R InfoMem byte array into a {@link InfoMemDeviceConfig}.
+ *
+ * When the first 6 bytes are all 0xFF the InfoMem is unconfigured: the returned
+ * config has `valid = false` and neutral defaults (the Java driver loads
+ * defaults in this case), with the raw bytes preserved.
+ *
+ * @param bytes the full InfoMem (≥ {@link INFOMEM_SIZE} bytes recommended;
+ *   shorter input is tolerated but out-of-range fields read as 0).
+ * @param ctx   firmware/hardware identity selecting the byte layout.
+ */
+function parseInfoMem(bytes, ctx) {
+    const raw = new Uint8Array(bytes);
+    if (!checkConfigBytesValid(raw)) {
+        return emptyConfig(raw);
+    }
+    const layout = resolveInfoMemLayout(ctx);
+    // Sampling rate (LSB-first divider).
+    const divider = (raw[layout.idxSamplingRate] & 0xff) + ((raw[layout.idxSamplingRate + 1] & 0xff) << 8);
+    const samplingRateHz = divider === 0 ? 0 : INFOMEM_SAMPLING_CLOCK_FREQ / divider;
+    const { enabledSensors, derivedSensors } = parseSensors(raw, layout);
+    const cfg3 = raw[layout.idxConfigSetupByte3] & 0xff;
+    const gsrRange = bit(cfg3, BIT_SHIFT.GSR_RANGE, MASK.GSR_RANGE);
+    const expPowerEnabled = bit(cfg3, BIT_SHIFT.EXP_POWER, MASK.EXP_POWER) === 1;
+    const exg1 = raw.slice(layout.idxExg1, layout.idxExg1 + EXG_BANK_LENGTH);
+    const exg2 = raw.slice(layout.idxExg2, layout.idxExg2 + EXG_BANK_LENGTH);
+    const btBaudRate = raw[layout.idxBtCommBaudRate] & 0xff;
+    const deviceName = parseName(raw, layout.idxSDShimmerName, NAME_LENGTH);
+    const trialName = parseName(raw, layout.idxSDEXPIDName, NAME_LENGTH);
+    // Config time (big-endian).
+    let configTime = 0;
+    for (let x = 0; x < CONFIG_TIME_LENGTH; x++) {
+        configTime += (raw[layout.idxSDConfigTime0 + x] & 0xff) * 2 ** CONFIG_TIME_BIT_SHIFTS[x];
+    }
+    const cfg0 = raw[layout.idxSDExperimentConfig0] & 0xff;
+    const cfg1 = raw[layout.idxSDExperimentConfig1] & 0xff;
+    // Experiment-config fields gated on firmware family / SD-log-sync support,
+    // matching the Java parse guards.
+    const buttonStart = layout.isSdLoggingFirmware && bit(cfg0, BIT_SHIFT.BUTTON_START, MASK.ONE_BIT) === 1;
+    const disableBluetooth = layout.isSdLoggingFirmware && bit(cfg0, BIT_SHIFT.DISABLE_BLUETOOTH, MASK.ONE_BIT) === 1;
+    const tcxo = layout.isSdLoggingFirmware && bit(cfg1, BIT_SHIFT.TCXO, MASK.ONE_BIT) === 1;
+    const syncWhenLogging = layout.supportsSdLogSync && bit(cfg0, BIT_SHIFT.SYNC_WHEN_LOGGING, MASK.ONE_BIT) === 1;
+    const masterShimmer = layout.supportsSdLogSync && bit(cfg0, BIT_SHIFT.MASTER_SHIMMER, MASK.ONE_BIT) === 1;
+    const singleTouch = layout.supportsSdLogSync && bit(cfg1, BIT_SHIFT.SINGLE_TOUCH, MASK.ONE_BIT) === 1;
+    const id = layout.supportsSdLogSync ? raw[layout.idxSDMyTrialID] & 0xff : 0;
+    const numShimmers = layout.supportsSdLogSync ? raw[layout.idxSDNumOfShimmers] & 0xff : 0;
+    const macAddress = macToHex(raw, layout.idxMacAddress);
+    return {
+        samplingRateHz,
+        enabledSensors,
+        derivedSensors,
+        gsrRange,
+        expPowerEnabled,
+        deviceName,
+        trialName,
+        configTime,
+        trial: {
+            id,
+            numShimmers,
+            syncWhenLogging,
+            masterShimmer,
+            buttonStart,
+            singleTouch,
+            tcxo,
+            disableBluetooth,
+        },
+        btBaudRate,
+        macAddress,
+        exg1,
+        exg2,
+        raw,
+        valid: true,
+    };
+}
+
+/**
+ * {@link InfoMemDeviceConfig} → InfoMem byte array.
+ *
+ * Ported from `ShimmerObject#configBytesGenerate` (ShimmerObject.java:5162-5380).
+ *
+ * Byte-layout, endianness and field gating are byte-exact against the Java
+ * oracle. One deliberate structural refinement: the Java generate rebuilds the
+ * whole InfoMem from scratch (0x00-filled) because a full `ShimmerObject`
+ * carries every sub-setting (sensor rates/ranges, calibration blocks, sync-node
+ * list) and rewrites them via per-sensor `configBytesGenerate`. This codec
+ * intentionally models only the subset in {@link InfoMemDeviceConfig}, so it
+ * instead layers the modelled fields over a BASE byte array (read-modify-write),
+ * preserving every unmodelled region (sensor rate/range bytes, calibration
+ * blocks, sync-node MAC list, showErrorLeds / low-batt bits). This matches the
+ * real configure-while-docked flow (read InfoMem → change a field → write back)
+ * and the spec requirement that "unknown regions must be preserved from a base
+ * byte array".
+ *
+ * HARDWARE-VERIFY: the device-write finalization — forcing the MAC to all-0xFF
+ * (so firmware re-reads it from the BT transceiver) and setting the
+ * config-file-creation flag in the config-delay byte (so firmware regenerates
+ * its SD config on undock/power-cycle) — is faithfully ported, but whether the
+ * device accepts and applies the written InfoMem can only be confirmed on real
+ * hardware.
+ */
+/** Overwrite a contiguous byte range. */
+function setBytes(out, offset, src) {
+    for (let i = 0; i < src.length; i++)
+        out[offset + i] = src[i] & 0xff;
+}
+/** Read-modify-write a single bit-field within a byte, preserving other bits. */
+function setBitField(out, offset, shift, mask, value) {
+    const cleared = out[offset] & ~(mask << shift) & 0xff;
+    out[offset] = (cleared | ((value & mask) << shift)) & 0xff;
+}
+/**
+ * Encode a {@link InfoMemDeviceConfig} to a {@link INFOMEM_SIZE}-byte InfoMem
+ * array ready to write to the device (128-byte chunks) or store.
+ */
+function generateInfoMem(config, ctx, opts = {}) {
+    const layout = resolveInfoMemLayout(ctx);
+    const out = new Uint8Array(INFOMEM_SIZE); // 0x00-filled
+    // Preserve unmodelled regions from the base (or the config's own raw bytes).
+    const base = opts.base ?? config.raw;
+    if (base && base.length > 0) {
+        out.set(base.subarray(0, Math.min(base.length, INFOMEM_SIZE)), 0);
+    }
+    writeModelledFields(out, config, layout);
+    if (opts.forDeviceWrite && layout.isSdLoggingFirmware) {
+        applyDeviceWriteFinalization(out, config, layout);
+    }
+    return out;
+}
+function writeModelledFields(out, config, layout) {
+    // Sampling rate (LSB-first divider = round(clock / Hz)).
+    const divider = config.samplingRateHz > 0 ? Math.round(INFOMEM_SAMPLING_CLOCK_FREQ / config.samplingRateHz) : 0;
+    out[layout.idxSamplingRate] = divider & 0xff;
+    out[layout.idxSamplingRate + 1] = (divider >> 8) & 0xff;
+    // Buffer size forced to 1 (BtStream rejects InfoMem otherwise) — ShimmerObject.java:5192.
+    out[layout.idxBufferSize] = 1;
+    // Enabled sensors: bytes 0-2 (bits 0-23). Bytes 3-4 (MPL) are written by the
+    // Java per-sensor generate, not the main path, so they are left to base.
+    out[layout.idxSensors0] = config.enabledSensors & 0xff;
+    out[layout.idxSensors1] = (config.enabledSensors >>> 8) & 0xff;
+    out[layout.idxSensors2] = (config.enabledSensors >>> 16) & 0xff;
+    // GSR range + expansion-board power (ConfigSetupByte3 bits 1-3 / bit 0),
+    // read-modify-write so the byte's other bits (pressure/accel range) survive.
+    setBitField(out, layout.idxConfigSetupByte3, BIT_SHIFT.GSR_RANGE, MASK.GSR_RANGE, config.gsrRange);
+    setBitField(out, layout.idxConfigSetupByte3, BIT_SHIFT.EXP_POWER, MASK.EXP_POWER, config.expPowerEnabled ? 1 : 0);
+    // EXG register banks (10 bytes each).
+    setBytes(out, layout.idxExg1, exgBank(config.exg1));
+    setBytes(out, layout.idxExg2, exgBank(config.exg2));
+    // Bluetooth baud.
+    out[layout.idxBtCommBaudRate] = config.btBaudRate & 0xff;
+    // Derived sensors (only when the layout has them, matching parse gating).
+    if (layout.idxDerivedSensors0 > 0 && layout.idxDerivedSensors1 > 0) {
+        const d = config.derivedSensors;
+        out[layout.idxDerivedSensors0] = derivedByte(d, 0n);
+        out[layout.idxDerivedSensors1] = derivedByte(d, 8n);
+        if (layout.idxDerivedSensors2 > 0)
+            out[layout.idxDerivedSensors2] = derivedByte(d, 16n);
+        if (layout.supportsEightByteDerived) {
+            out[layout.idxDerivedSensors3] = derivedByte(d, 24n);
+            out[layout.idxDerivedSensors4] = derivedByte(d, 32n);
+            out[layout.idxDerivedSensors5] = derivedByte(d, 40n);
+            out[layout.idxDerivedSensors6] = derivedByte(d, 48n);
+            out[layout.idxDerivedSensors7] = derivedByte(d, 56n);
+        }
+    }
+    // Names: up to 12 ASCII chars, remaining bytes padded 0xFF.
+    writeName(out, layout.idxSDShimmerName, config.deviceName);
+    writeName(out, layout.idxSDEXPIDName, config.trialName);
+    // Config time (big-endian).
+    for (let x = 0; x < CONFIG_TIME_LENGTH; x++) {
+        out[layout.idxSDConfigTime0 + x] =
+            Math.floor(config.configTime / 2 ** CONFIG_TIME_BIT_SHIFTS[x]) & 0xff;
+    }
+    // Experiment-config bit-fields (read-modify-write, gated like the Java parse/generate).
+    const t = config.trial;
+    if (layout.isSdLoggingFirmware) {
+        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.BUTTON_START, MASK.ONE_BIT, t.buttonStart ? 1 : 0);
+        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.DISABLE_BLUETOOTH, MASK.ONE_BIT, t.disableBluetooth ? 1 : 0);
+        setBitField(out, layout.idxSDExperimentConfig1, BIT_SHIFT.TCXO, MASK.ONE_BIT, t.tcxo ? 1 : 0);
+    }
+    if (layout.supportsSdLogSync) {
+        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.SYNC_WHEN_LOGGING, MASK.ONE_BIT, t.syncWhenLogging ? 1 : 0);
+        setBitField(out, layout.idxSDExperimentConfig0, BIT_SHIFT.MASTER_SHIMMER, MASK.ONE_BIT, t.masterShimmer ? 1 : 0);
+        setBitField(out, layout.idxSDExperimentConfig1, BIT_SHIFT.SINGLE_TOUCH, MASK.ONE_BIT, t.singleTouch ? 1 : 0);
+        out[layout.idxSDMyTrialID] = t.id & 0xff;
+        out[layout.idxSDNumOfShimmers] = t.numShimmers & 0xff;
+    }
+}
+/**
+ * Device-write finalization (ShimmerObject.java:5320-5339): force the MAC to
+ * all-0xFF and set the config-file-creation flag. These are the ONLY bytes that
+ * intentionally diverge from a plain round-trip after a device write — see
+ * {@link deviceWriteDivergentRanges}.
+ */
+function applyDeviceWriteFinalization(out, config, layout) {
+    // MAC → invalid (0xFF×6): firmware re-reads it from the BT transceiver.
+    for (let i = 0; i < MAC_LENGTH; i++)
+        out[layout.idxMacAddress + i] = 0xff;
+    // Config-delay byte: set the config-file-write flag bit when requested.
+    out[layout.idxSDConfigDelayFlag] = 0;
+    // We always request a new SD config on undock (mirrors mConfigFileCreationFlag=true
+    // in the desktop write path). HARDWARE-VERIFY: this flag is what makes the FW
+    // regenerate its SD config on undock/power-cycle.
+    const flag = MASK.SD_CFG_FILE_WRITE_FLAG << BIT_SHIFT.SD_CFG_FILE_WRITE_FLAG;
+    out[layout.idxSDConfigDelayFlag] |= flag;
+}
+/**
+ * Byte ranges that {@link generateInfoMem} with `forDeviceWrite` intentionally
+ * leaves diverged from the input config — used by the write-back verify to
+ * exclude them from the byte comparison.
+ */
+function deviceWriteDivergentRanges(ctx) {
+    const layout = resolveInfoMemLayout(ctx);
+    return {
+        mac: { start: layout.idxMacAddress, length: MAC_LENGTH },
+        configDelayFlag: { start: layout.idxSDConfigDelayFlag, length: 1 },
+    };
+}
+function exgBank(bank) {
+    if (bank.length === EXG_BANK_LENGTH)
+        return bank;
+    const b = new Uint8Array(EXG_BANK_LENGTH);
+    b.set(bank.subarray(0, EXG_BANK_LENGTH), 0);
+    return b;
+}
+function derivedByte(value, shift) {
+    return Number((value >> shift) & 0xffn);
+}
+function writeName(out, offset, name) {
+    for (let i = 0; i < NAME_LENGTH; i++) {
+        out[offset + i] = i < name.length ? name.charCodeAt(i) & 0xff : 0xff;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WiredShimmerClient
+// ---------------------------------------------------------------------------
+/**
+ * Client for a Shimmer sitting in a BasicDock/Base, talking over the dock's
+ * FTDI **UART** (host↔device). This is the wired/dock protocol
+ * (`com.shimmerresearch.comms.wiredProtocol`), which is entirely separate from
+ * the Bluetooth LiteProtocol used by {@link Shimmer3Client} /
+ * `Shimmer3RClient` — different framing (`$`-header packets with a component +
+ * property address, length, payload and a Shimmer-specific CRC), a different
+ * request/response state machine, and a different CRC (`./crc.ts`).
+ *
+ * Scope (phase D1): identify + status + property-level config for a single
+ * docked device. NO mass-storage/SD, NO firmware flashing, NO multi-slot Base
+ * state machine (those are later phases). Streaming is not part of the dock
+ * protocol.
+ *
+ * Robustness: the dock UART is an unframed byte stream (serial has no message
+ * boundaries), so — exactly like {@link Shimmer3Client} — this client
+ * accumulates inbound bytes and extracts complete packets with a length-aware
+ * parser ({@link wiredPacketLength}), tolerant of packets split, dribbled or
+ * coalesced arbitrarily. A packet whose CRC fails triggers a single-byte
+ * resync, matching the Java `parseSinglePacket` recovery path.
+ *
+ * Transport injection is mandatory — `connect()` with no transport throws.
+ *
+ * @example
+ * ```ts
+ * const client = new WiredShimmerClient({ transport: dockSerialTransport });
+ * await client.connect();
+ * const id = await client.identify();     // { mac, hwVersion, firmwareVersion, expansionBoard }
+ * const status = await client.getStatus(); // { voltage, percentage, chargingStatus, ... }
+ * const range = await client.getConfig(UART_PROP.GSR.RANGE);
+ * await client.setConfig(UART_PROP.GSR.RANGE, new Uint8Array([2]));
+ * ```
+ */
+class WiredShimmerClient extends BaseShimmerClient {
+    constructor(opts = {}) {
+        super(opts);
+        this._injectedTransport = null;
+        this._transport = null;
+        this._notifyUnsub = null;
+        this._disconnectUnsub = null;
+        this._rxBuf = new Uint8Array(0);
+        this._temps = new Set();
+        /**
+         * Serialization queue. Every public command method chains onto this so that
+         * only one request/response exchange is in flight at a time — the docked
+         * Shimmer speaks a strictly sequential request/response protocol and the
+         * Java driver clears pending ACKs before each command
+         * (AbstractCommsProtocolWired.java:318,358). Without this, overlapping
+         * commands could cross-resolve on the shared temp-handler set (e.g. one
+         * command's ACK satisfying another's {@link _waitForAck}), masking a failed
+         * write. See {@link _serialize}.
+         */
+        this._queue = Promise.resolve();
+        // Cached device info
+        this.identity = null;
+        this._handleTransportDisconnect = () => {
+            this._emitStatus('Dock disconnected');
+        };
+        // ---------------------------------------------------------------------------
+        // RX: accumulate an unframed byte stream, extract complete packets
+        // ---------------------------------------------------------------------------
+        this._handleNotify = (chunk) => {
+            if (!chunk || chunk.length === 0)
+                return;
+            this._log('Notify len=', chunk.length);
+            this._rxBuf = concatU8(this._rxBuf, chunk);
+            this._drain();
+        };
+        this._injectedTransport = opts.transport ?? null;
+    }
+    _log(...args) {
+        if (this.debug)
+            console.log('[WiredDock]', ...args);
+    }
+    _deviceLabel() {
+        return this._transport?.deviceName ?? 'Shimmer(dock)';
+    }
+    // ---------------------------------------------------------------------------
+    // Connection management
+    // ---------------------------------------------------------------------------
+    /**
+     * Open the dock UART connection. A transport is REQUIRED (constructor option
+     * or this parameter). Mirrors `BasicDock#setupDock` (open port); the identify
+     * / status reads are exposed as explicit methods rather than run implicitly,
+     * so callers control ordering (the Java auto-read order is preserved in
+     * {@link identify}).
+     */
+    async connect(transport) {
+        const t = transport ?? this._injectedTransport;
+        if (!t) {
+            throw new Error('WiredShimmerClient requires an injected transport: a docked Shimmer is only ' +
+                'reachable over the dock UART. Pass a ShimmerTransport via the constructor ' +
+                '({ transport }) or connect(transport).');
+        }
+        this._transport = t;
+        this._notifyUnsub = t.onNotify(this._handleNotify);
+        this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
+        this._emitStatus('Opening dock UART connection…');
+        await t.connect();
+        this._rxBuf = new Uint8Array(0);
+        this._emitStatus(`Connected: ${this._deviceLabel()}`);
+    }
+    async disconnect() {
+        try {
+            this._notifyUnsub?.();
+            this._disconnectUnsub?.();
+            await this._transport?.disconnect();
+        }
+        catch {
+            /* ignore */
+        }
+        finally {
+            this._notifyUnsub = this._disconnectUnsub = null;
+            this._transport = null;
+            this._rxBuf = new Uint8Array(0);
+            this._temps.clear();
+            this._emitStatus('Disconnected');
+        }
+    }
+    /**
+     * Discard any buffered inbound bytes, resyncing the byte stream. Used by
+     * {@link SmartDockClient} after a SmartDock slot change: switching the active
+     * slot re-routes the per-Shimmer UART to a different device, so any bytes left
+     * over from the previous slot must be dropped before the next request. (The
+     * `_drain` parser is already tolerant of leading garbage / bad CRC, so this is
+     * belt-and-braces rather than strictly required.)
+     */
+    resyncStream() {
+        this._rxBuf = new Uint8Array(0);
+    }
+    /** Streaming is not part of the dock UART protocol. */
+    async startStreaming() {
+        throw new Error('Streaming is not supported over the dock UART (use the Bluetooth client).');
+    }
+    async stopStreaming() {
+        /* no-op: the dock protocol has no stream to stop */
+    }
+    // ---------------------------------------------------------------------------
+    // High-level operations
+    // ---------------------------------------------------------------------------
+    /**
+     * Read the docked device's identity. Follows the order of
+     * `BasicDock#internalReadShimmerDetails` (MAC → HW/FW version → daughter-card
+     * ID). Battery is read separately via {@link getStatus}. The three reads run
+     * as one atomic serialized unit (see {@link _serialize}).
+     */
+    async identify() {
+        return this._serialize(() => this._identifyImpl());
+    }
+    async _identifyImpl() {
+        const mac = await this._readMacImpl();
+        const firmwareVersion = await this._readVersionImpl();
+        const expansionBoard = await this._readExpansionBoardImpl().catch(() => null);
+        const id = {
+            mac,
+            hardwareVersion: firmwareVersion.hardwareVersion,
+            firmwareVersion,
+            expansionBoard,
+        };
+        this.identity = id;
+        this._emitStatus(`Identified ${mac} HW=${id.hardwareVersion} FW=${firmwareVersion.firmwareVersionMajor}.` +
+            `${firmwareVersion.firmwareVersionMinor}.${firmwareVersion.firmwareVersionInternal} ` +
+            `(type ${firmwareVersion.firmwareIdentifier})`);
+        return id;
+    }
+    /** Read battery voltage / % / charging state (BAT.VALUE). */
+    async getStatus() {
+        return this._serialize(() => this._getStatusImpl());
+    }
+    async _getStatusImpl() {
+        const payload = await this._read(UART_PROP.BAT.VALUE);
+        const status = parseBatteryStatus(payload);
+        this._emitStatus(`Battery ${status.voltage.toFixed(3)} V` +
+            (status.percentage !== null ? ` (~${status.percentage.toFixed(0)}%)` : '') +
+            ` — ${status.chargingStatus}`);
+        return status;
+    }
+    /**
+     * Read the MAC address (MAIN_PROCESSOR.MAC), retrying a total of
+     * `WIRED_DEFAULTS.MAC_READ_RETRIES` (= 2) attempts as the Java dock does
+     * (`AbstractDock.readMacId`, AbstractDock.java:1153 `for(i=0;i<
+     * READ_MAC_RETRY_ATTEMPTS;i++)` → 2 total attempts).
+     */
+    async readMac() {
+        return this._serialize(() => this._readMacImpl());
+    }
+    async _readMacImpl() {
+        let lastErr;
+        for (let attempt = 0; attempt < WIRED_DEFAULTS.MAC_READ_RETRIES; attempt++) {
+            try {
+                const payload = await this._read(UART_PROP.MAIN_PROCESSOR.MAC);
+                return parseMacId(payload);
+            }
+            catch (err) {
+                lastErr = err;
+                this._log(`readMac attempt ${attempt + 1} failed: ${err.message}`);
+            }
+        }
+        throw lastErr instanceof Error ? lastErr : new Error('readMac failed');
+    }
+    /** Read the HW/FW version (MAIN_PROCESSOR.VER). */
+    async readVersion() {
+        return this._serialize(() => this._readVersionImpl());
+    }
+    async _readVersionImpl() {
+        const payload = await this._read(UART_PROP.MAIN_PROCESSOR.VER);
+        return parseVersionInfo(payload);
+    }
+    /**
+     * Read the daughter-card (expansion board) ID — the first 16 bytes of the
+     * card memory (`DAUGHTER_CARD.CARD_ID`, address 0). Returns null when no board
+     * is fitted. Cheap enough to include in {@link identify}.
+     */
+    async readExpansionBoard() {
+        return this._serialize(() => this._readExpansionBoardImpl());
+    }
+    async _readExpansionBoardImpl() {
+        const payload = await this._readMem(UART_PROP.DAUGHTER_CARD.CARD_ID, 0, 16);
+        return parseExpansionBoard(payload);
+    }
+    /**
+     * Read from the daughter-card EEPROM memory (`DAUGHTER_CARD.CARD_MEM`).
+     * `address` is a HOST offset — firmware maps it past the first (HW details)
+     * EEPROM page, so host offsets 0..2031 cover absolute EEPROM bytes 16..2047.
+     */
+    async readDaughterCardMem(address, size) {
+        if (!Number.isInteger(address) || address < 0 || address > 2031) {
+            throw new Error('Daughter-card mem address must be an integer in 0..2031.');
+        }
+        if (!Number.isInteger(size) || size < 1 || size > 128 || address + size > 2032) {
+            throw new Error('Daughter-card mem read must be 1..128 bytes within 0..2031.');
+        }
+        return this._serialize(() => this._readMem(UART_PROP.DAUGHTER_CARD.CARD_MEM, address, size));
+    }
+    /**
+     * Write to the daughter-card EEPROM memory (`DAUGHTER_CARD.CARD_MEM`).
+     * `address` is a HOST offset (see {@link readDaughterCardMem}).
+     */
+    async writeDaughterCardMem(address, data) {
+        if (!Number.isInteger(address) || address < 0 || address > 2031) {
+            throw new Error('Daughter-card mem address must be an integer in 0..2031.');
+        }
+        if (data.length < 1 || data.length > 128 || address + data.length > 2032) {
+            throw new Error('Daughter-card mem write must be 1..128 bytes within 0..2031.');
+        }
+        return this._serialize(async () => {
+            const payload = buildMemWritePayload(UART_PROP.DAUGHTER_CARD.CARD_MEM, address, data);
+            await this._writeRaw(UART_PROP.DAUGHTER_CARD.CARD_MEM, payload);
+            this._emitStatus(`Daughter-card mem write ACKed (${data.length}B @ ${address})`);
+        });
+    }
+    // ---------------------------------------------------------------------------
+    // Property-level config
+    // ---------------------------------------------------------------------------
+    /** Read one config property's raw payload (READ). */
+    async getConfig(arg) {
+        if (arg.permission === 'WRITE_ONLY') {
+            throw new Error(`Property ${arg.name} is write-only`);
+        }
+        return this._serialize(() => this._read(arg));
+    }
+    /** Write one config property (WRITE), resolving on ACK. */
+    async setConfig(arg, value) {
+        if (arg.permission === 'READ_ONLY') {
+            throw new Error(`Property ${arg.name} is read-only`);
+        }
+        return this._serialize(async () => {
+            await this._write(arg, value);
+            this._emitStatus(`SET ${arg.name} ACKed`);
+        });
+    }
+    /**
+     * Read every property in `UART_CONFIG_COMMANDS` (the Java
+     * `mListOfUartCommandsConfig` order). Individual reads that error (e.g. a
+     * property the docked firmware does not implement) are captured rather than
+     * aborting the batch — the returned map's value is the raw payload or the
+     * Error for that property.
+     */
+    async getConfigAll() {
+        return this._serialize(() => this._getConfigAllImpl());
+    }
+    async _getConfigAllImpl() {
+        const out = new Map();
+        for (const arg of UART_CONFIG_COMMANDS) {
+            if (arg.permission === 'WRITE_ONLY')
+                continue;
+            try {
+                out.set(arg, await this._read(arg));
+            }
+            catch (err) {
+                out.set(arg, err instanceof Error ? err : new Error(String(err)));
+            }
+        }
+        return out;
+    }
+    // ---------------------------------------------------------------------------
+    // Low-level InfoMem escape hatch (raw read/write; no layout interpretation)
+    // ---------------------------------------------------------------------------
+    /**
+     * Raw InfoMem read (`MAIN_PROCESSOR.INFOMEM`). Returns `size` bytes from
+     * `address`. The InfoMem *layout* is deliberately NOT interpreted in D1 — this
+     * is a byte-level escape hatch.
+     */
+    async readInfoMem(address, size) {
+        return this._serialize(() => this._readMem(UART_PROP.MAIN_PROCESSOR.INFOMEM, address, size));
+    }
+    /** Raw InfoMem write (`MAIN_PROCESSOR.INFOMEM`), resolving on ACK. */
+    async writeInfoMem(address, data) {
+        return this._serialize(async () => {
+            const payload = buildMemWritePayload(UART_PROP.MAIN_PROCESSOR.INFOMEM, address, data);
+            await this._writeRaw(UART_PROP.MAIN_PROCESSOR.INFOMEM, payload);
+        });
+    }
+    // ---------------------------------------------------------------------------
+    // InfoMem configuration (configure-while-docked, phase P2)
+    // ---------------------------------------------------------------------------
+    /**
+     * Read the full {@link INFOMEM_SIZE}-byte InfoMem in 128-byte page chunks
+     * (D → C → B), reassembled in order. The page addresses sent depend on the
+     * firmware/hardware (legacy MSP430 0x1800/… vs. flat 0/128/256), resolved
+     * from the cached {@link identity} — call {@link identify} (or
+     * {@link readVersion}) first.
+     */
+    async readInfoMemBytes() {
+        return this._serialize(() => this._readInfoMemBytesImpl(this._infoMemCtx()));
+    }
+    /**
+     * Write the full {@link INFOMEM_SIZE}-byte InfoMem in 128-byte page chunks,
+     * each resolving on its per-chunk ACK (the write guarantee is per-chunk
+     * CRC + ACK). Requires a cached {@link identity} for the page addressing.
+     */
+    async writeInfoMemBytes(bytes) {
+        if (bytes.length !== INFOMEM_SIZE) {
+            throw new Error(`writeInfoMemBytes expects ${INFOMEM_SIZE} bytes, got ${bytes.length}`);
+        }
+        return this._serialize(() => this._writeInfoMemBytesImpl(this._infoMemCtx(), bytes));
+    }
+    /**
+     * Read + decode the docked device's configuration. Uses the cached
+     * {@link identity} (already-read version info) as the {@link InfoMemContext}.
+     */
+    async readInfoMemConfig() {
+        return this._serialize(async () => {
+            const ctx = this._infoMemCtx();
+            const bytes = await this._readInfoMemBytesImpl(ctx);
+            return parseInfoMem(bytes, ctx);
+        });
+    }
+    /**
+     * Write the docked device's real-world clock from a host timestamp
+     * (`MAIN_PROCESSOR.RTC_CFG_TIME`), resolving on ACK. Port of
+     * `CommsProtocolWiredShimmerViaDock.writeRealWorldClockFromPcTime`
+     * (CommsProtocolWiredShimmerViaDock.java:138-153), which calls
+     * `writeRealWorldClock(System.currentTimeMillis())`.
+     *
+     * `nowMs` (UNIX epoch ms) is injectable for testability; it defaults to
+     * `Date.now()` — captured at call time, matching the Java's use of the current
+     * PC time. The payload is the 8-byte, LSB-first 32.768 kHz tick count
+     * ({@link msToRtcBytesLE}).
+     *
+     * NB the target property is `RTC_CFG_TIME` (0x04) — hardware-confirmed
+     * (DEV-866 drift tool bring-up): the firmware's UART_SET handler implements
+     * a time write ONLY for this property (RTC_setTimeFromTicksPtr), while a
+     * SET on CURR_LOCAL_TIME (0x05) is answered with BAD_CMD. The Java props
+     * table's READ_ONLY flag on 0x04 was wrong; the SDK table now says
+     * READ_WRITE, matching the firmware.
+     */
+    async writeRtcFromHostTime(nowMs) {
+        return this._serialize(() => this._writeRtcFromHostTimeImpl(nowMs ?? Date.now()));
+    }
+    /** Non-serialized RTC write — callers must already hold the queue. */
+    async _writeRtcFromHostTimeImpl(nowMs) {
+        const payload = msToRtcBytesLE(nowMs); // HARDWARE-VERIFY: ms × 32.768 ticks, 8 bytes LSB-first
+        await this._write(UART_PROP.MAIN_PROCESSOR.RTC_CFG_TIME, payload);
+        this._emitStatus('RTC set from host time');
+    }
+    /**
+     * Encode + write a configuration to the docked device. The MAC is forced to
+     * all-0xFF and the config-file-creation flag is set (device-write semantics),
+     * so the firmware re-reads its MAC from the BT transceiver and regenerates the
+     * SD config on undock/power-cycle.
+     *
+     * When `opts.setRtc` (default `true`, matching desktop), the device's
+     * real-world clock is written FIRST from the host time, then the InfoMem — the
+     * exact order of desktop `CallableWriteConfig.call()`
+     * (BasicDock.java:1556-1587): (1) RTC write when `isSupportedRtcConfigViaUart`,
+     * (2) chunked InfoMem write. The RTC write and InfoMem write are one atomic
+     * queued unit. RTC failure ABORTS the config write (the InfoMem write is NOT
+     * attempted) — desktop rethrows the RTC `ExecutionException` before reaching
+     * the InfoMem write (BasicDock.java:1564-1573), so this is deliberately NOT
+     * best-effort. On an identity that does not support RTC-via-UART the RTC write
+     * is SKIPPED (not failed), also matching desktop.
+     *
+     * Finalization (plain config write): there is NO reboot/poll/rewrite here — the
+     * device applies the new config and regenerates its SD config file on the next
+     * undock / power-cycle. This is identical for Shimmer3 and Shimmer3R. The
+     * reboot-then-rewrite dance is a DFU (firmware-update) concern only and is out
+     * of scope for a plain config write (BasicDock.java:1556).
+     *
+     * With `opts.verify`, the InfoMem is read back and byte-compared against the
+     * written bytes, EXCLUDING the intentionally-divergent ranges (the MAC bytes,
+     * forced to 0xFF, and the config-delay/flag byte). Returns
+     * `{ verified: boolean }` when verify was requested, or `{ verified: null }`
+     * otherwise.
+     *
+     * HARDWARE-VERIFY: whether the device accepts and applies the write (and
+     * regenerates its SD config on undock) can only be confirmed on real hardware.
+     */
+    async writeInfoMemConfig(config, opts = {}) {
+        return this._serialize(async () => {
+            const ctx = this._infoMemCtx();
+            // (1) RTC write first, exactly as desktop CallableWriteConfig orders it.
+            //     Skipped (not failed) on unsupported identities; a failure here aborts
+            //     before the InfoMem write, matching the Java rethrow semantics.
+            const setRtc = opts.setRtc ?? true;
+            if (setRtc && isSupportedRtcConfigViaUart(ctx.hardwareVersion, ctx.firmwareId)) {
+                await this._writeRtcFromHostTimeImpl(Date.now());
+            }
+            // (2) chunked InfoMem write.
+            const bytes = generateInfoMem(config, ctx, { base: config.raw, forDeviceWrite: true });
+            await this._writeInfoMemBytesImpl(ctx, bytes);
+            if (!opts.verify)
+                return { verified: null };
+            const readback = await this._readInfoMemBytesImpl(ctx);
+            const verified = compareInfoMemExcluding(bytes, readback, deviceWriteDivergentRanges(ctx));
+            return { verified };
+        });
+    }
+    /** Build the InfoMem layout context from the cached identity (requires identify/readVersion). */
+    _infoMemCtx() {
+        const id = this.identity;
+        if (!id) {
+            throw new Error('InfoMem operations need the device version: call identify() (or readVersion()) first.');
+        }
+        const fv = id.firmwareVersion;
+        return {
+            hardwareVersion: id.hardwareVersion,
+            firmwareId: fv.firmwareIdentifier,
+            firmwareVersion: {
+                major: fv.firmwareVersionMajor,
+                minor: fv.firmwareVersionMinor,
+                internal: fv.firmwareVersionInternal,
+            },
+        };
+    }
+    /** Non-serialized chunked read (D/C/B pages) — callers must already hold the queue. */
+    async _readInfoMemBytesImpl(ctx) {
+        const layout = resolveInfoMemLayout(ctx);
+        const pageAddrs = [layout.addrD, layout.addrC, layout.addrB];
+        const out = new Uint8Array(INFOMEM_SIZE);
+        for (let i = 0; i < pageAddrs.length; i++) {
+            const chunk = await this._readMem(UART_PROP.MAIN_PROCESSOR.INFOMEM, pageAddrs[i], INFOMEM_PAGE_SIZE);
+            if (chunk.length < INFOMEM_PAGE_SIZE) {
+                throw new Error(`InfoMem page ${i} short read: expected ${INFOMEM_PAGE_SIZE} bytes, got ${chunk.length}`);
+            }
+            out.set(chunk.subarray(0, INFOMEM_PAGE_SIZE), i * INFOMEM_PAGE_SIZE);
+        }
+        return out;
+    }
+    /** Non-serialized chunked write (D/C/B pages) — callers must already hold the queue. */
+    async _writeInfoMemBytesImpl(ctx, bytes) {
+        const layout = resolveInfoMemLayout(ctx);
+        const pageAddrs = [layout.addrD, layout.addrC, layout.addrB];
+        for (let i = 0; i < pageAddrs.length; i++) {
+            const page = bytes.subarray(i * INFOMEM_PAGE_SIZE, (i + 1) * INFOMEM_PAGE_SIZE);
+            const payload = buildMemWritePayload(UART_PROP.MAIN_PROCESSOR.INFOMEM, pageAddrs[i], page);
+            await this._writeRaw(UART_PROP.MAIN_PROCESSOR.INFOMEM, payload);
+        }
+    }
+    // ---------------------------------------------------------------------------
+    // Serialization
+    // ---------------------------------------------------------------------------
+    /**
+     * Run `fn` after every previously-queued operation has settled, so all public
+     * command methods execute strictly one-at-a-time (see {@link _queue}). The
+     * queue itself never rejects — a failed op does not poison later ones — while
+     * the caller still receives `fn`'s own resolution/rejection.
+     */
+    _serialize(fn) {
+        const run = this._queue.then(() => fn());
+        this._queue = run.then(() => undefined, () => undefined);
+        return run;
+    }
+    // ---------------------------------------------------------------------------
+    // Request/response core
+    // ---------------------------------------------------------------------------
+    /** Send a READ and await the matching DATA_RESPONSE payload. */
+    async _read(arg, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        await this._transport.write(buildReadPacket(arg));
+        return this._waitForDataResponse(arg, timeoutMs);
+    }
+    /** Send a memory READ and await the matching DATA_RESPONSE payload. */
+    async _readMem(arg, address, size, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        const payload = buildMemReadPayload(arg, address, size);
+        await this._transport.write(buildUartPacket(UART_PACKET_CMD.READ, arg, payload));
+        return this._waitForDataResponse(arg, timeoutMs);
+    }
+    /** Send a WRITE with a value and await ACK. */
+    async _write(arg, value, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        await this._transport.write(buildWritePacket(arg, value));
+        await this._waitForAck(timeoutMs);
+    }
+    /** Send a WRITE with a pre-built payload (e.g. mem write) and await ACK. */
+    async _writeRaw(arg, payload, timeoutMs = WIRED_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        await this._transport.write(buildUartPacket(UART_PACKET_CMD.WRITE, arg, payload));
+        await this._waitForAck(timeoutMs);
+    }
+    /** Resolve with the payload of a DATA_RESPONSE matching comp+prop; reject on bad/timeout. */
+    _waitForDataResponse(arg, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            const t = setTimeout(() => {
+                this._offTemp(handler);
+                reject(new Error(`Response timeout (READ ${arg.name})`));
+            }, timeoutMs);
+            const handler = (pkt) => {
+                if (isBadResponse(pkt.command)) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    reject(new Error(`Device error: ${badResponseReason(pkt.command)} (READ ${arg.name})`));
+                    return;
+                }
+                if (pkt.command === UART_PACKET_CMD.DATA_RESPONSE &&
+                    pkt.component === arg.component &&
+                    pkt.property === arg.property) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    resolve(pkt.payload);
+                }
+            };
+            this._onTemp(handler);
+        });
+    }
+    /** Resolve on the next ACK; reject on bad response or timeout. */
+    _waitForAck(timeoutMs) {
+        return new Promise((resolve, reject) => {
+            const t = setTimeout(() => {
+                this._offTemp(handler);
+                reject(new Error('ACK timeout'));
+            }, timeoutMs);
+            const handler = (pkt) => {
+                if (pkt.command === UART_PACKET_CMD.ACK_RESPONSE) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    resolve();
+                }
+                else if (isBadResponse(pkt.command)) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    reject(new Error(`Device error: ${badResponseReason(pkt.command)}`));
+                }
+            };
+            this._onTemp(handler);
+        });
+    }
+    /**
+     * Extract every complete packet currently buffered and dispatch each to the
+     * temp handlers, keeping the incomplete tail for the next chunk. A packet
+     * whose CRC fails is dropped one byte at a time to resync (matching the Java
+     * `parseSinglePacket` CRC-fail path).
+     */
+    _drain() {
+        let buf = this._rxBuf;
+        for (;;) {
+            if (buf.length === 0)
+                break;
+            const len = wiredPacketLength(buf);
+            if (len === NEED_MORE$1)
+                break;
+            if (len === RESYNC$1) {
+                this._log(`resync: dropping byte 0x${buf[0].toString(16)}`);
+                buf = buf.subarray(1);
+                continue;
+            }
+            if (buf.length < len)
+                break; // full packet not here yet
+            let pkt;
+            try {
+                pkt = parseUartPacket(buf);
+            }
+            catch {
+                buf = buf.subarray(1); // malformed — resync
+                continue;
+            }
+            if (!pkt.crcOk) {
+                this._log('bad CRC → dropping 1 byte to resync');
+                buf = buf.subarray(1);
+                continue;
+            }
+            this._emitTemp(pkt);
+            buf = buf.subarray(pkt.length);
+        }
+        this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
+    }
+    _onTemp(fn) {
+        this._temps.add(fn);
+    }
+    _offTemp(fn) {
+        this._temps.delete(fn);
+    }
+    _emitTemp(pkt) {
+        this._temps.forEach((fn) => {
+            try {
+                fn(pkt);
+            }
+            catch (e) {
+                this._log('temp handler error', e);
+            }
+        });
+    }
+}
+/**
+ * Byte-compare `written` against `readback` over the full InfoMem, ignoring the
+ * ranges that a device write intentionally leaves diverged (the MAC bytes,
+ * forced to 0xFF, and the config-delay/flag byte the firmware may rewrite).
+ */
+function compareInfoMemExcluding(written, readback, ranges) {
+    if (written.length !== readback.length)
+        return false;
+    const excluded = new Set();
+    for (const r of [ranges.mac, ranges.configDelayFlag]) {
+        for (let i = 0; i < r.length; i++)
+            excluded.add(r.start + i);
+    }
+    for (let i = 0; i < written.length; i++) {
+        if (excluded.has(i))
+            continue;
+        if (written[i] !== readback[i])
+            return false;
+    }
+    return true;
+}
+
+/**
+ * Pure codec for the Shimmer **SmartDock** (Base-6 / Base-15) multi-slot base
+ * command layer.
+ *
+ * This is the *base-level* protocol a SmartDock speaks over its FTDI UART — it
+ * is entirely distinct from the per-Shimmer binary `$`-header UART protocol in
+ * `./protocol.ts` (D1). The base commands are short **ASCII** strings
+ * terminated with `$`; the base replies with `\r\n`-terminated ASCII lines. The
+ * SmartDock switches which physical slot (docked Shimmer) is routed onto the
+ * *separate* per-Shimmer UART channel, so multi-slot support is: drive these
+ * ASCII base commands to enumerate/select a slot, then speak the D1 binary
+ * protocol to the now-active slot.
+ *
+ * Ported from the Java driver (read-only oracle):
+ *   com.shimmerresearch.managers.dockManager.SmartDockUart
+ *     (SmartDockUart.java:44-65   — BASE_CMD ASCII command strings)
+ *     (SmartDockUart.java:194-242 — set active slot / connection type)
+ *     (SmartDockUart.java:793-869 — version / active-slot response parse)
+ *   com.shimmerresearch.managers.dockManager.SmartDockUartListener
+ *     (SmartDockUartListener.java:62-296 — `\r\n` line framing + response
+ *      classification by leading char; the `Q,<map>` / `V,...` / `P,NN` shapes)
+ *   com.shimmerresearch.comms.wiredProtocol.SmartDockActiveSlotDetails
+ *     (SmartDockActiveSlotDetails.java:13-26 — connection types)
+ *   com.shimmerresearch.managers.dockManager.SmartDockVerInfoDetails
+ *     (SmartDockVerInfoDetails.java:11-31 — HW/FW version fields)
+ *   com.shimmerresearch.driverUtilities.HwDriverShimmerDeviceDetails
+ *     (HwDriverShimmerDeviceDetails.java:248-250 BASE_HARDWARE_IDS; :313-321
+ *      slot counts BASE15→15, BASE6→6)
+ *
+ * Everything here is side-effect-free so it can be unit-tested with fixtures and
+ * reused by {@link SmartDockClient} regardless of the byte pipe underneath.
+ */
+/** ASCII carriage-return + line-feed — every base response line ends with this. */
+const SMARTDOCK_LINE_TERMINATOR = '\r\n';
+/**
+ * SmartDock connection type for a slot select (SmartDockActiveSlotDetails.java:13-15).
+ * D2 is read-only and only ever uses `WITHOUT_SD_CARD` (partial connect, enough
+ * to read the docked Shimmer over the per-Shimmer UART); `WITH_SD_CARD` (full
+ * connect for mass-storage) is defined for completeness but NOT driven.
+ */
+const SMARTDOCK_CONNECTION_TYPE = Object.freeze({
+    DISCONNECTED: 0,
+    WITH_SD_CARD: 1,
+    WITHOUT_SD_CARD: 2,
+});
+/**
+ * SmartDock base ASCII commands (SmartDockUart.java:44-65). Each is sent as-is
+ * over the base UART; a `$` terminates the command. Slot-select commands append
+ * `,NN$` (two-digit zero-padded slot, `%02d`, SmartDockUart.java:231).
+ *
+ * Only the READ-ONLY subset needed for D2 (version, occupancy query, slot
+ * select without SD, disconnect) is surfaced as a driven command; the BSL-mask
+ * / GPIO / reset / indicator-LED commands in the Java table are deliberately
+ * omitted (out of scope, and several are write/flash-adjacent).
+ */
+const SMARTDOCK_BASE_CMD = Object.freeze({
+    /** `SDV$` → version info. */
+    GET_VERSION: 'SDV$',
+    /** `SDQ$` → per-slot occupancy bitmap. */
+    QUERY_CONNECTED_SLOTS: 'SDQ$',
+    /** `SDP$` → current active slot (without-SD form). */
+    GET_ACTIVE_SLOT: 'SDP$',
+    /** `SDP` prefix → set active slot WITHOUT SD access (append `,NN$`). */
+    SET_SLOT_WITHOUT_SD: 'SDP',
+    /** `SDC` prefix → set active slot WITH SD access (append `,NN$`). Not driven in D2. */
+    SET_SLOT_WITH_SD: 'SDC',
+    /** `SDD$` → disconnect all slots. */
+    DISCONNECT_ALL: 'SDD$',
+});
+/**
+ * SmartDock request/response timing, ported from
+ * com.shimmerresearch.managers.dockManager.SmartDock (SmartDock.java):
+ * - `SMARTDOCK_RESPONSE_TIMEOUT` = 1000 ms (:66) — normal base command reply.
+ * - `SMARTDOCK_RESPONSE_TIMEOUT_SLOT_CHANGE` = 10000 ms (:67) — slot switch.
+ * and com.shimmerresearch.managers.dockManager.AbstractDock:
+ * - `SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD` = 1500 ms (AbstractDock.java:96) —
+ *   settle delay after a without-SD slot change before talking to the Shimmer.
+ * - `CMD_RETRY_ATTEMPTS` = 2 (SmartDockUart.java:30).
+ */
+const SMARTDOCK_DEFAULTS = Object.freeze({
+    RESPONSE_TIMEOUT_MS: 1000,
+    SLOT_CHANGE_TIMEOUT_MS: 10000,
+    SLOT_CHANGEOVER_DELAY_MS: 1500,
+    CMD_RETRY_ATTEMPTS: 2,
+});
+/**
+ * Base hardware IDs from the version response's hardware-version field
+ * (HwDriverShimmerDeviceDetails.java:248-250 `BASE_HARDWARE_IDS`).
+ */
+const BASE_HARDWARE_IDS = Object.freeze({
+    BASE15U: 1,
+    BASE6U: 2,
+});
+/**
+ * Map a base hardware-version byte to a family + slot count
+ * (HwDriverShimmerDeviceDetails.java:313-321: BASE15→15 slots, BASE6→6 slots,
+ * BASICDOCK→1). NB: in the Java driver the slot count actually comes from the
+ * USB device descriptor, not the version byte — see the SmartDock README
+ * hardware-verify note.
+ */
+function baseHardwareType(hardwareVersion) {
+    switch (hardwareVersion) {
+        case BASE_HARDWARE_IDS.BASE15U:
+            return { hardwareType: 'base15', slotCount: 15 };
+        case BASE_HARDWARE_IDS.BASE6U:
+            return { hardwareType: 'base6', slotCount: 6 };
+        default:
+            return { hardwareType: 'unknown', slotCount: 0 };
+    }
+}
+// ---------------------------------------------------------------------------
+// TX — command assembly
+// ---------------------------------------------------------------------------
+const ASCII = new TextEncoder();
+/** Encode a base ASCII command string to bytes (UTF-8 == ASCII for this set). */
+function buildBaseCommand(cmd) {
+    return ASCII.encode(cmd);
+}
+/**
+ * Build a slot-select command: `SDP,NN$` (without SD) or `SDC,NN$` (with SD),
+ * or `SDD$` (disconnect all). Slot is formatted `%02d`
+ * (SmartDockUart.java:194-231). Slot values 1..15 (1-based, matching the UI /
+ * the Java `SmartDockActiveSlotDetails.mSlot`).
+ */
+function buildSelectSlotCommand(slot, connectionType) {
+    if (connectionType === SMARTDOCK_CONNECTION_TYPE.DISCONNECTED) {
+        return buildBaseCommand(SMARTDOCK_BASE_CMD.DISCONNECT_ALL);
+    }
+    const prefix = connectionType === SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD
+        ? SMARTDOCK_BASE_CMD.SET_SLOT_WITH_SD
+        : SMARTDOCK_BASE_CMD.SET_SLOT_WITHOUT_SD;
+    const nn = String(slot).padStart(2, '0');
+    return buildBaseCommand(`${prefix},${nn}$`);
+}
+// ---------------------------------------------------------------------------
+// RX — `\r\n` line framing over the unframed serial byte stream
+// ---------------------------------------------------------------------------
+const ASCII_DECODER = new TextDecoder('utf-8', { fatal: false });
+/**
+ * Extract the first complete `\r\n`-terminated line from an accumulated ASCII
+ * buffer, returning the line (WITHOUT the terminator) and the remaining bytes,
+ * or null when no complete line is buffered yet.
+ *
+ * This is the base-channel analogue of the D1 `wiredPacketLength` framing: the
+ * SmartDock UART is an unframed serial byte stream, so the client accumulates
+ * inbound bytes and pulls out whole lines. Mirrors the `indexOf("\r\n")` split
+ * in SmartDockUartListener.java:62-67.
+ */
+function extractBaseLine(buf) {
+    // Find CR LF (0x0d 0x0a).
+    for (let i = 0; i + 1 < buf.length; i++) {
+        if (buf[i] === 0x0d && buf[i + 1] === 0x0a) {
+            const line = ASCII_DECODER.decode(buf.subarray(0, i));
+            const rest = buf.subarray(i + 2);
+            return { line, rest: rest.length ? new Uint8Array(rest) : new Uint8Array(0) };
+        }
+    }
+    return null;
+}
+/**
+ * Classify a base response line by its leading character
+ * (SmartDockUartListener.java:71-296). Used to route a line to the awaiting
+ * operation and to discard unrelated / garbage lines (resync discipline).
+ */
+function classifyBaseResponse(line) {
+    if (line.length === 0)
+        return 'unknown';
+    if (line === 'E')
+        return 'error';
+    const c = line.charAt(0);
+    const hasComma = line.charAt(1) === ',';
+    if (c === 'V' && hasComma)
+        return 'version';
+    if (c === 'Q' && hasComma)
+        return 'occupancy';
+    if (c === 'S' && hasComma)
+        return 'occupancy'; // auto-notify slot map, same shape
+    if (c === 'P' && hasComma)
+        return 'slotWithoutSd';
+    if (c === 'C' && hasComma)
+        return 'slotWithSd';
+    if (c === 'C' || c === 'D')
+        return 'disconnected';
+    if (line.includes('Shimmer SmartDock Initialised'))
+        return 'boot';
+    return 'unknown';
+}
+/**
+ * Parse a `V,<hw>,<fwId>,<major>,<minor>,<internal>` version line
+ * (SmartDockUart.java:796-806). Returns null when malformed (wrong prefix or not
+ * exactly 5 comma-separated integers after `V,`).
+ */
+function parseSmartDockVersion(line) {
+    if (classifyBaseResponse(line) !== 'version')
+        return null;
+    const parts = line.slice(2).split(',');
+    if (parts.length !== 5)
+        return null;
+    const nums = parts.map((p) => Number.parseInt(p, 10));
+    if (nums.some((n) => Number.isNaN(n)))
+        return null;
+    return {
+        hardwareVersion: nums[0],
+        firmwareIdentifier: nums[1],
+        firmwareVersionMajor: nums[2],
+        firmwareVersionMinor: nums[3],
+        firmwareVersionInternal: nums[4],
+    };
+}
+/**
+ * Parse a slot-occupancy line `Q,<map>` (or auto-notify `S,<map>`) into a
+ * per-slot boolean array (SmartDockUartListener.java:140-181). Each map char is
+ * ASCII `'0'`/`'1'`; index 0 → slot 1, etc. The map length is the base's slot
+ * count. Returns null when malformed.
+ *
+ * NB: the Java `remapSlotsSmartDockToUi` remap for the BASE15U *prototype*
+ * board (firmware 1.0.0.≤5) is deliberately NOT applied here — it only affects
+ * pre-production hardware; see the README hardware-verify note.
+ */
+function parseSlotOccupancy(line) {
+    if (classifyBaseResponse(line) !== 'occupancy')
+        return null;
+    const map = line.slice(2);
+    if (map.length === 0)
+        return null;
+    const out = [];
+    for (const ch of map) {
+        if (ch !== '0' && ch !== '1')
+            return null;
+        out.push(ch === '1');
+    }
+    return out;
+}
+/**
+ * Parse an active-slot response line into slot + connection type
+ * (SmartDockUart.java:810-869):
+ * - `P,NN` → WITHOUT_SD, slot NN
+ * - `C,NN` → WITH_SD, slot NN
+ * - `C` / `D` → DISCONNECTED, slot -1
+ * Returns null when the numeric slot is malformed.
+ */
+function parseActiveSlot(line) {
+    const kind = classifyBaseResponse(line);
+    if (kind === 'disconnected') {
+        return { slot: -1, connectionType: SMARTDOCK_CONNECTION_TYPE.DISCONNECTED };
+    }
+    if (kind === 'slotWithoutSd' || kind === 'slotWithSd') {
+        const slotStr = line.slice(2);
+        if (!/^\d+$/.test(slotStr))
+            return null;
+        return {
+            slot: Number.parseInt(slotStr, 10),
+            connectionType: kind === 'slotWithSd'
+                ? SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD
+                : SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD,
+        };
+    }
+    return null;
+}
+
+/**
+ * Thrown by {@link SmartDockClient} when a base command reply does not arrive
+ * within the timeout. Distinguished from an explicit `E` error response so the
+ * retry logic re-sends on timeout only (SmartDockUart.java:526-537: a timeout
+ * from `waitForSmartDockResponse` triggers a re-send, whereas an error response
+ * throws immediately).
+ */
+class SmartDockTimeoutError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'SmartDockTimeoutError';
+    }
+}
+// ---------------------------------------------------------------------------
+// SmartDockClient
+// ---------------------------------------------------------------------------
+/**
+ * Client for a **SmartDock** multi-slot base (Base-6 / Base-15) — phase **D2**
+ * of dock support, building on D1's single-device {@link WiredShimmerClient}.
+ *
+ * A SmartDock exposes two logical channels over (two) FTDI serial ports:
+ *   1. a **base control** channel speaking short ASCII `SDx$` commands (this
+ *      client), used to read the base version, query per-slot occupancy, and
+ *      switch which slot is *active*; and
+ *   2. a **per-Shimmer** UART channel onto which the base routes the active
+ *      slot, spoken with the D1 binary `$`-header protocol.
+ *
+ * Multi-slot support is therefore: select a slot on the base channel, then talk
+ * to the docked Shimmer on the per-Shimmer channel. This client **composes**
+ * (does not duplicate) {@link WiredShimmerClient} for the per-Shimmer half —
+ * see {@link identifyDockedShimmer} / {@link getDockedShimmerStatus}.
+ *
+ * Scope (D2): **READ-ONLY**. Dock info, occupancy, slot select, and per-slot
+ * identify/status. NO config writes, NO SD/mass-storage (the `SDC` with-SD
+ * connect and `getSDMountDelay` path exist in the Java oracle but are not
+ * driven), NO bootloader/flashing.
+ *
+ * Robustness: the base UART is an unframed byte stream, so — like D1 — this
+ * client accumulates inbound bytes and extracts complete `\r\n`-terminated
+ * lines ({@link extractBaseLine}); unrecognised / partial lines are ignored,
+ * which naturally resyncs after garbage. Per-op timeouts are ported from Java
+ * (normal 1000 ms; slot change 10000 ms).
+ *
+ * Transport injection is mandatory — `connect()` with no base transport throws.
+ *
+ * @example
+ * ```ts
+ * const dock = new SmartDockClient({ transport: baseSerial, shimmerTransport: shimmerSerial });
+ * await dock.connect();
+ * const info = await dock.getDockInfo();       // { hardwareType, firmwareVersion, slotCount }
+ * const slots = await dock.getSlotOccupancy(); // [{ slot: 1, occupied: true }, ...]
+ * const id = await dock.identifyDockedShimmer(1);   // selects slot 1, then D1 identify()
+ * const st = await dock.getDockedShimmerStatus(1);  // selects slot 1, then D1 getStatus()
+ * ```
+ */
+class SmartDockClient extends BaseShimmerClient {
+    constructor(opts = {}) {
+        super(opts);
+        this._injectedTransport = null;
+        this._transport = null;
+        this._notifyUnsub = null;
+        this._disconnectUnsub = null;
+        this._rxBuf = new Uint8Array(0);
+        this._temps = new Set();
+        /**
+         * Serialization queue: all public operations chain onto this so slot
+         * select + per-slot reads run as atomic, non-interleaved units. Concurrent
+         * `selectSlot` / `identifyDockedShimmer` / `getDockedShimmerStatus` otherwise
+         * race on the shared {@link activeSlot} and single {@link _wired} client,
+         * mis-attributing one slot's data to another. See {@link _serialize}.
+         */
+        this._queue = Promise.resolve();
+        this._wired = null;
+        this._wiredConnected = false;
+        /** Cached dock info (from the last {@link getDockInfo}). */
+        this.dockInfo = null;
+        /** The last active slot confirmed by {@link selectSlot} (1-based; -1 when disconnected). */
+        this.activeSlot = -1;
+        this._handleTransportDisconnect = () => {
+            this._emitStatus('SmartDock disconnected');
+        };
+        // ---------------------------------------------------------------------------
+        // RX: accumulate the unframed byte stream, extract complete `\r\n` lines
+        // ---------------------------------------------------------------------------
+        this._handleNotify = (chunk) => {
+            if (!chunk || chunk.length === 0)
+                return;
+            this._log('Notify len=', chunk.length);
+            this._rxBuf = concatU8(this._rxBuf, chunk);
+            this._drain();
+        };
+        this._injectedTransport = opts.transport ?? null;
+        this._shimmerTransport = opts.shimmerTransport ?? null;
+        this._responseTimeoutMs =
+            opts.timeouts?.responseTimeoutMs ?? SMARTDOCK_DEFAULTS.RESPONSE_TIMEOUT_MS;
+        this._slotChangeTimeoutMs =
+            opts.timeouts?.slotChangeTimeoutMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGE_TIMEOUT_MS;
+        this._slotChangeoverDelayMs =
+            opts.timeouts?.slotChangeoverDelayMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGEOVER_DELAY_MS;
+    }
+    _log(...args) {
+        if (this.debug)
+            console.log('[SmartDock]', ...args);
+    }
+    _deviceLabel() {
+        return this._transport?.deviceName ?? 'SmartDock';
+    }
+    // ---------------------------------------------------------------------------
+    // Connection management
+    // ---------------------------------------------------------------------------
+    /**
+     * Open the SmartDock base UART connection. A base transport is REQUIRED
+     * (constructor option or this parameter). The per-Shimmer transport (if
+     * supplied) is opened lazily on the first docked-Shimmer op.
+     */
+    async connect(transport) {
+        const t = transport ?? this._injectedTransport;
+        if (!t) {
+            throw new Error('SmartDockClient requires an injected transport: a SmartDock is only reachable ' +
+                'over the base UART. Pass a ShimmerTransport via the constructor ({ transport }) ' +
+                'or connect(transport).');
+        }
+        this._transport = t;
+        this._notifyUnsub = t.onNotify(this._handleNotify);
+        this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
+        this._emitStatus('Opening SmartDock base UART connection…');
+        await t.connect();
+        this._rxBuf = new Uint8Array(0);
+        this._emitStatus(`Connected: ${this._deviceLabel()}`);
+    }
+    async disconnect() {
+        try {
+            if (this._wired && this._wiredConnected) {
+                await this._wired.disconnect().catch(() => undefined);
+            }
+            this._notifyUnsub?.();
+            this._disconnectUnsub?.();
+            await this._transport?.disconnect();
+        }
+        catch {
+            /* ignore */
+        }
+        finally {
+            this._wiredConnected = false;
+            this._wired = null;
+            this._notifyUnsub = this._disconnectUnsub = null;
+            this._transport = null;
+            this._rxBuf = new Uint8Array(0);
+            this._temps.clear();
+            this._emitStatus('Disconnected');
+        }
+    }
+    /** Streaming is not part of the SmartDock protocol. */
+    async startStreaming() {
+        throw new Error('Streaming is not supported over the SmartDock UART.');
+    }
+    async stopStreaming() {
+        /* no-op */
+    }
+    // ---------------------------------------------------------------------------
+    // High-level base operations
+    // ---------------------------------------------------------------------------
+    /**
+     * Read the base HW/FW version and derive its family + slot count. Sends
+     * `SDV$` and parses the `V,<hw>,<fwId>,<major>,<minor>,<internal>` reply
+     * (SmartDockUart.java:148-157, :796-806).
+     */
+    async getDockInfo() {
+        return this._serialize(() => this._getDockInfoImpl());
+    }
+    async _getDockInfoImpl() {
+        const line = await this._command(SMARTDOCK_BASE_CMD.GET_VERSION, 'version', this._responseTimeoutMs);
+        const firmwareVersion = parseSmartDockVersion(line);
+        if (!firmwareVersion)
+            throw new Error(`Malformed SmartDock version response: "${line}"`);
+        const { hardwareType, slotCount } = baseHardwareType(firmwareVersion.hardwareVersion);
+        const info = { hardwareType, firmwareVersion, slotCount };
+        this.dockInfo = info;
+        this._emitStatus(`SmartDock ${hardwareType} (${slotCount} slots) FW ${firmwareVersion.firmwareVersionMajor}.` +
+            `${firmwareVersion.firmwareVersionMinor}.${firmwareVersion.firmwareVersionInternal}`);
+        return info;
+    }
+    /**
+     * Query which slots are occupied. Sends `SDQ$` and parses the
+     * `Q,<map>` bitmap (one ASCII `0`/`1` per slot) into per-slot occupancy
+     * (SmartDockUart.java:162-171, SmartDockUartListener.java:140-181). The number
+     * of entries is the base's slot count as reported on the wire.
+     */
+    async getSlotOccupancy() {
+        return this._serialize(() => this._getSlotOccupancyImpl());
+    }
+    async _getSlotOccupancyImpl() {
+        const line = await this._command(SMARTDOCK_BASE_CMD.QUERY_CONNECTED_SLOTS, 'occupancy', this._responseTimeoutMs);
+        const map = parseSlotOccupancy(line);
+        if (!map)
+            throw new Error(`Malformed SmartDock occupancy response: "${line}"`);
+        return map.map((occupied, i) => ({ slot: i + 1, occupied }));
+    }
+    /**
+     * Select the active slot (WITHOUT SD access — the read path). Sends
+     * `SDP,NN$`, awaits the `P,NN` confirmation with the ported ~10 s slot-change
+     * timeout, verifies the returned slot matches the request (Java throws
+     * `DOCK_CMD_ERR_FAIL_SET` on mismatch, SmartDockUart.java:233-241), then waits
+     * the ported settle delay (1500 ms) before the per-Shimmer UART is usable
+     * (SmartDock.java:674-691). Finally resyncs the per-Shimmer byte stream (the
+     * slot re-route may leave stale bytes) — reusing D1's
+     * {@link WiredShimmerClient.resyncStream}.
+     *
+     * @param slotNumber 1-based slot (1..slotCount).
+     */
+    async selectSlot(slotNumber) {
+        return this._serialize(() => this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD));
+    }
+    /** Disconnect all slots (`SDD$`); no slot is active afterwards. */
+    async disconnectAllSlots() {
+        return this._serialize(() => this._disconnectAllSlotsImpl());
+    }
+    async _disconnectAllSlotsImpl() {
+        await this._command(SMARTDOCK_BASE_CMD.DISCONNECT_ALL, 'disconnected', this._slotChangeTimeoutMs);
+        this.activeSlot = -1;
+        this._emitStatus('All slots disconnected');
+    }
+    async _selectSlotInternal(slotNumber, connectionType) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        const cmd = buildSelectSlotCommand(slotNumber, connectionType);
+        // The reply is `P,NN` (without SD) or `C,NN` (with SD).
+        const wantKind = connectionType === SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD ? 'slotWithSd' : 'slotWithoutSd';
+        const line = await this._sendWithRetry(cmd, [wantKind, 'disconnected'], this._slotChangeTimeoutMs, `select slot ${slotNumber}`);
+        const active = parseActiveSlot(line);
+        if (!active || active.slot !== slotNumber) {
+            throw new Error(`SmartDock slot select failed: requested ${slotNumber}, got "${line}" (DOCK_CMD_ERR_FAIL_SET)`);
+        }
+        this.activeSlot = active.slot;
+        this._emitStatus(`Active slot ${active.slot} selected; settling ${this._slotChangeoverDelayMs}ms`);
+        await this._delay(this._slotChangeoverDelayMs);
+        // Resync the per-Shimmer stream for the newly routed slot.
+        this._wired?.resyncStream();
+    }
+    // ---------------------------------------------------------------------------
+    // Per-slot docked-Shimmer ops (compose D1 WiredShimmerClient)
+    // ---------------------------------------------------------------------------
+    /**
+     * Select `slotNumber`, then read the docked Shimmer's identity by delegating
+     * to the D1 {@link WiredShimmerClient.identify} over the per-Shimmer UART. The
+     * per-Shimmer protocol (MAC/HW/FW/expansion) is NOT re-implemented here.
+     */
+    async identifyDockedShimmer(slotNumber) {
+        return this._serialize(async () => {
+            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
+            const wired = await this._ensureWired();
+            return wired.identify();
+        });
+    }
+    /**
+     * Select `slotNumber`, then read the docked Shimmer's battery/charging status
+     * by delegating to the D1 {@link WiredShimmerClient.getStatus}.
+     */
+    async getDockedShimmerStatus(slotNumber) {
+        return this._serialize(async () => {
+            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
+            const wired = await this._ensureWired();
+            return wired.getStatus();
+        });
+    }
+    /**
+     * Select `slotNumber`, then read + decode the docked Shimmer's InfoMem
+     * configuration (configure-while-docked, phase P2). Slot-select and the
+     * per-Shimmer identify + InfoMem read run as one atomic unit under this
+     * client's queue, so concurrent calls for different slots cannot interleave.
+     * The docked device is (re)identified after the slot change to resolve the
+     * correct InfoMem byte layout for that slot.
+     */
+    async readInfoMemConfig(slotNumber) {
+        return this._serialize(async () => {
+            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
+            const wired = await this._ensureWired();
+            await wired.identify();
+            return wired.readInfoMemConfig();
+        });
+    }
+    /**
+     * Select `slotNumber`, then encode + write a configuration to the docked
+     * Shimmer's InfoMem, atomically. See
+     * {@link WiredShimmerClient.writeInfoMemConfig} for the device-write, RTC
+     * (`opts.setRtc`, default true) and verify semantics.
+     */
+    async writeInfoMemConfig(slotNumber, config, opts = {}) {
+        return this._serialize(async () => {
+            await this._selectSlotInternal(slotNumber, SMARTDOCK_CONNECTION_TYPE.WITHOUT_SD_CARD);
+            const wired = await this._ensureWired();
+            await wired.identify();
+            return wired.writeInfoMemConfig(config, opts);
+        });
+    }
+    /** Lazily build + connect the composed D1 client over the per-Shimmer transport. */
+    async _ensureWired() {
+        if (!this._shimmerTransport) {
+            throw new Error('SmartDockClient.identifyDockedShimmer / getDockedShimmerStatus require a per-Shimmer ' +
+                'transport: a SmartDock routes the active slot onto a separate FTDI UART port. Pass ' +
+                'it via the constructor ({ shimmerTransport }).');
+        }
+        if (!this._wired) {
+            this._wired = new WiredShimmerClient({
+                debug: this.debug,
+                transport: this._shimmerTransport,
+            });
+        }
+        if (!this._wiredConnected) {
+            await this._wired.connect();
+            this._wiredConnected = true;
+        }
+        return this._wired;
+    }
+    // ---------------------------------------------------------------------------
+    // Request/response core (base ASCII channel)
+    // ---------------------------------------------------------------------------
+    /** Send an ASCII base command and await a response of one of `kinds`. */
+    async _command(cmd, kind, timeoutMs) {
+        return this._sendWithRetry(buildBaseCommand(cmd), [kind], timeoutMs, cmd);
+    }
+    /**
+     * Write `cmdBytes` and await a matching response, re-sending the command on a
+     * missed reply for a total of `SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS` (= 2)
+     * attempts before failing — mirroring SmartDockUart.java:526-537
+     * (`txBytesAndWaitForReply`). Retries on TIMEOUT ONLY; an explicit `E` error
+     * response ({@link SmartDockTimeoutError} is not thrown for it) propagates
+     * immediately, matching the Java path where `waitForSmartDockResponse` throws
+     * on an error instead of returning false.
+     */
+    async _sendWithRetry(cmdBytes, kinds, timeoutMs, label) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        let lastErr;
+        for (let attempt = 0; attempt < SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS; attempt++) {
+            await this._transport.write(cmdBytes);
+            try {
+                return await this._waitForResponse(kinds, timeoutMs, label);
+            }
+            catch (err) {
+                // Only a timeout is retryable; an error response fails fast.
+                if (err instanceof SmartDockTimeoutError) {
+                    lastErr = err;
+                    this._log(`command "${label}" timed out (attempt ${attempt + 1}); re-sending`);
+                    continue;
+                }
+                throw err;
+            }
+        }
+        throw lastErr instanceof Error ? lastErr : new SmartDockTimeoutError(`timeout (${label})`);
+    }
+    /**
+     * Resolve with the first response line whose classification is in `kinds`;
+     * reject on an `E` error line or timeout. Lines of any other kind (including
+     * `unknown`/garbage) are ignored — this is the resync discipline.
+     */
+    _waitForResponse(kinds, timeoutMs, label) {
+        return new Promise((resolve, reject) => {
+            const t = setTimeout(() => {
+                this._offTemp(handler);
+                reject(new SmartDockTimeoutError(`SmartDock response timeout (${label})`));
+            }, timeoutMs);
+            const handler = (line) => {
+                const k = classifyBaseResponse(line);
+                if (k === 'error') {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    reject(new Error(`SmartDock error response (${label})`));
+                    return;
+                }
+                if (kinds.includes(k)) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    resolve(line);
+                }
+                // else: ignore (unrelated line / garbage) and keep waiting.
+            };
+            this._onTemp(handler);
+        });
+    }
+    _delay(ms) {
+        return new Promise((r) => setTimeout(r, ms));
+    }
+    /**
+     * Run `fn` after every previously-queued operation has settled, so all public
+     * operations execute strictly one-at-a-time (see {@link _queue}). The queue
+     * never rejects — a failed op does not poison later ones — while the caller
+     * still receives `fn`'s own resolution/rejection.
+     */
+    _serialize(fn) {
+        const run = this._queue.then(() => fn());
+        this._queue = run.then(() => undefined, () => undefined);
+        return run;
+    }
+    _drain() {
+        for (;;) {
+            const res = extractBaseLine(this._rxBuf);
+            if (!res)
+                break;
+            this._rxBuf = res.rest;
+            if (res.line.length > 0)
+                this._emitTemp(res.line);
+        }
+    }
+    _onTemp(fn) {
+        this._temps.add(fn);
+    }
+    _offTemp(fn) {
+        this._temps.delete(fn);
+    }
+    _emitTemp(line) {
+        this._temps.forEach((fn) => {
+            try {
+                fn(line);
+            }
+            catch (e) {
+                this._log('temp handler error', e);
+            }
+        });
+    }
+}
+
+/**
+ * Constants for the Shimmer3 / Shimmer3R binary SD-log file format.
+ *
+ * Ported from the Shimmer Java driver:
+ *   com.shimmerresearch.binaryfile.ShimmerSDLog (header layout + read loop)
+ *   com.shimmerresearch.driver.ShimmerObject.SDLogHeader (sensor bitmasks)
+ *   com.shimmerresearch.driverUtilities.ShimmerVerDetails (HW_ID / FW_ID)
+ */
+/** Shimmer hardware identifiers (ShimmerVerDetails.HW_ID). */
+const SDLOG_HW_ID = Object.freeze({
+    SHIMMER_3: 3,
+    SHIMMER_3R: 10,
+});
+/** Firmware identifiers (ShimmerVerDetails.FW_ID). */
+const SDLOG_FW_ID = Object.freeze({
+    BTSTREAM: 1,
+    SDLOG: 2,
+    LOGANDSTREAM: 3,
+    GQ_BLE: 5,
+    GQ_802154: 9,
+    STROKARE: 15,
+});
+/** SD-log header lengths in bytes, keyed by generation. */
+const SDLOG_HEADER_LENGTH = Object.freeze({
+    /** SDLog v0.5.x (unsupported — rejected with LEGACY_UNSUPPORTED). */
+    LEGACY: 178,
+    /** Modern Shimmer3 (SDLog >= 0.8.69, LogAndStream >= 0.5.0). */
+    SHIMMER3: 256,
+    /** Shimmer3R. */
+    SHIMMER3R: 384,
+});
+/** The 32 kHz sampling/RTC clock frequency shared by Shimmer3 and Shimmer3R. */
+const SDLOG_CLOCK_FREQ = 32768;
+/**
+ * Length in bytes of the sync timestamp-offset field prefixed to the first
+ * sample of each 512-byte block when "sync when logging" is enabled
+ * (ShimmerObject.OFFSET_LENGTH — always 9 for modern firmware; the 5-byte
+ * variant only exists on legacy SDLog 0.5.x, which is out of scope).
+ */
+const SDLOG_SYNC_OFFSET_LENGTH = 9;
+/** SD sector size used for the sync-when-logging block framing. */
+const SDLOG_SYNC_BLOCK_LENGTH = 512;
+/**
+ * Enabled-sensor bitmasks as stored in SD-log header bytes 3-7 (40-bit,
+ * LSB-first). Ported verbatim from ShimmerObject.SDLogHeader (values > 2^31
+ * are plain numbers — always test them with {@link hasSensorBit}, never with
+ * 32-bit bitwise operators).
+ */
+const SDLogHeaderBitmask = Object.freeze({
+    ACCEL_LN: 1 << 7,
+    GYRO: 1 << 6,
+    MAG: 1 << 5,
+    EXG1_24BIT: 1 << 4,
+    EXG2_24BIT: 1 << 3,
+    GSR: 1 << 2,
+    EXT_EXP_A7: 1 << 1,
+    EXT_EXP_A6: 1 << 0,
+    BRIDGE_AMP: 1 << 15,
+    ECG_TO_HR_FW: 1 << 14,
+    BATTERY: 1 << 13,
+    ACCEL_WR: 1 << 12,
+    EXT_EXP_A15: 1 << 11,
+    INT_EXP_A1: 1 << 10,
+    INT_EXP_A12: 1 << 9,
+    INT_EXP_A13: 1 << 8,
+    INT_EXP_A14: 1 << 23,
+    ACCEL_MPU: 1 << 22,
+    MAG_MPU: 1 << 21,
+    EXG1_16BIT: 1 << 20,
+    EXG2_16BIT: 1 << 19,
+    BMPX80: 1 << 18,
+    MPL_TEMPERATURE: 1 << 17,
+    MPL_QUAT_6DOF: 2 ** 31,
+    MPL_QUAT_9DOF: 1 << 30,
+    MPL_EULER_6DOF: 1 << 29,
+    MPL_EULER_9DOF: 1 << 28,
+    MPL_HEADING: 1 << 27,
+    MPL_PEDOMETER: 1 << 26,
+    MPL_TAP: 1 << 25,
+    MPL_MOTION_ORIENT: 1 << 24,
+    GYRO_MPU_MPL: 2 ** 39,
+    ACCEL_MPU_MPL: 2 ** 38,
+    MAG_MPU_MPL: 2 ** 37,
+    MPL_QUAT_6DOF_RAW: 2 ** 36,
+});
+/**
+ * Test a bit in the (up to 40-bit) enabled-sensors value. JavaScript bitwise
+ * operators truncate to 32 bits, so masks >= 2^31 must be tested arithmetically.
+ */
+function hasSensorBit(enabledSensors, mask) {
+    return Math.floor(enabledSensors / mask) % 2 === 1;
+}
+/**
+ * Expansion-board hardware SR codes used by the "new IMU" detection
+ * (ShimmerVerDetails.HW_ID_SR_CODES).
+ */
+const SDLOG_EXP_BRD_ID = Object.freeze({
+    SHIMMER3: 31,
+    PROTO3_MINI: 36,
+    PROTO3_DELUXE: 38,
+    ADXL377_ACCEL_200G: 44,
+    EXG_UNIFIED: 47,
+    GSR_UNIFIED: 48,
+    BR_AMP_UNIFIED: 49,
+});
+
+/**
+ * SD-log channel tables and raw datatype decoding.
+ *
+ * Ported from the Shimmer Java driver:
+ *   ShimmerSDLog#interpretdatapacketformat  — Shimmer3 enabled-sensors channel order
+ *   ShimmerObject#interpretDataPacketFormat(nChannels, signalIds) — Shimmer3R
+ *     dynamic signal-ID table (HW_ID.SHIMMER_3R branches)
+ *   UtilParseData#parseData(byte[], String[]) — datatype byte semantics
+ *
+ * Datatype string conventions (UtilParseData): suffix `r` = big-endian,
+ * otherwise little-endian; `i` = signed two's complement, `u` = unsigned;
+ * `i12*>` = Shimmer3R high-g accel packing (MSB << 4 | LSB >> 4).
+ */
+const SDLOG_DATA_TYPE_BYTES = Object.freeze({
+    u8: 1,
+    u12: 2,
+    u14: 2,
+    u16: 2,
+    u16r: 2,
+    i16: 2,
+    i16r: 2,
+    u24: 3,
+    u24r: 3,
+    i24r: 3,
+    u32r: 4,
+    i32r: 4,
+    'i12*>': 2,
+});
+function sign(value, bits) {
+    return value >= 2 ** (bits - 1) ? value - 2 ** bits : value;
+}
+/**
+ * Decode one channel value at `off` in `bytes`.
+ *
+ * Mirrors UtilParseData.parseData(byte[], String[]) exactly — including the
+ * quirk that `u12`/`u14` are read as full unsigned 16-bit little-endian values
+ * with no masking (the firmware guarantees the upper bits are zero).
+ */
+function decodeSdLogValue(bytes, off, type) {
+    switch (type) {
+        case 'u8':
+            return bytes[off];
+        case 'u12':
+        case 'u14':
+        case 'u16':
+            return bytes[off] | (bytes[off + 1] << 8);
+        case 'u16r':
+            return (bytes[off] << 8) | bytes[off + 1];
+        case 'i16':
+            return sign(bytes[off] | (bytes[off + 1] << 8), 16);
+        case 'i16r':
+            return sign((bytes[off] << 8) | bytes[off + 1], 16);
+        case 'u24':
+            return bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16);
+        case 'u24r':
+            return (bytes[off] << 16) | (bytes[off + 1] << 8) | bytes[off + 2];
+        case 'i24r':
+            return sign((bytes[off] << 16) | (bytes[off + 1] << 8) | bytes[off + 2], 24);
+        case 'u32r':
+            return bytes[off] * 2 ** 24 + (bytes[off + 1] << 16) + (bytes[off + 2] << 8) + bytes[off + 3];
+        case 'i32r':
+            // JS 32-bit bitwise OR yields the signed two's-complement result directly.
+            return (bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3];
+        case 'i12*>':
+            // Shimmer3R high-g accel: MSB byte << 4 OR'd with upper nibble of the
+            // LSB byte, then 12-bit two's complement (UtilParseData "i12*>").
+            return sign((bytes[off] << 4) | (bytes[off + 1] >> 4), 12);
+    }
+}
+const uncal = (name, dataType) => ({
+    name,
+    unit: null,
+    calibrated: false,
+    dataType,
+    sizeBytes: SDLOG_DATA_TYPE_BYTES[dataType],
+});
+/**
+ * GSR is the one channel with a reusable calibration path in this SDK (the
+ * amplifier-equation conversion shared by Shimmer3Client/Shimmer3RClient), so
+ * the decoder emits it calibrated, in µS.
+ */
+const gsrChannel = () => ({
+    name: 'GSR',
+    unit: 'uSiemens',
+    calibrated: true,
+    dataType: 'u16',
+    sizeBytes: 2,
+});
+/**
+ * Build the Shimmer3 (256-byte header) channel list from the enabled-sensors
+ * value. The order and datatypes replicate the "modern Shimmer3" branch of
+ * ShimmerSDLog#interpretdatapacketformat (ShimmerSDLog.java lines 817-1271)
+ * exactly, including the legacy-magnetometer X, Z, Y ordering.
+ *
+ * @param enabledSensors 40-bit enabled-sensors value from the header.
+ * @param newImuSensors  True when the expansion-board bytes identify a
+ *   new-IMU board (LSM303AHTR/MPU9250/BMP280 generation) — flips the mag
+ *   channels to little-endian X, Y, Z and renames the BMP channels.
+ */
+function buildShimmer3SdLogChannels(enabledSensors, newImuSensors) {
+    const has = (mask) => hasSensorBit(enabledSensors, mask);
+    const ch = [];
+    if (has(SDLogHeaderBitmask.ACCEL_LN)) {
+        ch.push(uncal('LN_ACCEL_X', 'u12'), uncal('LN_ACCEL_Y', 'u12'), uncal('LN_ACCEL_Z', 'u12'));
+    }
+    if (has(SDLogHeaderBitmask.BATTERY))
+        ch.push(uncal('BATTERY', 'u12'));
+    if (has(SDLogHeaderBitmask.EXT_EXP_A7))
+        ch.push(uncal('EXT_EXP_ADC_A7', 'u12'));
+    if (has(SDLogHeaderBitmask.EXT_EXP_A6))
+        ch.push(uncal('EXT_EXP_ADC_A6', 'u12'));
+    if (has(SDLogHeaderBitmask.EXT_EXP_A15))
+        ch.push(uncal('EXT_EXP_ADC_A15', 'u12'));
+    if (has(SDLogHeaderBitmask.INT_EXP_A12))
+        ch.push(uncal('INT_EXP_ADC_A12', 'u12'));
+    if (has(SDLogHeaderBitmask.INT_EXP_A13))
+        ch.push(uncal('INT_EXP_ADC_A13', 'u12'));
+    if (has(SDLogHeaderBitmask.INT_EXP_A14))
+        ch.push(uncal('INT_EXP_ADC_A14', 'u12'));
+    if (has(SDLogHeaderBitmask.BRIDGE_AMP)) {
+        ch.push(uncal('BRIDGE_AMP_HIGH', 'u12'), uncal('BRIDGE_AMP_LOW', 'u12'));
+    }
+    if (has(SDLogHeaderBitmask.GSR))
+        ch.push(gsrChannel());
+    if (has(SDLogHeaderBitmask.INT_EXP_A1))
+        ch.push(uncal('INT_EXP_ADC_A1', 'u12'));
+    if (has(SDLogHeaderBitmask.GYRO)) {
+        // Modern (non-legacy) SD logs store the MPU gyro big-endian.
+        ch.push(uncal('GYRO_X', 'i16r'), uncal('GYRO_Y', 'i16r'), uncal('GYRO_Z', 'i16r'));
+    }
+    if (has(SDLogHeaderBitmask.ACCEL_WR)) {
+        ch.push(uncal('WR_ACCEL_X', 'i16'), uncal('WR_ACCEL_Y', 'i16'), uncal('WR_ACCEL_Z', 'i16'));
+    }
+    if (has(SDLogHeaderBitmask.MAG)) {
+        if (newImuSensors) {
+            // LSM303AHTR: little-endian, natural X, Y, Z order.
+            ch.push(uncal('MAG_X', 'i16'), uncal('MAG_Y', 'i16'), uncal('MAG_Z', 'i16'));
+        }
+        else {
+            // LSM303DLHC: big-endian, X, Z, Y on-disk order.
+            // HARDWARE-VERIFY: old-IMU mag channel order (X, Z, Y) and endianness
+            // taken from ShimmerSDLog.java:980-990; verify against a real SR31<6 log.
+            ch.push(uncal('MAG_X', 'i16r'), uncal('MAG_Z', 'i16r'), uncal('MAG_Y', 'i16r'));
+        }
+    }
+    if (has(SDLogHeaderBitmask.ACCEL_MPU)) {
+        ch.push(uncal('ACCEL_MPU_X', 'i16r'), uncal('ACCEL_MPU_Y', 'i16r'), uncal('ACCEL_MPU_Z', 'i16r'));
+    }
+    if (has(SDLogHeaderBitmask.MAG_MPU)) {
+        ch.push(uncal('MAG_MPU_X', 'i16'), uncal('MAG_MPU_Y', 'i16'), uncal('MAG_MPU_Z', 'i16'));
+    }
+    if (has(SDLogHeaderBitmask.BMPX80)) {
+        const suffix = newImuSensors ? 'BMP280' : 'BMP180';
+        ch.push(uncal(`TEMPERATURE_${suffix}`, 'u16r'));
+        ch.push(uncal(`PRESSURE_${suffix}`, 'u24r'));
+    }
+    if (has(SDLogHeaderBitmask.EXG1_24BIT)) {
+        ch.push(uncal('Exg1_Status', 'u8'), uncal('Exg1_CH1_24Bit', 'i24r'), uncal('Exg1_CH2_24Bit', 'i24r'));
+    }
+    if (has(SDLogHeaderBitmask.EXG2_24BIT)) {
+        ch.push(uncal('Exg2_Status', 'u8'), uncal('Exg2_CH1_24Bit', 'i24r'), uncal('Exg2_CH2_24Bit', 'i24r'));
+    }
+    if (has(SDLogHeaderBitmask.EXG1_16BIT)) {
+        ch.push(uncal('Exg1_Status', 'u8'), uncal('Exg1_CH1_16Bit', 'i16r'), uncal('Exg1_CH2_16Bit', 'i16r'));
+    }
+    if (has(SDLogHeaderBitmask.EXG2_16BIT)) {
+        ch.push(uncal('Exg2_Status', 'u8'), uncal('Exg2_CH1_16Bit', 'i16r'), uncal('Exg2_CH2_16Bit', 'i16r'));
+    }
+    if (has(SDLogHeaderBitmask.MPL_QUAT_6DOF)) {
+        ch.push(uncal('QUAT_MPL_6DOF_W', 'i32r'), uncal('QUAT_MPL_6DOF_X', 'i32r'), uncal('QUAT_MPL_6DOF_Y', 'i32r'), uncal('QUAT_MPL_6DOF_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.MPL_QUAT_9DOF)) {
+        ch.push(uncal('QUAT_MPL_9DOF_W', 'i32r'), uncal('QUAT_MPL_9DOF_X', 'i32r'), uncal('QUAT_MPL_9DOF_Y', 'i32r'), uncal('QUAT_MPL_9DOF_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.MPL_EULER_6DOF)) {
+        ch.push(uncal('EULER_MPL_6DOF_X', 'i32r'), uncal('EULER_MPL_6DOF_Y', 'i32r'), uncal('EULER_MPL_6DOF_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.MPL_EULER_9DOF)) {
+        ch.push(uncal('EULER_MPL_9DOF_X', 'i32r'), uncal('EULER_MPL_9DOF_Y', 'i32r'), uncal('EULER_MPL_9DOF_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.MPL_HEADING))
+        ch.push(uncal('MPL_HEADING', 'i32r'));
+    if (has(SDLogHeaderBitmask.MPL_TEMPERATURE))
+        ch.push(uncal('MPL_TEMPERATURE', 'i32r'));
+    if (has(SDLogHeaderBitmask.MPL_PEDOMETER)) {
+        ch.push(uncal('MPL_PEDOM_CNT', 'u32r'), uncal('MPL_PEDOM_TIME', 'u32r'));
+    }
+    if (has(SDLogHeaderBitmask.MPL_TAP))
+        ch.push(uncal('TAPDIRANDTAPCNT', 'u8'));
+    if (has(SDLogHeaderBitmask.MPL_MOTION_ORIENT))
+        ch.push(uncal('MOTIONANDORIENT', 'u8'));
+    if (has(SDLogHeaderBitmask.GYRO_MPU_MPL)) {
+        ch.push(uncal('GYRO_MPU_MPL_X', 'i32r'), uncal('GYRO_MPU_MPL_Y', 'i32r'), uncal('GYRO_MPU_MPL_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.ACCEL_MPU_MPL)) {
+        ch.push(uncal('ACCEL_MPU_MPL_X', 'i32r'), uncal('ACCEL_MPU_MPL_Y', 'i32r'), uncal('ACCEL_MPU_MPL_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.MAG_MPU_MPL)) {
+        ch.push(uncal('MAG_MPU_MPL_X', 'i32r'), uncal('MAG_MPU_MPL_Y', 'i32r'), uncal('MAG_MPU_MPL_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.MPL_QUAT_6DOF_RAW)) {
+        ch.push(uncal('QUAT_DMP_6DOF_W', 'i32r'), uncal('QUAT_DMP_6DOF_X', 'i32r'), uncal('QUAT_DMP_6DOF_Y', 'i32r'), uncal('QUAT_DMP_6DOF_Z', 'i32r'));
+    }
+    if (has(SDLogHeaderBitmask.ECG_TO_HR_FW))
+        ch.push(uncal('ECG_TO_HR_FW', 'u8'));
+    return ch;
+}
+/**
+ * Shimmer3R signal-ID → channel mapping, replicating the HW_ID.SHIMMER_3R
+ * branches of ShimmerObject#interpretDataPacketFormat(nChannels, signalIds).
+ * Names follow the SDK's streaming CHANNEL_FORMATS where an equivalent exists.
+ */
+const SHIMMER3R_SIGNAL_ID_TABLE = Object.freeze({
+    0x00: uncal('LN_ACCEL_X', 'i16'),
+    0x01: uncal('LN_ACCEL_Y', 'i16'),
+    0x02: uncal('LN_ACCEL_Z', 'i16'),
+    // HARDWARE-VERIFY: the Shimmer3R dynamic table types BATTERY as signed i16
+    // (ShimmerObject.java:3030-3033) even though the ADC value is unsigned —
+    // ported as-is; confirm against a real Shimmer3R log with battery enabled.
+    0x03: uncal('BATTERY', 'i16'),
+    0x04: uncal('WR_ACCEL_X', 'i16'),
+    0x05: uncal('WR_ACCEL_Y', 'i16'),
+    0x06: uncal('WR_ACCEL_Z', 'i16'),
+    0x07: uncal('MAG_X', 'i16'),
+    0x08: uncal('MAG_Y', 'i16'),
+    0x09: uncal('MAG_Z', 'i16'),
+    0x0a: uncal('GYRO_X', 'i16'),
+    0x0b: uncal('GYRO_Y', 'i16'),
+    0x0c: uncal('GYRO_Z', 'i16'),
+    0x0d: uncal('EXT_ADC_0', 'u14'),
+    0x0e: uncal('EXT_ADC_1', 'u14'),
+    0x0f: uncal('EXT_ADC_2', 'u14'),
+    0x10: uncal('INT_ADC_3', 'u14'),
+    0x11: uncal('INT_ADC_0', 'u14'),
+    0x12: uncal('INT_ADC_1', 'u14'),
+    0x13: uncal('INT_ADC_2', 'u14'),
+    0x14: uncal('HG_ACCEL_X', 'i12*>'),
+    0x15: uncal('HG_ACCEL_Y', 'i12*>'),
+    0x16: uncal('HG_ACCEL_Z', 'i12*>'),
+    0x17: uncal('ALT_MAG_X', 'i16'),
+    0x18: uncal('ALT_MAG_Y', 'i16'),
+    0x19: uncal('ALT_MAG_Z', 'i16'),
+    0x1a: uncal('TEMPERATURE_BMP390', 'u24'),
+    0x1b: uncal('PRESSURE_BMP390', 'u24'),
+    0x1c: gsrChannel(),
+    0x1d: uncal('Exg1_Status', 'u8'),
+    0x1e: uncal('Exg1_CH1_24Bit', 'i24r'),
+    0x1f: uncal('Exg1_CH2_24Bit', 'i24r'),
+    0x20: uncal('Exg2_Status', 'u8'),
+    0x21: uncal('Exg2_CH1_24Bit', 'i24r'),
+    0x22: uncal('Exg2_CH2_24Bit', 'i24r'),
+    0x23: uncal('Exg1_CH1_16Bit', 'i16r'),
+    0x24: uncal('Exg1_CH2_16Bit', 'i16r'),
+    0x25: uncal('Exg2_CH1_16Bit', 'i16r'),
+    0x26: uncal('Exg2_CH2_16Bit', 'i16r'),
+    0x27: uncal('BRIDGE_AMP_HIGH', 'u12'),
+    0x28: uncal('BRIDGE_AMP_LOW', 'u12'),
+});
+/**
+ * Build the Shimmer3R (384-byte header) channel list from the dynamic
+ * channel table stored in the header (byte 314 = nChannels, bytes 315.. =
+ * signal IDs). Unknown IDs fall back to a `u12` channel named after the ID,
+ * matching the Java catch-all (ShimmerObject.java:3579-3583).
+ */
+function buildShimmer3RSdLogChannels(signalIds) {
+    const ch = [];
+    for (let i = 0; i < signalIds.length; i++) {
+        const id = signalIds[i];
+        const spec = SHIMMER3R_SIGNAL_ID_TABLE[id];
+        ch.push(spec ? { ...spec } : uncal(String(id), 'u12'));
+    }
+    return ch;
+}
+
+/**
+ * SD-log header parsing for modern Shimmer3 (256-byte) and Shimmer3R
+ * (384-byte) binary log files.
+ *
+ * Ported from the Shimmer Java driver:
+ *   ShimmerSDLog#processSDLogHeader / #parseHwFwVerForMaps /
+ *   #parseEnabledDerivedSensorsForMaps / #readSdConfigHeader
+ *   ShimmerVerObject (firmware version-code ladder → timestamp byte width)
+ *   ShimmerObject#isSupportedNewImuSensors / ShimmerVerObject
+ *   #isSupportedExpansionBrdIdInSdHeader / #isSupportedEightByteDerivedSensors
+ */
+const atLeast = (v, major, minor, internal) => v.major > major ||
+    (v.major === major && (v.minor > minor || (v.minor === minor && v.internal >= internal)));
+/**
+ * Whether SD packets carry a 3-byte (u24) timestamp for this firmware.
+ * Derived from the ShimmerVerObject firmware-version-code ladder
+ * (ShimmerVerObject.java:263-312) fed into
+ * `ShimmerObject#updateTimestampByteLength` (:4725-4736): version code >= 6
+ * selects 3 bytes, otherwise 2. Combinations that match no rule in the ladder
+ * fall through to code -1 (< 6) → 2 bytes.
+ *
+ * Relevant rules for the HW/FW combos this decoder supports (Shimmer3 /
+ * Shimmer3R × SDLog / LogAndStream):
+ *   - Shimmer3R + LogAndStream >= 0.0.1  → code 8 → 3 bytes
+ *   - Shimmer3R + SDLog                  → no rule → code -1 → 2 bytes
+ *   - Shimmer3  + SDLog        >= 0.11.5 → code 6 (or 8 >= 0.20.1) → 3 bytes; else 2
+ *   - Shimmer3  + LogAndStream >= 0.5.4  → code 6 (or higher) → 3 bytes; else 2
+ */
+function sdTimestampBytes(hw, fwId, v) {
+    if (hw === SDLOG_HW_ID.SHIMMER_3R) {
+        // The Java ladder only maps Shimmer3R+LogAndStream (→ code 8, u24). A
+        // Shimmer3R+SDLog file matches no rule → code -1 → 2-byte timestamp.
+        // HARDWARE-VERIFY: a Shimmer3R+SDLog SD log likely does not exist in the
+        // wild; oracle fidelity (ShimmerVerObject.java:270-273) is the tiebreak.
+        if (fwId === SDLOG_FW_ID.LOGANDSTREAM)
+            return atLeast(v, 0, 0, 1) ? 3 : 2;
+        return 2;
+    }
+    if (fwId === SDLOG_FW_ID.SDLOG)
+        return atLeast(v, 0, 11, 5) ? 3 : 2;
+    if (fwId === SDLOG_FW_ID.LOGANDSTREAM)
+        return atLeast(v, 0, 5, 4) ? 3 : 2;
+    return 3;
+}
+/**
+ * Sampling clock frequency used for the SD wall-clock (RTC) timestamp
+ * (`ShimmerObject#getSamplingClockFreq`, ShimmerObject.java:10868-10896):
+ *   - TCXO + the 20 MHz EXG-unified rev-1.1 board → 20 MHz / 64 = 312500 Hz
+ *   - TCXO otherwise                              → 16.369 MHz / 64 = 255765.625 Hz
+ *   - no TCXO                                     → 32768 Hz (crystal)
+ * NB: only the RTC (wall-clock) conversion uses this frequency. The
+ * device-clock timestamp uses `getRtcClockFreq()` = 32768 Hz always
+ * (ShimmerObject.java:2824, ShimmerDevice.java:4723), and the sampling-rate
+ * field is likewise divided by 32768 here — matching the Java driver, whose
+ * SD-log sampling-rate math also uses the (non-TCXO) crystal for these logs.
+ */
+function samplingClockFreq(tcxo, hw, expBrd) {
+    if (!tcxo)
+        return SDLOG_CLOCK_FREQ;
+    // isTcxoClock20MHz (ShimmerObject.java:10882-10896): Shimmer3/3R + EXG
+    // unified board id 47, rev 1, revSpecial 1.
+    const is20MHz = (hw === SDLOG_HW_ID.SHIMMER_3 || hw === SDLOG_HW_ID.SHIMMER_3R) &&
+        expBrd !== null &&
+        expBrd.id === SDLOG_EXP_BRD_ID.EXG_UNIFIED &&
+        expBrd.rev === 1 &&
+        expBrd.revSpecial === 1;
+    return is20MHz ? 312500.0 : 255765.625;
+}
+/**
+ * "New IMU sensors" detection for Shimmer3 (LSM303AHTR / MPU9250 / BMP280
+ * generation) — controls mag channel order/endianness and BMP naming.
+ * Port of ShimmerObject.isSupportedNewImuSensors(svo, expansionBoardDetails);
+ * a Shimmer3R always qualifies, a Shimmer3 without expansion-board info in
+ * the header never does (Java passes a LOG_FILE placeholder board → false).
+ */
+function isNewImuSensors(hw, expBrd) {
+    if (hw === SDLOG_HW_ID.SHIMMER_3R)
+        return true;
+    if (hw !== SDLOG_HW_ID.SHIMMER_3 || expBrd === null)
+        return false;
+    const { id, rev, revSpecial } = expBrd;
+    // HARDWARE-VERIFY: new-IMU expansion-board revision thresholds copied from
+    // Configuration.Shimmer3.NEW_IMU_EXP_REV; only verifiable against real
+    // boards of each revision.
+    return ((id === SDLOG_EXP_BRD_ID.EXG_UNIFIED && rev >= 3) ||
+        (id === SDLOG_EXP_BRD_ID.GSR_UNIFIED && rev >= 3) ||
+        (id === SDLOG_EXP_BRD_ID.BR_AMP_UNIFIED && rev >= 3) ||
+        (id === SDLOG_EXP_BRD_ID.SHIMMER3 && rev >= 6) ||
+        revSpecial === 171 ||
+        (id === SDLOG_EXP_BRD_ID.PROTO3_DELUXE && rev >= 3) ||
+        (id === SDLOG_EXP_BRD_ID.PROTO3_MINI && rev >= 3));
+}
+/**
+ * Whether the sync-when-logging 512-byte block framing applies. Port of the
+ * guard used throughout ShimmerSDLog (interpretdatapacketformat / setup /
+ * readPacketMsg): SDLog firmware always frames when the trial-config sync
+ * bit is set; LogAndStream only from 0.16.11 on Shimmer3 and from any
+ * version on Shimmer3R (Configuration.Shimmer3.CompatibilityInfoForMaps).
+ */
+function usesSyncBlockFraming(syncWhenLogging, hw, fwId, v) {
+    if (!syncWhenLogging)
+        return false;
+    if (fwId === SDLOG_FW_ID.SDLOG)
+        return true;
+    if (fwId === SDLOG_FW_ID.LOGANDSTREAM) {
+        if (hw === SDLOG_HW_ID.SHIMMER_3R)
+            return true;
+        return atLeast(v, 0, 16, 11);
+    }
+    return false;
+}
+/**
+ * Decode the inertial-sensor hardware ranges from the SD config setup bytes.
+ *
+ * The four config setup bytes live at SD header bytes 8-11 (setup0-3): the
+ * existing GSR-range read from byte 11 (setup3) fixes this mapping. Bit
+ * positions are ported from ConfigByteLayoutShimmer3
+ * (com.shimmerresearch.driver.shimmer2r3):
+ *   - WR accel range : setup0 (byte 8) bits 2-3, mask 0x03
+ *       (SensorLSM303.configByteArrayParse / SensorLIS2DW12 both use
+ *        bitShiftLSM303DLHCAccelRange = 2)
+ *   - gyro range LSB : setup2 (byte 10) bits 0-1, mask 0x03
+ *       (bitShiftMPU9150GyroRange = 0; SensorLSM6DSV reuses the same LSB field)
+ *   - mag range      : setup2 (byte 10) bits 5-7, mask 0x07
+ *       (bitShiftLSM303DLHCMagRange = 5)
+ *   - LN accel range : setup3 (byte 11) bits 6-7, mask 0x03 — Shimmer3R
+ *       (SensorLSM6DSV LN accel, bitShiftMPU9150AccelRange = 6). On Shimmer3 the
+ *       LN accel is the fixed-range Kionix KXRB, so this is forced to 0 there.
+ *   - gyro range MSB : setup4 (byte 12) bit 2, mask 0x01 — Shimmer3R only.
+ *       The LSM6DSV has 6 gyro ranges (0-5); the MSB lives in config setup byte 4
+ *       and is combined with the 2-bit LSB as `lsb | (msb << 2)`. Ported from
+ *       ShimmerSDLog.processSDLogHeader 3R branch:
+ *         int gyroRange    = (byteArrayInfo[10]) & 03;      // LSB (byte 10)
+ *         int msbGyroRange = (byteArrayInfo[12] >> 2) & 01; // MSB (byte 12 bit 2)
+ *         setGyroRange(gyroRange + (msbGyroRange << 2));
+ *       This matches the streaming path (Shimmer3RClient.ts, gyroLsb | gyroMsb<<2,
+ *       cfg bit 34 == setup4 bit 2) and ShimmerObject.interpretInqResponse.
+ *
+ * HARDWARE-VERIFY: no real Shimmer3R SD card has been available to confirm the
+ * byte-12 MSB placement; the offset is taken from the Java oracle only. The
+ * alt-accel (high-g) and alt-mag ranges are likewise not decoded from the SD
+ * header (defaulted to 0); their per-device calibration blocks, when present,
+ * override the default anyway.
+ */
+function parseImuRanges(bytes, hw) {
+    const setup0 = bytes[8] ?? 0;
+    const setup2 = bytes[10] ?? 0;
+    const setup3 = bytes[11] ?? 0;
+    const setup4 = bytes[12] ?? 0;
+    const wrAccel = (setup0 >> 2) & 0x03;
+    const gyroLsb = setup2 & 0x03;
+    // Shimmer3R gyro (LSM6DSV) has 6 ranges (0-5); the MSB rides in setup4 bit 2.
+    // Shimmer3 gyro (MPU9x50) has only 4 ranges (0-3), so no MSB there.
+    const gyro = hw === SDLOG_HW_ID.SHIMMER_3R ? gyroLsb | (((setup4 >> 2) & 0x01) << 2) : gyroLsb;
+    const mag = (setup2 >> 5) & 0x07;
+    const lnAccel = hw === SDLOG_HW_ID.SHIMMER_3R ? (setup3 >> 6) & 0x03 : 0;
+    return { lnAccel, wrAccel, gyro, mag, altAccel: 0, altMag: 0 };
+}
+function macFromBytes(b) {
+    let s = '';
+    for (let i = 24; i <= 29; i++)
+        s += b[i].toString(16).padStart(2, '0');
+    return s;
+}
+/**
+ * Parse an SD-log file header, including layout details needed by the packet
+ * decoder. Throws {@link SdLogFormatError} for anything outside the supported
+ * modern Shimmer3 / Shimmer3R formats.
+ */
+function parseSdLog(bytes) {
+    if (bytes.length < 40) {
+        throw new SdLogFormatError('TOO_SMALL', `File is ${bytes.length} bytes — too small to contain SD-log version fields (need 40).`);
+    }
+    // Version fields live at fixed offsets in every header generation
+    // (ShimmerSDLog#readSDVersionFromHeader).
+    const hardwareVersion = (bytes[30] << 8) | bytes[31];
+    const firmwareId = (bytes[34] << 8) | bytes[35];
+    const fwVersion = {
+        major: (bytes[36] << 8) | bytes[37],
+        minor: bytes[38],
+        internal: bytes[39],
+    };
+    if (firmwareId === SDLOG_FW_ID.SDLOG && fwVersion.major === 0 && fwVersion.minor === 5) {
+        throw new SdLogFormatError('LEGACY_UNSUPPORTED', `Legacy SDLog v0.5.x file (178-byte header) is not supported.`);
+    }
+    if (hardwareVersion !== SDLOG_HW_ID.SHIMMER_3 && hardwareVersion !== SDLOG_HW_ID.SHIMMER_3R) {
+        throw new SdLogFormatError('UNSUPPORTED_DEVICE', `Unsupported hardware version ${hardwareVersion} — only Shimmer3 (3) and Shimmer3R (10) SD logs are supported.`);
+    }
+    if (firmwareId !== SDLOG_FW_ID.SDLOG && firmwareId !== SDLOG_FW_ID.LOGANDSTREAM) {
+        throw new SdLogFormatError('UNSUPPORTED_DEVICE', `Unsupported firmware id ${firmwareId} — only SDLog (2) and LogAndStream (3) logs are supported.`);
+    }
+    // Support floors for the 256-byte-header era on Shimmer3: SDLog >= 0.8.69,
+    // LogAndStream >= 0.5.0. Shimmer3R firmware versioning restarted at 0.x and
+    // always writes the modern 384-byte header, so no floor applies there.
+    if (hardwareVersion === SDLOG_HW_ID.SHIMMER_3) {
+        if (firmwareId === SDLOG_FW_ID.SDLOG && !atLeast(fwVersion, 0, 8, 69)) {
+            throw new SdLogFormatError('LEGACY_UNSUPPORTED', `SDLog v${fwVersion.major}.${fwVersion.minor}.${fwVersion.internal} predates the supported floor (0.8.69).`);
+        }
+        if (firmwareId === SDLOG_FW_ID.LOGANDSTREAM && !atLeast(fwVersion, 0, 5, 0)) {
+            throw new SdLogFormatError('LEGACY_UNSUPPORTED', `LogAndStream v${fwVersion.major}.${fwVersion.minor}.${fwVersion.internal} predates the supported floor (0.5.0).`);
+        }
+    }
+    const headerLengthBytes = hardwareVersion === SDLOG_HW_ID.SHIMMER_3R
+        ? SDLOG_HEADER_LENGTH.SHIMMER3R
+        : SDLOG_HEADER_LENGTH.SHIMMER3;
+    if (bytes.length < headerLengthBytes) {
+        throw new SdLogFormatError('TOO_SMALL', `File is ${bytes.length} bytes but the header alone is ${headerLengthBytes} bytes.`);
+    }
+    // Bytes 0-1: sampling divider, LSB-first. Hz = 32768 / divider.
+    const rawSamplingDivider = bytes[0] | (bytes[1] << 8);
+    if (rawSamplingDivider === 0) {
+        throw new SdLogFormatError('BAD_HEADER', 'Sampling-rate divider is 0.');
+    }
+    const samplingRateHz = SDLOG_CLOCK_FREQ / rawSamplingDivider;
+    // Bytes 3-7: enabled sensors, 40-bit LSB-first, with the firmware-specific
+    // masking from ShimmerSDLog#parseEnabledDerivedSensorsForMaps.
+    const enabledBytes = [bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]];
+    const mpu9150Dmp = ((bytes[12] >> 7) & 0x01) === 1;
+    if (mpu9150Dmp || firmwareId === SDLOG_FW_ID.LOGANDSTREAM) {
+        enabledBytes[2] &= -3; // disable MPU temperature (MPL_TEMPERATURE bit)
+        enabledBytes[3] = 0;
+        enabledBytes[4] = 0;
+    }
+    let enabledSensors = enabledBytes[0] +
+        enabledBytes[1] * 2 ** 8 +
+        enabledBytes[2] * 2 ** 16 +
+        enabledBytes[3] * 2 ** 24 +
+        enabledBytes[4] * 2 ** 32;
+    if (firmwareId !== SDLOG_FW_ID.SDLOG) {
+        enabledSensors = enabledSensors % 2 ** 24; // & 0xFFFFFF
+    }
+    // Bytes 40-42 (+217-221 on newer firmware): derived sensors, LSB-first.
+    // Computed with BigInt because bytes 220-221 reach bit 56, beyond the 2^53
+    // exact-integer range of a JS number (Java uses a `long`). `derivedSensors`
+    // (number) stays exact through byte 219 / bit 47; `derivedSensorsBig`
+    // (bigint) carries the full 8-byte fidelity.
+    let derivedBig = BigInt(bytes[40]) + (BigInt(bytes[41]) << 8n) + (BigInt(bytes[42]) << 16n);
+    const eightByteDerived = (firmwareId === SDLOG_FW_ID.SDLOG && atLeast(fwVersion, 0, 13, 1)) ||
+        (firmwareId === SDLOG_FW_ID.LOGANDSTREAM && atLeast(fwVersion, 0, 7, 1));
+    if (eightByteDerived) {
+        for (let i = 0; i < 5; i++) {
+            derivedBig += BigInt(bytes[217 + i]) << BigInt(8 * (3 + i));
+        }
+    }
+    const derivedSensorsBig = derivedBig;
+    const derivedSensors = Number(derivedBig);
+    // Byte 16: trial config A.
+    const buttonStart = ((bytes[16] >> 5) & 0x01) === 1;
+    const syncWhenLogging = ((bytes[16] >> 2) & 0x01) === 1;
+    const masterShimmer = ((bytes[16] >> 1) & 0x01) === 1;
+    // Byte 17 bit 4: TCXO (temperature-compensated crystal oscillator) flag —
+    // ShimmerSDLog#processSDLogHeader sets it identically on both the Shimmer3
+    // (:303) and Shimmer3R (:233) branches. It only affects the SD wall-clock
+    // (RTC) conversion frequency (see samplingClockFreq).
+    const tcxo = ((bytes[17] >> 4) & 0x01) === 1;
+    // Byte 11 bits 1-3: GSR range (0-3 fixed, 4 = auto) — same offset on both
+    // the Shimmer3 and Shimmer3R header layouts.
+    const gsrRange = (bytes[11] >> 1) & 0x07;
+    // Bytes 44-51: RTC difference, signed 64-bit MSB-first.
+    let rtc = 0n;
+    for (let i = 44; i <= 51; i++)
+        rtc = (rtc << 8n) | BigInt(bytes[i]);
+    const rtcDifferenceTicks = BigInt.asIntN(64, rtc);
+    // Bytes 52-55: config time (Unix seconds), 32-bit MSB-first.
+    const configTime = bytes[52] * 2 ** 24 + bytes[53] * 2 ** 16 + bytes[54] * 2 ** 8 + bytes[55];
+    // Bytes 251-255: initial timestamp ticks in the firmware's non-sequential
+    // order: b[251]<<32 | b[255]<<24 | b[254]<<16 | b[253]<<8 | b[252].
+    // HARDWARE-VERIFY: byte order matches ShimmerSDLog.java:419-426; only a
+    // real SD card can confirm it end-to-end.
+    const initialTimestampTicks = bytes[251] * 2 ** 32 +
+        bytes[255] * 2 ** 24 +
+        bytes[254] * 2 ** 16 +
+        bytes[253] * 2 ** 8 +
+        bytes[252];
+    // Bytes 214-216: expansion board id/rev/special-rev, only stored by
+    // SDLog >= 0.12.4 / LogAndStream >= 0.6.13
+    // (ShimmerVerObject#isSupportedExpansionBrdIdInSdHeader).
+    const expBrdInHeader = (firmwareId === SDLOG_FW_ID.SDLOG && atLeast(fwVersion, 0, 12, 4)) ||
+        (firmwareId === SDLOG_FW_ID.LOGANDSTREAM && atLeast(fwVersion, 0, 6, 13));
+    const expansionBoard = expBrdInHeader
+        ? { id: bytes[214], rev: bytes[215], revSpecial: bytes[216] }
+        : null;
+    const newImu = isNewImuSensors(hardwareVersion, expansionBoard);
+    // Calibration parameter blocks (kept raw — see SdLogCalibrationBytes).
+    const pressureLen = newImu ? 24 : 22;
+    const pressure = new Uint8Array(pressureLen);
+    pressure.set(bytes.slice(160, 182), 0);
+    if (newImu)
+        pressure.set(bytes.slice(222, 224), 22); // BMP280/BMP390 extra bytes
+    const calibrationBytes = {
+        wrAccel: bytes.slice(76, 97),
+        gyro: bytes.slice(97, 118),
+        mag: bytes.slice(118, 139),
+        lnAccel: bytes.slice(139, 160),
+        pressure,
+    };
+    // Channel table.
+    let channels;
+    if (hardwareVersion === SDLOG_HW_ID.SHIMMER_3R) {
+        calibrationBytes.altAccel = bytes.slice(256, 277);
+        calibrationBytes.altMag = bytes.slice(285, 306);
+        const nChannels = bytes[314];
+        if (315 + nChannels > headerLengthBytes) {
+            throw new SdLogFormatError('BAD_HEADER', `Shimmer3R channel table overruns the header (nChannels=${nChannels}).`);
+        }
+        channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels));
+    }
+    else {
+        channels = buildShimmer3SdLogChannels(enabledSensors, newImu);
+    }
+    if (channels.length === 0) {
+        throw new SdLogFormatError('BAD_HEADER', 'Header enables no data channels.');
+    }
+    const timestampBytes = sdTimestampBytes(hardwareVersion, firmwareId, fwVersion);
+    const packetSizeBytes = timestampBytes + channels.reduce((sum, c) => sum + c.sizeBytes, 0);
+    const syncFraming = usesSyncBlockFraming(syncWhenLogging, hardwareVersion, firmwareId, fwVersion);
+    // ShimmerSDLog#setup(): floor((512 - OFFSET_LENGTH) / sensorPacketSize),
+    // where the Java mPacketSize includes the offset field and ours does not.
+    const samplesPerBlock = syncFraming
+        ? Math.floor((SDLOG_SYNC_BLOCK_LENGTH - SDLOG_SYNC_OFFSET_LENGTH) / packetSizeBytes)
+        : 0;
+    if (syncFraming && samplesPerBlock < 1) {
+        throw new SdLogFormatError('BAD_HEADER', `Packet size ${packetSizeBytes} does not fit a 512-byte sync block.`);
+    }
+    const wallClockFreqHz = samplingClockFreq(tcxo, hardwareVersion, expansionBoard);
+    const header = {
+        hardwareVersion,
+        firmwareId,
+        firmwareVersion: fwVersion,
+        samplingRateHz,
+        macAddress: macFromBytes(bytes),
+        enabledSensors,
+        derivedSensors,
+        derivedSensorsBig,
+        tcxo,
+        configTime,
+        rtcDifferenceTicks,
+        initialTimestampTicks,
+        trial: {
+            id: bytes[32],
+            numShimmers: bytes[33],
+            syncWhenLogging,
+            masterShimmer,
+            buttonStart,
+        },
+        headerLengthBytes,
+        timestampBytes,
+        packetSizeBytes,
+        channels,
+        calibrationBytes,
+        gsrRange,
+        expansionBoard,
+        imuRanges: parseImuRanges(bytes, hardwareVersion),
+        calibration: [],
+    };
+    return { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz };
+}
+/**
+ * Parse an SD-log file header (first 256 bytes for Shimmer3, 384 bytes for
+ * Shimmer3R). The whole file may be passed — only the header is read.
+ */
+function parseSdLogHeader(bytes) {
+    return parseSdLog(bytes).header;
+}
+
+/**
+ * SD-log inertial calibration planning.
+ *
+ * For a decoded SD-log file this builds one {@link CalibPlanEntry} per inertial
+ * channel group (LN accel, WR accel, gyro, mag, and the Shimmer3R alt-accel /
+ * alt-mag), choosing the per-device calibration block from the header when it
+ * is valid and falling back to the range-selected default otherwise — exactly
+ * the CalibDetailsKinematic behaviour (a stored block overrides the default;
+ * an all-0xFF/all-0x00 block keeps the default). It also flips the affected
+ * channel specs to `calibrated:true` with the right unit, so the decoder can
+ * emit calibrated values.
+ */
+function familyOf(header) {
+    if (header.hardwareVersion === SDLOG_HW_ID.SHIMMER_3R)
+        return 'shimmer3r';
+    return isNewImuSensors(header.hardwareVersion, header.expansionBoard)
+        ? 'shimmer3-new'
+        : 'shimmer3-old';
+}
+function groupSpecsFor(header) {
+    const cb = header.calibrationBytes;
+    const r = header.imuRanges;
+    if (header.hardwareVersion === SDLOG_HW_ID.SHIMMER_3R) {
+        return [
+            {
+                group: 'lnAccel',
+                axisNames: ['LN_ACCEL_X', 'LN_ACCEL_Y', 'LN_ACCEL_Z'],
+                block: cb.lnAccel,
+                range: r.lnAccel,
+            },
+            {
+                group: 'wrAccel',
+                axisNames: ['WR_ACCEL_X', 'WR_ACCEL_Y', 'WR_ACCEL_Z'],
+                block: cb.wrAccel,
+                range: r.wrAccel,
+            },
+            { group: 'gyro', axisNames: ['GYRO_X', 'GYRO_Y', 'GYRO_Z'], block: cb.gyro, range: r.gyro },
+            { group: 'mag', axisNames: ['MAG_X', 'MAG_Y', 'MAG_Z'], block: cb.mag, range: r.mag },
+            {
+                group: 'altAccel',
+                axisNames: ['HG_ACCEL_X', 'HG_ACCEL_Y', 'HG_ACCEL_Z'],
+                block: cb.altAccel,
+                range: r.altAccel,
+            },
+            {
+                group: 'altMag',
+                axisNames: ['ALT_MAG_X', 'ALT_MAG_Y', 'ALT_MAG_Z'],
+                block: cb.altMag,
+                range: r.altMag,
+            },
+        ];
+    }
+    // Shimmer3 (old + new IMU).
+    return [
+        {
+            group: 'lnAccel',
+            axisNames: ['LN_ACCEL_X', 'LN_ACCEL_Y', 'LN_ACCEL_Z'],
+            block: cb.lnAccel,
+            range: r.lnAccel,
+        },
+        {
+            group: 'wrAccel',
+            axisNames: ['WR_ACCEL_X', 'WR_ACCEL_Y', 'WR_ACCEL_Z'],
+            block: cb.wrAccel,
+            range: r.wrAccel,
+        },
+        { group: 'gyro', axisNames: ['GYRO_X', 'GYRO_Y', 'GYRO_Z'], block: cb.gyro, range: r.gyro },
+        { group: 'mag', axisNames: ['MAG_X', 'MAG_Y', 'MAG_Z'], block: cb.mag, range: r.mag },
+    ];
+}
+/**
+ * Build the calibration plan for a file and mark the calibrated channel specs.
+ * `channels` is the same array referenced by `header.channels`, so the
+ * `calibrated`/`unit` flips are visible to consumers of the header.
+ */
+function buildSdLogCalibPlan(header, channels) {
+    const family = familyOf(header);
+    const nameToIndex = new Map();
+    channels.forEach((c, i) => nameToIndex.set(c.name, i));
+    const entries = [];
+    const info = [];
+    for (const spec of groupSpecsFor(header)) {
+        const xi = nameToIndex.get(spec.axisNames[0]);
+        const yi = nameToIndex.get(spec.axisNames[1]);
+        const zi = nameToIndex.get(spec.axisNames[2]);
+        if (xi === undefined || yi === undefined || zi === undefined)
+            continue; // group not present
+        const def = getDefaultCalibration(family, spec.group, spec.range);
+        if (!def)
+            continue; // family has no such group
+        // A valid per-device block overrides the default (CalibDetailsKinematic
+        // parseCalParamByteArray: all-FF/all-00 → keep default).
+        const parsed = spec.block
+            ? parseKinematicCalibBlock(spec.block, { sensitivityScale: def.sensitivityScale })
+            : null;
+        const usingDefault = parsed === null;
+        const calibration = parsed ?? def.calibration;
+        entries.push({ indices: [xi, yi, zi], calibration });
+        info.push({
+            group: spec.group,
+            unit: def.unit,
+            usingDefaultCalibration: usingDefault,
+            source: usingDefault ? 'default' : 'sd-header',
+            range: spec.range,
+        });
+        for (const idx of [xi, yi, zi]) {
+            channels[idx].calibrated = true;
+            channels[idx].unit = def.unit;
+        }
+    }
+    return { entries, info };
+}
+/** Apply a calibration plan in place to one record's `values` array. */
+function applyCalibPlan(values, plan) {
+    for (const e of plan) {
+        const [xi, yi, zi] = e.indices;
+        const [cx, cy, cz] = calibrateTriple(values[xi], values[yi], values[zi], e.calibration);
+        values[xi] = cx;
+        values[yi] = cy;
+        values[zi] = cz;
+    }
+}
+function calibrateTriple(x, y, z, cal) {
+    const d0 = x - cal.offset[0];
+    const d1 = y - cal.offset[1];
+    const d2 = z - cal.offset[2];
+    const m = cal.m;
+    return [
+        m[0] * d0 + m[1] * d1 + m[2] * d2,
+        m[3] * d0 + m[4] * d1 + m[5] * d2,
+        m[6] * d0 + m[7] * d1 + m[8] * d2,
+    ];
+}
+
+/**
+ * SD-log packet decoding — single file and multi-file session.
+ *
+ * Ported from the Shimmer Java driver:
+ *   ShimmerSDLog#readPacketMsg / #isEndOfFile — read loop and sync-block
+ *     accounting (the 9-byte timestamp-offset field before the first packet
+ *     of each 512-byte block is consumed and DISCARDED; porting the sync
+ *     algorithm itself is out of scope)
+ *   ShimmerObject#unwrapTimeStamp / #parseTimestampShimmer3 — rollover
+ *     unwrapping and tick→ms conversion
+ *   ParserLoggedDataToDatabase#createMapOfFiles / #parseDataToDB /
+ *   #compareSDHeader — numeric file ordering + cross-file consistency
+ *     (modern files are self-contained: each restarts its own unwrap state
+ *     and carries its own initial timestamp; only legacy 0.5.x — out of
+ *     scope — carried rollover state across files)
+ */
+/**
+ * Convert a raw GSR sample to conductance in µS, reusing the streaming
+ * clients' amplifier-equation path (Shimmer3Client/Shimmer3RClient
+ * #_calibrateData) seeded with the header's GSR range setting.
+ */
+// HARDWARE-VERIFY: GSR amplifier-equation calibration is shared by the SDK's
+// Shimmer3 and Shimmer3R streaming clients; confirm it holds for SD-logged
+// GSR data on older (pre-GSR+) Shimmer3 expansion boards.
+function calibrateGsr(raw, gsrRangeSetting) {
+    let adc12 = raw & 0x0fff;
+    let range = gsrRangeSetting;
+    if (range === 4) {
+        range = (raw >> 14) & 0x03; // auto-range: range travels in bits 14-15
+    }
+    if (range === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3) {
+        adc12 = GSR_UNCAL_LIMIT_RANGE3;
+    }
+    let gsrkOhm = calibrateGsrDataToResistanceFromAmplifierEq(adc12, range);
+    gsrkOhm = nudgeGsrResistance(gsrkOhm, gsrRangeSetting);
+    return (1.0 / gsrkOhm) * 1000;
+}
+function decodeRecordsFromFile(bytes, parsed, out, budget) {
+    const { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz } = parsed;
+    // Build the inertial calibration plan once per file. This also flips the
+    // affected channel specs to calibrated:true / unit and records per-group
+    // metadata on the header (header.calibration), mirroring how GSR is emitted
+    // calibrated. LN accel, WR accel, gyro, mag (+ Shimmer3R alt accel/mag).
+    const calibPlan = buildSdLogCalibPlan(header, channels);
+    header.calibration = calibPlan.info;
+    const packetSize = header.packetSizeBytes;
+    const tsBytes = header.timestampBytes;
+    const maxTicks = 2 ** (8 * tsBytes);
+    const initialTicks = header.initialTimestampTicks;
+    const rtcTicks = Number(header.rtcDifferenceTicks);
+    const hasRtc = header.rtcDifferenceTicks !== 0n;
+    // Per-file rollover state (ShimmerObject#unwrapTimeStamp): modern files
+    // restart from cycle 0 with their own header initial timestamp.
+    let cycle = 0;
+    let lastUnwrapped = 0;
+    // ShimmerObject#parseTimestampShimmer3 subtracts the FIRST packet's raw
+    // timestamp before adding the header's initial timestamp: on modern
+    // firmware the 5-byte initial timestamp is the full clock at the first
+    // packet, whose low bytes are that packet's raw timestamp — without the
+    // subtraction those low bytes would be double-counted
+    // (mFirstTsOffsetFromInitialTsTicks in the Java driver).
+    let firstRawTicks = null;
+    let pos = header.headerLengthBytes;
+    let samplesInBlock = 0;
+    while (budget.remaining > 0) {
+        // ShimmerSDLog#readPacketMsg: the first packet of the file and the first
+        // packet after every `samplesPerBlock` packets is prefixed by the 9-byte
+        // sync timestamp-offset field, which is read and discarded here.
+        const withOffset = syncFraming && (samplesInBlock === 0 || samplesInBlock === samplesPerBlock);
+        const need = withOffset ? SDLOG_SYNC_OFFSET_LENGTH + packetSize : packetSize;
+        if (pos + need > bytes.length)
+            break; // trailing partial packet is dropped (Java EOF)
+        let p = pos;
+        if (withOffset) {
+            p += SDLOG_SYNC_OFFSET_LENGTH; // discard the offset value
+            samplesInBlock = 0;
+        }
+        // Timestamp: u16/u24 little-endian, unwrapped against rollovers.
+        let rawTs = bytes[p] | (bytes[p + 1] << 8);
+        if (tsBytes === 3)
+            rawTs |= bytes[p + 2] << 16;
+        p += tsBytes;
+        let unwrapped = rawTs + maxTicks * cycle;
+        if (unwrapped < lastUnwrapped) {
+            cycle += 1;
+            unwrapped = rawTs + maxTicks * cycle;
+        }
+        lastUnwrapped = unwrapped;
+        if (firstRawTicks === null)
+            firstRawTicks = rawTs;
+        const values = new Array(channels.length);
+        for (let c = 0; c < channels.length; c++) {
+            const spec = channels[c];
+            const raw = decodeSdLogValue(bytes, p, spec.dataType);
+            // GSR is calibrated inline (amplifier equation). Inertial channels are
+            // marked calibrated by the plan but keep their raw value here and are
+            // calibrated together (per triple) by applyCalibPlan below.
+            values[c] = spec.name === 'GSR' && spec.calibrated ? calibrateGsr(raw, header.gsrRange) : raw;
+            p += spec.sizeBytes;
+        }
+        if (calibPlan.entries.length)
+            applyCalibPlan(values, calibPlan.entries);
+        const absoluteTicks = initialTicks + unwrapped - firstRawTicks;
+        out.push({
+            // Device-clock timestamp always divides by the 32768 Hz RTC clock
+            // (ShimmerObject#getRtcClockFreq); only the wall-clock (RTC) conversion
+            // below honours the TCXO sampling clock (ShimmerObject#getSamplingClockFreq).
+            timestampMs: (absoluteTicks / SDLOG_CLOCK_FREQ) * 1000,
+            wallClockMs: hasRtc ? ((absoluteTicks + rtcTicks) / wallClockFreqHz) * 1000 : null,
+            values,
+        });
+        samplesInBlock += 1;
+        pos += need;
+        budget.remaining -= 1;
+    }
+    if (budget.remaining === 0) {
+        const nextWithOffset = syncFraming && (samplesInBlock === 0 || samplesInBlock === samplesPerBlock);
+        const nextNeed = nextWithOffset ? SDLOG_SYNC_OFFSET_LENGTH + packetSize : packetSize;
+        if (pos + nextNeed <= bytes.length) {
+            budget.truncated = true;
+        }
+    }
+}
+/**
+ * Decode a single SD-log binary file (e.g. `000`) into typed records.
+ *
+ * @throws SdLogFormatError `NO_DATA` when the file contains only a header.
+ */
+function decodeSdLogFile(bytes, opts) {
+    const parsed = parseSdLog(bytes);
+    if (bytes.length <= parsed.header.headerLengthBytes) {
+        throw new SdLogFormatError('NO_DATA', `File contains only the ${parsed.header.headerLengthBytes}-byte header — no sample data.`);
+    }
+    const records = [];
+    const budget = {
+        remaining: opts?.maxRecords ?? Number.POSITIVE_INFINITY,
+        truncated: false,
+    };
+    decodeRecordsFromFile(bytes, parsed, records, budget);
+    return { header: parsed.header, records, truncated: budget.truncated };
+}
+const isDataFileName = (name) => !name.includes('.');
+/**
+ * Decode a multi-file SD session (files `000`, `001`, … within one
+ * `<ShimmerName>-<SessionNumber>` folder).
+ *
+ * - Files whose names contain a `.` are ignored (UtilDock's "a log file is a
+ *   name containing no dot" rule); remaining names must be numeric.
+ * - Files are concatenated in ascending numeric order.
+ * - Headers must agree on MAC address, sampling rate, enabled sensors and
+ *   trial id (ParserLoggedDataToDatabase#compareSDHeader), otherwise
+ *   `INCONSISTENT_SESSION` is thrown.
+ * - Each file restarts its own timestamp-unwrap state and uses its own
+ *   header's initial timestamp, so absolute times remain continuous across
+ *   file boundaries on modern firmware.
+ */
+function decodeSdSession(files, opts) {
+    const dataFiles = files.filter((f) => isDataFileName(f.name));
+    if (dataFiles.length === 0) {
+        throw new SdLogFormatError('NO_DATA', 'No SD-log data files (dot-free numeric names) given.');
+    }
+    const numbered = dataFiles.map((f) => {
+        if (!/^\d+$/.test(f.name)) {
+            throw new SdLogFormatError('BAD_HEADER', `"${f.name}" is not a valid SD-log data file name (expected digits only, e.g. "000").`);
+        }
+        return { num: parseInt(f.name, 10), file: f };
+    });
+    numbered.sort((a, b) => a.num - b.num);
+    for (let i = 1; i < numbered.length; i++) {
+        if (numbered[i].num === numbered[i - 1].num) {
+            throw new SdLogFormatError('INCONSISTENT_SESSION', `Duplicate log file number ${numbered[i].num} in session.`);
+        }
+    }
+    const parsedFiles = numbered.map(({ file }) => ({
+        name: file.name,
+        bytes: file.bytes,
+        parsed: parseSdLog(file.bytes),
+    }));
+    const first = parsedFiles[0].parsed.header;
+    // Populate the returned header's calibration metadata (and calibrated channel
+    // flags) even if the first file turns out to be header-only.
+    first.calibration = buildSdLogCalibPlan(first, parsedFiles[0].parsed.channels).info;
+    for (const { name, parsed } of parsedFiles) {
+        const h = parsed.header;
+        if (h.macAddress !== first.macAddress ||
+            h.samplingRateHz !== first.samplingRateHz ||
+            h.enabledSensors !== first.enabledSensors ||
+            h.trial.id !== first.trial.id) {
+            throw new SdLogFormatError('INCONSISTENT_SESSION', `Header of file "${name}" does not match the session's first file (MAC/rate/sensors/trial id).`);
+        }
+    }
+    const withData = parsedFiles.filter((f) => f.bytes.length > f.parsed.header.headerLengthBytes);
+    if (withData.length === 0) {
+        throw new SdLogFormatError('NO_DATA', 'No file in the session contains sample data.');
+    }
+    const records = [];
+    const budget = {
+        remaining: opts?.maxRecords ?? Number.POSITIVE_INFINITY,
+        truncated: false,
+    };
+    for (const f of withData) {
+        if (budget.remaining <= 0) {
+            budget.truncated = true;
+            break;
+        }
+        decodeRecordsFromFile(f.bytes, f.parsed, records, budget);
+    }
+    return { header: first, records, truncated: budget.truncated };
+}
+
 /**
  * Verisense sensor-calibration TLV codec.
  *
@@ -9404,99 +11006,6 @@ function parsePendingEvents(payload) {
     for (let i = 0; i < payload.length; i++)
         out.push((payload[i] & 0x0f));
     return out;
-}
-
-function pad2(n) {
-    return Math.trunc(n).toString().padStart(2, '0');
-}
-function pad5(n) {
-    return Math.trunc(n).toString().padStart(5, '0');
-}
-function dateToYyMMddHHmmss(date) {
-    const yy = pad2(date.getUTCFullYear() % 100);
-    const mm = pad2(date.getUTCMonth() + 1);
-    const dd = pad2(date.getUTCDate());
-    const hh = pad2(date.getUTCHours());
-    const min = pad2(date.getUTCMinutes());
-    const ss = pad2(date.getUTCSeconds());
-    return `${yy}${mm}${dd}_${hh}${min}${ss}`;
-}
-/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
-function buildUploadBinaryFileName(uploadDate, firstPayloadIndex) {
-    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
-        throw new Error('buildUploadBinaryFileName: firstPayloadIndex must be in range 0..65535');
-    }
-    return `${dateToYyMMddHHmmss(uploadDate)}_${pad5(firstPayloadIndex)}.bin`;
-}
-/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
-function buildParsedCsvFileName(startDate, dataSource, firstPayloadIndex) {
-    if (!dataSource || !String(dataSource).trim()) {
-        throw new Error('buildParsedCsvFileName: dataSource must be a non-empty string');
-    }
-    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
-        throw new Error('buildParsedCsvFileName: firstPayloadIndex must be in range 0..65535');
-    }
-    return `${dateToYyMMddHHmmss(startDate)}_${String(dataSource).trim()}_${pad5(firstPayloadIndex)}.csv`;
-}
-/** Add duplicate suffix like " (2)" before extension. */
-function applyDuplicateSuffix(fileName, duplicateIndex) {
-    if (duplicateIndex < 2) {
-        throw new Error('applyDuplicateSuffix: duplicateIndex must be >= 2');
-    }
-    const idx = fileName.lastIndexOf('.');
-    if (idx <= 0)
-        return `${fileName} (${duplicateIndex})`;
-    const stem = fileName.slice(0, idx);
-    const ext = fileName.slice(idx);
-    return `${stem} (${duplicateIndex})${ext}`;
-}
-/** Return first non-colliding duplicate name for a target file name. */
-function nextAvailableDuplicateFileName(fileName, existingNames) {
-    const existing = new Set(existingNames);
-    if (!existing.has(fileName))
-        return fileName;
-    let i = 2;
-    while (true) {
-        const candidate = applyDuplicateSuffix(fileName, i);
-        if (!existing.has(candidate))
-            return candidate;
-        i++;
-    }
-}
-/** Parse first payload index (uint16 LE) from a payload byte array. */
-function getFirstPayloadIndex(payload) {
-    if (payload.length < 2) {
-        throw new Error('getFirstPayloadIndex: payload must contain at least 2 bytes');
-    }
-    return u16le_at(payload, 0);
-}
-/**
- * Evaluate whether parsed CSV output should roll to a new file.
- * Rules mirror ASM-DES08 split conditions.
- */
-function evaluateParsedFileSplit(input) {
-    const reasons = [];
-    const prev = input.prevTimestampSec;
-    const curr = input.currTimestampSec;
-    // Split when crossing 12:00am or 12:00pm boundaries.
-    const prevHalfDay = Math.floor(prev / (12 * 60 * 60));
-    const currHalfDay = Math.floor(curr / (12 * 60 * 60));
-    if (currHalfDay !== prevHalfDay)
-        reasons.push('midday-midnight-boundary');
-    if ((input.prevConfigSignature ?? null) !== (input.currConfigSignature ?? null)) {
-        reasons.push('config-change');
-    }
-    if (input.expectedDeltaSec != null) {
-        const tol = Math.max(0, input.timestampToleranceSec ?? 0);
-        const delta = curr - prev;
-        if (Math.abs(delta - input.expectedDeltaSec) > tol) {
-            reasons.push('timestamp-discontinuity');
-        }
-    }
-    if (input.powerResetDetected) {
-        reasons.push('power-reset');
-    }
-    return { shouldSplit: reasons.length > 0, reasons };
 }
 
 const VERISENSE_HW_MAJOR_FRIENDLY_NAMES = {
@@ -17146,5 +18655,5 @@ function verisenseFactoryTestReportToCsvRows(parsed, meta = {}) {
     return [header, values];
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID$1 as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$1 as WIRED_NEED_MORE, RESYNC$1 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, buildBaseCommand, buildDefaultVerisenseCalibrationSet, buildHeader, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseCalibDump, parseCalibrationBlob, parseEventLogPayload, parseExpansionBoard, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID$1 as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$1 as WIRED_NEED_MORE, RESYNC$1 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, sdCrc16, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

@@ -1,4 +1,13 @@
 /**
+ * SDK version, exported so consumers (e.g. the webBLEDemos pages, which vendor
+ * the built bundle) can log which build they are actually running — a stale
+ * vendored copy is otherwise indistinguishable from a firmware fault.
+ *
+ * Kept in sync with package.json by tests/core/version.test.ts.
+ */
+declare const SDK_VERSION = "0.1.13";
+
+/**
  * Discriminated kind tag for a data field in an ObjectCluster.
  */
 type FieldKind = 'raw' | 'cal' | null;
@@ -762,6 +771,24 @@ declare class StreamStatsTracker {
  * Shimmer3R BLE protocol opcodes.
  * Values taken directly from the Shimmer3 firmware header.
  */
+/**
+ * Feature ids for the SET_FEATURE (0xB7) command: `[0xB7][featureId][value]`.
+ * Mirrors the FEATURE_* enum in log-and-stream-common
+ * `Comms/shimmer_bt_uart.h`.
+ */
+declare const BT_FEATURE: Readonly<{
+    readonly NONE: 0;
+    /** Shimmer3 RN4678 error LEDs. */
+    readonly RN4678_ERROR_LEDS: 1;
+    /**
+     * Arm a one-shot soft reboot that fires when the host disconnects. Lets a
+     * host apply settings only read at boot (e.g. the EEPROM brand record's
+     * advertising names) without the user power-cycling the device. Firmware
+     * skips the reboot while sensing, so an armed request can never truncate an
+     * active SD recording.
+     */
+    readonly REBOOT_ON_DISCONNECT: 2;
+}>;
 declare const OPCODES: Readonly<{
     readonly DATA_PACKET: 0;
     readonly INQUIRY_COMMAND: 1;
@@ -1222,6 +1249,162 @@ interface StreamingImuRanges {
     altMag: number;
 }
 
+/**
+ * Wire protocol for Shimmer3R SD-card file transfer over BLE.
+ *
+ * Mirrors the firmware implementation in
+ * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.009).
+ *
+ * Command/response shapes (all multi-byte fields little-endian):
+ *
+ *   SD_LIST_DIR_COMMAND  0xCC: [startIdx u16][maxEntries u8][pathLen u8][path]
+ *   SD_LIST_DIR_RESPONSE 0xC1: [status][startIdx u16][entriesLen u16][nEntries][flags][entries…]
+ *       entry: [attr][size u32][fdate u16][ftime u16][nameLen][name…]
+ *   SD_FILE_STAT_COMMAND 0xC2: [pathLen u8][path]
+ *   SD_FILE_STAT_RESPONSE 0xC3: [status][size u32][fdate u16][ftime u16][attr]
+ *   SD_FILE_READ_COMMAND 0xC4: [offset u32][windowLen u32][blockPayloadLen u16][pathLen u8][path]
+ *   SD_FREE_SPACE_COMMAND 0xC8 / RESPONSE 0xC9: [status][freeKB u32][totalKB u32]
+ *   SD_DELETE_COMMAND 0xCA / RESPONSE 0xCB: [status]
+ *   SD_TRANSFER_ABORT_COMMAND 0xC7: no args
+ *
+ * Streamed frames (always self-CRC'd, independent of the global CRC mode):
+ *   data:   [0x8A][0xC5][sessionId][seq u16][len u16][payload…][crc16 u16]
+ *   status: [0x8A][0xC6][sessionId][status][nextOffset u32][crc16 u16]
+ */
+declare const SD_TRANSFER_OPCODES: {
+    readonly LIST_DIR_COMMAND: 204;
+    readonly LIST_DIR_RESPONSE: 193;
+    readonly FILE_STAT_COMMAND: 194;
+    readonly FILE_STAT_RESPONSE: 195;
+    readonly FILE_READ_COMMAND: 196;
+    readonly FILE_DATA_RESPONSE: 197;
+    readonly FILE_STATUS_RESPONSE: 198;
+    readonly TRANSFER_ABORT_COMMAND: 199;
+    readonly FREE_SPACE_COMMAND: 200;
+    readonly FREE_SPACE_RESPONSE: 201;
+    readonly DELETE_COMMAND: 202;
+    readonly DELETE_RESPONSE: 203;
+};
+/** Status byte of the one-shot responses. 0x01–0x13 are raw FatFs FRESULTs. */
+declare const SD_STATUS: {
+    readonly OK: 0;
+    readonly SD_UNAVAILABLE: 240;
+    readonly BUSY: 241;
+    readonly BAD_ARGS: 242;
+};
+/** Codes carried in SD_FILE_STATUS_RESPONSE frames. */
+declare const SD_XFER: {
+    readonly WINDOW_COMPLETE: 0;
+    readonly EOF: 1;
+    readonly HOST_ABORT: 2;
+    readonly SD_LOST: 3;
+    readonly FS_ERROR: 4;
+    readonly SUPERSEDED: 5;
+    readonly DENIED: 6;
+    readonly NOT_FOUND: 7;
+};
+declare const SD_ATTR_DIR = 1;
+declare const SD_ATTR_NAME_TRUNCATED = 2;
+declare const SD_MAX_PATH_LEN = 96;
+declare const SD_BLOCK_PAYLOAD_MIN = 64;
+declare const SD_BLOCK_PAYLOAD_MAX = 1024;
+declare const SD_BLOCK_PAYLOAD_DEFAULT = 512;
+interface SdDirEntry {
+    name: string;
+    isDir: boolean;
+    /** Truncated by the firmware to 64 bytes; such entries cannot be addressed by path. */
+    nameTruncated: boolean;
+    size: number;
+    fdate: number;
+    ftime: number;
+    /** Decoded FAT timestamp, or null when the card holds no timestamp (e.g. a file
+     * that was still open for logging when it was last written). */
+    mtime: Date | null;
+}
+interface SdFileStat {
+    size: number;
+    isDir: boolean;
+    fdate: number;
+    ftime: number;
+    mtime: Date | null;
+}
+interface SdCardSpace {
+    freeKB: number;
+    totalKB: number;
+}
+interface SdDataFrame {
+    kind: 'data';
+    sessionId: number;
+    seq: number;
+    payload: Uint8Array;
+    crcOk: boolean;
+}
+interface SdStatusFrame {
+    kind: 'status';
+    sessionId: number;
+    status: number;
+    nextOffset: number;
+    crcOk: boolean;
+}
+interface SdOneShotResponse {
+    kind: 'oneshot';
+    opcode: number;
+    /** Complete response bytes, opcode included. */
+    body: Uint8Array;
+}
+type SdMessage = SdDataFrame | SdStatusFrame | SdOneShotResponse;
+/** Error carrying the in-band status byte of a refused/failed SD command. */
+declare class SdTransferError extends Error {
+    readonly status: number;
+    constructor(message: string, status: number);
+}
+declare function sdStatusToString(status: number): string;
+declare function sdXferStatusToString(status: number): string;
+/** Shimmer CRC16 over `len` bytes of `data` (defaults to all of it). */
+declare function sdCrc16(data: Uint8Array, len?: number): number;
+/** Encode and validate a card path (ASCII, 1..96 bytes). */
+declare function encodeSdPath(path: string): Uint8Array;
+/** Decode a FAT date/time pair; null when unset or invalid. */
+declare function fatDateTimeToDate(fdate: number, ftime: number): Date | null;
+declare function buildListDirCmd(path: string, startIdx?: number, maxEntries?: number): Uint8Array;
+declare function buildStatCmd(path: string): Uint8Array;
+declare function buildDeleteCmd(path: string): Uint8Array;
+declare function buildFreeSpaceCmd(): Uint8Array;
+declare function buildAbortCmd(): Uint8Array;
+declare function buildReadCmd(path: string, offset: number, windowLen: number, blockPayloadLen?: number): Uint8Array;
+interface SdListDirPage {
+    status: number;
+    startIdx: number;
+    entries: SdDirEntry[];
+    hasMore: boolean;
+}
+declare function parseListDirRsp(buf: Uint8Array): SdListDirPage;
+declare function parseStatRsp(buf: Uint8Array): {
+    status: number;
+    stat: SdFileStat;
+};
+declare function parseFreeSpaceRsp(buf: Uint8Array): {
+    status: number;
+    space: SdCardSpace;
+};
+declare function parseDeleteRsp(buf: Uint8Array): {
+    status: number;
+};
+interface SdExtractResult {
+    /** Bytes to drop from the front of the buffer (0 = need more data). */
+    consumed: number;
+    msg?: SdMessage;
+    /** True when a data/status frame was recognised but failed its CRC; the
+     * extractor resynchronises one byte at a time in that case. */
+    crcError?: boolean;
+}
+/**
+ * Try to extract one SD-transfer message from the front of `buf`.
+ * Unknown bytes are skipped one at a time (resync) so interleaved traffic
+ * (e.g. unsolicited instream status responses) cannot jam the stream.
+ */
+declare function tryExtractSdMessage(buf: Uint8Array): SdExtractResult;
+
 interface ChannelField {
     id: number;
     name: string;
@@ -1426,7 +1609,52 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * 16-bit), matching readMem()/GET_INFOMEM_COMMAND in the Shimmer Java driver.
      * @returns the raw bytes read
      */
+    /**
+     * Issue a command and read back a length-prefixed response
+     * (`[opcode][len][data...]`), reassembling it across BLE notifications.
+     *
+     * A notification carries at most one ATT payload — around 42 bytes at the
+     * MTU the CYW20820 negotiates — and the transport surfaces one notification
+     * per chunk, so any response longer than that arrives split. Firmware writes
+     * the logical response contiguously, so the fragments simply concatenate in
+     * order: accumulate until `expectedLen` data bytes have arrived instead of
+     * assuming the first chunk holds the whole response.
+     *
+     * Firmware always emits the length byte after the opcode, but its absence is
+     * tolerated (older/variant firmware) by treating the first byte as a prefix
+     * only when it equals the requested length.
+     */
+    private _readLengthPrefixedResponse;
     readInfoMem(address: number, length: number): Promise<Uint8Array>;
+    /**
+     * Arm a one-shot soft reboot that the device performs as soon as this host
+     * disconnects (SET_FEATURE / FEATURE_REBOOT_ON_DISCONNECT).
+     *
+     * Settings that firmware only reads at boot - notably the EEPROM brand
+     * record's advertising names - otherwise need a manual power-cycle. The
+     * reboot cannot happen while still connected, because the link has to drop
+     * for the Bluetooth module to re-read its name; so the sequence is: write
+     * settings, call this, then {@link disconnect}.
+     *
+     * Firmware skips the reboot while sensing so that it can never truncate an
+     * active SD recording, and clears the request either way - it is strictly
+     * one-shot and never carries into a later disconnect.
+     *
+     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; older
+     * firmware NACKs the unknown feature id.
+     */
+    setRebootOnDisconnect(enabled: boolean): Promise<void>;
+    /**
+     * Read from the daughter-card (expansion board) EEPROM memory. `offset` is a
+     * HOST offset — firmware maps it past the first (HW details) EEPROM page, so
+     * host offsets 0..2031 cover absolute EEPROM bytes 16..2047.
+     */
+    readDaughterCardMem(offset: number, length: number): Promise<Uint8Array>;
+    /**
+     * Write to the daughter-card (expansion board) EEPROM memory. `offset` is a
+     * HOST offset (see {@link readDaughterCardMem}). Max 128 bytes per write.
+     */
+    writeDaughterCardMem(offset: number, data: Uint8Array): Promise<void>;
     /**
      * Read the device's MAC address from InfoMem and return it as 12 uppercase hex
      * characters (e.g. "2601140185B8") — byte order as stored, matching the
@@ -1504,6 +1732,82 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _onTemp;
     private _offTemp;
     private _emitTemp;
+    private _fwVersionCache;
+    /** Read (and cache) the firmware version via GET_FW_VERSION_COMMAND. */
+    readFwVersion(): Promise<{
+        fwId: number;
+        major: number;
+        minor: number;
+        patch: number;
+    }>;
+    /**
+     * True when the connected firmware serves the SD file-transfer commands
+     * (LogAndStream_Shimmer3R >= v1.01.009). Older firmware silently ignores
+     * unknown opcodes, so version gating is the only reliable probe.
+     */
+    supportsSdTransfer(): Promise<boolean>;
+    /**
+     * Measure raw BLE link throughput with the firmware's data-rate test
+     * (SET_DATA_RATE_TEST): the device free-runs 5-byte counter packets as
+     * fast as the link drains them and we count notification bytes for
+     * `durationMs`. This measures the pipe itself (connection interval, MTU,
+     * module buffering) independent of the SD/file-transfer protocol, so it
+     * gives an upper bound for transfer rates on a given host/adapter/OS.
+     * The device must be idle (the firmware NACKs the test while sensing).
+     */
+    runDataRateTest(durationMs?: number, onProgress?: (bytesSoFar: number, elapsedMs: number) => void): Promise<{
+        bytesReceived: number;
+        durationMs: number;
+        kBps: number;
+    }>;
+    private _sdRx;
+    private _sdUsers;
+    private _sdHandlerAttached;
+    private _sdExpect;
+    private _sdFrameListener;
+    private _sdCrcErrorListener;
+    private _sdKnownSession;
+    private _sdAcquire;
+    private _sdRelease;
+    private _sdChunkHandler;
+    /** Send an SD command and await its reassembled one-shot response. */
+    private _sdCommand;
+    /**
+     * List a directory on the SD card, transparently following the firmware's
+     * startIdx paging. Path example: `'data'` or
+     * `'data/DefaultTrial_123/Shimmer_ABCD-000'`.
+     */
+    sdListDir(path: string, opts?: {
+        maxEntriesPerPage?: number;
+    }): Promise<SdDirEntry[]>;
+    /** Stat one file or directory on the SD card. */
+    sdStatFile(path: string): Promise<SdFileStat>;
+    /** Query free/total space on the SD card (in KB). */
+    sdGetFreeSpace(): Promise<SdCardSpace>;
+    /**
+     * Delete one file (or empty directory) on the SD card. The firmware only
+     * permits paths strictly under `data/`.
+     */
+    sdDeletePath(path: string): Promise<void>;
+    /** Ask the firmware to abandon the in-flight read window, if any. */
+    sdAbortTransfer(): Promise<void>;
+    /**
+     * Read one window of a file. The firmware streams the window as CRC'd
+     * blocks; `onBlock` is invoked for each verified block in order. Resolves
+     * with the closing status frame. Rejects on stall, CRC failure or sequence
+     * gap — the caller re-requests from its last good offset (the firmware is
+     * stateless, so a fresh window is always a valid resume).
+     */
+    sdReadFileWindow(path: string, offset: number, windowLen: number, opts?: {
+        blockPayloadLen?: number;
+        stallTimeoutMs?: number;
+        signal?: AbortSignal;
+        onBlock?: (payload: Uint8Array, absOffset: number) => void;
+    }): Promise<{
+        status: number;
+        nextOffset: number;
+        bytesReceived: number;
+    }>;
 }
 
 /**
@@ -1611,6 +1915,270 @@ declare function nudgeGsrResistance(gsrResistanceKOhms: number, gsrRangeSetting:
  * @returns Oversampling ratio index 0–6.
  */
 declare function getOversamplingRatioADS1292R(samplingRate: number): number;
+
+/**
+ * EEPROM brand (advertising name) record.
+ *
+ * Shimmer3/Shimmer3R firmware stores the effective BT/BLE/USB name prefixes in
+ * a 64-byte record in the daughter-card EEPROM (log-and-stream-common
+ * `EEPROM/shimmer_eeprom.h`, `gEepromBrandDetails`). On boot, firmware seeds
+ * the record with its compile-time defaults when it is blank or invalid and
+ * treats it as the single source of truth from then on — so hosts can always
+ * read the current effective names back, and can rebrand a unit by writing a
+ * new record (the new names apply at the next Bluetooth init / reboot).
+ *
+ * The record lives at HOST daughter-card-memory offset 1952 (absolute EEPROM
+ * bytes 1968–2031 — host offsets skip the first, HW-details, EEPROM page).
+ * Reachable over BLE/BT via GET/SET_DAUGHTER_CARD_MEM and over the dock UART /
+ * USB-C via `UART_PROP.DAUGHTER_CARD.CARD_MEM` — both take host offsets.
+ *
+ * Layout v2 (all multi-byte fields little-endian, names NOT NUL-terminated):
+ * ```
+ * offset  size  field
+ *      0     2  magic 0x5342 ("SB": bytes 0x42,0x53 on the wire)
+ *      2     1  layoutVer (2)
+ *      3     1  flags: bit0 reserved, bits1-2 seededPlatform
+ *      4     1  btClassicLen        5     1  bleLen
+ *      6     1  usbProductLen       7     1  usbManufacturerLen
+ *      8    16  btClassic       (Classic BT name prefix)
+ *     24    10  ble             (BLE name prefix)
+ *     34    16  usbProduct      (USB product prefix)
+ *     50    24  usbManufacturer (USB iManufacturer string)
+ *     74     4  padding (zero)
+ *     78     2  CRC over bytes 0..77 — Shimmer UART CRC, LSB first
+ * ```
+ *
+ * The stock record carries the factory USB manufacturer string
+ * ("Shimmer Research Ltd."), so firmware applies the record unconditionally
+ * and an unbranded unit reports exactly what it always did. There is no
+ * "customer branded" flag: bit 0 of `flags` is reserved.
+ */
+/** Host expansion-board-memory offset of the record (absolute EEPROM 1952). */
+declare const BRAND_RECORD_HOST_OFFSET = 1936;
+declare const BRAND_RECORD_SIZE = 80;
+declare const BRAND_RECORD_MAGIC = 21314;
+declare const BRAND_RECORD_LAYOUT_VER = 2;
+declare const BRAND_BT_CLASSIC_MAX_CHARS = 16;
+declare const BRAND_BLE_MAX_CHARS = 10;
+declare const BRAND_USB_PRODUCT_MAX_CHARS = 16;
+/** Long enough for the stock "Shimmer Research Ltd." (21 chars). */
+declare const BRAND_USB_MANUFACTURER_MAX_CHARS = 24;
+/**
+ * Shimmer3 firmware truncates the BLE prefix to 8 chars so "<prefix>-XXXX"
+ * fits the RN4678's 31-byte advertisement payload. Shimmer3R allows the full
+ * field width.
+ */
+declare const BRAND_BLE_MAX_CHARS_SHIMMER3 = 8;
+/** `flags` bits 1-2: which platform seeded a stock (non-customer) record. */
+declare const BRAND_PLATFORM: Readonly<{
+    readonly UNKNOWN: 0;
+    readonly SHIMMER3: 1;
+    readonly SHIMMER3R: 2;
+    readonly SHIMMER4_SDK: 3;
+}>;
+interface BrandRecord {
+    /** True when magic, layout version, lengths, charset and CRC all check out. */
+    valid: boolean;
+    /** Populated when `valid` is false — first failed check, for display. */
+    invalidReason?: string;
+    /** Classic BT name prefix (firmware appends the MAC suffix). */
+    btClassic: string;
+    /** BLE name prefix. */
+    ble: string;
+    /** USB product-name prefix (firmware appends the MAC suffix). */
+    usbProduct: string;
+    /** USB iManufacturer string, verbatim. */
+    usbManufacturer: string;
+    /** BRAND_PLATFORM value stamped by the seeding firmware. */
+    seededPlatform: number;
+}
+interface BrandRecordFields {
+    btClassic: string;
+    ble: string;
+    usbProduct: string;
+    usbManufacturer: string;
+    /** Defaults to BRAND_PLATFORM.UNKNOWN — informational only. */
+    seededPlatform?: number;
+}
+/**
+ * Firmware-mirrored character rule: 1..max printable ASCII (0x20–0x7E),
+ * comma excluded (it would corrupt the RN4X `S-,<name>` command).
+ * Returns null when OK, else a human-readable reason.
+ */
+declare function brandNameProblem(name: string, maxChars: number): string | null;
+/** Decode and validate a brand record read from the device. */
+declare function parseBrandRecord(bytes: Uint8Array): BrandRecord;
+/**
+ * Serialise a brand record ready to write to the device. Throws on names that
+ * the firmware would reject (so callers surface errors before writing).
+ */
+declare function buildBrandRecord(fields: BrandRecordFields): Uint8Array;
+/**
+ * An all-0xFF (erased) record. Writing this restores the platform defaults:
+ * firmware re-seeds them at the next boot.
+ */
+declare function buildBlankBrandRecord(): Uint8Array;
+
+/**
+ * High-level SD-card download orchestration for the Shimmer3R.
+ *
+ * Walks the on-card tree with the client's SD commands, mirrors the directory
+ * structure on the host via the File System Access API, and pulls each file
+ * down in windows with resume-from-on-disk-size semantics — the same shape as
+ * the field-proven Verisense `transferLoggedData` flow.
+ */
+
+/**
+ * Where the downloaded files are placed under the destination folder.
+ *
+ * - `card` mirrors the on-card tree as-is:
+ *   `data/<TrialName>_<ConfigTime>/<ShimmerName>-<NNN>/<file>`
+ * - `consensysBackup` nests that same tree under the two levels Consensys
+ *   expects inside its workspace `Backup` folder:
+ *   `<import-stamp>/<ShimmerName>/data/<TrialName>_<ConfigTime>/<ShimmerName>-<NNN>/<file>`
+ *   so the download can be imported via
+ *   *Application Settings -> Manage Data -> Import Data From Backup Directory*.
+ */
+type SdDestinationLayout = 'card' | 'consensysBackup';
+/** Device-name folder used when a session folder is not `<Name>-<NNN>`. */
+declare const CONSENSYS_UNKNOWN_DEVICE = "Unknown_Shimmer";
+/**
+ * Format an import-time folder name as Consensys does: `yyyy-MM-dd_HH.mm.ss`
+ * in local time (e.g. `2025-06-25_15.30.36`).
+ */
+declare function formatSdImportStamp(date?: Date): string;
+/**
+ * Map a card directory chain to its Consensys Backup destination.
+ *
+ * The device name is taken from the session folder (`<ShimmerName>-<NNN>`)
+ * rather than from the connected device, so sessions recorded under a previous
+ * device name - or on a card that has been moved between devices - still file
+ * under the name they were recorded with, which is what Consensys shows.
+ */
+declare function consensysBackupSegments(cardDirSegments: string[], importStamp: string): string[];
+interface SdRemoteFile {
+    /** Full on-card path, e.g. `data/DefaultTrial_123/Shimmer_ABCD-000/000`. */
+    path: string;
+    size: number;
+    mtime: Date | null;
+}
+interface SdRemoteTree {
+    /** Directories in discovery order (parents before children), full paths. */
+    dirs: string[];
+    files: SdRemoteFile[];
+    totalBytes: number;
+}
+interface SdTransferProgress {
+    phase: 'enumerate' | 'download' | 'delete';
+    /** On-card path of the file currently transferring (download phase). */
+    currentFile?: string;
+    fileBytesDone?: number;
+    fileBytesTotal?: number;
+    bytesDone: number;
+    bytesTotal: number;
+    filesDone: number;
+    filesTotal: number;
+    /** Rolling throughput estimate over the current file, in KB/s. */
+    kbps?: number;
+}
+interface DownloadSdTreeOptions {
+    /** Root to walk on the card. @default 'data' */
+    rootPath?: string;
+    /** Bytes requested per SD_FILE_READ window. @default 131072 */
+    windowLen?: number;
+    /** Payload bytes per streamed block (64..1024). @default 512 */
+    blockPayloadLen?: number;
+    /** Resume partially-downloaded files from their on-disk size. @default true */
+    resume?: boolean;
+    /** Skip files whose on-disk size already matches the card. @default true */
+    skipExisting?: boolean;
+    /**
+     * After a file downloads completely (size verified), delete it from the
+     * card; session/trial directories that emptied out are removed afterwards.
+     * @default false
+     */
+    deleteAfterVerify?: boolean;
+    /** Windows retried per file before the file is marked failed. @default 3 */
+    maxRetriesPerFile?: number;
+    /** Per-window stall watchdog passed to sdReadFileWindow. @default 6000 */
+    stallTimeoutMs?: number;
+    /** Destination folder layout. @default 'card' */
+    layout?: SdDestinationLayout;
+    /**
+     * Import-time folder name for `consensysBackup` (one per download run).
+     * Defaults to the current local time via {@link formatSdImportStamp}.
+     */
+    importStamp?: string;
+    signal?: AbortSignal;
+    onProgress?: (p: SdTransferProgress) => void;
+}
+interface SdTransferSummary {
+    /** Import folder used for `consensysBackup`; undefined for `card`. */
+    importStamp?: string;
+    filesDownloaded: number;
+    filesSkipped: number;
+    filesFailed: {
+        path: string;
+        error: string;
+    }[];
+    bytesDownloaded: number;
+    deletedFromCard: string[];
+}
+/** Recursively enumerate the on-card tree below `rootPath` (depth-first). */
+declare function enumerateSdTree(client: Shimmer3RClient, rootPath?: string, opts?: {
+    signal?: AbortSignal;
+    maxDepth?: number;
+}): Promise<SdRemoteTree>;
+/**
+ * Download the card's `rootPath` tree into `destRoot`, recreating the on-card
+ * directory structure. Re-running with the same destination resumes: complete
+ * files are skipped and partial files continue from their on-disk size.
+ */
+declare function downloadSdTree(client: Shimmer3RClient, destRoot: FileSystemDirectoryHandle, opts?: DownloadSdTreeOptions): Promise<SdTransferSummary>;
+/**
+ * Delete verified files from the card (files first, then any directories that
+ * emptied out, deepest first). Only paths under `data/` are accepted by the
+ * firmware. Returns the paths actually deleted; failures are skipped.
+ */
+declare function deleteDownloadedFromCard(client: Shimmer3RClient, filePaths: string[], dirPaths?: string[], opts?: {
+    signal?: AbortSignal;
+}): Promise<string[]>;
+
+type ParsedSplitReason = 'midday-midnight-boundary' | 'config-change' | 'timestamp-discontinuity' | 'power-reset';
+interface EvaluateParsedSplitInput {
+    prevTimestampSec: number;
+    currTimestampSec: number;
+    expectedDeltaSec?: number;
+    timestampToleranceSec?: number;
+    prevConfigSignature?: string | null;
+    currConfigSignature?: string | null;
+    powerResetDetected?: boolean;
+}
+/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
+declare function buildUploadBinaryFileName(uploadDate: Date, firstPayloadIndex: number): string;
+/**
+ * Ensure a nested directory path exists under a root directory handle, creating
+ * each level as needed, and return the leaf handle. Browser-only (File System
+ * Access API) — the app obtains `root` from `showDirectoryPicker()` when the
+ * user selects an output location at transfer start.
+ */
+declare function ensureDirectoryPath(root: FileSystemDirectoryHandle, segments: string[]): Promise<FileSystemDirectoryHandle>;
+/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
+declare function buildParsedCsvFileName(startDate: Date, dataSource: string, firstPayloadIndex: number): string;
+/** Add duplicate suffix like " (2)" before extension. */
+declare function applyDuplicateSuffix(fileName: string, duplicateIndex: number): string;
+/** Return first non-colliding duplicate name for a target file name. */
+declare function nextAvailableDuplicateFileName(fileName: string, existingNames: Iterable<string>): string;
+/** Parse first payload index (uint16 LE) from a payload byte array. */
+declare function getFirstPayloadIndex(payload: Uint8Array): number;
+/**
+ * Evaluate whether parsed CSV output should roll to a new file.
+ * Rules mirror ASM-DES08 split conditions.
+ */
+declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
+    shouldSplit: boolean;
+    reasons: ParsedSplitReason[];
+};
 
 /**
  * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
@@ -1997,6 +2565,35 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * stream schema. Tolerant of an optional leading ACK before the response.
      */
     inquiry(): Promise<Shimmer3InquiryResult>;
+    /**
+     * Arm a one-shot soft reboot that the device performs as soon as this host
+     * disconnects (SET_FEATURE / FEATURE_REBOOT_ON_DISCONNECT).
+     *
+     * Settings that firmware only reads at boot - notably the EEPROM brand
+     * record's advertising names - otherwise need a manual power-cycle. The
+     * reboot cannot happen while still connected, because the link has to drop
+     * for the Bluetooth module to re-read its name; so the sequence is: write
+     * settings, call this, then {@link disconnect}.
+     *
+     * Firmware skips the reboot while sensing so that it can never truncate an
+     * active SD recording, and clears the request either way - it is strictly
+     * one-shot and never carries into a later disconnect.
+     *
+     * Requires firmware with FEATURE_REBOOT_ON_DISCONNECT support; older
+     * firmware NACKs the unknown feature id.
+     */
+    setRebootOnDisconnect(enabled: boolean): Promise<void>;
+    /**
+     * Read from the daughter-card EEPROM memory. `offset` is a HOST offset —
+     * firmware maps it past the first (HW details) EEPROM page, so host offsets
+     * 0..2031 cover absolute EEPROM bytes 16..2047.
+     */
+    readDaughterCardMem(offset: number, length: number): Promise<Uint8Array>;
+    /**
+     * Write to the daughter-card EEPROM memory. `offset` is a HOST offset (see
+     * {@link readDaughterCardMem}). Max 128 bytes per write.
+     */
+    writeDaughterCardMem(offset: number, data: Uint8Array): Promise<void>;
     startStreaming(): Promise<void>;
     stopStreaming(): Promise<void>;
     /**
@@ -2894,6 +3491,17 @@ declare class WiredShimmerClient extends BaseShimmerClient {
      */
     readExpansionBoard(): Promise<ExpansionBoardInfo | null>;
     private _readExpansionBoardImpl;
+    /**
+     * Read from the daughter-card EEPROM memory (`DAUGHTER_CARD.CARD_MEM`).
+     * `address` is a HOST offset — firmware maps it past the first (HW details)
+     * EEPROM page, so host offsets 0..2031 cover absolute EEPROM bytes 16..2047.
+     */
+    readDaughterCardMem(address: number, size: number): Promise<Uint8Array>;
+    /**
+     * Write to the daughter-card EEPROM memory (`DAUGHTER_CARD.CARD_MEM`).
+     * `address` is a HOST offset (see {@link readDaughterCardMem}).
+     */
+    writeDaughterCardMem(address: number, data: Uint8Array): Promise<void>;
     /** Read one config property's raw payload (READ). */
     getConfig(arg: UartComponentProperty): Promise<Uint8Array>;
     /** Write one config property (WRITE), resolving on ACK. */
@@ -4658,35 +5266,6 @@ declare function deriveVerisenseMacIdFromName(name: string | null | undefined): 
  * can omit it cleanly.
  */
 declare function verisenseDeviceFileTag(idOrName: string | null | undefined): string;
-
-type ParsedSplitReason = 'midday-midnight-boundary' | 'config-change' | 'timestamp-discontinuity' | 'power-reset';
-interface EvaluateParsedSplitInput {
-    prevTimestampSec: number;
-    currTimestampSec: number;
-    expectedDeltaSec?: number;
-    timestampToleranceSec?: number;
-    prevConfigSignature?: string | null;
-    currConfigSignature?: string | null;
-    powerResetDetected?: boolean;
-}
-/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
-declare function buildUploadBinaryFileName(uploadDate: Date, firstPayloadIndex: number): string;
-/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
-declare function buildParsedCsvFileName(startDate: Date, dataSource: string, firstPayloadIndex: number): string;
-/** Add duplicate suffix like " (2)" before extension. */
-declare function applyDuplicateSuffix(fileName: string, duplicateIndex: number): string;
-/** Return first non-colliding duplicate name for a target file name. */
-declare function nextAvailableDuplicateFileName(fileName: string, existingNames: Iterable<string>): string;
-/** Parse first payload index (uint16 LE) from a payload byte array. */
-declare function getFirstPayloadIndex(payload: Uint8Array): number;
-/**
- * Evaluate whether parsed CSV output should roll to a new file.
- * Rules mirror ASM-DES08 split conditions.
- */
-declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
-    shouldSplit: boolean;
-    reasons: ParsedSplitReason[];
-};
 
 type VerisenseHardwareFriendlyName = 'IMU' | 'GSR+' | 'SDK' | 'Pulse+';
 interface VerisenseHardwareCapabilities {
@@ -7106,5 +7685,5 @@ declare function parseVerisenseFactoryTestReport(text: string): VerisenseFactory
  */
 declare function verisenseFactoryTestReportToCsvRows(parsed: VerisenseFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE as WIRED_NEED_MORE, RESYNC as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, buildBaseCommand, buildDefaultVerisenseCalibrationSet, buildHeader, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseCalibDump, parseCalibrationBlob, parseEventLogPayload, parseExpansionBoard, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemContext, InfoMemDeviceConfig, InfoMemLayout, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE as WIRED_NEED_MORE, RESYNC as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, sdCrc16, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BrandRecord, BrandRecordFields, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemContext, InfoMemDeviceConfig, InfoMemLayout, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
