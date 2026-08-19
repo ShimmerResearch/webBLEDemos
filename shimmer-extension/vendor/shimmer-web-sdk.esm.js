@@ -4069,8 +4069,7 @@ function parseBrandRecord(bytes) {
         rec.usb = readField(bytes, OFF_USB, usbLen);
     }
     if (magic !== BRAND_RECORD_MAGIC) {
-        rec.invalidReason =
-            bytes.every((b) => b === 0xff) ? 'blank (erased) record' : 'bad magic';
+        rec.invalidReason = bytes.every((b) => b === 0xff) ? 'blank (erased) record' : 'bad magic';
         return rec;
     }
     if (bytes[OFF_LAYOUT_VER] !== BRAND_RECORD_LAYOUT_VER) {
@@ -4112,13 +4111,17 @@ function buildBrandRecord(fields) {
         if (problem)
             throw new Error(`${label}: ${problem}`);
     }
+    const platform = fields.seededPlatform ?? BRAND_PLATFORM.UNKNOWN;
+    if (!Number.isInteger(platform) || platform < 0 || platform > 3) {
+        throw new Error(`seededPlatform: must be a BRAND_PLATFORM value (0..3), got ${platform}`);
+    }
     const bytes = new Uint8Array(BRAND_RECORD_SIZE); // zero-filled, incl. padding
     bytes[OFF_MAGIC] = BRAND_RECORD_MAGIC & 0xff;
     bytes[OFF_MAGIC + 1] = (BRAND_RECORD_MAGIC >> 8) & 0xff;
     bytes[OFF_LAYOUT_VER] = BRAND_RECORD_LAYOUT_VER;
     bytes[OFF_FLAGS] =
         (fields.customerBranded ? FLAG_CUSTOMER_BRANDED : 0) |
-            (((fields.seededPlatform ?? BRAND_PLATFORM.UNKNOWN) << PLATFORM_SHIFT) & PLATFORM_MASK);
+            ((platform << PLATFORM_SHIFT) & PLATFORM_MASK);
     bytes[OFF_BT_CLASSIC_LEN] = fields.btClassic.length;
     bytes[OFF_BLE_LEN] = fields.ble.length;
     bytes[OFF_USB_LEN] = fields.usb.length;
@@ -4428,6 +4431,16 @@ function shimmer3ControlMessageLength(buf) {
         if (numChannels > 32)
             return RESYNC;
         return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
+    }
+    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE) {
+        // Variable length: [0x68][length][data...]. Firmware caps daughter-card
+        // memory reads at 128 bytes — treat larger "lengths" as garbage and resync.
+        if (buf.length < 2)
+            return NEED_MORE;
+        const dcLen = buf[1];
+        if (dcLen > 128)
+            return RESYNC;
+        return 2 + dcLen;
     }
     const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
     if (payload === undefined)

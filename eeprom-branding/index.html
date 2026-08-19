@@ -216,7 +216,11 @@ function deviceLabelForHw() {
 }
 
 function bleCap() {
-  return isShimmer3() ? BRAND_BLE_MAX_CHARS_SHIMMER3 : BRAND_BLE_MAX_CHARS;
+  // Only allow the full field width when the device is positively identified
+  // as a Shimmer3R. If identify() failed (hwVersion null), stay conservative
+  // with the Shimmer3 8-char cap so an unidentified Shimmer3 can't be given a
+  // BLE prefix that its firmware would truncate on air.
+  return hwVersion === HW_ID.SHIMMER3R ? BRAND_BLE_MAX_CHARS : BRAND_BLE_MAX_CHARS_SHIMMER3;
 }
 
 // ---------------------------------------------------------------------------
