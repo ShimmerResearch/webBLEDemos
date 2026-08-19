@@ -1,3 +1,5 @@
+'use strict';
+
 /**
  * Container for a single decoded sensor frame.
  *
@@ -683,30 +685,12 @@ class RtcDriftMonitor {
         return (s[s.length - 1].hostSec - s[0].hostSec) / 60;
     }
     /**
-     * CSV rows of the current series, matching the DEV-844 export format: a
-     * header row (host ISO time, host/device unix seconds, offset, rtt,
-     * monotonic seconds) followed by one row per sample.
-     *
-     * Optional `metadata` is emitted as `# key: value` comment lines BEFORE the
-     * header (so the header is no longer row 0 when metadata is supplied), so a
-     * saved file records what it came from (device, transport, the fit result,
-     * etc.) - the S3R drift tool established this preamble and the console
-     * adopts it. Each value has newlines collapsed so every entry stays a single
-     * comment line; a caller can read the fit via
-     * {@link ppmFit}/{@link deviceSteps}/{@link hostSteps} to build the map.
+     * CSV rows (header first) of the current series, matching the DEV-844
+     * export format: host ISO time, host/device unix seconds, offset, rtt,
+     * monotonic seconds.
      */
-    toCsvRows(metadata) {
-        const rows = [];
-        if (metadata) {
-            for (const [k, v] of Object.entries(metadata)) {
-                // Keep each entry a single clean comment line.
-                const clean = String(v)
-                    .replace(/[\r\n]+/g, ' ')
-                    .trim();
-                rows.push(`# ${k}: ${clean}`);
-            }
-        }
-        rows.push('host_iso,host_unix_s,device_unix_s,offset_s,rtt_ms,perf_monotonic_s');
+    toCsvRows() {
+        const rows = ['host_iso,host_unix_s,device_unix_s,offset_s,rtt_ms,perf_monotonic_s'];
         for (const p of this.samples) {
             rows.push(`${new Date(p.hostSec * 1000).toISOString()},${p.hostSec.toFixed(3)},${p.devSec.toFixed(5)},${p.offsetSec.toFixed(3)},${p.rttMs},${(p.perfMs / 1000).toFixed(3)}`);
         }
@@ -15949,669 +15933,293 @@ function getVerisenseCalibrationSensorAvailability(support) {
     };
 }
 
-/** The firmware release that renumbered the tests. */
-const RENUMBER_VERSION = { major: 2, minor: 0, internal: 10 };
-/**
- * Line starts that may appear glued onto the end of a previous line.
- *
- * The firmware assembles each line in a shared 128-byte buffer, and the
- * WS_TEST_0003 WARNING text is longer than that: `snprintf` truncates it and
- * the trailing CRLF is lost, so whatever is written next runs straight on. We
- * re-split on these anchors and note the repair.
- */
-const REPAIR_ANCHORS = [
-    / - WS_TEST_\d{4} - /g,
-    /LED test \(WS_TEST_\d{4}\):/g,
-    /(?:MCU|I\/O status|Battery|Shimmer model|TWIM0|TWIM1 \(part ?\d\)|SPIM2|SPIM3):/g,
-    /Overall Result\s*=/g,
-    /\/\/\*+/g,
-];
-/**
- * Matched in order against the text following the `WS_TEST_00NN` prefix; first
- * hit wins. Every pattern keys on wording the firmware has printed stably
- * across the renumbering, not on the test number.
- */
-const CLASSIFIERS = [
-    {
-        name: 'vcore',
-        label: 'VCore',
-        match: /VCore/i,
-        extract: (body, out) => {
-            const m = /VCore\s*=\s*(-?\d+)\s*mV(?:\s*\(\s*(\d+)\s*-\s*(\d+)\s*mV\s*\))?/i.exec(body);
-            if (!m)
-                return;
-            setNum(out, 'vcore_mv', m[1]);
-            setNum(out, 'vcore_limit_low_mv', m[2]);
-            setNum(out, 'vcore_limit_high_mv', m[3]);
-        },
-    },
-    {
-        name: 'mcu_temp',
-        label: 'MCU temperature',
-        match: /Temperature\s*=\s*-?\d/i,
-        extract: (body, out) => {
-            setNum(out, 'mcu_temp_c', /Temperature\s*=\s*(-?\d+)/i.exec(body)?.[1]);
-        },
-    },
-    {
-        name: 'lfclk',
-        label: 'LF crystal',
-        match: /LF crystal/i,
-        extract: (body, out) => {
-            setNum(out, 'lfclk_ppm', /error\s*=\s*([+-]?\d+(?:\.\d+)?)\s*ppm/i.exec(body)?.[1]);
-            setNum(out, 'lfclk_s_per_day', /\(\s*([+-]?\d+(?:\.\d+)?)\s*s\/day\s*\)/i.exec(body)?.[1]);
-            setNum(out, 'lfclk_limit_ppm', /limit\s*\+\/-\s*(\d+(?:\.\d+)?)\s*ppm/i.exec(body)?.[1]);
-            setStr(out, 'lfclk_src', /LFCLK\s*src\s*=\s*([A-Za-z]+)/i.exec(body)?.[1]);
-            setStr(out, 'lfclk_fail_reason', /not measurable\s*\(([^,)]+)/i.exec(body)?.[1]);
-        },
-    },
-    {
-        name: 'usb_power',
-        label: 'USB power good',
-        match: /USB (?:power good|not applicable)/i,
-        extract: (body, out) => {
-            const m = /USB power good\s*:\s*(Yes|No)/i.exec(body);
-            if (m)
-                out.usb_power_good = /yes/i.test(m[1]);
-        },
-    },
-    { name: 'eeprom', label: 'CAT24M01 EEPROM', match: /EEPROM/i },
-    {
-        name: 'model',
-        label: 'Shimmer model',
-        match: /production config|^\s*(?:PASS|FAIL)\s*$/i,
-    },
-    {
-        name: 'battery',
-        label: 'VBatt',
-        match: /VBatt/i,
-        resultKey: 'vbatt_result',
-        extract: (body, out) => {
-            const m = /VBatt\s*=\s*(-?\d+)\s*mV(?:\s*\(\s*(\d+)\s*-\s*(\d+)\s*mV\s*\))?/i.exec(body);
-            if (m) {
-                setNum(out, 'vbatt_mv', m[1]);
-                setNum(out, 'vbatt_limit_low_mv', m[2]);
-                setNum(out, 'vbatt_limit_high_mv', m[3]);
-            }
-            // Percentage is only printed when the unit is not charging.
-            setNum(out, 'batt_pct', /,\s*(\d+)\s*%/.exec(body)?.[1]);
-        },
-    },
-    {
-        name: 'charger',
-        label: 'Charger status',
-        match: /Charger/i,
-        extract: (body, out) => {
-            setStr(out, 'charger_status', /Charger status\s*:\s*(.+?)\s*$/i.exec(body)?.[1]);
-        },
-    },
-    {
-        name: 'light',
-        label: 'VD6283TX Light sensor',
-        match: /VD6283|Light sensor/i,
-        extract: (body, out) => {
-            setNum(out, 'lux', /([\d.]+)\s*Lux/i.exec(body)?.[1]);
-            setNum(out, 'cct_k', /CCT\s*:\s*(\d+)\s*K/i.exec(body)?.[1]);
-            const flicker = /Flicker\s*:\s*([\d.]+)\s*Hz\s*,\s*(\d+)\s*%\s*mod/i.exec(body);
-            if (flicker) {
-                setNum(out, 'flicker_hz', flicker[1]);
-                setNum(out, 'flicker_mod_pct', flicker[2]);
-                out.flicker_status = 'detected';
-            }
-            else if (/Flicker\s*:\s*link OK/i.test(body)) {
-                out.flicker_status = 'link_ok_none_detected';
-            }
-            else if (/Flicker\s*:\s*FAIL\s*-\s*no signal/i.test(body)) {
-                out.flicker_status = 'no_signal';
-            }
-            else if (/Flicker\s*:\s*FAIL\s*-\s*no capture/i.test(body)) {
-                out.flicker_status = 'no_capture';
-            }
-        },
-    },
-    {
-        name: 'skin_temp',
-        label: 'Thermal sensor',
-        // The firmware prints MLX90640; the part actually fitted is an MLX90632.
-        match: /MLX906|Thermal sensor/i,
-        extract: (body, out) => {
-            setNum(out, 'mlx_ambient_c', /Ambient\s*=\s*(-?\d+)/i.exec(body)?.[1]);
-            setNum(out, 'mlx_object_c', /Object\s*=\s*(-?\d+)/i.exec(body)?.[1]);
-        },
-    },
-    {
-        name: 'algo_hub',
-        label: 'MAX32674C Algorithm hub',
-        match: /MAX32674|Algorithm hub/i,
-        resultKey: 'hub_result',
-        extract: (body, out) => {
-            setStr(out, 'hub_fw_version', /\(\s*v([\d.]+)\s*\)/i.exec(body)?.[1]);
-            if (/Incorrect FW/i.test(body))
-                out.hub_fail_reason = 'incorrect_fw';
-            else if (/bootloader mode/i.test(body))
-                out.hub_fail_reason = 'bootloader_mode';
-            else if (/not responding/i.test(body))
-                out.hub_fail_reason = 'not_responding';
-            else if (/not detected/i.test(body))
-                out.hub_fail_reason = 'not_detected';
-        },
-    },
-    {
-        name: 'ppg_afe',
-        label: 'MAX86176 Pulse oximeter',
-        match: /MAX86|Pulse oximeter/i,
-        extract: (body, out) => chipDetail(body, out, 'ppg_afe'),
-    },
-    {
-        name: 'accel2',
-        label: 'LIS2DW12 Accelerometer',
-        match: /LIS2DW12/i,
-        extract: (body, out) => chipDetail(body, out, 'accel2'),
-    },
-    {
-        name: 'imu',
-        label: 'IMU',
-        match: /LSM6DS/i,
-        extract: (body, out) => chipDetail(body, out, 'imu'),
-    },
-    {
-        name: 'mag',
-        label: 'LIS2MDL Magnetometer',
-        match: /LIS2MDL/i,
-        extract: (body, out) => chipDetail(body, out, 'mag'),
-    },
-    {
-        name: 'nand_health',
-        label: 'NAND health test',
-        match: /NAND health/i,
-    },
-    {
-        name: 'nand',
-        label: 'Main flash test',
-        match: /Main flash test|read flash device ID/i,
-    },
-    { name: 'stf1', label: 'STF1 Flash test', match: /STF1/i },
-    { name: 'stf2', label: 'STF2 Flash test', match: /STF2/i },
-    { name: 'led', label: 'LED test', match: /LED test/i },
-];
-/** Shared shape of the IMU-class self-test lines: optional temperature in
- * parentheses plus an optional failure-reason suffix. */
-function chipDetail(body, out, prefix) {
-    setNum(out, `${prefix}_temp_c`, /\(\s*(-?\d+)\s*°?\s*C\s*\)/i.exec(body)?.[1]);
-    const reason = /-\s*(Chip not detected|Signal issue|Temperature issue|DRDY\/INT issue|Unknown)/i.exec(body)?.[1];
-    if (reason)
-        out[`${prefix}_fail_reason`] = reason.trim();
-}
-function num(value) {
-    if (value == null || value === '')
-        return undefined;
-    const n = Number(value);
-    return Number.isFinite(n) ? n : undefined;
-}
-function setNum(out, key, value) {
-    const n = num(value);
-    if (n !== undefined)
-        out[key] = n;
-}
-function setStr(out, key, value) {
-    const s = value?.trim();
-    if (s)
-        out[key] = s;
-}
-/**
- * Fold the several ways a degree sign can reach us into a single `°`.
- *
- * The firmware emits a bare `0xB0` on some builds and UTF-8 `0xC2 0xB0` on
- * others; depending on how the transport decoded the bytes we see `°`, the
- * mojibake `Â°`, or the Unicode replacement character.
- */
-function normalizeReportText(text) {
-    return String(text ?? '')
-        .replace(/Â°/g, '°')
-        .replace(/�/g, '°');
-}
-/** Split into lines, dropping the NAND health progress dots and re-splitting
- * lines that the firmware's 128-byte buffer glued together. */
-function toLines(text, warnings) {
-    const out = [];
-    let stripped = 0;
-    for (const raw of text.split(/\r\n|\r|\n/)) {
-        // The NAND health test streams bare dots to keep the host's idle timer
-        // alive; they arrive with no newline of their own.
-        if (/^[.\s]*$/.test(raw) && /\./.test(raw)) {
-            stripped += 1;
-            continue;
-        }
-        const line = raw.replace(/\.{3,}\s*$/, '');
-        for (const piece of repairLine(line, warnings)) {
-            if (piece.trim())
-                out.push(piece);
-        }
-    }
-    if (stripped)
-        warnings.push(`stripped ${stripped} progress-dot line(s)`);
-    return out;
-}
-/** Re-split one physical line wherever a known line start appears mid-line. */
-function repairLine(line, warnings) {
-    let earliest = -1;
-    for (const anchor of REPAIR_ANCHORS) {
-        anchor.lastIndex = 0;
-        let m;
-        while ((m = anchor.exec(line)) !== null) {
-            if (m.index > 0 && (earliest < 0 || m.index < earliest))
-                earliest = m.index;
-        }
-    }
-    if (earliest <= 0)
-        return [line];
-    warnings.push(`repaired a line truncated by the firmware buffer near column ${earliest}`);
-    const head = line.slice(0, earliest);
-    return [head, ...repairLine(line.slice(earliest), warnings)];
-}
-/** Read the verdict keyword, if any, off the text following the test id. */
-function readVerdict(body) {
-    const m = /^\s*(PASS|FAIL|WARNING)\b/i.exec(body);
-    if (m)
-        return m[1].toUpperCase();
-    if (/not applicable/i.test(body))
-        return 'NOT_APPLICABLE';
-    if (body.trim())
-        return 'INFO';
-    return 'UNKNOWN';
-}
-/** Derive the numbering scheme from the reported firmware version. */
-function readIdScheme(version) {
-    if (!version)
-        return 'unknown';
-    const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
-    if (!m)
-        return 'unknown';
-    const triple = {
-        major: Number(m[1]),
-        minor: Number(m[2]),
-        internal: Number(m[3]),
-    };
-    return compareVerisenseFirmwareVersion(triple, RENUMBER_VERSION) >= 0 ? 'v2_00_010' : 'legacy';
-}
-function emptyResult() {
-    return {
-        ok: false,
-        complete: false,
-        firmwareVersion: null,
-        idScheme: 'unknown',
-        overall: { result: null, failMaskHex: null, failMask: null, failedTestNames: [] },
-        mcu: {
-            macId: null,
-            deviceId: null,
-            part: null,
-            variant: null,
-            lastResetHex: null,
-            lastResetReasons: null,
-            bootCount: null,
-        },
-        model: null,
-        tests: [],
-        metrics: {},
-        unparsedLines: [],
-        parserWarnings: [],
-    };
-}
-/**
- * Parse a full factory test report into structured metrics.
- *
- * Never throws: malformed or unrecognized input comes back with `ok: false`
- * and/or its lines preserved in `unparsedLines`.
- */
-function parseVerisenseFactoryTestReport(text) {
-    const result = emptyResult();
-    try {
-        parseInto(normalizeReportText(text), result);
-    }
-    catch (err) {
-        result.parserWarnings.push(`parser error: ${String(err?.message ?? err)}`);
-    }
-    return result;
-}
-function parseInto(text, result) {
-    const warnings = result.parserWarnings;
-    const lines = toLines(text, warnings);
-    const metrics = result.metrics;
-    /** Canonical name of the test each printed id was seen against, so the fail
-     * mask can be decoded under whichever numbering this report used. */
-    const nameById = new Map();
-    let ledSeen = 0;
-    /** Held in an object so the assignment inside `pushTest` stays visible to
-     * the type checker at every use site. */
-    const open = { test: null };
-    const pushTest = (test) => {
-        result.tests.push(test);
-        if (test.id != null)
-            nameById.set(test.id, test.name);
-        open.test = test;
-    };
-    const addDetail = (line) => {
-        const test = open.test;
-        if (!test)
-            return;
-        test.detail = test.detail ? `${test.detail} | ${line.trim()}` : line.trim();
-    };
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (/TEST START/.test(trimmed)) {
-            result.ok = true;
-            continue;
-        }
-        if (/TEST END/.test(trimmed)) {
-            result.complete = true;
-            continue;
-        }
-        const fw = /^Firmware version\s*:\s*v?([\d.]+)/i.exec(trimmed);
-        if (fw) {
-            result.firmwareVersion = fw[1];
-            result.idScheme = readIdScheme(fw[1]);
-            metrics.fw_version = fw[1];
-            continue;
-        }
-        const range = /Temperature pass range set to\s*(-?\d+)\s*-\s*(-?\d+)/i.exec(trimmed);
-        if (range) {
-            setNum(metrics, 'temp_range_low_c', range[1]);
-            setNum(metrics, 'temp_range_high_c', range[2]);
-            continue;
-        }
-        const overall = /^Overall Result\s*=\s*(PASS|FAIL)(?:\s*\(\s*(0x[0-9A-Fa-f]+)\s*\))?/i.exec(trimmed);
-        if (overall) {
-            result.overall.result = overall[1].toUpperCase();
-            metrics.overall_result = result.overall.result;
-            if (overall[2]) {
-                result.overall.failMaskHex = overall[2].toUpperCase().replace('0X', '0x');
-                result.overall.failMask = Number.parseInt(overall[2], 16);
-                metrics.fail_mask_hex = result.overall.failMaskHex;
-            }
-            continue;
-        }
-        // Section headers (`MCU:`, `SPIM3:` …) carry no data but end the previous
-        // test's sub-line run.
-        if (/^(?:MCU|I\/O status|Battery|Shimmer model|TWIM0|TWIM1 \(part ?\d\)|SPIM2|SPIM3)\s*:$/i.test(trimmed)) {
-            open.test = null;
-            continue;
-        }
-        if (readMcuHeaderLine(trimmed, result, metrics))
-            continue;
-        // `LED test (WS_TEST_0019):` — the first such block is the operational
-        // status LED, the second the battery LED. Ordering survives renumbering.
-        const ledHeader = /^LED test\s*\(\s*WS_TEST_(\d{4})\s*\)\s*:/i.exec(trimmed);
-        if (ledHeader) {
-            const name = ledSeen === 0 ? 'led_status' : 'led_batt';
-            ledSeen += 1;
-            pushTest({
-                id: Number(ledHeader[1]),
-                name,
-                label: name === 'led_status' ? 'LED test - operational status' : 'LED test - battery status',
-                verdict: 'INFO',
-                detail: '',
-                metrics: {},
-            });
-            // Deliberately no `<name>_result` metric: an INFO verdict carries no
-            // data (the LED test is operator-visual narration), and which suite ran
-            // is already recorded by the caller's factory-test-type column. The
-            // verdict is still on the tests[] entry for anyone who wants it.
-            continue;
-        }
-        const idLine = /^-?\s*WS_TEST_(\d{4})\s*-\s*(.*)$/i.exec(trimmed.replace(/^-\s*/, '- '));
-        if (idLine) {
-            const id = Number(idLine[1]);
-            const body = idLine[2] ?? '';
-            const verdict = readVerdict(body);
-            const classifier = CLASSIFIERS.find((c) => c.match.test(body));
-            let name = classifier?.name ?? `ws_test_${idLine[1]}`;
-            let label = classifier?.label ?? `WS_TEST_${idLine[1]}`;
-            if (name === 'led') {
-                // Not-applicable LED lines come through the id path rather than as a
-                // `LED test (…):` header.
-                name = ledSeen === 0 ? 'led_status' : 'led_batt';
-                label =
-                    name === 'led_status' ? 'LED test - operational status' : 'LED test - battery status';
-                ledSeen += 1;
-            }
-            const testMetrics = {};
-            classifier?.extract?.(body, testMetrics);
-            if (!classifier)
-                scrapeGenericMetrics(body, name, testMetrics);
-            // A verdict column is only worth a spreadsheet cell when it can vary:
-            // PASS/FAIL/WARNING record an outcome and NOT_APPLICABLE records a
-            // model gate, but INFO just means "an informational line printed" — its
-            // substance is already in that line's own metrics (usb_power_good,
-            // charger_status, ...), so emitting it would waste a column per test.
-            if (verdict !== 'INFO') {
-                const resultKey = classifier?.resultKey ?? `${name}_result`;
-                testMetrics[resultKey] = verdict;
-            }
-            pushTest({ id, name, label, verdict, detail: body.trim(), metrics: testMetrics });
-            Object.assign(metrics, testMetrics);
-            continue;
-        }
-        if (readSubLine(trimmed, result, metrics, open.test, addDetail))
-            continue;
-        // LED narration (`- All LEDs off`, `- Left Red LED on`) belongs to the LED
-        // test currently open.
-        if (open.test && /^-\s*(All|Left|Right)\b.*LED/i.test(trimmed)) {
-            addDetail(trimmed.replace(/^-\s*/, ''));
-            continue;
-        }
-        result.unparsedLines.push(line);
-    }
-    // Decode the fail mask through the ids this report actually used.
-    if (result.overall.failMask != null) {
-        const names = [];
-        for (let bit = 0; bit < 32; bit += 1) {
-            if (!(result.overall.failMask & (1 << bit)))
-                continue;
-            const id = bit + 1;
-            names.push(nameById.get(id) ?? `ws_test_${String(id).padStart(4, '0')}`);
-        }
-        result.overall.failedTestNames = names;
-    }
-}
-/** MCU identification lines printed above the first test. */
-function readMcuHeaderLine(trimmed, result, metrics) {
-    const mac = /^-?\s*MAC ID\s*:\s*([0-9A-Fa-f]+)/.exec(trimmed);
-    if (mac) {
-        result.mcu.macId = mac[1].toUpperCase();
-        // Named ble_mac, not mac_id: this is the full 12-hex BLE MAC from the
-        // report, distinct from the production config's 4-hex "MAC ID" suffix that
-        // callers pass as a mac_id meta column. Sharing the name collided the two.
-        metrics.ble_mac = result.mcu.macId;
-        return true;
-    }
-    const dev = /^Device ID\s*:\s*(\S+)/i.exec(trimmed);
-    if (dev) {
-        result.mcu.deviceId = dev[1];
-        metrics.device_id = dev[1];
-        return true;
-    }
-    const part = /^Part\s*:\s*(\S+?)\s*,\s*Variant\s*:\s*(\S+)/i.exec(trimmed);
-    if (part) {
-        result.mcu.part = part[1];
-        result.mcu.variant = part[2];
-        metrics.mcu_part = part[1];
-        metrics.mcu_variant = part[2];
-        return true;
-    }
-    const reset = /^Last reset\s*:\s*(0x[0-9A-Fa-f]+)\s*(.*?)\s*,\s*boot count\s*=\s*(\d+)/i.exec(trimmed);
-    if (reset) {
-        result.mcu.lastResetHex = reset[1];
-        result.mcu.lastResetReasons = reset[2].replace(/^\(|\)$/g, '').trim() || null;
-        result.mcu.bootCount = Number(reset[3]);
-        metrics.last_reset_hex = reset[1];
-        if (result.mcu.lastResetReasons)
-            metrics.last_reset_reasons = result.mcu.lastResetReasons;
-        setNum(metrics, 'boot_count', reset[3]);
-        return true;
-    }
-    return false;
-}
-/**
- * Indented continuation lines, dispatched on their own wording rather than on
- * which test is open. A value always lands in the GLOBAL metrics map under its
- * own name, so the flat map is correct even when the parent line went missing;
- * it is additionally attached to the currently open test's entry when one
- * exists, so a stray sub-line after an unrelated test would show up on that
- * test's `metrics`/`detail` (the tests[] attachment is best-effort context,
- * not the source of truth).
- */
-function readSubLine(trimmed, result, metrics, current, addDetail) {
-    const put = (key, value) => {
-        metrics[key] = value;
-        if (current)
-            current.metrics[key] = value;
-    };
-    // --- Shimmer model block ---
-    const name = /^Name\s*:\s*(.+?)(?:\s*\(\s*(SR[\d-]+)\s*\))?\s*$/i.exec(trimmed);
-    if (name) {
-        result.model ?? (result.model = emptyModel());
-        result.model.name = name[1].trim();
-        put('model_name', result.model.name);
-        if (name[2]) {
-            result.model.srRevision = name[2];
-            put('model_sr_revision', name[2]);
-        }
-        addDetail(trimmed);
-        return true;
-    }
-    const mo = /^Manufacturing Order\s*\|\s*MAC\s*:\s*([0-9A-Fa-f]+)\s*\|\s*([0-9A-Fa-f]+)/i.exec(trimmed);
-    if (mo) {
-        result.model ?? (result.model = emptyModel());
-        result.model.manufacturingOrder = mo[1].toUpperCase();
-        result.model.macSuffix = mo[2].toUpperCase();
-        put('model_mo', result.model.manufacturingOrder);
-        put('model_mac_suffix', result.model.macSuffix);
-        addDetail(trimmed);
-        return true;
-    }
-    const advPrefix = /^Advertising Prefix\s*:\s*(.+?)\s*$/i.exec(trimmed);
-    if (advPrefix) {
-        result.model ?? (result.model = emptyModel());
-        result.model.advertisingPrefix = advPrefix[1];
-        put('adv_prefix', advPrefix[1]);
-        addDetail(trimmed);
-        return true;
-    }
-    const passkeyId = /^Passkey ID\s*:\s*(\S+)\s*(?:\(([^)]*)\))?/i.exec(trimmed);
-    if (passkeyId) {
-        result.model ?? (result.model = emptyModel());
-        result.model.passkeyId = passkeyId[1];
-        put('passkey_id', passkeyId[1]);
-        if (passkeyId[2]) {
-            result.model.passkeyKind = passkeyId[2].trim();
-            put('passkey_kind', result.model.passkeyKind);
-        }
-        addDetail(trimmed);
-        return true;
-    }
-    // The passkey value itself is a device secret — record only that one is set.
-    if (/^Passkey\s*:/i.test(trimmed)) {
-        addDetail('Passkey: (not recorded)');
-        return true;
-    }
-    // --- Main flash geometry ---
-    const manufacturer = /^Manufacturer\s*=\s*(.+?)\s*$/i.exec(trimmed);
-    if (manufacturer) {
-        put('nand_manufacturer', manufacturer[1]);
-        addDetail(trimmed);
-        return true;
-    }
-    const model = /^Model\s*=\s*(.+?)\s*$/i.exec(trimmed);
-    if (model) {
-        put('nand_model', model[1]);
-        addDetail(trimmed);
-        return true;
-    }
-    const size = /^Size\s*=\s*(\d+)\s*MB/i.exec(trimmed);
-    if (size) {
-        put('nand_size_mb', Number(size[1]));
-        addDetail(trimmed);
-        return true;
-    }
-    // --- NAND health ---
-    const census = /^Bad-block census\s*=\s*(\d+)\s*of\s*(\d+)\s*\(\s*limit\s*(\d+)\s*\)/i.exec(trimmed);
-    if (census) {
-        put('nand_bad_blocks', Number(census[1]));
-        put('nand_bad_block_total', Number(census[2]));
-        put('nand_bad_block_limit', Number(census[3]));
-        addDetail(trimmed);
-        return true;
-    }
-    const stress = /^Stress\s*=\s*(\d+)\s*blocks\s*\/\s*(\d+)\s*page checks(?:\s*\(\s*(\d+)\s*sampled blocks skipped bad\s*\))?/i.exec(trimmed);
-    if (stress) {
-        put('nand_stress_blocks', Number(stress[1]));
-        put('nand_page_checks', Number(stress[2]));
-        if (stress[3] != null)
-            put('nand_blocks_skipped', Number(stress[3]));
-        addDetail(trimmed);
-        return true;
-    }
-    const pages = /^Corrupt pages\s*=\s*(\d+)\s*,\s*unstable pages\s*=\s*(\d+)\s*,\s*erase\/write fails\s*=\s*(\d+)\s*\/\s*(\d+)/i.exec(trimmed);
-    if (pages) {
-        put('nand_corrupt_pages', Number(pages[1]));
-        put('nand_unstable_pages', Number(pages[2]));
-        put('nand_erase_write_fails', `${pages[3]}/${pages[4]}`);
-        addDetail(trimmed);
-        return true;
-    }
-    // Progress line for the health test; the verdict follows separately.
-    if (/^NAND health\s*:/i.test(trimmed))
-        return true;
-    return false;
-}
-function emptyModel() {
-    return {
-        name: null,
-        srRevision: null,
-        manufacturingOrder: null,
-        macSuffix: null,
-        advertisingPrefix: null,
-        passkeyId: null,
-        passkeyKind: null,
-    };
-}
-/**
- * Fallback for a test this build of the SDK has never seen: keep any
- * `Key = value` pairs so a firmware change still lands data in the sheet.
- */
-function scrapeGenericMetrics(body, name, out) {
-    const re = /([A-Za-z][A-Za-z0-9 _-]{0,40}?)\s*=\s*([-+]?\d+(?:\.\d+)?)/g;
-    let m;
-    while ((m = re.exec(body)) !== null) {
-        const key = `${name}_${m[1]
-            .trim()
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '_')}`;
-        setNum(out, key, m[2]);
-    }
-}
-/**
- * Render a parsed report as two CSV rows (header, values): the caller's `meta`
- * columns first, then the parsed metrics sorted by name. A metric whose name
- * collides with a meta column is dropped in favour of the meta value — the
- * caller's identity columns are authoritative, and a duplicated header name
- * breaks most CSV consumers.
- */
-function verisenseFactoryTestReportToCsvRows(parsed, meta = {}) {
-    // Normalized once and used for both key discovery and value lookup, so a
-    // null/undefined `parsed` from a plain-JS caller cannot throw here.
-    const metrics = parsed?.metrics ?? {};
-    const metaKeys = Object.keys(meta);
-    const metaKeySet = new Set(metaKeys);
-    const metricKeys = Object.keys(metrics)
-        .filter((k) => !metaKeySet.has(k))
-        .sort();
-    const header = [...metaKeys, ...metricKeys].map(csvCell).join(',');
-    const values = [...metaKeys.map((k) => meta[k]), ...metricKeys.map((k) => metrics[k])]
-        .map(csvCell)
-        .join(',');
-    return [header, values];
-}
-
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID$1 as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SHIMMER3R_DEFAULTS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_STREAM_SENSOR_LABELS, VerisenseBleDevice, WIRED_DEFAULTS, NEED_MORE$1 as WIRED_NEED_MORE, RESYNC$1 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, buildBaseCommand, buildDefaultVerisenseCalibrationSet, buildHeader, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, crc16_ccitt_false, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, enforceVerisenseCommsChannelInterlock, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseCalibDump, parseCalibrationBlob, parseEventLogPayload, parseExpansionBoard, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, supportsVerisenseCalibration, supportsVerisenseMagnetometer, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
-//# sourceMappingURL=shimmer-web-sdk.esm.js.map
+exports.ASM_COMMAND = ASM_COMMAND;
+exports.ASM_PROPERTY = ASM_PROPERTY;
+exports.BASE_HARDWARE_IDS = BASE_HARDWARE_IDS;
+exports.BLE_LINK_MIN_FW = BLE_LINK_MIN_FW;
+exports.BaseShimmerClient = BaseShimmerClient;
+exports.CALIB_READ_SOURCE = CALIB_READ_SOURCE;
+exports.CHANNEL_FORMATS = CHANNEL_FORMATS;
+exports.CHARGING_STATUS_BYTE = CHARGING_STATUS_BYTE;
+exports.CalibQuality = CalibQuality;
+exports.CalibSensorId = CalibSensorId;
+exports.DEBUG_COMMAND_ID = DEBUG_COMMAND_ID;
+exports.FW_ID = FW_ID;
+exports.GSR_NAME = GSR_NAME;
+exports.INERTIAL_UNITS = INERTIAL_UNITS;
+exports.INFOMEM_ADDR_FLAT = INFOMEM_ADDR_FLAT;
+exports.INFOMEM_ADDR_LEGACY = INFOMEM_ADDR_LEGACY;
+exports.INFOMEM_ANY_VERSION = ANY_VERSION;
+exports.INFOMEM_FW_ID = FW_ID$1;
+exports.INFOMEM_HW_ID = HW_ID;
+exports.INFOMEM_PAGE_SIZE = INFOMEM_PAGE_SIZE;
+exports.INFOMEM_SAMPLING_CLOCK_FREQ = INFOMEM_SAMPLING_CLOCK_FREQ;
+exports.INFOMEM_SIZE = INFOMEM_SIZE;
+exports.INFOMEM_VALIDITY_BYTES = INFOMEM_VALIDITY_BYTES;
+exports.LoopbackTransport = LoopbackTransport;
+exports.NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS;
+exports.NORDIC_DFU_BUTTONLESS_WITH_BONDS = NORDIC_DFU_BUTTONLESS_WITH_BONDS;
+exports.NORDIC_DFU_OP_ENTER_BOOTLOADER = NORDIC_DFU_OP_ENTER_BOOTLOADER;
+exports.NORDIC_DFU_SERVICE = NORDIC_DFU_SERVICE;
+exports.NUS_RX = NUS_RX;
+exports.NUS_SERVICE = NUS_SERVICE;
+exports.NUS_TX = NUS_TX;
+exports.OPCODES = OPCODES;
+exports.OP_IDX = OP_IDX;
+exports.ObjectCluster = ObjectCluster;
+exports.PACKET_OVERHEAD_RESPONSE_DATA = PACKET_OVERHEAD_RESPONSE_DATA;
+exports.PACKET_OVERHEAD_RESPONSE_OTHER = PACKET_OVERHEAD_RESPONSE_OTHER;
+exports.RtcDriftMonitor = RtcDriftMonitor;
+exports.SC_CALIB_FORMAT_VERSION = SC_CALIB_FORMAT_VERSION;
+exports.SC_CAL_QUALITY_MASK = SC_CAL_QUALITY_MASK;
+exports.SC_CAL_QUALITY_SHIFT = SC_CAL_QUALITY_SHIFT;
+exports.SC_CAL_RANGE_MASK = SC_CAL_RANGE_MASK;
+exports.SC_DATA_LEN_IMU = SC_DATA_LEN_IMU;
+exports.SC_GLOBAL_HEADER_BYTES = SC_GLOBAL_HEADER_BYTES;
+exports.SDLOG_CLOCK_FREQ = SDLOG_CLOCK_FREQ;
+exports.SDLOG_DATA_TYPE_BYTES = SDLOG_DATA_TYPE_BYTES;
+exports.SDLOG_FW_ID = SDLOG_FW_ID;
+exports.SDLOG_HEADER_LENGTH = SDLOG_HEADER_LENGTH;
+exports.SDLOG_HW_ID = SDLOG_HW_ID;
+exports.SDLOG_SYNC_BLOCK_LENGTH = SDLOG_SYNC_BLOCK_LENGTH;
+exports.SDLOG_SYNC_OFFSET_LENGTH = SDLOG_SYNC_OFFSET_LENGTH;
+exports.SDLogHeaderBitmask = SDLogHeaderBitmask;
+exports.SHIMMER3R_DEFAULTS = SHIMMER3R_DEFAULTS;
+exports.SHIMMER3_ACK = ACK;
+exports.SHIMMER3_DEFAULTS = SHIMMER3_DEFAULTS;
+exports.SHIMMER3_INQ_CHANNELS_OFFSET = SHIMMER3_INQ_CHANNELS_OFFSET;
+exports.SHIMMER3_INQ_CONFIG_LENGTH = SHIMMER3_INQ_CONFIG_LENGTH;
+exports.SHIMMER3_INQ_CONFIG_OFFSET = SHIMMER3_INQ_CONFIG_OFFSET;
+exports.SHIMMER3_INQ_NUM_CHANNELS_OFFSET = SHIMMER3_INQ_NUM_CHANNELS_OFFSET;
+exports.SHIMMER3_NACK = NACK;
+exports.SHIMMER3_NEED_MORE = NEED_MORE;
+exports.SHIMMER3_RESPONSE_PAYLOAD_LENGTHS = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS;
+exports.SHIMMER3_RESYNC = RESYNC;
+exports.SHIMMER3_SAMPLING_CLOCK_FREQ = SHIMMER3_SAMPLING_CLOCK_FREQ;
+exports.SHIMMER3_SPP_UUID = SHIMMER3_SPP_UUID;
+exports.SHIMMER_UART_CRC_INIT = SHIMMER_UART_CRC_INIT;
+exports.SMARTDOCK_BASE_CMD = SMARTDOCK_BASE_CMD;
+exports.SMARTDOCK_CONNECTION_TYPE = SMARTDOCK_CONNECTION_TYPE;
+exports.SMARTDOCK_DEFAULTS = SMARTDOCK_DEFAULTS;
+exports.SMARTDOCK_LINE_TERMINATOR = SMARTDOCK_LINE_TERMINATOR;
+exports.STREAM_MODE = STREAM_MODE;
+exports.SdLogFormatError = SdLogFormatError;
+exports.SensorADC = SensorADC;
+exports.SensorBase = SensorBase;
+exports.SensorBitmapShimmer3 = SensorBitmapShimmer3;
+exports.SensorLIS2DW12 = SensorLIS2DW12;
+exports.SensorLSM6DS3 = SensorLSM6DS3;
+exports.SensorLSM6DSV = SensorLSM6DSV;
+exports.SensorMAX32674 = SensorMAX32674;
+exports.SensorMLX90632 = SensorMLX90632;
+exports.SensorPPG = SensorPPG;
+exports.SensorVD6283 = SensorVD6283;
+exports.Shimmer3Client = Shimmer3Client;
+exports.Shimmer3RClient = Shimmer3RClient;
+exports.SmartDockClient = SmartDockClient;
+exports.StreamStatsTracker = StreamStatsTracker;
+exports.TEST_MODE_ID = TEST_MODE_ID;
+exports.TIMESTAMP_FIELD = TIMESTAMP_FIELD;
+exports.UART_COMPONENT = UART_COMPONENT;
+exports.UART_CONFIG_COMMANDS = UART_CONFIG_COMMANDS;
+exports.UART_DOCK_BAUD_RATE = UART_DOCK_BAUD_RATE;
+exports.UART_PACKET_CMD = UART_PACKET_CMD;
+exports.UART_PACKET_HEADER = UART_PACKET_HEADER;
+exports.UART_PROP = UART_PROP;
+exports.VERISENSE_BLE_SCHEDULE_DEFAULTS = VERISENSE_BLE_SCHEDULE_DEFAULTS;
+exports.VERISENSE_BLE_SCHEDULE_RANGES = VERISENSE_BLE_SCHEDULE_RANGES;
+exports.VERISENSE_BLE_SYNC_SCHEDULES = VERISENSE_BLE_SYNC_SCHEDULES;
+exports.VERISENSE_CALIBRATION_MIN_FW = VERISENSE_CALIBRATION_MIN_FW;
+exports.VERISENSE_DEFAULT_PASSKEY_BY_ID = VERISENSE_DEFAULT_PASSKEY_BY_ID;
+exports.VERISENSE_DFU_BOOTLOADER_NAME_PREFIX = VERISENSE_DFU_BOOTLOADER_NAME_PREFIX;
+exports.VERISENSE_DFU_CONNECT_ATTEMPTS = VERISENSE_DFU_CONNECT_ATTEMPTS;
+exports.VERISENSE_DFU_FAST_PACKET_DELAY_MS = VERISENSE_DFU_FAST_PACKET_DELAY_MS;
+exports.VERISENSE_DFU_REBOOT_DELAY_MS = VERISENSE_DFU_REBOOT_DELAY_MS;
+exports.VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS = VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS;
+exports.VERISENSE_DFU_RETRY_DELAY_MS = VERISENSE_DFU_RETRY_DELAY_MS;
+exports.VERISENSE_DFU_ROUTINE_LOG_REGEX = VERISENSE_DFU_ROUTINE_LOG_REGEX;
+exports.VERISENSE_DFU_SET_MODE_TIMEOUT_MS = VERISENSE_DFU_SET_MODE_TIMEOUT_MS;
+exports.VERISENSE_DFU_TRANSIENT_ERROR_REGEX = VERISENSE_DFU_TRANSIENT_ERROR_REGEX;
+exports.VERISENSE_HW_MAJOR_FRIENDLY_NAMES = VERISENSE_HW_MAJOR_FRIENDLY_NAMES;
+exports.VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS = VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS;
+exports.VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID = VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID;
+exports.VERISENSE_OPERATIONAL_FIELD_GROUPS = VERISENSE_OPERATIONAL_FIELD_GROUPS;
+exports.VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR = VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR;
+exports.VERISENSE_OPERATIONAL_FIELD_SCHEMA = VERISENSE_OPERATIONAL_FIELD_SCHEMA;
+exports.VERISENSE_OP_CONFIG_BYTE_SIZE = VERISENSE_OP_CONFIG_BYTE_SIZE;
+exports.VERISENSE_SENSOR_ENABLE_FIELDS = VERISENSE_SENSOR_ENABLE_FIELDS;
+exports.VERISENSE_SENSOR_RATE_DEFAULT_GROUPS = VERISENSE_SENSOR_RATE_DEFAULT_GROUPS;
+exports.VERISENSE_STREAM_SENSOR_LABELS = VERISENSE_STREAM_SENSOR_LABELS;
+exports.VerisenseBleDevice = VerisenseBleDevice;
+exports.WIRED_DEFAULTS = WIRED_DEFAULTS;
+exports.WIRED_NEED_MORE = NEED_MORE$1;
+exports.WIRED_RESYNC = RESYNC$1;
+exports.WebBluetoothTransport = WebBluetoothTransport;
+exports.WebSerialTransport = WebSerialTransport;
+exports.WiredShimmerClient = WiredShimmerClient;
+exports.applyDuplicateSuffix = applyDuplicateSuffix;
+exports.applyImuCalibration = applyImuCalibration;
+exports.asmRtcBytesToUnixSeconds = asmRtcBytesToUnixSeconds;
+exports.asmRtcMinutesBytesToUnixSeconds = asmRtcMinutesBytesToUnixSeconds;
+exports.badResponseReason = badResponseReason;
+exports.baseHardwareType = baseHardwareType;
+exports.battAdcToVoltage = battAdcToVoltage;
+exports.battVoltageToPercentage = battVoltageToPercentage;
+exports.buildBaseCommand = buildBaseCommand;
+exports.buildDefaultVerisenseCalibrationSet = buildDefaultVerisenseCalibrationSet;
+exports.buildHeader = buildHeader;
+exports.buildMemReadPayload = buildMemReadPayload;
+exports.buildMemWritePayload = buildMemWritePayload;
+exports.buildMessage = buildMessage;
+exports.buildParsedCsvFileName = buildParsedCsvFileName;
+exports.buildProductionConfigPayload = buildProductionConfigPayload;
+exports.buildReadPacket = buildReadPacket;
+exports.buildSelectSlotCommand = buildSelectSlotCommand;
+exports.buildShimmer3Schema = buildShimmer3Schema;
+exports.buildUartPacket = buildUartPacket;
+exports.buildUploadBinaryFileName = buildUploadBinaryFileName;
+exports.buildVerisenseAdvertisedName = buildVerisenseAdvertisedName;
+exports.buildVerisenseDfuRequestDeviceOptions = buildVerisenseDfuRequestDeviceOptions;
+exports.buildWritePacket = buildWritePacket;
+exports.calibTsBytesToUnixSeconds = calibTsBytesToUnixSeconds;
+exports.calibrateGsrDataToResistanceFromAmplifierEq = calibrateGsrDataToResistanceFromAmplifierEq;
+exports.calibrateShimmer3RAdcChannel = calibrateShimmer3RAdcChannel;
+exports.calibrateU12AdcValue = calibrateU12AdcValue;
+exports.calibrateVector3 = calibrateVector3;
+exports.calibrationBlobCrc = calibrationBlobCrc;
+exports.checkConfigBytesValid = checkConfigBytesValid;
+exports.classifyBaseResponse = classifyBaseResponse;
+exports.classifyVerisenseDfuError = classifyVerisenseDfuError;
+exports.compareVerisenseFirmwareVersion = compareVerisenseFirmwareVersion;
+exports.computeVerisensePairingPin = computeVerisensePairingPin;
+exports.crc16_ccitt_false = crc16_ccitt_false;
+exports.createBlankVerisenseOperationalConfig = createBlankVerisenseOperationalConfig;
+exports.csvCell = csvCell;
+exports.decodeSdLogFile = decodeSdLogFile;
+exports.decodeSdLogValue = decodeSdLogValue;
+exports.decodeSdSession = decodeSdSession;
+exports.decodeVerisenseBleOptimizationResult = decodeVerisenseBleOptimizationResult;
+exports.defaultVerisensePasskeyForId = defaultVerisensePasskeyForId;
+exports.deriveVerisenseMacIdFromName = deriveVerisenseMacIdFromName;
+exports.describeVerisenseChargerStatus = describeVerisenseChargerStatus;
+exports.deviceWriteDivergentRanges = deviceWriteDivergentRanges;
+exports.enforceVerisenseCommsChannelInterlock = enforceVerisenseCommsChannelInterlock;
+exports.evaluateParsedFileSplit = evaluateParsedFileSplit;
+exports.expectedVerisenseStreamSensorIds = expectedVerisenseStreamSensorIds;
+exports.expectedVerisenseStreamSensorIdsFromConfig = expectedVerisenseStreamSensorIdsFromConfig;
+exports.extractBaseLine = extractBaseLine;
+exports.formatByteArrayAsHex = formatByteArrayAsHex;
+exports.formatByteAsHex = formatByteAsHex;
+exports.formatPendingEventProperties = formatPendingEventProperties;
+exports.formatSchedulerPayloadForLog = formatSchedulerPayloadForLog;
+exports.formatStatusPayloadForLog = formatStatusPayloadForLog;
+exports.formatVerisenseChargerStatus = formatVerisenseChargerStatus;
+exports.formatVerisenseFirmwareVersion = formatVerisenseFirmwareVersion;
+exports.formatVerisenseHardwareRevision = formatVerisenseHardwareRevision;
+exports.formatVerisenseUnixAndHuman = formatVerisenseUnixAndHuman;
+exports.fwCompare = fwCompare;
+exports.generateCalibDump = generateCalibDump;
+exports.generateInfoMem = generateInfoMem;
+exports.generateKinematicCalibBlock = generateKinematicCalibBlock;
+exports.getDefaultCalibration = getDefaultCalibration;
+exports.getFirstPayloadIndex = getFirstPayloadIndex;
+exports.getGroupDefaults = getGroupDefaults;
+exports.getOversamplingRatioADS1292R = getOversamplingRatioADS1292R;
+exports.getVerisenseCalibrationSensorAvailability = getVerisenseCalibrationSensorAvailability;
+exports.getVerisenseCalibrationSensors = getVerisenseCalibrationSensors;
+exports.getVerisenseHardwareCapabilities = getVerisenseHardwareCapabilities;
+exports.getVerisenseHardwareFriendlyName = getVerisenseHardwareFriendlyName;
+exports.getVerisenseHardwareRevision = getVerisenseHardwareRevision;
+exports.getVerisenseHardwareSensorSupport = getVerisenseHardwareSensorSupport;
+exports.getVerisenseStreamSensorLabel = getVerisenseStreamSensorLabel;
+exports.getVerisenseStreamingBatteryVoltageMultiplier = getVerisenseStreamingBatteryVoltageMultiplier;
+exports.getVerisenseSupportedOperationalFieldGroupIds = getVerisenseSupportedOperationalFieldGroupIds;
+exports.hasSensorBit = hasSensorBit;
+exports.hhmmToMinutesSinceMidnight = hhmmToMinutesSinceMidnight;
+exports.inferVerisenseChargerChipFamily = inferVerisenseChargerChipFamily;
+exports.inferVerisenseLookupBankCount = inferVerisenseLookupBankCount;
+exports.interpretShimmer3InquiryResponse = interpretShimmer3InquiryResponse;
+exports.isAckCommand = isAckCommand;
+exports.isBadResponse = isBadResponse;
+exports.isNackCommand = isNackCommand;
+exports.isNewImuSensors = isNewImuSensors;
+exports.isRoutineVerisenseDfuLogMessage = isRoutineVerisenseDfuLogMessage;
+exports.isSafeFirmwareArchiveName = isSafeFirmwareArchiveName;
+exports.isSdLoggingFirmware = isSdLoggingFirmware;
+exports.isSupportedEightByteDerivedSensors = isSupportedEightByteDerivedSensors;
+exports.isSupportedMpl = isSupportedMpl;
+exports.isSupportedRtcConfigViaUart = isSupportedRtcConfigViaUart;
+exports.isSupportedSdLogSync = isSupportedSdLogSync;
+exports.isUniformByteArray = isUniformByteArray;
+exports.isVerisenseGsrSupportedHardware = isVerisenseGsrSupportedHardware;
+exports.isVerisenseLightDarkChannelEnabled = isVerisenseLightDarkChannelEnabled;
+exports.isVerisenseLipoBatteryHardware = isVerisenseLipoBatteryHardware;
+exports.isVerisenseSecondGenerationHardware = isVerisenseSecondGenerationHardware;
+exports.localCivilUnixSecondsNow = localCivilUnixSecondsNow;
+exports.makeKinematicCalibration = makeKinematicCalibration;
+exports.matrixInverse3x3 = matrixInverse3x3;
+exports.matrixMultiply3x3 = matrixMultiply3x3;
+exports.minutesSinceMidnightToHHMM = minutesSinceMidnightToHHMM;
+exports.msToRtcBytesLE = msToRtcBytesLE;
+exports.nextAvailableDuplicateFileName = nextAvailableDuplicateFileName;
+exports.normalizeBytePayload = normalizeBytePayload;
+exports.normalizeOperationalConfig = normalizeOperationalConfig;
+exports.nudgeGsrResistance = nudgeGsrResistance;
+exports.padVerisenseOperationalConfig = padVerisenseOperationalConfig;
+exports.parseActiveSlot = parseActiveSlot;
+exports.parseBatteryStatus = parseBatteryStatus;
+exports.parseBleLinkDebugPayload = parseBleLinkDebugPayload;
+exports.parseCalibDump = parseCalibDump;
+exports.parseCalibrationBlob = parseCalibrationBlob;
+exports.parseEventLogPayload = parseEventLogPayload;
+exports.parseExpansionBoard = parseExpansionBoard;
+exports.parseHeader = parseHeader;
+exports.parseHexByteString = parseHexByteString;
+exports.parseInfoMem = parseInfoMem;
+exports.parseKinematicCalibBlock = parseKinematicCalibBlock;
+exports.parseLookupTablePayload = parseLookupTablePayload;
+exports.parseMacId = parseMacId;
+exports.parseMessage = parseMessage;
+exports.parsePayloadCrcErrorBankIndexes = parsePayloadCrcErrorBankIndexes;
+exports.parsePendingEvents = parsePendingEvents;
+exports.parseProductionConfigPayload = parseProductionConfigPayload;
+exports.parseProductionConfigPayloadFull = parseProductionConfigPayloadFull;
+exports.parseRecordBufferDetailsPayload = parseRecordBufferDetailsPayload;
+exports.parseSchedulerDebugPayload = parseSchedulerDebugPayload;
+exports.parseSdLogHeader = parseSdLogHeader;
+exports.parseSdSessionName = parseSdSessionName;
+exports.parseSdTrialFolderName = parseSdTrialFolderName;
+exports.parseShimmer3DeviceVersionResponse = parseShimmer3DeviceVersionResponse;
+exports.parseShimmer3FwVersionResponse = parseShimmer3FwVersionResponse;
+exports.parseSlotOccupancy = parseSlotOccupancy;
+exports.parseSmartDockVersion = parseSmartDockVersion;
+exports.parseStatusPayload = parseStatusPayload;
+exports.parseUartPacket = parseUartPacket;
+exports.parseVerisenseAdvertisedName = parseVerisenseAdvertisedName;
+exports.parseVersionInfo = parseVersionInfo;
+exports.patchSecureDfuSendOperation = patchSecureDfuSendOperation;
+exports.promiseWithTimeout = promiseWithTimeout;
+exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
+exports.resolveInfoMemLayout = resolveInfoMemLayout;
+exports.resolveVerisenseSensorRateFieldKey = resolveVerisenseSensorRateFieldKey;
+exports.runVerisenseDfuUpdate = runVerisenseDfuUpdate;
+exports.serializeCalibrationBlob = serializeCalibrationBlob;
+exports.setVerisenseDfuModeWithRetry = setVerisenseDfuModeWithRetry;
+exports.setVerisenseOperationalBitRange = setVerisenseOperationalBitRange;
+exports.shimmer3ControlMessageLength = shimmer3ControlMessageLength;
+exports.shimmer3UsesThreeByteTimestamp = shimmer3UsesThreeByteTimestamp;
+exports.shimmerUartCrcByte = shimmerUartCrcByte;
+exports.shimmerUartCrcCalc = shimmerUartCrcCalc;
+exports.shimmerUartCrcCheck = shimmerUartCrcCheck;
+exports.shouldOverrideCalibration = shouldOverrideCalibration;
+exports.supportsVerisenseCalibration = supportsVerisenseCalibration;
+exports.supportsVerisenseMagnetometer = supportsVerisenseMagnetometer;
+exports.unixSecondsToAsmRtcBytes = unixSecondsToAsmRtcBytes;
+exports.unixSecondsToCalibTsBytes = unixSecondsToCalibTsBytes;
+exports.updateVerisenseDfuImageWithRetry = updateVerisenseDfuImageWithRetry;
+exports.utcToLocalCivilMillis = utcToLocalCivilMillis;
+exports.verisenseDeviceFileTag = verisenseDeviceFileTag;
+exports.verisenseDfuAttemptLabel = verisenseDfuAttemptLabel;
+exports.wiredPacketLength = wiredPacketLength;
+exports.writeVerisenseOperationalFieldValue = writeVerisenseOperationalFieldValue;
+//# sourceMappingURL=shimmer-web-sdk.cjs.map

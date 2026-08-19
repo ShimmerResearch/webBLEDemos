@@ -2,7 +2,7 @@
 
 Shimmer Companion streams Shimmer3R PPG and GSR data alongside browser media context. A session can include physiological CSV files, timestamped screenshots and events, an HTML report, and optional webcam-derived face-presence data.
 
-Note that `shimmer3r.js` is copied from the ShimmerAPI folder. Replace it when a newer API build is required.
+All Shimmer3R BLE communication uses the [`shimmer-web-sdk`](https://github.com/ShimmerResearch/shimmer-web-sdk) package. For MV3, the SDK module is vendored inside this extension folder at `vendor/shimmer-web-sdk.esm.js`; rebuild the SDK (`npm install && npm run build`) and copy `dist/shimmer-web-sdk.esm.js` over it when a newer SDK build is required.
 
 ## Install for development
 
