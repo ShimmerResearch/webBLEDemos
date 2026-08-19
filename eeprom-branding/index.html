@@ -605,9 +605,7 @@
           setConnected(true, `serial · ${label}`);
           log(`connected over USB/dock serial (${label})`);
           await readAndShow().catch((e) =>
-            log(
-              `record read failed: ${readFailureHint(e)}`,
-            ),
+            log(`record read failed: ${readFailureHint(e)}`),
           );
         } catch (e) {
           log(`serial connect failed: ${e.message}`);
@@ -633,9 +631,7 @@
           setConnected(true, `BLE · ${c.deviceName ?? "Shimmer3R"}`);
           log(`connected over BLE (${c.deviceName ?? "Shimmer3R"})`);
           await readAndShow().catch((e) =>
-            log(
-              `record read failed: ${readFailureHint(e)}`,
-            ),
+            log(`record read failed: ${readFailureHint(e)}`),
           );
         } catch (e) {
           log(`BLE connect failed: ${e.message}`);
