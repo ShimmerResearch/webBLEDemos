@@ -186,6 +186,7 @@
       }
       #rebootBanner {
         display: none;
+        position: relative;
         border: 1px solid var(--warn);
         background: #2a2415;
         border-radius: 10px;
@@ -194,12 +195,27 @@
       }
       #rebootBanner h2 {
         color: var(--warn);
-        margin: 0 0 6px;
+        margin: 0 40px 6px 0;
         font-size: 15px;
       }
       #rebootBanner ol {
         margin: 6px 0 10px 18px;
         padding: 0;
+      }
+      button.dismiss {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        background: none;
+        border: none;
+        color: var(--muted);
+        font-size: 20px;
+        line-height: 1;
+        padding: 2px 8px;
+      }
+      button.dismiss:hover {
+        color: var(--warn);
+        border: none;
       }
     </style>
   </head>
@@ -223,8 +239,8 @@
 
       <div class="card">
         <div class="row">
-          <button id="btnSerial" class="primary">Connect USB / dock</button>
-          <button id="btnBle">Connect BLE (Shimmer3R)</button>
+          <button id="btnBle" class="primary">Connect BLE (Shimmer3R)</button>
+          <button id="btnSerial">Connect USB / dock</button>
           <button id="btnDisconnect" disabled>Disconnect</button>
           <span id="connPill" class="pill">disconnected</span>
           <span id="devInfo" class="note"></span>
@@ -232,6 +248,14 @@
       </div>
 
       <div id="rebootBanner">
+        <button
+          id="btnBannerDismiss"
+          class="dismiss"
+          title="Dismiss this reminder"
+          aria-label="Dismiss reboot reminder"
+        >
+          &times;
+        </button>
         <h2>
           Reboot required — the new names are stored but not yet advertised
         </h2>
@@ -332,8 +356,11 @@
         </div>
         <div class="row">
           <label
-            ><input id="inCustomer" type="checkbox" checked /> Customer-branded
-            (protects the record from platform re-seeding)</label
+            title="Marks the record as a deliberate customer brand. Firmware then (a) keeps it when the daughter card is moved between a Shimmer3 and a Shimmer3R instead of resetting it to that platform's stock names, and (b) applies the USB manufacturer string on Shimmer3R. It does NOT write-protect the record - it stays fully rewritable and erasable from this page."
+          >
+            <input id="inCustomer" type="checkbox" checked />
+            Customer brand (keep across platform swaps; also sets the USB
+            manufacturer)</label
           >
         </div>
         <div class="row" style="margin-top: 10px">
@@ -350,6 +377,11 @@
           </button>
         </div>
         <div class="note">
+          <b>Customer brand</b> is a marker, not a lock: the record stays
+          rewritable and erasable from this page at any time. Leaving it
+          unticked means firmware treats the record as stock and will reset it
+          to platform defaults if the daughter card is moved between a Shimmer3
+          and a Shimmer3R. <br /><br />
           Names: 1–16 printable ASCII characters, no commas. BLE prefix: max 10
           (<b>Shimmer3: max 8</b> — the 31-byte BLE advertisement limit). The
           firmware appends the MAC suffix automatically. Writes are
@@ -399,6 +431,7 @@
         write: $("btnWrite"),
         restore: $("btnRestore"),
         bannerDisc: $("btnBannerDisconnect"),
+        bannerDismiss: $("btnBannerDismiss"),
         banner: $("rebootBanner"),
         pill: $("connPill"),
         recPill: $("recPill"),
@@ -441,6 +474,15 @@
         els.disc.disabled = !on;
         els.read.disabled = !on;
         refreshForm();
+      }
+
+      function showRebootBanner() {
+        els.banner.style.display = "block";
+        els.banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+
+      function hideRebootBanner() {
+        els.banner.style.display = "none";
       }
 
       function isShimmer3() {
@@ -583,6 +625,7 @@
 
       els.serial.onclick = async () => {
         try {
+          hideRebootBanner();
           const c = new WiredShimmerClient({
             transport: new WebSerialTransport(),
           });
@@ -614,6 +657,7 @@
 
       els.ble.onclick = async () => {
         try {
+          hideRebootBanner();
           const c = new Shimmer3RClient();
           await c.connect();
           client = c;
@@ -656,10 +700,11 @@
       els.bannerDisc.onclick = async () => {
         await disconnect();
       };
+      els.bannerDismiss.onclick = () => hideRebootBanner();
 
       els.read.onclick = async () => {
         try {
-          els.banner.style.display = "none";
+          hideRebootBanner();
           await readAndShow();
         } catch (e) {
           log(`record read failed: ${readFailureHint(e)}`);
@@ -701,8 +746,7 @@
           }
           showRecord(parseBrandRecord(verify));
           log("write verified OK (read-back matches byte-for-byte)");
-          els.banner.style.display = "block";
-          els.banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          showRebootBanner();
         } catch (e) {
           log(`write failed: ${e.message}`);
         }
@@ -727,8 +771,7 @@
           log(
             "erase verified — stock defaults will be re-seeded at the next boot",
           );
-          els.banner.style.display = "block";
-          els.banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          showRebootBanner();
         } catch (e) {
           log(`erase failed: ${e.message}`);
         }
