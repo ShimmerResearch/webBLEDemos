@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.1.13';
+const SDK_VERSION = '0.1.14';
 
 /**
  * Container for a single decoded sensor frame.
@@ -10682,7 +10682,19 @@ function decodeSdSession(files, opts) {
  * recovers physical = R⁻¹·K⁻¹·(raw − b). K is the diagonal sensitivity, R the
  * rotation into the common ASM axes, b the offset bias.
  */
-const SC_CALIB_FORMAT_VERSION = 1;
+/**
+ * Blob layout version. v2 is byte-for-byte identical in layout to v1 — the
+ * firmware bumped it purely to force already-deployed gen-2 units to re-seed
+ * with the corrected LSM6DSV/LIS2MDL alignment (its load path checks neither a
+ * CRC nor the FW version, so nothing else would).
+ *
+ * `parseCalibrationBlob` accepts any version and reports what it read;
+ * `serializeCalibrationBlob` preserves `input.formatVersion` when present and
+ * only falls back to this constant. That matters when writing to a device: a
+ * blob stamped with the wrong version is rejected at the device's next boot and
+ * silently replaced by the seeded defaults.
+ */
+const SC_CALIB_FORMAT_VERSION = 2;
 const SC_GLOBAL_HEADER_BYTES = 12;
 const SC_BLOCK_HEADER_BYTES = 12;
 const SC_TS_BYTES = 8;
@@ -17843,12 +17855,19 @@ const LSM6DS3_GYRO_RANGES = [
     { code: 3, label: '±2000dps', sens: 14.285714286 },
 ];
 /**
- * 2nd-generation catalog (LSM6DSV accel+gyro, LIS2DW12, LIS2MDL). Alignment
- * matrices derived from the ST datasheet axis figures + the SR68-10 pin-1
- * placement; common frame +X=strap, +Y=out of face, +Z=toward hand. LSM6DSV /
- * LIS2DW12 are proper rotations (det +1); the LIS2MDL frame is left-handed
- * (det −1, a reflection). Kept byte-for-byte in sync with the firmware seed
- * (asm_calibration.c) and VERISENSE_CALIBRATION.md §4.
+ * 2nd-generation catalog (LSM6DSV accel+gyro, LIS2DW12, LIS2MDL). Common frame
+ * +X=strap, +Y=out of face, +Z=toward hand. LSM6DSV / LIS2DW12 are proper
+ * rotations (det +1); the LIS2MDL frame is left-handed (det −1, a reflection).
+ *
+ * The LIS2DW12 matrix comes from the ST datasheet axis figures + the SR68-10
+ * pin-1 placement. LSM6DSV and LIS2MDL were derived the same way originally but
+ * that derivation did not survive measurement — they carry the empirically
+ * validated values instead (an SR61-5 recording cross-checked against a
+ * Shimmer3R logging the same motion; ASM_PC_00005 Test_063). One matrix per
+ * sensor covers every gen-2 board.
+ *
+ * Byte-for-byte in sync with the firmware seed (asm_calibration.c) and
+ * VERISENSE_CALIBRATION.md §4 — verified as of the format v2 bump.
  */
 const CALIBRATION_SENSORS_GEN2 = [
     {
