@@ -852,8 +852,20 @@
           );
         } catch (e) {
           log(`classic Bluetooth connect failed: ${e.message}`);
+          if (/timeout/i.test(e.message)) {
+            /* A Shimmer3R pairs as two separate Bluetooth entries: "…-BT"
+             * (classic, speaks this protocol) and "…-BLE" (GATT, does not). The
+             * SPP service-class filter should keep the BLE one out of the
+             * picker, but if it appears anyway, opening it succeeds and then
+             * nothing ever answers — which looks exactly like this. The Web
+             * Serial picker is browser-drawn and cannot be filtered by name, so
+             * explaining the symptom afterwards is the best available fix. */
+            log(
+              'the port opened but the sensor never answered — if you picked a "…-BLE" entry, choose the "…-BT" one instead (or use Connect BLE)',
+            );
+          }
           log(
-            "check the sensor is paired with this PC, powered, and not held open by another app (e.g. Consensys)",
+            "also check the sensor is paired with this PC, powered, and not held open by another app (e.g. Consensys)",
           );
         }
       };

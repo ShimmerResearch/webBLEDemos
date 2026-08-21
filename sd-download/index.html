@@ -460,10 +460,31 @@
 
           sdSupported = await client.supportsSdTransfer();
           const v = await client.readFwVersion().catch(() => null);
-          const verStr = v
-            ? `v${v.major}.${String(v.minor).padStart(2, "0")}.${String(v.patch).padStart(3, "0")}`
-            : "unknown";
           const banner = $("fwBanner");
+
+          /* No version at all means the sensor never answered — the link is open
+           * but nothing is talking. Reporting that as "firmware unknown does not
+           * support SD file transfer" would send you looking for a firmware
+           * problem that isn't there, so it gets its own message. */
+          if (!v) {
+            banner.className = "banner err";
+            banner.textContent =
+              "Connected, but the sensor did not answer the firmware-version query.";
+            log(
+              "no reply to GET_FW_VERSION — link open, sensor not responding",
+              true,
+            );
+            for (const hint of connectFailureHints(
+              linkName,
+              new Error("timeout"),
+            )) {
+              log(hint, true);
+            }
+            updateDownloadButtons();
+            return;
+          }
+
+          const verStr = `v${v.major}.${String(v.minor).padStart(2, "0")}.${String(v.patch).padStart(3, "0")}`;
           if (!sdSupported) {
             banner.className = "banner err";
             banner.textContent = `Firmware ${verStr} does not support SD file transfer (needs LogAndStream_Shimmer3R v1.01.009 or later).`;
@@ -484,9 +505,36 @@
           await refreshTree();
         } catch (e) {
           log(`Connect failed over ${linkName}: ${e.message}`, true);
+          for (const hint of connectFailureHints(linkName, e)) log(hint, true);
           setConnected(false);
           client = null;
         }
+      }
+
+      /**
+       * Extra guidance for a failed connect. The Web Serial picker is drawn by
+       * the browser and cannot be filtered by device name — the API only filters
+       * on USB VID/PID or Bluetooth service class, and a port's name is not even
+       * readable via getInfo(). So when the wrong entry is picked, the best we
+       * can do is explain the symptom afterwards.
+       */
+      function connectFailureHints(linkName, e) {
+        if (linkName !== "classic Bluetooth") return [];
+        const hints = [];
+        if (/timeout/i.test(e.message)) {
+          /* A Shimmer3R pairs as two separate Bluetooth entries: "…-BT"
+           * (classic, speaks this protocol) and "…-BLE" (GATT, does not). The
+           * SPP service-class filter should keep the BLE one out of the picker,
+           * but if it appears anyway, opening it succeeds and then nothing ever
+           * answers — which looks exactly like this. */
+          hints.push(
+            'the port opened but the sensor never answered — if you picked a "…-BLE" entry, choose the "…-BT" one instead (or use Connect BLE)',
+          );
+        }
+        hints.push(
+          "also check the sensor is paired with this PC, powered, in range, and not held open by another app (e.g. Consensys)",
+        );
+        return hints;
       }
 
       $("btnConnect").onclick = () =>
