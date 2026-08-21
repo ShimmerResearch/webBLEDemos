@@ -2745,6 +2745,30 @@ declare class Shimmer3Client extends BaseShimmerClient {
      */
     readDaughterCardMem(offset: number, length: number): Promise<Uint8Array>;
     /**
+     * Read the device configuration memory (InfoMem) via GET_INFOMEM_COMMAND.
+     *
+     * `address` is a **wire** address, not an index into the 384-byte InfoMem
+     * image: older firmware addresses the D/C/B pages at 0x1800/0x1880/0x1900
+     * while newer firmware and all Shimmer3Rs use a flat 0/128/256. Use
+     * {@link resolveInfoMemLayout} to pick the right page base for the connected
+     * device — {@link getMacAddress} shows the pattern. Max 128 bytes per read
+     * (one page), which the firmware enforces too.
+     */
+    readInfoMem(address: number, length: number): Promise<Uint8Array>;
+    /**
+     * Read the device's Bluetooth MAC as a 12-char uppercase hex string.
+     *
+     * The MAC lives in InfoMem rather than behind a command of its own, so this
+     * resolves the layout for the connected device first: `idxMacAddress` (224) is
+     * an index into the InfoMem image, which only equals the wire address on
+     * firmware that uses flat page addressing. Older firmware needs the C-page
+     * base instead, hence the page/offset split below.
+     *
+     * Requires a completed {@link connect} handshake — the layout depends on the
+     * hardware and firmware version it reads.
+     */
+    getMacAddress(): Promise<string>;
+    /**
      * Write to the daughter-card EEPROM memory. `offset` is a HOST offset (see
      * {@link readDaughterCardMem}). Max 128 bytes per write.
      */

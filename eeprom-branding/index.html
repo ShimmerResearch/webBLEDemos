@@ -819,18 +819,29 @@
                 fw.internal,
               ).padStart(3, "0")}`
             : "unknown";
-          els.devInfo.textContent = `HW ${hwVersion ?? "?"} (${deviceLabelForHw()}) · FW ${fwStr} · classic Bluetooth`;
+          /* The MAC has no command of its own - it comes out of InfoMem, and the
+           * client resolves the right page addressing from the firmware version
+           * the handshake just read. Best-effort: an unprovisioned or very old
+           * unit still connects, it just cannot show the suffix. */
+          let macStr = null;
+          try {
+            const mac = await c.getMacAddress();
+            macSuffix = mac.slice(-4);
+            macStr = mac;
+          } catch (e) {
+            log(`MAC read failed (continuing): ${e.message}`);
+            log(
+              'name previews will show "XXXX" — the device still appends its real suffix',
+            );
+          }
+          els.devInfo.textContent =
+            `${macStr ? `MAC ${macStr} · ` : ""}HW ${hwVersion ?? "?"} ` +
+            `(${deviceLabelForHw()}) · FW ${fwStr} · classic Bluetooth`;
           els.curDev.textContent = deviceLabelForHw();
-          /* The MAC is not on this link: it lives in InfoMem, which this client
-           * cannot read yet (the page-addressing mode is firmware-dependent).
-           * Say so rather than showing a suffix that is really a placeholder. */
-          els.curMac.textContent = "not read over classic BT";
+          els.curMac.textContent = macSuffix;
           setConnected(true, `BT classic · ${deviceLabelForHw()}`);
           log(
             `connected over classic Bluetooth (${deviceLabelForHw()}, FW ${fwStr})`,
-          );
-          log(
-            'name previews below show "XXXX" for the MAC suffix — the device still appends its real one',
           );
           await readAndShow().catch((e) =>
             log(`record read failed: ${readFailureHint(e)}`),

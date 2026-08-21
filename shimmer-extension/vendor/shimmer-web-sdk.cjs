@@ -2630,15 +2630,22 @@ function shimmer3rControlMessageLength(buf) {
         const total = SHIMMER3R_INQ_CHANNELS_OFFSET + numChannels;
         return buf.length < total ? NEED_MORE$1 : total;
     }
-    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE) {
-        // [0x68][length][data…]; the firmware caps a read at 128 bytes, so a larger
-        // "length" is garbage rather than a giant response.
+    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE || opcode === OPCODES.INFOMEM_RESPONSE) {
+        // [opcode][length][data…]; the firmware caps both a daughter-card and an
+        // InfoMem read at 128 bytes, so a larger "length" is garbage rather than a
+        // giant response.
+        //
+        // Framing these means the whole response arrives as ONE message, so
+        // `_readLengthPrefixedResponse`'s continuation path — which treats later
+        // chunks as raw opcode-less payload — never engages on a byte stream. That
+        // matters: those continuation bytes have no opcode, so the drain could not
+        // frame them and would resync straight past the tail of the record.
         if (buf.length < 2)
             return NEED_MORE$1;
-        const dcLen = buf[1];
-        if (dcLen > 128)
+        const memLen = buf[1];
+        if (memLen > 128)
             return RESYNC$1;
-        const total = 2 + dcLen;
+        const total = 2 + memLen;
         return buf.length < total ? NEED_MORE$1 : total;
     }
     const payload = SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS[opcode];
@@ -3334,6 +3341,12 @@ const EXG_BANK_LENGTH = 10;
 const NAME_LENGTH = 12;
 const CONFIG_TIME_LENGTH = 4;
 const MAC_LENGTH = 6;
+/**
+ * MAC values reported by a device whose InfoMem has never been provisioned
+ * (erased flash reads back all-FF; a zeroed page reads back all-zero). Neither
+ * is a real address, so a client should reject rather than surface them.
+ */
+const INVALID_MAC_IDS = Object.freeze(['FFFFFFFFFFFF', '000000000000']);
 const BIT_SHIFT = Object.freeze({
     GSR_RANGE: 1,
     EXP_POWER: 0,
@@ -3491,8 +3504,6 @@ function checkConfigBytesValid(bytes) {
 // in the Shimmer Java driver: idxMacAddress = 128+96 (=224), length 6 bytes.
 // 224+6 stays within one 128-byte InfoMem segment, so a single read suffices.
 const INFOMEM_MAC_OFFSET = 224;
-// Devices that have not been provisioned report an all-FF or all-zero MAC.
-const INVALID_MAC_IDS = ['FFFFFFFFFFFF', '000000000000'];
 // ---------------------------------------------------------------------------
 // Shimmer3RClient
 // ---------------------------------------------------------------------------
@@ -7306,15 +7317,16 @@ function shimmer3ControlMessageLength(buf) {
             return RESYNC;
         return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
     }
-    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE) {
-        // Variable length: [0x68][length][data...]. Firmware caps daughter-card
-        // memory reads at 128 bytes — treat larger "lengths" as garbage and resync.
+    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE || opcode === OPCODES.INFOMEM_RESPONSE) {
+        // Variable length: [opcode][length][data...]. Firmware caps both a
+        // daughter-card memory read and an InfoMem read at 128 bytes — treat larger
+        // "lengths" as garbage and resync.
         if (buf.length < 2)
             return NEED_MORE;
-        const dcLen = buf[1];
-        if (dcLen > 128)
+        const memLen = buf[1];
+        if (memLen > 128)
             return RESYNC;
-        return 2 + dcLen;
+        return 2 + memLen;
     }
     const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
     if (payload === undefined)
@@ -7839,6 +7851,85 @@ class Shimmer3Client extends BaseShimmerClient {
             throw new Error(`Daughter-card mem read returned ${data.length} of ${length} bytes.`);
         }
         return data;
+    }
+    /**
+     * Read the device configuration memory (InfoMem) via GET_INFOMEM_COMMAND.
+     *
+     * `address` is a **wire** address, not an index into the 384-byte InfoMem
+     * image: older firmware addresses the D/C/B pages at 0x1800/0x1880/0x1900
+     * while newer firmware and all Shimmer3Rs use a flat 0/128/256. Use
+     * {@link resolveInfoMemLayout} to pick the right page base for the connected
+     * device — {@link getMacAddress} shows the pattern. Max 128 bytes per read
+     * (one page), which the firmware enforces too.
+     */
+    async readInfoMem(address, length) {
+        if (!this._transport)
+            throw new Error('Not connected');
+        if (!Number.isInteger(address) || address < 0 || address > 0xffff) {
+            throw new Error('InfoMem address must be an integer in 0..65535.');
+        }
+        if (!Number.isInteger(length) || length < 1 || length > 128) {
+            throw new Error('InfoMem read length must be an integer in 1..128.');
+        }
+        this._emitStatus(`GET_INFOMEM ${length}B @ ${address} → waiting for RSP…`);
+        const cmd = new Uint8Array([
+            OPCODES.GET_INFOMEM_COMMAND,
+            length & 0xff,
+            address & 0xff,
+            (address >> 8) & 0xff,
+        ]);
+        await this._write(cmd);
+        const rsp = await this._waitForResponse(OPCODES.INFOMEM_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
+        /* Response is [INFOMEM_RSP][length][data...]; the opcode and length bytes
+         * are skipped when present and consistent. No reassembly needed — the
+         * byte-stream framer already delivers the whole response as one message. */
+        let off = 0;
+        if (rsp[off] === OPCODES.INFOMEM_RESPONSE)
+            off++;
+        if (rsp.length > off && rsp[off] === length && rsp.length >= off + 1 + length)
+            off++;
+        const data = rsp.slice(off, off + length);
+        if (data.length < length) {
+            throw new Error(`InfoMem read returned ${data.length} of ${length} bytes.`);
+        }
+        return data;
+    }
+    /**
+     * Read the device's Bluetooth MAC as a 12-char uppercase hex string.
+     *
+     * The MAC lives in InfoMem rather than behind a command of its own, so this
+     * resolves the layout for the connected device first: `idxMacAddress` (224) is
+     * an index into the InfoMem image, which only equals the wire address on
+     * firmware that uses flat page addressing. Older firmware needs the C-page
+     * base instead, hence the page/offset split below.
+     *
+     * Requires a completed {@link connect} handshake — the layout depends on the
+     * hardware and firmware version it reads.
+     */
+    async getMacAddress() {
+        const fw = this.firmwareVersion;
+        const hw = this.deviceVersion?.hardwareVersion;
+        if (!fw || hw === undefined) {
+            throw new Error('getMacAddress requires a completed connect handshake.');
+        }
+        const layout = resolveInfoMemLayout({
+            hardwareVersion: hw,
+            firmwareId: fw.firmwareIdentifier,
+            firmwareVersion: { major: fw.major, minor: fw.minor, internal: fw.internal },
+        });
+        const pageBases = [layout.addrD, layout.addrC, layout.addrB];
+        const page = Math.floor(layout.idxMacAddress / INFOMEM_PAGE_SIZE);
+        const address = pageBases[page] + (layout.idxMacAddress % INFOMEM_PAGE_SIZE);
+        const bytes = await this.readInfoMem(address, MAC_LENGTH);
+        const mac = Array.from(bytes)
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('')
+            .toUpperCase();
+        if (INVALID_MAC_IDS.includes(mac)) {
+            throw new Error(`Device reported an unprovisioned MAC (${mac}).`);
+        }
+        this._emitStatus(`Device MAC: ${mac}`);
+        return mac;
     }
     /**
      * Write to the daughter-card EEPROM memory. `offset` is a HOST offset (see
