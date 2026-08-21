@@ -507,9 +507,12 @@
             new Shimmer3RClient({
               debug: false,
               transport: new WebSerialTransport({
-                /* Chrome hides Bluetooth serial ports from the picker unless the
-                 * origin names their service class. Harmless on Windows, where
-                 * they are ordinary COM ports and appear regardless. */
+                /* These two do different jobs and BOTH are needed.
+                 * allowedBluetoothServiceClassIds only *permits* Bluetooth ports
+                 * to appear at all; filters is what *narrows* the picker. With
+                 * the permission alone the picker lists every COM port and every
+                 * paired Bluetooth device, which is useless to choose from. */
+                filters: [{ bluetoothServiceClassId: SHIMMER3_SPP_UUID }],
                 allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
                 kind: "rfcomm",
                 /* Bulk transfer: a generous read buffer keeps a slow turn of the
