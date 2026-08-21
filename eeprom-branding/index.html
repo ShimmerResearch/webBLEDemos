@@ -798,9 +798,15 @@
        * connect handshake reports the hardware version, so this path works for
        * a Shimmer3 and a Shimmer3R alike. */
       els.btClassic.onclick = async () => {
+        /* Declared outside the try so the catch can still reach it: if connect()
+         * rejects after the port opened (a handshake timeout, say),
+         * WebSerialTransport leaves the COM port open, and a port we no longer
+         * hold a reference to can never be closed - the next attempt then fails
+         * with "port already open" until the page is reloaded. */
+        let c = null;
         try {
           hideRebootBanner();
-          const c = new Shimmer3Client({
+          c = new Shimmer3Client({
             transport: new WebSerialTransport({
               /* These two do different jobs and BOTH are needed.
                * allowedBluetoothServiceClassIds only *permits* Bluetooth ports to
@@ -835,7 +841,7 @@
           } catch (e) {
             log(`MAC read failed (continuing): ${e.message}`);
             log(
-              'name previews will show "XXXX" — the device still appends its real suffix',
+              'MAC suffix unknown, so name previews show "XXXX" as a placeholder',
             );
           }
           els.devInfo.textContent =
@@ -851,6 +857,13 @@
             log(`record read failed: ${readFailureHint(e)}`),
           );
         } catch (e) {
+          /* Release the port before giving up, or it stays open and locks out
+           * every later attempt. */
+          try {
+            await c?.disconnect();
+          } catch {
+            /* already down */
+          }
           log(`classic Bluetooth connect failed: ${e.message}`);
           if (/timeout/i.test(e.message)) {
             /* A Shimmer3R pairs as two separate Bluetooth entries: "…-BT"
@@ -1044,9 +1057,13 @@
       setConnected(false);
       if (!("serial" in navigator)) {
         log(
-          "note: Web Serial not available in this browser (USB/dock connect disabled)",
+          "note: Web Serial not available in this browser (USB/dock and classic-Bluetooth connect disabled)",
         );
         els.serial.disabled = true;
+        /* The classic-Bluetooth button is Web Serial too - it opens the COM port
+         * the pairing creates - so it needs the same guard, or clicking it just
+         * produces a caught "Web Serial not supported" instead of this note. */
+        els.btClassic.disabled = true;
       }
       if (!("bluetooth" in navigator)) {
         log(

@@ -504,6 +504,15 @@
           }
           await refreshTree();
         } catch (e) {
+          /* Release the link before dropping the reference. If connect() rejected
+           * after the port opened, WebSerialTransport leaves the COM port open,
+           * and a port nothing references can never be closed - the next attempt
+           * then fails with "port already open" until the page is reloaded. */
+          try {
+            await client?.disconnect();
+          } catch {
+            /* already down */
+          }
           log(`Connect failed over ${linkName}: ${e.message}`, true);
           for (const hint of connectFailureHints(linkName, e)) log(hint, true);
           setConnected(false);
@@ -800,6 +809,18 @@
         banner.className = "banner err";
         banner.textContent =
           "Web Bluetooth is not available in this browser (use Chrome or Edge on desktop).";
+        $("btnConnect").disabled = true;
+      }
+      /* The classic-Bluetooth button is Web Serial - it opens the COM port the
+       * pairing creates - so it needs its own guard. Without it, clicking in a
+       * browser without Web Serial only yields a caught "Web Serial not
+       * supported" in the log instead of visible guidance. */
+      if (!("serial" in navigator)) {
+        log(
+          "Web Serial is not available in this browser — classic-Bluetooth connect disabled (use Chrome or Edge on desktop).",
+          true,
+        );
+        $("btnConnectBt").disabled = true;
       }
       if (!("showDirectoryPicker" in window)) {
         log(
