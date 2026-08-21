@@ -239,21 +239,22 @@
         </li>
         <li><b>BLE</b> — Shimmer3R only; a Shimmer3 has no BLE radio.</li>
         <li>
-          <b>Classic Bluetooth</b> — pair the sensor with this PC first
-          (Windows Settings → Bluetooth, PIN <code>1234</code>). Windows then
-          exposes it as a COM port, which this page opens with Web Serial. Works
-          for Shimmer3 <i>and</i> Shimmer3R, with no dock and no cable.
+          <b>Classic Bluetooth</b> — pair the sensor with this PC first (Windows
+          Settings → Bluetooth, PIN <code>1234</code>). Windows then exposes it
+          as a COM port, which this page opens with Web Serial. Works for
+          Shimmer3 <i>and</i> Shimmer3R, with no dock and no cable.
         </li>
       </ul>
-      <p class="sub">
-        Requires firmware with brand-record support.
-      </p>
+      <p class="sub">Requires firmware with brand-record support.</p>
 
       <div class="card">
         <div class="row">
           <button id="btnBle" class="primary">Connect BLE (Shimmer3R)</button>
           <button id="btnSerial">Connect USB / dock</button>
-          <button id="btnBtClassic" title="Requires the sensor to be paired with this PC over classic Bluetooth">
+          <button
+            id="btnBtClassic"
+            title="Requires the sensor to be paired with this PC over classic Bluetooth"
+          >
             Connect Bluetooth (paired COM port)
           </button>
           <button id="btnDisconnect" disabled>Disconnect</button>
