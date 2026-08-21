@@ -165,7 +165,14 @@
   <body>
     <header>
       <h1>Shimmer3R SD Download</h1>
-      <button id="btnConnect">Connect</button>
+      <button id="btnConnect">Connect BLE</button>
+      <button
+        id="btnConnectBt"
+        class="secondary"
+        title="Requires the sensor to be paired with this PC over classic Bluetooth"
+      >
+        Connect Bluetooth (paired COM port)
+      </button>
       <button id="btnDisconnect" class="secondary" disabled>Disconnect</button>
       <span id="connState" class="muted">Not connected</span>
     </header>
@@ -249,6 +256,8 @@
     <script type="module">
       import {
         Shimmer3RClient,
+        WebSerialTransport,
+        SHIMMER3_SPP_UUID,
         enumerateSdTree,
         downloadSdTree,
         formatSdImportStamp,
@@ -348,6 +357,7 @@
 
       function setConnected(connected) {
         $("btnConnect").disabled = connected;
+        $("btnConnectBt").disabled = connected;
         $("btnDisconnect").disabled = !connected;
         updateDownloadButtons();
         $("connState").textContent = connected ? "Connected" : "Not connected";
@@ -406,7 +416,7 @@
       $("btnLinkTest").onclick = async () => {
         linkTesting = true;
         updateDownloadButtons();
-        log("Measuring raw BLE link speed (5 s, firmware data-rate test)…");
+        log("Measuring raw link speed (5 s, firmware data-rate test)…");
         try {
           const res = await client.runDataRateTest(5000, (bytes, elapsedMs) => {
             $("statLink").textContent =
@@ -435,10 +445,16 @@
         }
       };
 
-      $("btnConnect").onclick = async () => {
+      /**
+       * Connect over `linkName`, then identify the firmware and read the card.
+       * `makeClient` builds the client so the two buttons differ only in which
+       * transport they hand over.
+       */
+      async function connectVia(linkName, makeClient) {
         try {
-          client = new Shimmer3RClient({ debug: false });
+          client = makeClient();
           client.onStatus = (s) => log(s);
+          log(`connecting over ${linkName}…`);
           await client.connect();
           setConnected(true);
 
@@ -467,11 +483,41 @@
           }
           await refreshTree();
         } catch (e) {
-          log(`Connect failed: ${e.message}`, true);
+          log(`Connect failed over ${linkName}: ${e.message}`, true);
           setConnected(false);
           client = null;
         }
-      };
+      }
+
+      $("btnConnect").onclick = () =>
+        connectVia("BLE", () => new Shimmer3RClient({ debug: false }));
+
+      /* Classic Bluetooth. A Shimmer paired over classic BT appears to Windows
+       * as a COM port, which Web Serial can open — the same LiteProtocol, over
+       * RFCOMM instead of GATT. Worth a button here above all for throughput:
+       * classic BT is not bound by BLE's connection interval and MTU, and the
+       * "Measure link speed" button above gives a direct A/B against BLE.
+       *
+       * The client re-frames the byte stream itself (an unframed transport
+       * reports capabilities.framed === false), so nothing else changes. */
+      $("btnConnectBt").onclick = () =>
+        connectVia(
+          "classic Bluetooth",
+          () =>
+            new Shimmer3RClient({
+              debug: false,
+              transport: new WebSerialTransport({
+                /* Chrome hides Bluetooth serial ports from the picker unless the
+                 * origin names their service class. Harmless on Windows, where
+                 * they are ordinary COM ports and appear regardless. */
+                allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
+                kind: "rfcomm",
+                /* Bulk transfer: a generous read buffer keeps a slow turn of the
+                 * read loop from stalling the sender. */
+                bufferSize: 64 * 1024,
+              }),
+            }),
+        );
 
       $("btnDisconnect").onclick = async () => {
         try {

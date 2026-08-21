@@ -7,7 +7,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.1.13';
+const SDK_VERSION = '0.1.15';
 
 /**
  * Container for a single decoded sensor frame.
@@ -295,7 +295,6 @@ class WebBluetoothTransport {
  */
 class WebSerialTransport {
     constructor(opts = {}) {
-        this.kind = 'serial';
         this.capabilities = { framed: false };
         this._abort = null;
         this._reader = null;
@@ -304,6 +303,9 @@ class WebSerialTransport {
         this._disconnectCbs = new Set();
         this._port = opts.port ?? null;
         this._filters = opts.filters ?? null;
+        this._allowedBluetoothServiceClassIds = opts.allowedBluetoothServiceClassIds ?? null;
+        this._openTimeoutMs = opts.openTimeoutMs ?? 15000;
+        this.kind = opts.kind ?? 'serial';
         this._signals = {
             dataTerminalReady: opts.dataTerminalReady ?? true,
             requestToSend: opts.requestToSend ?? true,
@@ -315,6 +317,7 @@ class WebSerialTransport {
             stopBits: opts.stopBits ?? 1,
             parity: opts.parity ?? 'none',
             flowControl: opts.flowControl ?? 'none',
+            ...(opts.bufferSize !== undefined ? { bufferSize: opts.bufferSize } : {}),
         };
     }
     /** The underlying serial port, once opened. */
@@ -327,9 +330,17 @@ class WebSerialTransport {
         }
         if (!this._port) {
             const serial = navigator.serial;
-            this._port = await serial.requestPort(this._filters ? { filters: this._filters } : undefined);
+            // Unknown dictionary members are ignored by WebIDL, so naming the
+            // Bluetooth service classes is safe on browsers that predate them.
+            const request = {};
+            if (this._filters)
+                request.filters = this._filters;
+            if (this._allowedBluetoothServiceClassIds) {
+                request.allowedBluetoothServiceClassIds = this._allowedBluetoothServiceClassIds;
+            }
+            this._port = await serial.requestPort(Object.keys(request).length ? request : undefined);
         }
-        await this._port.open(this._openOptions);
+        await this._openWithTimeout();
         // Assert DTR/RTS now that the port is open. The Shimmer single-slot dock
         // holds the docked sensor in RESET until both lines are asserted, so a
         // port opened without them leaves the sensor unresponsive. Non-fatal when
@@ -344,6 +355,46 @@ class WebSerialTransport {
         }
         this._abort = new AbortController();
         this._startReadLoop(this._abort.signal);
+    }
+    /**
+     * `port.open()`, bounded by {@link WebSerialTransportOptions.openTimeoutMs}.
+     *
+     * Opening a classic-Bluetooth COM port is what brings the RFCOMM link up, so
+     * an asleep or out-of-range sensor blocks here rather than failing fast. If
+     * the timeout wins we still close the port should the open land later —
+     * otherwise the OS keeps an orphaned handle and the next attempt fails with
+     * "port already open" instead of the real reason.
+     */
+    async _openWithTimeout() {
+        const port = this._port;
+        const opening = port.open(this._openOptions);
+        if (this._openTimeoutMs <= 0)
+            return opening;
+        let timedOut = false;
+        let timer;
+        try {
+            await Promise.race([
+                opening,
+                new Promise((_resolve, reject) => {
+                    timer = setTimeout(() => {
+                        timedOut = true;
+                        reject(new Error(`Timed out after ${this._openTimeoutMs} ms opening the serial port. ` +
+                            'For a Bluetooth COM port: check the sensor is powered, in range, ' +
+                            'and still paired with this PC.'));
+                    }, this._openTimeoutMs);
+                }),
+            ]);
+        }
+        finally {
+            if (timer !== undefined)
+                clearTimeout(timer);
+            if (timedOut) {
+                // Never leave the late open unobserved (unhandled rejection) or the
+                // port held open behind our back.
+                void opening.then(() => port.close().catch(() => undefined), () => undefined);
+                this._port = null;
+            }
+        }
     }
     async write(data) {
         const writable = this._port?.writable;
@@ -1836,9 +1887,9 @@ function isSupportedRtcConfigViaUart(hwVer, fwId) {
 // RX — framing (reassembly length) + single-packet parse
 // ---------------------------------------------------------------------------
 /** Sentinel: not enough bytes buffered yet to know the message length. */
-const NEED_MORE$1 = -1;
+const NEED_MORE$2 = -1;
 /** Sentinel: leading byte is not a valid header/command — caller drops 1 byte. */
-const RESYNC$1 = 0;
+const RESYNC$2 = 0;
 /**
  * Given the head of the accumulated RX buffer, return the total byte length of
  * the complete UART packet it starts with, or {@link NEED_MORE} / {@link RESYNC}.
@@ -1857,17 +1908,17 @@ const RESYNC$1 = 0;
  */
 function wiredPacketLength(buf) {
     if (buf.length === 0)
-        return NEED_MORE$1;
+        return NEED_MORE$2;
     if (buf[0] !== UART_PACKET_HEADER)
-        return RESYNC$1;
+        return RESYNC$2;
     if (buf.length < 2)
-        return NEED_MORE$1;
+        return NEED_MORE$2;
     const cmd = buf[1];
     if (cmd === UART_PACKET_CMD.DATA_RESPONSE ||
         cmd === UART_PACKET_CMD.READ ||
         cmd === UART_PACKET_CMD.WRITE) {
         if (buf.length < 3)
-            return NEED_MORE$1; // need the LENGTH byte at index 2
+            return NEED_MORE$2; // need the LENGTH byte at index 2
         return PACKET_OVERHEAD_RESPONSE_DATA + buf[2];
     }
     if (cmd === UART_PACKET_CMD.ACK_RESPONSE ||
@@ -1876,7 +1927,7 @@ function wiredPacketLength(buf) {
         cmd === UART_PACKET_CMD.BAD_CRC_RESPONSE) {
         return PACKET_OVERHEAD_RESPONSE_OTHER;
     }
-    return RESYNC$1; // unknown command byte
+    return RESYNC$2; // unknown command byte
 }
 /**
  * Parse exactly one complete packet from the START of `buf`. The caller is
@@ -2079,6 +2130,522 @@ function parseExpansionBoard(payload) {
     if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
         return null;
     return { boardId, boardRev, specialRev };
+}
+
+/**
+ * Sentinels shared by the byte-stream (unframed transport) message framers.
+ *
+ * A framer is a pure function `(buf) => number` that reports how many bytes the
+ * message at the head of `buf` occupies, so a client reading from an unframed
+ * pipe (Web Serial, RFCOMM/SPP, a dock UART) can rebuild the message boundaries
+ * that BLE notifications hand it for free.
+ *
+ * `src/devices/shimmer3/protocol.ts` and `src/devices/dock/protocol.ts` each
+ * predate this module and export their own identically-valued copies; they are
+ * public API and are left alone. New framers should import from here.
+ */
+/** Not enough bytes buffered yet to determine the message length. */
+const NEED_MORE$1 = -1;
+/**
+ * The leading byte is not the start of a message we understand — the caller
+ * should drop one byte and retry (resynchronise) rather than guess a length.
+ */
+const RESYNC$1 = 0;
+
+/**
+ * Wire protocol for Shimmer3R SD-card file transfer over BLE.
+ *
+ * Mirrors the firmware implementation in
+ * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.009).
+ *
+ * Command/response shapes (all multi-byte fields little-endian):
+ *
+ *   SD_LIST_DIR_COMMAND  0xCC: [startIdx u16][maxEntries u8][pathLen u8][path]
+ *   SD_LIST_DIR_RESPONSE 0xC1: [status][startIdx u16][entriesLen u16][nEntries][flags][entries…]
+ *       entry: [attr][size u32][fdate u16][ftime u16][nameLen][name…]
+ *   SD_FILE_STAT_COMMAND 0xC2: [pathLen u8][path]
+ *   SD_FILE_STAT_RESPONSE 0xC3: [status][size u32][fdate u16][ftime u16][attr]
+ *   SD_FILE_READ_COMMAND 0xC4: [offset u32][windowLen u32][blockPayloadLen u16][pathLen u8][path]
+ *   SD_FREE_SPACE_COMMAND 0xC8 / RESPONSE 0xC9: [status][freeKB u32][totalKB u32]
+ *   SD_DELETE_COMMAND 0xCA / RESPONSE 0xCB: [status]
+ *   SD_TRANSFER_ABORT_COMMAND 0xC7: no args
+ *
+ * Streamed frames (always self-CRC'd, independent of the global CRC mode):
+ *   data:   [0x8A][0xC5][sessionId][seq u16][len u16][payload…][crc16 u16]
+ *   status: [0x8A][0xC6][sessionId][status][nextOffset u32][crc16 u16]
+ */
+const SD_TRANSFER_OPCODES = {
+    // Command opcodes must avoid the CYW20820 EZ-Serial SOF bytes 0x80/0xC0/
+    // 0xD0 (the firmware's UART RX demux would route them to the EZ-Serial
+    // parser instead of the Shimmer command parser) — hence LIST sits at 0xCC.
+    LIST_DIR_COMMAND: 0xcc,
+    LIST_DIR_RESPONSE: 0xc1,
+    FILE_STAT_COMMAND: 0xc2,
+    FILE_STAT_RESPONSE: 0xc3,
+    FILE_READ_COMMAND: 0xc4,
+    FILE_DATA_RESPONSE: 0xc5,
+    FILE_STATUS_RESPONSE: 0xc6,
+    TRANSFER_ABORT_COMMAND: 0xc7,
+    FREE_SPACE_COMMAND: 0xc8,
+    FREE_SPACE_RESPONSE: 0xc9,
+    DELETE_COMMAND: 0xca,
+    DELETE_RESPONSE: 0xcb,
+};
+/** Prefix byte shared with the firmware's other instream responses. */
+const SD_INSTREAM_BYTE = 0x8a;
+/** Status byte of the one-shot responses. 0x01–0x13 are raw FatFs FRESULTs. */
+const SD_STATUS = {
+    OK: 0x00,
+    SD_UNAVAILABLE: 0xf0,
+    BUSY: 0xf1,
+    BAD_ARGS: 0xf2,
+};
+/** Codes carried in SD_FILE_STATUS_RESPONSE frames. */
+const SD_XFER = {
+    WINDOW_COMPLETE: 0,
+    EOF: 1,
+    HOST_ABORT: 2,
+    SD_LOST: 3,
+    FS_ERROR: 4,
+    SUPERSEDED: 5,
+    DENIED: 6,
+    NOT_FOUND: 7,
+};
+const SD_ATTR_DIR = 0x01;
+const SD_ATTR_NAME_TRUNCATED = 0x02;
+const SD_MAX_PATH_LEN = 96;
+const SD_LIST_MAX_ENTRIES = 16;
+const SD_BLOCK_PAYLOAD_MIN = 64;
+const SD_BLOCK_PAYLOAD_MAX = 1024;
+const SD_BLOCK_PAYLOAD_DEFAULT = 512;
+const DATA_FRAME_HEADER_LEN = 7;
+const FRAME_CRC_LEN = 2;
+const STATUS_FRAME_LEN = 8 + FRAME_CRC_LEN;
+const LIST_RSP_HDR_LEN = 8;
+/** Error carrying the in-band status byte of a refused/failed SD command. */
+class SdTransferError extends Error {
+    constructor(message, status) {
+        super(message);
+        this.status = status;
+        this.name = 'SdTransferError';
+    }
+}
+function sdStatusToString(status) {
+    switch (status) {
+        case SD_STATUS.OK:
+            return 'OK';
+        case SD_STATUS.SD_UNAVAILABLE:
+            return 'SD unavailable (docked, USB-C plugged, no card or bad card)';
+        case SD_STATUS.BUSY:
+            return 'device busy (sensing/logging/streaming)';
+        case SD_STATUS.BAD_ARGS:
+            return 'bad arguments';
+        default:
+            return `FatFs error ${status}`;
+    }
+}
+function sdXferStatusToString(status) {
+    switch (status) {
+        case SD_XFER.WINDOW_COMPLETE:
+            return 'window complete';
+        case SD_XFER.EOF:
+            return 'end of file';
+        case SD_XFER.HOST_ABORT:
+            return 'aborted by host';
+        case SD_XFER.SD_LOST:
+            return 'SD card lost (docked or USB-C plugged)';
+        case SD_XFER.FS_ERROR:
+            return 'filesystem error';
+        case SD_XFER.SUPERSEDED:
+            return 'superseded by a newer read';
+        case SD_XFER.DENIED:
+            return 'denied (busy or bad arguments)';
+        case SD_XFER.NOT_FOUND:
+            return 'file not found';
+        default:
+            return `unknown transfer status ${status}`;
+    }
+}
+// ---------------------------------------------------------------------------
+// CRC16 — mirrors the firmware's ShimSwCrc (init 0xB0CA, odd-length zero pad)
+// ---------------------------------------------------------------------------
+const SD_CRC_INIT = 0xb0ca;
+function crcByte(crc, b) {
+    crc = (((crc >> 8) & 0xff) | (crc << 8)) & 0xffff;
+    crc ^= b & 0xff;
+    crc ^= (crc & 0xff) >> 4;
+    crc = (crc ^ (crc << 12)) & 0xffff;
+    crc = (crc ^ ((crc & 0xff) << 5)) & 0xffff;
+    return crc;
+}
+/** Shimmer CRC16 over `len` bytes of `data` (defaults to all of it). */
+function sdCrc16(data, len = data.length) {
+    let crc = SD_CRC_INIT;
+    for (let i = 0; i < len; i++)
+        crc = crcByte(crc, data[i]);
+    if (len % 2)
+        crc = crcByte(crc, 0x00);
+    return crc;
+}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function u16(buf, off) {
+    return buf[off] | (buf[off + 1] << 8);
+}
+function u32(buf, off) {
+    return (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
+}
+/** Encode and validate a card path (ASCII, 1..96 bytes). */
+function encodeSdPath(path) {
+    if (path.length === 0 || path.length > SD_MAX_PATH_LEN) {
+        throw new SdTransferError(`path must be 1..${SD_MAX_PATH_LEN} characters, got ${path.length}`, SD_STATUS.BAD_ARGS);
+    }
+    const out = new Uint8Array(path.length);
+    for (let i = 0; i < path.length; i++) {
+        const c = path.charCodeAt(i);
+        if (c < 0x20 || c > 0x7e) {
+            throw new SdTransferError(`path contains non-ASCII character at index ${i}`, SD_STATUS.BAD_ARGS);
+        }
+        out[i] = c;
+    }
+    return out;
+}
+/** Decode a FAT date/time pair; null when unset or invalid. */
+function fatDateTimeToDate(fdate, ftime) {
+    if (!fdate)
+        return null;
+    const year = 1980 + ((fdate >> 9) & 0x7f);
+    const month = (fdate >> 5) & 0x0f;
+    const day = fdate & 0x1f;
+    const hours = (ftime >> 11) & 0x1f;
+    const minutes = (ftime >> 5) & 0x3f;
+    const seconds = (ftime & 0x1f) * 2;
+    if (month < 1 || month > 12 || day < 1 || day > 31)
+        return null;
+    if (hours > 23 || minutes > 59 || seconds > 59)
+        return null;
+    return new Date(year, month - 1, day, hours, minutes, seconds);
+}
+// ---------------------------------------------------------------------------
+// Command builders
+// ---------------------------------------------------------------------------
+function buildListDirCmd(path, startIdx = 0, maxEntries = SD_LIST_MAX_ENTRIES) {
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(5 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.LIST_DIR_COMMAND;
+    cmd[1] = startIdx & 0xff;
+    cmd[2] = (startIdx >> 8) & 0xff;
+    cmd[3] = maxEntries & 0xff;
+    cmd[4] = p.length;
+    cmd.set(p, 5);
+    return cmd;
+}
+function buildStatCmd(path) {
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(2 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.FILE_STAT_COMMAND;
+    cmd[1] = p.length;
+    cmd.set(p, 2);
+    return cmd;
+}
+function buildDeleteCmd(path) {
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(2 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.DELETE_COMMAND;
+    cmd[1] = p.length;
+    cmd.set(p, 2);
+    return cmd;
+}
+function buildFreeSpaceCmd() {
+    return new Uint8Array([SD_TRANSFER_OPCODES.FREE_SPACE_COMMAND]);
+}
+function buildAbortCmd() {
+    return new Uint8Array([SD_TRANSFER_OPCODES.TRANSFER_ABORT_COMMAND]);
+}
+function buildReadCmd(path, offset, windowLen, blockPayloadLen = SD_BLOCK_PAYLOAD_DEFAULT) {
+    if (blockPayloadLen < SD_BLOCK_PAYLOAD_MIN || blockPayloadLen > SD_BLOCK_PAYLOAD_MAX) {
+        throw new SdTransferError(`blockPayloadLen must be ${SD_BLOCK_PAYLOAD_MIN}..${SD_BLOCK_PAYLOAD_MAX}, got ${blockPayloadLen}`, SD_STATUS.BAD_ARGS);
+    }
+    const p = encodeSdPath(path);
+    const cmd = new Uint8Array(12 + p.length);
+    cmd[0] = SD_TRANSFER_OPCODES.FILE_READ_COMMAND;
+    new DataView(cmd.buffer).setUint32(1, offset >>> 0, true);
+    new DataView(cmd.buffer).setUint32(5, windowLen >>> 0, true);
+    new DataView(cmd.buffer).setUint16(9, blockPayloadLen, true);
+    cmd[11] = p.length;
+    cmd.set(p, 12);
+    return cmd;
+}
+function parseListDirRsp(buf) {
+    if (buf.length < LIST_RSP_HDR_LEN || buf[0] !== SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE) {
+        throw new Error('malformed SD_LIST_DIR_RESPONSE');
+    }
+    const status = buf[1];
+    const startIdx = u16(buf, 2);
+    const entriesLen = u16(buf, 4);
+    const nEntries = buf[6];
+    const hasMore = (buf[7] & 0x01) !== 0;
+    const entries = [];
+    let off = LIST_RSP_HDR_LEN;
+    const end = LIST_RSP_HDR_LEN + entriesLen;
+    if (buf.length < end)
+        throw new Error('truncated SD_LIST_DIR_RESPONSE');
+    while (off < end && entries.length < nEntries) {
+        const attr = buf[off];
+        const size = u32(buf, off + 1);
+        const fdate = u16(buf, off + 5);
+        const ftime = u16(buf, off + 7);
+        const nameLen = buf[off + 9];
+        const nameBytes = buf.subarray(off + 10, off + 10 + nameLen);
+        entries.push({
+            name: String.fromCharCode(...nameBytes),
+            isDir: (attr & SD_ATTR_DIR) !== 0,
+            nameTruncated: (attr & SD_ATTR_NAME_TRUNCATED) !== 0,
+            size,
+            fdate,
+            ftime,
+            mtime: fatDateTimeToDate(fdate, ftime),
+        });
+        off += 10 + nameLen;
+    }
+    return { status, startIdx, entries, hasMore };
+}
+function parseStatRsp(buf) {
+    if (buf.length < 11 || buf[0] !== SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE) {
+        throw new Error('malformed SD_FILE_STAT_RESPONSE');
+    }
+    const fdate = u16(buf, 6);
+    const ftime = u16(buf, 8);
+    return {
+        status: buf[1],
+        stat: {
+            size: u32(buf, 2),
+            fdate,
+            ftime,
+            mtime: fatDateTimeToDate(fdate, ftime),
+            isDir: (buf[10] & SD_ATTR_DIR) !== 0,
+        },
+    };
+}
+function parseFreeSpaceRsp(buf) {
+    if (buf.length < 10 || buf[0] !== SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE) {
+        throw new Error('malformed SD_FREE_SPACE_RESPONSE');
+    }
+    return { status: buf[1], space: { freeKB: u32(buf, 2), totalKB: u32(buf, 6) } };
+}
+function parseDeleteRsp(buf) {
+    if (buf.length < 2 || buf[0] !== SD_TRANSFER_OPCODES.DELETE_RESPONSE) {
+        throw new Error('malformed SD_DELETE_RESPONSE');
+    }
+    return { status: buf[1] };
+}
+// ---------------------------------------------------------------------------
+// Incremental extractor
+// ---------------------------------------------------------------------------
+/** Expected total length of a one-shot response, or 0 if `buf` is too short
+ * to tell yet, or -1 if buf[0] is not a known one-shot response opcode. */
+function oneShotLength(buf) {
+    switch (buf[0]) {
+        case SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE:
+            if (buf.length < 6)
+                return 0;
+            return LIST_RSP_HDR_LEN + u16(buf, 4);
+        case SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE:
+            return 11;
+        case SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE:
+            return 10;
+        case SD_TRANSFER_OPCODES.DELETE_RESPONSE:
+            return 2;
+        default:
+            return -1;
+    }
+}
+/**
+ * Total length of the SD-transfer message at the head of `buf`, or
+ * {@link NEED_MORE} / {@link RESYNC}.
+ *
+ * The single source of truth for SD frame spans: {@link tryExtractSdMessage}
+ * uses it to slice a message before CRC-checking it, and the Shimmer3R client's
+ * unframed-transport drain uses it to decide how many bytes of a serial byte
+ * stream belong to one SD message. CRC validity is deliberately not considered
+ * here — a frame with a bad CRC still occupies the same span, and it is the
+ * extractor's job to reject it.
+ */
+function sdMessageSpan(buf) {
+    if (buf.length === 0)
+        return NEED_MORE$1;
+    if (buf[0] === SD_INSTREAM_BYTE) {
+        if (buf.length < 2)
+            return NEED_MORE$1;
+        if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
+            if (buf.length < DATA_FRAME_HEADER_LEN)
+                return NEED_MORE$1;
+            const len = u16(buf, 5);
+            if (len === 0 || len > SD_BLOCK_PAYLOAD_MAX)
+                return RESYNC$1;
+            const total = DATA_FRAME_HEADER_LEN + len + FRAME_CRC_LEN;
+            return buf.length < total ? NEED_MORE$1 : total;
+        }
+        if (buf[1] === SD_TRANSFER_OPCODES.FILE_STATUS_RESPONSE) {
+            return buf.length < STATUS_FRAME_LEN ? NEED_MORE$1 : STATUS_FRAME_LEN;
+        }
+        /* An instream response that is not part of the SD-transfer protocol
+         * (e.g. an unsolicited status response) — resync past it. */
+        return RESYNC$1;
+    }
+    const len = oneShotLength(buf);
+    if (len === -1)
+        return RESYNC$1;
+    if (len === 0 || buf.length < len)
+        return NEED_MORE$1;
+    return len;
+}
+/**
+ * Try to extract one SD-transfer message from the front of `buf`.
+ * Unknown bytes are skipped one at a time (resync) so interleaved traffic
+ * (e.g. unsolicited instream status responses) cannot jam the stream.
+ */
+function tryExtractSdMessage(buf) {
+    const span = sdMessageSpan(buf);
+    if (span === NEED_MORE$1)
+        return { consumed: 0 };
+    if (span === RESYNC$1)
+        return { consumed: 1 };
+    if (buf[0] === SD_INSTREAM_BYTE) {
+        if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
+            const len = u16(buf, 5);
+            const crcOk = sdCrc16(buf, DATA_FRAME_HEADER_LEN + len) === u16(buf, DATA_FRAME_HEADER_LEN + len);
+            if (!crcOk)
+                return { consumed: 1, crcError: true };
+            return {
+                consumed: span,
+                msg: {
+                    kind: 'data',
+                    sessionId: buf[2],
+                    seq: u16(buf, 3),
+                    payload: buf.slice(DATA_FRAME_HEADER_LEN, DATA_FRAME_HEADER_LEN + len),
+                    crcOk,
+                },
+            };
+        }
+        // FILE_STATUS_RESPONSE — the only other span sdMessageSpan accepts here.
+        const crcOk = sdCrc16(buf, 8) === u16(buf, 8);
+        if (!crcOk)
+            return { consumed: 1, crcError: true };
+        return {
+            consumed: span,
+            msg: { kind: 'status', sessionId: buf[2], status: buf[3], nextOffset: u32(buf, 4), crcOk },
+        };
+    }
+    return { consumed: span, msg: { kind: 'oneshot', opcode: buf[0], body: buf.slice(0, span) } };
+}
+
+/**
+ * Message framing for a Shimmer3R reached over an **unframed** byte stream.
+ *
+ * Over BLE the module hands the client one notification per firmware message,
+ * so {@link Shimmer3RClient} can assume `chunk[0]` is an opcode and the rest of
+ * the chunk is that message. A byte stream — Web Serial over USB, or over the
+ * virtual COM port Windows/macOS create for a Shimmer paired via classic
+ * Bluetooth (RFCOMM/SPP) — offers no such guarantee: messages arrive split
+ * across reads and coalesced with their neighbours.
+ *
+ * {@link shimmer3rControlMessageLength} restores those boundaries the way
+ * `shimmer3ControlMessageLength` does for the classic Shimmer3: as a pure
+ * length function the client's drain loop can consult, expressing the same
+ * length knowledge the Java driver encodes in its blocking `readBytes(n)`
+ * calls.
+ *
+ * SD-transfer traffic is delegated to {@link sdMessageSpan} so the frame layout
+ * has exactly one definition.
+ */
+/**
+ * Offset of the `numChannels` byte within an opcode-prefixed
+ * INQUIRY_RESPONSE. Shimmer3R's config word is 7 bytes at [3..9] (Shimmer3's is
+ * 4 at [3..6]) which pushes numChannels to [10] and bufferSize to [11].
+ */
+const SHIMMER3R_INQ_NUM_CHANNELS_OFFSET = 10;
+/** Offset of the first channel-ID byte within an INQUIRY_RESPONSE. */
+const SHIMMER3R_INQ_CHANNELS_OFFSET = SHIMMER3R_INQ_NUM_CHANNELS_OFFSET + 2; // 12
+/**
+ * Fixed payload lengths (bytes AFTER the opcode) for the fixed-width control
+ * responses. Variable-length responses (INQUIRY_RESPONSE, DAUGHTER_CARD_MEM_
+ * RESPONSE, everything SD) are handled explicitly in
+ * {@link shimmer3rControlMessageLength}.
+ *
+ * **Extension point.** An opcode absent from here — and from the special cases
+ * below — cannot be framed, so the drain loop resynchronises past it one byte at
+ * a time and whatever command was awaiting it times out. Add an entry when
+ * teaching the client a new GET over an unframed transport; the value is the
+ * response's `response_size` in the LiteProtocol instruction set, minus the
+ * opcode byte.
+ */
+const SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS = Object.freeze({
+    [OPCODES.SAMPLING_RATE_RESPONSE]: 2, // 0x04
+    [OPCODES.GSR_RANGE_RESPONSE]: 1, // 0x22
+    [OPCODES.DEVICE_VERSION_RESPONSE]: 1, // 0x25
+    [OPCODES.FW_VERSION_RESPONSE]: 6, // 0x2F fwId u16, major u16, minor u8, patch u8
+    [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
+    [OPCODES.RWC_RESPONSE]: 8, // 0x90 64-bit ticks, LSB first
+    // 0xA5 — DATA_RATE_TEST_PACKET_SIZE is 5 in the firmware: header + u32 counter
+    [OPCODES.DATA_RATE_TEST_RESPONSE]: 4,
+});
+/** SD-transfer response opcodes, which {@link sdMessageSpan} owns. */
+const SD_RESPONSE_OPCODES = new Set([
+    SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE,
+    SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE,
+    SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE,
+    SD_TRANSFER_OPCODES.DELETE_RESPONSE,
+]);
+/**
+ * Total length (INCLUDING the leading opcode) of the control message at the
+ * head of `buf`, or {@link NEED_MORE} when more bytes are required to tell, or
+ * {@link RESYNC} when the leading byte starts nothing we recognise.
+ *
+ * Deliberately does NOT frame DATA_PACKET (0x00): stream data is length-defined
+ * by the negotiated schema rather than by the protocol, so the client routes it
+ * to its schema parser instead of through this function.
+ */
+function shimmer3rControlMessageLength(buf) {
+    if (buf.length === 0)
+        return NEED_MORE$1;
+    const opcode = buf[0];
+    if (opcode === OPCODES.ACK_COMMAND_PROCESSED || opcode === OPCODES.NACK_COMMAND_PROCESSED) {
+        return 1;
+    }
+    // SD-transfer frames and one-shot responses: one definition, in sdMessageSpan.
+    if (opcode === SD_INSTREAM_BYTE || SD_RESPONSE_OPCODES.has(opcode)) {
+        return sdMessageSpan(buf);
+    }
+    if (opcode === OPCODES.INQUIRY_RESPONSE) {
+        if (buf.length <= SHIMMER3R_INQ_NUM_CHANNELS_OFFSET)
+            return NEED_MORE$1;
+        const numChannels = buf[SHIMMER3R_INQ_NUM_CHANNELS_OFFSET];
+        // A stray stream byte 0x02 can masquerade as an INQUIRY_RESPONSE whose
+        // "numChannels" is garbage, swallowing real control traffic (ACK included).
+        // No Shimmer3R comes close to 32 channels — treat the rest as garbage.
+        if (numChannels > 32)
+            return RESYNC$1;
+        const total = SHIMMER3R_INQ_CHANNELS_OFFSET + numChannels;
+        return buf.length < total ? NEED_MORE$1 : total;
+    }
+    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE) {
+        // [0x68][length][data…]; the firmware caps a read at 128 bytes, so a larger
+        // "length" is garbage rather than a giant response.
+        if (buf.length < 2)
+            return NEED_MORE$1;
+        const dcLen = buf[1];
+        if (dcLen > 128)
+            return RESYNC$1;
+        const total = 2 + dcLen;
+        return buf.length < total ? NEED_MORE$1 : total;
+    }
+    const payload = SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS[opcode];
+    if (payload === undefined)
+        return RESYNC$1;
+    const total = 1 + payload;
+    return buf.length < total ? NEED_MORE$1 : total;
 }
 
 /**
@@ -2917,372 +3484,6 @@ function checkConfigBytesValid(bytes) {
     return false;
 }
 
-/**
- * Wire protocol for Shimmer3R SD-card file transfer over BLE.
- *
- * Mirrors the firmware implementation in
- * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.009).
- *
- * Command/response shapes (all multi-byte fields little-endian):
- *
- *   SD_LIST_DIR_COMMAND  0xCC: [startIdx u16][maxEntries u8][pathLen u8][path]
- *   SD_LIST_DIR_RESPONSE 0xC1: [status][startIdx u16][entriesLen u16][nEntries][flags][entries…]
- *       entry: [attr][size u32][fdate u16][ftime u16][nameLen][name…]
- *   SD_FILE_STAT_COMMAND 0xC2: [pathLen u8][path]
- *   SD_FILE_STAT_RESPONSE 0xC3: [status][size u32][fdate u16][ftime u16][attr]
- *   SD_FILE_READ_COMMAND 0xC4: [offset u32][windowLen u32][blockPayloadLen u16][pathLen u8][path]
- *   SD_FREE_SPACE_COMMAND 0xC8 / RESPONSE 0xC9: [status][freeKB u32][totalKB u32]
- *   SD_DELETE_COMMAND 0xCA / RESPONSE 0xCB: [status]
- *   SD_TRANSFER_ABORT_COMMAND 0xC7: no args
- *
- * Streamed frames (always self-CRC'd, independent of the global CRC mode):
- *   data:   [0x8A][0xC5][sessionId][seq u16][len u16][payload…][crc16 u16]
- *   status: [0x8A][0xC6][sessionId][status][nextOffset u32][crc16 u16]
- */
-const SD_TRANSFER_OPCODES = {
-    // Command opcodes must avoid the CYW20820 EZ-Serial SOF bytes 0x80/0xC0/
-    // 0xD0 (the firmware's UART RX demux would route them to the EZ-Serial
-    // parser instead of the Shimmer command parser) — hence LIST sits at 0xCC.
-    LIST_DIR_COMMAND: 0xcc,
-    LIST_DIR_RESPONSE: 0xc1,
-    FILE_STAT_COMMAND: 0xc2,
-    FILE_STAT_RESPONSE: 0xc3,
-    FILE_READ_COMMAND: 0xc4,
-    FILE_DATA_RESPONSE: 0xc5,
-    FILE_STATUS_RESPONSE: 0xc6,
-    TRANSFER_ABORT_COMMAND: 0xc7,
-    FREE_SPACE_COMMAND: 0xc8,
-    FREE_SPACE_RESPONSE: 0xc9,
-    DELETE_COMMAND: 0xca,
-    DELETE_RESPONSE: 0xcb,
-};
-/** Prefix byte shared with the firmware's other instream responses. */
-const SD_INSTREAM_BYTE = 0x8a;
-/** Status byte of the one-shot responses. 0x01–0x13 are raw FatFs FRESULTs. */
-const SD_STATUS = {
-    OK: 0x00,
-    SD_UNAVAILABLE: 0xf0,
-    BUSY: 0xf1,
-    BAD_ARGS: 0xf2,
-};
-/** Codes carried in SD_FILE_STATUS_RESPONSE frames. */
-const SD_XFER = {
-    WINDOW_COMPLETE: 0,
-    EOF: 1,
-    HOST_ABORT: 2,
-    SD_LOST: 3,
-    FS_ERROR: 4,
-    SUPERSEDED: 5,
-    DENIED: 6,
-    NOT_FOUND: 7,
-};
-const SD_ATTR_DIR = 0x01;
-const SD_ATTR_NAME_TRUNCATED = 0x02;
-const SD_MAX_PATH_LEN = 96;
-const SD_LIST_MAX_ENTRIES = 16;
-const SD_BLOCK_PAYLOAD_MIN = 64;
-const SD_BLOCK_PAYLOAD_MAX = 1024;
-const SD_BLOCK_PAYLOAD_DEFAULT = 512;
-const DATA_FRAME_HEADER_LEN = 7;
-const FRAME_CRC_LEN = 2;
-const STATUS_FRAME_LEN = 8 + FRAME_CRC_LEN;
-const LIST_RSP_HDR_LEN = 8;
-/** Error carrying the in-band status byte of a refused/failed SD command. */
-class SdTransferError extends Error {
-    constructor(message, status) {
-        super(message);
-        this.status = status;
-        this.name = 'SdTransferError';
-    }
-}
-function sdStatusToString(status) {
-    switch (status) {
-        case SD_STATUS.OK:
-            return 'OK';
-        case SD_STATUS.SD_UNAVAILABLE:
-            return 'SD unavailable (docked, USB-C plugged, no card or bad card)';
-        case SD_STATUS.BUSY:
-            return 'device busy (sensing/logging/streaming)';
-        case SD_STATUS.BAD_ARGS:
-            return 'bad arguments';
-        default:
-            return `FatFs error ${status}`;
-    }
-}
-function sdXferStatusToString(status) {
-    switch (status) {
-        case SD_XFER.WINDOW_COMPLETE:
-            return 'window complete';
-        case SD_XFER.EOF:
-            return 'end of file';
-        case SD_XFER.HOST_ABORT:
-            return 'aborted by host';
-        case SD_XFER.SD_LOST:
-            return 'SD card lost (docked or USB-C plugged)';
-        case SD_XFER.FS_ERROR:
-            return 'filesystem error';
-        case SD_XFER.SUPERSEDED:
-            return 'superseded by a newer read';
-        case SD_XFER.DENIED:
-            return 'denied (busy or bad arguments)';
-        case SD_XFER.NOT_FOUND:
-            return 'file not found';
-        default:
-            return `unknown transfer status ${status}`;
-    }
-}
-// ---------------------------------------------------------------------------
-// CRC16 — mirrors the firmware's ShimSwCrc (init 0xB0CA, odd-length zero pad)
-// ---------------------------------------------------------------------------
-const SD_CRC_INIT = 0xb0ca;
-function crcByte(crc, b) {
-    crc = (((crc >> 8) & 0xff) | (crc << 8)) & 0xffff;
-    crc ^= b & 0xff;
-    crc ^= (crc & 0xff) >> 4;
-    crc = (crc ^ (crc << 12)) & 0xffff;
-    crc = (crc ^ ((crc & 0xff) << 5)) & 0xffff;
-    return crc;
-}
-/** Shimmer CRC16 over `len` bytes of `data` (defaults to all of it). */
-function sdCrc16(data, len = data.length) {
-    let crc = SD_CRC_INIT;
-    for (let i = 0; i < len; i++)
-        crc = crcByte(crc, data[i]);
-    if (len % 2)
-        crc = crcByte(crc, 0x00);
-    return crc;
-}
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-function u16(buf, off) {
-    return buf[off] | (buf[off + 1] << 8);
-}
-function u32(buf, off) {
-    return (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
-}
-/** Encode and validate a card path (ASCII, 1..96 bytes). */
-function encodeSdPath(path) {
-    if (path.length === 0 || path.length > SD_MAX_PATH_LEN) {
-        throw new SdTransferError(`path must be 1..${SD_MAX_PATH_LEN} characters, got ${path.length}`, SD_STATUS.BAD_ARGS);
-    }
-    const out = new Uint8Array(path.length);
-    for (let i = 0; i < path.length; i++) {
-        const c = path.charCodeAt(i);
-        if (c < 0x20 || c > 0x7e) {
-            throw new SdTransferError(`path contains non-ASCII character at index ${i}`, SD_STATUS.BAD_ARGS);
-        }
-        out[i] = c;
-    }
-    return out;
-}
-/** Decode a FAT date/time pair; null when unset or invalid. */
-function fatDateTimeToDate(fdate, ftime) {
-    if (!fdate)
-        return null;
-    const year = 1980 + ((fdate >> 9) & 0x7f);
-    const month = (fdate >> 5) & 0x0f;
-    const day = fdate & 0x1f;
-    const hours = (ftime >> 11) & 0x1f;
-    const minutes = (ftime >> 5) & 0x3f;
-    const seconds = (ftime & 0x1f) * 2;
-    if (month < 1 || month > 12 || day < 1 || day > 31)
-        return null;
-    if (hours > 23 || minutes > 59 || seconds > 59)
-        return null;
-    return new Date(year, month - 1, day, hours, minutes, seconds);
-}
-// ---------------------------------------------------------------------------
-// Command builders
-// ---------------------------------------------------------------------------
-function buildListDirCmd(path, startIdx = 0, maxEntries = SD_LIST_MAX_ENTRIES) {
-    const p = encodeSdPath(path);
-    const cmd = new Uint8Array(5 + p.length);
-    cmd[0] = SD_TRANSFER_OPCODES.LIST_DIR_COMMAND;
-    cmd[1] = startIdx & 0xff;
-    cmd[2] = (startIdx >> 8) & 0xff;
-    cmd[3] = maxEntries & 0xff;
-    cmd[4] = p.length;
-    cmd.set(p, 5);
-    return cmd;
-}
-function buildStatCmd(path) {
-    const p = encodeSdPath(path);
-    const cmd = new Uint8Array(2 + p.length);
-    cmd[0] = SD_TRANSFER_OPCODES.FILE_STAT_COMMAND;
-    cmd[1] = p.length;
-    cmd.set(p, 2);
-    return cmd;
-}
-function buildDeleteCmd(path) {
-    const p = encodeSdPath(path);
-    const cmd = new Uint8Array(2 + p.length);
-    cmd[0] = SD_TRANSFER_OPCODES.DELETE_COMMAND;
-    cmd[1] = p.length;
-    cmd.set(p, 2);
-    return cmd;
-}
-function buildFreeSpaceCmd() {
-    return new Uint8Array([SD_TRANSFER_OPCODES.FREE_SPACE_COMMAND]);
-}
-function buildAbortCmd() {
-    return new Uint8Array([SD_TRANSFER_OPCODES.TRANSFER_ABORT_COMMAND]);
-}
-function buildReadCmd(path, offset, windowLen, blockPayloadLen = SD_BLOCK_PAYLOAD_DEFAULT) {
-    if (blockPayloadLen < SD_BLOCK_PAYLOAD_MIN || blockPayloadLen > SD_BLOCK_PAYLOAD_MAX) {
-        throw new SdTransferError(`blockPayloadLen must be ${SD_BLOCK_PAYLOAD_MIN}..${SD_BLOCK_PAYLOAD_MAX}, got ${blockPayloadLen}`, SD_STATUS.BAD_ARGS);
-    }
-    const p = encodeSdPath(path);
-    const cmd = new Uint8Array(12 + p.length);
-    cmd[0] = SD_TRANSFER_OPCODES.FILE_READ_COMMAND;
-    new DataView(cmd.buffer).setUint32(1, offset >>> 0, true);
-    new DataView(cmd.buffer).setUint32(5, windowLen >>> 0, true);
-    new DataView(cmd.buffer).setUint16(9, blockPayloadLen, true);
-    cmd[11] = p.length;
-    cmd.set(p, 12);
-    return cmd;
-}
-function parseListDirRsp(buf) {
-    if (buf.length < LIST_RSP_HDR_LEN || buf[0] !== SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE) {
-        throw new Error('malformed SD_LIST_DIR_RESPONSE');
-    }
-    const status = buf[1];
-    const startIdx = u16(buf, 2);
-    const entriesLen = u16(buf, 4);
-    const nEntries = buf[6];
-    const hasMore = (buf[7] & 0x01) !== 0;
-    const entries = [];
-    let off = LIST_RSP_HDR_LEN;
-    const end = LIST_RSP_HDR_LEN + entriesLen;
-    if (buf.length < end)
-        throw new Error('truncated SD_LIST_DIR_RESPONSE');
-    while (off < end && entries.length < nEntries) {
-        const attr = buf[off];
-        const size = u32(buf, off + 1);
-        const fdate = u16(buf, off + 5);
-        const ftime = u16(buf, off + 7);
-        const nameLen = buf[off + 9];
-        const nameBytes = buf.subarray(off + 10, off + 10 + nameLen);
-        entries.push({
-            name: String.fromCharCode(...nameBytes),
-            isDir: (attr & SD_ATTR_DIR) !== 0,
-            nameTruncated: (attr & SD_ATTR_NAME_TRUNCATED) !== 0,
-            size,
-            fdate,
-            ftime,
-            mtime: fatDateTimeToDate(fdate, ftime),
-        });
-        off += 10 + nameLen;
-    }
-    return { status, startIdx, entries, hasMore };
-}
-function parseStatRsp(buf) {
-    if (buf.length < 11 || buf[0] !== SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE) {
-        throw new Error('malformed SD_FILE_STAT_RESPONSE');
-    }
-    const fdate = u16(buf, 6);
-    const ftime = u16(buf, 8);
-    return {
-        status: buf[1],
-        stat: {
-            size: u32(buf, 2),
-            fdate,
-            ftime,
-            mtime: fatDateTimeToDate(fdate, ftime),
-            isDir: (buf[10] & SD_ATTR_DIR) !== 0,
-        },
-    };
-}
-function parseFreeSpaceRsp(buf) {
-    if (buf.length < 10 || buf[0] !== SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE) {
-        throw new Error('malformed SD_FREE_SPACE_RESPONSE');
-    }
-    return { status: buf[1], space: { freeKB: u32(buf, 2), totalKB: u32(buf, 6) } };
-}
-function parseDeleteRsp(buf) {
-    if (buf.length < 2 || buf[0] !== SD_TRANSFER_OPCODES.DELETE_RESPONSE) {
-        throw new Error('malformed SD_DELETE_RESPONSE');
-    }
-    return { status: buf[1] };
-}
-// ---------------------------------------------------------------------------
-// Incremental extractor
-// ---------------------------------------------------------------------------
-/** Expected total length of a one-shot response, or 0 if `buf` is too short
- * to tell yet, or -1 if buf[0] is not a known one-shot response opcode. */
-function oneShotLength(buf) {
-    switch (buf[0]) {
-        case SD_TRANSFER_OPCODES.LIST_DIR_RESPONSE:
-            if (buf.length < 6)
-                return 0;
-            return LIST_RSP_HDR_LEN + u16(buf, 4);
-        case SD_TRANSFER_OPCODES.FILE_STAT_RESPONSE:
-            return 11;
-        case SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE:
-            return 10;
-        case SD_TRANSFER_OPCODES.DELETE_RESPONSE:
-            return 2;
-        default:
-            return -1;
-    }
-}
-/**
- * Try to extract one SD-transfer message from the front of `buf`.
- * Unknown bytes are skipped one at a time (resync) so interleaved traffic
- * (e.g. unsolicited instream status responses) cannot jam the stream.
- */
-function tryExtractSdMessage(buf) {
-    if (buf.length === 0)
-        return { consumed: 0 };
-    if (buf[0] === SD_INSTREAM_BYTE) {
-        if (buf.length < 2)
-            return { consumed: 0 };
-        if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
-            if (buf.length < DATA_FRAME_HEADER_LEN)
-                return { consumed: 0 };
-            const len = u16(buf, 5);
-            if (len === 0 || len > SD_BLOCK_PAYLOAD_MAX)
-                return { consumed: 1 };
-            const total = DATA_FRAME_HEADER_LEN + len + FRAME_CRC_LEN;
-            if (buf.length < total)
-                return { consumed: 0 };
-            const crcOk = sdCrc16(buf, DATA_FRAME_HEADER_LEN + len) === u16(buf, DATA_FRAME_HEADER_LEN + len);
-            if (!crcOk)
-                return { consumed: 1, crcError: true };
-            return {
-                consumed: total,
-                msg: {
-                    kind: 'data',
-                    sessionId: buf[2],
-                    seq: u16(buf, 3),
-                    payload: buf.slice(DATA_FRAME_HEADER_LEN, DATA_FRAME_HEADER_LEN + len),
-                    crcOk,
-                },
-            };
-        }
-        if (buf[1] === SD_TRANSFER_OPCODES.FILE_STATUS_RESPONSE) {
-            if (buf.length < STATUS_FRAME_LEN)
-                return { consumed: 0 };
-            const crcOk = sdCrc16(buf, 8) === u16(buf, 8);
-            if (!crcOk)
-                return { consumed: 1, crcError: true };
-            return {
-                consumed: STATUS_FRAME_LEN,
-                msg: { kind: 'status', sessionId: buf[2], status: buf[3], nextOffset: u32(buf, 4), crcOk },
-            };
-        }
-        /* An instream response that is not part of the SD-transfer protocol
-         * (e.g. an unsolicited status response) — resync past it. */
-        return { consumed: 1 };
-    }
-    const len = oneShotLength(buf);
-    if (len === -1)
-        return { consumed: 1 };
-    if (len === 0 || buf.length < len)
-        return { consumed: 0 };
-    return { consumed: len, msg: { kind: 'oneshot', opcode: buf[0], body: buf.slice(0, len) } };
-}
-
 // ---------------------------------------------------------------------------
 // InfoMem constants
 // ---------------------------------------------------------------------------
@@ -3338,6 +3539,10 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._expectingAck = 0;
         this._streaming = false;
         this._lastTs = 0;
+        /** True while the active transport is a byte stream with no message framing. */
+        this._unframed = false;
+        /** Re-framing accumulator, used only when {@link _unframed}. */
+        this._ctrlBuf = new Uint8Array(0);
         // Cached device configuration
         this.enabledSensors = 0x000000;
         this.samplingRateHz = 0;
@@ -3376,7 +3581,20 @@ class Shimmer3RClient extends BaseShimmerClient {
         // ---------------------------------------------------------------------------
         // Notify handler (fed raw notification chunks by the transport)
         // ---------------------------------------------------------------------------
+        /**
+         * Transport entry point. A framed transport (BLE) delivers one firmware
+         * message per call and goes straight to {@link _handleFramedChunk}; an
+         * unframed one (Web Serial over USB or over a classic-Bluetooth COM port)
+         * is re-framed first, then funnelled through the very same handler.
+         */
         this._handleNotify = (chunk) => {
+            if (this._unframed) {
+                this._handleUnframedChunk(chunk);
+                return;
+            }
+            this._handleFramedChunk(chunk);
+        };
+        this._handleFramedChunk = (chunk) => {
             this._log('Notify len=', chunk.length, 'data=', chunk);
             // 1) Consume an expected ACK
             if (chunk.length >= 1 &&
@@ -3523,6 +3741,10 @@ class Shimmer3RClient extends BaseShimmerClient {
     async connect(transport) {
         const t = transport ?? this._injectedTransport ?? this._makeWebTransport();
         this._transport = t;
+        // A byte-stream transport needs its message boundaries rebuilt; BLE gets
+        // them from the notification boundaries and takes the untouched path.
+        this._unframed = t.capabilities.framed === false;
+        this._ctrlBuf = new Uint8Array(0);
         // The firmware's SD session counter restarts with the connection
         this._sdKnownSession = null;
         this._notifyUnsub = t.onNotify(this._handleNotify);
@@ -3550,12 +3772,106 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._transport = null;
             this.device = null;
             this._rxBuf = new Uint8Array(0);
+            this._ctrlBuf = new Uint8Array(0);
+            this._unframed = false;
             this.schema = null;
             this._streaming = false;
             this.ExpPower = 0;
             this._deviceCalibrations = {};
             this._sdKnownSession = null;
             this._emitStatus('Disconnected');
+        }
+    }
+    // ---------------------------------------------------------------------------
+    // Unframed (byte-stream) transports
+    // ---------------------------------------------------------------------------
+    /**
+     * Re-frame an unframed transport's read into whole firmware messages, then
+     * replay them through {@link _handleFramedChunk} so every command, waiter and
+     * SD handler above behaves exactly as it does over BLE.
+     *
+     * Without this a serial read can split a response down the middle (the waiter
+     * resolves with a truncated buffer) or carry two messages at once (the second
+     * is swallowed as the first's ACK remainder).
+     */
+    _handleUnframedChunk(chunk) {
+        this._log('Serial rx len=', chunk.length, 'data=', chunk);
+        // While a stream is live every byte is schema-defined stream data, whose
+        // length this protocol layer cannot know — hand it straight to the parser,
+        // which accumulates and so is already fragmentation-proof.
+        if (this._streaming) {
+            this._rxBuf = concatU8(this._rxBuf, chunk);
+            this._parseStreamIfPossible();
+            return;
+        }
+        this._ctrlBuf = concatU8(this._ctrlBuf, chunk);
+        for (const msg of this._extractUnframedMessages())
+            this._handleFramedChunk(msg);
+    }
+    /**
+     * Pull every complete message out of {@link _ctrlBuf}, leaving the incomplete
+     * tail behind. Extraction is finished before anything is dispatched so a
+     * handler can never observe a half-updated buffer.
+     */
+    _extractUnframedMessages() {
+        const out = [];
+        let buf = this._ctrlBuf;
+        for (;;) {
+            if (buf.length === 0)
+                break;
+            // DATA_PACKET belongs to the stream plane even before `_streaming` is set
+            // (the window between START_STREAMING and its ACK). Its length comes from
+            // the schema, so stop framing and let the stream parser own the rest.
+            if (buf[0] === OPCODES.DATA_PACKET) {
+                this._rxBuf = concatU8(this._rxBuf, buf);
+                buf = new Uint8Array(0);
+                this._parseStreamIfPossible();
+                break;
+            }
+            const len = shimmer3rControlMessageLength(buf);
+            if (len === NEED_MORE$1)
+                break;
+            if (len === RESYNC$1) {
+                this._log(`serial resync: dropping unframeable byte 0x${buf[0].toString(16)}`);
+                buf = buf.subarray(1);
+                continue;
+            }
+            if (buf.length < len)
+                break; // defensive: framer should have said NEED_MORE
+            const msg = new Uint8Array(buf.subarray(0, len));
+            buf = buf.subarray(len);
+            // Emulate BLE's coalescing: the module packs an ACK and the response the
+            // firmware wrote straight after it into ONE notification, and the waiters
+            // rely on that — `_waitForAck` hands the remainder over synchronously via
+            // `_lastAckRemainder`. Emitted as two separate messages, the response
+            // would arrive before the caller's `await` continuation had registered its
+            // response handler, and be dropped. Two ACKs are never merged: the second
+            // would masquerade as the first's response body.
+            if (msg.length === 1 && msg[0] === OPCODES.ACK_COMMAND_PROCESSED && this._expectingAck > 0) {
+                const nextLen = shimmer3rControlMessageLength(buf);
+                if (nextLen !== NEED_MORE$1 &&
+                    nextLen !== RESYNC$1 &&
+                    buf.length >= nextLen &&
+                    buf[0] !== OPCODES.ACK_COMMAND_PROCESSED) {
+                    out.push(concatU8(msg, buf.subarray(0, nextLen)));
+                    buf = buf.subarray(nextLen);
+                    continue;
+                }
+            }
+            out.push(msg);
+        }
+        this._ctrlBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
+        return out;
+    }
+    /** Run the schema parser if one has been built, swallowing parse errors. */
+    _parseStreamIfPossible() {
+        if (!this.schema)
+            return;
+        try {
+            this._parseBySchema();
+        }
+        catch (e) {
+            this._log('parseBySchema error:', e);
         }
     }
     // ---------------------------------------------------------------------------
@@ -4536,12 +4852,13 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
     }
     /**
-     * Measure raw BLE link throughput with the firmware's data-rate test
+     * Measure raw link throughput with the firmware's data-rate test
      * (SET_DATA_RATE_TEST): the device free-runs 5-byte counter packets as
-     * fast as the link drains them and we count notification bytes for
-     * `durationMs`. This measures the pipe itself (connection interval, MTU,
-     * module buffering) independent of the SD/file-transfer protocol, so it
-     * gives an upper bound for transfer rates on a given host/adapter/OS.
+     * fast as the link drains them and we count received bytes for
+     * `durationMs`. This measures the pipe itself (BLE connection interval and
+     * MTU, or RFCOMM/serial buffering) independent of the SD/file-transfer
+     * protocol, so it gives an upper bound for transfer rates on a given
+     * host/adapter/OS — and a direct BLE-vs-classic-Bluetooth comparison.
      * The device must be idle (the firmware NACKs the test while sensing).
      */
     async runDataRateTest(durationMs = 5000, onProgress) {
@@ -4582,8 +4899,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             catch {
                 /* the stop ACK can be indistinguishable from residual test bytes */
             }
-            // Drop any test bytes that were mistaken for stream data
+            // Drop any test bytes that were mistaken for stream data, or that are
+            // still sitting in the re-framing accumulator on an unframed transport.
             this._rxBuf = new Uint8Array(0);
+            this._ctrlBuf = new Uint8Array(0);
         }
     }
     _sdAcquire() {
@@ -7172,9 +7491,11 @@ class Shimmer3Client extends BaseShimmerClient {
     /**
      * Open the RFCOMM connection and run the classic-Shimmer3 connect handshake.
      *
-     * A transport is REQUIRED (constructor option or this parameter); classic
-     * Bluetooth cannot run in a browser, so there is no default. Calling without
-     * one throws.
+     * A transport is REQUIRED (constructor option or this parameter): Web
+     * Bluetooth cannot open an RFCOMM socket, so there is no default. In a browser
+     * the working transport is a {@link WebSerialTransport} over the virtual COM
+     * port the OS creates for a Shimmer paired over classic Bluetooth. Calling
+     * without one throws.
      *
      * Handshake (ported from ShimmerBluetooth#initialize → readShimmerVersionNew →
      * readFWVersion):
@@ -7187,9 +7508,11 @@ class Shimmer3Client extends BaseShimmerClient {
     async connect(transport) {
         const t = transport ?? this._injectedTransport;
         if (!t) {
-            throw new Error('Shimmer3Client requires an injected transport: classic Bluetooth (RFCOMM/SPP) ' +
-                'is not available in browsers. Pass a ShimmerTransport via the constructor ' +
-                '({ transport }) or connect(transport).');
+            throw new Error('Shimmer3Client requires an injected transport: Web Bluetooth cannot open an ' +
+                'RFCOMM/SPP socket. In a browser, pair the sensor over classic Bluetooth and ' +
+                'pass a WebSerialTransport over the COM port the OS creates for it ' +
+                '(allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID]); elsewhere pass any ' +
+                'ShimmerTransport via the constructor ({ transport }) or connect(transport).');
         }
         this._transport = t;
         this._notifyUnsub = t.onNotify(this._handleNotify);
@@ -8813,9 +9136,9 @@ class WiredShimmerClient extends BaseShimmerClient {
             if (buf.length === 0)
                 break;
             const len = wiredPacketLength(buf);
-            if (len === NEED_MORE$1)
+            if (len === NEED_MORE$2)
                 break;
-            if (len === RESYNC$1) {
+            if (len === RESYNC$2) {
                 this._log(`resync: dropping byte 0x${buf[0].toString(16)}`);
                 buf = buf.subarray(1);
                 continue;
@@ -10684,7 +11007,19 @@ function decodeSdSession(files, opts) {
  * recovers physical = R⁻¹·K⁻¹·(raw − b). K is the diagonal sensitivity, R the
  * rotation into the common ASM axes, b the offset bias.
  */
-const SC_CALIB_FORMAT_VERSION = 1;
+/**
+ * Blob layout version. v2 is byte-for-byte identical in layout to v1 — the
+ * firmware bumped it purely to force already-deployed gen-2 units to re-seed
+ * with the corrected LSM6DSV/LIS2MDL alignment (its load path checks neither a
+ * CRC nor the FW version, so nothing else would).
+ *
+ * `parseCalibrationBlob` accepts any version and reports what it read;
+ * `serializeCalibrationBlob` preserves `input.formatVersion` when present and
+ * only falls back to this constant. That matters when writing to a device: a
+ * blob stamped with the wrong version is rejected at the device's next boot and
+ * silently replaced by the seeded defaults.
+ */
+const SC_CALIB_FORMAT_VERSION = 2;
 const SC_GLOBAL_HEADER_BYTES = 12;
 const SC_BLOCK_HEADER_BYTES = 12;
 const SC_TS_BYTES = 8;
@@ -17845,12 +18180,19 @@ const LSM6DS3_GYRO_RANGES = [
     { code: 3, label: '±2000dps', sens: 14.285714286 },
 ];
 /**
- * 2nd-generation catalog (LSM6DSV accel+gyro, LIS2DW12, LIS2MDL). Alignment
- * matrices derived from the ST datasheet axis figures + the SR68-10 pin-1
- * placement; common frame +X=strap, +Y=out of face, +Z=toward hand. LSM6DSV /
- * LIS2DW12 are proper rotations (det +1); the LIS2MDL frame is left-handed
- * (det −1, a reflection). Kept byte-for-byte in sync with the firmware seed
- * (asm_calibration.c) and VERISENSE_CALIBRATION.md §4.
+ * 2nd-generation catalog (LSM6DSV accel+gyro, LIS2DW12, LIS2MDL). Common frame
+ * +X=strap, +Y=out of face, +Z=toward hand. LSM6DSV / LIS2DW12 are proper
+ * rotations (det +1); the LIS2MDL frame is left-handed (det −1, a reflection).
+ *
+ * The LIS2DW12 matrix comes from the ST datasheet axis figures + the SR68-10
+ * pin-1 placement. LSM6DSV and LIS2MDL were derived the same way originally but
+ * that derivation did not survive measurement — they carry the empirically
+ * validated values instead (an SR61-5 recording cross-checked against a
+ * Shimmer3R logging the same motion; ASM_PC_00005 Test_063). One matrix per
+ * sensor covers every gen-2 board.
+ *
+ * Byte-for-byte in sync with the firmware seed (asm_calibration.c) and
+ * VERISENSE_CALIBRATION.md §4 — verified as of the format v2 bump.
  */
 const CALIBRATION_SENSORS_GEN2 = [
     {
@@ -18693,6 +19035,7 @@ exports.INFOMEM_SAMPLING_CLOCK_FREQ = INFOMEM_SAMPLING_CLOCK_FREQ;
 exports.INFOMEM_SIZE = INFOMEM_SIZE;
 exports.INFOMEM_VALIDITY_BYTES = INFOMEM_VALIDITY_BYTES;
 exports.LoopbackTransport = LoopbackTransport;
+exports.NEED_MORE = NEED_MORE$1;
 exports.NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS;
 exports.NORDIC_DFU_BUTTONLESS_WITH_BONDS = NORDIC_DFU_BUTTONLESS_WITH_BONDS;
 exports.NORDIC_DFU_OP_ENTER_BOOTLOADER = NORDIC_DFU_OP_ENTER_BOOTLOADER;
@@ -18705,6 +19048,7 @@ exports.OP_IDX = OP_IDX;
 exports.ObjectCluster = ObjectCluster;
 exports.PACKET_OVERHEAD_RESPONSE_DATA = PACKET_OVERHEAD_RESPONSE_DATA;
 exports.PACKET_OVERHEAD_RESPONSE_OTHER = PACKET_OVERHEAD_RESPONSE_OTHER;
+exports.RESYNC = RESYNC$1;
 exports.RtcDriftMonitor = RtcDriftMonitor;
 exports.SC_CALIB_FORMAT_VERSION = SC_CALIB_FORMAT_VERSION;
 exports.SC_CAL_QUALITY_MASK = SC_CAL_QUALITY_MASK;
@@ -18735,6 +19079,9 @@ exports.SERIAL_DFU_OBJECT_TYPE = SERIAL_DFU_OBJECT_TYPE;
 exports.SERIAL_DFU_OP = SERIAL_DFU_OP;
 exports.SERIAL_DFU_RESULT_NAMES = SERIAL_DFU_RESULT_NAMES;
 exports.SHIMMER3R_DEFAULTS = SHIMMER3R_DEFAULTS;
+exports.SHIMMER3R_INQ_CHANNELS_OFFSET = SHIMMER3R_INQ_CHANNELS_OFFSET;
+exports.SHIMMER3R_INQ_NUM_CHANNELS_OFFSET = SHIMMER3R_INQ_NUM_CHANNELS_OFFSET;
+exports.SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS = SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS;
 exports.SHIMMER3_ACK = ACK;
 exports.SHIMMER3_DEFAULTS = SHIMMER3_DEFAULTS;
 exports.SHIMMER3_INQ_CHANNELS_OFFSET = SHIMMER3_INQ_CHANNELS_OFFSET;
@@ -18812,8 +19159,8 @@ exports.VERISENSE_USB_DFU_VID = VERISENSE_USB_DFU_VID;
 exports.VerisenseBleDevice = VerisenseBleDevice;
 exports.VerisenseSerialDfu = VerisenseSerialDfu;
 exports.WIRED_DEFAULTS = WIRED_DEFAULTS;
-exports.WIRED_NEED_MORE = NEED_MORE$1;
-exports.WIRED_RESYNC = RESYNC$1;
+exports.WIRED_NEED_MORE = NEED_MORE$2;
+exports.WIRED_RESYNC = RESYNC$2;
 exports.WebBluetoothTransport = WebBluetoothTransport;
 exports.WebSerialTransport = WebSerialTransport;
 exports.WiredShimmerClient = WiredShimmerClient;
@@ -18989,6 +19336,7 @@ exports.resolveInfoMemLayout = resolveInfoMemLayout;
 exports.resolveVerisenseSensorRateFieldKey = resolveVerisenseSensorRateFieldKey;
 exports.runVerisenseDfuUpdate = runVerisenseDfuUpdate;
 exports.sdCrc16 = sdCrc16;
+exports.sdMessageSpan = sdMessageSpan;
 exports.sdStatusToString = sdStatusToString;
 exports.sdXferStatusToString = sdXferStatusToString;
 exports.serializeCalibrationBlob = serializeCalibrationBlob;
@@ -18996,6 +19344,7 @@ exports.setVerisenseDfuModeWithRetry = setVerisenseDfuModeWithRetry;
 exports.setVerisenseOperationalBitRange = setVerisenseOperationalBitRange;
 exports.shimmer3ControlMessageLength = shimmer3ControlMessageLength;
 exports.shimmer3UsesThreeByteTimestamp = shimmer3UsesThreeByteTimestamp;
+exports.shimmer3rControlMessageLength = shimmer3rControlMessageLength;
 exports.shimmerUartCrcByte = shimmerUartCrcByte;
 exports.shimmerUartCrcCalc = shimmerUartCrcCalc;
 exports.shimmerUartCrcCheck = shimmerUartCrcCheck;

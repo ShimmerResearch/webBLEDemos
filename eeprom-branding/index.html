@@ -230,17 +230,32 @@
         the device's Bluetooth Classic, BLE and USB names. Firmware seeds the
         record with the stock defaults on first boot and uses it as the single
         source of truth afterwards, so what you see below is what the device
-        actually advertises. Works over
-        <b>USB / dock serial</b> (Shimmer3 in a base, Shimmer3R directly over
-        USB-C) and over <b>BLE</b> (Shimmer3R only — the browser cannot reach a
-        Shimmer3 over Bluetooth). Requires firmware with DEV-949 brand-record
-        support.
+        actually advertises. Three ways in:
+      </p>
+      <ul class="sub">
+        <li>
+          <b>USB / dock serial</b> — Shimmer3 in a base, Shimmer3R directly over
+          USB-C.
+        </li>
+        <li><b>BLE</b> — Shimmer3R only; a Shimmer3 has no BLE radio.</li>
+        <li>
+          <b>Classic Bluetooth</b> — pair the sensor with this PC first
+          (Windows Settings → Bluetooth, PIN <code>1234</code>). Windows then
+          exposes it as a COM port, which this page opens with Web Serial. Works
+          for Shimmer3 <i>and</i> Shimmer3R, with no dock and no cable.
+        </li>
+      </ul>
+      <p class="sub">
+        Requires firmware with brand-record support.
       </p>
 
       <div class="card">
         <div class="row">
           <button id="btnBle" class="primary">Connect BLE (Shimmer3R)</button>
           <button id="btnSerial">Connect USB / dock</button>
+          <button id="btnBtClassic" title="Requires the sensor to be paired with this PC over classic Bluetooth">
+            Connect Bluetooth (paired COM port)
+          </button>
           <button id="btnDisconnect" disabled>Disconnect</button>
           <span id="connPill" class="pill">disconnected</span>
           <span id="devInfo" class="note"></span>
@@ -424,8 +439,10 @@
       import * as sdkNs from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
       import {
         Shimmer3RClient,
+        Shimmer3Client,
         WiredShimmerClient,
         WebSerialTransport,
+        SHIMMER3_SPP_UUID,
         parseBrandRecord,
         buildBrandRecord,
         buildBlankBrandRecord,
@@ -451,6 +468,7 @@
       const els = {
         serial: $("btnSerial"),
         ble: $("btnBle"),
+        btClassic: $("btnBtClassic"),
         disc: $("btnDisconnect"),
         read: $("btnRead"),
         write: $("btnWrite"),
@@ -486,8 +504,8 @@
         errUsbManufacturer: $("errUsbManufacturer"),
       };
 
-      let client = null; // Shimmer3RClient | WiredShimmerClient
-      let mode = null; // 'ble' | 'serial'
+      let client = null; // Shimmer3RClient | WiredShimmerClient | Shimmer3Client
+      let mode = null; // 'ble' | 'serial' | 'btclassic'
       let hwVersion = null; // 3 | 10 | null (unknown)
       let macSuffix = "XXXX";
 
@@ -502,6 +520,7 @@
         els.pill.classList.toggle("on", on);
         els.serial.disabled = on;
         els.ble.disabled = on;
+        els.btClassic.disabled = on;
         els.disc.disabled = !on;
         els.read.disabled = !on;
         refreshForm();
@@ -517,12 +536,13 @@
         refreshForm();
       }
 
-      /* Soft reboot is a Bluetooth command (SET_FEATURE), so it is only
-       * available on the BLE/BT client - the dock UART protocol has no
-       * equivalent property. */
+      /* Soft reboot is a Bluetooth command (SET_FEATURE), so it is available on
+       * either Bluetooth link - BLE or classic - but not over the dock UART
+       * protocol, which has no equivalent property. */
       function canSoftReboot() {
         return (
-          mode === "ble" && typeof client?.setRebootOnDisconnect === "function"
+          (mode === "ble" || mode === "btclassic") &&
+          typeof client?.setRebootOnDisconnect === "function"
         );
       }
 
@@ -769,6 +789,60 @@
         }
       };
 
+      /* Classic Bluetooth. Pairing a Shimmer over classic BT makes Windows (and
+       * macOS) expose it as a virtual COM port, and Web Serial can open that —
+       * so the RFCOMM/SPP link Chrome cannot reach directly is reachable after
+       * all. Shimmer3Client is the right client for it: same LiteProtocol as
+       * BLE, but with the byte-stream parser an unframed link needs, and its
+       * connect handshake reports the hardware version, so this path works for
+       * a Shimmer3 and a Shimmer3R alike. */
+      els.btClassic.onclick = async () => {
+        try {
+          hideRebootBanner();
+          const c = new Shimmer3Client({
+            transport: new WebSerialTransport({
+              /* Chrome hides Bluetooth serial ports from the picker unless the
+               * origin names their service class. Harmless on Windows, where
+               * they are ordinary COM ports and show up regardless. */
+              allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
+              kind: "rfcomm",
+            }),
+          });
+          c.onStatus = (m) => log(m);
+          await c.connect();
+          client = c;
+          mode = "btclassic";
+          hwVersion = c.deviceVersion?.hardwareVersion ?? null;
+          const fw = c.firmwareVersion;
+          const fwStr = fw
+            ? `v${fw.major}.${String(fw.minor).padStart(2, "0")}.${String(
+                fw.internal,
+              ).padStart(3, "0")}`
+            : "unknown";
+          els.devInfo.textContent = `HW ${hwVersion ?? "?"} (${deviceLabelForHw()}) · FW ${fwStr} · classic Bluetooth`;
+          els.curDev.textContent = deviceLabelForHw();
+          /* The MAC is not on this link: it lives in InfoMem, which this client
+           * cannot read yet (the page-addressing mode is firmware-dependent).
+           * Say so rather than showing a suffix that is really a placeholder. */
+          els.curMac.textContent = "not read over classic BT";
+          setConnected(true, `BT classic · ${deviceLabelForHw()}`);
+          log(
+            `connected over classic Bluetooth (${deviceLabelForHw()}, FW ${fwStr})`,
+          );
+          log(
+            'name previews below show "XXXX" for the MAC suffix — the device still appends its real one',
+          );
+          await readAndShow().catch((e) =>
+            log(`record read failed: ${readFailureHint(e)}`),
+          );
+        } catch (e) {
+          log(`classic Bluetooth connect failed: ${e.message}`);
+          log(
+            "check the sensor is paired with this PC, powered, and not held open by another app (e.g. Consensys)",
+          );
+        }
+      };
+
       els.ble.onclick = async () => {
         try {
           hideRebootBanner();
@@ -918,7 +992,7 @@
 
       function readFailureHint(e) {
         if (/response truncated/i.test(e.message)) {
-          return `${e.message} — BLE link dropped mid-response; retry, and check the sensor is in range`;
+          return `${e.message} — the link dropped mid-response; retry, and check the sensor is in range`;
         }
         if (/returned \d+ of \d+ bytes/.test(e.message)) {
           /* Pre-0.1.12 SDK wording: the vendored bundle predates BLE reassembly */
