@@ -1342,6 +1342,9 @@ declare const SD_STATUS: {
     readonly SD_UNAVAILABLE: 240;
     readonly BUSY: 241;
     readonly BAD_ARGS: 242;
+    /** Host-side only, never on the wire: the connected firmware's version is
+     * below the transfer gate (see Shimmer3RClient.supportsSdTransfer). */
+    readonly UNSUPPORTED_FW: 255;
 };
 /** Codes carried in SD_FILE_STATUS_RESPONSE frames. */
 declare const SD_XFER: {
@@ -1869,6 +1872,16 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _sdAcquire;
     private _sdRelease;
     private _sdChunkHandler;
+    /**
+     * Enforce the {@link supportsSdTransfer} gate on every SD entry point, so a
+     * caller that skips the advisory check cannot pull silently-corrupted data
+     * off a v1.01.009/.010 device. Must complete BEFORE the synchronous
+     * single-slot checks (`_sdExpect`, `_sdFrameListener`): those are
+     * check-then-set atomically only while no await sits between them.
+     * (The first call costs one GET_FW_VERSION round trip; readFwVersion
+     * caches it for the rest of the connection.)
+     */
+    private _ensureSdTransferSupported;
     /** Send an SD command and await its reassembled one-shot response. */
     private _sdCommand;
     /**
@@ -1888,7 +1901,10 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * permits paths strictly under `data/`.
      */
     sdDeletePath(path: string): Promise<void>;
-    /** Ask the firmware to abandon the in-flight read window, if any. */
+    /** Ask the firmware to abandon the in-flight read window, if any.
+     * Deliberately NOT gated on {@link supportsSdTransfer}: it runs in cleanup
+     * paths (abort signals, disconnects) where an extra version probe could
+     * fail, and old firmware just ignores the unknown opcode. */
     sdAbortTransfer(): Promise<void>;
     /**
      * Read one window of a file. The firmware streams the window as CRC'd
