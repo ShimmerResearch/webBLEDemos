@@ -11,7 +11,7 @@
      *
      * Kept in sync with package.json by tests/core/version.test.ts.
      */
-    const SDK_VERSION = '0.1.15';
+    const SDK_VERSION = '0.1.16';
 
     /**
      * Container for a single decoded sensor frame.
@@ -2137,25 +2137,16 @@
     }
 
     /**
-     * Reading a protocol off an unframed pipe: the sentinels every framer returns,
-     * and the drain loop that turns a framer into message boundaries.
+     * Sentinels shared by the byte-stream (unframed transport) message framers.
      *
-     * A **framer** is a pure function `(buf) => number` reporting how many bytes the
-     * message at the head of `buf` occupies — the length knowledge the Java driver
-     * encodes in its blocking `readBytes(n)` calls, expressed as a function. Each
-     * device family owns its own (`shimmer3ControlMessageLength`,
-     * `shimmer3rControlMessageLength`, the dock's `wiredPacketLength`), because that
-     * part genuinely differs per protocol.
-     *
-     * The **drain** ({@link drainByteStream}) is the part that does not differ, so it
-     * lives here once: accumulate, extract every complete message, resynchronise
-     * past what cannot be framed, hand back the tail. `Shimmer3Client` and
-     * `Shimmer3RClient` both run on it, differing only in their framer and in two
-     * small hooks ({@link DrainOptions.inspect}, {@link DrainOptions.coalesce}).
+     * A framer is a pure function `(buf) => number` that reports how many bytes the
+     * message at the head of `buf` occupies, so a client reading from an unframed
+     * pipe (Web Serial, RFCOMM/SPP, a dock UART) can rebuild the message boundaries
+     * that BLE notifications hand it for free.
      *
      * `src/devices/shimmer3/protocol.ts` and `src/devices/dock/protocol.ts` each
-     * predate this module and export their own identically-valued sentinel copies;
-     * they are public API and are left alone. New framers should import from here.
+     * predate this module and export their own identically-valued copies; they are
+     * public API and are left alone. New framers should import from here.
      */
     /** Not enough bytes buffered yet to determine the message length. */
     const NEED_MORE$1 = -1;
@@ -2164,101 +2155,14 @@
      * should drop one byte and retry (resynchronise) rather than guess a length.
      */
     const RESYNC$1 = 0;
-    /**
-     * Rebuild message boundaries from an unframed byte stream.
-     *
-     * The shared half of what a client reading from Web Serial, RFCOMM/SPP or a dock
-     * UART has to do: accumulate, extract every complete message the framer can
-     * size, drop what cannot be framed one byte at a time (never guessing a length),
-     * and hand back the incomplete tail. Pure — no client state is touched — so the
-     * awkward cases are unit-testable without a transport.
-     *
-     * Byte-at-a-time resynchronisation is the deliberate choice over flushing the
-     * buffer on garbage: a corrupt byte then costs one byte, not every valid message
-     * queued behind it.
-     *
-     * Pass {@link DrainOptions.onMessage} to have each message dispatched as it is
-     * extracted. That ordering matters whenever `inspect` or `coalesce` consult state
-     * a handler mutates synchronously — see that option's note.
-     */
-    function drainByteStream(buf, opts) {
-        const { messageLength, decode, inspect, coalesce, onMessage, onDrop } = opts;
-        const messages = [];
-        const deliver = (m) => {
-            if (onMessage)
-                onMessage(m);
-            else
-                messages.push(m);
-        };
-        let rest = buf;
-        let stopped = false;
-        for (;;) {
-            if (rest.length === 0)
-                break;
-            if (inspect) {
-                const verdict = inspect(rest);
-                if (verdict === 'stop') {
-                    stopped = true;
-                    break;
-                }
-                if (verdict === 'drop') {
-                    onDrop?.(rest[0], 'gated');
-                    rest = rest.subarray(1);
-                    continue;
-                }
-            }
-            const len = messageLength(rest);
-            if (len === NEED_MORE$1)
-                break;
-            if (len === RESYNC$1) {
-                onDrop?.(rest[0], 'resync');
-                rest = rest.subarray(1);
-                continue;
-            }
-            // Defensive: a framer should report NEED_MORE rather than a length it cannot
-            // yet cover, but never slice past the end of the buffer if one does.
-            if (rest.length < len)
-                break;
-            // Nothing is consumed until the disposition is known, so a message `decode`
-            // refuses can still resync by one byte from where it started.
-            let payload = new Uint8Array(rest.subarray(0, len));
-            let consumed = len;
-            const extra = coalesce ? coalesce(payload, rest.subarray(len)) : 0;
-            if (extra > 0 && extra <= rest.length - len) {
-                const merged = new Uint8Array(len + extra);
-                merged.set(payload, 0);
-                merged.set(rest.subarray(len, len + extra), len);
-                payload = merged;
-                consumed = len + extra;
-            }
-            if (decode) {
-                const decoded = decode(payload);
-                if (decoded === null) {
-                    onDrop?.(rest[0], 'rejected');
-                    rest = rest.subarray(1);
-                    continue;
-                }
-                deliver(decoded);
-            }
-            else {
-                // No decode: T is its default, Uint8Array. The cast is the price of one
-                // signature serving both the raw and the decoded case.
-                deliver(payload);
-            }
-            rest = rest.subarray(consumed);
-        }
-        return {
-            messages,
-            rest: rest.length ? new Uint8Array(rest) : new Uint8Array(0),
-            stopped,
-        };
-    }
 
     /**
      * Wire protocol for Shimmer3R SD-card file transfer over BLE.
      *
      * Mirrors the firmware implementation in
-     * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.009).
+     * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.011;
+     * v1.01.009/.010 speak the protocol but corrupt every block — see
+     * Shimmer3RClient.supportsSdTransfer).
      *
      * Command/response shapes (all multi-byte fields little-endian):
      *
@@ -3751,35 +3655,12 @@
                     }
                 }
             };
-            /**
-             * Merge a bare ACK with the message that follows it, emulating BLE: the module
-             * packs an ACK and the response the firmware wrote straight after it into ONE
-             * notification, and the waiters rely on that — `_waitForAck` hands the
-             * remainder over synchronously via `_lastAckRemainder`. Emitted as two
-             * separate messages, the response would arrive before the caller's `await`
-             * continuation had registered its response handler, and be dropped.
-             *
-             * Two ACKs are never merged: the second would masquerade as the first's
-             * response body.
-             */
-            this._coalesceAckWithResponse = (msg, rest) => {
-                if (msg.length !== 1 || msg[0] !== OPCODES.ACK_COMMAND_PROCESSED)
-                    return 0;
-                if (this._expectingAck <= 0)
-                    return 0;
-                if (rest.length === 0 || rest[0] === OPCODES.ACK_COMMAND_PROCESSED)
-                    return 0;
-                const nextLen = shimmer3rControlMessageLength(rest);
-                if (nextLen === NEED_MORE$1 || nextLen === RESYNC$1 || rest.length < nextLen)
-                    return 0;
-                return nextLen;
-            };
             // ---------------------------------------------------------------------------
             // Firmware version (feature gating)
             // ---------------------------------------------------------------------------
             this._fwVersionCache = null;
             // ---------------------------------------------------------------------------
-            // SD-card file transfer (FW >= v1.01.009)
+            // SD-card file transfer (FW >= v1.01.011; see supportsSdTransfer)
             //
             // A dedicated, self-resynchronising RX pipeline: while any SD operation is
             // active, a persistent temp handler accumulates notification chunks and
@@ -3941,28 +3822,63 @@
                 return;
             }
             this._ctrlBuf = concatU8(this._ctrlBuf, chunk);
-            /* Dispatch as extracted, not in a batch afterwards: _coalesceAckWithResponse
-             * reads `_expectingAck`, which _handleFramedChunk decrements synchronously
-             * when it consumes an ACK. Batching would evaluate the coalescing decision
-             * for a second ACK+response pair in the same read against a stale count. */
-            const { rest, stopped } = drainByteStream(this._ctrlBuf, {
-                messageLength: shimmer3rControlMessageLength,
-                onMessage: (msg) => this._handleFramedChunk(msg),
+            for (const msg of this._extractUnframedMessages())
+                this._handleFramedChunk(msg);
+        }
+        /**
+         * Pull every complete message out of {@link _ctrlBuf}, leaving the incomplete
+         * tail behind. Extraction is finished before anything is dispatched so a
+         * handler can never observe a half-updated buffer.
+         */
+        _extractUnframedMessages() {
+            const out = [];
+            let buf = this._ctrlBuf;
+            for (;;) {
+                if (buf.length === 0)
+                    break;
                 // DATA_PACKET belongs to the stream plane even before `_streaming` is set
                 // (the window between START_STREAMING and its ACK). Its length comes from
                 // the schema, so stop framing and let the stream parser own the rest.
-                inspect: (buf) => (buf[0] === OPCODES.DATA_PACKET ? 'stop' : 'frame'),
-                coalesce: this._coalesceAckWithResponse,
-                onDrop: (byte) => this._log(`serial resync: dropping unframeable byte 0x${byte.toString(16)}`),
-            });
-            if (stopped) {
-                this._ctrlBuf = new Uint8Array(0);
-                this._rxBuf = concatU8(this._rxBuf, rest);
-                this._parseStreamIfPossible();
+                if (buf[0] === OPCODES.DATA_PACKET) {
+                    this._rxBuf = concatU8(this._rxBuf, buf);
+                    buf = new Uint8Array(0);
+                    this._parseStreamIfPossible();
+                    break;
+                }
+                const len = shimmer3rControlMessageLength(buf);
+                if (len === NEED_MORE$1)
+                    break;
+                if (len === RESYNC$1) {
+                    this._log(`serial resync: dropping unframeable byte 0x${buf[0].toString(16)}`);
+                    buf = buf.subarray(1);
+                    continue;
+                }
+                if (buf.length < len)
+                    break; // defensive: framer should have said NEED_MORE
+                const msg = new Uint8Array(buf.subarray(0, len));
+                buf = buf.subarray(len);
+                // Emulate BLE's coalescing: the module packs an ACK and the response the
+                // firmware wrote straight after it into ONE notification, and the waiters
+                // rely on that — `_waitForAck` hands the remainder over synchronously via
+                // `_lastAckRemainder`. Emitted as two separate messages, the response
+                // would arrive before the caller's `await` continuation had registered its
+                // response handler, and be dropped. Two ACKs are never merged: the second
+                // would masquerade as the first's response body.
+                if (msg.length === 1 && msg[0] === OPCODES.ACK_COMMAND_PROCESSED && this._expectingAck > 0) {
+                    const nextLen = shimmer3rControlMessageLength(buf);
+                    if (nextLen !== NEED_MORE$1 &&
+                        nextLen !== RESYNC$1 &&
+                        buf.length >= nextLen &&
+                        buf[0] !== OPCODES.ACK_COMMAND_PROCESSED) {
+                        out.push(concatU8(msg, buf.subarray(0, nextLen)));
+                        buf = buf.subarray(nextLen);
+                        continue;
+                    }
+                }
+                out.push(msg);
             }
-            else {
-                this._ctrlBuf = rest;
-            }
+            this._ctrlBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
+            return out;
         }
         /** Run the schema parser if one has been built, swallowing parse errors. */
         _parseStreamIfPossible() {
@@ -4940,13 +4856,19 @@
         }
         /**
          * True when the connected firmware serves the SD file-transfer commands
-         * (LogAndStream_Shimmer3R >= v1.01.009). Older firmware silently ignores
-         * unknown opcodes, so version gating is the only reliable probe.
+         * AND transfers them intact (LogAndStream_Shimmer3R >= v1.01.011).
+         * v1.01.009 and v1.01.010 implement the protocol but ship every 512-byte
+         * block shifted 3 bytes with a zero-padded tail — the firmware's sector DMA
+         * landed below the misaligned payload buffer and the frame CRC was computed
+         * after the fact, so the corruption arrives as valid frames the host cannot
+         * detect. Those versions are therefore gated out. Firmware older than that
+         * silently ignores unknown opcodes, so version gating is the only reliable
+         * probe.
          */
         async supportsSdTransfer() {
             try {
                 const v = await this.readFwVersion();
-                return v.major * 1000000 + v.minor * 1000 + v.patch >= 1001009;
+                return v.major * 1000000 + v.minor * 1000 + v.patch >= 1001011;
             }
             catch {
                 return false;
@@ -7693,49 +7615,51 @@
          * ACK/response machinery below.
          */
         _drainControl() {
-            /* Dispatch each message as it is extracted, NOT in a batch afterwards: the
-             * `_awaitInq`/`_awaitCmd` gates in _inspectControlHead are decremented
-             * synchronously inside the waiter handlers that _emitTemp invokes. Draining
-             * first and emitting later would inspect every head byte against the gate
-             * state as it was before any response was delivered, so a stray 0x02 sharing
-             * a read with a genuine INQUIRY_RESPONSE would still look awaited and get
-             * framed - swallowing the ACK behind it. */
-            const { rest } = drainByteStream(this._rxBuf, {
-                messageLength: shimmer3ControlMessageLength,
-                inspect: (buf) => this._inspectControlHead(buf),
-                onMessage: (msg) => this._emitTemp(msg),
-                onDrop: (byte, reason) => this._log(reason === 'resync'
-                    ? `resync: dropping unexpected control byte 0x${byte.toString(16)}`
-                    : `drainControl: dropping gated byte 0x${byte.toString(16)}`),
-            });
-            this._rxBuf = rest;
-        }
-        /**
-         * Gate the head byte before framing is attempted.
-         *
-         * Three bytes are only control traffic in the right context, and framing one
-         * out of context would swallow the real control bytes behind it:
-         *
-         * - DATA_PACKET (0x00) while a stream is (about to be) live belongs to the
-         *   stream parser — stop and leave it buffered.
-         * - INQUIRY_RESPONSE (0x02) with no inquiry outstanding is a stray/stream
-         *   byte; framing it would consume `9 + numChannels` bytes of garbage.
-         * - NACK (0xFE) with no command outstanding is likewise dropped. This diverges
-         *   from the Java driver (ShimmerObject processes every 0xFE unconditionally)
-         *   but strictly reduces the risk of a leaked stream byte being read as a NACK.
-         *   Defence-in-depth: `_onTemp` handlers are only added while `_awaitCmd > 0`,
-         *   so an ungated stray 0xFE would emit to no listener anyway — this keeps that
-         *   invariant explicit and survives refactors that add a longer-lived listener.
-         */
-        _inspectControlHead(buf) {
-            const head = buf[0];
-            if ((this._streaming || this._streamStarting) && head === OPCODES.DATA_PACKET)
-                return 'stop';
-            if (head === OPCODES.INQUIRY_RESPONSE && this._awaitInq <= 0)
-                return 'drop';
-            if (head === NACK && this._awaitCmd <= 0)
-                return 'drop';
-            return 'frame';
+            let buf = this._rxBuf;
+            for (;;) {
+                if (buf.length === 0)
+                    break;
+                // While a stream is (about to be) live, DATA_PACKET (0x00) bytes belong to
+                // the stream parser, not the control plane — leave them buffered.
+                if ((this._streaming || this._streamStarting) && buf[0] === OPCODES.DATA_PACKET)
+                    break;
+                // Only frame 0x02 as an INQUIRY_RESPONSE when an inquiry is actually
+                // awaited; an unexpected 0x02 is a stray/stream byte and framing it would
+                // swallow real control bytes. Drop it instead.
+                if (buf[0] === OPCODES.INQUIRY_RESPONSE && this._awaitInq <= 0) {
+                    this._log('drainControl: dropping 0x02 — no INQUIRY awaited');
+                    buf = buf.subarray(1);
+                    continue;
+                }
+                // Same guard for NACK (0xFE): only frame it as a control message while a
+                // command is genuinely awaiting a response (_awaitCmd > 0). A stray 0xFE —
+                // e.g. a late residual byte arriving after the stop-drain returned early —
+                // is dropped instead of framed. This diverges from the Java driver
+                // (ShimmerObject processes every 0xFE unconditionally) but strictly reduces
+                // the risk of a leaked stream byte being mistaken for a NACK, mirroring the
+                // 0x02 gate above. Defence-in-depth: today _onTemp handlers are added only
+                // while _awaitCmd > 0, so an ungated stray 0xFE would emit to no listener;
+                // this guard keeps that invariant explicit and survives refactors that add
+                // a longer-lived control listener.
+                if (buf[0] === NACK && this._awaitCmd <= 0) {
+                    this._log('drainControl: dropping 0xFE — no command awaited');
+                    buf = buf.subarray(1);
+                    continue;
+                }
+                const len = shimmer3ControlMessageLength(buf);
+                if (len === NEED_MORE)
+                    break;
+                if (len === RESYNC) {
+                    this._log(`resync: dropping unexpected control byte 0x${buf[0].toString(16)}`);
+                    buf = buf.subarray(1);
+                    continue;
+                }
+                if (buf.length < len)
+                    break; // full message not here yet
+                this._emitTemp(new Uint8Array(buf.subarray(0, len)));
+                buf = buf.subarray(len);
+            }
+            this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
         }
         // ---------------------------------------------------------------------------
         // Configuration commands
@@ -9314,35 +9238,42 @@
         }
         /**
          * Extract every complete packet currently buffered and dispatch each to the
-         * temp handlers, keeping the incomplete tail for the next chunk.
-         *
-         * Runs on the shared {@link drainByteStream} loop, decoding straight to
-         * {@link UartRxPacket} so the temp handlers receive parsed packets. A packet
-         * that frames but fails its CRC (or will not parse) is refused, and the drain
-         * resyncs by ONE byte rather than skipping the whole supposed length —
-         * matching the Java `parseSinglePacket` CRC-fail path, on the reasoning that a
-         * bad CRC means the framing itself was probably wrong.
+         * temp handlers, keeping the incomplete tail for the next chunk. A packet
+         * whose CRC fails is dropped one byte at a time to resync (matching the Java
+         * `parseSinglePacket` CRC-fail path).
          */
         _drain() {
-            const { messages, rest } = drainByteStream(this._rxBuf, {
-                messageLength: wiredPacketLength,
-                decode: (msg) => {
-                    let pkt;
-                    try {
-                        pkt = parseUartPacket(msg);
-                    }
-                    catch {
-                        return null; // malformed
-                    }
-                    return pkt.crcOk ? pkt : null;
-                },
-                onDrop: (byte, reason) => this._log(reason === 'rejected'
-                    ? 'bad CRC or malformed packet → dropping 1 byte to resync'
-                    : `resync: dropping byte 0x${byte.toString(16)}`),
-            });
-            this._rxBuf = rest;
-            for (const pkt of messages)
+            let buf = this._rxBuf;
+            for (;;) {
+                if (buf.length === 0)
+                    break;
+                const len = wiredPacketLength(buf);
+                if (len === NEED_MORE$2)
+                    break;
+                if (len === RESYNC$2) {
+                    this._log(`resync: dropping byte 0x${buf[0].toString(16)}`);
+                    buf = buf.subarray(1);
+                    continue;
+                }
+                if (buf.length < len)
+                    break; // full packet not here yet
+                let pkt;
+                try {
+                    pkt = parseUartPacket(buf);
+                }
+                catch {
+                    buf = buf.subarray(1); // malformed — resync
+                    continue;
+                }
+                if (!pkt.crcOk) {
+                    this._log('bad CRC → dropping 1 byte to resync');
+                    buf = buf.subarray(1);
+                    continue;
+                }
                 this._emitTemp(pkt);
+                buf = buf.subarray(pkt.length);
+            }
+            this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
         }
         _onTemp(fn) {
             this._temps.add(fn);
@@ -19404,7 +19335,6 @@
     exports.describeVerisenseChargerStatus = describeVerisenseChargerStatus;
     exports.deviceWriteDivergentRanges = deviceWriteDivergentRanges;
     exports.downloadSdTree = downloadSdTree;
-    exports.drainByteStream = drainByteStream;
     exports.encodeSdPath = encodeSdPath;
     exports.enforceVerisenseCommsChannelInterlock = enforceVerisenseCommsChannelInterlock;
     exports.ensureDirectoryPath = ensureDirectoryPath;
