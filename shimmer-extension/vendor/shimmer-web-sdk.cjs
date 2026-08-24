@@ -113,17 +113,20 @@ class BaseShimmerClient {
  *
  * The split this module insists on:
  *
- * - **Gate on capability.** `webSerial` / `webBluetooth` are `in navigator`
- *   checks. A missing API is a fact.
+ * - **Gate on capability.** `webSerial` / `webBluetooth` report whether the API's
+ *   entry point is *callable* — stricter than `'serial' in navigator`, because a
+ *   property that is `null`, a non-object, or an object without the entry point
+ *   satisfies `in` and still throws the moment anything uses it. Whether calling
+ *   would throw is a fact, and that is what a control's enabled state may rest on.
  * - **Message on platform.** `isAndroid` / `isIOS` come from the user-agent, and
  *   are used only to choose which words to show. A UA string is a guess, and
  *   guesses must never decide what a user is allowed to click.
  *
  * The awkward case that shaped the API is Android. Chrome 138+ implements Web
  * Serial there, but deliberately only for Bluetooth RFCOMM port emulation —
- * wired ports are a separate feature still rolling out. So `'serial' in
- * navigator` is `true` while the dock is unreachable, and no amount of feature
- * detection can tell the two apart. That is why {@link transportAvailability}
+ * wired ports are a separate feature still rolling out. So Web Serial is fully
+ * present and usable there — `webSerial` is `true`, correctly — while the dock is
+ * still unreachable, and no amount of feature detection can tell the two apart. That is why {@link transportAvailability}
  * returns three states rather than a boolean: `'unlikely'` is the honest answer
  * for a wired port on Android, and it maps to "leave the button enabled and warn"
  * rather than "disable", so devices that do gain wired support are not locked out.
@@ -145,11 +148,13 @@ function readNavigator(nav) {
 /**
  * Whether an API entry point is actually callable.
  *
- * Deliberately stricter than "the property exists". A `navigator.bluetooth` that
- * is `null`, or an object without `requestDevice`, satisfies `'bluetooth' in
- * navigator` while still throwing a synchronous TypeError the moment anything
- * calls it — so treating the property's presence as the capability hands callers
- * a flag they cannot safely gate on, which is the entire job of these fields.
+ * Deliberately stricter than "the property exists". `null`, `undefined`, a
+ * non-object, an object lacking the method, and a method that is not a function
+ * all satisfy `'bluetooth' in navigator` while still throwing a synchronous
+ * TypeError the moment anything calls them — so treating the property's presence
+ * as the capability hands callers a flag they cannot safely gate on, which is the
+ * entire job of these fields. The optional chain covers null/undefined and the
+ * typeof covers the rest.
  * Reported as unavailable instead: an API that cannot be called is, for every
  * purpose here, absent.
  */
