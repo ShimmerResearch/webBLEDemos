@@ -11,7 +11,7 @@
      *
      * Kept in sync with package.json by tests/core/version.test.ts.
      */
-    const SDK_VERSION = '0.1.17';
+    const SDK_VERSION = '0.1.18';
 
     /**
      * Container for a single decoded sensor frame.
