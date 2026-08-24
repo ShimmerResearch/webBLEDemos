@@ -2322,7 +2322,9 @@
      * Wire protocol for Shimmer3R SD-card file transfer over BLE.
      *
      * Mirrors the firmware implementation in
-     * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.009).
+     * `log-and-stream-common/Comms/shimmer_sd_file_transfer.{c,h}` (FW >= v1.01.011;
+     * v1.01.009/.010 speak the protocol but corrupt every block — see
+     * Shimmer3RClient.supportsSdTransfer).
      *
      * Command/response shapes (all multi-byte fields little-endian):
      *
@@ -2365,6 +2367,9 @@
         SD_UNAVAILABLE: 0xf0,
         BUSY: 0xf1,
         BAD_ARGS: 0xf2,
+        /** Host-side only, never on the wire: the connected firmware's version is
+         * below the transfer gate (see Shimmer3RClient.supportsSdTransfer). */
+        UNSUPPORTED_FW: 0xff,
     };
     /** Codes carried in SD_FILE_STATUS_RESPONSE frames. */
     const SD_XFER = {
@@ -2406,6 +2411,8 @@
                 return 'device busy (sensing/logging/streaming)';
             case SD_STATUS.BAD_ARGS:
                 return 'bad arguments';
+            case SD_STATUS.UNSUPPORTED_FW:
+                return 'firmware too old for SD file transfer (update required)';
             default:
                 return `FatFs error ${status}`;
         }
@@ -3820,7 +3827,7 @@
             // ---------------------------------------------------------------------------
             this._fwVersionCache = null;
             // ---------------------------------------------------------------------------
-            // SD-card file transfer (FW >= v1.01.009)
+            // SD-card file transfer (FW >= v1.01.011; see supportsSdTransfer)
             //
             // A dedicated, self-resynchronising RX pipeline: while any SD operation is
             // active, a persistent temp handler accumulates notification chunks and
@@ -5016,13 +5023,19 @@
         }
         /**
          * True when the connected firmware serves the SD file-transfer commands
-         * (LogAndStream_Shimmer3R >= v1.01.009). Older firmware silently ignores
-         * unknown opcodes, so version gating is the only reliable probe.
+         * AND transfers them intact (LogAndStream_Shimmer3R >= v1.01.011).
+         * v1.01.009 and v1.01.010 implement the protocol but ship every 512-byte
+         * block shifted 3 bytes with a zero-padded tail — the firmware's sector DMA
+         * landed below the misaligned payload buffer and the frame CRC was computed
+         * after the fact, so the corruption arrives as valid frames the host cannot
+         * detect. Those versions are therefore gated out. Firmware older than that
+         * silently ignores unknown opcodes, so version gating is the only reliable
+         * probe.
          */
         async supportsSdTransfer() {
             try {
                 const v = await this.readFwVersion();
-                return v.major * 1000000 + v.minor * 1000 + v.patch >= 1001009;
+                return v.major * 1000000 + v.minor * 1000 + v.patch >= 1001011;
             }
             catch {
                 return false;
@@ -5097,6 +5110,20 @@
                 this._sdRx = new Uint8Array(0);
             }
         }
+        /**
+         * Enforce the {@link supportsSdTransfer} gate on every SD entry point, so a
+         * caller that skips the advisory check cannot pull silently-corrupted data
+         * off a v1.01.009/.010 device. Must complete BEFORE the synchronous
+         * single-slot checks (`_sdExpect`, `_sdFrameListener`): those are
+         * check-then-set atomically only while no await sits between them.
+         * (The first call costs one GET_FW_VERSION round trip; readFwVersion
+         * caches it for the rest of the connection.)
+         */
+        async _ensureSdTransferSupported() {
+            if (!(await this.supportsSdTransfer())) {
+                throw new SdTransferError('SD file transfer requires firmware v1.01.011 or later — v1.01.009/.010 corrupt transferred data', SD_STATUS.UNSUPPORTED_FW);
+            }
+        }
         /** Send an SD command and await its reassembled one-shot response. */
         async _sdCommand(cmd, rspOpcode, timeoutMs = 5000) {
             if (!this._transport)
@@ -5104,6 +5131,7 @@
             if (this._streaming) {
                 throw new SdTransferError('SD transfer is unavailable while streaming', SD_STATUS.BUSY);
             }
+            await this._ensureSdTransferSupported();
             if (this._sdExpect) {
                 // A shared expectation slot: concurrent SD commands would race on it,
                 // so refuse deterministically — callers are expected to sequence
@@ -5194,7 +5222,10 @@
                 throw new SdTransferError(`delete '${path}': ${sdStatusToString(status)}`, status);
             }
         }
-        /** Ask the firmware to abandon the in-flight read window, if any. */
+        /** Ask the firmware to abandon the in-flight read window, if any.
+         * Deliberately NOT gated on {@link supportsSdTransfer}: it runs in cleanup
+         * paths (abort signals, disconnects) where an extra version probe could
+         * fail, and old firmware just ignores the unknown opcode. */
         async sdAbortTransfer() {
             if (!this._transport)
                 return;
@@ -5213,6 +5244,7 @@
             if (this._streaming) {
                 throw new SdTransferError('SD transfer is unavailable while streaming', SD_STATUS.BUSY);
             }
+            await this._ensureSdTransferSupported();
             if (this._sdFrameListener) {
                 // The frame/CRC listeners are single-slot instance fields, so a second
                 // overlapping window would hijack the first one's frames. Refuse
