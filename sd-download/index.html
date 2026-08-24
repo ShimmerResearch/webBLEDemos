@@ -285,9 +285,11 @@
       }
 
       // Windows is the only platform where the Consensys workspace has a
-      // predictable location worth suggesting. The directory picker is
-      // Chromium-desktop only anyway, so Android never reaches this UI, and
-      // iOS browsers have no Web Bluetooth so the page cannot run there.
+      // predictable location worth suggesting. What keeps mobile out of this UI
+      // is showDirectoryPicker, which is Chromium-desktop only - not the link
+      // layer: Android Chrome has both Web Bluetooth and (for RFCOMM) Web
+      // Serial, and on iOS a bundled-stack browser like Bluefy can run this page
+      // over BLE. Either way there is no destination folder to pick.
       const IS_WINDOWS = /Windows/i.test(
         navigator.userAgentData?.platform || navigator.userAgent,
       );

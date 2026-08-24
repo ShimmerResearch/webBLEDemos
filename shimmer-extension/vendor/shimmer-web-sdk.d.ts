@@ -487,7 +487,7 @@ interface WebSerialTransportOptions {
     parity?: ParityType;
     flowControl?: FlowControlType;
     /** `requestPort` filters. */
-    filters?: SerialPortFilter[] | null;
+    filters?: readonly SerialPortFilter[] | null;
     /**
      * Service class IDs the port picker is *permitted* to surface Bluetooth
      * (RFCOMM/SPP) ports for — pass `[SHIMMER3_SPP_UUID]` to reach a Shimmer
@@ -504,7 +504,7 @@ interface WebSerialTransportOptions {
      * allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
      * ```
      */
-    allowedBluetoothServiceClassIds?: BluetoothServiceClassId[] | null;
+    allowedBluetoothServiceClassIds?: readonly BluetoothServiceClassId[] | null;
     /**
      * Read buffer size handed to `port.open`. Defaults to the browser's own
      * default (8 KiB in Chrome); raise it for bulk transfers so a slow turn of
@@ -2645,10 +2645,10 @@ declare function shimmer3ControlMessageLength(buf: Uint8Array): number;
  * paired in system settings first. See `describePlatformSupport`.
  */
 declare const SHIMMER3_SPP_SERIAL_OPTIONS: Readonly<{
-    readonly filters: readonly [{
-        readonly bluetoothServiceClassId: "00001101-0000-1000-8000-00805f9b34fb";
-    }];
-    readonly allowedBluetoothServiceClassIds: readonly ["00001101-0000-1000-8000-00805f9b34fb"];
+    readonly filters: readonly Readonly<{
+        bluetoothServiceClassId: "00001101-0000-1000-8000-00805f9b34fb";
+    }>[];
+    readonly allowedBluetoothServiceClassIds: readonly string[];
     readonly kind: "rfcomm";
 }>;
 /**

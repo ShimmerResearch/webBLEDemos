@@ -205,16 +205,22 @@ function transportAdvice(support, need) {
     if (availability === 'unavailable') {
         if (support.isIOS) {
             /*
-             * On iOS the only route is BLE, so the advice depends on whether this
-             * browser has it. If Web Bluetooth is present we are inside Bluefy or
-             * WebBLE already, and recommending them would be telling the user to
-             * install what they are using.
+             * On iOS the only possible route is BLE, so the advice turns on whether
+             * this browser has it. If Web Bluetooth is present we are already inside
+             * Bluefy or WebBLE, and recommending them would tell the user to install
+             * what they are using.
+             *
+             * Deliberately conditional on the *sensor* too. BLE is not a substitute
+             * for classic Bluetooth in general - a classic-only Shimmer3 (the RN42
+             * fleet has no BLE radio at all) cannot be reached from iOS by any route.
+             * Promising "connect over BLE instead" would send exactly the user who
+             * needs classic Bluetooth off after something that cannot work for them.
              */
             const route = support.webBluetooth
-                ? 'Connect over BLE instead.'
-                : 'Bluefy or WebBLE (App Store) bundle their own BLE stack and can run this page.';
+                ? 'A sensor that also supports BLE can be reached that way instead.'
+                : 'A sensor that also supports BLE can be reached with Bluefy or WebBLE (App Store), which bundle their own BLE stack.';
             return need === 'classicBluetooth'
-                ? `Classic Bluetooth cannot be reached from iOS at all: iOS gives apps no classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP requires MFi licensing). ${route}`
+                ? `Classic Bluetooth cannot be reached from iOS at all: iOS gives apps no classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP requires MFi licensing). ${route} A classic-Bluetooth-only sensor cannot be used from iOS.`
                 : `Web Serial is not available on iOS — WebKit does not implement it, so a wired dock cannot be opened. ${route}`;
         }
         return need === 'classicBluetooth'
@@ -459,14 +465,19 @@ class WebSerialTransport {
         return this._port;
     }
     async connect() {
-        if (!('serial' in navigator)) {
-            /*
-             * Platform-specific wording, because "use a desktop browser" is wrong on
-             * Android (Chrome 138+ serves RFCOMM ports) and misleading on iOS, where no
-             * browser will ever have this. transportAdvice picks by platform; the guard
-             * itself stays a capability check.
-             */
-            const support = describePlatformSupport();
+        /*
+         * Snapshot before the guard rather than testing `navigator` directly: with no
+         * global navigator at all (Node, React Native) `'serial' in navigator` throws
+         * before any message can be produced, so the descriptive error below would be
+         * unreachable exactly where it is most needed.
+         *
+         * Platform-specific wording, because "use a desktop browser" is wrong on
+         * Android (Chrome 138+ serves RFCOMM ports) and misleading on iOS, where no
+         * browser will ever have this. The gate is still a capability check - the
+         * platform only chooses the words.
+         */
+        const support = describePlatformSupport();
+        if (!support.webSerial) {
             const need = this._allowedBluetoothServiceClassIds ? 'classicBluetooth' : 'wiredSerial';
             throw new Error(transportAdvice(support, need) ?? 'Web Serial is not available.');
         }
@@ -475,10 +486,17 @@ class WebSerialTransport {
             // Unknown dictionary members are ignored by WebIDL, so naming the
             // Bluetooth service classes is safe on browsers that predate them.
             const request = {};
+            /*
+             * Copied, not aliased. The public options accept `readonly` arrays so a
+             * frozen shared default (SHIMMER3_SPP_SERIAL_OPTIONS) can be spread
+             * straight in, but SerialPortRequestOptions is a WebIDL dictionary typed
+             * with mutable arrays - and passing a frozen array into it would also let
+             * the caller's constant be reached by anything that mutates the request.
+             */
             if (this._filters)
-                request.filters = this._filters;
+                request.filters = [...this._filters];
             if (this._allowedBluetoothServiceClassIds) {
-                request.allowedBluetoothServiceClassIds = this._allowedBluetoothServiceClassIds;
+                request.allowedBluetoothServiceClassIds = [...this._allowedBluetoothServiceClassIds];
             }
             this._port = await serial.requestPort(Object.keys(request).length ? request : undefined);
         }
@@ -7508,8 +7526,13 @@ function shimmer3ControlMessageLength(buf) {
  * paired in system settings first. See `describePlatformSupport`.
  */
 const SHIMMER3_SPP_SERIAL_OPTIONS = Object.freeze({
-    filters: [{ bluetoothServiceClassId: SHIMMER3_SPP_UUID }],
-    allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
+    /*
+     * Frozen at every level, not just the outer object. Object.freeze is shallow,
+     * so freezing only the wrapper would still let a JavaScript caller push into
+     * the arrays of a default that every other caller shares.
+     */
+    filters: Object.freeze([Object.freeze({ bluetoothServiceClassId: SHIMMER3_SPP_UUID })]),
+    allowedBluetoothServiceClassIds: Object.freeze([SHIMMER3_SPP_UUID]),
     kind: 'rfcomm',
 });
 /**
@@ -15770,9 +15793,15 @@ class VerisenseBleDevice extends BaseShimmerClient {
     // --- Web Serial (USB COM port) connect ---
     async connectSerial(opts = {}) {
         const injected = opts.transport ?? this._injectedTransport;
-        if (!injected && !('serial' in navigator)) {
-            /* Verisense docks over a wired USB serial port, never RFCOMM. */
-            throw new Error(transportAdvice(describePlatformSupport(), 'wiredSerial') ?? 'Web Serial is not available.');
+        /*
+         * Snapshot first: testing `navigator` directly throws with no global
+         * navigator (Node, React Native), which would make the descriptive error
+         * below unreachable. Verisense docks over a wired USB serial port, never
+         * RFCOMM, so the advice is the wired one.
+         */
+        const serialSupport = describePlatformSupport();
+        if (!injected && !serialSupport.webSerial) {
+            throw new Error(transportAdvice(serialSupport, 'wiredSerial') ?? 'Web Serial is not available.');
         }
         if (this._transportKind === 'ble' && this.device?.gatt?.connected) {
             await this.disconnect();
