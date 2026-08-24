@@ -468,6 +468,12 @@
       const STOCK_MANUFACTURER = "Shimmer Research Ltd.";
 
       const $ = (id) => document.getElementById(id);
+
+      /* Snapshotted once, up here, for two reasons: setConnected() consults it on
+       * every disconnect (see below), and setConnected(false) runs during startup
+       * before the guidance block at the bottom of this script - a const declared
+       * down there would be in its temporal dead zone when that call lands. */
+      const support = describePlatformSupport();
       const els = {
         serial: $("btnSerial"),
         ble: $("btnBle"),
@@ -521,9 +527,17 @@
       function setConnected(on, label) {
         els.pill.textContent = on ? label : "disconnected";
         els.pill.classList.toggle("on", on);
-        els.serial.disabled = on;
-        els.ble.disabled = on;
-        els.btClassic.disabled = on;
+        /* Capability is a floor the connected-state cannot lift. Assigning
+         * `disabled = on` alone re-enabled all three on every disconnect, so on
+         * a browser with only some of these APIs one connect/disconnect cycle
+         * handed the user buttons that cannot work.
+         *
+         * The dock is the exception that proves the rule: it gates on webSerial
+         * only, because on Android that is true while a wired port is merely
+         * "unlikely" - warned about below, deliberately not disabled. */
+        els.serial.disabled = on || !support.webSerial;
+        els.ble.disabled = on || !support.webBluetooth;
+        els.btClassic.disabled = on || !support.webSerial;
         els.disc.disabled = !on;
         els.read.disabled = !on;
         refreshForm();
@@ -1055,10 +1069,9 @@
        * than a disable: on Android "serial" in navigator is true while wired
        * ports are still rolling out, and no feature detection separates the two,
        * so a hard disable would lock out the phones where it does land. */
-      const support = describePlatformSupport();
-      els.serial.disabled = !support.webSerial;
-      els.btClassic.disabled = !support.webSerial;
-      els.ble.disabled = !support.webBluetooth;
+      /* setConnected() re-applies these floors on every state change; the call
+       * above has already applied them once, so all that is left here is the
+       * advice. */
       for (const need of ["ble", "classicBluetooth", "wiredSerial"]) {
         const advice = transportAdvice(support, need);
         if (advice) log(`note: ${advice}`);

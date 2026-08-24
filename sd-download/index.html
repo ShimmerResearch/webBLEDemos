@@ -267,6 +267,12 @@
       } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
       const $ = (id) => document.getElementById(id);
+
+      /* Snapshotted once, up here, for two reasons: setConnected() consults it on
+       * every disconnect (see below), and it is referenced before the guidance
+       * block at the bottom of this script runs - a const declared down there
+       * would be in its temporal dead zone. */
+      const support = describePlatformSupport();
       const logEl = $("log");
 
       function log(msg, isErr = false) {
@@ -361,8 +367,13 @@
       let linkTesting = false;
 
       function setConnected(connected) {
-        $("btnConnect").disabled = connected;
-        $("btnConnectBt").disabled = connected;
+        /* Capability is a floor the connected-state cannot lift. Assigning
+         * `disabled = connected` alone re-enabled both buttons on every
+         * disconnect, so on a browser with only one of the two APIs - desktop
+         * Firefox has Web Serial but no Web Bluetooth - one connect/disconnect
+         * cycle handed the user a button that cannot work. */
+        $("btnConnect").disabled = connected || !support.webBluetooth;
+        $("btnConnectBt").disabled = connected || !support.webSerial;
         $("btnDisconnect").disabled = !connected;
         updateDownloadButtons();
         $("connState").textContent = connected ? "Connected" : "Not connected";
@@ -806,7 +817,6 @@
        * says the same accurate thing: it owns the awkward facts (Android serves
        * Web Serial for RFCOMM only; iOS cannot reach classic Bluetooth at any
        * layer) and returns null when a link simply works. */
-      const support = describePlatformSupport();
       if (!support.webBluetooth) {
         const banner = $("fwBanner");
         banner.className = "banner err";
@@ -814,7 +824,9 @@
         $("btnConnect").disabled = true;
       }
       /* The classic-Bluetooth button rides Web Serial - it opens the serial port
-       * the pairing creates - so it gates on that, not on Web Bluetooth. */
+       * the pairing creates - so it gates on that, not on Web Bluetooth.
+       * setConnected() re-applies both floors on every state change; this is the
+       * initial application, before anything has connected. */
       $("btnConnectBt").disabled = !support.webSerial;
       const btAdvice = transportAdvice(support, "classicBluetooth");
       if (btAdvice) log(btAdvice, !support.webSerial);

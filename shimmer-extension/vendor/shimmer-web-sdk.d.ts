@@ -567,6 +567,18 @@ declare class WebSerialTransport implements ShimmerTransport {
     constructor(opts?: WebSerialTransportOptions);
     /** The underlying serial port, once opened. */
     get port(): SerialPort | null;
+    /**
+     * Which kind of link this transport was configured to open, for choosing the
+     * right advice when Web Serial is missing.
+     *
+     * Deliberately not `this._allowedBluetoothServiceClassIds ? ... : ...`: an
+     * empty array is truthy, so `allowedBluetoothServiceClassIds: []` would be
+     * called Bluetooth, and a caller who passed only a `bluetoothServiceClassId`
+     * filter without the permission would be told about a wired dock. Both cases
+     * would hand the user advice for the wrong link - most visibly on iOS, where
+     * the two messages differ in kind rather than in wording.
+     */
+    private _need;
     connect(): Promise<void>;
     /**
      * `port.open()`, bounded by {@link WebSerialTransportOptions.openTimeoutMs}.

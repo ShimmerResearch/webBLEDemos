@@ -464,6 +464,25 @@ class WebSerialTransport {
     get port() {
         return this._port;
     }
+    /**
+     * Which kind of link this transport was configured to open, for choosing the
+     * right advice when Web Serial is missing.
+     *
+     * Deliberately not `this._allowedBluetoothServiceClassIds ? ... : ...`: an
+     * empty array is truthy, so `allowedBluetoothServiceClassIds: []` would be
+     * called Bluetooth, and a caller who passed only a `bluetoothServiceClassId`
+     * filter without the permission would be told about a wired dock. Both cases
+     * would hand the user advice for the wrong link - most visibly on iOS, where
+     * the two messages differ in kind rather than in wording.
+     */
+    _need() {
+        if (this._allowedBluetoothServiceClassIds?.length)
+            return 'classicBluetooth';
+        if (this._filters?.some((f) => f.bluetoothServiceClassId !== undefined)) {
+            return 'classicBluetooth';
+        }
+        return 'wiredSerial';
+    }
     async connect() {
         /*
          * Snapshot before the guard rather than testing `navigator` directly: with no
@@ -478,8 +497,7 @@ class WebSerialTransport {
          */
         const support = describePlatformSupport();
         if (!support.webSerial) {
-            const need = this._allowedBluetoothServiceClassIds ? 'classicBluetooth' : 'wiredSerial';
-            throw new Error(transportAdvice(support, need) ?? 'Web Serial is not available.');
+            throw new Error(transportAdvice(support, this._need()) ?? 'Web Serial is not available.');
         }
         if (!this._port) {
             const serial = navigator.serial;
