@@ -257,7 +257,9 @@
       import {
         Shimmer3RClient,
         WebSerialTransport,
-        SHIMMER3_SPP_UUID,
+        SHIMMER3_SPP_SERIAL_OPTIONS,
+        describePlatformSupport,
+        transportAdvice,
         enumerateSdTree,
         downloadSdTree,
         formatSdImportStamp,
@@ -290,30 +292,6 @@
         navigator.userAgentData?.platform || navigator.userAgent,
       );
 
-      /* Platform hints, used ONLY to choose which advice to print. Every
-       * enable/disable decision below stays capability-based ("serial" in
-       * navigator): a missing API is a fact, a UA string is a guess.
-       *
-       * Worth stating because it is counter-intuitive: Android Chrome 138+ DOES
-       * implement Web Serial, but deliberately only for Bluetooth RFCOMM port
-       * emulation - which is exactly what the classic-Bluetooth button uses. So
-       * "use desktop" is the wrong advice on Android; the paired-sensor path is
-       * expected to work there.
-       *
-       * iOS is a harder no than an unimplemented API. Every iOS browser is
-       * WebKit, which ships neither Web Bluetooth nor Web Serial, and iOS gives
-       * third-party apps no classic-Bluetooth serial access at any layer (Core
-       * Bluetooth is BLE-only; classic profiles such as SPP need MFi licensing).
-       * So BLE through a browser that bundles its own stack is the ceiling, and
-       * classic Bluetooth is impossible rather than merely absent. */
-      const IS_ANDROID = /Android/i.test(
-        navigator.userAgentData?.platform || navigator.userAgent,
-      );
-      /* iPadOS 13+ reports itself as "Macintosh"; the touch-point count is what
-       * separates an iPad from a Mac. */
-      const IS_IOS =
-        /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-        (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
       const CONSENSYS_BACKUP_HINT =
         String.raw`Tip: choose %USERPROFILE%\Shimmer_Workspace\Backup so Consensys can ` +
         "import this directly (Application Settings → Manage Data → Import Data " +
@@ -589,14 +567,7 @@
             new Shimmer3RClient({
               debug: false,
               transport: new WebSerialTransport({
-                /* These two do different jobs and BOTH are needed.
-                 * allowedBluetoothServiceClassIds only *permits* Bluetooth ports
-                 * to appear at all; filters is what *narrows* the picker. With
-                 * the permission alone the picker lists every COM port and every
-                 * paired Bluetooth device, which is useless to choose from. */
-                filters: [{ bluetoothServiceClassId: SHIMMER3_SPP_UUID }],
-                allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
-                kind: "rfcomm",
+                ...SHIMMER3_SPP_SERIAL_OPTIONS,
                 /* Bulk transfer: a generous read buffer keeps a slow turn of the
                  * read loop from stalling the sender. */
                 bufferSize: 64 * 1024,
@@ -829,44 +800,22 @@
       $("btnDownloadAll").onclick = () => runDownload(["data"]);
       $("btnAbort").onclick = () => abortCtl?.abort();
 
-      /* On iOS the only route is BLE. If Web Bluetooth is already present we are
-       * running inside a browser that bundles its own stack (Bluefy, WebBLE), so
-       * recommending those would be telling the user to use what they are already
-       * using - point at the BLE button instead. */
-      const IOS_BLE_ADVICE =
-        "bluetooth" in navigator
-          ? "Use the BLE button instead."
-          : "Bluefy or WebBLE (App Store) bundle their own BLE stack and can run this page.";
-
-      if (!("bluetooth" in navigator)) {
+      /* Capability and guidance both come from the SDK now, so every consumer
+       * says the same accurate thing: it owns the awkward facts (Android serves
+       * Web Serial for RFCOMM only; iOS cannot reach classic Bluetooth at any
+       * layer) and returns null when a link simply works. */
+      const support = describePlatformSupport();
+      if (!support.webBluetooth) {
         const banner = $("fwBanner");
         banner.className = "banner err";
-        banner.textContent = IS_IOS
-          ? "Web Bluetooth is not available on iOS — every iOS browser uses WebKit, which does not implement it. Bluefy or WebBLE (App Store) bundle their own BLE stack and can run this page."
-          : "Web Bluetooth is not available in this browser (use Chrome or Edge — desktop or Android).";
+        banner.textContent = transportAdvice(support, "ble");
         $("btnConnect").disabled = true;
       }
-      /* The classic-Bluetooth button is Web Serial - it opens the serial port the
-       * pairing creates - so it needs its own guard. Without it, clicking in a
-       * browser without Web Serial only yields a caught "Web Serial not
-       * supported" in the log instead of visible guidance. */
-      if (!("serial" in navigator)) {
-        log(
-          IS_IOS
-            ? `Classic Bluetooth is not reachable from iOS at all: iOS gives apps no classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP needs MFi licensing). ${IOS_BLE_ADVICE}`
-            : "Web Serial is not available in this browser — classic-Bluetooth connect disabled (Chrome or Edge on desktop, or Chrome 138+ on Android).",
-          true,
-        );
-        $("btnConnectBt").disabled = true;
-      } else if (IS_ANDROID) {
-        /* Android Chrome exposes Web Serial for Bluetooth RFCOMM only, so the
-         * picker lists paired sensors and nothing else. That happens to be all
-         * this page wants - but the sensor has to be paired in Android Settings
-         * first, and the picker being empty otherwise looks like a bug. */
-        log(
-          "Android: pair the Shimmer in Settings → Bluetooth first, then use “Connect Classic Bluetooth”. Android Chrome exposes Web Serial for paired Bluetooth devices only, so the picker stays empty until the sensor is paired.",
-        );
-      }
+      /* The classic-Bluetooth button rides Web Serial - it opens the serial port
+       * the pairing creates - so it gates on that, not on Web Bluetooth. */
+      $("btnConnectBt").disabled = !support.webSerial;
+      const btAdvice = transportAdvice(support, "classicBluetooth");
+      if (btAdvice) log(btAdvice, !support.webSerial);
       if (!("showDirectoryPicker" in window)) {
         log(
           "File System Access API unavailable — destination picking will not work in this browser.",
