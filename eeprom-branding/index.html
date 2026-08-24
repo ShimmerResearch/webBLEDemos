@@ -443,7 +443,9 @@
         Shimmer3Client,
         WiredShimmerClient,
         WebSerialTransport,
-        SHIMMER3_SPP_UUID,
+        SHIMMER3_SPP_SERIAL_OPTIONS,
+        describePlatformSupport,
+        transportAdvice,
         parseBrandRecord,
         buildBrandRecord,
         buildBlankBrandRecord,
@@ -465,34 +467,13 @@
        * to tell a stock record from a custom one. */
       const STOCK_MANUFACTURER = "Shimmer Research Ltd.";
 
-      /* Platform hints, used ONLY to choose which advice to print. Every
-       * enable/disable decision below stays capability-based ("serial" in
-       * navigator): a missing API is a fact, a UA string is a guess.
-       *
-       * Counter-intuitive but load-bearing here: Android Chrome 138+ DOES
-       * implement Web Serial, but deliberately only for Bluetooth RFCOMM port
-       * emulation. So on Android the classic-Bluetooth button is expected to
-       * work while "Connect USB / dock" is not - "serial" in navigator is true
-       * either way, which is why the dock gets a warning it cannot feature-detect
-       * its way out of. Wired ports are a separate Android feature still rolling
-       * out (~M149, 2026Q2, limited devices).
-       *
-       * iOS is a harder no than an unimplemented API. Every iOS browser is
-       * WebKit, which ships neither Web Bluetooth nor Web Serial, and iOS gives
-       * third-party apps no classic-Bluetooth serial access at any layer (Core
-       * Bluetooth is BLE-only; classic profiles such as SPP need MFi licensing).
-       * So BLE through a browser that bundles its own stack is the ceiling, and
-       * classic Bluetooth is impossible rather than merely absent. */
-      const IS_ANDROID = /Android/i.test(
-        navigator.userAgentData?.platform || navigator.userAgent,
-      );
-      /* iPadOS 13+ reports itself as "Macintosh"; the touch-point count is what
-       * separates an iPad from a Mac. */
-      const IS_IOS =
-        /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-        (/Mac/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
-
       const $ = (id) => document.getElementById(id);
+
+      /* Snapshotted once, up here, for two reasons: setConnected() consults it on
+       * every disconnect (see below), and setConnected(false) runs during startup
+       * before the guidance block at the bottom of this script - a const declared
+       * down there would be in its temporal dead zone when that call lands. */
+      const support = describePlatformSupport();
       const els = {
         serial: $("btnSerial"),
         ble: $("btnBle"),
@@ -546,9 +527,17 @@
       function setConnected(on, label) {
         els.pill.textContent = on ? label : "disconnected";
         els.pill.classList.toggle("on", on);
-        els.serial.disabled = on;
-        els.ble.disabled = on;
-        els.btClassic.disabled = on;
+        /* Capability is a floor the connected-state cannot lift. Assigning
+         * `disabled = on` alone re-enabled all three on every disconnect, so on
+         * a browser with only some of these APIs one connect/disconnect cycle
+         * handed the user buttons that cannot work.
+         *
+         * The dock is the exception that proves the rule: it gates on webSerial
+         * only, because on Android that is true while a wired port is merely
+         * "unlikely" - warned about below, deliberately not disabled. */
+        els.serial.disabled = on || !support.webSerial;
+        els.ble.disabled = on || !support.webBluetooth;
+        els.btClassic.disabled = on || !support.webSerial;
         els.disc.disabled = !on;
         els.read.disabled = !on;
         refreshForm();
@@ -834,16 +823,7 @@
         try {
           hideRebootBanner();
           c = new Shimmer3Client({
-            transport: new WebSerialTransport({
-              /* These two do different jobs and BOTH are needed.
-               * allowedBluetoothServiceClassIds only *permits* Bluetooth ports to
-               * appear at all; filters is what *narrows* the picker. With the
-               * permission alone the picker lists every COM port and every paired
-               * Bluetooth device, which is useless to choose from. */
-              filters: [{ bluetoothServiceClassId: SHIMMER3_SPP_UUID }],
-              allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
-              kind: "rfcomm",
-            }),
+            transport: new WebSerialTransport(SHIMMER3_SPP_SERIAL_OPTIONS),
           });
           c.onStatus = (m) => log(m);
           await c.connect();
@@ -1082,43 +1062,19 @@
         );
       }
       setConnected(false);
-      /* On iOS the only route is BLE. If Web Bluetooth is already present we are
-       * running inside a browser that bundles its own stack (Bluefy, WebBLE), so
-       * recommending those would be telling the user to use what they are already
-       * using - point at the BLE button instead. */
-      const IOS_BLE_ADVICE =
-        "bluetooth" in navigator
-          ? "Use the BLE button instead."
-          : "Bluefy or WebBLE (App Store) bundle their own BLE stack and can run this page.";
-
-      if (!("serial" in navigator)) {
-        log(
-          IS_IOS
-            ? `note: iOS reaches neither the dock nor classic Bluetooth — WebKit ships no Web Serial, and iOS gives apps no classic-Bluetooth serial access at all (Core Bluetooth is BLE-only, SPP needs MFi). BLE is the only route. ${IOS_BLE_ADVICE}`
-            : "note: Web Serial not available in this browser (USB/dock and classic-Bluetooth connect disabled) — use Chrome or Edge on desktop, or Chrome 138+ on Android for the classic-Bluetooth button",
-        );
-        els.serial.disabled = true;
-        /* The classic-Bluetooth button is Web Serial too - it opens the serial
-         * port the pairing creates - so it needs the same guard, or clicking it
-         * just produces a caught "Web Serial not supported" instead of this note. */
-        els.btClassic.disabled = true;
-      } else if (IS_ANDROID) {
-        /* Deliberately a warning and not a disable: Android's wired-serial
-         * support is arriving on a limited set of devices, so a hard disable here
-         * would lock out the phones where it does land. The dock button is left
-         * clickable and the picker will simply come up empty on a device without
-         * it - which reads as a bug unless we say this up front. */
-        log(
-          "note: Android Chrome exposes Web Serial for paired Bluetooth devices only, so “Connect USB / dock” will most likely find nothing (wired serial is still rolling out). Pair the Shimmer in Settings → Bluetooth and use “Connect Classic Bluetooth” instead.",
-        );
-      }
-      if (!("bluetooth" in navigator)) {
-        log(
-          IS_IOS
-            ? "note: Web Bluetooth is not available on iOS — every iOS browser uses WebKit, which does not implement it. Bluefy or WebBLE (App Store) bundle their own BLE stack and can run this page."
-            : "note: Web Bluetooth not available in this browser (BLE connect disabled) — use Chrome or Edge, desktop or Android",
-        );
-        els.ble.disabled = true;
+      /* Capability and guidance both come from the SDK now, so every consumer
+       * says the same accurate thing about each link.
+       *
+       * The dock deliberately gets transportAvailability's middle state rather
+       * than a disable: on Android "serial" in navigator is true while wired
+       * ports are still rolling out, and no feature detection separates the two,
+       * so a hard disable would lock out the phones where it does land. */
+      /* setConnected() re-applies these floors on every state change; the call
+       * above has already applied them once, so all that is left here is the
+       * advice. */
+      for (const need of ["ble", "classicBluetooth", "wiredSerial"]) {
+        const advice = transportAdvice(support, need);
+        if (advice) log(`note: ${advice}`);
       }
     </script>
   </body>
