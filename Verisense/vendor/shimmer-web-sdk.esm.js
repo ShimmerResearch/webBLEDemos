@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.1.16';
+const SDK_VERSION = '0.1.18';
 
 /**
  * Container for a single decoded sensor frame.
@@ -98,6 +98,178 @@ class BaseShimmerClient {
         this._log(msg);
         this.onStatus?.(msg);
     }
+}
+
+/**
+ * Which link types this browser can actually reach, and what to tell the user
+ * when it cannot.
+ *
+ * Every consumer of this SDK was hand-writing the same advice — "Web Serial not
+ * supported, use Chrome/Edge on desktop" — in its own words, in six places
+ * across three repos. All six were wrong in the same way once Chrome shipped Web
+ * Serial on Android, so the knowledge lives here once instead.
+ *
+ * The split this module insists on:
+ *
+ * - **Gate on capability.** `webSerial` / `webBluetooth` report whether the API's
+ *   entry point is *callable* — stricter than `'serial' in navigator`, because a
+ *   property that is `null`, a non-object, or an object without the entry point
+ *   satisfies `in` and still throws the moment anything uses it. Whether calling
+ *   would throw is a fact, and that is what a control's enabled state may rest on.
+ * - **Message on platform.** `isAndroid` / `isIOS` come from the user-agent, and
+ *   are used only to choose which words to show. A UA string is a guess, and
+ *   guesses must never decide what a user is allowed to click.
+ *
+ * The awkward case that shaped the API is Android. Chrome 138+ implements Web
+ * Serial there, but deliberately only for Bluetooth RFCOMM port emulation —
+ * wired ports are a separate feature still rolling out. So `navigator.serial` is
+ * present and callable, and `webSerial` is correctly `true`: the API is usable,
+ * but only for RFCOMM. A wired dock still will not appear in the picker, and no
+ * amount of feature detection separates the two. That is why
+ * {@link transportAvailability} returns three states rather than a boolean:
+ * `'unlikely'` is the honest answer for a wired port on Android, and it maps to
+ * "leave the button enabled and warn" rather than "disable", so devices that do
+ * gain wired support are not locked out.
+ *
+ * iOS is the opposite shape — a harder "no" than an unimplemented API. Every iOS
+ * browser is WebKit, which ships neither API, and iOS exposes no
+ * classic-Bluetooth serial access to third-party apps at any layer: Core
+ * Bluetooth is BLE-only, and classic profiles such as SPP require MFi licensing.
+ * So classic Bluetooth there is impossible rather than merely absent, and no
+ * future browser release changes that. BLE via a browser that bundles its own
+ * stack (Bluefy, WebBLE) is the ceiling.
+ */
+function readNavigator(nav) {
+    if (nav)
+        return nav;
+    const g = globalThis;
+    return g.navigator ?? {};
+}
+/**
+ * Whether an API entry point is actually callable.
+ *
+ * Deliberately stricter than "the property exists". `null`, `undefined`, a
+ * non-object, an object lacking the method, and a method that is not a function
+ * all satisfy `'bluetooth' in navigator` while still throwing a synchronous
+ * TypeError the moment anything calls them — so treating the property's presence
+ * as the capability hands callers a flag they cannot safely gate on, which is the
+ * entire job of these fields. The optional chain covers null/undefined and the
+ * typeof covers the rest.
+ * Reported as unavailable instead: an API that cannot be called is, for every
+ * purpose here, absent.
+ */
+function callable(api, method) {
+    return typeof api?.[method] === 'function';
+}
+/**
+ * Snapshot what this browser can reach. Call once and pass the result around;
+ * nothing here changes during a page's lifetime.
+ *
+ * Safe outside a browser — with no `navigator` every capability reads `false`,
+ * so a Node or React Native caller gets "nothing available" rather than a throw.
+ */
+function describePlatformSupport(nav) {
+    const n = readNavigator(nav);
+    const ua = n.userAgent ?? '';
+    const isAndroid = /Android/i.test(n.userAgentData?.platform || ua);
+    /*
+     * iPadOS 13+ reports itself as "Macintosh" to look like a desktop, so the UA
+     * alone cannot separate an iPad from a Mac — the touch-point count is what
+     * does. Requiring more than one point keeps desktop macOS out, including a Mac
+     * with a stray touch-capable peripheral.
+     */
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (/Mac/.test(ua) && (n.maxTouchPoints ?? 0) > 1);
+    const webSerial = callable(n.serial, 'requestPort');
+    return {
+        webSerial,
+        webBluetooth: callable(n.bluetooth, 'requestDevice'),
+        isAndroid,
+        isIOS,
+        serialBluetoothOnly: webSerial && isAndroid,
+    };
+}
+/**
+ * Whether to offer `need` here — see {@link Availability} for how to map the
+ * three states onto a control's enabled state.
+ */
+function transportAvailability(support, need) {
+    if (need === 'ble')
+        return support.webBluetooth ? 'available' : 'unavailable';
+    if (!support.webSerial)
+        return 'unavailable';
+    /*
+     * Both remaining needs ride Web Serial, and on Android it serves only one of
+     * them: a paired sensor's RFCOMM port is exactly what it exposes, while a
+     * wired dock is the feature that has not arrived.
+     */
+    if (need === 'wiredSerial' && support.serialBluetoothOnly)
+        return 'unlikely';
+    return 'available';
+}
+/**
+ * What to tell the user about `need` on this platform, or `null` when there is
+ * nothing worth saying (the API is present and unrestricted).
+ *
+ * Returning `null` on the happy path is deliberate: it lets a caller write
+ * `const msg = transportAdvice(...); if (msg) log(msg);` without first working
+ * out whether this platform is interesting.
+ */
+function transportAdvice(support, need) {
+    const availability = transportAvailability(support, need);
+    if (need === 'ble') {
+        if (availability === 'available')
+            return null;
+        return support.isIOS
+            ? 'Web Bluetooth is not available on iOS — every iOS browser uses WebKit, which does not implement it. Bluefy or WebBLE (App Store) bundle their own BLE stack and can run this page.'
+            : 'Web Bluetooth is not available in this browser. Use Chrome or Edge — desktop or Android — over HTTPS or on localhost.';
+    }
+    if (availability === 'unavailable') {
+        if (support.isIOS) {
+            /*
+             * On iOS the only possible route is BLE, so the advice turns on whether
+             * this browser has it. If Web Bluetooth is present we are already inside
+             * Bluefy or WebBLE, and recommending them would tell the user to install
+             * what they are using.
+             *
+             * Deliberately conditional on the *sensor* too. BLE is not a substitute
+             * for classic Bluetooth in general - a classic-only Shimmer3 (the RN42
+             * fleet has no BLE radio at all) cannot be reached from iOS by any route.
+             * Promising "connect over BLE instead" would send exactly the user who
+             * needs classic Bluetooth off after something that cannot work for them.
+             */
+            const route = support.webBluetooth
+                ? 'A sensor that also supports BLE can be reached that way instead.'
+                : 'A sensor that also supports BLE can be reached with Bluefy or WebBLE (App Store), which bundle their own BLE stack.';
+            return need === 'classicBluetooth'
+                ? `Classic Bluetooth cannot be reached from iOS at all: iOS gives apps no classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP requires MFi licensing). ${route} A classic-Bluetooth-only sensor cannot be used from iOS.`
+                : `Web Serial is not available on iOS — WebKit does not implement it, so a wired dock cannot be opened. ${route}`;
+        }
+        return need === 'classicBluetooth'
+            ? 'Web Serial is not available in this browser, so classic Bluetooth cannot be used. Use Chrome or Edge on desktop, or Chrome 138+ on Android, over HTTPS or on localhost.'
+            : 'Web Serial is not available in this browser, so the USB/dock connection cannot be used. Use Chrome or Edge on desktop, over HTTPS or on localhost.';
+    }
+    if (availability === 'unlikely') {
+        /*
+         * Only reachable for a wired port on Android — see serialBluetoothOnly.
+         *
+         * The classic-Bluetooth alternative is conditional, not prescribed. This
+         * advice is device-agnostic (TransportNeed says nothing about the sensor),
+         * and a Verisense reaches the host over wired USB serial or BLE and has no
+         * RFCOMM at all — so telling every Android caller to "pair over classic
+         * Bluetooth instead" sends wired-only users after a connection that cannot
+         * exist. Same failure as promising BLE on iOS above.
+         */
+        return 'Android Chrome exposes Web Serial for paired Bluetooth devices only, so a wired USB/dock connection will most likely find nothing (wired serial support is still rolling out). A sensor that supports classic Bluetooth can be paired and reached that way instead.';
+    }
+    /*
+     * Classic Bluetooth works here, but on Android the picker is empty until the
+     * sensor is paired in system settings — which reads as a bug unless said up
+     * front. Worth a note even though nothing is wrong.
+     */
+    if (need === 'classicBluetooth' && support.isAndroid) {
+        return 'Pair the sensor in Android Settings → Bluetooth first: Android Chrome exposes Web Serial for paired Bluetooth devices only, so the picker stays empty until it is paired.';
+    }
+    return null;
 }
 
 function toArrayBuffer(u8) {
@@ -322,19 +494,57 @@ class WebSerialTransport {
     get port() {
         return this._port;
     }
+    /**
+     * Which kind of link this transport was configured to open, for choosing the
+     * right advice when Web Serial is missing.
+     *
+     * Deliberately not `this._allowedBluetoothServiceClassIds ? ... : ...`: an
+     * empty array is truthy, so `allowedBluetoothServiceClassIds: []` would be
+     * called Bluetooth, and a caller who passed only a `bluetoothServiceClassId`
+     * filter without the permission would be told about a wired dock. Both cases
+     * would hand the user advice for the wrong link - most visibly on iOS, where
+     * the two messages differ in kind rather than in wording.
+     */
+    _need() {
+        if (this._allowedBluetoothServiceClassIds?.length)
+            return 'classicBluetooth';
+        if (this._filters?.some((f) => f.bluetoothServiceClassId !== undefined)) {
+            return 'classicBluetooth';
+        }
+        return 'wiredSerial';
+    }
     async connect() {
-        if (!('serial' in navigator)) {
-            throw new Error('Web Serial not supported. Use Chrome/Edge on HTTPS or http://localhost.');
+        /*
+         * Snapshot before the guard rather than testing `navigator` directly: with no
+         * global navigator at all (Node, React Native) `'serial' in navigator` throws
+         * before any message can be produced, so the descriptive error below would be
+         * unreachable exactly where it is most needed.
+         *
+         * Platform-specific wording, because "use a desktop browser" is wrong on
+         * Android (Chrome 138+ serves RFCOMM ports) and misleading on iOS, where no
+         * browser will ever have this. The gate is still a capability check - the
+         * platform only chooses the words.
+         */
+        const support = describePlatformSupport();
+        if (!support.webSerial) {
+            throw new Error(transportAdvice(support, this._need()) ?? 'Web Serial is not available.');
         }
         if (!this._port) {
             const serial = navigator.serial;
             // Unknown dictionary members are ignored by WebIDL, so naming the
             // Bluetooth service classes is safe on browsers that predate them.
             const request = {};
+            /*
+             * Copied, not aliased. The public options accept `readonly` arrays so a
+             * frozen shared default (SHIMMER3_SPP_SERIAL_OPTIONS) can be spread
+             * straight in, but SerialPortRequestOptions is a WebIDL dictionary typed
+             * with mutable arrays - and passing a frozen array into it would also let
+             * the caller's constant be reached by anything that mutates the request.
+             */
             if (this._filters)
-                request.filters = this._filters;
+                request.filters = [...this._filters];
             if (this._allowedBluetoothServiceClassIds) {
-                request.allowedBluetoothServiceClassIds = this._allowedBluetoothServiceClassIds;
+                request.allowedBluetoothServiceClassIds = [...this._allowedBluetoothServiceClassIds];
             }
             this._port = await serial.requestPort(Object.keys(request).length ? request : undefined);
         }
@@ -7374,6 +7584,37 @@ function shimmer3ControlMessageLength(buf) {
  */
 // Re-export the shared LiteProtocol surface so Shimmer3 consumers import from one
 // module (these are identical across the two device families).
+/**
+ * The `WebSerialTransport` options that reach a Shimmer over classic Bluetooth.
+ *
+ * Both Bluetooth fields are required and they do different jobs, which is the
+ * whole reason this is a constant rather than something each caller assembles:
+ * `allowedBluetoothServiceClassIds` only *permits* Bluetooth ports to appear at
+ * all, while `filters` is what *narrows* the picker to Shimmers. Supply the
+ * permission alone and the picker lists every serial port and every paired
+ * Bluetooth device, which is unusable — a mistake that has been made once
+ * already, in the demos this constant replaces.
+ *
+ * Spread it and add whatever the call site needs on top:
+ *
+ * ```ts
+ * new WebSerialTransport({ ...SHIMMER3_SPP_SERIAL_OPTIONS, bufferSize: 64 * 1024 })
+ * ```
+ *
+ * Works on desktop Chrome/Edge 117+ and — because Android's Web Serial serves
+ * RFCOMM and nothing else — on Android Chrome 138+, where the sensor must be
+ * paired in system settings first. See `describePlatformSupport`.
+ */
+const SHIMMER3_SPP_SERIAL_OPTIONS = Object.freeze({
+    /*
+     * Frozen at every level, not just the outer object. Object.freeze is shallow,
+     * so freezing only the wrapper would still let a JavaScript caller push into
+     * the arrays of a default that every other caller shares.
+     */
+    filters: Object.freeze([Object.freeze({ bluetoothServiceClassId: SHIMMER3_SPP_UUID })]),
+    allowedBluetoothServiceClassIds: Object.freeze([SHIMMER3_SPP_UUID]),
+    kind: 'rfcomm',
+});
 /**
  * Connect-handshake defaults, ported from the timings/sequence in
  * com.shimmerresearch.bluetooth.ShimmerBluetooth.
@@ -15632,8 +15873,15 @@ class VerisenseBleDevice extends BaseShimmerClient {
     // --- Web Serial (USB COM port) connect ---
     async connectSerial(opts = {}) {
         const injected = opts.transport ?? this._injectedTransport;
-        if (!injected && !('serial' in navigator)) {
-            throw new Error('Web Serial not supported. Use Chrome/Edge on HTTPS or http://localhost.');
+        /*
+         * Snapshot first: testing `navigator` directly throws with no global
+         * navigator (Node, React Native), which would make the descriptive error
+         * below unreachable. Verisense docks over a wired USB serial port, never
+         * RFCOMM, so the advice is the wired one.
+         */
+        const serialSupport = describePlatformSupport();
+        if (!injected && !serialSupport.webSerial) {
+            throw new Error(transportAdvice(serialSupport, 'wiredSerial') ?? 'Web Serial is not available.');
         }
         if (this._transportKind === 'ble' && this.device?.gatt?.connected) {
             await this.disconnect();
@@ -19129,5 +19377,5 @@ function verisenseFactoryTestReportToCsvRows(parsed, meta = {}) {
     return [header, values];
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID$1 as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NEED_MORE$1 as NEED_MORE, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC$1 as RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID$1 as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NEED_MORE$1 as NEED_MORE, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC$1 as RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, deviceWriteDivergentRanges, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

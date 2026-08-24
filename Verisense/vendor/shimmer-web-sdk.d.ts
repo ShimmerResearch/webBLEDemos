@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-declare const SDK_VERSION = "0.1.16";
+declare const SDK_VERSION = "0.1.18";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
@@ -156,6 +156,123 @@ declare abstract class BaseShimmerClient implements IShimmerClient {
     abstract startStreaming(): Promise<void>;
     abstract stopStreaming(): Promise<void>;
 }
+
+/**
+ * Which link types this browser can actually reach, and what to tell the user
+ * when it cannot.
+ *
+ * Every consumer of this SDK was hand-writing the same advice — "Web Serial not
+ * supported, use Chrome/Edge on desktop" — in its own words, in six places
+ * across three repos. All six were wrong in the same way once Chrome shipped Web
+ * Serial on Android, so the knowledge lives here once instead.
+ *
+ * The split this module insists on:
+ *
+ * - **Gate on capability.** `webSerial` / `webBluetooth` report whether the API's
+ *   entry point is *callable* — stricter than `'serial' in navigator`, because a
+ *   property that is `null`, a non-object, or an object without the entry point
+ *   satisfies `in` and still throws the moment anything uses it. Whether calling
+ *   would throw is a fact, and that is what a control's enabled state may rest on.
+ * - **Message on platform.** `isAndroid` / `isIOS` come from the user-agent, and
+ *   are used only to choose which words to show. A UA string is a guess, and
+ *   guesses must never decide what a user is allowed to click.
+ *
+ * The awkward case that shaped the API is Android. Chrome 138+ implements Web
+ * Serial there, but deliberately only for Bluetooth RFCOMM port emulation —
+ * wired ports are a separate feature still rolling out. So `navigator.serial` is
+ * present and callable, and `webSerial` is correctly `true`: the API is usable,
+ * but only for RFCOMM. A wired dock still will not appear in the picker, and no
+ * amount of feature detection separates the two. That is why
+ * {@link transportAvailability} returns three states rather than a boolean:
+ * `'unlikely'` is the honest answer for a wired port on Android, and it maps to
+ * "leave the button enabled and warn" rather than "disable", so devices that do
+ * gain wired support are not locked out.
+ *
+ * iOS is the opposite shape — a harder "no" than an unimplemented API. Every iOS
+ * browser is WebKit, which ships neither API, and iOS exposes no
+ * classic-Bluetooth serial access to third-party apps at any layer: Core
+ * Bluetooth is BLE-only, and classic profiles such as SPP require MFi licensing.
+ * So classic Bluetooth there is impossible rather than merely absent, and no
+ * future browser release changes that. BLE via a browser that bundles its own
+ * stack (Bluefy, WebBLE) is the ceiling.
+ */
+/**
+ * The parts of `navigator` this module reads. Injectable so the logic is
+ * testable without a browser — the reason this belongs in the SDK rather than
+ * being copy-pasted into pages, where it could never be unit-tested.
+ */
+interface NavigatorLike {
+    userAgent?: string;
+    userAgentData?: {
+        platform?: string;
+    };
+    maxTouchPoints?: number;
+    serial?: unknown;
+    bluetooth?: unknown;
+}
+/** A link the caller wants to offer, independent of how it is implemented. */
+type TransportNeed = 'ble' | 'classicBluetooth' | 'wiredSerial';
+/**
+ * How likely a {@link TransportNeed} is to work here.
+ *
+ * - `available` — the API is present and unrestricted for this need.
+ * - `unlikely` — the API is present but probably cannot serve this need. Keep the
+ *   control enabled and warn; a hard disable would lock out the devices where it
+ *   does work.
+ * - `unavailable` — the API is absent. Disable the control.
+ */
+type Availability = 'available' | 'unlikely' | 'unavailable';
+interface PlatformSupport {
+    /**
+     * `typeof navigator.serial?.requestPort === 'function'`. Safe to gate on.
+     *
+     * False whenever calling would throw: `serial` missing, `null`, `undefined`, a
+     * non-object, an object without `requestPort`, or a `requestPort` that is not a
+     * function. Note this is a stronger claim than "the property exists" — do not
+     * read it as `'serial' in navigator`.
+     */
+    readonly webSerial: boolean;
+    /**
+     * `typeof navigator.bluetooth?.requestDevice === 'function'`. Safe to gate on.
+     *
+     * False whenever calling would throw: `bluetooth` missing, `null`, `undefined`,
+     * a non-object, an object without `requestDevice`, or a `requestDevice` that is
+     * not a function. All of those satisfy `'bluetooth' in navigator` while still
+     * throwing synchronously on first use, which is why this is the stronger check.
+     */
+    readonly webBluetooth: boolean;
+    /** UA hint. Advice only — never gate on this. */
+    readonly isAndroid: boolean;
+    /** UA hint. Advice only — never gate on this. */
+    readonly isIOS: boolean;
+    /**
+     * Web Serial is present but expected to expose Bluetooth RFCOMM ports only,
+     * so a wired dock will not appear in the picker. True on Android.
+     */
+    readonly serialBluetoothOnly: boolean;
+}
+/**
+ * Snapshot what this browser can reach. Call once and pass the result around;
+ * nothing here changes during a page's lifetime.
+ *
+ * Safe outside a browser — with no `navigator` every capability reads `false`,
+ * so a Node or React Native caller gets "nothing available" rather than a throw.
+ */
+declare function describePlatformSupport(nav?: NavigatorLike): PlatformSupport;
+/**
+ * Whether to offer `need` here — see {@link Availability} for how to map the
+ * three states onto a control's enabled state.
+ */
+declare function transportAvailability(support: PlatformSupport, need: TransportNeed): Availability;
+/**
+ * What to tell the user about `need` on this platform, or `null` when there is
+ * nothing worth saying (the API is present and unrestricted).
+ *
+ * Returning `null` on the happy path is deliberate: it lets a caller write
+ * `const msg = transportAdvice(...); if (msg) log(msg);` without first working
+ * out whether this platform is interesting.
+ */
+declare function transportAdvice(support: PlatformSupport, need: TransportNeed): string | null;
 
 /**
  * Shimmer transport abstraction (Phase 1 refactor).
@@ -389,7 +506,7 @@ interface WebSerialTransportOptions {
     parity?: ParityType;
     flowControl?: FlowControlType;
     /** `requestPort` filters. */
-    filters?: SerialPortFilter[] | null;
+    filters?: readonly SerialPortFilter[] | null;
     /**
      * Service class IDs the port picker is *permitted* to surface Bluetooth
      * (RFCOMM/SPP) ports for — pass `[SHIMMER3_SPP_UUID]` to reach a Shimmer
@@ -406,7 +523,7 @@ interface WebSerialTransportOptions {
      * allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID],
      * ```
      */
-    allowedBluetoothServiceClassIds?: BluetoothServiceClassId[] | null;
+    allowedBluetoothServiceClassIds?: readonly BluetoothServiceClassId[] | null;
     /**
      * Read buffer size handed to `port.open`. Defaults to the browser's own
      * default (8 KiB in Chrome); raise it for bulk transfers so a slow turn of
@@ -469,6 +586,18 @@ declare class WebSerialTransport implements ShimmerTransport {
     constructor(opts?: WebSerialTransportOptions);
     /** The underlying serial port, once opened. */
     get port(): SerialPort | null;
+    /**
+     * Which kind of link this transport was configured to open, for choosing the
+     * right advice when Web Serial is missing.
+     *
+     * Deliberately not `this._allowedBluetoothServiceClassIds ? ... : ...`: an
+     * empty array is truthy, so `allowedBluetoothServiceClassIds: []` would be
+     * called Bluetooth, and a caller who passed only a `bluetoothServiceClassId`
+     * filter without the permission would be told about a wired dock. Both cases
+     * would hand the user advice for the wrong link - most visibly on iOS, where
+     * the two messages differ in kind rather than in wording.
+     */
+    private _need;
     connect(): Promise<void>;
     /**
      * `port.open()`, bounded by {@link WebSerialTransportOptions.openTimeoutMs}.
@@ -2549,6 +2678,34 @@ declare function shimmer3ControlMessageLength(buf: Uint8Array): number;
  * are genuinely Shimmer3-classic-specific live here.
  */
 
+/**
+ * The `WebSerialTransport` options that reach a Shimmer over classic Bluetooth.
+ *
+ * Both Bluetooth fields are required and they do different jobs, which is the
+ * whole reason this is a constant rather than something each caller assembles:
+ * `allowedBluetoothServiceClassIds` only *permits* Bluetooth ports to appear at
+ * all, while `filters` is what *narrows* the picker to Shimmers. Supply the
+ * permission alone and the picker lists every serial port and every paired
+ * Bluetooth device, which is unusable — a mistake that has been made once
+ * already, in the demos this constant replaces.
+ *
+ * Spread it and add whatever the call site needs on top:
+ *
+ * ```ts
+ * new WebSerialTransport({ ...SHIMMER3_SPP_SERIAL_OPTIONS, bufferSize: 64 * 1024 })
+ * ```
+ *
+ * Works on desktop Chrome/Edge 117+ and — because Android's Web Serial serves
+ * RFCOMM and nothing else — on Android Chrome 138+, where the sensor must be
+ * paired in system settings first. See `describePlatformSupport`.
+ */
+declare const SHIMMER3_SPP_SERIAL_OPTIONS: Readonly<{
+    readonly filters: readonly Readonly<{
+        bluetoothServiceClassId: "00001101-0000-1000-8000-00805f9b34fb";
+    }>[];
+    readonly allowedBluetoothServiceClassIds: readonly string[];
+    readonly kind: "rfcomm";
+}>;
 /**
  * Connect-handshake defaults, ported from the timings/sequence in
  * com.shimmerresearch.bluetooth.ShimmerBluetooth.
@@ -7910,5 +8067,5 @@ declare function parseVerisenseFactoryTestReport(text: string): VerisenseFactory
  */
 declare function verisenseFactoryTestReportToCsvRows(parsed: VerisenseFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NEED_MORE$2 as NEED_MORE, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC$2 as RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE as WIRED_NEED_MORE, RESYNC as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describeVerisenseChargerStatus, deviceWriteDivergentRanges, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BrandRecord, BrandRecordFields, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemContext, InfoMemDeviceConfig, InfoMemLayout, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NEED_MORE$2 as NEED_MORE, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC$2 as RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE as WIRED_NEED_MORE, RESYNC as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, deviceWriteDivergentRanges, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BrandRecord, BrandRecordFields, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemContext, InfoMemDeviceConfig, InfoMemLayout, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, NavigatorLike, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
