@@ -218,9 +218,16 @@ type TransportNeed = 'ble' | 'classicBluetooth' | 'wiredSerial';
  */
 type Availability = 'available' | 'unlikely' | 'unavailable';
 interface PlatformSupport {
-    /** `'serial' in navigator`. Capability, safe to gate on. */
+    /**
+     * `navigator.serial.requestPort` is callable. Safe to gate on — false for a
+     * `serial` that is missing, `null`, or present without the entry point.
+     */
     readonly webSerial: boolean;
-    /** `'bluetooth' in navigator`. Capability, safe to gate on. */
+    /**
+     * `navigator.bluetooth.requestDevice` is callable. Safe to gate on — false for
+     * a `bluetooth` that is missing, `null`, or present without the entry point,
+     * all of which would otherwise throw synchronously on first use.
+     */
     readonly webBluetooth: boolean;
     /** UA hint. Advice only — never gate on this. */
     readonly isAndroid: boolean;

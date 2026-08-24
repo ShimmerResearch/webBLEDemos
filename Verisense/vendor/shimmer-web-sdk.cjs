@@ -143,6 +143,20 @@ function readNavigator(nav) {
     return g.navigator ?? {};
 }
 /**
+ * Whether an API entry point is actually callable.
+ *
+ * Deliberately stricter than "the property exists". A `navigator.bluetooth` that
+ * is `null`, or an object without `requestDevice`, satisfies `'bluetooth' in
+ * navigator` while still throwing a synchronous TypeError the moment anything
+ * calls it — so treating the property's presence as the capability hands callers
+ * a flag they cannot safely gate on, which is the entire job of these fields.
+ * Reported as unavailable instead: an API that cannot be called is, for every
+ * purpose here, absent.
+ */
+function callable(api, method) {
+    return typeof api?.[method] === 'function';
+}
+/**
  * Snapshot what this browser can reach. Call once and pass the result around;
  * nothing here changes during a page's lifetime.
  *
@@ -160,10 +174,10 @@ function describePlatformSupport(nav) {
      * with a stray touch-capable peripheral.
      */
     const isIOS = /iPad|iPhone|iPod/.test(ua) || (/Mac/.test(ua) && (n.maxTouchPoints ?? 0) > 1);
-    const webSerial = 'serial' in n && n.serial !== undefined;
+    const webSerial = callable(n.serial, 'requestPort');
     return {
         webSerial,
-        webBluetooth: 'bluetooth' in n && n.bluetooth !== undefined,
+        webBluetooth: callable(n.bluetooth, 'requestDevice'),
         isAndroid,
         isIOS,
         serialBluetoothOnly: webSerial && isAndroid,
