@@ -169,7 +169,7 @@
       <button
         id="btnConnectBt"
         class="secondary"
-        title="Requires the sensor to be paired with this PC over classic Bluetooth"
+        title="Requires the sensor to be paired with this host over classic Bluetooth"
       >
         Connect Classic Bluetooth
       </button>
@@ -557,7 +557,7 @@
           );
         }
         hints.push(
-          "also check the sensor is paired with this PC, powered, in range, and not held open by another app (e.g. Consensys)",
+          "also check the sensor is paired with this host, powered, in range, and not held open by another app (e.g. Consensys)",
         );
         return hints;
       }
@@ -691,7 +691,7 @@
         if (deleteAfterVerify) {
           // Deleting is the default, so state the scope rather than showing a
           // generic warning that is easy to click through. Counts come from the
-          // last card listing; only files verified on this PC are deleted.
+          // last card listing; only files verified on this host are deleted.
           const doomed = (tree?.files ?? []).filter((f) =>
             rootPaths.some((r) => f.path === r || f.path.startsWith(r + "/")),
           );
