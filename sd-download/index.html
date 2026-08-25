@@ -474,8 +474,17 @@
           log(`connecting over ${linkName}…`);
           await client.connect();
           /* Before anything else can fail: identifying what we connected to is
-           * worth more than the rest of the session when a link misbehaves. */
-          afterConnect?.();
+           * worth more than the rest of the session when a link misbehaves.
+           * Diagnostic only, so a failure inside the hook is logged and never
+           * allowed to tear down the connection it is reporting on. */
+          try {
+            await afterConnect?.();
+          } catch (hookErr) {
+            log(
+              `post-connect diagnostics failed: ${hookErr?.message ?? hookErr}`,
+              true,
+            );
+          }
           setConnected(true);
 
           sdSupported = await client.supportsSdTransfer();
@@ -603,9 +612,14 @@
                 (isSpp ? " (standard SPP)" : " — NOT standard SPP"),
               !isSpp,
             );
+          } else {
+            log(
+              "port reports no Bluetooth service class — not an RFCOMM port (a wired serial port may have been picked)",
+              true,
+            );
           }
         } catch (e) {
-          log(`port.getInfo() failed: ${e.message}`, true);
+          log(`port.getInfo() failed: ${e?.message ?? e}`, true);
         }
       }
 
