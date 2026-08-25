@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-declare const SDK_VERSION = "0.1.19";
+declare const SDK_VERSION = "0.1.21";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
