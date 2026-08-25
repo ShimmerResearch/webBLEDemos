@@ -258,6 +258,7 @@
         Shimmer3RClient,
         WebSerialTransport,
         SHIMMER3_SPP_SERIAL_OPTIONS,
+        SHIMMER3_SPP_UUID,
         describePlatformSupport,
         transportAdvice,
         enumerateSdTree,
@@ -466,12 +467,24 @@
        * `makeClient` builds the client so the two buttons differ only in which
        * transport they hand over.
        */
-      async function connectVia(linkName, makeClient) {
+      async function connectVia(linkName, makeClient, afterConnect) {
         try {
           client = makeClient();
           client.onStatus = (s) => log(s);
           log(`connecting over ${linkName}…`);
           await client.connect();
+          /* Before anything else can fail: identifying what we connected to is
+           * worth more than the rest of the session when a link misbehaves.
+           * Diagnostic only, so a failure inside the hook is logged and never
+           * allowed to tear down the connection it is reporting on. */
+          try {
+            await afterConnect?.();
+          } catch (hookErr) {
+            log(
+              `post-connect diagnostics failed: ${hookErr?.message ?? hookErr}`,
+              true,
+            );
+          }
           setConnected(true);
 
           sdSupported = await client.supportsSdTransfer();
@@ -573,19 +586,59 @@
        *
        * The client re-frames the byte stream itself (an unframed transport
        * reports capabilities.framed === false), so nothing else changes. */
+      /* Held so the connect path can read back what the browser actually opened -
+       * see logPortIdentity. */
+      let btTransport = null;
+
+      /* What the picker really gave us. getInfo() reports the RFCOMM service
+       * class the port was matched on, which is the one fact that tells you why a
+       * paired sensor did or did not appear: if this is not
+       * 00001101-0000-1000-8000-00805f9b34fb then the sensor exposes a
+       * non-standard service class, and SHIMMER3_SPP_SERIAL_OPTIONS is filtering
+       * on the wrong UUID. Cheap to log every time and useless to guess at
+       * afterwards. */
+      function logPortIdentity(transport) {
+        const port = transport?.port;
+        if (!port?.getInfo) return;
+        try {
+          const info = port.getInfo();
+          log(`port: ${JSON.stringify(info)}`);
+          if (info.bluetoothServiceClassId) {
+            const isSpp =
+              String(info.bluetoothServiceClassId).toLowerCase() ===
+              SHIMMER3_SPP_UUID.toLowerCase();
+            log(
+              `service class ${info.bluetoothServiceClassId}` +
+                (isSpp ? " (standard SPP)" : " — NOT standard SPP"),
+              !isSpp,
+            );
+          } else {
+            log(
+              "port reports no Bluetooth service class — not an RFCOMM port (a wired serial port may have been picked)",
+              true,
+            );
+          }
+        } catch (e) {
+          log(`port.getInfo() failed: ${e?.message ?? e}`, true);
+        }
+      }
+
       $("btnConnectBt").onclick = () =>
         connectVia(
           "classic Bluetooth",
-          () =>
-            new Shimmer3RClient({
+          () => {
+            btTransport = new WebSerialTransport({
+              ...SHIMMER3_SPP_SERIAL_OPTIONS,
+              /* Bulk transfer: a generous read buffer keeps a slow turn of the
+               * read loop from stalling the sender. */
+              bufferSize: 64 * 1024,
+            });
+            return new Shimmer3RClient({
               debug: false,
-              transport: new WebSerialTransport({
-                ...SHIMMER3_SPP_SERIAL_OPTIONS,
-                /* Bulk transfer: a generous read buffer keeps a slow turn of the
-                 * read loop from stalling the sender. */
-                bufferSize: 64 * 1024,
-              }),
-            }),
+              transport: btTransport,
+            });
+          },
+          () => logPortIdentity(btTransport),
         );
 
       $("btnDisconnect").onclick = async () => {
