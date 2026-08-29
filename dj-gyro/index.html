@@ -1,0 +1,2414 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <!-- Google tag (gtag.js) -->
+    <script
+      async
+      src="https://www.googletagmanager.com/gtag/js?id=G-T26GWN0LJW"
+    ></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag() {
+        dataLayer.push(arguments);
+      }
+      gtag("js", new Date());
+      gtag("config", "G-T26GWN0LJW");
+    </script>
+
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DJ Gyro — Shimmer3R Turntable</title>
+    <style>
+      :root {
+        --neon: #00e5ff;
+        --neon2: #ff2ea6;
+        --panel: rgba(10, 12, 20, 0.82);
+        --border: rgba(0, 229, 255, 0.35);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #05060a;
+        color: #eaf6ff;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        overflow: hidden;
+      }
+
+      #stage {
+        position: fixed;
+        inset: 0;
+      }
+      #stage canvas {
+        display: block;
+      }
+
+      /* ---------- Top control bar ---------- */
+      #controls {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+        padding: 10px;
+        background: linear-gradient(
+          180deg,
+          rgba(5, 6, 10, 0.92),
+          rgba(5, 6, 10, 0.55) 80%,
+          transparent
+        );
+        z-index: 20;
+      }
+
+      button {
+        padding: 9px 14px;
+        font-size: 14px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        cursor: pointer;
+        color: #fff;
+        background: #1b2130;
+        transition:
+          transform 0.08s ease,
+          box-shadow 0.15s ease,
+          background 0.15s ease;
+      }
+      button:hover:not(:disabled) {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 14px rgba(0, 229, 255, 0.25);
+      }
+      button:disabled {
+        opacity: 0.38;
+        cursor: not-allowed;
+      }
+
+      #scanBtn {
+        background: #1565c0;
+      }
+      #disconnectBtn {
+        background: #b3362b;
+      }
+      #autoDjBtn {
+        background: #6a1b9a;
+      }
+      #motorBtn {
+        background: #37474f;
+      }
+      #motorBtn.on {
+        background: #00838f;
+        box-shadow: 0 0 14px rgba(0, 229, 255, 0.55);
+      }
+      #autoDjBtn.on {
+        background: #ab1fd6;
+        box-shadow: 0 0 14px rgba(255, 46, 166, 0.55);
+      }
+      #recordBtn {
+        background: #5d1f1f;
+        font-variant-numeric: tabular-nums;
+      }
+      #recordBtn.on {
+        background: #d32f2f;
+        box-shadow: 0 0 14px rgba(255, 80, 80, 0.6);
+      }
+
+      #controls select {
+        padding: 9px 10px;
+        font-size: 14px;
+        border-radius: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        background: #1b2130;
+        color: #fff;
+        cursor: pointer;
+      }
+      #controls select:hover:not(:disabled) {
+        box-shadow: 0 4px 14px rgba(0, 229, 255, 0.25);
+      }
+      #controls select:disabled {
+        opacity: 0.38;
+        cursor: not-allowed;
+      }
+
+      #deviceName {
+        margin: 0 6px;
+        font-size: 13px;
+        color: #9fb8c9;
+        white-space: nowrap;
+      }
+
+      /* ---------- Console ---------- */
+      #consoleOutput {
+        position: fixed;
+        left: 12px;
+        bottom: 12px;
+        width: min(420px, 44vw);
+        background: var(--panel);
+        color: #47ff9a;
+        padding: 8px 10px;
+        font-family: Consolas, monospace;
+        font-size: 12px;
+        border: 1px solid rgba(71, 255, 154, 0.3);
+        border-radius: 8px;
+        line-height: 1.45em;
+        max-height: calc(1.45em * 4 + 16px);
+        overflow-y: auto;
+        z-index: 20;
+        backdrop-filter: blur(6px);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      /* ---------- Right HUD ---------- */
+      #hud {
+        position: fixed;
+        right: 12px;
+        top: 64px;
+        width: 218px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 14px;
+        z-index: 20;
+        backdrop-filter: blur(6px);
+      }
+
+      .hudTitle {
+        font-size: 11px;
+        letter-spacing: 2.5px;
+        color: var(--neon);
+        text-transform: uppercase;
+        margin-bottom: 8px;
+      }
+
+      .readout {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin: 3px 0;
+        font-size: 13px;
+        color: #9fb8c9;
+      }
+      .readout b {
+        font-family: Consolas, monospace;
+        font-size: 17px;
+        color: #fff;
+        font-variant-numeric: tabular-nums;
+      }
+      .readout b.hot {
+        color: var(--neon2);
+      }
+
+      #gyroBarWrap {
+        height: 10px;
+        margin: 8px 0 4px;
+        background: #0b0e16;
+        border-radius: 5px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        position: relative;
+        overflow: hidden;
+      }
+      #gyroBar {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 50%;
+        width: 0;
+        background: linear-gradient(90deg, var(--neon), var(--neon2));
+        border-radius: 5px;
+      }
+      #gyroBarWrap::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: -2px;
+        bottom: -2px;
+        width: 1px;
+        background: rgba(255, 255, 255, 0.45);
+      }
+
+      .sliderRow {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #9fb8c9;
+      }
+      .sliderRow label {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 3px;
+      }
+      input[type="range"] {
+        width: 100%;
+        accent-color: var(--neon);
+      }
+
+      .checkRow {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 10px;
+        font-size: 12px;
+        color: #9fb8c9;
+      }
+
+      #zeroBtn {
+        width: 100%;
+        margin-top: 10px;
+        padding: 7px;
+        font-size: 12px;
+        background: #23304a;
+      }
+
+      #hintBar {
+        position: fixed;
+        bottom: 12px;
+        right: 12px;
+        max-width: 320px;
+        text-align: right;
+        font-size: 12px;
+        color: #6f8797;
+        z-index: 20;
+        text-shadow: 0 1px 3px #000;
+      }
+
+      /* ---------- Intro overlay ---------- */
+      #introOverlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(3, 4, 8, 0.9);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 100;
+        overflow-y: auto;
+      }
+      .introContent {
+        max-width: 540px;
+        margin: 20px;
+        padding: 26px 30px;
+        background: #0c0f18;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        font-size: 15px;
+        box-shadow: 0 0 60px rgba(0, 229, 255, 0.18);
+      }
+      .introContent h2 {
+        margin: 0 0 4px;
+        font-size: 26px;
+        background: linear-gradient(90deg, var(--neon), var(--neon2));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .introContent .sub {
+        color: #7e97a8;
+        font-size: 13px;
+        margin-bottom: 14px;
+      }
+      .introContent ul {
+        padding-left: 20px;
+        margin: 10px 0;
+      }
+      .introContent li {
+        margin: 6px 0;
+        color: #c8dceb;
+      }
+      .btnHint {
+        background: #232c3f;
+        padding: 2px 7px;
+        border-radius: 5px;
+        font-family: Consolas, monospace;
+        font-size: 13px;
+        color: var(--neon);
+      }
+      .reqBox {
+        background: #101522;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        padding: 8px 14px;
+        font-size: 13px;
+        color: #9fb8c9;
+        margin-top: 12px;
+      }
+      #closeIntroBtn {
+        margin-top: 16px;
+        width: 100%;
+        padding: 12px;
+        font-size: 16px;
+        background: linear-gradient(90deg, #007a8f, #8f1264);
+        border: none;
+      }
+      .dontShowRow {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 12px;
+        font-size: 13px;
+        color: #9fb8c9;
+      }
+
+      #toast {
+        display: none;
+        position: fixed;
+        bottom: 90px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: #141a28;
+        color: #fff;
+        padding: 12px 22px;
+        border: 1px solid var(--neon2);
+        border-radius: 10px;
+        font-size: 14px;
+        z-index: 50;
+        box-shadow: 0 0 24px rgba(255, 46, 166, 0.35);
+      }
+
+      @media (max-width: 760px) {
+        #hud {
+          width: 178px;
+          top: 108px;
+          padding: 10px;
+        }
+        #consoleOutput {
+          width: min(320px, 60vw);
+        }
+        #hintBar {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+
+    <!-- ================= Intro overlay ================= -->
+    <div id="introOverlay">
+      <div class="introContent">
+        <h2>🎧 DJ GYRO</h2>
+        <div class="sub">
+          A 3D turntable driven by your Shimmer3R's Z-axis gyroscope
+        </div>
+        <ul>
+          <li>
+            <strong>Connect:</strong> pick a gyro range, then hit
+            <span class="btnHint">🔍 Scan &amp; Play</span> — it connects,
+            configures and starts streaming in one go.
+          </li>
+          <li>
+            <strong>Hold the Shimmer3R flat</strong> (like a record) and twist
+            it around its <strong>Z-axis</strong> — the vinyl follows your hand
+            1:1. Twist fast to scratch, hold still to stop the record.
+          </li>
+          <li>
+            <strong>Motor:</strong>
+            <span class="btnHint">🎚️ Motor 33⅓</span> keeps the record grooving
+            at 33⅓ RPM whenever your hand is off it.
+          </li>
+          <li>
+            <strong>No device?</strong> Drag the record with your mouse/finger,
+            or hit <span class="btnHint">🤖 Auto-DJ</span> to watch it scratch
+            itself.
+          </li>
+          <li>
+            <strong>The crate:</strong> three original tracks — funk, boom bap
+            and house — all synthesized in your browser, 100% royalty-free. Swap
+            records with the <span class="btnHint">💿</span> selector.
+          </li>
+          <li>
+            <strong>Record your set:</strong>
+            <span class="btnHint">⏺ Record</span> captures everything you hear
+            and saves it as a WAV when you stop.
+          </li>
+        </ul>
+        <div class="reqBox">
+          <strong>Requirements:</strong> Shimmer3R · Firmware ≥
+          <code>v1.0.22</code> · Chrome/Edge (Web Bluetooth)
+        </div>
+        <div class="dontShowRow">
+          <input type="checkbox" id="dontShowAgain" />
+          <label for="dontShowAgain">Don't show this again</label>
+        </div>
+        <button id="closeIntroBtn">🔊 Drop the needle</button>
+      </div>
+    </div>
+
+    <!-- ================= Controls ================= -->
+    <div id="controls">
+      <select
+        id="gyroRangeSelect"
+        title="Gyro range — applied when you press Scan"
+      >
+        <option value="0">Gyro ±125 °/s</option>
+        <option value="1">Gyro ±250 °/s</option>
+        <option value="2" selected>Gyro ±500 °/s</option>
+        <option value="3">Gyro ±1000 °/s</option>
+        <option value="4">Gyro ±2000 °/s</option>
+        <option value="5">Gyro ±4000 °/s</option>
+      </select>
+      <button id="scanBtn">🔍 Scan &amp; Play</button>
+      <button id="disconnectBtn" disabled>❌ Disconnect</button>
+      <button id="motorBtn">🎚️ Motor 33⅓</button>
+      <button id="autoDjBtn">🤖 Auto-DJ</button>
+      <select id="trackSelect" title="Pick a record from the crate"></select>
+      <button id="recordBtn">⏺ Record</button>
+      <button id="showTipBtn">💡 Help</button>
+      <p id="deviceName">No device selected</p>
+    </div>
+
+    <!-- ================= HUD ================= -->
+    <div id="hud">
+      <div class="hudTitle" id="deckTitle">Deck A · Shimmer Funk Break</div>
+      <div class="readout">
+        <span>Platter</span><b id="rpmVal">0.0</b
+        ><span style="font-size: 11px">RPM</span>
+      </div>
+      <div class="readout">
+        <span>Pitch</span><b id="pitchVal">—</b
+        ><span style="font-size: 11px">%</span>
+      </div>
+      <div class="readout">
+        <span>Gyro Z</span><b id="gyroVal">0</b
+        ><span style="font-size: 11px">°/s</span>
+      </div>
+      <div id="gyroBarWrap"><div id="gyroBar"></div></div>
+
+      <div class="sliderRow">
+        <label
+          ><span>Scratch sensitivity</span><span id="sensVal">1.0×</span></label
+        >
+        <input
+          type="range"
+          id="sensSlider"
+          min="0.1"
+          max="4"
+          step="0.05"
+          value="1"
+        />
+      </div>
+      <div class="sliderRow">
+        <label
+          ><span>Grab threshold</span><span id="grabVal">30 °/s</span></label
+        >
+        <input
+          type="range"
+          id="grabSlider"
+          min="5"
+          max="80"
+          step="1"
+          value="30"
+        />
+      </div>
+      <div class="sliderRow">
+        <label><span>Volume</span><span id="volVal">80%</span></label>
+        <input
+          type="range"
+          id="volSlider"
+          min="0"
+          max="100"
+          step="1"
+          value="80"
+        />
+      </div>
+      <div class="checkRow">
+        <input type="checkbox" id="invertChk" />
+        <label for="invertChk">Invert direction</label>
+      </div>
+      <button id="zeroBtn">🎯 Re-zero gyro</button>
+    </div>
+
+    <pre id="consoleOutput"></pre>
+    <div id="hintBar">
+      🖱️ Drag the record to scratch · Click the deck's START/STOP button · Space
+      = motor · Drag empty space to orbit
+    </div>
+    <div id="toast"></div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+      import {
+        Shimmer3RClient,
+        SensorBitmapShimmer3,
+      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+
+      // =====================================================================
+      //  Constants & shared state
+      // =====================================================================
+      const NOMINAL_RPM = 100 / 3; // 33⅓ RPM
+      const NOMINAL_REVS = NOMINAL_RPM / 60; // rev/s at pitch 0
+      // Hand-on/off hysteresis: the hand "grabs" the record above the grab
+      // threshold (HUD slider, ui.grabDps) and only "lets go" after staying
+      // below 40% of it for a short hold — micro-tremor can't grab the record
+      // or pin it near zero.
+      const GYRO_HAND_OFF_RATIO = 0.4;
+      const GYRO_HAND_OFF_MS = 90;
+      // Post-scratch recovery: the motor never stopped, so the platter grabs
+      // the record through the slipmat — constant accel, lands exactly on pitch 0
+      const MOTOR_RECOVERY_ACCEL = 2.5; // rev/s² (~0.22 s from a dead stop)
+
+      // Shimmer3R (LSM6DSV) gyro ranges — index = SET_GYRO_RANGE value,
+      // sensitivities from the Shimmer C# API default calibration matrices
+      const GYRO_RANGES = [
+        { dps: 125, lsbPerDps: 229 },
+        { dps: 250, lsbPerDps: 114 },
+        { dps: 500, lsbPerDps: 57 },
+        { dps: 1000, lsbPerDps: 29 },
+        { dps: 2000, lsbPerDps: 14 },
+        { dps: 4000, lsbPerDps: 7 },
+      ];
+
+      const state = {
+        platterVel: 0, // rev/s, signed
+        platterAngle: 0, // revs, unwrapped
+        motorOn: false,
+        // gyro
+        gyroDps: 0, // latest bias-corrected, smoothed °/s
+        gyroRaw: 0,
+        gyroBias: 0,
+        gyroLsbPerDps: GYRO_RANGES[2].lsbPerDps, // ±500 dps default
+        gyroRangeDps: GYRO_RANGES[2].dps,
+        biasSamples: [],
+        calibrated: false,
+        lastGyroAt: 0, // ms timestamp of last frame (stale detection)
+        handOn: false, // hysteresis: is the hand currently on the record?
+        handOffSince: 0, // ms timestamp when gyro first dropped below the OFF threshold
+        // pointer scratch
+        pointerOn: false,
+        pointerVel: 0, // rev/s
+        // auto dj
+        autoDj: false,
+        autoT: 0,
+        // audio
+        loopPos: 0, // 0..1 playhead within the loop (from worklet)
+        audioLevel: 0,
+        spectrum: new Uint8Array(0),
+        streaming: false,
+        // record crate
+        trackIndex: 0,
+        swapping: false, // record-swap animation in progress
+      };
+
+      const ui = {
+        sensitivity: 1,
+        invert: false,
+        volume: 0.8,
+        grabDps: 30, // gyro °/s above which the hand grabs the record
+      };
+
+      // =====================================================================
+      //  Console / toast helpers
+      // =====================================================================
+      const consoleEl = document.getElementById("consoleOutput");
+      // A kiosk/Auto-DJ session can run for hours, so keep only the tail rather
+      // than growing one unbounded string.
+      const CONSOLE_MAX_CHARS = 20000;
+      function log(t) {
+        let text = consoleEl.textContent + t + "\n";
+        if (text.length > CONSOLE_MAX_CHARS) {
+          text = text.slice(text.length - CONSOLE_MAX_CHARS);
+          // Drop the partial first line so the view never starts mid-message.
+          const nl = text.indexOf("\n");
+          if (nl !== -1) text = text.slice(nl + 1);
+        }
+        consoleEl.textContent = text;
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      }
+      function toast(msg, ms = 2600) {
+        const el = document.getElementById("toast");
+        el.textContent = msg;
+        el.style.display = "block";
+        clearTimeout(toast._t);
+        toast._t = setTimeout(() => {
+          el.style.display = "none";
+        }, ms);
+      }
+
+      // =====================================================================
+      //  AUDIO — original in-browser record crate + signed-rate scratch player
+      // =====================================================================
+      const STEPS = 16;
+
+      let audioCtx = null,
+        workletNode = null,
+        rateParam = null,
+        recorderNode = null,
+        masterGain = null,
+        analyser = null,
+        audioReady = false,
+        audioStarting = false;
+
+      const midi = (n) => 440 * Math.pow(2, (n - 69) / 12);
+      // MIDI note numbers used by the patterns
+      const N = {
+        E1: 28,
+        G1: 31,
+        A1: 33,
+        B1: 35,
+        C2: 36,
+        D2: 38,
+        E2: 40,
+        G2: 43,
+        A2: 45,
+        E3: 52,
+        G3: 55,
+        A3: 57,
+        B3: 59,
+        C4: 60,
+        D4: 62,
+        E4: 64,
+        G4: 67,
+      };
+
+      // ---- the crate ------------------------------------------------------
+      const TRACKS = [
+        {
+          name: "Shimmer Funk Break",
+          genre: "FUNK",
+          bpm: 100,
+          bars: 8,
+          crackle: 0.5,
+          labelA: "#ff4db8",
+          labelB: "#b8177c",
+          labelC: "#6e0b52",
+          pattern: funkPattern,
+        },
+        {
+          name: "Dusty Crate Theory",
+          genre: "BOOM BAP",
+          bpm: 90,
+          bars: 8,
+          crackle: 1.0,
+          labelA: "#ffd24d",
+          labelB: "#c78a17",
+          labelC: "#6e460b",
+          pattern: boomBapPattern,
+        },
+        {
+          name: "Warehouse 33",
+          genre: "HOUSE",
+          bpm: 124,
+          bars: 8,
+          crackle: 0.25,
+          labelA: "#4dffa1",
+          labelB: "#17b869",
+          labelC: "#0b6e3c",
+          pattern: housePattern,
+        },
+      ];
+      const trackLoopSeconds = (t) => t.bars * 4 * (60 / t.bpm);
+
+      function composeTrack(off, track) {
+        const sps = 60 / track.bpm / 4; // seconds per 16th step
+        const out = off.createDynamicsCompressor();
+        out.threshold.value = -14;
+        out.knee.value = 20;
+        out.ratio.value = 5;
+        out.attack.value = 0.004;
+        out.release.value = 0.18;
+        out.connect(off.destination);
+
+        const bus = off.createGain();
+        bus.gain.value = 0.9;
+        bus.connect(out);
+
+        const at = (bar, step) => (bar * STEPS + step) * sps;
+
+        // --- instruments -------------------------------------------------
+        function kick(t, vel = 1) {
+          const o = off.createOscillator(),
+            g = off.createGain();
+          o.type = "sine";
+          o.frequency.setValueAtTime(165, t);
+          o.frequency.exponentialRampToValueAtTime(44, t + 0.11);
+          g.gain.setValueAtTime(0.95 * vel, t);
+          g.gain.exponentialRampToValueAtTime(0.001, t + 0.34);
+          o.connect(g);
+          g.connect(bus);
+          o.start(t);
+          o.stop(t + 0.36);
+        }
+
+        function noiseBurst(t, dur, filterType, freq, q, vel) {
+          const len = Math.ceil(dur * off.sampleRate);
+          const buf = off.createBuffer(1, len, off.sampleRate);
+          const d = buf.getChannelData(0);
+          for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+          const src = off.createBufferSource();
+          src.buffer = buf;
+          const f = off.createBiquadFilter();
+          f.type = filterType;
+          f.frequency.value = freq;
+          f.Q.value = q;
+          const g = off.createGain();
+          g.gain.setValueAtTime(vel, t);
+          g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+          src.connect(f);
+          f.connect(g);
+          g.connect(bus);
+          src.start(t);
+          src.stop(t + dur);
+        }
+
+        function snare(t, vel = 1) {
+          noiseBurst(t, 0.19, "bandpass", 1900, 0.9, 0.55 * vel);
+          const o = off.createOscillator(),
+            g = off.createGain();
+          o.type = "triangle";
+          o.frequency.value = 196;
+          g.gain.setValueAtTime(0.42 * vel, t);
+          g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+          o.connect(g);
+          g.connect(bus);
+          o.start(t);
+          o.stop(t + 0.1);
+        }
+
+        const hatClosed = (t, vel) =>
+          noiseBurst(t, 0.045, "highpass", 8200, 0.7, 0.3 * vel);
+        const hatOpen = (t, vel) =>
+          noiseBurst(t, 0.28, "highpass", 7600, 0.7, 0.22 * vel);
+
+        function clap(t, vel = 1) {
+          for (const d of [0, 0.012, 0.026])
+            noiseBurst(t + d, 0.13, "bandpass", 1500, 1.2, 0.28 * vel);
+        }
+
+        function bass(t, note, dur, vel = 1) {
+          const o = off.createOscillator(),
+            f = off.createBiquadFilter(),
+            g = off.createGain();
+          o.type = "sawtooth";
+          o.frequency.value = midi(note);
+          f.type = "lowpass";
+          f.Q.value = 6;
+          f.frequency.setValueAtTime(900, t);
+          f.frequency.exponentialRampToValueAtTime(
+            220,
+            t + Math.min(0.18, dur),
+          );
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.linearRampToValueAtTime(0.5 * vel, t + 0.008);
+          g.gain.setValueAtTime(0.5 * vel, t + dur * 0.7);
+          g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+          o.connect(f);
+          f.connect(g);
+          g.connect(bus);
+          o.start(t);
+          o.stop(t + dur + 0.02);
+        }
+
+        // Deep sine/triangle sub — boom-bap low end
+        function subBass(t, note, dur, vel = 1) {
+          const o = off.createOscillator(),
+            g = off.createGain();
+          o.type = "triangle";
+          o.frequency.value = midi(note);
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.linearRampToValueAtTime(0.62 * vel, t + 0.02);
+          g.gain.setValueAtTime(0.62 * vel, t + dur * 0.6);
+          g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+          o.connect(g);
+          g.connect(bus);
+          o.start(t);
+          o.stop(t + dur + 0.02);
+        }
+
+        // Resonant squelchy saw — house/acid low end
+        function acidBass(t, note, dur, vel = 1) {
+          const o = off.createOscillator(),
+            f = off.createBiquadFilter(),
+            g = off.createGain();
+          o.type = "sawtooth";
+          o.frequency.value = midi(note);
+          f.type = "lowpass";
+          f.Q.value = 13;
+          f.frequency.setValueAtTime(2300, t);
+          f.frequency.exponentialRampToValueAtTime(150, t + dur);
+          g.gain.setValueAtTime(0.38 * vel, t);
+          g.gain.setValueAtTime(0.38 * vel, t + dur * 0.7);
+          g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+          o.connect(f);
+          f.connect(g);
+          g.connect(bus);
+          o.start(t);
+          o.stop(t + dur + 0.02);
+        }
+
+        function clav(t, notes, vel = 1) {
+          for (const n of notes) {
+            const o = off.createOscillator(),
+              f = off.createBiquadFilter(),
+              g = off.createGain();
+            o.type = "square";
+            o.frequency.value = midi(n);
+            f.type = "bandpass";
+            f.frequency.value = midi(n) * 2.4;
+            f.Q.value = 1.6;
+            g.gain.setValueAtTime(0.16 * vel, t);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
+            o.connect(f);
+            f.connect(g);
+            g.connect(bus);
+            o.start(t);
+            o.stop(t + 0.13);
+          }
+        }
+
+        // Big chord stab — the classic thing to scratch
+        function stab(t, notes, vel = 1) {
+          for (const n of notes) {
+            const o = off.createOscillator(),
+              f = off.createBiquadFilter(),
+              g = off.createGain();
+            o.type = "sawtooth";
+            o.frequency.value = midi(n);
+            o.detune.value = ((n % 3) - 1) * 6;
+            f.type = "lowpass";
+            f.Q.value = 2;
+            f.frequency.setValueAtTime(5200, t);
+            f.frequency.exponentialRampToValueAtTime(500, t + 0.4);
+            g.gain.setValueAtTime(0.14 * vel, t);
+            g.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+            o.connect(f);
+            f.connect(g);
+            g.connect(bus);
+            o.start(t);
+            o.stop(t + 0.52);
+          }
+        }
+
+        // --- arrangement — delegated to the track's pattern ----------------
+        const kit = {
+          kick,
+          snare,
+          hatClosed,
+          hatOpen,
+          clap,
+          bass,
+          subBass,
+          acidBass,
+          clav,
+          stab,
+        };
+        track.pattern(kit, at, sps, track.bars);
+
+        // Vinyl crackle baked into the loop so it scratches with the record
+        {
+          const len = Math.ceil(trackLoopSeconds(track) * off.sampleRate);
+          const buf = off.createBuffer(1, len, off.sampleRate);
+          const d = buf.getChannelData(0);
+          for (let i = 0; i < len; i++) {
+            if (Math.random() < 0.00012) d[i] = (Math.random() * 2 - 1) * 0.5;
+            d[i] += (Math.random() * 2 - 1) * 0.006;
+          }
+          const src = off.createBufferSource();
+          src.buffer = buf;
+          const f = off.createBiquadFilter();
+          f.type = "highpass";
+          f.frequency.value = 1800;
+          const g = off.createGain();
+          g.gain.value = 0.5 * track.crackle;
+          src.connect(f);
+          f.connect(g);
+          g.connect(bus);
+          src.start(0);
+        }
+      }
+
+      // ---- patterns: 100 BPM funk ------------------------------------------
+      function funkPattern(k, at, sps, bars) {
+        const CHORD = [N.E3, N.G3, N.B3, N.D4, N.E4 + 12];
+        for (let bar = 0; bar < bars; bar++) {
+          // Kick: funk staple, extra push on odd bars
+          for (const s of bar % 2 ? [0, 7, 10, 13] : [0, 7, 10])
+            k.kick(at(bar, s));
+
+          // Snare on 2 & 4 + ghost notes
+          k.snare(at(bar, 4));
+          k.snare(at(bar, 12));
+          if (bar % 2 === 1) {
+            k.snare(at(bar, 7), 0.22);
+            k.snare(at(bar, 15), 0.2);
+          }
+          if (bar === 3 || bar === 7) k.snare(at(bar, 11), 0.28);
+
+          // Hats: swung-feel 8ths with 16th pickups
+          for (let s = 0; s < 16; s += 2)
+            k.hatClosed(at(bar, s), s % 4 === 0 ? 1 : 0.55);
+          k.hatClosed(at(bar, 7), 0.4);
+          k.hatClosed(at(bar, 15), 0.4);
+          if (bar % 2 === 1) k.hatOpen(at(bar, 14), 1);
+
+          // Bassline (2-bar phrase)
+          if (bar % 2 === 0) {
+            k.bass(at(bar, 0), N.E1, sps * 3, 1);
+            k.bass(at(bar, 3), N.E1, sps * 1.5, 0.8);
+            k.bass(at(bar, 6), N.G1, sps * 1.2, 0.85);
+            k.bass(at(bar, 7), N.E2, sps * 2, 0.9);
+            k.bass(at(bar, 10), N.D2, sps * 2, 0.85);
+            k.bass(at(bar, 12), N.B1, sps * 1.5, 0.8);
+            k.bass(at(bar, 14), N.A1, sps * 1.5, 0.8);
+          } else {
+            k.bass(at(bar, 0), N.E1, sps * 3, 1);
+            k.bass(at(bar, 3), N.E1, sps * 1.5, 0.8);
+            k.bass(at(bar, 6), N.G1, sps * 1.2, 0.85);
+            k.bass(at(bar, 7), N.A1, sps * 2, 0.9);
+            k.bass(at(bar, 10), N.B1, sps * 1.2, 0.85);
+            k.bass(at(bar, 11), N.D2, sps * 1.2, 0.8);
+            k.bass(at(bar, 12), N.E2, sps * 2.4, 0.95);
+            k.bass(at(bar, 14), N.D2, sps * 1.5, 0.75);
+          }
+
+          // Clav stabs
+          k.clav(at(bar, 2), [N.E3, N.B3], 1);
+          k.clav(at(bar, 9), [N.G3, N.D4], 0.85);
+          k.clav(at(bar, 13), [N.E3, N.B3], bar % 2 ? 0.9 : 0.6);
+
+          // Chord stab at the top of bars 1 & 5
+          if (bar === 0 || bar === 4) k.stab(at(bar, 0), CHORD, 1);
+          if (bar === 6) k.stab(at(bar, 8), CHORD, 0.7);
+        }
+      }
+
+      // ---- patterns: 90 BPM boom bap ----------------------------------------
+      function boomBapPattern(k, at, sps, bars) {
+        const AM7 = [N.A3, N.C4, N.E4, N.G4];
+        for (let bar = 0; bar < bars; bar++) {
+          // Lazy boom kicks
+          k.kick(at(bar, 0), 1);
+          k.kick(at(bar, 6), 0.7);
+          if (bar % 2 === 1) k.kick(at(bar, 9), 0.8);
+          else k.kick(at(bar, 10), 0.85);
+
+          // Fat snares on 2 & 4
+          k.snare(at(bar, 4), 1.15);
+          k.snare(at(bar, 12), 1.1);
+          if (bar === 3 || bar === 7) k.snare(at(bar, 14), 0.3);
+
+          // Sparse dusty hats, swung 16th pickups
+          for (let s = 0; s < 16; s += 2) {
+            const swing = s % 4 === 2 ? sps * 0.55 : 0;
+            k.hatClosed(at(bar, s) + swing, s % 4 === 0 ? 0.8 : 0.5);
+          }
+          if (bar % 4 === 3) k.hatOpen(at(bar, 14), 0.8);
+
+          // Sub bass — A minor, head-nod tempo
+          if (bar % 2 === 0) {
+            k.subBass(at(bar, 0), N.A1, sps * 4);
+            k.subBass(at(bar, 6), N.A1, sps * 2, 0.8);
+            k.subBass(at(bar, 10), N.C2, sps * 3, 0.9);
+            k.subBass(at(bar, 14), N.E2, sps * 2, 0.8);
+          } else {
+            k.subBass(at(bar, 0), N.A1, sps * 4);
+            k.subBass(at(bar, 6), N.G1, sps * 3, 0.85);
+            k.subBass(at(bar, 10), N.E1, sps * 4, 0.9);
+          }
+
+          // Dusty Am7 chord stabs
+          k.stab(at(bar, 2), [N.A3, N.C4, N.E4], 0.4);
+          if (bar % 2 === 1) k.stab(at(bar, 11), [N.G3, N.C4, N.E4], 0.32);
+          if (bar === 0 || bar === 4) k.stab(at(bar, 0), AM7, 0.7);
+        }
+      }
+
+      // ---- patterns: 124 BPM house -------------------------------------------
+      function housePattern(k, at, sps, bars) {
+        const AM7 = [N.A3, N.C4, N.E4, N.G4];
+        for (let bar = 0; bar < bars; bar++) {
+          // Four on the floor
+          for (const s of [0, 4, 8, 12]) k.kick(at(bar, s), 1);
+          k.clap(at(bar, 4));
+          k.clap(at(bar, 12));
+
+          // Open hats on the offbeats, ticking closed hats between
+          for (let s = 2; s < 16; s += 4) k.hatOpen(at(bar, s), 0.85);
+          for (let s = 0; s < 16; s += 2)
+            if (s % 4 !== 2) k.hatClosed(at(bar, s), 0.4);
+
+          // Rolling offbeat acid bass — A minor
+          const seq =
+            bar % 2 === 0
+              ? [
+                  [2, N.A1],
+                  [6, N.A1],
+                  [10, N.C2],
+                  [14, N.A1],
+                ]
+              : [
+                  [2, N.A1],
+                  [6, N.G1],
+                  [10, N.E2],
+                  [13, N.D2],
+                  [14, N.E2],
+                ];
+          for (const [s, n] of seq) k.acidBass(at(bar, s), n, sps * 1.6);
+
+          // Piano-ish stabs
+          if (bar % 2 === 0) {
+            k.stab(at(bar, 3), AM7, 0.55);
+            k.stab(at(bar, 11), [N.E3, N.A3, N.C4], 0.45);
+          } else {
+            k.stab(at(bar, 7), [N.G3, N.C4, N.E4], 0.5);
+          }
+          if (bar === 7) k.snare(at(bar, 15), 0.4);
+        }
+      }
+
+      // AudioWorklet that plays a buffer at a signed variable rate (true scratching)
+      const WORKLET_SRC = `
+      class ScratchProcessor extends AudioWorkletProcessor {
+        static get parameterDescriptors() {
+          return [{ name: 'rate', defaultValue: 0, automationRate: 'a-rate' }];
+        }
+        constructor() {
+          super();
+          this.l = null; this.r = null; this.len = 0; this.pos = 0; this.block = 0;
+          this.port.onmessage = (e) => {
+            if (e.data.type === 'buffer') {
+              this.l = e.data.l; this.r = e.data.r; this.len = this.l.length; this.pos = 0;
+            }
+          };
+        }
+        process(inputs, outputs, params) {
+          const out = outputs[0];
+          const L = out[0], R = out[1] || out[0];
+          if (!this.l || !this.len) return true;
+          const rates = params.rate;
+          const n = L.length;
+          for (let i = 0; i < n; i++) {
+            const r = rates.length > 1 ? rates[i] : rates[0];
+            this.pos += r;
+            this.pos = ((this.pos % this.len) + this.len) % this.len;
+            const i0 = this.pos | 0;
+            const frac = this.pos - i0;
+            const i1 = i0 + 1 === this.len ? 0 : i0 + 1;
+            L[i] = this.l[i0] * (1 - frac) + this.l[i1] * frac;
+            R[i] = this.r[i0] * (1 - frac) + this.r[i1] * frac;
+          }
+          if ((++this.block & 7) === 0) this.port.postMessage({ pos: this.pos / this.len });
+          return true;
+        }
+      }
+      registerProcessor('scratch-processor', ScratchProcessor);
+
+      // Pass-through tap on the master bus; batches samples while recording
+      class RecorderProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.rec = false; this.bufL = []; this.bufR = [];
+          this.port.onmessage = (e) => {
+            if (e.data.rec !== undefined) {
+              const wasRec = this.rec;
+              this.rec = e.data.rec;
+              if (!this.rec) {
+                this.flush();
+                // Port messages keep their order, so the main thread sees this
+                // after the final { recL, recR } above — that is what makes
+                // finishRecording() safe to run on it.
+                if (wasRec) this.port.postMessage({ recDone: true });
+              }
+            }
+          };
+        }
+        flush() {
+          if (!this.bufL.length) return;
+          let n = 0;
+          for (const b of this.bufL) n += b.length;
+          const L = new Float32Array(n), R = new Float32Array(n);
+          let o = 0;
+          for (let i = 0; i < this.bufL.length; i++) {
+            L.set(this.bufL[i], o); R.set(this.bufR[i], o);
+            o += this.bufL[i].length;
+          }
+          this.bufL = []; this.bufR = [];
+          this.port.postMessage({ recL: L, recR: R }, [L.buffer, R.buffer]);
+        }
+        process(inputs, outputs) {
+          const inp = inputs[0], out = outputs[0];
+          if (inp && inp.length) {
+            for (let c = 0; c < out.length; c++) out[c].set(inp[Math.min(c, inp.length - 1)]);
+            if (this.rec) {
+              this.bufL.push(inp[0].slice(0));
+              this.bufR.push((inp[1] || inp[0]).slice(0));
+              if (this.bufL.length >= 32) this.flush();   // ~85 ms batches @ 48 kHz
+            }
+          }
+          return true;
+        }
+      }
+      registerProcessor('recorder-processor', RecorderProcessor);
+    `;
+
+      // Render a track offline once, cache the raw stereo data on the track
+      async function renderTrack(track) {
+        if (track.rendered) return track.rendered;
+        log(`🎛️ Cutting "${track.name}" to wax…`);
+        const sr = audioCtx.sampleRate;
+        const off = new OfflineAudioContext(
+          2,
+          Math.ceil(trackLoopSeconds(track) * sr),
+          sr,
+        );
+        composeTrack(off, track);
+        const rendered = await off.startRendering();
+        track.rendered = {
+          l: rendered.getChannelData(0).slice(0),
+          r: rendered.getChannelData(1).slice(0),
+        };
+        return track.rendered;
+      }
+
+      // Put a track on the platter: worklet buffer + label + HUD title
+      async function loadTrack(i) {
+        const track = TRACKS[i];
+        const data = await renderTrack(track);
+        workletNode.port.postMessage({ type: "buffer", l: data.l, r: data.r });
+        state.loopPos = 0;
+        applyVinylLook(track);
+        log(
+          `🔊 "${track.name}" ready — ${trackLoopSeconds(track).toFixed(1)}s loop @ ${track.bpm} BPM (original, royalty-free)`,
+        );
+      }
+
+      async function ensureAudio() {
+        if (audioReady || audioStarting) return audioReady;
+        audioStarting = true;
+        try {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          await audioCtx.resume();
+
+          const url = URL.createObjectURL(
+            new Blob([WORKLET_SRC], { type: "text/javascript" }),
+          );
+          await audioCtx.audioWorklet.addModule(url);
+          URL.revokeObjectURL(url);
+
+          workletNode = new AudioWorkletNode(audioCtx, "scratch-processor", {
+            outputChannelCount: [2],
+          });
+          rateParam = workletNode.parameters.get("rate");
+          workletNode.port.onmessage = (e) => {
+            if (e.data.pos !== undefined) state.loopPos = e.data.pos;
+          };
+
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 256;
+          analyser.smoothingTimeConstant = 0.72;
+          state.spectrum = new Uint8Array(analyser.frequencyBinCount);
+
+          masterGain = audioCtx.createGain();
+          masterGain.gain.value = ui.volume;
+
+          recorderNode = new AudioWorkletNode(audioCtx, "recorder-processor", {
+            outputChannelCount: [2],
+          });
+          recorderNode.port.onmessage = (e) => {
+            if (e.data.recL) onRecChunk(e.data.recL, e.data.recR);
+            if (e.data.recDone) finishRecording();
+          };
+
+          workletNode.connect(analyser);
+          analyser.connect(masterGain);
+          masterGain.connect(recorderNode);
+          recorderNode.connect(audioCtx.destination);
+
+          audioReady = true;
+          await loadTrack(state.trackIndex);
+        } catch (e) {
+          log("❌ Audio init failed: " + e.message);
+        } finally {
+          audioStarting = false;
+        }
+        return audioReady;
+      }
+
+      // =====================================================================
+      //  RECORDING — tap on the master bus → 16-bit stereo WAV download
+      // =====================================================================
+      const REC_MAX_SECONDS = 600; // 10 min ≈ 230 MB of float32 — hard cap
+      const REC_FLUSH_TIMEOUT_MS = 2000; // only if the worklet never acknowledges
+      const rec = {
+        on: false,
+        chunksL: [],
+        chunksR: [],
+        samples: 0,
+        startedAt: 0,
+        flushTimer: 0,
+        finishing: false,
+      };
+
+      function onRecChunk(L, R) {
+        rec.chunksL.push(L);
+        rec.chunksR.push(R);
+        rec.samples += L.length;
+        if (rec.on && rec.samples >= audioCtx.sampleRate * REC_MAX_SECONDS) {
+          toast("⏺ 10-minute limit reached — saving your set…");
+          toggleRecording();
+        }
+      }
+
+      async function toggleRecording() {
+        const btn = document.getElementById("recordBtn");
+        if (!rec.on) {
+          if (!(await ensureAudio())) return;
+          rec.chunksL = [];
+          rec.chunksR = [];
+          rec.samples = 0;
+          rec.on = true;
+          rec.finishing = false;
+          rec.startedAt = performance.now();
+          recorderNode.port.postMessage({ rec: true });
+          btn.classList.add("on");
+          log("⏺ Recording the master output…");
+        } else {
+          rec.on = false;
+          recorderNode.port.postMessage({ rec: false });
+          // finishRecording() runs on the worklet's { recDone } reply, which is
+          // queued behind its final flush. A fixed delay could beat that last
+          // chunk on a loaded machine and truncate the WAV; this timer is only a
+          // fallback for a worklet that never answers at all.
+          clearTimeout(rec.flushTimer);
+          rec.flushTimer = setTimeout(() => {
+            log("⚠️ Recorder flush timed out — saving what arrived");
+            finishRecording();
+          }, REC_FLUSH_TIMEOUT_MS);
+        }
+      }
+
+      function finishRecording() {
+        // Reachable from both the worklet reply and the fallback timer.
+        if (rec.finishing) return;
+        rec.finishing = true;
+        clearTimeout(rec.flushTimer);
+        rec.flushTimer = 0;
+
+        const btn = document.getElementById("recordBtn");
+        btn.classList.remove("on");
+        btn.textContent = "⏺ Record";
+        if (!rec.samples) {
+          toast("Nothing was recorded");
+          return;
+        }
+
+        const blob = encodeWav(
+          rec.chunksL,
+          rec.chunksR,
+          rec.samples,
+          audioCtx.sampleRate,
+        );
+        rec.chunksL = [];
+        rec.chunksR = [];
+
+        const stamp = new Date()
+          .toISOString()
+          .slice(0, 19)
+          .replace(/[T:]/g, "-");
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `dj-gyro-set-${stamp}.wav`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+
+        const secs = rec.samples / audioCtx.sampleRate;
+        log(
+          `💾 Saved ${secs.toFixed(1)}s WAV (${(blob.size / 1048576).toFixed(1)} MB)`,
+        );
+        toast("💾 Your set is downloading as a WAV!");
+        rec.samples = 0;
+      }
+
+      function encodeWav(chunksL, chunksR, totalSamples, sampleRate) {
+        const dv = new DataView(new ArrayBuffer(44 + totalSamples * 4));
+        const wStr = (o, s) => {
+          for (let i = 0; i < s.length; i++)
+            dv.setUint8(o + i, s.charCodeAt(i));
+        };
+        wStr(0, "RIFF");
+        dv.setUint32(4, 36 + totalSamples * 4, true);
+        wStr(8, "WAVE");
+        wStr(12, "fmt ");
+        dv.setUint32(16, 16, true);
+        dv.setUint16(20, 1, true); // PCM
+        dv.setUint16(22, 2, true); // stereo
+        dv.setUint32(24, sampleRate, true);
+        dv.setUint32(28, sampleRate * 4, true); // byte rate
+        dv.setUint16(32, 4, true); // block align
+        dv.setUint16(34, 16, true); // bits per sample
+        wStr(36, "data");
+        dv.setUint32(40, totalSamples * 4, true);
+        let o = 44;
+        for (let c = 0; c < chunksL.length; c++) {
+          const L = chunksL[c],
+            R = chunksR[c];
+          for (let i = 0; i < L.length; i++) {
+            dv.setInt16(
+              o,
+              Math.max(-32768, Math.min(32767, L[i] * 32767)) | 0,
+              true,
+            );
+            o += 2;
+            dv.setInt16(
+              o,
+              Math.max(-32768, Math.min(32767, R[i] * 32767)) | 0,
+              true,
+            );
+            o += 2;
+          }
+        }
+        return new Blob([dv.buffer], { type: "audio/wav" });
+      }
+
+      // =====================================================================
+      //  THREE.JS — the turntable
+      // =====================================================================
+      const stage = document.getElementById("stage");
+      const renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.05;
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      stage.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x05060a);
+      scene.fog = new THREE.Fog(0x05060a, 14, 30);
+
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.06).texture;
+
+      const camera = new THREE.PerspectiveCamera(
+        42,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        100,
+      );
+      camera.position.set(0.6, 6.4, 8.4);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(-0.3, 0.6, 0);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.06;
+      controls.enablePan = false;
+      controls.minDistance = 4.5;
+      controls.maxDistance = 16;
+      controls.minPolarAngle = 0.28;
+      controls.maxPolarAngle = 1.38;
+      controls.update();
+
+      // ---- lights ----
+      scene.add(new THREE.HemisphereLight(0x8899bb, 0x0a0a12, 0.5));
+      const key = new THREE.DirectionalLight(0xffffff, 1.6);
+      key.position.set(4, 9, 5);
+      scene.add(key);
+      const cyanLight = new THREE.PointLight(0x00e5ff, 26, 22);
+      cyanLight.position.set(-6, 4.5, -3);
+      scene.add(cyanLight);
+      const pinkLight = new THREE.PointLight(0xff2ea6, 26, 22);
+      pinkLight.position.set(6, 4, -4);
+      scene.add(pinkLight);
+
+      // ---- floor ----
+      {
+        const c = document.createElement("canvas");
+        c.width = c.height = 512;
+        const g = c.getContext("2d");
+        const grad = g.createRadialGradient(256, 256, 40, 256, 256, 256);
+        grad.addColorStop(0, "#161a26");
+        grad.addColorStop(0.6, "#0a0c14");
+        grad.addColorStop(1, "#05060a");
+        g.fillStyle = grad;
+        g.fillRect(0, 0, 512, 512);
+        const tex = new THREE.CanvasTexture(c);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        const floor = new THREE.Mesh(
+          new THREE.CircleGeometry(22, 48),
+          new THREE.MeshStandardMaterial({
+            map: tex,
+            roughness: 0.4,
+            metalness: 0.55,
+          }),
+        );
+        floor.rotation.x = -Math.PI / 2;
+        floor.position.y = -0.32;
+        scene.add(floor);
+      }
+
+      // ---- deck plinth ----
+      const PLATTER_C = new THREE.Vector3(-0.55, 0, 0); // platter/record center
+      const DECK_TOP = 0.62;
+
+      const deck = new THREE.Group();
+      scene.add(deck);
+
+      const plinthMat = new THREE.MeshStandardMaterial({
+        color: 0x171b24,
+        metalness: 0.7,
+        roughness: 0.32,
+      });
+      const plinth = new THREE.Mesh(
+        new THREE.BoxGeometry(7.6, 0.62, 5.3),
+        plinthMat,
+      );
+      plinth.position.y = DECK_TOP - 0.31;
+      deck.add(plinth);
+
+      const topPlate = new THREE.Mesh(
+        new THREE.BoxGeometry(7.44, 0.05, 5.14),
+        new THREE.MeshStandardMaterial({
+          color: 0x232a38,
+          metalness: 0.85,
+          roughness: 0.25,
+        }),
+      );
+      topPlate.position.y = DECK_TOP + 0.005;
+      deck.add(topPlate);
+
+      // neon trim strip around the plinth
+      const trim = new THREE.Mesh(
+        new THREE.BoxGeometry(7.7, 0.05, 5.4),
+        new THREE.MeshStandardMaterial({
+          color: 0x00131a,
+          emissive: 0x00e5ff,
+          emissiveIntensity: 1.6,
+        }),
+      );
+      trim.position.y = DECK_TOP - 0.6;
+      deck.add(trim);
+
+      // deck feet
+      for (const [fx, fz] of [
+        [-3.4, -2.3],
+        [3.4, -2.3],
+        [-3.4, 2.3],
+        [3.4, 2.3],
+      ]) {
+        const foot = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.22, 0.28, 0.34, 20),
+          new THREE.MeshStandardMaterial({
+            color: 0x0c0e14,
+            metalness: 0.5,
+            roughness: 0.5,
+          }),
+        );
+        foot.position.set(fx, -0.15, fz);
+        deck.add(foot);
+      }
+
+      // ---- platter (spins with the record) ----
+      const platterGroup = new THREE.Group();
+      platterGroup.position.set(PLATTER_C.x, DECK_TOP + 0.03, PLATTER_C.z);
+      deck.add(platterGroup);
+
+      const platter = new THREE.Mesh(
+        new THREE.CylinderGeometry(2.28, 2.32, 0.14, 96),
+        new THREE.MeshStandardMaterial({
+          color: 0x8a8f9a,
+          metalness: 0.95,
+          roughness: 0.28,
+        }),
+      );
+      platter.position.y = 0.07;
+      platterGroup.add(platter);
+
+      // strobe dots on the platter rim
+      {
+        const dotGeo = new THREE.BoxGeometry(0.05, 0.05, 0.1);
+        const dotMat = new THREE.MeshStandardMaterial({
+          color: 0x111111,
+          emissive: 0xffffff,
+          emissiveIntensity: 0.7,
+        });
+        for (let i = 0; i < 72; i++) {
+          const a = (i / 72) * Math.PI * 2;
+          const dot = new THREE.Mesh(dotGeo, dotMat);
+          dot.position.set(Math.cos(a) * 2.3, 0.07, Math.sin(a) * 2.3);
+          dot.rotation.y = -a;
+          platterGroup.add(dot);
+        }
+      }
+
+      // ---- vinyl record ----
+      function makeVinylTexture(track) {
+        const S = 1024;
+        const c = document.createElement("canvas");
+        c.width = c.height = S;
+        const g = c.getContext("2d");
+        const cx = S / 2,
+          cy = S / 2;
+
+        g.fillStyle = "#0a0a0c";
+        g.fillRect(0, 0, S, S);
+
+        // grooves — concentric rings with subtle brightness variation
+        for (let r = S * 0.16; r < S * 0.492; r += 1.6) {
+          const v = 12 + Math.abs(Math.sin(r * 0.55)) * 14 + Math.random() * 6;
+          g.strokeStyle = `rgb(${v | 0},${v | 0},${(v + 3) | 0})`;
+          g.lineWidth = 1;
+          g.beginPath();
+          g.arc(cx, cy, r, 0, Math.PI * 2);
+          g.stroke();
+        }
+        // dead wax + lead-in bands
+        for (const r of [S * 0.165, S * 0.36, S * 0.487]) {
+          g.strokeStyle = "rgba(0,0,0,0.85)";
+          g.lineWidth = 5;
+          g.beginPath();
+          g.arc(cx, cy, r, 0, Math.PI * 2);
+          g.stroke();
+        }
+
+        // label
+        const lr = S * 0.155;
+        const grad = g.createRadialGradient(cx, cy, 6, cx, cy, lr);
+        grad.addColorStop(0, track.labelA);
+        grad.addColorStop(0.55, track.labelB);
+        grad.addColorStop(1, track.labelC);
+        g.fillStyle = grad;
+        g.beginPath();
+        g.arc(cx, cy, lr, 0, Math.PI * 2);
+        g.fill();
+        g.strokeStyle = "rgba(255,255,255,0.6)";
+        g.lineWidth = 2;
+        g.beginPath();
+        g.arc(cx, cy, lr - 4, 0, Math.PI * 2);
+        g.stroke();
+
+        g.fillStyle = "#fff";
+        g.textAlign = "center";
+        g.font = `bold ${S * 0.032}px 'Segoe UI', sans-serif`;
+        g.fillText(track.name.toUpperCase(), cx, cy - S * 0.055);
+        g.font = `${S * 0.022}px 'Segoe UI', sans-serif`;
+        g.fillText(`DJ GYRO · ${track.genre} · SIDE A`, cx, cy - S * 0.018);
+        g.font = `${S * 0.019}px 'Segoe UI', sans-serif`;
+        g.fillStyle = "rgba(255,255,255,0.85)";
+        g.fillText(`33⅓ RPM · ${track.bpm} BPM · STEREO`, cx, cy + S * 0.045);
+        g.fillText("SYNTHESIZED LIVE · ROYALTY-FREE", cx, cy + S * 0.075);
+
+        // spindle hole
+        g.fillStyle = "#05060a";
+        g.beginPath();
+        g.arc(cx, cy, S * 0.012, 0, Math.PI * 2);
+        g.fill();
+
+        const tex = new THREE.CanvasTexture(c);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        return tex;
+      }
+
+      const vinyl = new THREE.Mesh(
+        new THREE.CylinderGeometry(2.06, 2.06, 0.045, 96),
+        [
+          new THREE.MeshStandardMaterial({
+            color: 0x0c0c10,
+            metalness: 0.35,
+            roughness: 0.5,
+          }), // side
+          new THREE.MeshStandardMaterial({
+            map: makeVinylTexture(TRACKS[0]),
+            metalness: 0.42,
+            roughness: 0.3,
+          }), // top
+          new THREE.MeshStandardMaterial({ color: 0x0a0a0c, roughness: 0.6 }), // bottom
+        ],
+      );
+      vinyl.position.y = 0.165;
+      platterGroup.add(vinyl);
+
+      function applyVinylLook(track) {
+        const old = vinyl.material[1].map;
+        vinyl.material[1].map = makeVinylTexture(track);
+        vinyl.material[1].needsUpdate = true;
+        if (old) old.dispose();
+        document.getElementById("deckTitle").textContent =
+          `Deck A · ${track.name}`;
+      }
+
+      // spindle
+      const spindle = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.045, 0.045, 0.34, 16),
+        new THREE.MeshStandardMaterial({
+          color: 0xd8dde6,
+          metalness: 1,
+          roughness: 0.15,
+        }),
+      );
+      spindle.position.y = 0.24;
+      platterGroup.add(spindle);
+
+      // ---- tonearm ----
+      const armPivot = new THREE.Vector3(2.6, DECK_TOP + 0.12, -1.62);
+      const armGroup = new THREE.Group();
+      armGroup.position.copy(armPivot);
+      deck.add(armGroup);
+
+      const armBase = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.34, 0.42, 0.26, 32),
+        new THREE.MeshStandardMaterial({
+          color: 0x2b303c,
+          metalness: 0.9,
+          roughness: 0.3,
+        }),
+      );
+      armBase.position.y = 0.02;
+      armGroup.add(armBase);
+
+      const armYaw = new THREE.Group(); // rotates around Y to track the groove
+      armYaw.position.y = 0.22;
+      armGroup.add(armYaw);
+
+      const chromeMat = new THREE.MeshStandardMaterial({
+        color: 0xcfd6e0,
+        metalness: 1,
+        roughness: 0.18,
+      });
+
+      const armTube = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.038, 0.05, 1, 14),
+        chromeMat,
+      );
+      armTube.rotation.x = Math.PI / 2; // lie along +z of armYaw
+      armTube.position.z = 0.5; // unit length; scaled each frame
+      armYaw.add(armTube);
+
+      const counterweight = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.15, 0.15, 0.22, 20),
+        new THREE.MeshStandardMaterial({
+          color: 0x14161c,
+          metalness: 0.9,
+          roughness: 0.35,
+        }),
+      );
+      counterweight.rotation.x = Math.PI / 2;
+      counterweight.position.z = -0.42;
+      armYaw.add(counterweight);
+
+      const headshell = new THREE.Mesh(
+        new THREE.BoxGeometry(0.16, 0.09, 0.4),
+        new THREE.MeshStandardMaterial({
+          color: 0xff2ea6,
+          metalness: 0.6,
+          roughness: 0.35,
+          emissive: 0x550a36,
+          emissiveIntensity: 0.6,
+        }),
+      );
+      armYaw.add(headshell); // positioned each frame at the arm tip
+
+      const stylus = new THREE.Mesh(
+        new THREE.ConeGeometry(0.02, 0.09, 8),
+        new THREE.MeshStandardMaterial({ color: 0xffffff }),
+      );
+      stylus.rotation.x = Math.PI;
+      armYaw.add(stylus);
+
+      // groove path in deck space: outer edge → label, relative to platter center
+      const grooveOuter = new THREE.Vector3(
+        PLATTER_C.x + Math.cos(THREE.MathUtils.degToRad(42)) * 1.9,
+        0,
+        PLATTER_C.z + Math.sin(THREE.MathUtils.degToRad(42)) * 1.9,
+      );
+      const grooveInner = new THREE.Vector3(
+        PLATTER_C.x + Math.cos(THREE.MathUtils.degToRad(20)) * 0.75,
+        0,
+        PLATTER_C.z + Math.sin(THREE.MathUtils.degToRad(20)) * 0.75,
+      );
+      const armRest = new THREE.Vector3(2.15, 0, 0.35);
+
+      let armLift = 0; // 0 = on record, 1 = lifted at rest
+      let armTargetLift = 1;
+
+      function updateTonearm(dt) {
+        const playing = audioReady && Math.abs(state.platterVel) > 0.01;
+        armTargetLift = playing ? 0 : 1;
+        armLift += (armTargetLift - armLift) * Math.min(1, dt * 3.5);
+
+        const t = THREE.MathUtils.clamp(state.loopPos, 0, 1);
+        const groovePt = grooveOuter.clone().lerp(grooveInner, t);
+        const target = groovePt.clone().lerp(armRest, armLift);
+
+        // yaw the arm toward the target point
+        const dx = target.x - armPivot.x;
+        const dz = target.z - armPivot.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        armYaw.rotation.y = Math.atan2(dx, dz);
+
+        // stretch tube to reach; park headshell + stylus at the tip
+        armTube.scale.y = dist;
+        armTube.position.z = dist / 2;
+        headshell.position.set(0, -0.02 - 0.06 * (1 - armLift), dist);
+        stylus.position.set(0, -0.1 * (1 - armLift), dist + 0.12);
+
+        // arm floats a little higher when lifted
+        armYaw.position.y = 0.22 + armLift * 0.14;
+      }
+
+      // ---- start/stop button on the deck ----
+      const startStopBtn = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.3, 0.32, 0.1, 32),
+        new THREE.MeshStandardMaterial({
+          color: 0x222831,
+          metalness: 0.7,
+          roughness: 0.4,
+          emissive: 0x00e5ff,
+          emissiveIntensity: 0,
+        }),
+      );
+      startStopBtn.position.set(-3.15, DECK_TOP + 0.06, 2.15);
+      deck.add(startStopBtn);
+
+      // ---- pitch fader (visual, reflects current pitch) ----
+      const faderSlot = new THREE.Mesh(
+        new THREE.BoxGeometry(0.1, 0.02, 2.1),
+        new THREE.MeshStandardMaterial({ color: 0x05070c }),
+      );
+      faderSlot.position.set(3.25, DECK_TOP + 0.035, 0.7);
+      deck.add(faderSlot);
+      const faderKnob = new THREE.Mesh(
+        new THREE.BoxGeometry(0.3, 0.12, 0.16),
+        new THREE.MeshStandardMaterial({
+          color: 0xe8edf5,
+          metalness: 0.7,
+          roughness: 0.3,
+        }),
+      );
+      faderKnob.position.set(3.25, DECK_TOP + 0.1, 0.7);
+      deck.add(faderKnob);
+
+      // ---- spectrum bars behind the deck ----
+      const BAR_COUNT = 30;
+      const bars = [];
+      {
+        const barGroup = new THREE.Group();
+        barGroup.position.set(0, 0, -4.6);
+        scene.add(barGroup);
+        for (let i = 0; i < BAR_COUNT; i++) {
+          const hue = i / BAR_COUNT;
+          const col = new THREE.Color().setHSL(0.52 + hue * 0.38, 1, 0.5);
+          const bar = new THREE.Mesh(
+            new THREE.BoxGeometry(0.24, 1, 0.24),
+            new THREE.MeshStandardMaterial({
+              color: 0x05060a,
+              emissive: col,
+              emissiveIntensity: 0.9,
+            }),
+          );
+          bar.position.x = (i - (BAR_COUNT - 1) / 2) * 0.33;
+          bar.scale.y = 0.1;
+          bar.position.y = bar.scale.y / 2 - 0.3;
+          barGroup.add(bar);
+          bars.push(bar);
+        }
+      }
+
+      // ---- floating dust ----
+      let dust;
+      {
+        const n = 260;
+        const pos = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) {
+          pos[i * 3] = (Math.random() - 0.5) * 22;
+          pos[i * 3 + 1] = Math.random() * 8;
+          pos[i * 3 + 2] = (Math.random() - 0.5) * 22;
+        }
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+        dust = new THREE.Points(
+          geo,
+          new THREE.PointsMaterial({
+            color: 0x77aacc,
+            size: 0.035,
+            transparent: true,
+            opacity: 0.5,
+            depthWrite: false,
+          }),
+        );
+        scene.add(dust);
+      }
+
+      // =====================================================================
+      //  Pointer scratching (drag the record) + deck button clicks
+      // =====================================================================
+      const raycaster = new THREE.Raycaster();
+      const ndc = new THREE.Vector2();
+      const recordPlane = new THREE.Plane(
+        new THREE.Vector3(0, 1, 0),
+        -(DECK_TOP + 0.2),
+      );
+      let lastPointerAngle = null;
+      let lastPointerTime = 0;
+
+      function pointerToNdc(e) {
+        const r = renderer.domElement.getBoundingClientRect();
+        ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+        ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+      }
+
+      // signed angle of a world point around the platter center (increases with +Y rotation)
+      function platterAngleOf(pt) {
+        return Math.atan2(-(pt.z - PLATTER_C.z), pt.x - PLATTER_C.x);
+      }
+
+      renderer.domElement.addEventListener("pointerdown", (e) => {
+        pointerToNdc(e);
+        raycaster.setFromCamera(ndc, camera);
+
+        // deck start/stop button?
+        if (raycaster.intersectObject(startStopBtn).length) {
+          toggleMotor();
+          return;
+        }
+
+        // on the record? (not while it's being swapped)
+        if (state.swapping) return;
+        const hit = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(recordPlane, hit)) {
+          const d = Math.hypot(hit.x - PLATTER_C.x, hit.z - PLATTER_C.z);
+          if (d < 2.15) {
+            state.pointerOn = true;
+            state.pointerVel = 0;
+            lastPointerAngle = platterAngleOf(hit);
+            lastPointerTime = performance.now();
+            controls.enabled = false;
+            ensureAudio();
+            renderer.domElement.setPointerCapture(e.pointerId);
+          }
+        }
+      });
+
+      renderer.domElement.addEventListener("pointermove", (e) => {
+        if (!state.pointerOn) return;
+        pointerToNdc(e);
+        raycaster.setFromCamera(ndc, camera);
+        const hit = new THREE.Vector3();
+        if (!raycaster.ray.intersectPlane(recordPlane, hit)) return;
+
+        const now = performance.now();
+        const dt = Math.max(0.004, (now - lastPointerTime) / 1000);
+        const a = platterAngleOf(hit);
+        if (lastPointerAngle !== null) {
+          let dA = a - lastPointerAngle;
+          if (dA > Math.PI) dA -= Math.PI * 2;
+          if (dA < -Math.PI) dA += Math.PI * 2;
+          // platter "forward" is clockwise from above = decreasing angle
+          const instVel = -dA / (Math.PI * 2) / dt;
+          state.pointerVel = state.pointerVel * 0.5 + instVel * 0.5;
+        }
+        lastPointerAngle = a;
+        lastPointerTime = now;
+      });
+
+      function endPointer(e) {
+        if (!state.pointerOn) return;
+        state.pointerOn = false;
+        lastPointerAngle = null;
+        controls.enabled = true;
+        try {
+          renderer.domElement.releasePointerCapture(e.pointerId);
+        } catch {}
+      }
+      renderer.domElement.addEventListener("pointerup", endPointer);
+      renderer.domElement.addEventListener("pointercancel", endPointer);
+
+      // =====================================================================
+      //  Physics — gyro / pointer / motor → platter velocity → audio rate
+      // =====================================================================
+      function autoDjDps(t) {
+        const phase = t % 14;
+        if (phase < 2.4) return Math.sin(t * Math.PI * 2 * 2.1) * 240; // baby scratch
+        if (phase < 3.4) return 0;
+        if (phase < 4.9) return Math.sin(t * Math.PI * 2 * 3.2) * 430; // faster chirp
+        if (phase < 8.0) return 0; // let it groove
+        if (phase < 8.9) return -320; // long rewind
+        return 0;
+      }
+
+      function toggleMotor(forceState) {
+        state.motorOn = forceState !== undefined ? forceState : !state.motorOn;
+        document
+          .getElementById("motorBtn")
+          .classList.toggle("on", state.motorOn);
+        startStopBtn.material.emissiveIntensity = state.motorOn ? 2.2 : 0;
+        if (state.motorOn) ensureAudio();
+      }
+
+      let prevScratching = false; // was a hand (gyro or pointer) on the record last frame?
+      let motorRecovering = false; // post-scratch slipmat grab in progress
+
+      function physicsStep(dt, nowS) {
+        // pick the driving hand
+        let gyroDps = state.gyroDps;
+        if (state.autoDj && !state.streaming && !state.pointerOn) {
+          state.autoT += dt;
+          gyroDps = autoDjDps(state.autoT);
+          state.gyroDps = gyroDps; // so the HUD shows it
+        }
+
+        // stale stream guard: if no gyro frame for 400 ms, treat as hands-off
+        const gyroFresh =
+          state.streaming && performance.now() - state.lastGyroAt < 400;
+        const gyroDriving = gyroFresh || (state.autoDj && !state.streaming);
+
+        // hand-on/off hysteresis
+        if (!gyroDriving) {
+          state.handOn = false;
+        } else if (!state.handOn) {
+          if (Math.abs(gyroDps) > ui.grabDps) {
+            state.handOn = true;
+            state.handOffSince = 0;
+          }
+        } else if (Math.abs(gyroDps) < ui.grabDps * GYRO_HAND_OFF_RATIO) {
+          if (!state.handOffSince) state.handOffSince = performance.now();
+          else if (performance.now() - state.handOffSince > GYRO_HAND_OFF_MS)
+            state.handOn = false;
+        } else {
+          state.handOffSince = 0;
+        }
+        const gyroActive = gyroDriving && state.handOn;
+
+        // hand released with the motor on → slipmat grabs the record back to speed
+        const scratching = state.pointerOn || gyroActive;
+        if (prevScratching && !scratching && state.motorOn)
+          motorRecovering = true;
+        if (scratching || !state.motorOn) motorRecovering = false;
+        prevScratching = scratching;
+
+        let target, slew;
+        if (state.swapping) {
+          target = 0;
+          slew = 10; // brake the platter while the record is off the deck
+        } else if (state.pointerOn) {
+          target = state.pointerVel;
+          slew = 30;
+          state.pointerVel *= Math.exp(-dt / 0.12); // decays if the pointer stops moving
+        } else if (gyroActive) {
+          const dir = ui.invert ? -1 : 1;
+          target = (gyroDps / 360) * ui.sensitivity * dir; // device °/s → record rev/s, 1:1
+          slew = 28;
+        } else if (state.motorOn) {
+          target = NOMINAL_REVS;
+          if (motorRecovering) {
+            // constant accel so it lands crisply on pitch 0 instead of creeping up
+            slew = 0;
+            const dv = target - state.platterVel;
+            const step = MOTOR_RECOVERY_ACCEL * dt;
+            if (Math.abs(dv) <= step) {
+              state.platterVel = target;
+              motorRecovering = false;
+            } else state.platterVel += Math.sign(dv) * step;
+          } else {
+            slew = 5; // cold-start spin-up feel (Technics power-on)
+          }
+        } else {
+          target = 0;
+          slew = 1.6; // free-wheeling spin-down
+        }
+
+        state.platterVel +=
+          (target - state.platterVel) * Math.min(1, dt * slew);
+        if (Math.abs(state.platterVel) < 0.0004 && target === 0)
+          state.platterVel = 0;
+        state.platterAngle += state.platterVel * dt;
+
+        // drive the audio: playbackRate 1.0 == 33⅓ RPM
+        if (audioReady && rateParam) {
+          const rate = state.platterVel / NOMINAL_REVS;
+          rateParam.setTargetAtTime(rate, audioCtx.currentTime, 0.016);
+        }
+      }
+
+      // =====================================================================
+      //  HUD wiring
+      // =====================================================================
+      const rpmEl = document.getElementById("rpmVal");
+      const pitchEl = document.getElementById("pitchVal");
+      const gyroEl = document.getElementById("gyroVal");
+      const gyroBar = document.getElementById("gyroBar");
+      const recordBtn = document.getElementById("recordBtn");
+      const trackSelect = document.getElementById("trackSelect");
+
+      // ---- record crate ----
+      let swapAnim = null;
+      const SWAP_DURATION = 1.1; // seconds for the lift-swap-drop animation
+
+      TRACKS.forEach((t, i) => {
+        const opt = document.createElement("option");
+        opt.value = i;
+        opt.textContent = `💿 ${t.name} · ${t.genre} ${t.bpm} BPM`;
+        trackSelect.appendChild(opt);
+      });
+
+      trackSelect.addEventListener("change", async () => {
+        const i = parseInt(trackSelect.value, 10);
+        if (i === state.trackIndex) return;
+        if (state.swapping || audioStarting) {
+          trackSelect.value = state.trackIndex;
+          return;
+        }
+        state.trackIndex = i;
+        const track = TRACKS[i];
+        if (!audioReady) {
+          // no audio yet — just put the new record on the deck visually
+          applyVinylLook(track);
+          toast(`💿 ${track.name}`);
+          return;
+        }
+        state.swapping = true;
+        try {
+          await renderTrack(track); // render first so the drop is seamless
+          swapAnim = { t: 0, applied: false, trackIndex: i };
+        } catch (e) {
+          state.swapping = false;
+          log(`❌ Track render failed: ${e.message}`);
+        }
+      });
+
+      recordBtn.addEventListener("click", toggleRecording);
+
+      document.getElementById("sensSlider").addEventListener("input", (e) => {
+        ui.sensitivity = parseFloat(e.target.value);
+        document.getElementById("sensVal").textContent =
+          ui.sensitivity.toFixed(2).replace(/0$/, "") + "×";
+      });
+      document.getElementById("grabSlider").addEventListener("input", (e) => {
+        ui.grabDps = parseFloat(e.target.value);
+        document.getElementById("grabVal").textContent =
+          ui.grabDps.toFixed(0) + " °/s";
+      });
+      document.getElementById("volSlider").addEventListener("input", (e) => {
+        ui.volume = e.target.value / 100;
+        document.getElementById("volVal").textContent = e.target.value + "%";
+        if (masterGain)
+          masterGain.gain.setTargetAtTime(
+            ui.volume,
+            audioCtx.currentTime,
+            0.02,
+          );
+      });
+      document.getElementById("invertChk").addEventListener("change", (e) => {
+        ui.invert = e.target.checked;
+      });
+
+      document.getElementById("zeroBtn").addEventListener("click", () => {
+        state.biasSamples = [];
+        state.calibrated = false;
+        log("🎯 Re-zeroing gyro — keep the device still…");
+      });
+
+      document
+        .getElementById("motorBtn")
+        .addEventListener("click", () => toggleMotor());
+      document
+        .getElementById("autoDjBtn")
+        .addEventListener("click", async () => {
+          state.autoDj = !state.autoDj;
+          document
+            .getElementById("autoDjBtn")
+            .classList.toggle("on", state.autoDj);
+          if (!state.autoDj && !state.streaming) state.gyroDps = 0;
+          if (state.autoDj) {
+            state.autoT = 0;
+            await ensureAudio();
+            toggleMotor(true);
+            toast(
+              "🤖 Auto-DJ on the decks — connect a Shimmer3R to take over!",
+            );
+          }
+        });
+
+      window.addEventListener("keydown", (e) => {
+        if (e.code === "Space" && !e.repeat && e.target === document.body) {
+          e.preventDefault();
+          toggleMotor();
+        }
+      });
+
+      function updateHud() {
+        const rpm = state.platterVel * 60;
+        rpmEl.textContent = rpm.toFixed(1);
+        rpmEl.classList.toggle("hot", Math.abs(rpm) > 45 || rpm < -0.5);
+
+        if (audioReady) {
+          const pitch = (state.platterVel / NOMINAL_REVS - 1) * 100;
+          pitchEl.textContent = (pitch >= 0 ? "+" : "") + pitch.toFixed(0);
+        } else {
+          pitchEl.textContent = "—";
+        }
+
+        if (rec.on) {
+          const s = Math.floor((performance.now() - rec.startedAt) / 1000);
+          recordBtn.textContent = `⏹ ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+        }
+
+        gyroEl.textContent = state.gyroDps.toFixed(0);
+        const frac = THREE.MathUtils.clamp(
+          state.gyroDps / state.gyroRangeDps,
+          -1,
+          1,
+        );
+        if (frac >= 0) {
+          gyroBar.style.left = "50%";
+          gyroBar.style.width = frac * 50 + "%";
+        } else {
+          gyroBar.style.left = 50 + frac * 50 + "%";
+          gyroBar.style.width = -frac * 50 + "%";
+        }
+      }
+
+      // =====================================================================
+      //  Render loop
+      // =====================================================================
+      let lastT = performance.now();
+      let hudTick = 0;
+
+      function animate(nowMs) {
+        requestAnimationFrame(animate);
+        const dt = Math.min(0.05, (nowMs - lastT) / 1000);
+        lastT = nowMs;
+        const nowS = nowMs / 1000;
+
+        physicsStep(dt, nowS);
+
+        // record swap: lift the vinyl, change it at the apex, drop it back
+        if (swapAnim) {
+          swapAnim.t += dt;
+          const p = Math.min(1, swapAnim.t / SWAP_DURATION);
+          const lift = Math.sin(Math.PI * p); // 0 → 1 → 0
+          vinyl.position.y = 0.165 + lift * 1.7;
+          vinyl.position.x = lift * 0.9;
+          if (p >= 0.5 && !swapAnim.applied) {
+            swapAnim.applied = true;
+            const track = TRACKS[swapAnim.trackIndex];
+            workletNode.port.postMessage({
+              type: "buffer",
+              l: track.rendered.l,
+              r: track.rendered.r,
+            });
+            state.loopPos = 0;
+            applyVinylLook(track);
+          }
+          if (p >= 1) {
+            swapAnim = null;
+            state.swapping = false;
+            vinyl.position.set(0, 0.165, 0);
+          }
+        }
+
+        // record + platter rotation (forward = clockwise from above = -Y)
+        platterGroup.rotation.y = -state.platterAngle * Math.PI * 2;
+
+        updateTonearm(dt);
+
+        // pitch fader knob mirrors current speed (±20% window)
+        {
+          const pitch = THREE.MathUtils.clamp(
+            state.platterVel / NOMINAL_REVS - 1,
+            -1,
+            1,
+          );
+          faderKnob.position.z = 0.7 - pitch * 0.9;
+        }
+
+        // spectrum bars + audio level
+        if (analyser) {
+          analyser.getByteFrequencyData(state.spectrum);
+          let sum = 0;
+          const bins = state.spectrum.length;
+          for (let i = 0; i < BAR_COUNT; i++) {
+            // slightly logarithmic bin mapping, skip DC
+            const bi =
+              2 + Math.floor(Math.pow(i / BAR_COUNT, 1.4) * (bins - 6));
+            const v = state.spectrum[bi] / 255;
+            sum += v;
+            const b = bars[i];
+            const h = 0.08 + v * v * 3.4;
+            b.scale.y += (h - b.scale.y) * Math.min(1, dt * 14);
+            b.position.y = b.scale.y / 2 - 0.3;
+            b.material.emissiveIntensity = 0.35 + v * 2.4;
+          }
+          state.audioLevel +=
+            (sum / BAR_COUNT - state.audioLevel) * Math.min(1, dt * 10);
+        }
+
+        // club lights breathe with the music
+        const pulse = 1 + state.audioLevel * 2.2;
+        cyanLight.intensity = 22 * pulse + Math.sin(nowS * 1.7) * 4;
+        pinkLight.intensity = 22 * pulse + Math.cos(nowS * 1.3) * 4;
+        trim.material.emissiveIntensity = 1.1 + state.audioLevel * 4;
+
+        // dust drift
+        dust.rotation.y = nowS * 0.012;
+
+        if ((hudTick++ & 3) === 0) updateHud();
+
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      requestAnimationFrame(animate);
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // =====================================================================
+      //  Shimmer3R BLE wiring (same flow as the other demos)
+      // =====================================================================
+      const scanBtn = document.getElementById("scanBtn");
+      const disconnectBtn = document.getElementById("disconnectBtn");
+      const deviceNameEl = document.getElementById("deviceName");
+      const gyroRangeSelect = document.getElementById("gyroRangeSelect");
+
+      const client = new Shimmer3RClient({ timestampFmt: "u24", debug: false });
+      client.onStatus = (msg) => log(msg);
+      client.onInquiry = (info) =>
+        log(
+          `Inquiry → ${info.numChannels} ch @ ${info.samplingRateHz.toFixed(1)} Hz`,
+        );
+
+      const BIAS_SAMPLE_COUNT = 64;
+
+      client.onStreamFrame = (oc) => {
+        const gz = oc.get("GYRO_Z")?.value;
+        if (gz === undefined || gz === null) return;
+
+        state.gyroRaw = gz;
+        state.lastGyroAt = performance.now();
+
+        // auto-zero: average the first frames while the device is (hopefully) still
+        if (!state.calibrated) {
+          state.biasSamples.push(gz);
+          if (state.biasSamples.length >= BIAS_SAMPLE_COUNT) {
+            state.gyroBias =
+              state.biasSamples.reduce((a, b) => a + b, 0) /
+              state.biasSamples.length;
+            state.calibrated = true;
+            log(
+              `🎯 Gyro zeroed (bias ${state.gyroBias.toFixed(1)} LSB). Scratch away!`,
+            );
+            toast("🎯 Gyro calibrated — twist the Shimmer3R to scratch!");
+          }
+          return;
+        }
+
+        const dps = (gz - state.gyroBias) / state.gyroLsbPerDps;
+        state.gyroDps = state.gyroDps * 0.55 + dps * 0.45; // light smoothing, low latency
+      };
+
+      // One-shot flow: connect → configure (rate, sensors, gyro range) → stream
+      scanBtn.addEventListener("click", async () => {
+        const rangeIdx = parseInt(gyroRangeSelect.value, 10);
+        const range = GYRO_RANGES[rangeIdx];
+        try {
+          scanBtn.disabled = true;
+          gyroRangeSelect.disabled = true;
+
+          await client.connect();
+          deviceNameEl.textContent = `Connected: ${client.device?.name || "Shimmer3R"}`;
+          disconnectBtn.disabled = false;
+          log("✅ Connected — configuring…");
+
+          await client.setSamplingRate(102.4);
+          await client.setSensors(SensorBitmapShimmer3.SENSOR_GYRO);
+          await client.setGyroRange(rangeIdx);
+          state.gyroLsbPerDps = range.lsbPerDps;
+          state.gyroRangeDps = range.dps;
+          log(`⚙️ Configured — gyro ±${range.dps} °/s @ 102.4 Hz`);
+
+          await ensureAudio();
+          state.biasSamples = [];
+          state.calibrated = false;
+          await client.startStreaming();
+          state.streaming = true;
+          if (state.autoDj) {
+            state.autoDj = false;
+            document.getElementById("autoDjBtn").classList.remove("on");
+          }
+          toggleMotor(true);
+          log(
+            "📡 Streaming — hold the device still for a second to zero the gyro…",
+          );
+        } catch (e) {
+          log(`❌ ${e.message}`);
+          await resetToDisconnected();
+        }
+      });
+
+      // Best-effort close the link and put the UI back to "no device". Shared by
+      // the Disconnect button and the scan flow's error path, so a failure part
+      // way through configuration cannot leave the page reading as connected
+      // with the BLE link still open.
+      async function resetToDisconnected(reason) {
+        try {
+          await client.disconnect();
+        } catch (e) {
+          log(`⚠️ Disconnect error: ${e.message}`);
+        }
+        state.streaming = false;
+        state.gyroDps = 0;
+        deviceNameEl.textContent = "No device selected";
+        scanBtn.disabled = false;
+        gyroRangeSelect.disabled = false;
+        disconnectBtn.disabled = true;
+        if (reason) log(reason);
+      }
+
+      disconnectBtn.addEventListener("click", async () => {
+        await resetToDisconnected("🔌 Disconnected");
+      });
+
+      // =====================================================================
+      //  Intro overlay
+      // =====================================================================
+      window.addEventListener("DOMContentLoaded", () => {
+        const params = new URLSearchParams(location.search);
+        const skip =
+          localStorage.getItem("hideDjGyroIntro") === "true" ||
+          params.has("nointro") ||
+          params.has("autodj");
+        if (skip)
+          document.getElementById("introOverlay").style.display = "none";
+        // kiosk mode: ?autodj starts the Auto-DJ routine on load
+        if (params.has("autodj")) {
+          setTimeout(() => document.getElementById("autoDjBtn").click(), 300);
+        }
+      });
+      document.getElementById("closeIntroBtn").addEventListener("click", () => {
+        if (document.getElementById("dontShowAgain").checked) {
+          localStorage.setItem("hideDjGyroIntro", "true");
+        }
+        document.getElementById("introOverlay").style.display = "none";
+        ensureAudio(); // user gesture → safe to build the AudioContext now
+      });
+      document.getElementById("showTipBtn").addEventListener("click", () => {
+        document.getElementById("introOverlay").style.display = "flex";
+        localStorage.removeItem("hideDjGyroIntro");
+      });
+
+      log(
+        "🎧 DJ GYRO ready. Scan for your Shimmer3R, or try 🤖 Auto-DJ / drag the record.",
+      );
+    </script>
+  </body>
+</html>

@@ -51,6 +51,7 @@ The full Verisense control console now lives in a dedicated repository:
 | PPG heart-rate visualiser | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/video-ppg/) |
 | Two-device gyro brick game | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/) |
 | Spell caster (gyro gestures) | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/) |
+| DJ gyro (3D turntable scratch) | [dj-gyro](https://shimmerresearch.github.io/webBLEDemos/dj-gyro/) |
 | Data capture / CSV download | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
 | Consensys trial export + Bluetooth RTC set | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) |
 | RTC drift test (32k crystal, DEV-866) | [rtc-drift-test](https://shimmerresearch.github.io/webBLEDemos/rtc-drift-test/) |
