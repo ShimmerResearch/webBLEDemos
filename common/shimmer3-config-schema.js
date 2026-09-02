@@ -48,9 +48,9 @@
  * @param {object|null} client a Shimmer3Client / Shimmer3RClient / wired client
  * @param {"ble"|"rfcomm"|"usb"|string} [mode] the link the client is on
  * @returns {{
- *   stream: boolean, sdbt: boolean, infomem: boolean, calib: boolean,
- *   rtc: boolean, ranges: boolean, exg: boolean, sensors: boolean,
- *   battery: boolean, status: boolean,
+ *   stream: boolean, sdbt: boolean, infomem: boolean, sdlog: boolean,
+ *   calib: boolean, rtc: boolean, ranges: boolean, exg: boolean,
+ *   sensors: boolean, battery: boolean, status: boolean,
  * }}
  */
 export function describeShimmer3Caps(client, mode) {
@@ -69,6 +69,10 @@ export function describeShimmer3Caps(client, mode) {
     stream: has("startStreaming") && mode !== "usb",
     sdbt: has("startStreamingAndLogging") && mode !== "usb",
     infomem: infomemRead && infomemWrite,
+    // The 0x9C SD-header rebuild. A separate capability from `infomem`
+    // because an older bundle can read and write the image without being able
+    // to ask the firmware to regenerate the card's configuration file.
+    sdlog: has("updateSdLogConfig"),
     calib: has("readCalibration"),
     rtc: has("setRtcTime") && has("getRtcTime"),
     ranges: has("setWrAccelRange") && has("setGyroRange"),
@@ -277,16 +281,29 @@ export const SENSOR_LABELS = Object.freeze({
 // Apply plan
 // ---------------------------------------------------------------------------
 
-/**
- * The InfoMem write step. `updateSdLogConfig` is command 0x9C
- * (`UPD_SDLOG_CFG_COMMAND`), which makes the firmware regenerate the SD
- * header from the config bytes it has just been given.
+/*
+ * Step names are the SDK client's own method names, so a caller dispatches on
+ * them directly (`await client[step]()`) instead of maintaining a second
+ * lookup table that can drift from this list.
+ *
+ * The two InfoMem steps name the WHOLE-IMAGE methods, because the working
+ * document is the whole 384-byte image. A bundle old enough to expose only the
+ * paged `readInfoMem(address, length)` / `writeInfoMem(address, data)`
+ * primitives has no `readInfoMemBytes`, so `describeShimmer3Caps` reports
+ * `infomem` from the paged pair and the page assembles the three pages itself
+ * — the step name then reads as the operation, not as a callable method.
+ *
+ * `updateSdLogConfig` is command 0x9C (`UPD_SDLOG_CFG_COMMAND`), which makes
+ * the firmware regenerate the SD configuration file from the config bytes it
+ * has just been given. `exgMode` is the only name here that is NOT a client
+ * method: the ExG preset picks one of {@link EXG_MODES}, whose `method` field
+ * carries the actual helper to call.
  */
-const STEP_INFOMEM = "writeInfoMem";
+const STEP_INFOMEM = "writeInfoMemBytes";
 const STEP_SDLOG = "updateSdLogConfig";
 const STEP_EXG = "exgMode";
 const STEP_INQUIRY = "inquiry";
-const STEP_REREAD = "readInfoMem";
+const STEP_REREAD = "readInfoMemBytes";
 
 /**
  * Turn a set of dirty field keys into the ordered list of operations that
@@ -300,8 +317,9 @@ const STEP_REREAD = "readInfoMem";
  *     that survives a reboot and that the SD header is built from.
  *  2. `updateSdLogConfig` — 0x9C. `ShimBt_processGeneralCmd` answers it with
  *     `ShimTask_set(TASK_SDLOG_CFG_UPDATE)` (shimmer_bt_uart.c:1099-1103), so
- *     the firmware rewrites the SD header from the bytes just written. Skipped
- *     when nothing that reaches the SD header changed; harmless when run.
+ *     the firmware rewrites the SD header from the bytes just written. Always
+ *     run when the client has the method (it is harmless when nothing the
+ *     header carries changed), and dropped when it does not.
  *  3. the live setters, in {@link LIVE_ORDER} — sensors, then sampling rate,
  *     then ranges, then expansion power. These overwrite the RUNNING config;
  *     without them the stored image and the streaming behaviour disagree
@@ -358,11 +376,13 @@ export function buildApplyPlan(dirtyKeys, ctx = {}) {
     label: "Write the configuration image (InfoMem pages D, C, B)",
     kind: "infomem",
   });
-  steps.push({
-    step: STEP_SDLOG,
-    label: "Rebuild the SD header from the new configuration (0x9C)",
-    kind: "infomem",
-  });
+  if (caps.sdlog !== false) {
+    steps.push({
+      step: STEP_SDLOG,
+      label: "Rebuild the SD header from the new configuration (0x9C)",
+      kind: "infomem",
+    });
+  }
 
   // 3. Live overlays, in firmware-mandated order, for the dirty subset only.
   for (const configKey of LIVE_ORDER) {

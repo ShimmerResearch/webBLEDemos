@@ -51,14 +51,38 @@ const UNSUPPORTED_TITLE = "Not available on this hardware";
 const ASCII_MIN = 0x20;
 const ASCII_MAX = 0x7e;
 
-/** `bytes21` blocks are 21 bytes, i.e. 42 hex characters. */
-const BYTES21_LENGTH = 21;
+/**
+ * Kinds that decode to a plain number, and so render as a number input.
+ * `bit` is handled separately (it can be a checkbox or a select).
+ */
+const NUMERIC_KINDS = new Set(["bit", "u8", "u16le", "u16be", "u32be"]);
 
 /** One MAC is 6 bytes, i.e. 12 hex characters. */
 const MAC_HEX_LENGTH = 12;
 
 /** Default cap on a `mac6[]` list when the field declares no `max`. */
 const MAC_LIST_MAX_DEFAULT = 21;
+
+/**
+ * Length of a raw byte-block kind, or null when the kind is not one.
+ *
+ * The schema names these by their length (`bytes21` for a kinematic
+ * calibration block, `bytes10` for an ADS1292R register bank), so the length
+ * is parsed out of the kind rather than tabulated. A `bytes6` added tomorrow
+ * therefore renders correctly with no change here — which is the point: the
+ * ExG banks arrived as `u8` and became `bytes10` mid-development, and a
+ * hard-coded table would have silently rendered the new kind as a number
+ * input and written ten zeroes over the register bank on the first commit.
+ *
+ * @param {string} kind
+ * @returns {number|null}
+ */
+function byteBlockLength(kind) {
+  const m = /^bytes(\d+)$/.exec(String(kind));
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
 
 /** Instance counter, so two forms on one page cannot collide on element ids. */
 let instanceSeq = 0;
@@ -120,14 +144,15 @@ export function encodingTooltip(field, index, msbIndex) {
       return `${byteSpanText(index, 4)} (big-endian)`;
     case "ascii12":
       return `${byteSpanText(index, 12)} (ASCII, 0xFF-padded)`;
-    case "bytes21":
-      return `${byteSpanText(index, BYTES21_LENGTH)} (raw)`;
     case "mac6[]": {
       const slots = field.max ?? MAC_LIST_MAX_DEFAULT;
       return `${byteSpanText(index, slots * 6)} (${slots} slots x 6 bytes)`;
     }
-    default:
-      return byteSpanText(index, 1);
+    default: {
+      const block = byteBlockLength(field.kind);
+      if (block !== null) return `${byteSpanText(index, block)} (raw)`;
+      return `${byteSpanText(index, 1)} (unrecognised encoding '${field.kind}')`;
+    }
   }
 }
 
@@ -233,25 +258,6 @@ function parseControlValue(field, raw) {
       }
       return { ok: true, value: s };
     }
-    case "bytes21": {
-      const s = String(raw)
-        .replace(/[\s:-]/g, "")
-        .toUpperCase();
-      if (!/^[0-9A-F]*$/.test(s)) {
-        return { ok: false, error: "hex digits only" };
-      }
-      if (s.length !== BYTES21_LENGTH * 2) {
-        return {
-          ok: false,
-          error: `${BYTES21_LENGTH * 2} hex characters needed, ${s.length} given`,
-        };
-      }
-      const out = new Uint8Array(BYTES21_LENGTH);
-      for (let i = 0; i < BYTES21_LENGTH; i++) {
-        out[i] = Number.parseInt(s.slice(i * 2, i * 2 + 2), 16);
-      }
-      return { ok: true, value: out };
-    }
     case "mac6[]": {
       const limit = field.max ?? MAC_LIST_MAX_DEFAULT;
       const macs = [];
@@ -275,7 +281,36 @@ function parseControlValue(field, raw) {
       return { ok: true, value: macs };
     }
     default: {
-      // Every remaining kind is numeric.
+      const block = byteBlockLength(field.kind);
+      if (block !== null) {
+        const hex = String(raw)
+          .replace(/[\s:-]/g, "")
+          .toUpperCase();
+        if (!/^[0-9A-F]*$/.test(hex)) {
+          return { ok: false, error: "hex digits only" };
+        }
+        if (hex.length !== block * 2) {
+          return {
+            ok: false,
+            error: `${block * 2} hex characters needed, ${hex.length} given`,
+          };
+        }
+        const out = new Uint8Array(block);
+        for (let i = 0; i < block; i++) {
+          out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        return { ok: true, value: out };
+      }
+      // Numeric kinds are named, not assumed: an encoding this module does
+      // not know must be refused, never parsed as a number and written over
+      // the field's bytes. (`buildControl` renders such a field read-only, so
+      // this is the second of two guards.)
+      if (!NUMERIC_KINDS.has(field.kind)) {
+        return {
+          ok: false,
+          error: `unrecognised field encoding '${field.kind}'`,
+        };
+      }
       const s = String(raw).trim();
       if (s === "") return { ok: false, error: "a number is needed" };
       const n = Number(s);
@@ -545,7 +580,7 @@ export function createConfigForm(host, cfg) {
     // keystroke: "13" on the way to "130" is out of range for plenty of
     // fields, and a per-keystroke commit would either reject it or write it.
     control.addEventListener("change", () => commit(entry));
-    if (field.kind === "bytes21" || field.kind === "mac6[]") {
+    if (byteBlockLength(field.kind) !== null || field.kind === "mac6[]") {
       // Hex and MAC input gets live validity styling while typing — the error
       // is what tells the user the length is still wrong — but still only
       // commits on change.
@@ -587,16 +622,6 @@ export function createConfigForm(host, cfg) {
           autocomplete: "off",
           spellcheck: "false",
         });
-      case "bytes21":
-        return el("input", {
-          id,
-          type: "text",
-          class: "mono",
-          maxlength: String(BYTES21_LENGTH * 2),
-          autocomplete: "off",
-          spellcheck: "false",
-          placeholder: `${BYTES21_LENGTH * 2} hex characters`,
-        });
       case "mac6[]":
         return el("textarea", {
           id,
@@ -605,8 +630,41 @@ export function createConfigForm(host, cfg) {
           spellcheck: "false",
           placeholder: "one 12-hex-digit address per line",
         });
-      default:
+      // Listed explicitly rather than left to fall through to `default`: the
+      // default is now the byte-block/unknown branch, and a numeric kind that
+      // reached it would render read-only and silently stop being editable.
+      case "u8":
+      case "u16le":
+      case "u16be":
+      case "u32be":
         return numberControl(field, id);
+      default: {
+        const block = byteBlockLength(field.kind);
+        if (block !== null) {
+          return el("input", {
+            id,
+            type: "text",
+            class: "mono",
+            maxlength: String(block * 2),
+            autocomplete: "off",
+            spellcheck: "false",
+            placeholder: `${block * 2} hex characters`,
+          });
+        }
+        // An encoding this module does not recognise. A number input would be
+        // the WRONG guess for a block or a string kind, and committing it
+        // would write a plain number over the field's bytes, so render a
+        // read-only display of what the codec decoded instead. The bytes stay
+        // exactly as they were and the page is told, rather than the image
+        // being quietly corrupted by a control that guessed.
+        return el("input", {
+          id,
+          type: "text",
+          class: "mono",
+          readonly: true,
+          title: `Unrecognised field encoding '${field.kind}' — shown read-only`,
+        });
+      }
     }
   }
 
@@ -689,6 +747,9 @@ export function createConfigForm(host, cfg) {
    */
   function commit(entry) {
     const { field, control } = entry;
+    // A read-only control is a display of bytes this module cannot encode.
+    // Never write from one, however the change event arrived.
+    if (control.readOnly) return;
     const raw =
       control.type === "checkbox" ? (control.checked ? 1 : 0) : control.value;
     const parsed = parseControlValue(field, raw);
