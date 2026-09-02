@@ -252,7 +252,7 @@
               id="btnSetClock"
               type="button"
               data-requires="idle"
-              data-cap="rtc"
+              data-cap="rtcWrite"
             >
               Set device clock from host
             </button>
@@ -331,7 +331,7 @@
               type="button"
               class="warn"
               data-requires="idle"
-              data-cap="calibDump"
+              data-cap="calibWrite"
             >
               Write dump
             </button>
@@ -408,7 +408,12 @@
             >
               Start stream
             </button>
-            <button id="btnStreamStop" type="button" data-requires="streaming">
+            <button
+              id="btnStreamStop"
+              type="button"
+              data-requires="streaming"
+              data-cap="btStop"
+            >
               Stop stream
             </button>
             <button
@@ -419,7 +424,12 @@
             >
               Start stream + SD logging
             </button>
-            <button id="btnSdStop" type="button" data-requires="streaming">
+            <button
+              id="btnSdStop"
+              type="button"
+              data-requires="streaming"
+              data-cap="sdStop"
+            >
               Stop stream + SD logging
             </button>
           </div>
@@ -725,6 +735,12 @@
         // Capability floors the markup gates on but only the page can know.
         caps.record = !!csvColumns;
         caps.calibWrite = !!caps.calibDump && !!calibBytes;
+        /* Exactly one stop button is live at a time. STOP_STREAMING (0x20)
+           and STOP_SDBT (0x97) are different commands: the first leaves an SD
+           recording running, so offering both would let one click end a
+           stream and silently leave the card still being written. */
+        caps.btStop = streaming && !sdLogging;
+        caps.sdStop = sdLogging;
 
         gate.apply({
           connected: !!client,
@@ -781,9 +797,15 @@
           );
         }
         if (/NACK/i.test(raw)) {
+          /* The firmware answered, so the link is fine. Two things produce a
+             NACK, and the page cannot tell them apart from here: a command
+             refused because the sensor is sensing, and a command this
+             firmware does not implement at all. Say both rather than
+             asserting the wrong one. */
           return (
-            `The sensor refused "${what}". It refuses configuration commands ` +
-            `while it is streaming or logging, so stop it first.`
+            `The sensor refused "${what}". Configuration commands are ` +
+            `refused while it is streaming or logging — if it is idle, its ` +
+            `firmware may not support this command.`
           );
         }
         if (/not open|disconnect|GATT/i.test(raw)) {
@@ -2301,6 +2323,20 @@
       // Wiring
       // =====================================================================
 
+      /**
+       * Run a device action from a click and swallow its rejection.
+       *
+       * `withDevice` rethrows so a multi-step run can abort, but a click has
+       * nothing to abort: the failure has already been logged and toasted.
+       * Swallowing it HERE rather than making those functions quiet keeps the
+       * apply plan able to stop — and keeps a refused command out of the
+       * console as an unhandled promise rejection, where it reads like a page
+       * fault rather than like a sensor that said no.
+       */
+      const reported = (fn) => () => {
+        fn().catch(() => {});
+      };
+
       $("btnBle").addEventListener("click", () => connect.connectVia("ble"));
       $("btnBt").addEventListener("click", () => connect.connectVia("rfcomm"));
       $("btnUsb").addEventListener("click", () => connect.connectVia("usb"));
@@ -2324,14 +2360,15 @@
         resetAfterDisconnect();
       });
 
-      $("btnRefreshDevice").addEventListener("click", () =>
-        refreshDeviceState(),
+      $("btnRefreshDevice").addEventListener(
+        "click",
+        reported(refreshDeviceState),
       );
-      $("btnSetClock").addEventListener("click", () => setDeviceClock());
+      $("btnSetClock").addEventListener("click", reported(setDeviceClock));
 
-      $("btnRead").addEventListener("click", () => readConfiguration());
-      $("btnImRead").addEventListener("click", () => readConfiguration());
-      $("btnApply").addEventListener("click", () => applyConfiguration());
+      $("btnRead").addEventListener("click", reported(readConfiguration));
+      $("btnImRead").addEventListener("click", reported(readConfiguration));
+      $("btnApply").addEventListener("click", reported(applyConfiguration));
 
       $("btnDiscard").addEventListener("click", () => {
         form?.revert();
@@ -2427,7 +2464,7 @@
         );
       });
 
-      $("btnCalRead").addEventListener("click", () => readCalibration());
+      $("btnCalRead").addEventListener("click", reported(readCalibration));
       $("btnCalSave").addEventListener("click", () => {
         if (!calibBytes) return;
         downloadBlob(
@@ -2450,12 +2487,24 @@
         }
         regate();
       });
-      $("btnCalWrite").addEventListener("click", () => writeCalibration());
+      $("btnCalWrite").addEventListener("click", reported(writeCalibration));
 
-      $("btnStreamStart").addEventListener("click", () => startStream(false));
-      $("btnStreamStop").addEventListener("click", () => stopStream(false));
-      $("btnSdStart").addEventListener("click", () => startStream(true));
-      $("btnSdStop").addEventListener("click", () => stopStream(true));
+      $("btnStreamStart").addEventListener(
+        "click",
+        reported(() => startStream(false)),
+      );
+      $("btnStreamStop").addEventListener(
+        "click",
+        reported(() => stopStream(false)),
+      );
+      $("btnSdStart").addEventListener(
+        "click",
+        reported(() => startStream(true)),
+      );
+      $("btnSdStop").addEventListener(
+        "click",
+        reported(() => stopStream(true)),
+      );
 
       $("selWindow").addEventListener("change", (e) => {
         const wanted = Number(e.target.value);
@@ -2482,12 +2531,26 @@
         $("btnPause").textContent = plotPaused ? "Resume plot" : "Pause plot";
       });
 
-      $("btnRecStart").addEventListener("click", () => startRecording());
-      $("btnRecStop").addEventListener("click", () => stopRecording());
+      /* NOT wrapped: showSaveFilePicker is gesture-gated, so `startRecording`
+         must be reached straight off the click. It reports its own failures. */
+      $("btnRecStart").addEventListener("click", () => {
+        startRecording().catch(() => {});
+      });
+      $("btnRecStop").addEventListener("click", reported(stopRecording));
 
       // =====================================================================
       // Startup
       // =====================================================================
+
+      /* Anything that still escapes belongs in the log the user can download,
+         not only in a console they will never open. Deliberately NOT
+         `preventDefault()`ed: it stays a console error too, because a
+         rejection nobody handled is a bug worth seeing. */
+      window.addEventListener("unhandledrejection", (event) => {
+        log.error(
+          `unhandled error: ${event.reason?.message ?? event.reason ?? "unknown"}`,
+        );
+      });
 
       renderHex();
       clearIdentity();
