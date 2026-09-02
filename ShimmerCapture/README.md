@@ -13,20 +13,26 @@ is reachable from a page you can read in an afternoon.
 
 ## The three ways to connect
 
-| Link                  | Configure | Read / write the configuration image | Calibration | Set the clock | Stream to the host | Log to the SD card |
-| --------------------- | :-------: | :----------------------------------: | :---------: | :-----------: | :----------------: | :----------------: |
-| **BLE**               |    yes    |                 yes                  |     yes     |      yes      |        yes         |        yes         |
-| **Classic Bluetooth** |    yes    |                 yes                  |     yes     |      yes      |        yes         |        yes         |
-| **USB-C**             |    yes    |                 yes                  |     yes     |      yes      |      **no**\*      |      **no**\*      |
+| Link                  | Configure | Read / write the configuration image | Set the clock | Status flags | Calibration dump | Stream to the host | Log to the SD card |
+| --------------------- | :-------: | :----------------------------------: | :-----------: | :----------: | :--------------: | :----------------: | :----------------: |
+| **BLE**               |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |
+| **Classic Bluetooth** |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |
+| **USB-C**             |    yes    |                 yes                  |      yes      | battery only |        no        |      **no**\*      |      **no**\*      |
 
 \* **The Shimmer3R's USB-C port speaks the dock protocol, not the Bluetooth
 one** — the firmware routes the bytes arriving on the USB serial port to the
 same parser a docked sensor talks to, which is a configuration and
 file-transfer channel with no sample stream on it at all. So over USB the page
-configures the sensor, sets its clock, and reads and writes its configuration
-image and calibration, and it closes the Stream tab off with a note saying
-streaming needs a Bluetooth link. That is a property of the firmware, not a
-limitation of the page.
+configures the sensor, sets its clock and reads and writes its configuration
+image, and it closes the Stream tab off with a note saying streaming needs a
+Bluetooth link. That is a property of the firmware, not a limitation of the
+page.
+
+The dock protocol is a different command set, not a subset, which is why the
+last few columns differ: it has no `STATUS_RESPONSE` (it reports the battery
+instead of the status bits) and no calibration-dump command, so the page greys
+those controls out rather than guessing. It does have a clock write, so
+setting the clock works over all three links.
 
 The two Bluetooth links reach the same command set by different routes. **BLE**
 uses Web Bluetooth and its own device picker. **Classic Bluetooth** uses Web
@@ -76,20 +82,27 @@ greyed out with that reason while a stream or a recording is running.
 
 ## Device and clock
 
-A refresh reads the battery voltage and charge, the decoded device status flags
-— docked, sensing, streaming, logging, SD card present, SD file error, clock
-set — and the real-world clock. The sensor keeps that clock in **local civil
-time**, which is what the offline file parser expects, so setting it from the
-host applies the host's time-zone offset rather than writing plain UTC.
+A refresh reads the battery voltage and charge, and over a Bluetooth link the
+decoded device status flags — docked, sensing, streaming, logging, SD card
+present, SD file error, clock set, USB plugged in — and the real-world clock.
+Those flags are the only way to learn that the sensor was started from its own
+button, or that its firmware could not open its SD file; the page says so in
+the log when it sees them.
+
+The sensor keeps its clock in **local civil time**, which is what the offline
+file parser expects, so setting it from the host applies the host's time-zone
+offset rather than writing plain UTC. Over USB the clock can be set but not
+read back, because the dock protocol has a write for it and no read.
 
 ## Calibration
 
 The calibration dump is the sensor's own record of every per-sensor calibration
 it holds: which sensor, at which range, calibrated when. The page reads it into
-a table, saves it to a file and writes one back. Note the ordering the firmware
-imposes — writing a configuration image regenerates the dump from the
-configuration bytes, so a dump must be written **after** a configuration, never
-before.
+a table, saves it to a file and writes one back, over a Bluetooth link — the
+dock protocol has no calibration-dump command, so these controls are greyed out
+over USB. Note the ordering the firmware imposes: writing a configuration image
+regenerates the dump from the configuration bytes, so a dump must be written
+**after** a configuration, never before.
 
 ## Streaming, plotting and recording
 
