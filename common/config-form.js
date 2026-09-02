@@ -148,7 +148,8 @@ export function derivedMax(field) {
   }
   switch (field.kind) {
     case "bit": {
-      const width = (field.width ?? 1) + (field.msbLayoutKey ? (field.msbWidth ?? 1) : 0);
+      const width =
+        (field.width ?? 1) + (field.msbLayoutKey ? (field.msbWidth ?? 1) : 0);
       return (1 << width) - 1;
     }
     case "u8":
@@ -233,7 +234,9 @@ function parseControlValue(field, raw) {
       return { ok: true, value: s };
     }
     case "bytes21": {
-      const s = String(raw).replace(/[\s:-]/g, "").toUpperCase();
+      const s = String(raw)
+        .replace(/[\s:-]/g, "")
+        .toUpperCase();
       if (!/^[0-9A-F]*$/.test(s)) {
         return { ok: false, error: "hex digits only" };
       }
@@ -683,7 +686,8 @@ export function createConfigForm(host, cfg) {
    */
   function commit(entry) {
     const { field, control } = entry;
-    const raw = control.type === "checkbox" ? (control.checked ? 1 : 0) : control.value;
+    const raw =
+      control.type === "checkbox" ? (control.checked ? 1 : 0) : control.value;
     const parsed = parseControlValue(field, raw);
     if (!parsed.ok) {
       showError(entry, parsed.error);
@@ -753,7 +757,9 @@ export function createConfigForm(host, cfg) {
       if (!details) continue;
 
       const members = [...entries.values()].filter(
-        (e) => e.field.group === g.id || String(e.field.group).startsWith(`${g.id}.`),
+        (e) =>
+          e.field.group === g.id ||
+          String(e.field.group).startsWith(`${g.id}.`),
       );
       // An empty group (the sensor-enable bitmaps are not schema fields, so
       // "Sensor Enables" arrives with none) is hidden unless the page has put
