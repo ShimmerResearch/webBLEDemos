@@ -95,11 +95,23 @@ function hex2(n) {
   return (n & 0xff).toString(16).toUpperCase().padStart(2, "0");
 }
 
-/** `byte 130, bits 6-7 (mask 0x03)` for one bitfield slice. */
+/**
+ * `byte 130, bits 6-7 (mask 0xC0)` for one bitfield slice.
+ *
+ * The mask is the IN-BYTE mask, i.e. already shifted into place, because the
+ * reader hovering this is holding a register map or a hex dump and wants the
+ * bits as they sit in that byte. An unshifted 0x03 for bits 6-7 is a mask of
+ * the field's VALUE, which is not a thing anyone can look up.
+ *
+ * Each slice of a composite field is shifted by its OWN shift, so the two
+ * halves of the LSM6DSV gyro range read `mask 0x03` and `mask 0x04` — the
+ * bytes they live in, not one mask applied twice.
+ */
 function bitSpanText(index, shift, width) {
   const bits =
     width === 1 ? `bit ${shift}` : `bits ${shift}-${shift + width - 1}`;
-  return `byte ${index}, ${bits} (mask 0x${hex2((1 << width) - 1)})`;
+  const mask = ((1 << width) - 1) << shift;
+  return `byte ${index}, ${bits} (mask 0x${hex2(mask)})`;
 }
 
 function byteSpanText(index, length) {
