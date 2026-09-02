@@ -1794,6 +1794,21 @@
       const recorder = createCsvRecorder({
         fileNameFn: () => recordFileName(),
         log,
+        /* The recorder gave up on the file part way through — it has already
+           stopped itself and written the detail to the log. All that is left
+           is to make sure the page does not go on claiming it is recording,
+           and that the researcher hears about it before they walk away with a
+           file that is short. */
+        onError: (info) => {
+          paintRecordingStopped(info);
+          showToast(
+            `Recording stopped: ${info.fileName} is INCOMPLETE — ` +
+              `${info.rowsDropped.toLocaleString()} rows were lost (${info.error})`,
+            "err",
+            { ttlMs: 30000 },
+          );
+          regate();
+        },
       });
 
       function macTail() {
@@ -1947,21 +1962,37 @@
         regate();
       }
 
-      async function stopRecording() {
-        if (!recorder.active) return;
-        const result = await recorder.stop();
+      /** Repaint the recording panel from a `stop()`-shaped result. */
+      function paintRecordingStopped(result) {
         $("recRows").textContent = result.rows.toLocaleString();
         $("recBytes").textContent = fmtBytes(result.bytes);
         $("recName").textContent = result.fileName;
         $("recPill").textContent = "not recording";
         $("recPill").classList.remove("on");
-        log.log(
-          `recording stopped: ${result.rows} rows, ${fmtBytes(result.bytes)}, ${result.fileName}`,
-        );
-        showToast(
-          `Recorded ${result.rows.toLocaleString()} rows to ${result.fileName}`,
-          "ok",
-        );
+      }
+
+      async function stopRecording() {
+        if (!recorder.active) return;
+        const result = await recorder.stop();
+        paintRecordingStopped(result);
+        if (result.complete) {
+          log.log(
+            `recording stopped: ${result.rows} rows, ${fmtBytes(result.bytes)}, ${result.fileName}`,
+          );
+          showToast(
+            `Recorded ${result.rows.toLocaleString()} rows to ${result.fileName}`,
+            "ok",
+          );
+        } else {
+          /* Only reachable when the failure happened during the close; a
+             failure mid-recording has already gone through onError. */
+          showToast(
+            `${result.fileName} is INCOMPLETE — ` +
+              `${result.rowsDropped.toLocaleString()} rows were lost (${result.error})`,
+            "err",
+            { ttlMs: 30000 },
+          );
+        }
         regate();
       }
 
