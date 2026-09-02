@@ -963,7 +963,14 @@ details.group > summary::-webkit-details-marker {
     grid-template-columns: 1fr;
   }
 
-  .row > button,
+  /* Buttons grow to share the row rather than each claiming a full line —
+     a row of three actions reads better as one band than as three. Icon
+     buttons keep their fixed size; a stretched circle is not a circle. */
+  .row > button:not(.theme-toggle) {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
   .row > select,
   .row > input:not([type="checkbox"]):not([type="radio"]) {
     flex: 1 1 100%;

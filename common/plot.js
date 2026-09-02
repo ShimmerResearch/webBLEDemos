@@ -476,6 +476,13 @@ export function createStreamPlot(host, opts = {}) {
 
     const tLast = times[(write - 1 + maxPoints) % maxPoints];
     const tMin = tLast - windowSec;
+    /* While the buffer holds less than a full window, the axis starts at the
+     * oldest sample instead of tLast - windowSec. Otherwise the first seconds
+     * of a stream draw a trace squeezed against the right edge of a mostly
+     * empty frame, with negative seconds on the axis where the device clock
+     * had not started yet. */
+    const tOldest = times[(write - count + maxPoints) % maxPoints];
+    const xMin = Math.max(tMin, tOldest);
 
     // One pass per panel: fill each of its series' point arrays from the ring
     // and take the panel's y extent as we go.
@@ -517,7 +524,7 @@ export function createStreamPlot(host, opts = {}) {
       }
       const x = panel.chart.options.scales.x;
       if (points > 1) {
-        x.min = tMin;
+        x.min = xMin;
         x.max = tLast;
       }
       // Decimate to roughly one sample per device pixel; the canvas size is
