@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.1.21';
+const SDK_VERSION = '0.1.23';
 
 /**
  * Container for a single decoded sensor frame.
@@ -86,6 +86,25 @@ class BaseShimmerClient {
          * - `VerisenseBleDevice` passes a streaming packet object (see that class).
          */
         this.onStreamFrame = null;
+        /**
+         * Invoked when the link to the device goes away **without the application
+         * asking for it**: the sensor was switched off, walked out of BLE range, or
+         * its USB / classic-Bluetooth COM port was unplugged. `reason` carries the
+         * transport's error when it supplied one.
+         *
+         * Deliberately NOT invoked by {@link disconnect}. A caller that closed the
+         * link already knows it did, so firing there would make every teardown look
+         * like a fault and force applications to filter their own action back out —
+         * exactly the reconnect-loop trap this callback exists to avoid. Put shared
+         * teardown after your own `await disconnect()` instead.
+         *
+         * Fires at most once per connection: a transport that reports the same drop
+         * twice, or a `disconnect()` issued to clean up after a drop, is collapsed to
+         * the first notification.
+         */
+        this.onDisconnect = null;
+        /** Set once {@link onDisconnect} has fired (or been suppressed) for the current connection. */
+        this._disconnectNotified = true;
         this.debug = opts.debug ?? true;
     }
     /** Log to console when debug is enabled. */
@@ -97,6 +116,38 @@ class BaseShimmerClient {
     _emitStatus(msg) {
         this._log(msg);
         this.onStatus?.(msg);
+    }
+    /**
+     * Arm {@link onDisconnect} for a fresh connection. Sub-classes call this from
+     * `connect()`, so the next drop is reported even after an earlier one.
+     */
+    _armDisconnectNotification() {
+        this._disconnectNotified = false;
+    }
+    /**
+     * Mark the current connection's drop as already accounted for, so a transport
+     * event arriving after an application-initiated `disconnect()` cannot surface
+     * as a fault. Sub-classes call this from `disconnect()`.
+     */
+    _suppressDisconnectNotification() {
+        this._disconnectNotified = true;
+    }
+    /**
+     * Report an unexpected transport drop to {@link onDisconnect}, at most once
+     * per connection. Sub-classes call this from their transport-disconnect
+     * handler — never from `disconnect()`. A throwing handler is logged and
+     * swallowed: the drop has already happened, so there is nothing to fail.
+     */
+    _emitDisconnect(reason) {
+        if (this._disconnectNotified)
+            return;
+        this._disconnectNotified = true;
+        try {
+            this.onDisconnect?.(reason);
+        }
+        catch (e) {
+            this._log('onDisconnect handler error', e);
+        }
     }
 }
 
@@ -861,6 +912,20 @@ class LoopbackTransport {
 }
 
 /**
+ * CSV emission for decoded sensor data.
+ *
+ * A stream of {@link ObjectCluster}s is not a table: each frame carries the
+ * channels that frame happened to have, in whatever order the schema listed
+ * them, with a raw and a calibrated version of some signals and only one of
+ * others. Turning that into a CSV means fixing a column set ONCE and then
+ * projecting every frame onto it — otherwise a row silently shifts the moment a
+ * frame's field list differs, and the file reads as valid data that is wrong.
+ *
+ * {@link objectClusterColumns} derives that column set from a representative
+ * frame; {@link objectClusterRow} projects a frame onto it, writing `null`
+ * where a frame lacks a column rather than dropping the cell.
+ */
+/**
  * Escape a value for a CSV cell (RFC 4180 style): whitespace runs — including
  * newlines — collapse to a single space, then cells containing a quote or
  * comma are quoted with internal quotes doubled. Null/undefined become the
@@ -871,6 +936,58 @@ function csvCell(text) {
         .replace(/\s+/g, ' ')
         .trim();
     return /[",]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+/**
+ * Join cells into one CSV line, each escaped by {@link csvCell}. No trailing
+ * newline — the caller decides the line ending, which matters because a file
+ * destined for Excel on Windows wants CRLF.
+ */
+function csvRow(cells) {
+    return cells.map((cell) => csvCell(cell)).join(',');
+}
+/**
+ * Derive a CSV column set from one frame.
+ *
+ * Column ORDER follows `oc.fields`, so it matches the schema the device
+ * negotiated rather than an alphabetical reordering the reader would have to
+ * undo. A name/kind pair that appears twice in a frame contributes one column;
+ * the first occurrence wins, and {@link objectClusterRow} reads that same one.
+ *
+ * Call this once, on the first frame, and reuse the result. Re-deriving it per
+ * frame is the mistake this function exists to prevent.
+ */
+function objectClusterColumns(oc, opts = {}) {
+    const { kinds } = opts;
+    const out = [];
+    const seen = new Set();
+    for (const field of oc.fields) {
+        if (kinds && !kinds.includes(field.kind))
+            continue;
+        const header = field.kind === 'raw'
+            ? `${field.name}_RAW`
+            : field.kind === 'cal'
+                ? `${field.name}_CAL`
+                : field.name;
+        if (seen.has(header))
+            continue;
+        seen.add(header);
+        out.push({ name: field.name, kind: field.kind, unit: field.unit, header });
+    }
+    return out;
+}
+/**
+ * Project a frame onto a column set: one value per column, in column order,
+ * `null` for a column this frame does not carry.
+ *
+ * Matches on the column's kind EXACTLY, which `ObjectCluster.get` deliberately
+ * does not — it treats a null `kind` as "any kind", so a kindless column would
+ * pick up a raw field that shares its name.
+ */
+function objectClusterRow(oc, columns) {
+    return columns.map((column) => {
+        const field = oc.fields.find((f) => f.name === column.name && f.kind === column.kind);
+        return field ? field.value : null;
+    });
 }
 
 /**
@@ -1694,7 +1811,7 @@ function u16le$3(b, o) {
     return (b[o] | (b[o + 1] << 8)) >>> 0;
 }
 /** Read a 16-bit unsigned integer, big-endian. */
-function u16be(b, o) {
+function u16be$1(b, o) {
     return ((b[o] << 8) | b[o + 1]) >>> 0;
 }
 /** Read a 24-bit unsigned integer, little-endian. */
@@ -1714,8 +1831,43 @@ function sign24(v) {
     return v & 0x800000 ? v | 0xff000000 : v;
 }
 /** Format a byte as a 2-digit uppercase hex string. */
-function hex2(v) {
+function hex2$1(v) {
     return v.toString(16).padStart(2, '0').toUpperCase();
+}
+/**
+ * Decode the status bytes of a STATUS_RESPONSE.
+ *
+ * Takes the payload ONLY — the bytes after `[0x8A][0x71]`. It cannot be lenient
+ * about a leading header the way `parseShimmer3DeviceVersionResponse` is,
+ * because a status byte of 0x8A is a perfectly ordinary reading (red LED + SD
+ * logging + sensing), so there is nothing to test a header against.
+ *
+ * Bit assignment from `ShimBt_assembleStatusBytes`
+ * (log-and-stream-common `Comms/shimmer_bt_uart.c:2920-2932`): bit 7
+ * toggleLedRedCmd, 6 sdBadFile, 5 sdInserted, 4 btStreaming, 3 sdLogging,
+ * 2 RTC set, 1 sensing, 0 docked.
+ *
+ * The second byte (usbPluggedIn) exists only under `#if defined(SHIMMER3R)`, so
+ * `STATUS_BYTE_COUNT` is 2 on a Shimmer3R and 1 on a Shimmer3
+ * (`Comms/shimmer_bt_uart.h:259-263`) — hence the nullable field rather than a
+ * plain boolean.
+ */
+function parseShimmer3StatusBytes(bytes) {
+    if (bytes.length < 1)
+        throw new Error('status payload too short (need at least 1 byte)');
+    const s0 = bytes[0] & 0xff;
+    return {
+        docked: (s0 & 0x01) !== 0,
+        sensing: (s0 & 0x02) !== 0,
+        rtcSet: (s0 & 0x04) !== 0,
+        sdLogging: (s0 & 0x08) !== 0,
+        streaming: (s0 & 0x10) !== 0,
+        sdPresent: (s0 & 0x20) !== 0,
+        sdError: (s0 & 0x40) !== 0,
+        redLedOn: (s0 & 0x80) !== 0,
+        usbPluggedIn: bytes.length >= 2 ? (bytes[1] & 0xff) !== 0 : null,
+        raw: new Uint8Array(bytes),
+    };
 }
 
 /**
@@ -2372,6 +2524,765 @@ function parseExpansionBoard(payload) {
 }
 
 /**
+ * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
+ *
+ * Classic Shimmer3 speaks the same LiteProtocol command set as the Shimmer3R
+ * (see `../shimmer3r/constants.ts`), but over an **unframed RFCOMM byte stream**
+ * rather than framed BLE notifications, and with a **different inquiry-response
+ * layout** (a 4-byte config word instead of Shimmer3R's 7-byte word). Everything
+ * in this file is a side-effect-free function so it can be unit-tested without a
+ * transport.
+ *
+ * Ported from the Shimmer Java driver:
+ *   com.shimmerresearch.driver.ShimmerObject#interpretInqResponse (HW_ID.SHIMMER_3 branch)
+ *   com.shimmerresearch.bluetooth.ShimmerBluetooth (response byte layouts + handshake)
+ */
+/** The Shimmer3 acknowledgement byte (LiteProtocol). Shared with Shimmer3R. */
+const ACK = OPCODES.ACK_COMMAND_PROCESSED; // 0xFF
+/** The Shimmer3 negative-acknowledgement byte (LiteProtocol). */
+const NACK = OPCODES.NACK_COMMAND_PROCESSED; // 0xFE
+/**
+ * Well-known SPP (Serial Port Profile) service UUID used to open an RFCOMM
+ * socket to a classic Shimmer3. Documented here for the platform transport
+ * (e.g. the React Native Android module calls
+ * `createRfcommSocketToServiceRecord(SPP_UUID)`); the SDK client itself is
+ * transport-agnostic and never touches it.
+ */
+const SHIMMER3_SPP_UUID = '00001101-0000-1000-8000-00805f9b34fb';
+// ---------------------------------------------------------------------------
+// Inquiry-response layout — THE key protocol difference vs Shimmer3R
+// ---------------------------------------------------------------------------
+//
+// Byte layout of an INQUIRY_RESPONSE, INCLUDING the 0x02 opcode byte
+// (ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch works on the
+// opcode-stripped buffer, so every index below is the Java index + 1):
+//
+//   [0]      = 0x02  INQUIRY_RESPONSE opcode
+//   [1..2]   = sampling-rate divisor, 16-bit little-endian
+//   [3..6]   = config word (configByte0), 4 bytes little-endian   <-- 4, not 7
+//   [7]      = numChannels
+//   [8]      = bufferSize
+//   [9..]    = numChannels channel/signal-ID bytes
+//
+// Shimmer3R differs: its config word is 7 bytes (indices [3..9]), numChannels at
+// [10], bufferSize at [11], channels from [12]. That single width difference is
+// why this cannot reuse Shimmer3RClient's inquiry parser.
+/** 0-based offset (within the opcode-prefixed message) of the config word. */
+const SHIMMER3_INQ_CONFIG_OFFSET = 3;
+/** Config word width in bytes (Shimmer3 = 4; Shimmer3R = 7). */
+const SHIMMER3_INQ_CONFIG_LENGTH = 4;
+/** Offset of the numChannels byte within the opcode-prefixed message. */
+const SHIMMER3_INQ_NUM_CHANNELS_OFFSET = SHIMMER3_INQ_CONFIG_OFFSET + SHIMMER3_INQ_CONFIG_LENGTH; // 7
+/** Offset of the first channel-ID byte within the opcode-prefixed message. */
+const SHIMMER3_INQ_CHANNELS_OFFSET = SHIMMER3_INQ_NUM_CHANNELS_OFFSET + 2; // 9
+/** The sampling clock frequency (Hz) used for divisor↔rate conversion. */
+// ShimmerDevice#getSamplingClockFreq() returns 32768.0 for Shimmer3 and Shimmer3R.
+const SHIMMER3_SAMPLING_CLOCK_FREQ = 32768;
+/**
+ * Build a stream schema from the channel-ID list reported by the inquiry.
+ *
+ * Mirrors ShimmerObject#interpretDataPacketFormat (the channel→format mapping is
+ * identical for Shimmer3 and Shimmer3R, so `CHANNEL_FORMATS` and
+ * `SensorBitmapShimmer3` are reused verbatim). The only Shimmer3-relevant knob is
+ * the timestamp width (u24 for firmware code ≥ 6, else u16 — see
+ * ShimmerObject#updateTimestampByteLength).
+ */
+function buildShimmer3Schema(channelIds, timestampFmt) {
+    const fields = [];
+    const ts = timestampFmt === 'u24' ? TIMESTAMP_FIELD.u24 : TIMESTAMP_FIELD.u16;
+    let frameBytes = 1 + ts.sizeBytes; // 1 = DATA_PACKET (0x00) preamble
+    let enabledSensors = 0;
+    for (const id of channelIds) {
+        const fmt = CHANNEL_FORMATS[id];
+        if (!fmt) {
+            fields.push({ id, name: `CH_${hex2$1(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
+            frameBytes += 2;
+            continue;
+        }
+        fields.push({ id, ...fmt });
+        frameBytes += fmt.sizeBytes ?? 2;
+        enabledSensors |= channelIdToSensorBit(id);
+    }
+    return { timestampFmt, fields, frameBytes, enabledSensors, dataPreambleByte: 0x00 };
+}
+/** Map a channel/signal ID to its SensorBitmapShimmer3 enable bit (0 if none). */
+function channelIdToSensorBit(id) {
+    switch (id) {
+        case 0x00:
+        case 0x01:
+        case 0x02:
+            return SensorBitmapShimmer3.SENSOR_A_ACCEL;
+        case 0x04:
+        case 0x05:
+        case 0x06:
+            return SensorBitmapShimmer3.SENSOR_D_ACCEL;
+        case 0x14:
+        case 0x15:
+        case 0x16:
+            return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
+        case 0x07:
+        case 0x08:
+        case 0x09:
+            return SensorBitmapShimmer3.SENSOR_MAG;
+        case 0x0a:
+        case 0x0b:
+        case 0x0c:
+            return SensorBitmapShimmer3.SENSOR_GYRO;
+        case 0x12:
+            return SensorBitmapShimmer3.SENSOR_INT_A1;
+        case 0x1c:
+            return SensorBitmapShimmer3.SENSOR_GSR;
+        case 0x23:
+        case 0x24:
+            return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
+        case 0x25:
+        case 0x26:
+            return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
+        case 0x1e:
+        case 0x1f:
+            return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
+        case 0x21:
+        case 0x22:
+            return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
+        default:
+            return 0;
+    }
+}
+/**
+ * Decode an INQUIRY_RESPONSE using the Shimmer3 (classic) layout.
+ *
+ * Accepts the message with or without the leading 0x02 opcode byte (the
+ * byte-stream parser always includes it; a caller passing a bare body also
+ * works, matching Shimmer3RClient's `base` handling).
+ *
+ * Ported from ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch.
+ */
+function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24') {
+    let base = 0;
+    if (u8[0] === OPCODES.INQUIRY_RESPONSE)
+        base = 1;
+    const adcRaw = u16le$3(u8, base + 0);
+    const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
+    // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
+    const configByte0 = ((u8[base + 2] | (u8[base + 3] << 8) | (u8[base + 4] << 16) | (u8[base + 5] << 24)) >>> 0) >>>
+        0;
+    const accelRange = (configByte0 & 0xc) >>> 2;
+    const gyroRange = (configByte0 & 0x30000) >>> 16;
+    const magRange = (configByte0 & 0xe00000) >>> 21;
+    const gsrRange = (configByte0 >>> 25) & 0x7;
+    const internalExpPower = (configByte0 >>> 24) & 0x1;
+    const numChannels = u8[base + 6] ?? 0;
+    const bufferSize = u8[base + 7] ?? 0;
+    const chStart = base + 8;
+    const channelIds = [...u8.slice(chStart, chStart + numChannels)];
+    const schema = buildShimmer3Schema(channelIds, timestampFmt);
+    return {
+        opcode: u8[0],
+        adcRaw,
+        samplingRateHz,
+        configByte0,
+        gsrRange,
+        internalExpPower,
+        accelRange,
+        gyroRange,
+        magRange,
+        numChannels,
+        bufferSize,
+        channelIds,
+        schema,
+        bytes: u8.slice(0),
+    };
+}
+/** Decode a DEVICE_VERSION_RESPONSE (0x25) — 1 payload byte = HW version.
+ *  Ported from ShimmerBluetooth (GET_SHIMMER_VERSION_RESPONSE handler). */
+function parseShimmer3DeviceVersionResponse(u8) {
+    const base = u8[0] === OPCODES.DEVICE_VERSION_RESPONSE ? 1 : 0;
+    return { hardwareVersion: u8[base] ?? 0 };
+}
+/**
+ * Firmware identifier (type) values, from
+ * com.shimmerresearch.driverUtilities.ShimmerVerDetails.FW_ID.
+ */
+const FW_ID$1 = Object.freeze({
+    BTSTREAM: 1,
+    SDLOG: 2,
+    LOGANDSTREAM: 3,
+});
+/**
+ * Decode a FW_VERSION_RESPONSE (0x2F) — 6 payload bytes.
+ * Ported from ShimmerBluetooth (FW_VERSION_RESPONSE handler):
+ *   id  = b1<<8 | b0   (little-endian)
+ *   maj = b3<<8 | b2
+ *   min = b4
+ *   int = b5
+ */
+function parseShimmer3FwVersionResponse(u8) {
+    const base = u8[0] === OPCODES.FW_VERSION_RESPONSE ? 1 : 0;
+    const b = (i) => u8[base + i] ?? 0;
+    return {
+        firmwareIdentifier: (b(1) << 8) | b(0),
+        major: (b(3) << 8) | b(2),
+        minor: b(4),
+        internal: b(5),
+    };
+}
+/**
+ * Whether streaming data frames use a 3-byte (u24) timestamp for this firmware.
+ *
+ * The Java driver widens the timestamp to 3 bytes when the derived firmware
+ * version code is ≥ 6 (ShimmerObject#updateTimestampByteLength). That code is a
+ * per-firmware-type version ladder (ShimmerVerObject); code ≥ 6 corresponds to
+ * LogAndStream ≥ 0.5.4, BtStream ≥ 0.7.3, and SDLog ≥ 0.11.5. Anything at or
+ * above those (and any firmware type we don't recognise, assumed modern) uses
+ * u24; older firmware uses u16.
+ */
+function shimmer3UsesThreeByteTimestamp(v) {
+    const atLeast = (maj, min, int) => v.major > maj || (v.major === maj && (v.minor > min || (v.minor === min && v.internal >= int)));
+    switch (v.firmwareIdentifier) {
+        case FW_ID$1.LOGANDSTREAM:
+            return atLeast(0, 5, 4);
+        case FW_ID$1.BTSTREAM:
+            return atLeast(0, 7, 3);
+        case FW_ID$1.SDLOG:
+            return atLeast(0, 11, 5);
+        default:
+            return true; // unknown/newer firmware type — default to modern u24
+    }
+}
+// ---------------------------------------------------------------------------
+// Unframed-stream control-message framing
+// ---------------------------------------------------------------------------
+/**
+ * Fixed payload lengths (bytes AFTER the opcode) for the control responses the
+ * v1 client consumes. INQUIRY_RESPONSE is variable and handled specially in
+ * {@link shimmer3ControlMessageLength}. Extend this table to teach the
+ * byte-stream parser about further GET responses.
+ *
+ * Lengths taken from the `readBytes(n, ...)` calls in ShimmerBluetooth and the
+ * LiteProtocol instruction-set response_size annotations.
+ */
+const SHIMMER3_RESPONSE_PAYLOAD_LENGTHS = Object.freeze({
+    [OPCODES.SAMPLING_RATE_RESPONSE]: 2, // 0x04
+    [OPCODES.FW_VERSION_RESPONSE]: 6, // 0x2F
+    [OPCODES.DEVICE_VERSION_RESPONSE]: 1, // 0x25
+    [OPCODES.GSR_RANGE_RESPONSE]: 1, // 0x22
+    [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
+});
+/** Sentinel: need more bytes before the message length can be determined. */
+const NEED_MORE$1 = -1;
+/** Sentinel: leading byte is not a recognised control opcode — caller resyncs. */
+const RESYNC$1 = 0;
+/**
+ * Given the head of the accumulated RFCOMM byte buffer, return the total length
+ * (INCLUDING the leading opcode) of the complete control message it starts with,
+ * or {@link NEED_MORE} if not enough bytes have arrived yet, or {@link RESYNC}
+ * if the leading byte is not a control opcode we understand (garbage / a data
+ * byte leaked into the control plane — the caller should drop one byte and
+ * retry).
+ *
+ * This is the primitive that makes the unframed RFCOMM stream tractable: unlike
+ * BLE (one notification == one message), RFCOMM delivers bytes split or
+ * coalesced arbitrarily, so the client cannot assume `chunk[0]` is a whole
+ * message. The Java driver solves the same problem with blocking `readBytes(n)`
+ * calls that know each response's length up front (ShimmerBluetooth); this
+ * expresses that length knowledge as a pure function.
+ *
+ * ACK (0xFF) and NACK (0xFE) are 1-byte messages. INQUIRY_RESPONSE (0x02) is
+ * `9 + numChannels` bytes, and numChannels lives at index 7, so at least 8 bytes
+ * are needed to compute the length.
+ */
+function shimmer3ControlMessageLength(buf) {
+    if (buf.length === 0)
+        return NEED_MORE$1;
+    const opcode = buf[0];
+    if (opcode === ACK || opcode === NACK)
+        return 1;
+    if (opcode === OPCODES.INQUIRY_RESPONSE) {
+        if (buf.length <= SHIMMER3_INQ_NUM_CHANNELS_OFFSET)
+            return NEED_MORE$1; // need index 7 present
+        const numChannels = buf[SHIMMER3_INQ_NUM_CHANNELS_OFFSET];
+        // Sanity bound: a stray stream-data byte 0x02 can masquerade as an
+        // INQUIRY_RESPONSE whose "numChannels" comes from garbage, swallowing up to
+        // 264 bytes of real control traffic (including ACK/NACK). No real Shimmer3
+        // has anywhere near 32 channels — treat implausible values as garbage and
+        // resync instead.
+        if (numChannels > 32)
+            return RESYNC$1;
+        return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
+    }
+    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE || opcode === OPCODES.INFOMEM_RESPONSE) {
+        // Variable length: [opcode][length][data...]. Firmware caps both a
+        // daughter-card memory read and an InfoMem read at 128 bytes — treat larger
+        // "lengths" as garbage and resync.
+        if (buf.length < 2)
+            return NEED_MORE$1;
+        const memLen = buf[1];
+        if (memLen > 128)
+            return RESYNC$1;
+        return 2 + memLen;
+    }
+    const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
+    if (payload === undefined)
+        return RESYNC$1;
+    return 1 + payload;
+}
+
+/**
+ * Firmware/hardware-conditional InfoMem byte-layout resolution for Shimmer3
+ * and Shimmer3R.
+ *
+ * Ported verbatim from the Java driver:
+ *   com.shimmerresearch.driver.shimmer2r3.ConfigByteLayoutShimmer3
+ *     (field initialisers + the constructor @324-412 that mutates offsets and
+ *      the InfoMem address base by firmware version / hardware id)
+ *   com.shimmerresearch.driver.ConfigByteLayout (address defaults @36-40,
+ *     checkConfigBytesValid @90)
+ *   com.shimmerresearch.driverUtilities.UtilShimmer#compareVersions (@580-629)
+ *   com.shimmerresearch.driverUtilities.ShimmerVerObject
+ *     (#isSupportedMpl @390, #isSupportedEightByteDerivedSensors @472)
+ *   com.shimmerresearch.driver.ShimmerDevice#isSupportedSdLogSync (@2091)
+ *
+ * Everything here is pure so it can be unit-tested with byte fixtures.
+ */
+// ---------------------------------------------------------------------------
+// HW / FW id constants (ShimmerVerDetails.java)
+// ---------------------------------------------------------------------------
+/** Hardware version codes (`ShimmerVerDetails.HW_ID`). */
+const HW_ID = Object.freeze({
+    SHIMMER_3: 3,
+    SHIMMER_3R: 10,
+});
+/** Firmware identifier codes (`ShimmerVerDetails.FW_ID`). */
+const FW_ID = Object.freeze({
+    BTSTREAM: 1,
+    SDLOG: 2,
+    LOGANDSTREAM: 3,
+    GQ_802154: 9,
+    SHIMMER4_SDK_STOCK: 12,
+    STROKARE: 15,
+});
+/** `ShimmerVerDetails.ANY_VERSION` — wildcard for a version-field comparison. */
+const ANY_VERSION = -1;
+// ---------------------------------------------------------------------------
+// InfoMem geometry
+// ---------------------------------------------------------------------------
+/** Total InfoMem config length used by Shimmer3/3R (D+C+B pages). */
+const INFOMEM_SIZE = 384;
+/** One InfoMem page (D/C/B) = 128 bytes; also the UART transfer chunk size. */
+const INFOMEM_PAGE_SIZE = 128;
+/** Number of validity sentinel bytes checked at the start of the InfoMem. */
+const INFOMEM_VALIDITY_BYTES = 6;
+/** Legacy MSP430 absolute page addresses (`ConfigByteLayout` defaults). */
+const INFOMEM_ADDR_LEGACY = Object.freeze({ D: 0x1800, C: 0x1880, B: 0x1900 });
+/** 0-based flat page addresses used by newer firmware / all Shimmer3R. */
+const INFOMEM_ADDR_FLAT = Object.freeze({ D: 0, C: 128, B: 256 });
+// ---------------------------------------------------------------------------
+// Version comparison (UtilShimmer#compareVersions)
+// ---------------------------------------------------------------------------
+/**
+ * True when the context firmware matches `fwId` (or `fwId` is
+ * {@link ANY_VERSION}) AND the context version is >= the given threshold.
+ * Major/minor use strict `>`, internal uses `>=`, exactly as
+ * `UtilShimmer.compareVersions` (UtilShimmer.java:582-629). Passing
+ * {@link ANY_VERSION} for the version fields makes the version test always pass
+ * (any real version is `> -1`), matching the Java `ANY_VERSION` idiom.
+ */
+function fwCompare(ctx, fwId, major, minor, internal) {
+    if (fwId !== ANY_VERSION && ctx.firmwareId !== fwId)
+        return false;
+    const { major: a, minor: b, internal: c } = ctx.firmwareVersion;
+    return a > major || (a === major && b > minor) || (a === major && b === minor && c >= internal);
+}
+const isShimmer3R = (ctx) => ctx.hardwareVersion === HW_ID.SHIMMER_3R;
+// ---------------------------------------------------------------------------
+// Feature predicates that gate which InfoMem fields are meaningful
+// ---------------------------------------------------------------------------
+/**
+ * `ShimmerVerObject#isSupportedMpl` (@390): Shimmer3 + SDLog in the half-open
+ * window [0.7.0, 0.8.0). No supported/target device runs this, so enabled-
+ * sensor bytes 3-4 (bits 24-39) are effectively never populated.
+ */
+function isSupportedMpl(ctx) {
+    return (ctx.hardwareVersion === HW_ID.SHIMMER_3 &&
+        fwCompare(ctx, FW_ID.SDLOG, 0, 7, 0) &&
+        !fwCompare(ctx, FW_ID.SDLOG, 0, 8, 0));
+}
+/**
+ * `ShimmerVerObject#isSupportedEightByteDerivedSensors` (@472): SDLog>=0.13.1,
+ * LogAndStream>=0.7.1, GQ_802154>=0.3.2, Shimmer4>=0.0.23, or StroKare (any).
+ */
+function isSupportedEightByteDerivedSensors(ctx) {
+    return (fwCompare(ctx, FW_ID.SDLOG, 0, 13, 1) ||
+        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 7, 1) ||
+        fwCompare(ctx, FW_ID.GQ_802154, 0, 3, 2) ||
+        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, 0, 0, 23) ||
+        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION));
+}
+/**
+ * `ShimmerDevice#isSupportedSdLogSync` (@2091): SDLog (any), Shimmer3R+
+ * LogAndStream (any), Shimmer3+LogAndStream>=0.16.11, or StroKare. Gates the
+ * trial id / number-of-Shimmers, sync bits, sync-node list.
+ */
+function isSupportedSdLogSync(ctx) {
+    if (ctx.firmwareId === FW_ID.SDLOG)
+        return true;
+    if (ctx.firmwareId === FW_ID.STROKARE)
+        return true;
+    if (isShimmer3R(ctx) && ctx.firmwareId === FW_ID.LOGANDSTREAM)
+        return true;
+    if (ctx.hardwareVersion === HW_ID.SHIMMER_3 &&
+        ctx.firmwareId === FW_ID.LOGANDSTREAM &&
+        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 16, 11)) {
+        return true;
+    }
+    return false;
+}
+/**
+ * SDLog / LogAndStream / StroKare firmware — the family that stores the
+ * experiment-config bytes (button-start, disable-BT, TCXO) and honours the
+ * device-write MAC-0xFF + config-file-creation-flag semantics
+ * (ShimmerObject.java:5035,5054,5278,5312,5320).
+ */
+function isSdLoggingFirmware(ctx) {
+    return (ctx.firmwareId === FW_ID.SDLOG ||
+        ctx.firmwareId === FW_ID.LOGANDSTREAM ||
+        ctx.firmwareId === FW_ID.STROKARE);
+}
+/*
+ * MPL (MPU9150 DMP / sensor-fusion) InfoMem regions and bit fields are
+ * DELIBERATELY NOT MODELLED and must never appear in host UI:
+ *
+ *   `idxMPLAccelCalibration` = 128+5, `idxMPLMagCalibration` = 128+26,
+ *   `idxMPLGyroCalibration`  = 128+47, plus every `bitShiftMPL*` /
+ *   `bitShiftMPU9150DMP|LPF|MotCalCfg|MPLSamplingRate|MagSamplingRate` field
+ *   (ConfigByteLayoutShimmer3.java:226-248) written into ConfigSetupByte4/5/6
+ *   by `SensorMPU9X50.configBytesGenerate` (@905-931).
+ *
+ * They are MPU9150-DMP-only: `ShimmerVerObject#isSupportedMpl` restricts them
+ * to Shimmer3 + SDLog in [0.7.0, 0.8.0), which no supported/target device runs.
+ * The product decision is that these settings are never surfaced; their bytes
+ * must simply SURVIVE round-trip, which the read-modify-write generate path
+ * guarantees (anything not explicitly written keeps its base value).
+ *
+ * Note that on every supported firmware the MPL blocks are physically the same
+ * bytes as the Shimmer3R alt-IMU calibration blocks (MPL accel 133 ==
+ * ADXL371 alt-accel calib, MPL mag 154 == LIS3MDL alt-mag calib), and the
+ * firmware header marks the MPL gyro region as `unusedIdx175To186[12]`
+ * (shimmer_config.h) — i.e. the MPL region was reclaimed, further confirming
+ * it should not be modelled as MPL.
+ */
+// Field constant lengths / bit positions shared by parse + generate.
+const EXG_BANK_LENGTH = 10;
+const NAME_LENGTH = 12;
+const CONFIG_TIME_LENGTH = 4;
+const MAC_LENGTH = 6;
+const MAX_SYNC_NODES = 21;
+/**
+ * MAC values reported by a device whose InfoMem has never been provisioned
+ * (erased flash reads back all-FF; a zeroed page reads back all-zero). Neither
+ * is a real address, so a client should reject rather than surface them.
+ */
+const INVALID_MAC_IDS = Object.freeze(['FFFFFFFFFFFF', '000000000000']);
+/** One 21-byte kinematic calibration block (`lengthGeneralCalibrationBytes`). */
+const GENERAL_CALIBRATION_LENGTH = 21;
+/**
+ * Bit positions within the InfoMem config-setup bytes. Every entry cites its
+ * `ConfigByteLayoutShimmer3` declaration; where the Java DECLARATION comment
+ * ("//Config ByteN") disagrees with the byte the Java code actually indexes, or
+ * with the firmware `gConfigBytes` struct, the firmware wins and the
+ * disagreement is called out inline.
+ */
+const BIT_SHIFT = Object.freeze({
+    // ---- ConfigSetupByte0 (idx 6) — firmware `gConfigBytes` idx 6 bitfield.
+    /** WR-accel sampling rate. `bitShiftLSM303DLHCAccelSamplingRate` (@124); FW `wrAccelRate` bits 4-7. */
+    WR_ACCEL_RATE: 4,
+    /** WR-accel range. `bitShiftLSM303DLHCAccelRange` (@126); FW `wrAccelRange` bits 2-3. */
+    WR_ACCEL_RANGE: 2,
+    /** WR-accel low-power mode (LSB). `bitShiftLSM303DLHCAccelLPM` (@129); FW `wrAccelLpModeLsb` bit 1. */
+    WR_ACCEL_LPM: 1,
+    /** WR-accel high-resolution mode. `bitShiftLSM303DLHCAccelHRM` (@132); FW `wrAccelHrMode` bit 0. */
+    WR_ACCEL_HRM: 0,
+    // ---- ConfigSetupByte1 (idx 7) — whole byte.
+    /** IMU (MPU9x50 / LSM6DSV) accel+gyro rate. `bitShiftMPU9150AccelGyroSamplingRate` (@139); FW `gyroRate`. */
+    IMU_RATE: 0,
+    // ---- ConfigSetupByte2 (idx 8).
+    /** Mag range. `bitShiftLSM303DLHCMagRange` (@143); FW `magRange` (S3) / `altMagRange` (S3R) bits 5-7. */
+    MAG_RANGE: 5,
+    /** Mag sampling rate. `bitShiftLSM303DLHCMagSamplingRate` (@145); FW `magRate` bits 2-4. */
+    MAG_RATE: 2,
+    /** Gyro range, LOW 2 bits. `bitShiftMPU9150GyroRange` (@147); FW `gyroRangeLsb` bits 0-1. */
+    GYRO_RANGE_LSB: 0,
+    // ---- ConfigSetupByte3 (idx 9).
+    /** Alt-accel range (S3 MPU9x50) / LN-accel range (S3R LSM6DSV). `bitShiftMPU9150AccelRange` (@150); FW bits 6-7. */
+    ALT_ACCEL_RANGE: 6,
+    /** Pressure oversampling, LOW 2 bits. `bitShiftBMPX80PressureResolution` (@152); FW `pressureOversamplingRatioLsb` bits 4-5. */
+    PRESSURE_OVERSAMPLING_LSB: 4,
+    GSR_RANGE: 1,
+    EXP_POWER: 0,
+    // ---- ConfigSetupByte4 (idx 130 on every supported firmware).
+    /**
+     * Alt-accel (ADXL371) sampling rate. `bitShiftADXL371AltAccelSamplingRate`
+     * (@161) used with `idxConfigSetupByte4` in SensorADXL371.java:356/370;
+     * FW `altAccelRate` bits 6-7 of idx 130. Java and firmware AGREE.
+     */
+    ALT_ACCEL_RATE: 6,
+    /**
+     * Gyro range MSB (3rd bit). `bitShiftLSM6DSVGyroRangeMSB` (@163) used with
+     * `idxConfigSetupByte4` in SensorLSM6DSV.java:980/1015; FW `gyroRangeMsb`
+     * bit 2 of idx 130. Java and firmware AGREE.
+     */
+    GYRO_RANGE_MSB: 2,
+    /**
+     * Pressure oversampling MSB (3rd bit). Java declares this as
+     * `bitShiftBMP390PressureResolution` under a "//Config Byte0" comment
+     * (@134-135) — that comment is WRONG: both SensorBMP390.java:499 and
+     * SensorBMP581.java:380 index `idxConfigSetupByte4`, and the firmware struct
+     * has `pressureOversamplingRatioMsb` as bit 0 of idx 130. FIRMWARE WINS →
+     * ConfigSetupByte4 bit 0, not ConfigSetupByte0.
+     */
+    PRESSURE_OVERSAMPLING_MSB: 0,
+    /**
+     * WR-accel low-power-mode MSB — FIRMWARE-ONLY (`wrAccelLpModeMsb`, bit 1 of
+     * idx 130). The Java driver has no equivalent field and never writes it, so
+     * the codec does not model it either; the bit survives round-trip untouched.
+     */
+    WR_ACCEL_LPM_MSB: 1,
+    // ---- ConfigSetupByte5 (idx 131 on every supported firmware).
+    /**
+     * Alt-mag (LIS3MDL) sampling rate. Java declares
+     * `bitShiftLIS3MDLAltMagSamplingRate` (@158) under a "//Config Byte4"
+     * comment — that comment is WRONG: SensorLIS3MDL.java:809/831 index
+     * `idxConfigSetupByte5`, and the firmware struct has `altMagRate` as bits
+     * 0-5 of idx 131. FIRMWARE WINS → ConfigSetupByte5 bits 0-5.
+     */
+    ALT_MAG_RATE: 0,
+    /**
+     * `bitShiftLIS2MDLMagRateMSB` (@167). NOT MODELLED: every use in
+     * SensorLIS2MDL.java (@581 generate, @602 parse) is COMMENTED OUT, and the
+     * firmware struct has idx 131 bits 6-7 as `unusedByte131Bit6/7` with no mag
+     * MSB anywhere. LIS2MDL mag rate is the plain 3-bit ConfigSetupByte2 field.
+     * Kept here only so the constant table is complete against the Java source;
+     * writing it would corrupt `altMagRate` bits 3-5.
+     */
+    LIS2MDL_MAG_RATE_MSB_UNUSED: 3,
+    // ---- SD / trial bits (idx 217/218/230).
+    BUTTON_START: 5,
+    DISABLE_BLUETOOTH: 3,
+    SYNC_WHEN_LOGGING: 2,
+    MASTER_SHIMMER: 1,
+    SINGLE_TOUCH: 7,
+    TCXO: 4,
+    SD_CFG_FILE_WRITE_FLAG: 0,
+});
+const MASK = Object.freeze({
+    // ConfigSetupByte0
+    WR_ACCEL_RATE: 0x0f, // maskLSM303DLHCAccelSamplingRate @125
+    WR_ACCEL_RANGE: 0x03, // maskLSM303DLHCAccelRange @127
+    WR_ACCEL_LPM: 0x01, // maskLSM303DLHCAccelLPM @130
+    WR_ACCEL_HRM: 0x01, // maskLSM303DLHCAccelHRM @133
+    // ConfigSetupByte1
+    IMU_RATE: 0xff, // maskMPU9150AccelGyroSamplingRate @140
+    // ConfigSetupByte2
+    MAG_RANGE: 0x07, // maskLSM303DLHCMagRange @144
+    MAG_RATE: 0x07, // maskLSM303DLHCMagSamplingRate @146
+    GYRO_RANGE_LSB: 0x03, // maskMPU9150GyroRange @148
+    // ConfigSetupByte3
+    ALT_ACCEL_RANGE: 0x03, // maskMPU9150AccelRange @151
+    PRESSURE_OVERSAMPLING_LSB: 0x03, // maskBMPX80PressureResolution @153
+    GSR_RANGE: 0x07,
+    EXP_POWER: 0x01,
+    // ConfigSetupByte4
+    ALT_ACCEL_RATE: 0x03, // maskADXL371AltAccelSamplingRate @162
+    GYRO_RANGE_MSB: 0x01, // maskLSM6DSVGyroRangeMSB @164
+    PRESSURE_OVERSAMPLING_MSB: 0x01, // maskBMP390PressureResolution @136
+    WR_ACCEL_LPM_MSB: 0x01, // firmware-only, not written
+    // ConfigSetupByte5
+    ALT_MAG_RATE: 0x3f, // maskLIS3MDLAltMagSamplingRate @159
+    LIS2MDL_MAG_RATE_MSB_UNUSED: 0x07, // maskLIS2MDLMagRateMSB @166 (never written)
+    // Shared
+    ONE_BIT: 0x01,
+    DERIVED_BYTE: 0xff,
+    SD_CFG_FILE_WRITE_FLAG: 0x01,
+});
+/**
+ * Composite (split across two bytes) field widths. The low part lives in
+ * ConfigSetupByte2/3 and the high bit in ConfigSetupByte4; the high bit is only
+ * written on Shimmer3R, where the LSM6DSV / BMP390-BMP581 need the extra range.
+ */
+const COMPOSITE_MSB_SHIFT = 2;
+/** Config-time bytes are big-endian: byte0 = MSB (shift 24) … byte3 = LSB. */
+const CONFIG_TIME_BIT_SHIFTS = [24, 16, 8, 0];
+/**
+ * Resolve the InfoMem layout for a firmware/hardware context, applying the
+ * same ordered constructor branches as `ConfigByteLayoutShimmer3` (oldest →
+ * newest). Returns a frozen, fully-derived {@link InfoMemLayout}.
+ */
+function resolveInfoMemLayout(ctx) {
+    const r = isShimmer3R(ctx);
+    // ---- Base (default) initialiser values (ConfigByteLayoutShimmer3 @34-109).
+    const layout = {
+        // Page addresses — legacy default; branch 4 may remap to flat 0-based.
+        addrD: INFOMEM_ADDR_LEGACY.D,
+        addrC: INFOMEM_ADDR_LEGACY.C,
+        addrB: INFOMEM_ADDR_LEGACY.B,
+        flatAddressing: false,
+        idxSamplingRate: 0,
+        idxBufferSize: 2,
+        idxSensors0: 3,
+        idxSensors1: 4,
+        idxSensors2: 5,
+        idxConfigSetupByte0: 6,
+        idxConfigSetupByte1: 7,
+        idxConfigSetupByte2: 8,
+        idxConfigSetupByte3: 9,
+        idxExg1: 10,
+        idxExg2: 20,
+        idxBtCommBaudRate: 30,
+        // Kinematic calibration blocks — defaults (@95-99); branch 2 remaps all six.
+        idxAnalogAccelCalibration: 31,
+        idxMPU9150GyroCalibration: 52,
+        idxLSM303DLHCMagCalibration: 73,
+        idxLSM303DLHCAccelCalibration: 94,
+        idxADXL371AltAccelCalibration: 256,
+        idxLIS3MDLAltMagCalibration: 285,
+        // Derived-sensor offsets default to 0 ("not present").
+        idxDerivedSensors0: 0,
+        idxDerivedSensors1: 0,
+        idxDerivedSensors2: 0,
+        idxDerivedSensors3: 0,
+        idxDerivedSensors4: 0,
+        idxDerivedSensors5: 0,
+        idxDerivedSensors6: 0,
+        idxDerivedSensors7: 0,
+        // C page (128 + X).
+        idxSensors3: 128 + 2,
+        idxSensors4: 128 + 3,
+        // Defaults (@113-117): ConfigSetupByte4/5 sit BELOW Sensors3/4; branch 1
+        // swaps them so Sensors3/4 land at 128/129 and ConfigSetupByte4/5 at
+        // 130/131. ConfigSetupByte6 is 128+4 in both cases.
+        idxConfigSetupByte4: 128 + 0,
+        idxConfigSetupByte5: 128 + 1,
+        idxConfigSetupByte6: 128 + 4, // 132
+        idxSDShimmerName: 128 + 59, // 187
+        idxSDEXPIDName: 128 + 71, // 199
+        idxSDConfigTime0: 128 + 83, // 211
+        idxSDConfigTime1: 128 + 84, // 212
+        idxSDConfigTime2: 128 + 85, // 213
+        idxSDConfigTime3: 128 + 86, // 214
+        idxSDMyTrialID: 128 + 87, // 215
+        idxSDNumOfShimmers: 128 + 88, // 216
+        idxSDExperimentConfig0: 128 + 89, // 217
+        idxSDExperimentConfig1: 128 + 90, // 218
+        idxSDBTInterval: 128 + 91, // 219
+        idxEstimatedExpLengthMsb: 128 + 92, // 220
+        idxEstimatedExpLengthLsb: 128 + 93, // 221
+        idxMaxExpLengthMsb: 128 + 94, // 222
+        idxMaxExpLengthLsb: 128 + 95, // 223
+        idxMacAddress: 128 + 96, // 224
+        idxSDConfigDelayFlag: 128 + 102, // 230
+        idxBtFactoryReset: 0,
+        // B page. Java `idxNode0` = 128+128 = 256 with `maxNumOfExperimentNodes`
+        // = 21 (→ 256..381). The firmware header's NV_* defines look different
+        // (NV_CENTER = 256, NV_NODE0 = 262) but its `gConfigBytes` struct lays out
+        // `syncNodeAddr1[6]`…`syncNodeAddr21[6]` starting at 256 with
+        // NV_NUM_BYTES_SYNC_CENTER_NODE_ADDRS = 126 = 21*6, so the struct AGREES
+        // with Java: slot 0 (the "center") is simply the first of the 21 slots.
+        idxNode0: 128 + 128, // 256
+        lengthGeneralCalibrationBytes: GENERAL_CALIBRATION_LENGTH,
+        supportsMpl: isSupportedMpl(ctx),
+        supportsEightByteDerived: isSupportedEightByteDerivedSensors(ctx),
+        supportsSdLogSync: isSupportedSdLogSync(ctx),
+        isSdLoggingFirmware: isSdLoggingFirmware(ctx),
+        isShimmer3R: r,
+    };
+    // ---- Branch 1 (@330-343): 3R | SDLog>=0.8.42 | LogAndStream>=0.3.4 | Shimmer4 | StroKare
+    // Relocates Sensors3/4 to 128/129 (ConfigSetupByte4/5 shift to 130/131) and
+    // seeds DerivedSensors0-2 at 115-117 (overridden by branch 2 below).
+    if (r ||
+        fwCompare(ctx, FW_ID.SDLOG, 0, 8, 42) ||
+        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 3, 4) ||
+        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
+        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
+        layout.idxSensors3 = 128 + 0;
+        layout.idxSensors4 = 128 + 1;
+        layout.idxConfigSetupByte4 = 128 + 2; // 130 — matches FW NV_CONFIG_SETUP_BYTE4
+        layout.idxConfigSetupByte5 = 128 + 3; // 131 — matches FW NV_CONFIG_SETUP_BYTE5
+        layout.idxConfigSetupByte6 = 128 + 4; // 132 — matches FW NV_CONFIG_SETUP_BYTE6
+        layout.idxDerivedSensors0 = 115;
+        layout.idxDerivedSensors1 = 116;
+        layout.idxDerivedSensors2 = 117;
+    }
+    // ---- Branch 2 (@345-360): 3R | SDLog>=0.8.68 | LogAndStream>=0.3.17 | BtStream>=0.6.0 | Shimmer4 | StroKare
+    // Moves DerivedSensors0-2 into InfoMem D at 31-33 (and the calibration blocks,
+    // which this codec does not surface).
+    if (r ||
+        fwCompare(ctx, FW_ID.SDLOG, 0, 8, 68) ||
+        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 3, 17) ||
+        fwCompare(ctx, FW_ID.BTSTREAM, 0, 6, 0) ||
+        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
+        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
+        layout.idxDerivedSensors0 = 31;
+        layout.idxDerivedSensors1 = 32;
+        layout.idxDerivedSensors2 = 33;
+        // Calibration blocks shift up by 3 to make room for DerivedSensors0-2, and
+        // the two alt-IMU blocks move from their (bogus, InfoMem-B-colliding)
+        // defaults into InfoMem C. All six match the firmware NV_* map exactly:
+        // NV_LN_ACCEL_CALIBRATION 34, NV_GYRO_CALIBRATION 55, NV_MAG_CALIBRATION
+        // 76, NV_WR_ACCEL_CALIBRATION 97, NV_ALT_ACCEL_CALIBRATION 128+5 = 133,
+        // NV_ALT_MAG_CALIBRATION 128+26 = 154.
+        layout.idxAnalogAccelCalibration = 34;
+        layout.idxMPU9150GyroCalibration = 55;
+        layout.idxLSM303DLHCMagCalibration = 76;
+        layout.idxLSM303DLHCAccelCalibration = 97;
+        layout.idxADXL371AltAccelCalibration = 133;
+        layout.idxLIS3MDLAltMagCalibration = 154;
+    }
+    // ---- Branch 4 — ADDRESS-BASE REMAP (@370-381): 3R | SDLog>=0.11.5 |
+    // LogAndStream>=0.5.16 | BtStream>=0.7.4 | Shimmer4 | StroKare.
+    // HARDWARE-VERIFY: the page address the device firmware expects on the wire
+    // (legacy MSP430 0x1800/0x1880/0x1900 vs. flat 0/128/256) is only confirmable
+    // against real hardware of each firmware generation.
+    if (r ||
+        fwCompare(ctx, FW_ID.SDLOG, 0, 11, 5) ||
+        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 5, 16) ||
+        fwCompare(ctx, FW_ID.BTSTREAM, 0, 7, 4) ||
+        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
+        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
+        layout.addrD = INFOMEM_ADDR_FLAT.D;
+        layout.addrC = INFOMEM_ADDR_FLAT.C;
+        layout.addrB = INFOMEM_ADDR_FLAT.B;
+        layout.flatAddressing = true;
+    }
+    // ---- Branch 5 (@383-390): 3R | isSupportedEightByteDerivedSensors.
+    if (r || layout.supportsEightByteDerived) {
+        layout.idxDerivedSensors3 = 118;
+        layout.idxDerivedSensors4 = 119;
+        layout.idxDerivedSensors5 = 120;
+        layout.idxDerivedSensors6 = 121;
+        layout.idxDerivedSensors7 = 122;
+    }
+    // ---- Branch 7 (@398-401): 3R | LogAndStream>=0.8.1.
+    if (r || fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 8, 1)) {
+        layout.idxBtFactoryReset = 128 + 103; // 231
+    }
+    return Object.freeze(layout);
+}
+/**
+ * The "first 6 bytes all 0xFF ⇒ unconfigured/invalid" check
+ * (ConfigByteLayout.checkConfigBytesValid @90). Returns true when the InfoMem
+ * holds a real configuration.
+ */
+function checkConfigBytesValid(bytes) {
+    if (bytes.length < INFOMEM_VALIDITY_BYTES)
+        return false;
+    for (let i = 0; i < INFOMEM_VALIDITY_BYTES; i++) {
+        if (bytes[i] !== 0xff)
+            return true;
+    }
+    return false;
+}
+
+/**
  * Sentinels shared by the byte-stream (unframed transport) message framers.
  *
  * A framer is a pure function `(buf) => number` that reports how many bytes the
@@ -2384,12 +3295,12 @@ function parseExpansionBoard(payload) {
  * public API and are left alone. New framers should import from here.
  */
 /** Not enough bytes buffered yet to determine the message length. */
-const NEED_MORE$1 = -1;
+const NEED_MORE = -1;
 /**
  * The leading byte is not the start of a message we understand — the caller
  * should drop one byte and retry (resynchronise) rather than guess a length.
  */
-const RESYNC$1 = 0;
+const RESYNC = 0;
 
 /**
  * Wire protocol for Shimmer3R SD-card file transfer over BLE.
@@ -2720,31 +3631,31 @@ function oneShotLength(buf) {
  */
 function sdMessageSpan(buf) {
     if (buf.length === 0)
-        return NEED_MORE$1;
+        return NEED_MORE;
     if (buf[0] === SD_INSTREAM_BYTE) {
         if (buf.length < 2)
-            return NEED_MORE$1;
+            return NEED_MORE;
         if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
             if (buf.length < DATA_FRAME_HEADER_LEN)
-                return NEED_MORE$1;
+                return NEED_MORE;
             const len = u16(buf, 5);
             if (len === 0 || len > SD_BLOCK_PAYLOAD_MAX)
-                return RESYNC$1;
+                return RESYNC;
             const total = DATA_FRAME_HEADER_LEN + len + FRAME_CRC_LEN;
-            return buf.length < total ? NEED_MORE$1 : total;
+            return buf.length < total ? NEED_MORE : total;
         }
         if (buf[1] === SD_TRANSFER_OPCODES.FILE_STATUS_RESPONSE) {
-            return buf.length < STATUS_FRAME_LEN ? NEED_MORE$1 : STATUS_FRAME_LEN;
+            return buf.length < STATUS_FRAME_LEN ? NEED_MORE : STATUS_FRAME_LEN;
         }
         /* An instream response that is not part of the SD-transfer protocol
          * (e.g. an unsolicited status response) — resync past it. */
-        return RESYNC$1;
+        return RESYNC;
     }
     const len = oneShotLength(buf);
     if (len === -1)
-        return RESYNC$1;
+        return RESYNC;
     if (len === 0 || buf.length < len)
-        return NEED_MORE$1;
+        return NEED_MORE;
     return len;
 }
 /**
@@ -2754,9 +3665,9 @@ function sdMessageSpan(buf) {
  */
 function tryExtractSdMessage(buf) {
     const span = sdMessageSpan(buf);
-    if (span === NEED_MORE$1)
+    if (span === NEED_MORE)
         return { consumed: 0 };
-    if (span === RESYNC$1)
+    if (span === RESYNC)
         return { consumed: 1 };
     if (buf[0] === SD_INSTREAM_BYTE) {
         if (buf[1] === SD_TRANSFER_OPCODES.FILE_DATA_RESPONSE) {
@@ -2829,7 +3740,9 @@ const SHIMMER3R_INQ_CHANNELS_OFFSET = SHIMMER3R_INQ_NUM_CHANNELS_OFFSET + 2; // 
  */
 const SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS = Object.freeze({
     [OPCODES.SAMPLING_RATE_RESPONSE]: 2, // 0x04
+    [OPCODES.WR_ACCEL_RANGE_RESPONSE]: 1, // 0x0A
     [OPCODES.GSR_RANGE_RESPONSE]: 1, // 0x22
+    [OPCODES.GYRO_RANGE_RESPONSE]: 1, // 0x4A
     [OPCODES.DEVICE_VERSION_RESPONSE]: 1, // 0x25
     [OPCODES.FW_VERSION_RESPONSE]: 6, // 0x2F fwId u16, major u16, minor u8, patch u8
     [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
@@ -2853,28 +3766,63 @@ const SD_RESPONSE_OPCODES = new Set([
  * by the negotiated schema rather than by the protocol, so the client routes it
  * to its schema parser instead of through this function.
  */
-function shimmer3rControlMessageLength(buf) {
+function shimmer3rControlMessageLength(buf, opts = {}) {
     if (buf.length === 0)
-        return NEED_MORE$1;
+        return NEED_MORE;
     const opcode = buf[0];
     if (opcode === OPCODES.ACK_COMMAND_PROCESSED || opcode === OPCODES.NACK_COMMAND_PROCESSED) {
         return 1;
     }
-    // SD-transfer frames and one-shot responses: one definition, in sdMessageSpan.
-    if (opcode === SD_INSTREAM_BYTE || SD_RESPONSE_OPCODES.has(opcode)) {
+    /*
+     * 0x8A (INSTREAM_CMD_RESPONSE) is a shared prefix, not an opcode: the byte
+     * after it selects the message. SD transfer owns most of that space, but the
+     * firmware also answers GET_STATUS and GET_VBATT through it, and those two
+     * predate the SD frames — so they are decided here before the rest is handed
+     * to sdMessageSpan.
+     */
+    if (opcode === SD_INSTREAM_BYTE) {
+        if (buf.length < 2)
+            return NEED_MORE;
+        if (buf[1] === OPCODES.STATUS_RESPONSE) {
+            // [0x8A][0x71][status0]{[status1]} — ShimBt_assembleStatusBytes,
+            // `Comms/shimmer_bt_uart.c:2920-2932`.
+            const total = 2 + (opts.statusPayloadBytes ?? 2);
+            return buf.length < total ? NEED_MORE : total;
+        }
+        if (buf[1] === OPCODES.VBATT_RESPONSE) {
+            // [0x8A][0x94][BattStatusRaw x3] — `Comms/shimmer_bt_uart.c:1848-1859`.
+            return buf.length < 5 ? NEED_MORE : 5;
+        }
         return sdMessageSpan(buf);
+    }
+    // SD-transfer one-shot responses: one definition, in sdMessageSpan.
+    if (SD_RESPONSE_OPCODES.has(opcode)) {
+        return sdMessageSpan(buf);
+    }
+    if (opcode === OPCODES.RSP_CALIB_DUMP_COMMAND) {
+        // [0x99][length][offsetLo][offsetHi][data…] — the length byte counts the
+        // data only, and the firmware reads at most 128 bytes of calibration RAM
+        // per request (`Comms/shimmer_bt_uart.c:2241-2249`), so a larger one is a
+        // stray byte rather than a giant response.
+        if (buf.length < 2)
+            return NEED_MORE;
+        const dataLen = buf[1];
+        if (dataLen > 128)
+            return RESYNC;
+        const total = 4 + dataLen;
+        return buf.length < total ? NEED_MORE : total;
     }
     if (opcode === OPCODES.INQUIRY_RESPONSE) {
         if (buf.length <= SHIMMER3R_INQ_NUM_CHANNELS_OFFSET)
-            return NEED_MORE$1;
+            return NEED_MORE;
         const numChannels = buf[SHIMMER3R_INQ_NUM_CHANNELS_OFFSET];
         // A stray stream byte 0x02 can masquerade as an INQUIRY_RESPONSE whose
         // "numChannels" is garbage, swallowing real control traffic (ACK included).
         // No Shimmer3R comes close to 32 channels — treat the rest as garbage.
         if (numChannels > 32)
-            return RESYNC$1;
+            return RESYNC;
         const total = SHIMMER3R_INQ_CHANNELS_OFFSET + numChannels;
-        return buf.length < total ? NEED_MORE$1 : total;
+        return buf.length < total ? NEED_MORE : total;
     }
     if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE || opcode === OPCODES.INFOMEM_RESPONSE) {
         // [opcode][length][data…]; the firmware caps both a daughter-card and an
@@ -2887,18 +3835,18 @@ function shimmer3rControlMessageLength(buf) {
         // matters: those continuation bytes have no opcode, so the drain could not
         // frame them and would resync straight past the tail of the record.
         if (buf.length < 2)
-            return NEED_MORE$1;
+            return NEED_MORE;
         const memLen = buf[1];
         if (memLen > 128)
-            return RESYNC$1;
+            return RESYNC;
         const total = 2 + memLen;
-        return buf.length < total ? NEED_MORE$1 : total;
+        return buf.length < total ? NEED_MORE : total;
     }
     const payload = SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS[opcode];
     if (payload === undefined)
-        return RESYNC$1;
+        return RESYNC;
     const total = 1 + payload;
-    return buf.length < total ? NEED_MORE$1 : total;
+    return buf.length < total ? NEED_MORE : total;
 }
 
 /**
@@ -3461,288 +4409,6 @@ function applyStreamingCalibration(oc, state) {
     }
 }
 
-/**
- * Firmware/hardware-conditional InfoMem byte-layout resolution for Shimmer3
- * and Shimmer3R.
- *
- * Ported verbatim from the Java driver:
- *   com.shimmerresearch.driver.shimmer2r3.ConfigByteLayoutShimmer3
- *     (field initialisers + the constructor @324-412 that mutates offsets and
- *      the InfoMem address base by firmware version / hardware id)
- *   com.shimmerresearch.driver.ConfigByteLayout (address defaults @36-40,
- *     checkConfigBytesValid @90)
- *   com.shimmerresearch.driverUtilities.UtilShimmer#compareVersions (@580-629)
- *   com.shimmerresearch.driverUtilities.ShimmerVerObject
- *     (#isSupportedMpl @390, #isSupportedEightByteDerivedSensors @472)
- *   com.shimmerresearch.driver.ShimmerDevice#isSupportedSdLogSync (@2091)
- *
- * Everything here is pure so it can be unit-tested with byte fixtures.
- */
-// ---------------------------------------------------------------------------
-// HW / FW id constants (ShimmerVerDetails.java)
-// ---------------------------------------------------------------------------
-/** Hardware version codes (`ShimmerVerDetails.HW_ID`). */
-const HW_ID = Object.freeze({
-    SHIMMER_3: 3,
-    SHIMMER_3R: 10,
-});
-/** Firmware identifier codes (`ShimmerVerDetails.FW_ID`). */
-const FW_ID$1 = Object.freeze({
-    BTSTREAM: 1,
-    SDLOG: 2,
-    LOGANDSTREAM: 3,
-    GQ_802154: 9,
-    SHIMMER4_SDK_STOCK: 12,
-    STROKARE: 15,
-});
-/** `ShimmerVerDetails.ANY_VERSION` — wildcard for a version-field comparison. */
-const ANY_VERSION = -1;
-// ---------------------------------------------------------------------------
-// InfoMem geometry
-// ---------------------------------------------------------------------------
-/** Total InfoMem config length used by Shimmer3/3R (D+C+B pages). */
-const INFOMEM_SIZE = 384;
-/** One InfoMem page (D/C/B) = 128 bytes; also the UART transfer chunk size. */
-const INFOMEM_PAGE_SIZE = 128;
-/** Number of validity sentinel bytes checked at the start of the InfoMem. */
-const INFOMEM_VALIDITY_BYTES = 6;
-/** Legacy MSP430 absolute page addresses (`ConfigByteLayout` defaults). */
-const INFOMEM_ADDR_LEGACY = Object.freeze({ D: 0x1800, C: 0x1880, B: 0x1900 });
-/** 0-based flat page addresses used by newer firmware / all Shimmer3R. */
-const INFOMEM_ADDR_FLAT = Object.freeze({ D: 0, C: 128, B: 256 });
-// ---------------------------------------------------------------------------
-// Version comparison (UtilShimmer#compareVersions)
-// ---------------------------------------------------------------------------
-/**
- * True when the context firmware matches `fwId` (or `fwId` is
- * {@link ANY_VERSION}) AND the context version is >= the given threshold.
- * Major/minor use strict `>`, internal uses `>=`, exactly as
- * `UtilShimmer.compareVersions` (UtilShimmer.java:582-629). Passing
- * {@link ANY_VERSION} for the version fields makes the version test always pass
- * (any real version is `> -1`), matching the Java `ANY_VERSION` idiom.
- */
-function fwCompare(ctx, fwId, major, minor, internal) {
-    if (fwId !== ANY_VERSION && ctx.firmwareId !== fwId)
-        return false;
-    const { major: a, minor: b, internal: c } = ctx.firmwareVersion;
-    return a > major || (a === major && b > minor) || (a === major && b === minor && c >= internal);
-}
-const isShimmer3R = (ctx) => ctx.hardwareVersion === HW_ID.SHIMMER_3R;
-// ---------------------------------------------------------------------------
-// Feature predicates that gate which InfoMem fields are meaningful
-// ---------------------------------------------------------------------------
-/**
- * `ShimmerVerObject#isSupportedMpl` (@390): Shimmer3 + SDLog in the half-open
- * window [0.7.0, 0.8.0). No supported/target device runs this, so enabled-
- * sensor bytes 3-4 (bits 24-39) are effectively never populated.
- */
-function isSupportedMpl(ctx) {
-    return (ctx.hardwareVersion === HW_ID.SHIMMER_3 &&
-        fwCompare(ctx, FW_ID$1.SDLOG, 0, 7, 0) &&
-        !fwCompare(ctx, FW_ID$1.SDLOG, 0, 8, 0));
-}
-/**
- * `ShimmerVerObject#isSupportedEightByteDerivedSensors` (@472): SDLog>=0.13.1,
- * LogAndStream>=0.7.1, GQ_802154>=0.3.2, Shimmer4>=0.0.23, or StroKare (any).
- */
-function isSupportedEightByteDerivedSensors(ctx) {
-    return (fwCompare(ctx, FW_ID$1.SDLOG, 0, 13, 1) ||
-        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 7, 1) ||
-        fwCompare(ctx, FW_ID$1.GQ_802154, 0, 3, 2) ||
-        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, 0, 0, 23) ||
-        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION));
-}
-/**
- * `ShimmerDevice#isSupportedSdLogSync` (@2091): SDLog (any), Shimmer3R+
- * LogAndStream (any), Shimmer3+LogAndStream>=0.16.11, or StroKare. Gates the
- * trial id / number-of-Shimmers, sync bits, sync-node list.
- */
-function isSupportedSdLogSync(ctx) {
-    if (ctx.firmwareId === FW_ID$1.SDLOG)
-        return true;
-    if (ctx.firmwareId === FW_ID$1.STROKARE)
-        return true;
-    if (isShimmer3R(ctx) && ctx.firmwareId === FW_ID$1.LOGANDSTREAM)
-        return true;
-    if (ctx.hardwareVersion === HW_ID.SHIMMER_3 &&
-        ctx.firmwareId === FW_ID$1.LOGANDSTREAM &&
-        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 16, 11)) {
-        return true;
-    }
-    return false;
-}
-/**
- * SDLog / LogAndStream / StroKare firmware — the family that stores the
- * experiment-config bytes (button-start, disable-BT, TCXO) and honours the
- * device-write MAC-0xFF + config-file-creation-flag semantics
- * (ShimmerObject.java:5035,5054,5278,5312,5320).
- */
-function isSdLoggingFirmware(ctx) {
-    return (ctx.firmwareId === FW_ID$1.SDLOG ||
-        ctx.firmwareId === FW_ID$1.LOGANDSTREAM ||
-        ctx.firmwareId === FW_ID$1.STROKARE);
-}
-// Field constant lengths / bit positions shared by parse + generate.
-const EXG_BANK_LENGTH = 10;
-const NAME_LENGTH = 12;
-const CONFIG_TIME_LENGTH = 4;
-const MAC_LENGTH = 6;
-/**
- * MAC values reported by a device whose InfoMem has never been provisioned
- * (erased flash reads back all-FF; a zeroed page reads back all-zero). Neither
- * is a real address, so a client should reject rather than surface them.
- */
-const INVALID_MAC_IDS = Object.freeze(['FFFFFFFFFFFF', '000000000000']);
-const BIT_SHIFT = Object.freeze({
-    GSR_RANGE: 1,
-    EXP_POWER: 0,
-    BUTTON_START: 5,
-    DISABLE_BLUETOOTH: 3,
-    SYNC_WHEN_LOGGING: 2,
-    MASTER_SHIMMER: 1,
-    SINGLE_TOUCH: 7,
-    TCXO: 4,
-    SD_CFG_FILE_WRITE_FLAG: 0,
-});
-const MASK = Object.freeze({
-    GSR_RANGE: 0x07,
-    EXP_POWER: 0x01,
-    ONE_BIT: 0x01,
-    DERIVED_BYTE: 0xff,
-    SD_CFG_FILE_WRITE_FLAG: 0x01,
-});
-/** Config-time bytes are big-endian: byte0 = MSB (shift 24) … byte3 = LSB. */
-const CONFIG_TIME_BIT_SHIFTS = [24, 16, 8, 0];
-/**
- * Resolve the InfoMem layout for a firmware/hardware context, applying the
- * same ordered constructor branches as `ConfigByteLayoutShimmer3` (oldest →
- * newest). Returns a frozen, fully-derived {@link InfoMemLayout}.
- */
-function resolveInfoMemLayout(ctx) {
-    const r = isShimmer3R(ctx);
-    // ---- Base (default) initialiser values (ConfigByteLayoutShimmer3 @34-109).
-    const layout = {
-        // Page addresses — legacy default; branch 4 may remap to flat 0-based.
-        addrD: INFOMEM_ADDR_LEGACY.D,
-        addrC: INFOMEM_ADDR_LEGACY.C,
-        addrB: INFOMEM_ADDR_LEGACY.B,
-        flatAddressing: false,
-        idxSamplingRate: 0,
-        idxBufferSize: 2,
-        idxSensors0: 3,
-        idxSensors1: 4,
-        idxSensors2: 5,
-        idxConfigSetupByte0: 6,
-        idxConfigSetupByte3: 9,
-        idxExg1: 10,
-        idxExg2: 20,
-        idxBtCommBaudRate: 30,
-        // Derived-sensor offsets default to 0 ("not present").
-        idxDerivedSensors0: 0,
-        idxDerivedSensors1: 0,
-        idxDerivedSensors2: 0,
-        idxDerivedSensors3: 0,
-        idxDerivedSensors4: 0,
-        idxDerivedSensors5: 0,
-        idxDerivedSensors6: 0,
-        idxDerivedSensors7: 0,
-        // C page (128 + X).
-        idxSensors3: 128 + 2,
-        idxSensors4: 128 + 3,
-        idxSDShimmerName: 128 + 59, // 187
-        idxSDEXPIDName: 128 + 71, // 199
-        idxSDConfigTime0: 128 + 83, // 211
-        idxSDMyTrialID: 128 + 87, // 215
-        idxSDNumOfShimmers: 128 + 88, // 216
-        idxSDExperimentConfig0: 128 + 89, // 217
-        idxSDExperimentConfig1: 128 + 90, // 218
-        idxSDBTInterval: 128 + 91, // 219
-        idxEstimatedExpLengthMsb: 128 + 92, // 220
-        idxEstimatedExpLengthLsb: 128 + 93, // 221
-        idxMaxExpLengthMsb: 128 + 94, // 222
-        idxMaxExpLengthLsb: 128 + 95, // 223
-        idxMacAddress: 128 + 96, // 224
-        idxSDConfigDelayFlag: 128 + 102, // 230
-        idxBtFactoryReset: 0,
-        // B page.
-        idxNode0: 128 + 128, // 256
-        supportsMpl: isSupportedMpl(ctx),
-        supportsEightByteDerived: isSupportedEightByteDerivedSensors(ctx),
-        supportsSdLogSync: isSupportedSdLogSync(ctx),
-        isSdLoggingFirmware: isSdLoggingFirmware(ctx),
-    };
-    // ---- Branch 1 (@330-343): 3R | SDLog>=0.8.42 | LogAndStream>=0.3.4 | Shimmer4 | StroKare
-    // Relocates Sensors3/4 to 128/129 (ConfigSetupByte4/5 shift to 130/131) and
-    // seeds DerivedSensors0-2 at 115-117 (overridden by branch 2 below).
-    if (r ||
-        fwCompare(ctx, FW_ID$1.SDLOG, 0, 8, 42) ||
-        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 3, 4) ||
-        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
-        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
-        layout.idxSensors3 = 128 + 0;
-        layout.idxSensors4 = 128 + 1;
-        layout.idxDerivedSensors0 = 115;
-        layout.idxDerivedSensors1 = 116;
-        layout.idxDerivedSensors2 = 117;
-    }
-    // ---- Branch 2 (@345-360): 3R | SDLog>=0.8.68 | LogAndStream>=0.3.17 | BtStream>=0.6.0 | Shimmer4 | StroKare
-    // Moves DerivedSensors0-2 into InfoMem D at 31-33 (and the calibration blocks,
-    // which this codec does not surface).
-    if (r ||
-        fwCompare(ctx, FW_ID$1.SDLOG, 0, 8, 68) ||
-        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 3, 17) ||
-        fwCompare(ctx, FW_ID$1.BTSTREAM, 0, 6, 0) ||
-        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
-        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
-        layout.idxDerivedSensors0 = 31;
-        layout.idxDerivedSensors1 = 32;
-        layout.idxDerivedSensors2 = 33;
-    }
-    // ---- Branch 4 — ADDRESS-BASE REMAP (@370-381): 3R | SDLog>=0.11.5 |
-    // LogAndStream>=0.5.16 | BtStream>=0.7.4 | Shimmer4 | StroKare.
-    // HARDWARE-VERIFY: the page address the device firmware expects on the wire
-    // (legacy MSP430 0x1800/0x1880/0x1900 vs. flat 0/128/256) is only confirmable
-    // against real hardware of each firmware generation.
-    if (r ||
-        fwCompare(ctx, FW_ID$1.SDLOG, 0, 11, 5) ||
-        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 5, 16) ||
-        fwCompare(ctx, FW_ID$1.BTSTREAM, 0, 7, 4) ||
-        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
-        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
-        layout.addrD = INFOMEM_ADDR_FLAT.D;
-        layout.addrC = INFOMEM_ADDR_FLAT.C;
-        layout.addrB = INFOMEM_ADDR_FLAT.B;
-        layout.flatAddressing = true;
-    }
-    // ---- Branch 5 (@383-390): 3R | isSupportedEightByteDerivedSensors.
-    if (r || layout.supportsEightByteDerived) {
-        layout.idxDerivedSensors3 = 118;
-        layout.idxDerivedSensors4 = 119;
-        layout.idxDerivedSensors5 = 120;
-        layout.idxDerivedSensors6 = 121;
-        layout.idxDerivedSensors7 = 122;
-    }
-    // ---- Branch 7 (@398-401): 3R | LogAndStream>=0.8.1.
-    if (r || fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 8, 1)) {
-        layout.idxBtFactoryReset = 128 + 103; // 231
-    }
-    return Object.freeze(layout);
-}
-/**
- * The "first 6 bytes all 0xFF ⇒ unconfigured/invalid" check
- * (ConfigByteLayout.checkConfigBytesValid @90). Returns true when the InfoMem
- * holds a real configuration.
- */
-function checkConfigBytesValid(bytes) {
-    if (bytes.length < INFOMEM_VALIDITY_BYTES)
-        return false;
-    for (let i = 0; i < INFOMEM_VALIDITY_BYTES; i++) {
-        if (bytes[i] !== 0xff)
-            return true;
-    }
-    return false;
-}
-
 // ---------------------------------------------------------------------------
 // InfoMem constants
 // ---------------------------------------------------------------------------
@@ -3800,6 +4466,20 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._unframed = false;
         /** Re-framing accumulator, used only when {@link _unframed}. */
         this._ctrlBuf = new Uint8Array(0);
+        /**
+         * How many bytes a STATUS_RESPONSE payload carries: 2 on a Shimmer3R, 1 on a
+         * Shimmer3 (`STATUS_BYTE_COUNT`, log-and-stream-common
+         * `Comms/shimmer_bt_uart.h:259-263`). Assumed 2 until
+         * {@link readDeviceVersion} says otherwise, and handed to the framer so a
+         * byte stream splits the message in the right place.
+         */
+        this._statusPayloadBytes = 2;
+        /**
+         * Non-zero while a {@link getStatus} round trip is outstanding, so its answer
+         * is not also reported as an unsolicited push. Counted rather than flagged:
+         * two callers may be awaiting at once.
+         */
+        this._statusReadsInFlight = 0;
         // Cached device configuration
         this.enabledSensors = 0x000000;
         this.samplingRateHz = 0;
@@ -3829,11 +4509,28 @@ class Shimmer3RClient extends BaseShimmerClient {
         // Callbacks
         this.onInquiry = null;
         this.onExpPowerChanged = null;
-        /** Handle an unexpected / requested transport disconnect. */
-        this._handleTransportDisconnect = () => {
+        /**
+         * Invoked for a STATUS_RESPONSE the host did not ask for. The firmware pushes
+         * one whenever docking, SD logging, streaming or the USB rail changes
+         * (`ShimBt_instreamStatusRespSend`, log-and-stream-common
+         * `Comms/shimmer_bt_uart.c:2445-2469`), so this is how a host learns the user
+         * pressed the button or seated the sensor in a dock.
+         *
+         * The answer to a {@link getStatus} call is NOT delivered here — that would
+         * report every state twice.
+         *
+         * **Only fires while idle.** Once streaming, every inbound byte belongs to the
+         * data plane and goes to the schema parser, which has no way to tell a status
+         * push from sample bytes and will consume it. Do not rely on this callback to
+         * notice that a recording stopped mid-stream; poll {@link getStatus} instead.
+         */
+        this.onDeviceStatus = null;
+        /** Handle an unexpected transport disconnect (the link dropped under us). */
+        this._handleTransportDisconnect = (reason) => {
             this._streaming = false;
             this._sdKnownSession = null;
             this._emitStatus('Device disconnected');
+            this._emitDisconnect(reason);
         };
         // ---------------------------------------------------------------------------
         // Notify handler (fed raw notification chunks by the transport)
@@ -3870,6 +4567,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                     else {
                         this._log('Forwarding non-DATA remainder to control handlers');
                         this._emitTemp(this._lastAckRemainder);
+                        this._maybeEmitDeviceStatus(this._lastAckRemainder);
                     }
                     this._lastAckRemainder = null;
                 }
@@ -3881,6 +4579,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             }
             else {
                 this._emitTemp(chunk);
+                this._maybeEmitDeviceStatus(chunk);
                 if (chunk.length && chunk[0] === OPCODES.DATA_PACKET) {
                     this._rxBuf = concatU8(this._rxBuf, chunk);
                 }
@@ -3899,6 +4598,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         // Firmware version (feature gating)
         // ---------------------------------------------------------------------------
         this._fwVersionCache = null;
+        this._deviceVersionCache = null;
         // ---------------------------------------------------------------------------
         // SD-card file transfer (FW >= v1.01.011; see supportsSdTransfer)
         //
@@ -4004,6 +4704,12 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._ctrlBuf = new Uint8Array(0);
         // The firmware's SD session counter restarts with the connection
         this._sdKnownSession = null;
+        // Both version caches describe the device at the far end of the link, so a
+        // reconnect — possibly to a different sensor — must not inherit them.
+        this._fwVersionCache = null;
+        this._deviceVersionCache = null;
+        this._statusPayloadBytes = 2;
+        this._armDisconnectNotification();
         this._notifyUnsub = t.onNotify(this._handleNotify);
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         /*
@@ -4038,6 +4744,9 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
     }
     async disconnect() {
+        // Application-initiated teardown is not a fault, so `onDisconnect` stays
+        // silent — including when this call is the cleanup that follows a drop.
+        this._suppressDisconnectNotification();
         try {
             this._notifyUnsub?.();
             this._disconnectUnsub?.();
@@ -4059,6 +4768,38 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._deviceCalibrations = {};
             this._sdKnownSession = null;
             this._emitStatus('Disconnected');
+        }
+    }
+    /**
+     * Surface a STATUS_RESPONSE nobody asked for on {@link onDeviceStatus}.
+     *
+     * Called for control-plane messages only, so it never sees stream data — and
+     * so a push that lands mid-stream is lost to the schema parser instead, as
+     * {@link onDeviceStatus} documents.
+     */
+    _maybeEmitDeviceStatus(chunk) {
+        if (!this.onDeviceStatus)
+            return;
+        // A push carries the ACK prefix when the firmware's
+        // `useAckPrefixForInstreamResponses` flag is on
+        // (SET_INSTREAM_RESPONSE_ACK_PREFIX_STATE, 0xA3), so step over one if it is
+        // there. On a byte stream the drain has already split the ACK off, but over
+        // BLE it shares the notification.
+        const at = chunk[0] === OPCODES.ACK_COMMAND_PROCESSED ? 1 : 0;
+        if (chunk.length < at + 3)
+            return;
+        if (chunk[at] !== OPCODES.INSTREAM_CMD_RESPONSE)
+            return;
+        if (chunk[at + 1] !== OPCODES.STATUS_RESPONSE)
+            return;
+        // Somebody's answer, not news: `getStatus` reports it to its own caller.
+        if (this._statusReadsInFlight > 0)
+            return;
+        try {
+            this.onDeviceStatus(parseShimmer3StatusBytes(chunk.subarray(at + 2, at + 2 + this._statusPayloadBytes)));
+        }
+        catch (e) {
+            this._log('onDeviceStatus handler error', e);
         }
     }
     // ---------------------------------------------------------------------------
@@ -4088,6 +4829,13 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._handleFramedChunk(msg);
     }
     /**
+     * The framer, told which platform is answering. Only STATUS_RESPONSE's length
+     * depends on that, and only this client knows it.
+     */
+    _controlMessageLength(buf) {
+        return shimmer3rControlMessageLength(buf, { statusPayloadBytes: this._statusPayloadBytes });
+    }
+    /**
      * Pull every complete message out of {@link _ctrlBuf}, leaving the incomplete
      * tail behind. Extraction is finished before anything is dispatched so a
      * handler can never observe a half-updated buffer.
@@ -4107,10 +4855,10 @@ class Shimmer3RClient extends BaseShimmerClient {
                 this._parseStreamIfPossible();
                 break;
             }
-            const len = shimmer3rControlMessageLength(buf);
-            if (len === NEED_MORE$1)
+            const len = this._controlMessageLength(buf);
+            if (len === NEED_MORE)
                 break;
-            if (len === RESYNC$1) {
+            if (len === RESYNC) {
                 this._log(`serial resync: dropping unframeable byte 0x${buf[0].toString(16)}`);
                 buf = buf.subarray(1);
                 continue;
@@ -4127,9 +4875,9 @@ class Shimmer3RClient extends BaseShimmerClient {
             // response handler, and be dropped. Two ACKs are never merged: the second
             // would masquerade as the first's response body.
             if (msg.length === 1 && msg[0] === OPCODES.ACK_COMMAND_PROCESSED && this._expectingAck > 0) {
-                const nextLen = shimmer3rControlMessageLength(buf);
-                if (nextLen !== NEED_MORE$1 &&
-                    nextLen !== RESYNC$1 &&
+                const nextLen = this._controlMessageLength(buf);
+                if (nextLen !== NEED_MORE &&
+                    nextLen !== RESYNC &&
                     buf.length >= nextLen &&
                     buf[0] !== OPCODES.ACK_COMMAND_PROCESSED) {
                     out.push(concatU8(msg, buf.subarray(0, nextLen)));
@@ -4807,7 +5555,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         for (const id of channelIds) {
             const fmt = CHANNEL_FORMATS[id];
             if (!fmt) {
-                fields.push({ id, name: `CH_${hex2(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
+                fields.push({ id, name: `CH_${hex2$1(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
                 packetSize += 2;
                 continue;
             }
@@ -4948,10 +5696,10 @@ class Shimmer3RClient extends BaseShimmerClient {
                         let v;
                         switch (f.fmt) {
                             case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$3(frame, cursor));
+                                v = f.endian === 'be' ? sign16(u16be$1(frame, cursor)) : sign16(u16le$3(frame, cursor));
                                 break;
                             case 'u16':
-                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$3(frame, cursor);
+                                v = f.endian === 'be' ? u16be$1(frame, cursor) : u16le$3(frame, cursor);
                                 break;
                             case 'i24':
                                 v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
@@ -5037,6 +5785,19 @@ class Shimmer3RClient extends BaseShimmerClient {
             const handler = (chunk) => {
                 if (!chunk || chunk.length === 0)
                     return;
+                // A NACK is the firmware's answer, so stop waiting for one that is not
+                // coming. Several commands are refused outright while the device is
+                // sensing (`ShimBt_isCmdBlockedWhileSensing`), and "NACK received" says
+                // that; "ACK timeout" a second and a half later reads as a dead link.
+                // Only reachable while a command is in flight — this handler is
+                // registered for exactly that window — so a stray 0xFE cannot fabricate
+                // one, and stream bytes never reach the control fan-out at all.
+                if (chunk[0] === OPCODES.NACK_COMMAND_PROCESSED) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    reject(new Error('NACK received'));
+                    return;
+                }
                 if (chunk.length === 1 && chunk[0] === OPCODES.ACK_COMMAND_PROCESSED) {
                     clearTimeout(t);
                     this._offTemp(handler);
@@ -5079,6 +5840,44 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._onTemp(handler);
         });
     }
+    /**
+     * Await an instream response — one of the messages the firmware answers
+     * behind the shared `[0x8A]` prefix, where the byte after it selects the
+     * message rather than the leading opcode.
+     *
+     * @param subOpcode   The byte after 0x8A (STATUS_RESPONSE, VBATT_RESPONSE …).
+     * @param payloadLen  Minimum payload the message must carry to count, so a
+     *   truncated one is waited past rather than parsed. A *minimum*, not an
+     *   exact length: a Shimmer3 sends one status byte where a Shimmer3R sends
+     *   two, and a caller that has not yet asked which it is talking to must not
+     *   time out on the shorter answer.
+     */
+    _waitForInstreamResponse(subOpcode, payloadLen, timeoutMs = 1500) {
+        const matches = (c) => c.length >= 2 + payloadLen && c[0] === OPCODES.INSTREAM_CMD_RESPONSE && c[1] === subOpcode;
+        // BLE packs [0xFF][0x8A][0x71]… into a single notification, so the reply may
+        // already be sitting in the ACK's remainder — the same synchronous hand-over
+        // `_waitForResponse` performs for a plain opcode. Without this the message
+        // has been and gone by the time the waiter registers.
+        const rem = this._lastAckRemainder;
+        if (rem && matches(rem)) {
+            this._lastAckRemainder = null;
+            return Promise.resolve(rem);
+        }
+        return new Promise((resolve, reject) => {
+            const t = setTimeout(() => {
+                this._offTemp(handler);
+                reject(new Error(`Instream response 0x${hex2$1(subOpcode)} timeout`));
+            }, timeoutMs);
+            const handler = (chunk) => {
+                if (!chunk || !matches(chunk))
+                    return;
+                clearTimeout(t);
+                this._offTemp(handler);
+                resolve(chunk);
+            };
+            this._onTemp(handler);
+        });
+    }
     _onTemp(fn) {
         this._temps.add(fn);
     }
@@ -5094,6 +5893,105 @@ class Shimmer3RClient extends BaseShimmerClient {
                 this._log('temp handler error', e);
             }
         });
+    }
+    /**
+     * Read (and cache) the hardware version via GET_DEVICE_VERSION_COMMAND
+     * (0x3F → `[0x25][hw]`). 3 = Shimmer3, 10 = Shimmer3R.
+     *
+     * Worth asking even though this client is named for the Shimmer3R: the two
+     * platforms share this firmware and this command set, so a Shimmer3 reached
+     * over classic Bluetooth answers here too — and answers some commands with
+     * fewer bytes than a Shimmer3R does (see {@link getStatus}). Cached, so the
+     * gating call sites can ask freely.
+     */
+    async readDeviceVersion() {
+        if (this._deviceVersionCache)
+            return this._deviceVersionCache;
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        const cmd = new Uint8Array([OPCODES.GET_DEVICE_VERSION_COMMAND]);
+        const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+        const rsp = ackRemainder && ackRemainder[0] === OPCODES.DEVICE_VERSION_RESPONSE
+            ? ackRemainder
+            : await this._waitForResponse(OPCODES.DEVICE_VERSION_RESPONSE, 1500);
+        if (rsp.length < 2)
+            throw new Error('short DEVICE_VERSION_RESPONSE');
+        this._deviceVersionCache = parseShimmer3DeviceVersionResponse(rsp);
+        // A Shimmer3's firmware omits the usbPluggedIn status byte, so the framer
+        // has to stop waiting for a byte that is never coming — and, worse, stop
+        // swallowing the ACK that follows the status instead.
+        this._statusPayloadBytes = this._deviceVersionCache.hardwareVersion === HW_ID.SHIMMER_3 ? 1 : 2;
+        return this._deviceVersionCache;
+    }
+    // ---------------------------------------------------------------------------
+    // Device status and battery
+    // ---------------------------------------------------------------------------
+    /**
+     * Ask what the sensor is doing: docked, sensing, logging, streaming, SD card
+     * present, RTC set (GET_STATUS_COMMAND 0x72 → `[0x8A][0x71][status0]…`).
+     *
+     * This is the only way to learn several of those. An inquiry reports the
+     * *configuration*; only the status bytes say whether a recording is actually
+     * running, whether the clock has been set since the sensor last lost power,
+     * or whether the firmware failed to open its SD file.
+     *
+     * Call {@link readDeviceVersion} first when the platform is unknown: a
+     * Shimmer3 answers with one status byte where a Shimmer3R sends two, and over
+     * a byte stream the framer needs to know which before it can split the
+     * message. Getting it wrong there consumes the ACK that follows.
+     */
+    async getStatus() {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        // Claimed before the write, not after the ACK: the reply can arrive while
+        // this method is still between awaits, and it must not be mistaken for an
+        // unsolicited push in that window.
+        this._statusReadsInFlight++;
+        try {
+            this._emitStatus('GET_STATUS → waiting for ACK then RSP…');
+            const ackRemainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_STATUS_COMMAND]), 1500);
+            const rsp = ackRemainder &&
+                ackRemainder.length >= 3 &&
+                ackRemainder[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
+                ackRemainder[1] === OPCODES.STATUS_RESPONSE
+                ? ackRemainder
+                : await this._waitForInstreamResponse(OPCODES.STATUS_RESPONSE, 1, 1500);
+            const status = parseShimmer3StatusBytes(rsp.subarray(2, 2 + this._statusPayloadBytes));
+            this._emitStatus(`Status: docked=${status.docked} sensing=${status.sensing} ` +
+                `logging=${status.sdLogging} streaming=${status.streaming} ` +
+                `sdPresent=${status.sdPresent} rtcSet=${status.rtcSet}`);
+            return status;
+        }
+        finally {
+            this._statusReadsInFlight--;
+        }
+    }
+    /**
+     * Read the battery ADC and charger state (GET_VBATT_COMMAND 0x95 →
+     * `[0x8A][0x94][raw x3]`).
+     *
+     * The three payload bytes are the firmware's own `BattStatusRaw` union
+     * (`Battery/shimmer_battery.h:60-74`): a little-endian 12-bit ADC reading
+     * followed by the charger chip's STAT1/STAT2 bits. That is the same record the
+     * dock UART carries, so this reuses {@link parseBatteryStatus} rather than
+     * adding a second reading of the same bytes — including its voltage curve and
+     * the percentage it declines to report when the reading is out of range.
+     */
+    async getBattery() {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        this._emitStatus('GET_VBATT → waiting for ACK then RSP…');
+        const ackRemainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_VBATT_COMMAND]), 1500);
+        const rsp = ackRemainder &&
+            ackRemainder.length >= 5 &&
+            ackRemainder[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
+            ackRemainder[1] === OPCODES.VBATT_RESPONSE
+            ? ackRemainder
+            : await this._waitForInstreamResponse(OPCODES.VBATT_RESPONSE, 3, 1500);
+        const batt = parseBatteryStatus(rsp.subarray(2, 5));
+        const pct = batt.percentage === null ? 'n/a' : `${batt.percentage.toFixed(1)}%`;
+        this._emitStatus(`Battery: ${batt.voltage.toFixed(3)} V (${pct}), charger ${batt.chargingStatus}`);
+        return batt;
     }
     /** Read (and cache) the firmware version via GET_FW_VERSION_COMMAND. */
     async readFwVersion() {
@@ -7324,310 +8222,6 @@ async function deleteDownloadedFromCard(client, filePaths, dirPaths = [], opts =
 }
 
 /**
- * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
- *
- * Classic Shimmer3 speaks the same LiteProtocol command set as the Shimmer3R
- * (see `../shimmer3r/constants.ts`), but over an **unframed RFCOMM byte stream**
- * rather than framed BLE notifications, and with a **different inquiry-response
- * layout** (a 4-byte config word instead of Shimmer3R's 7-byte word). Everything
- * in this file is a side-effect-free function so it can be unit-tested without a
- * transport.
- *
- * Ported from the Shimmer Java driver:
- *   com.shimmerresearch.driver.ShimmerObject#interpretInqResponse (HW_ID.SHIMMER_3 branch)
- *   com.shimmerresearch.bluetooth.ShimmerBluetooth (response byte layouts + handshake)
- */
-/** The Shimmer3 acknowledgement byte (LiteProtocol). Shared with Shimmer3R. */
-const ACK = OPCODES.ACK_COMMAND_PROCESSED; // 0xFF
-/** The Shimmer3 negative-acknowledgement byte (LiteProtocol). */
-const NACK = OPCODES.NACK_COMMAND_PROCESSED; // 0xFE
-/**
- * Well-known SPP (Serial Port Profile) service UUID used to open an RFCOMM
- * socket to a classic Shimmer3. Documented here for the platform transport
- * (e.g. the React Native Android module calls
- * `createRfcommSocketToServiceRecord(SPP_UUID)`); the SDK client itself is
- * transport-agnostic and never touches it.
- */
-const SHIMMER3_SPP_UUID = '00001101-0000-1000-8000-00805f9b34fb';
-// ---------------------------------------------------------------------------
-// Inquiry-response layout — THE key protocol difference vs Shimmer3R
-// ---------------------------------------------------------------------------
-//
-// Byte layout of an INQUIRY_RESPONSE, INCLUDING the 0x02 opcode byte
-// (ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch works on the
-// opcode-stripped buffer, so every index below is the Java index + 1):
-//
-//   [0]      = 0x02  INQUIRY_RESPONSE opcode
-//   [1..2]   = sampling-rate divisor, 16-bit little-endian
-//   [3..6]   = config word (configByte0), 4 bytes little-endian   <-- 4, not 7
-//   [7]      = numChannels
-//   [8]      = bufferSize
-//   [9..]    = numChannels channel/signal-ID bytes
-//
-// Shimmer3R differs: its config word is 7 bytes (indices [3..9]), numChannels at
-// [10], bufferSize at [11], channels from [12]. That single width difference is
-// why this cannot reuse Shimmer3RClient's inquiry parser.
-/** 0-based offset (within the opcode-prefixed message) of the config word. */
-const SHIMMER3_INQ_CONFIG_OFFSET = 3;
-/** Config word width in bytes (Shimmer3 = 4; Shimmer3R = 7). */
-const SHIMMER3_INQ_CONFIG_LENGTH = 4;
-/** Offset of the numChannels byte within the opcode-prefixed message. */
-const SHIMMER3_INQ_NUM_CHANNELS_OFFSET = SHIMMER3_INQ_CONFIG_OFFSET + SHIMMER3_INQ_CONFIG_LENGTH; // 7
-/** Offset of the first channel-ID byte within the opcode-prefixed message. */
-const SHIMMER3_INQ_CHANNELS_OFFSET = SHIMMER3_INQ_NUM_CHANNELS_OFFSET + 2; // 9
-/** The sampling clock frequency (Hz) used for divisor↔rate conversion. */
-// ShimmerDevice#getSamplingClockFreq() returns 32768.0 for Shimmer3 and Shimmer3R.
-const SHIMMER3_SAMPLING_CLOCK_FREQ = 32768;
-/**
- * Build a stream schema from the channel-ID list reported by the inquiry.
- *
- * Mirrors ShimmerObject#interpretDataPacketFormat (the channel→format mapping is
- * identical for Shimmer3 and Shimmer3R, so `CHANNEL_FORMATS` and
- * `SensorBitmapShimmer3` are reused verbatim). The only Shimmer3-relevant knob is
- * the timestamp width (u24 for firmware code ≥ 6, else u16 — see
- * ShimmerObject#updateTimestampByteLength).
- */
-function buildShimmer3Schema(channelIds, timestampFmt) {
-    const fields = [];
-    const ts = timestampFmt === 'u24' ? TIMESTAMP_FIELD.u24 : TIMESTAMP_FIELD.u16;
-    let frameBytes = 1 + ts.sizeBytes; // 1 = DATA_PACKET (0x00) preamble
-    let enabledSensors = 0;
-    for (const id of channelIds) {
-        const fmt = CHANNEL_FORMATS[id];
-        if (!fmt) {
-            fields.push({ id, name: `CH_${hex2(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
-            frameBytes += 2;
-            continue;
-        }
-        fields.push({ id, ...fmt });
-        frameBytes += fmt.sizeBytes ?? 2;
-        enabledSensors |= channelIdToSensorBit(id);
-    }
-    return { timestampFmt, fields, frameBytes, enabledSensors, dataPreambleByte: 0x00 };
-}
-/** Map a channel/signal ID to its SensorBitmapShimmer3 enable bit (0 if none). */
-function channelIdToSensorBit(id) {
-    switch (id) {
-        case 0x00:
-        case 0x01:
-        case 0x02:
-            return SensorBitmapShimmer3.SENSOR_A_ACCEL;
-        case 0x04:
-        case 0x05:
-        case 0x06:
-            return SensorBitmapShimmer3.SENSOR_D_ACCEL;
-        case 0x14:
-        case 0x15:
-        case 0x16:
-            return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
-        case 0x07:
-        case 0x08:
-        case 0x09:
-            return SensorBitmapShimmer3.SENSOR_MAG;
-        case 0x0a:
-        case 0x0b:
-        case 0x0c:
-            return SensorBitmapShimmer3.SENSOR_GYRO;
-        case 0x12:
-            return SensorBitmapShimmer3.SENSOR_INT_A1;
-        case 0x1c:
-            return SensorBitmapShimmer3.SENSOR_GSR;
-        case 0x23:
-        case 0x24:
-            return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
-        case 0x25:
-        case 0x26:
-            return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
-        case 0x1e:
-        case 0x1f:
-            return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
-        case 0x21:
-        case 0x22:
-            return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
-        default:
-            return 0;
-    }
-}
-/**
- * Decode an INQUIRY_RESPONSE using the Shimmer3 (classic) layout.
- *
- * Accepts the message with or without the leading 0x02 opcode byte (the
- * byte-stream parser always includes it; a caller passing a bare body also
- * works, matching Shimmer3RClient's `base` handling).
- *
- * Ported from ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch.
- */
-function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24') {
-    let base = 0;
-    if (u8[0] === OPCODES.INQUIRY_RESPONSE)
-        base = 1;
-    const adcRaw = u16le$3(u8, base + 0);
-    const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
-    // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
-    const configByte0 = ((u8[base + 2] | (u8[base + 3] << 8) | (u8[base + 4] << 16) | (u8[base + 5] << 24)) >>> 0) >>>
-        0;
-    const accelRange = (configByte0 & 0xc) >>> 2;
-    const gyroRange = (configByte0 & 0x30000) >>> 16;
-    const magRange = (configByte0 & 0xe00000) >>> 21;
-    const gsrRange = (configByte0 >>> 25) & 0x7;
-    const internalExpPower = (configByte0 >>> 24) & 0x1;
-    const numChannels = u8[base + 6] ?? 0;
-    const bufferSize = u8[base + 7] ?? 0;
-    const chStart = base + 8;
-    const channelIds = [...u8.slice(chStart, chStart + numChannels)];
-    const schema = buildShimmer3Schema(channelIds, timestampFmt);
-    return {
-        opcode: u8[0],
-        adcRaw,
-        samplingRateHz,
-        configByte0,
-        gsrRange,
-        internalExpPower,
-        accelRange,
-        gyroRange,
-        magRange,
-        numChannels,
-        bufferSize,
-        channelIds,
-        schema,
-        bytes: u8.slice(0),
-    };
-}
-/** Decode a DEVICE_VERSION_RESPONSE (0x25) — 1 payload byte = HW version.
- *  Ported from ShimmerBluetooth (GET_SHIMMER_VERSION_RESPONSE handler). */
-function parseShimmer3DeviceVersionResponse(u8) {
-    const base = u8[0] === OPCODES.DEVICE_VERSION_RESPONSE ? 1 : 0;
-    return { hardwareVersion: u8[base] ?? 0 };
-}
-/**
- * Firmware identifier (type) values, from
- * com.shimmerresearch.driverUtilities.ShimmerVerDetails.FW_ID.
- */
-const FW_ID = Object.freeze({
-    BTSTREAM: 1,
-    SDLOG: 2,
-    LOGANDSTREAM: 3,
-});
-/**
- * Decode a FW_VERSION_RESPONSE (0x2F) — 6 payload bytes.
- * Ported from ShimmerBluetooth (FW_VERSION_RESPONSE handler):
- *   id  = b1<<8 | b0   (little-endian)
- *   maj = b3<<8 | b2
- *   min = b4
- *   int = b5
- */
-function parseShimmer3FwVersionResponse(u8) {
-    const base = u8[0] === OPCODES.FW_VERSION_RESPONSE ? 1 : 0;
-    const b = (i) => u8[base + i] ?? 0;
-    return {
-        firmwareIdentifier: (b(1) << 8) | b(0),
-        major: (b(3) << 8) | b(2),
-        minor: b(4),
-        internal: b(5),
-    };
-}
-/**
- * Whether streaming data frames use a 3-byte (u24) timestamp for this firmware.
- *
- * The Java driver widens the timestamp to 3 bytes when the derived firmware
- * version code is ≥ 6 (ShimmerObject#updateTimestampByteLength). That code is a
- * per-firmware-type version ladder (ShimmerVerObject); code ≥ 6 corresponds to
- * LogAndStream ≥ 0.5.4, BtStream ≥ 0.7.3, and SDLog ≥ 0.11.5. Anything at or
- * above those (and any firmware type we don't recognise, assumed modern) uses
- * u24; older firmware uses u16.
- */
-function shimmer3UsesThreeByteTimestamp(v) {
-    const atLeast = (maj, min, int) => v.major > maj || (v.major === maj && (v.minor > min || (v.minor === min && v.internal >= int)));
-    switch (v.firmwareIdentifier) {
-        case FW_ID.LOGANDSTREAM:
-            return atLeast(0, 5, 4);
-        case FW_ID.BTSTREAM:
-            return atLeast(0, 7, 3);
-        case FW_ID.SDLOG:
-            return atLeast(0, 11, 5);
-        default:
-            return true; // unknown/newer firmware type — default to modern u24
-    }
-}
-// ---------------------------------------------------------------------------
-// Unframed-stream control-message framing
-// ---------------------------------------------------------------------------
-/**
- * Fixed payload lengths (bytes AFTER the opcode) for the control responses the
- * v1 client consumes. INQUIRY_RESPONSE is variable and handled specially in
- * {@link shimmer3ControlMessageLength}. Extend this table to teach the
- * byte-stream parser about further GET responses.
- *
- * Lengths taken from the `readBytes(n, ...)` calls in ShimmerBluetooth and the
- * LiteProtocol instruction-set response_size annotations.
- */
-const SHIMMER3_RESPONSE_PAYLOAD_LENGTHS = Object.freeze({
-    [OPCODES.SAMPLING_RATE_RESPONSE]: 2, // 0x04
-    [OPCODES.FW_VERSION_RESPONSE]: 6, // 0x2F
-    [OPCODES.DEVICE_VERSION_RESPONSE]: 1, // 0x25
-    [OPCODES.GSR_RANGE_RESPONSE]: 1, // 0x22
-    [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
-});
-/** Sentinel: need more bytes before the message length can be determined. */
-const NEED_MORE = -1;
-/** Sentinel: leading byte is not a recognised control opcode — caller resyncs. */
-const RESYNC = 0;
-/**
- * Given the head of the accumulated RFCOMM byte buffer, return the total length
- * (INCLUDING the leading opcode) of the complete control message it starts with,
- * or {@link NEED_MORE} if not enough bytes have arrived yet, or {@link RESYNC}
- * if the leading byte is not a control opcode we understand (garbage / a data
- * byte leaked into the control plane — the caller should drop one byte and
- * retry).
- *
- * This is the primitive that makes the unframed RFCOMM stream tractable: unlike
- * BLE (one notification == one message), RFCOMM delivers bytes split or
- * coalesced arbitrarily, so the client cannot assume `chunk[0]` is a whole
- * message. The Java driver solves the same problem with blocking `readBytes(n)`
- * calls that know each response's length up front (ShimmerBluetooth); this
- * expresses that length knowledge as a pure function.
- *
- * ACK (0xFF) and NACK (0xFE) are 1-byte messages. INQUIRY_RESPONSE (0x02) is
- * `9 + numChannels` bytes, and numChannels lives at index 7, so at least 8 bytes
- * are needed to compute the length.
- */
-function shimmer3ControlMessageLength(buf) {
-    if (buf.length === 0)
-        return NEED_MORE;
-    const opcode = buf[0];
-    if (opcode === ACK || opcode === NACK)
-        return 1;
-    if (opcode === OPCODES.INQUIRY_RESPONSE) {
-        if (buf.length <= SHIMMER3_INQ_NUM_CHANNELS_OFFSET)
-            return NEED_MORE; // need index 7 present
-        const numChannels = buf[SHIMMER3_INQ_NUM_CHANNELS_OFFSET];
-        // Sanity bound: a stray stream-data byte 0x02 can masquerade as an
-        // INQUIRY_RESPONSE whose "numChannels" comes from garbage, swallowing up to
-        // 264 bytes of real control traffic (including ACK/NACK). No real Shimmer3
-        // has anywhere near 32 channels — treat implausible values as garbage and
-        // resync instead.
-        if (numChannels > 32)
-            return RESYNC;
-        return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
-    }
-    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE || opcode === OPCODES.INFOMEM_RESPONSE) {
-        // Variable length: [opcode][length][data...]. Firmware caps both a
-        // daughter-card memory read and an InfoMem read at 128 bytes — treat larger
-        // "lengths" as garbage and resync.
-        if (buf.length < 2)
-            return NEED_MORE;
-        const memLen = buf[1];
-        if (memLen > 128)
-            return RESYNC;
-        return 2 + memLen;
-    }
-    const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
-    if (payload === undefined)
-        return RESYNC;
-    return 1 + payload;
-}
-
-/**
  * Classic-Bluetooth (RFCOMM/SPP) Shimmer3 constants.
  *
  * The LiteProtocol opcode set, sensor bitmap, channel formats and timestamp
@@ -7777,10 +8371,12 @@ class Shimmer3Client extends BaseShimmerClient {
         // Callbacks
         this.onInquiry = null;
         this.onExpPowerChanged = null;
-        this._handleTransportDisconnect = () => {
+        /** Handle an unexpected transport disconnect (the link dropped under us). */
+        this._handleTransportDisconnect = (reason) => {
             this._streaming = false;
             this._streamStarting = false;
             this._emitStatus('Device disconnected');
+            this._emitDisconnect(reason);
         };
         // ---------------------------------------------------------------------------
         // Notify handler — accumulate + parse an UNFRAMED byte stream
@@ -7851,6 +8447,7 @@ class Shimmer3Client extends BaseShimmerClient {
                 'ShimmerTransport via the constructor ({ transport }) or connect(transport).');
         }
         this._transport = t;
+        this._armDisconnectNotification();
         this._notifyUnsub = t.onNotify(this._handleNotify);
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         this._emitStatus('Opening RFCOMM connection…');
@@ -7900,6 +8497,9 @@ class Shimmer3Client extends BaseShimmerClient {
         this._emitStatus(`Handshake complete (timestamp = ${this._timestampFmt}).`);
     }
     async disconnect() {
+        // Application-initiated teardown is not a fault, so `onDisconnect` stays
+        // silent — including when this call is the cleanup that follows a drop.
+        this._suppressDisconnectNotification();
         try {
             this._notifyUnsub?.();
             this._disconnectUnsub?.();
@@ -7959,9 +8559,9 @@ class Shimmer3Client extends BaseShimmerClient {
                 continue;
             }
             const len = shimmer3ControlMessageLength(buf);
-            if (len === NEED_MORE)
+            if (len === NEED_MORE$1)
                 break;
-            if (len === RESYNC) {
+            if (len === RESYNC$1) {
                 this._log(`resync: dropping unexpected control byte 0x${buf[0].toString(16)}`);
                 buf = buf.subarray(1);
                 continue;
@@ -8416,10 +9016,10 @@ class Shimmer3Client extends BaseShimmerClient {
                         let v;
                         switch (f.fmt) {
                             case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be(frame, cursor)) : sign16(u16le$3(frame, cursor));
+                                v = f.endian === 'be' ? sign16(u16be$1(frame, cursor)) : sign16(u16le$3(frame, cursor));
                                 break;
                             case 'u16':
-                                v = f.endian === 'be' ? u16be(frame, cursor) : u16le$3(frame, cursor);
+                                v = f.endian === 'be' ? u16be$1(frame, cursor) : u16le$3(frame, cursor);
                                 break;
                             case 'i24':
                                 v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
@@ -8653,6 +9253,544 @@ class Shimmer3Client extends BaseShimmerClient {
 }
 
 /**
+ * Configuration option tables for the Shimmer3 / Shimmer3R families.
+ *
+ * Every table is the set of values a firmware config field will accept, paired
+ * with the label the Shimmer software has shown for it since Consensys. They
+ * are ported VERBATIM from the Java driver
+ * (`Shimmer-Java-Android-API/ShimmerDriver/.../com/shimmerresearch/`), values
+ * and labels alike, with a `file:line` citation above each one.
+ *
+ * Verbatim matters more here than tidiness. These are the strings a researcher
+ * recorded in a trial log next to their data, so a host that renames "Ultra
+ * High" to "Very High" makes two records of the same setting disagree — and the
+ * config values are register encodings, several of which are neither
+ * contiguous nor monotonic. Where the Java list looks wrong (a duplicated
+ * label, a gap in the values, a config array longer than its labels) that
+ * oddity is reproduced and the comment says why, because the firmware is what
+ * the Java list describes.
+ *
+ * The two families share this file because they share the command set: a table
+ * belongs to a CHIP, not to a platform, and which chip answers is what changed
+ * between a Shimmer3 (MPU9X50, LSM303DLHC/AH, BMP180/280) and a Shimmer3R
+ * (LSM6DSV, LIS2DW12, LIS2MDL/LIS3MDL, ADXL371, BMP390/581).
+ */
+// The characters the Java labels are built from (`UtilShimmer.java:59-64`):
+// UNICODE_PLUS_MINUS "±", UNICODE_MICRO "µ", UNICODE_OHMS "Ω".
+// Note that several older lists spell the sign as ASCII "+/-" instead; the
+// inconsistency is in the Java source and is preserved.
+// ---------------------------------------------------------------------------
+// LSM6DSV — Shimmer3R low-noise accelerometer + gyroscope
+// ---------------------------------------------------------------------------
+/** `SensorLSM6DSV.java:61-67` (ListofLSM6DSVAccelRange[ConfigValues]). */
+const SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS = [
+    [0, '± 2g'],
+    [1, '± 4g'],
+    [2, '± 8g'],
+    [3, '± 16g'],
+];
+/** `SensorLSM6DSV.java:274-275` (ListofGyroRange / ListofLSM6DSVGyroRangeConfigValues). */
+const SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS = [
+    [0, '+/- 125dps'],
+    [1, '+/- 250dps'],
+    [2, '+/- 500dps'],
+    [3, '+/- 1000dps'],
+    [4, '+/- 2000dps'],
+    [5, '+/- 4000dps'],
+];
+/**
+ * `SensorLSM6DSV.java:276-278` (ListofLSM6DSVGyroRate / …ConfigValues).
+ *
+ * One rate drives both halves of the chip — the Java field is
+ * `mLSM6DSVGyroAccelRate` — so there is no separate accelerometer table.
+ *
+ * The Java config-value array runs 0-13 while the label array stops at 12, so
+ * its last entry pairs with nothing; only the 13 labelled values are listed
+ * here.
+ */
+const SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS = [
+    [0, 'Power-down'],
+    [1, '1.875Hz'],
+    [2, '7.5Hz'],
+    [3, '12.0Hz'],
+    [4, '30.0Hz'],
+    [5, '60.0Hz'],
+    [6, '120.0Hz'],
+    [7, '240.0Hz'],
+    [8, '480.0Hz'],
+    [9, '960.0Hz'],
+    [10, '1920.0Hz'],
+    [11, '3840.0Hz'],
+    [12, '7680.0Hz'],
+];
+// ---------------------------------------------------------------------------
+// LIS2DW12 — Shimmer3R wide-range accelerometer
+// ---------------------------------------------------------------------------
+/** `SensorLIS2DW12.java:117-122, 236` (ListofLIS2DW12AccelRange[ConfigValues]). */
+const SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS = [
+    [0, '± 2g'],
+    [1, '± 4g'],
+    [2, '± 8g'],
+    [3, '± 16g'],
+];
+/**
+ * High-performance-mode rates, `SensorLIS2DW12.java:238-239`.
+ *
+ * Values 1 and 2 both read "12.5Hz": in high-performance mode the chip's
+ * lowest two ODR codes land on the same output rate. Reproduced from the Java
+ * list rather than de-duplicated, because both codes are writable.
+ */
+const SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS = [
+    [0, 'Power-down'],
+    [1, '12.5Hz'],
+    [2, '12.5Hz'],
+    [3, '25.0Hz'],
+    [4, '50.0Hz'],
+    [5, '100.0Hz'],
+    [6, '200.0Hz'],
+    [7, '400.0Hz'],
+    [8, '800.0Hz'],
+    [9, '1600.0Hz'],
+];
+/**
+ * Low-power-mode rates, `SensorLIS2DW12.java:241-242`.
+ *
+ * Values 6-9 all read "200.0Hz" — low-power mode cannot go faster, so the
+ * higher ODR codes saturate. Again as the Java list has it.
+ */
+const SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS = [
+    [0, 'Power-down'],
+    [1, '1.6Hz'],
+    [2, '12.5Hz'],
+    [3, '25.0Hz'],
+    [4, '50.0Hz'],
+    [5, '100.0Hz'],
+    [6, '200.0Hz'],
+    [7, '200.0Hz'],
+    [8, '200.0Hz'],
+    [9, '200.0Hz'],
+];
+// ---------------------------------------------------------------------------
+// ADXL371 — Shimmer3R alternate (high-g) accelerometer
+// ---------------------------------------------------------------------------
+/** `SensorADXL371.java:179-180` (ListofADXL371AccelRate[ConfigValues]). */
+const SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS = [
+    [0, '320Hz'],
+    [1, '640Hz'],
+    [2, '1280Hz'],
+    [3, '2560Hz'],
+];
+/**
+ * `SensorADXL371.java:181-182` (ListofADXL371AccelRange[ConfigValues]).
+ * A single fixed range — the option exists so the UI can show it, not choose.
+ */
+const SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS = [
+    [0, '+/- 200g'],
+];
+// ---------------------------------------------------------------------------
+// LIS2MDL — Shimmer3R magnetometer
+// ---------------------------------------------------------------------------
+/** `SensorLIS2MDL.java:147-148` (ListofLIS2MDLMagRate[ConfigValues]). */
+const SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS = [
+    [0, '10.0Hz'],
+    [1, '20.0Hz'],
+    [2, '50.0Hz'],
+    [3, '100.0Hz'],
+];
+/** `SensorLIS2MDL.java:150-151` (ListofLIS2MDLMagRange[ConfigValues]) — fixed range. */
+const SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS = [
+    [0, '+/- 49.152Ga'],
+];
+// ---------------------------------------------------------------------------
+// LIS3MDL — Shimmer3R alternate magnetometer
+// ---------------------------------------------------------------------------
+/**
+ * `SensorLIS3MDL.java:177-178` (ListofLIS3MDLAltMagRate[ConfigValues]).
+ *
+ * These config values are raw CTRL_REG1 codes, not indexes: 0x01, 0x11, 0x21,
+ * 0x31, 0x3E, 0x3A, 0x08. They are neither contiguous nor monotonic — 0x3E
+ * (80Hz) is numerically above 0x3A (20Hz), and 0x08 (10Hz) is below all of
+ * them. Keep them exactly as they are; deriving them from the label order
+ * would write the wrong register.
+ */
+const SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS = [
+    [0x01, '1000Hz'],
+    [0x11, '560Hz'],
+    [0x21, '300Hz'],
+    [0x31, '155Hz'],
+    [0x3e, '80Hz'],
+    [0x3a, '20Hz'],
+    [0x08, '10Hz'],
+];
+/** `SensorLIS3MDL.java:179-180` (ListofLIS3MDLAltMagRange[ConfigValues]). */
+const SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS = [
+    [0, '+/- 4Ga'],
+    [1, '+/- 8Ga'],
+    [2, '+/- 12Ga'],
+    [3, '+/- 16Ga'],
+];
+// ---------------------------------------------------------------------------
+// Pressure / temperature
+// ---------------------------------------------------------------------------
+/** `SensorBMP390.java:124-125` (ListofPressureResolutionBMP390[ConfigValues]). */
+const SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS = [
+    [0, 'Ultra Low'],
+    [1, 'Low'],
+    [2, 'Standard'],
+    [3, 'High'],
+    [4, 'Ultra High'],
+    [5, 'Highest'],
+];
+/** `SensorBMP390.java:126-127` (ListofPressureRateBMP390[ConfigValues]). */
+const SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS = [
+    [0, '200.0Hz'],
+    [1, '100.0Hz'],
+    [2, '50.0Hz'],
+    [3, '25.0Hz'],
+    [4, '12.5Hz'],
+    [5, '6.25Hz'],
+    [6, '3.1Hz'],
+    [7, '1.5Hz'],
+    [8, '0.78Hz'],
+    [9, '0.39Hz'],
+    [10, '0.2Hz'],
+    [11, '0.1Hz'],
+    [12, '0.05Hz'],
+    [13, '0.02Hz'],
+    [14, '0.01Hz'],
+    [15, '0.006Hz'],
+    [16, '0.003Hz'],
+    [17, '0.0015Hz'],
+];
+/** `SensorBMP581.java:107-108` (ListofPressureResolutionBMP581[ConfigValues]). */
+const SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS = [
+    [0, 'Lowest Power'],
+    [1, 'Low'],
+    [2, 'Standard'],
+    [3, 'High'],
+    [4, 'High Res'],
+    [5, 'Very High Res'],
+    [6, 'Ultra High Res'],
+    [7, 'Highest Res'],
+];
+/**
+ * `SensorBMP581.java:109-110` — the Java source aliases the BMP390 arrays
+ * rather than copying them, so this aliases the table for the same reason: one
+ * definition, and the two cannot drift apart.
+ */
+const SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS = SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS;
+/** `SensorBMP180.java:107-108` (ListofPressureResolution[ConfigValues]). */
+const SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS = [
+    [0, 'Low'],
+    [1, 'Standard'],
+    [2, 'High'],
+    [3, 'Very High'],
+];
+/**
+ * `SensorBMP280.java:112-113` (ListofPressureResolutionBMP280[ConfigValues]).
+ * The top label reads "Ultra High" where the BMP180's reads "Very High"; the
+ * difference is in the Java source and is kept.
+ */
+const SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS = [
+    [0, 'Low'],
+    [1, 'Standard'],
+    [2, 'High'],
+    [3, 'Ultra High'],
+];
+// ---------------------------------------------------------------------------
+// GSR
+// ---------------------------------------------------------------------------
+/**
+ * `SensorGSR.java:115-127` (ListofGSRRangeResistance / ListofGSRRangeConfigValues).
+ * The same four hardware ranges the Shimmer software labels by resistance.
+ */
+const SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS = [
+    [0, '8kΩ to 63kΩ'],
+    [1, '63kΩ to 220kΩ'],
+    [2, '220kΩ to 680kΩ'],
+    [3, '680kΩ to 4.7MΩ'],
+    [4, 'Auto Range'],
+];
+/**
+ * `SensorGSR.java:121-127` (ListofGSRRangeConductance / ListofGSRRangeConfigValues).
+ * The identical ranges expressed as conductance, which is why the numbers run
+ * downwards. Offer whichever unit the study reports in — the config value is
+ * the same either way.
+ */
+const SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS = [
+    [0, '125µS to 15.9µS'],
+    [1, '15.9µS to 4.5µS'],
+    [2, '4.5µS to 1.5µS'],
+    [3, '1.5µS to 0.2µS'],
+    [4, 'Auto Range'],
+];
+// ---------------------------------------------------------------------------
+// LSM303DLHC — classic Shimmer3 wide-range accelerometer + magnetometer
+// ---------------------------------------------------------------------------
+/** `SensorLSM303.java:83-86` labels, `SensorLSM303DLHC.java:325` values. */
+const SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS = [
+    [0, '± 2g'],
+    [1, '± 4g'],
+    [2, '± 8g'],
+    [3, '± 16g'],
+];
+/**
+ * High-resolution-mode rates, `SensorLSM303DLHC.java:327-328`.
+ *
+ * The values skip 8: that ODR code is the low-power-only 1620Hz setting, so in
+ * high-resolution mode 1344Hz is code 9. A table generated from label indexes
+ * would silently select 1620Hz here.
+ */
+const SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS = [
+    [0, 'Power-down'],
+    [1, '1.0Hz'],
+    [2, '10.0Hz'],
+    [3, '25.0Hz'],
+    [4, '50.0Hz'],
+    [5, '100.0Hz'],
+    [6, '200.0Hz'],
+    [7, '400.0Hz'],
+    [9, '1344.0Hz'],
+];
+/**
+ * Low-power-mode rates, `SensorLSM303DLHC.java:330-331`. 1620Hz and 5376Hz are
+ * available in low-power mode only (the Java comment says as much).
+ */
+const SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS = [
+    [0, 'Power-down'],
+    [1, '1.0Hz'],
+    [2, '10.0Hz'],
+    [3, '25.0Hz'],
+    [4, '50.0Hz'],
+    [5, '100.0Hz'],
+    [6, '200.0Hz'],
+    [7, '400.0Hz'],
+    [8, '1620.0Hz'],
+    [9, '5376.0Hz'],
+];
+/**
+ * `SensorLSM303DLHC.java:357-358` (ListofLSM303DLHCMagRange[ConfigValues]).
+ * Values start at 1 — the Java comment reads "no '0' option" — so the first
+ * label is NOT config value 0.
+ */
+const SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS = [
+    [1, '+/- 1.3Ga'],
+    [2, '+/- 1.9Ga'],
+    [3, '+/- 2.5Ga'],
+    [4, '+/- 4.0Ga'],
+    [5, '+/- 4.7Ga'],
+    [6, '+/- 5.6Ga'],
+    [7, '+/- 8.1Ga'],
+];
+/** `SensorLSM303DLHC.java:354-355` (ListofLSM303DLHCMagRate[ConfigValues]). */
+const SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS = [
+    [0, '0.75Hz'],
+    [1, '1.5Hz'],
+    [2, '3.0Hz'],
+    [3, '7.5Hz'],
+    [4, '15.0Hz'],
+    [5, '30.0Hz'],
+    [6, '75.0Hz'],
+    [7, '220.0Hz'],
+];
+// ---------------------------------------------------------------------------
+// LSM303AH — later classic-Shimmer3 (new-IMU) accelerometer + magnetometer
+// ---------------------------------------------------------------------------
+/**
+ * `SensorLSM303.java:83-86` labels, `SensorLSM303AH.java:174` values.
+ *
+ * The values are `{0, 2, 3, 1}`: this chip's FS bits do not run in range
+ * order, so ±4g is code 2, ±8g code 3 and ±16g code 1. Pairing labels with
+ * their index — the obvious "simplification" — swaps ±4g with ±16g and
+ * miscalibrates every sample by a factor of four.
+ */
+const SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS = [
+    [0, '± 2g'],
+    [2, '± 4g'],
+    [3, '± 8g'],
+    [1, '± 16g'],
+];
+/** High-resolution-mode rates, `SensorLSM303AH.java:176-177`. */
+const SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS = [
+    [0, 'Power-down'],
+    [1, '12.5Hz'],
+    [2, '25.0Hz'],
+    [3, '50.0Hz'],
+    [4, '100.0Hz'],
+    [5, '200.0Hz'],
+    [6, '400.0Hz'],
+    [7, '800.0Hz'],
+    [8, '1600.0Hz'],
+    [9, '3200.0Hz'],
+    [10, '6400.0Hz'],
+];
+/**
+ * Low-power-mode rates, `SensorLSM303AH.java:179-180`.
+ * Values jump from 0 straight to 8-15: low-power ODR codes live in the upper
+ * half of the field, so only "Power-down" is shared with the table above.
+ */
+const SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS = [
+    [0, 'Power-down'],
+    [8, '1.0Hz'],
+    [9, '12.5Hz'],
+    [10, '25.0Hz'],
+    [11, '50.0Hz'],
+    [12, '100.0Hz'],
+    [13, '200.0Hz'],
+    [14, '400.0Hz'],
+    [15, '800.0Hz'],
+];
+/** `SensorLSM303AH.java:202-203` (ListofLSM303AHMagRate[ConfigValues]). */
+const SHIMMER3_LSM303AH_MAG_RATE_OPTIONS = [
+    [0, '10.0Hz'],
+    [1, '20.0Hz'],
+    [2, '50.0Hz'],
+    [3, '100.0Hz'],
+];
+/** `SensorLSM303AH.java:205-206` (ListofLSM303AHMagRange[ConfigValues]) — fixed range. */
+const SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS = [
+    [0, '+/- 49.152Ga'],
+];
+// ---------------------------------------------------------------------------
+// MPU9X50 — classic Shimmer3 gyroscope + alternate accelerometer/magnetometer
+// ---------------------------------------------------------------------------
+/**
+ * `SensorMPU9X50.java:366-367` (ListofGyroRange / ListofMPU9X50GyroRangeConfigValues).
+ * Four ranges, where the Shimmer3R's LSM6DSV offers six — the reason a caller
+ * must know which platform it is configuring before validating a gyro range.
+ */
+const SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS = [
+    [0, '+/- 250dps'],
+    [1, '+/- 500dps'],
+    [2, '+/- 1000dps'],
+    [3, '+/- 2000dps'],
+];
+/** `SensorMPU9X50.java:369-370` (ListofMPU9X50AccelRange[ConfigValues]). */
+const SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS = [
+    [0, '+/- 2g'],
+    [1, '+/- 4g'],
+    [2, '+/- 8g'],
+    [3, '+/- 16g'],
+];
+/** `SensorMPU9X50.java:371-372` (ListofMPU9X50MagRate[ConfigValues]). */
+const SHIMMER3_MPU9X50_MAG_RATE_OPTIONS = [
+    [0, '10.0Hz'],
+    [1, '20.0Hz'],
+    [2, '40.0Hz'],
+    [3, '50.0Hz'],
+    [4, '100.0Hz'],
+];
+// ---------------------------------------------------------------------------
+// Bluetooth
+// ---------------------------------------------------------------------------
+/**
+ * `Configuration.java:649-650`
+ * (Shimmer3.ListofBluetoothBaudRates[ConfigValues]).
+ *
+ * 115200 is config value 0 and heads the list, so the labels are NOT in
+ * ascending rate order. That is the firmware's default-first ordering, kept as
+ * it is.
+ */
+const SHIMMER3_BT_BAUD_RATE_OPTIONS = [
+    [0, '115200'],
+    [1, '1200'],
+    [2, '2400'],
+    [3, '4800'],
+    [4, '9600'],
+    [5, '19200'],
+    [6, '38400'],
+    [7, '57600'],
+    [8, '230400'],
+    [9, '460800'],
+    [10, '921600'],
+];
+// ---------------------------------------------------------------------------
+// Sampling rate
+// ---------------------------------------------------------------------------
+/**
+ * The sampling rates the Shimmer software offers for a Shimmer3 / Shimmer3R.
+ *
+ * NOT ported from the Java driver: it has no such list. Java holds a sampling
+ * rate as a double and converts it to a divisor on the way out, so the picker
+ * values live in the Consensys UI rather than in the driver.
+ * (`Configuration.java:2365` is the ShimmerGqBle divider list — a different
+ * device, and dividers rather than rates.) These are the conventional Shimmer3
+ * rates: the ones that divide 32768 exactly, plus 1Hz and the 10.2 / 51.2 /
+ * 102.4 / 204.8 family every Shimmer trial has used.
+ *
+ * Any positive rate is legal — the firmware takes a divisor, not an index — so
+ * treat this as a picker's contents, not a validation set.
+ */
+const SHIMMER3_SAMPLING_RATES_HZ = [
+    1, 10.2, 51.2, 102.4, 204.8, 256, 512, 1024, 2048,
+];
+/**
+ * Convert a sampling rate to the 16-bit divisor SET_SAMPLING_RATE_COMMAND
+ * carries: `floor(32768 / rateHz)`, clamped to 1…0xFFFF.
+ *
+ * Mirrors `Shimmer3RClient.setSamplingRate` (and Java's
+ * `ShimmerObject#setSamplingRateShimmer`). The floor is why a requested rate
+ * and the applied one differ: run the result back through
+ * {@link divisorToSamplingRate} to find out what the device will actually do
+ * before telling a user it is sampling at their number.
+ */
+function samplingRateToDivisor(rateHz) {
+    if (!Number.isFinite(rateHz) || rateHz <= 0) {
+        throw new Error('Sampling rate must be a positive number (Hz)');
+    }
+    return Math.max(1, Math.min(0xffff, Math.floor(SHIMMER3_SAMPLING_CLOCK_FREQ / rateHz)));
+}
+/** The rate a given divisor actually produces: `32768 / divisor`. */
+function divisorToSamplingRate(divisor) {
+    if (!Number.isFinite(divisor) || divisor <= 0) {
+        throw new Error('Sampling-rate divisor must be a positive number');
+    }
+    return SHIMMER3_SAMPLING_CLOCK_FREQ / divisor;
+}
+/**
+ * Friendly labels for the sensor-enable bits, keyed by
+ * {@link SensorBitmapShimmer3}.
+ *
+ * The ADC channels are the one place the two platforms disagree on wording, not
+ * on availability: a Shimmer3's external channels are named for the MSP430 pins
+ * (A7 / A6 / A15) and a Shimmer3R's are numbered 0-2 (`SensorADC.java:425-453`,
+ * `Sensing/shimmer_sensing.h:105-122`). The labels below give both, because a
+ * host that shows only one set leaves half its users unable to find their
+ * channel.
+ */
+const SHIMMER3_SENSOR_LABELS = Object.freeze({
+    SENSOR_A_ACCEL: { label: 'Low-Noise Accelerometer', shimmer3r: true },
+    SENSOR_GYRO: { label: 'Gyroscope', shimmer3r: true },
+    SENSOR_MAG: { label: 'Magnetometer', shimmer3r: true },
+    SENSOR_GSR: { label: 'GSR', shimmer3r: true },
+    SENSOR_VBATT: { label: 'Battery Voltage', shimmer3r: true },
+    SENSOR_D_ACCEL: { label: 'Wide-Range Accelerometer', shimmer3r: true },
+    SENSOR_PRESSURE: { label: 'Pressure & Temperature', shimmer3r: true },
+    SENSOR_EXG1_24BIT: { label: 'ExG Chip 1 (24-bit)', shimmer3r: true },
+    SENSOR_EXG2_24BIT: { label: 'ExG Chip 2 (24-bit)', shimmer3r: true },
+    SENSOR_EXG1_16BIT: { label: 'ExG Chip 1 (16-bit)', shimmer3r: true },
+    SENSOR_EXG2_16BIT: { label: 'ExG Chip 2 (16-bit)', shimmer3r: true },
+    SENSOR_BRIDGE_AMP: { label: 'Bridge Amplifier', shimmer3r: true },
+    SENSOR_ACCEL_ALT: { label: 'Alternate Accelerometer', shimmer3r: true },
+    SENSOR_MAG_ALT: { label: 'Alternate Magnetometer', shimmer3r: true },
+    SENSOR_EXT_A0: { label: 'External ADC A7 (Shimmer3R: 0)', shimmer3r: true },
+    SENSOR_EXT_A1: { label: 'External ADC A6 (Shimmer3R: 1)', shimmer3r: true },
+    SENSOR_EXT_A2: { label: 'External ADC A15 (Shimmer3R: 2)', shimmer3r: true },
+    SENSOR_INT_A3: { label: 'Internal ADC A1 (Shimmer3R: 3)', shimmer3r: true },
+    SENSOR_INT_A0: { label: 'Internal ADC A12 (Shimmer3R: 0)', shimmer3r: true },
+    SENSOR_INT_A1: { label: 'Internal ADC A13 (Shimmer3R: 1)', shimmer3r: true },
+    SENSOR_INT_A2: { label: 'Internal ADC A14 (Shimmer3R: 2)', shimmer3r: true },
+});
+/** Label for one sensor-enable bit, or null when the bit is not a known sensor. */
+function shimmer3SensorLabel(mask) {
+    for (const [key, bit] of Object.entries(SensorBitmapShimmer3)) {
+        if (bit === mask)
+            return SHIMMER3_SENSOR_LABELS[key].label;
+    }
+    return null;
+}
+
+/**
  * InfoMem → {@link InfoMemDeviceConfig} decode.
  *
  * Ported from `ShimmerObject#configBytesParse` (ShimmerObject.java:4931-5111)
@@ -8690,6 +9828,109 @@ function macToHex(bytes, offset) {
         s += (bytes[offset + i] ?? 0).toString(16).toUpperCase().padStart(2, '0');
     }
     return s;
+}
+/**
+ * Decode the IMU rate/range fields from ConfigSetupByte0-5.
+ *
+ * `gyroRange` and `pressureOversampling` are composite: the low bits sit in
+ * ConfigSetupByte2/3 and, on Shimmer3R ONLY, a 3rd bit in ConfigSetupByte4.
+ * See SensorLSM6DSV.java:1014-1017 and SensorBMP390.java:482-490.
+ */
+function parseImu(bytes, layout) {
+    const cfg0 = bytes[layout.idxConfigSetupByte0] & 0xff;
+    const cfg1 = bytes[layout.idxConfigSetupByte1] & 0xff;
+    const cfg2 = bytes[layout.idxConfigSetupByte2] & 0xff;
+    const cfg3 = bytes[layout.idxConfigSetupByte3] & 0xff;
+    const cfg4 = bytes[layout.idxConfigSetupByte4] & 0xff;
+    const cfg5 = bytes[layout.idxConfigSetupByte5] & 0xff;
+    const gyroRangeLsb = bit(cfg2, BIT_SHIFT.GYRO_RANGE_LSB, MASK.GYRO_RANGE_LSB);
+    const pressureLsb = bit(cfg3, BIT_SHIFT.PRESSURE_OVERSAMPLING_LSB, MASK.PRESSURE_OVERSAMPLING_LSB);
+    const gyroRangeMsb = layout.isShimmer3R
+        ? bit(cfg4, BIT_SHIFT.GYRO_RANGE_MSB, MASK.GYRO_RANGE_MSB)
+        : 0;
+    const pressureMsb = layout.isShimmer3R
+        ? bit(cfg4, BIT_SHIFT.PRESSURE_OVERSAMPLING_MSB, MASK.PRESSURE_OVERSAMPLING_MSB)
+        : 0;
+    return {
+        wrAccelRange: bit(cfg0, BIT_SHIFT.WR_ACCEL_RANGE, MASK.WR_ACCEL_RANGE),
+        wrAccelRate: bit(cfg0, BIT_SHIFT.WR_ACCEL_RATE, MASK.WR_ACCEL_RATE),
+        wrAccelLpm: bit(cfg0, BIT_SHIFT.WR_ACCEL_LPM, MASK.WR_ACCEL_LPM) === 1,
+        wrAccelHrm: bit(cfg0, BIT_SHIFT.WR_ACCEL_HRM, MASK.WR_ACCEL_HRM) === 1,
+        gyroRange: (gyroRangeMsb << COMPOSITE_MSB_SHIFT) | gyroRangeLsb,
+        imuRate: bit(cfg1, BIT_SHIFT.IMU_RATE, MASK.IMU_RATE),
+        magRange: bit(cfg2, BIT_SHIFT.MAG_RANGE, MASK.MAG_RANGE),
+        magRate: bit(cfg2, BIT_SHIFT.MAG_RATE, MASK.MAG_RATE),
+        altAccelRange: bit(cfg3, BIT_SHIFT.ALT_ACCEL_RANGE, MASK.ALT_ACCEL_RANGE),
+        pressureOversampling: (pressureMsb << COMPOSITE_MSB_SHIFT) | pressureLsb,
+        altMagRate: bit(cfg5, BIT_SHIFT.ALT_MAG_RATE, MASK.ALT_MAG_RATE),
+        altAccelRate: bit(cfg4, BIT_SHIFT.ALT_ACCEL_RATE, MASK.ALT_ACCEL_RATE),
+    };
+}
+/** Big-endian u16 read (MSB byte first), used for the experiment lengths. */
+function u16be(bytes, msbIdx, lsbIdx) {
+    return ((bytes[msbIdx] & 0xff) << 8) | (bytes[lsbIdx] & 0xff);
+}
+/**
+ * SD interval / experiment lengths. Java gates all three on
+ * `isSupportedSdLogSync()` (ShimmerObject.java:5055-5060), so an unsupported
+ * firmware yields zeros rather than junk.
+ */
+function parseSd(bytes, layout) {
+    if (!layout.supportsSdLogSync) {
+        return { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 };
+    }
+    return {
+        btInterval: bytes[layout.idxSDBTInterval] & 0xff,
+        estimatedExpLengthMin: u16be(bytes, layout.idxEstimatedExpLengthMsb, layout.idxEstimatedExpLengthLsb),
+        maxExpLengthMin: u16be(bytes, layout.idxMaxExpLengthMsb, layout.idxMaxExpLengthLsb),
+    };
+}
+/** Slice one 21-byte kinematic calibration block verbatim. */
+function calibBlock$1(bytes, offset) {
+    const out = new Uint8Array(GENERAL_CALIBRATION_LENGTH);
+    out.set(bytes.subarray(offset, offset + GENERAL_CALIBRATION_LENGTH), 0);
+    return out;
+}
+/**
+ * The six calibration blocks, verbatim. The alt-accel / alt-mag blocks only
+ * exist on Shimmer3R; on Shimmer3 the same bytes are the MPL calibration
+ * region, which is deliberately not modelled (see layout.ts).
+ */
+function parseCalibration(bytes, layout) {
+    const blocks = {
+        lnAccel: calibBlock$1(bytes, layout.idxAnalogAccelCalibration),
+        gyro: calibBlock$1(bytes, layout.idxMPU9150GyroCalibration),
+        mag: calibBlock$1(bytes, layout.idxLSM303DLHCMagCalibration),
+        wrAccel: calibBlock$1(bytes, layout.idxLSM303DLHCAccelCalibration),
+    };
+    if (layout.isShimmer3R) {
+        blocks.altAccel = calibBlock$1(bytes, layout.idxADXL371AltAccelCalibration);
+        blocks.altMag = calibBlock$1(bytes, layout.idxLIS3MDLAltMagCalibration);
+    }
+    return blocks;
+}
+/**
+ * Sync-node MAC list (InfoMem B). Stops at the first all-0xFF slot, exactly
+ * like the Java parse loop (ShimmerObject.java:5359-5366).
+ */
+function parseSyncNodes(bytes, layout) {
+    if (!layout.supportsSdLogSync)
+        return [];
+    const nodes = [];
+    for (let i = 0; i < MAX_SYNC_NODES; i++) {
+        const offset = layout.idxNode0 + i * MAC_LENGTH;
+        let allFf = true;
+        for (let b = 0; b < MAC_LENGTH; b++) {
+            if ((bytes[offset + b] ?? 0xff) !== 0xff) {
+                allFf = false;
+                break;
+            }
+        }
+        if (allFf)
+            break;
+        nodes.push(macToHex(bytes, offset));
+    }
+    return nodes;
 }
 /** Parse the enabled + derived sensor bitmaps (parseEnabledDerivedSensorsForMaps). */
 function parseSensors(bytes, layout) {
@@ -8746,6 +9987,28 @@ function emptyConfig(raw) {
         macAddress: '',
         exg1: new Uint8Array(EXG_BANK_LENGTH),
         exg2: new Uint8Array(EXG_BANK_LENGTH),
+        imu: {
+            wrAccelRange: 0,
+            wrAccelRate: 0,
+            wrAccelLpm: false,
+            wrAccelHrm: false,
+            gyroRange: 0,
+            imuRate: 0,
+            magRange: 0,
+            magRate: 0,
+            altAccelRange: 0,
+            pressureOversampling: 0,
+            altMagRate: 0,
+            altAccelRate: 0,
+        },
+        sd: { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 },
+        calibration: {
+            lnAccel: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
+            gyro: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
+            mag: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
+            wrAccel: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
+        },
+        syncNodes: [],
         raw,
         valid: false,
     };
@@ -8820,6 +10083,10 @@ function parseInfoMem(bytes, ctx) {
         macAddress,
         exg1,
         exg2,
+        imu: parseImu(raw, layout),
+        sd: parseSd(raw, layout),
+        calibration: parseCalibration(raw, layout),
+        syncNodes: parseSyncNodes(raw, layout),
         raw,
         valid: true,
     };
@@ -8936,6 +10203,117 @@ function writeModelledFields(out, config, layout) {
         out[layout.idxSDMyTrialID] = t.id & 0xff;
         out[layout.idxSDNumOfShimmers] = t.numShimmers & 0xff;
     }
+    writeImu(out, config, layout);
+    writeSd(out, config, layout);
+    writeCalibration(out, config, layout);
+    writeSyncNodes(out, config, layout);
+}
+/**
+ * IMU rate/range fields into ConfigSetupByte0-5, all read-modify-write so the
+ * unmodelled bits in those bytes (the firmware-only `wrAccelLpModeMsb`, the
+ * MPL bits on Shimmer3, every reserved bit) keep their base value.
+ *
+ * The composite MSB bits (gyro range bit 2, pressure oversampling bit 2) are
+ * written ONLY on Shimmer3R — on Shimmer3 they belong to the MPL region of
+ * ConfigSetupByte4 and must not be disturbed.
+ */
+function writeImu(out, config, layout) {
+    const imu = config.imu;
+    // ConfigSetupByte0 — WR accel (LSM303DLHC/LSM303AH/LIS2DW12).
+    setBitField(out, layout.idxConfigSetupByte0, BIT_SHIFT.WR_ACCEL_RATE, MASK.WR_ACCEL_RATE, imu.wrAccelRate);
+    setBitField(out, layout.idxConfigSetupByte0, BIT_SHIFT.WR_ACCEL_RANGE, MASK.WR_ACCEL_RANGE, imu.wrAccelRange);
+    setBitField(out, layout.idxConfigSetupByte0, BIT_SHIFT.WR_ACCEL_LPM, MASK.WR_ACCEL_LPM, imu.wrAccelLpm ? 1 : 0);
+    setBitField(out, layout.idxConfigSetupByte0, BIT_SHIFT.WR_ACCEL_HRM, MASK.WR_ACCEL_HRM, imu.wrAccelHrm ? 1 : 0);
+    // ConfigSetupByte1 — whole byte is the IMU accel+gyro rate.
+    setBitField(out, layout.idxConfigSetupByte1, BIT_SHIFT.IMU_RATE, MASK.IMU_RATE, imu.imuRate);
+    // ConfigSetupByte2 — mag range/rate + gyro-range low bits.
+    setBitField(out, layout.idxConfigSetupByte2, BIT_SHIFT.MAG_RANGE, MASK.MAG_RANGE, imu.magRange);
+    setBitField(out, layout.idxConfigSetupByte2, BIT_SHIFT.MAG_RATE, MASK.MAG_RATE, imu.magRate);
+    setBitField(out, layout.idxConfigSetupByte2, BIT_SHIFT.GYRO_RANGE_LSB, MASK.GYRO_RANGE_LSB, imu.gyroRange);
+    // ConfigSetupByte3 — alt/LN accel range + pressure-oversampling low bits.
+    // (GSR range and exp power are written by the caller above.)
+    setBitField(out, layout.idxConfigSetupByte3, BIT_SHIFT.ALT_ACCEL_RANGE, MASK.ALT_ACCEL_RANGE, imu.altAccelRange);
+    setBitField(out, layout.idxConfigSetupByte3, BIT_SHIFT.PRESSURE_OVERSAMPLING_LSB, MASK.PRESSURE_OVERSAMPLING_LSB, imu.pressureOversampling);
+    if (!layout.isShimmer3R)
+        return;
+    // ---- Shimmer3R-only: ConfigSetupByte4/5.
+    setBitField(out, layout.idxConfigSetupByte4, BIT_SHIFT.GYRO_RANGE_MSB, MASK.GYRO_RANGE_MSB, imu.gyroRange >> COMPOSITE_MSB_SHIFT);
+    setBitField(out, layout.idxConfigSetupByte4, BIT_SHIFT.PRESSURE_OVERSAMPLING_MSB, MASK.PRESSURE_OVERSAMPLING_MSB, imu.pressureOversampling >> COMPOSITE_MSB_SHIFT);
+    setBitField(out, layout.idxConfigSetupByte4, BIT_SHIFT.ALT_ACCEL_RATE, MASK.ALT_ACCEL_RATE, imu.altAccelRate);
+    // ConfigSetupByte5 bits 0-5 (NOT byte 4 — see BIT_SHIFT.ALT_MAG_RATE).
+    setBitField(out, layout.idxConfigSetupByte5, BIT_SHIFT.ALT_MAG_RATE, MASK.ALT_MAG_RATE, imu.altMagRate);
+}
+/** SD interval + big-endian experiment lengths, gated like the Java generate. */
+function writeSd(out, config, layout) {
+    if (!layout.supportsSdLogSync)
+        return;
+    const sd = config.sd;
+    out[layout.idxSDBTInterval] = sd.btInterval & 0xff;
+    out[layout.idxEstimatedExpLengthMsb] = (sd.estimatedExpLengthMin >> 8) & 0xff;
+    out[layout.idxEstimatedExpLengthLsb] = sd.estimatedExpLengthMin & 0xff;
+    out[layout.idxMaxExpLengthMsb] = (sd.maxExpLengthMin >> 8) & 0xff;
+    out[layout.idxMaxExpLengthLsb] = sd.maxExpLengthMin & 0xff;
+}
+/**
+ * The 21-byte kinematic calibration blocks, byte-for-byte as modelled — an
+ * identity write unless the caller replaced an array. Blocks shorter than 21
+ * bytes are zero-padded; longer ones are truncated.
+ */
+function writeCalibration(out, config, layout) {
+    const c = config.calibration;
+    setBytes(out, layout.idxAnalogAccelCalibration, calibBlock(c.lnAccel));
+    setBytes(out, layout.idxMPU9150GyroCalibration, calibBlock(c.gyro));
+    setBytes(out, layout.idxLSM303DLHCMagCalibration, calibBlock(c.mag));
+    setBytes(out, layout.idxLSM303DLHCAccelCalibration, calibBlock(c.wrAccel));
+    if (layout.isShimmer3R) {
+        if (c.altAccel)
+            setBytes(out, layout.idxADXL371AltAccelCalibration, calibBlock(c.altAccel));
+        if (c.altMag)
+            setBytes(out, layout.idxLIS3MDLAltMagCalibration, calibBlock(c.altMag));
+    }
+}
+/**
+ * Sync-node MAC list into InfoMem B: the listed MACs at `idxNode0 + i*6`, the
+ * remaining slots padded with 0xFF (ShimmerObject.java:5353-5366).
+ *
+ * DELIBERATE DEVIATION: Java additionally blanks the WHOLE list to 0xFF when
+ * `mSyncWhenLogging == 0`. This codec writes the list as modelled, so a
+ * read-change-write cycle cannot silently destroy a stored node list just
+ * because sync happens to be off; a caller that wants the Java behaviour sets
+ * `syncNodes: []`.
+ */
+function writeSyncNodes(out, config, layout) {
+    if (!layout.supportsSdLogSync)
+        return;
+    for (let i = 0; i < MAX_SYNC_NODES; i++) {
+        const offset = layout.idxNode0 + i * MAC_LENGTH;
+        const mac = config.syncNodes[i];
+        if (mac === undefined) {
+            for (let b = 0; b < MAC_LENGTH; b++)
+                out[offset + b] = 0xff;
+        }
+        else {
+            setBytes(out, offset, macFromHex(mac));
+        }
+    }
+}
+/** 12-char hex → 6 bytes (UtilShimmer.hexStringToByteArray). Bad input → invalid MAC. */
+function macFromHex(hex) {
+    const out = new Uint8Array(MAC_LENGTH).fill(0xff);
+    if (!/^[0-9a-fA-F]{12}$/.test(hex))
+        return out;
+    for (let i = 0; i < MAC_LENGTH; i++) {
+        out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    }
+    return out;
+}
+/** Normalise a calibration block to exactly 21 bytes. */
+function calibBlock(block) {
+    if (block.length === GENERAL_CALIBRATION_LENGTH)
+        return block;
+    const b = new Uint8Array(GENERAL_CALIBRATION_LENGTH);
+    b.set(block.subarray(0, GENERAL_CALIBRATION_LENGTH), 0);
+    return b;
 }
 /**
  * Device-write finalization (ShimmerObject.java:5320-5339): force the MAC to
@@ -8981,6 +10359,1089 @@ function writeName(out, offset, name) {
     for (let i = 0; i < NAME_LENGTH; i++) {
         out[offset + i] = i < name.length ? name.charCodeAt(i) & 0xff : 0xff;
     }
+}
+
+/**
+ * Declarative field schema for the Shimmer3/Shimmer3R InfoMem, so a generic UI
+ * can render the whole configuration surface without hard-coding byte offsets.
+ *
+ * Shape mirrors `VerisenseOperationalFieldDefinition`
+ * (devices/verisense/operationalConfig.ts:14-25) with ONE structural
+ * difference: a Verisense field carries a literal `index`, whereas a Shimmer3
+ * byte offset is firmware/hardware-conditional, so a field here carries a
+ * `layoutKey` that {@link resolveFieldIndex} resolves against a
+ * {@link InfoMemLayout} at runtime.
+ *
+ * SCOPE DECISION — LogAndStream only. This schema deliberately contains ONLY
+ * options that LogAndStream firmware honours:
+ *
+ *  - No MPL / MPU9150-DMP fields (ConfigSetupByte4/5/6 MPL bits, the three MPL
+ *    calibration blocks). They are SDLog-0.7.x-only, are never surfaced in host
+ *    UI by product decision, and only need to survive round-trip.
+ *  - No SDLog-only or BtStream-only settings (e.g. the showErrorLedsRwc /
+ *    showErrorLedsSd bits, whose masks `ConfigByteLayoutShimmer3` zeroes unless
+ *    a specific firmware generation is detected, and the `bufferSize` byte that
+ *    "FW [is] not using" — ShimmerObject.java:5191).
+ *  - Sensors0-4 and the derived-channel bitmaps are not fields here: they are
+ *    per-channel enable bitmaps driven by the sensor/channel map, not scalar
+ *    settings, and belong to a different UI surface.
+ */
+// ---------------------------------------------------------------------------
+// Option tables
+// ---------------------------------------------------------------------------
+// TODO(next PR): source these from devices/shimmer3/sensorOptions.ts once that
+// module lands. The tuple shape ([value, label]) is identical, so the swap is a
+// mechanical import change — every table below is transcribed verbatim from the
+// Java `Listof…` / `Listof…ConfigValues` pairs cited on each constant.
+const ALL = ['shimmer3-old-imu', 'shimmer3-new-imu', 'shimmer3r'];
+const SHIMMER3_ONLY = ['shimmer3-old-imu', 'shimmer3-new-imu'];
+const S3R_ONLY = ['shimmer3r'];
+const OLD_IMU_ONLY = ['shimmer3-old-imu'];
+const NEW_IMU_ONLY = ['shimmer3-new-imu'];
+/** `SensorLSM303.ListofLSM303AccelRange` / `SensorLIS2DW12.ListofLIS2DW12AccelRange` (identical). */
+const WR_ACCEL_RANGE = [
+    [0, '± 2 g'],
+    [1, '± 4 g'],
+    [2, '± 8 g'],
+    [3, '± 16 g'],
+];
+/** `SensorLSM303DLHC.ListofLSM303DLHCAccelRateHr` + `…ConfigValues` (note: no value 8). */
+const WR_ACCEL_RATE_LSM303DLHC = [
+    [0, 'Power-down'],
+    [1, '1.0 Hz'],
+    [2, '10.0 Hz'],
+    [3, '25.0 Hz'],
+    [4, '50.0 Hz'],
+    [5, '100.0 Hz'],
+    [6, '200.0 Hz'],
+    [7, '400.0 Hz'],
+    [8, '1620.0 Hz (low-power only)'],
+    [9, '1344.0 Hz / 5376.0 Hz (low-power)'],
+];
+/** `SensorLSM303AH.ListofLSM303AHAccelRateHr` + `…ConfigValues`. */
+const WR_ACCEL_RATE_LSM303AH = [
+    [0, 'Power-down'],
+    [1, '12.5 Hz'],
+    [2, '25.0 Hz'],
+    [3, '50.0 Hz'],
+    [4, '100.0 Hz'],
+    [5, '200.0 Hz'],
+    [6, '400.0 Hz'],
+    [7, '800.0 Hz'],
+    [8, '1600.0 Hz'],
+    [9, '3200.0 Hz'],
+    [10, '6400.0 Hz'],
+];
+/** `SensorLIS2DW12.ListofLIS2DW12AccelRateHpm` + `…ConfigValues`. */
+const WR_ACCEL_RATE_LIS2DW12 = [
+    [0, 'Power-down'],
+    [1, '12.5 Hz'],
+    [2, '12.5 Hz'],
+    [3, '25.0 Hz'],
+    [4, '50.0 Hz'],
+    [5, '100.0 Hz'],
+    [6, '200.0 Hz'],
+    [7, '400.0 Hz'],
+    [8, '800.0 Hz'],
+    [9, '1600.0 Hz'],
+];
+/** `SensorMPU9X50.ListofGyroRange` + `ListofMPU9X50GyroRangeConfigValues`. */
+const GYRO_RANGE_MPU9X50 = [
+    [0, '± 250 dps'],
+    [1, '± 500 dps'],
+    [2, '± 1000 dps'],
+    [3, '± 2000 dps'],
+];
+/** `SensorLSM6DSV.ListofGyroRange` + `ListofLSM6DSVGyroRangeConfigValues`. */
+const GYRO_RANGE_LSM6DSV = [
+    [0, '± 125 dps'],
+    [1, '± 250 dps'],
+    [2, '± 500 dps'],
+    [3, '± 1000 dps'],
+    [4, '± 2000 dps'],
+    [5, '± 4000 dps'],
+];
+/**
+ * `SensorLSM6DSV.ListofLSM6DSVGyroRate` + `…ConfigValues`. NOTE: the Java
+ * label array has 13 entries (values 0-12) while `…ConfigValues` lists 0-13, so
+ * value 13 has no Java label; it is omitted here rather than invented.
+ */
+const IMU_RATE_LSM6DSV = [
+    [0, 'Power-down'],
+    [1, '1.875 Hz'],
+    [2, '7.5 Hz'],
+    [3, '12.0 Hz'],
+    [4, '30.0 Hz'],
+    [5, '60.0 Hz'],
+    [6, '120.0 Hz'],
+    [7, '240.0 Hz'],
+    [8, '480.0 Hz'],
+    [9, '960.0 Hz'],
+    [10, '1920.0 Hz'],
+    [11, '3840.0 Hz'],
+    [12, '7680.0 Hz'],
+];
+/** `SensorLSM303DLHC.ListofLSM303DLHCMagRange` + `…ConfigValues` (no '0' option). */
+const MAG_RANGE_LSM303DLHC = [
+    [1, '± 1.3 Ga'],
+    [2, '± 1.9 Ga'],
+    [3, '± 2.5 Ga'],
+    [4, '± 4.0 Ga'],
+    [5, '± 4.7 Ga'],
+    [6, '± 5.6 Ga'],
+    [7, '± 8.1 Ga'],
+];
+/** `SensorLIS3MDL.ListofLIS3MDLAltMagRange` + `…ConfigValues`. */
+const ALT_MAG_RANGE_LIS3MDL = [
+    [0, '± 4 Ga'],
+    [1, '± 8 Ga'],
+    [2, '± 12 Ga'],
+    [3, '± 16 Ga'],
+];
+/** `SensorLSM303DLHC.ListofLSM303DLHCMagRate` + `…ConfigValues`. */
+const MAG_RATE_LSM303DLHC = [
+    [0, '0.75 Hz'],
+    [1, '1.5 Hz'],
+    [2, '3.0 Hz'],
+    [3, '7.5 Hz'],
+    [4, '15.0 Hz'],
+    [5, '30.0 Hz'],
+    [6, '75.0 Hz'],
+    [7, '220.0 Hz'],
+];
+/**
+ * `SensorLSM303AH.ListofLSM303AHMagRate` and
+ * `SensorLIS2MDL.ListofLIS2MDLMagRate` — identical tables.
+ */
+const MAG_RATE_LIS2MDL = [
+    [0, '10.0 Hz'],
+    [1, '20.0 Hz'],
+    [2, '50.0 Hz'],
+    [3, '100.0 Hz'],
+];
+/** `SensorLIS3MDL.ListofLIS3MDLAltMagRate` + `…ConfigValues` (raw CTRL_REG1 codes). */
+const ALT_MAG_RATE_LIS3MDL = [
+    [0x01, '1000 Hz'],
+    [0x11, '560 Hz'],
+    [0x21, '300 Hz'],
+    [0x31, '155 Hz'],
+    [0x3e, '80 Hz'],
+    [0x3a, '20 Hz'],
+    [0x08, '10 Hz'],
+];
+/** `SensorADXL371.ListofADXL371AccelRate` + `…ConfigValues`. */
+const ALT_ACCEL_RATE_ADXL371 = [
+    [0, '320 Hz'],
+    [1, '640 Hz'],
+    [2, '1280 Hz'],
+    [3, '2560 Hz'],
+];
+/** `SensorMPU9X50.ListofMPU9X50AccelRange` + `…ConfigValues`. */
+const ALT_ACCEL_RANGE_MPU9X50 = [
+    [0, '± 2 g'],
+    [1, '± 4 g'],
+    [2, '± 8 g'],
+    [3, '± 16 g'],
+];
+/** `SensorLSM6DSV.ListofLSM6DSVAccelRange` + `…ConfigValues` (same bits on Shimmer3R). */
+const LN_ACCEL_RANGE_LSM6DSV = [
+    [0, '± 2 g'],
+    [1, '± 4 g'],
+    [2, '± 8 g'],
+    [3, '± 16 g'],
+];
+/** `SensorBMP180.ListofPressureResolution` (BMP180/BMP280, 2-bit field). */
+const PRESSURE_OVERSAMPLING_BMPX80 = [
+    [0, 'Low'],
+    [1, 'Standard'],
+    [2, 'High'],
+    [3, 'Very High'],
+];
+/**
+ * `SensorBMP581.ListofPressureResolutionBMP581` + `…ConfigValues` — the widest
+ * table for the 3-bit composite field (`SensorBMP390`'s stops at 5).
+ */
+const PRESSURE_OVERSAMPLING_BMP581 = [
+    [0, 'Lowest Power'],
+    [1, 'Low'],
+    [2, 'Standard'],
+    [3, 'High'],
+    [4, 'High Res'],
+    [5, 'Very High Res'],
+    [6, 'Ultra High Res'],
+    [7, 'Highest Res'],
+];
+/** `Configuration.Shimmer2.ListofGSRRange` (index 4 = auto). */
+const GSR_RANGE = [
+    [0, '10 kOhm to 56 kOhm'],
+    [1, '56 kOhm to 220 kOhm'],
+    [2, '220 kOhm to 680 kOhm'],
+    [3, '680 kOhm to 4.7 MOhm'],
+    [4, 'Auto Range'],
+];
+/** `Configuration.Shimmer3.ListofBluetoothBaudRates` + `…ConfigValues`. */
+const BT_BAUD_RATE = [
+    [0, '115200'],
+    [1, '1200'],
+    [2, '2400'],
+    [3, '4800'],
+    [4, '9600'],
+    [5, '19200'],
+    [6, '38400'],
+    [7, '57600'],
+    [8, '230400'],
+    [9, '460800'],
+    [10, '921600'],
+];
+const ON_OFF = [
+    [0, 'Disabled'],
+    [1, 'Enabled'],
+];
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+const SHIMMER3_INFOMEM_FIELD_GROUPS = Object.freeze([
+    { id: 'sampling', title: 'Sampling', openByDefault: true },
+    { id: 'sensors', title: 'Sensor Enables', openByDefault: true },
+    { id: 'lnAccel', title: 'Low-Noise Accelerometer' },
+    { id: 'wrAccel', title: 'Wide-Range Accelerometer' },
+    { id: 'gyro', title: 'Gyroscope' },
+    { id: 'mag', title: 'Magnetometer' },
+    { id: 'altAccel', title: 'Alt Accelerometer (high-g)' },
+    { id: 'altMag', title: 'Alt Magnetometer' },
+    { id: 'pressure', title: 'Pressure / Temperature' },
+    { id: 'gsr', title: 'GSR' },
+    { id: 'exg', title: 'ExG (ADS1292R)' },
+    { id: 'bluetooth', title: 'Bluetooth' },
+    {
+        id: 'sdLogging',
+        title: 'SD Logging',
+        subgroups: [
+            { id: 'sdLogging.startup', title: 'Start-up' },
+            { id: 'sdLogging.duration', title: 'Duration' },
+        ],
+    },
+    { id: 'trial', title: 'Trial / Experiment' },
+    { id: 'sync', title: 'Multi-Shimmer Sync' },
+    { id: 'calibration', title: 'Calibration' },
+]);
+// ---------------------------------------------------------------------------
+// Field schema
+// ---------------------------------------------------------------------------
+const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
+    // ---- Sampling
+    {
+        key: 'samplingRate',
+        label: 'Sampling Rate',
+        desc: 'Sampling-rate divider, LSB-first u16 at bytes 0-1 (32768 / divider = Hz).',
+        kind: 'u16le',
+        layoutKey: 'idxSamplingRate',
+        min: 1,
+        max: 0xffff,
+        group: 'sampling',
+        appliesTo: ALL,
+        configKey: 'samplingRateHz',
+    },
+    // ---- Low-noise accelerometer
+    {
+        key: 'lnAccelRange',
+        label: 'LN Accel Range',
+        desc: 'Shimmer3R LSM6DSV low-noise accel range — ConfigSetupByte3 bits 6-7 (FW lnAccelRange, SensorLSM6DSV.java:979).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte3',
+        shift: 6,
+        width: 2,
+        options: LN_ACCEL_RANGE_LSM6DSV,
+        group: 'lnAccel',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.altAccelRange',
+    },
+    // ---- Wide-range accelerometer
+    {
+        key: 'wrAccelRange',
+        label: 'WR Accel Range',
+        desc: 'ConfigSetupByte0 bits 2-3 (bitShiftLSM303DLHCAccelRange=2, mask 0x03).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 2,
+        width: 2,
+        options: WR_ACCEL_RANGE,
+        group: 'wrAccel',
+        appliesTo: ALL,
+        configKey: 'imu.wrAccelRange',
+    },
+    {
+        key: 'wrAccelRate.lsm303dlhc',
+        label: 'WR Accel Rate',
+        desc: 'LSM303DLHC rate — ConfigSetupByte0 bits 4-7 (bitShiftLSM303DLHCAccelSamplingRate=4, mask 0x0F).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 4,
+        width: 4,
+        options: WR_ACCEL_RATE_LSM303DLHC,
+        group: 'wrAccel',
+        appliesTo: OLD_IMU_ONLY,
+        configKey: 'imu.wrAccelRate',
+    },
+    {
+        key: 'wrAccelRate.lsm303ah',
+        label: 'WR Accel Rate',
+        desc: 'LSM303AH (new-IMU Shimmer3) rate — ConfigSetupByte0 bits 4-7.',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 4,
+        width: 4,
+        options: WR_ACCEL_RATE_LSM303AH,
+        group: 'wrAccel',
+        appliesTo: NEW_IMU_ONLY,
+        configKey: 'imu.wrAccelRate',
+    },
+    {
+        key: 'wrAccelRate.lis2dw12',
+        label: 'WR Accel Rate',
+        desc: 'LIS2DW12 (Shimmer3R) rate — ConfigSetupByte0 bits 4-7 (SensorLIS2DW12.java:428).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 4,
+        width: 4,
+        options: WR_ACCEL_RATE_LIS2DW12,
+        group: 'wrAccel',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.wrAccelRate',
+    },
+    {
+        key: 'wrAccelLpm',
+        label: 'WR Accel Low-Power Mode',
+        desc: 'ConfigSetupByte0 bit 1 (bitShiftLSM303DLHCAccelLPM=1, FW wrAccelLpModeLsb).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 1,
+        width: 1,
+        options: ON_OFF,
+        group: 'wrAccel',
+        appliesTo: ALL,
+        configKey: 'imu.wrAccelLpm',
+    },
+    {
+        key: 'wrAccelHrm',
+        label: 'WR Accel High-Resolution Mode',
+        desc: 'ConfigSetupByte0 bit 0 (bitShiftLSM303DLHCAccelHRM=0, FW wrAccelHrMode).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 0,
+        width: 1,
+        options: ON_OFF,
+        group: 'wrAccel',
+        appliesTo: ALL,
+        configKey: 'imu.wrAccelHrm',
+    },
+    // ---- Gyroscope
+    {
+        key: 'gyroRange.mpu9x50',
+        label: 'Gyro Range',
+        desc: 'MPU9x50 range — ConfigSetupByte2 bits 0-1 (bitShiftMPU9150GyroRange=0, mask 0x03).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte2',
+        shift: 0,
+        width: 2,
+        options: GYRO_RANGE_MPU9X50,
+        group: 'gyro',
+        appliesTo: SHIMMER3_ONLY,
+        configKey: 'imu.gyroRange',
+    },
+    {
+        key: 'gyroRange.lsm6dsv',
+        label: 'Gyro Range',
+        desc: 'LSM6DSV range, COMPOSITE: ConfigSetupByte2 bits 0-1 plus the MSB at ConfigSetupByte4 bit 2 (SensorLSM6DSV.java:980/1017).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte2',
+        shift: 0,
+        width: 2,
+        msbLayoutKey: 'idxConfigSetupByte4',
+        msbShift: 2,
+        msbWidth: 1,
+        options: GYRO_RANGE_LSM6DSV,
+        group: 'gyro',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.gyroRange',
+    },
+    {
+        key: 'imuRate.mpu9x50',
+        label: 'Gyro/Accel Rate (divider)',
+        desc: 'Raw MPU9x50 sample-rate divider — the whole of ConfigSetupByte1 (mask 0xFF). Rate = 8000 / (1 + divider) Hz.',
+        kind: 'u8',
+        layoutKey: 'idxConfigSetupByte1',
+        min: 0,
+        max: 255,
+        group: 'gyro',
+        appliesTo: SHIMMER3_ONLY,
+        configKey: 'imu.imuRate',
+    },
+    {
+        key: 'imuRate.lsm6dsv',
+        label: 'Gyro/Accel Rate',
+        desc: 'LSM6DSV ODR enum — the whole of ConfigSetupByte1 (SensorLSM6DSV.java:977).',
+        kind: 'u8',
+        layoutKey: 'idxConfigSetupByte1',
+        options: IMU_RATE_LSM6DSV,
+        group: 'gyro',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.imuRate',
+    },
+    // ---- Magnetometer
+    {
+        key: 'magRange.lsm303dlhc',
+        label: 'Mag Range',
+        desc: 'LSM303DLHC range — ConfigSetupByte2 bits 5-7 (bitShiftLSM303DLHCMagRange=5, mask 0x07).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte2',
+        shift: 5,
+        width: 3,
+        options: MAG_RANGE_LSM303DLHC,
+        group: 'mag',
+        appliesTo: OLD_IMU_ONLY,
+        configKey: 'imu.magRange',
+    },
+    {
+        key: 'magRate.lsm303dlhc',
+        label: 'Mag Rate',
+        desc: 'LSM303DLHC rate — ConfigSetupByte2 bits 2-4 (bitShiftLSM303DLHCMagSamplingRate=2, mask 0x07).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte2',
+        shift: 2,
+        width: 3,
+        options: MAG_RATE_LSM303DLHC,
+        group: 'mag',
+        appliesTo: OLD_IMU_ONLY,
+        configKey: 'imu.magRate',
+    },
+    {
+        key: 'magRate.lis2mdl',
+        label: 'Mag Rate',
+        desc: 'LSM303AH / LIS2MDL rate — ConfigSetupByte2 bits 2-4 (SensorLIS2MDL.java:580). NOT composite: the declared LIS2MDL rate MSB is commented out in Java and absent from the firmware struct.',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte2',
+        shift: 2,
+        width: 3,
+        options: MAG_RATE_LIS2MDL,
+        group: 'mag',
+        appliesTo: ['shimmer3-new-imu', 'shimmer3r'],
+        configKey: 'imu.magRate',
+    },
+    // ---- Alt accelerometer (high-g)
+    {
+        key: 'altAccelRange.mpu9x50',
+        label: 'Alt Accel Range',
+        desc: 'MPU9x50 accel range — ConfigSetupByte3 bits 6-7 (bitShiftMPU9150AccelRange=6, mask 0x03).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte3',
+        shift: 6,
+        width: 2,
+        options: ALT_ACCEL_RANGE_MPU9X50,
+        group: 'altAccel',
+        appliesTo: SHIMMER3_ONLY,
+        configKey: 'imu.altAccelRange',
+    },
+    {
+        key: 'altAccelRate.adxl371',
+        label: 'Alt Accel Rate',
+        desc: 'ADXL371 rate — ConfigSetupByte4 bits 6-7 (bitShiftADXL371AltAccelSamplingRate=6, SensorADXL371.java:356; FW altAccelRate).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte4',
+        shift: 6,
+        width: 2,
+        options: ALT_ACCEL_RATE_ADXL371,
+        group: 'altAccel',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.altAccelRate',
+    },
+    // ---- Alt magnetometer
+    {
+        key: 'altMagRange.lis3mdl',
+        label: 'Alt Mag Range',
+        desc: 'LIS3MDL range — ConfigSetupByte2 bits 5-7, the same bits Shimmer3 uses for its mag range (SensorLIS3MDL.java:806; FW altMagRange).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte2',
+        shift: 5,
+        width: 3,
+        options: ALT_MAG_RANGE_LIS3MDL,
+        group: 'altMag',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.magRange',
+    },
+    {
+        key: 'altMagRate.lis3mdl',
+        label: 'Alt Mag Rate',
+        desc: 'LIS3MDL rate — ConfigSetupByte5 bits 0-5, mask 0x3F (SensorLIS3MDL.java:809; FW altMagRate). The Java declaration comment says "Config Byte4" and is wrong.',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte5',
+        shift: 0,
+        width: 6,
+        options: ALT_MAG_RATE_LIS3MDL,
+        group: 'altMag',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.altMagRate',
+    },
+    // ---- Pressure
+    {
+        key: 'pressureOversampling.bmpX80',
+        label: 'Pressure Resolution',
+        desc: 'BMP180/BMP280 oversampling — ConfigSetupByte3 bits 4-5 (bitShiftBMPX80PressureResolution=4, mask 0x03).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte3',
+        shift: 4,
+        width: 2,
+        options: PRESSURE_OVERSAMPLING_BMPX80,
+        group: 'pressure',
+        appliesTo: SHIMMER3_ONLY,
+        configKey: 'imu.pressureOversampling',
+    },
+    {
+        key: 'pressureOversampling.bmp390_581',
+        label: 'Pressure Oversampling',
+        desc: 'BMP390/BMP581 oversampling, COMPOSITE: ConfigSetupByte3 bits 4-5 plus the MSB at ConfigSetupByte4 bit 0 (SensorBMP390.java:499, SensorBMP581.java:380; FW pressureOversamplingRatioMsb).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte3',
+        shift: 4,
+        width: 2,
+        msbLayoutKey: 'idxConfigSetupByte4',
+        msbShift: 0,
+        msbWidth: 1,
+        options: PRESSURE_OVERSAMPLING_BMP581,
+        group: 'pressure',
+        appliesTo: S3R_ONLY,
+        configKey: 'imu.pressureOversampling',
+    },
+    // ---- GSR / expansion power
+    {
+        key: 'gsrRange',
+        label: 'GSR Range',
+        desc: 'ConfigSetupByte3 bits 1-3 (bitShiftGSRRange=1, mask 0x07).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte3',
+        shift: 1,
+        width: 3,
+        options: GSR_RANGE,
+        group: 'gsr',
+        appliesTo: ALL,
+        configKey: 'gsrRange',
+    },
+    {
+        key: 'expPower',
+        label: 'Expansion-Board Power',
+        desc: 'Internal expansion-board 5V/3V rail enable — ConfigSetupByte3 bit 0 (FW expansionBoardPower).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte3',
+        shift: 0,
+        width: 1,
+        options: ON_OFF,
+        group: 'gsr',
+        appliesTo: ALL,
+        configKey: 'expPowerEnabled',
+    },
+    // ---- ExG
+    {
+        key: 'exg1',
+        label: 'ExG Chip 1 Registers',
+        desc: 'Raw 10-byte ADS1292R chip-1 register bank at bytes 10-19.',
+        kind: 'u8',
+        layoutKey: 'idxExg1',
+        group: 'exg',
+        appliesTo: ALL,
+        configKey: 'exg1',
+    },
+    {
+        key: 'exg2',
+        label: 'ExG Chip 2 Registers',
+        desc: 'Raw 10-byte ADS1292R chip-2 register bank at bytes 20-29.',
+        kind: 'u8',
+        layoutKey: 'idxExg2',
+        group: 'exg',
+        appliesTo: ALL,
+        configKey: 'exg2',
+    },
+    // ---- Bluetooth
+    {
+        key: 'btBaudRate',
+        label: 'Bluetooth Baud Rate',
+        desc: 'RN42/RN4678 UART baud index — byte 30 (maskBaudRate 0xFF).',
+        kind: 'u8',
+        layoutKey: 'idxBtCommBaudRate',
+        options: BT_BAUD_RATE,
+        group: 'bluetooth',
+        appliesTo: ALL,
+        configKey: 'btBaudRate',
+    },
+    {
+        key: 'disableBluetooth',
+        label: 'Disable Bluetooth While Logging',
+        desc: 'ExperimentConfig0 bit 3 (bitShiftDisableBluetooth=3, FW bluetoothDisable).',
+        kind: 'bit',
+        layoutKey: 'idxSDExperimentConfig0',
+        shift: 3,
+        width: 1,
+        options: ON_OFF,
+        group: 'bluetooth',
+        appliesTo: ALL,
+        configKey: 'trial.disableBluetooth',
+    },
+    // ---- SD logging
+    {
+        key: 'buttonStart',
+        label: 'Start Logging On Button Press',
+        desc: 'ExperimentConfig0 bit 5 (bitShiftButtonStart=5, FW userButtonEnable).',
+        kind: 'bit',
+        layoutKey: 'idxSDExperimentConfig0',
+        shift: 5,
+        width: 1,
+        options: ON_OFF,
+        group: 'sdLogging',
+        appliesTo: ALL,
+        configKey: 'trial.buttonStart',
+    },
+    {
+        key: 'singleTouch',
+        label: 'Single-Touch Start',
+        desc: 'ExperimentConfig1 bit 7 (bitShiftSingleTouch=7, FW singleTouchStart).',
+        kind: 'bit',
+        layoutKey: 'idxSDExperimentConfig1',
+        shift: 7,
+        width: 1,
+        options: ON_OFF,
+        group: 'sdLogging',
+        appliesTo: ALL,
+        configKey: 'trial.singleTouch',
+    },
+    {
+        key: 'tcxo',
+        label: 'TCXO',
+        desc: 'Use the temperature-compensated crystal oscillator — ExperimentConfig1 bit 4 (bitShiftTCX0=4, FW tcxo).',
+        kind: 'bit',
+        layoutKey: 'idxSDExperimentConfig1',
+        shift: 4,
+        width: 1,
+        options: ON_OFF,
+        group: 'sdLogging',
+        appliesTo: ALL,
+        configKey: 'trial.tcxo',
+    },
+    {
+        key: 'estimatedExpLength',
+        label: 'Estimated Experiment Length',
+        desc: 'Big-endian u16 at idxEstimatedExpLengthMsb/Lsb (ShimmerObject.java:5316-5317; FW experimentLengthEstimatedInSec*).',
+        kind: 'u16be',
+        layoutKey: 'idxEstimatedExpLengthMsb',
+        min: 0,
+        max: 0xffff,
+        group: 'sdLogging',
+        appliesTo: ALL,
+        configKey: 'sd.estimatedExpLengthMin',
+    },
+    {
+        key: 'maxExpLength',
+        label: 'Maximum Experiment Length (auto-stop)',
+        desc: 'Big-endian u16 at idxMaxExpLengthMsb/Lsb (ShimmerObject.java:5318-5319; FW experimentLengthMaxInMinutes*).',
+        kind: 'u16be',
+        layoutKey: 'idxMaxExpLengthMsb',
+        min: 0,
+        max: 0xffff,
+        group: 'sdLogging',
+        appliesTo: ALL,
+        configKey: 'sd.maxExpLengthMin',
+    },
+    // ---- Trial / experiment identity
+    {
+        key: 'deviceName',
+        label: 'Shimmer Name',
+        desc: '12 ASCII bytes at idxSDShimmerName, 0xFF-padded.',
+        kind: 'ascii12',
+        layoutKey: 'idxSDShimmerName',
+        max: 12,
+        group: 'trial',
+        appliesTo: ALL,
+        configKey: 'deviceName',
+    },
+    {
+        key: 'trialName',
+        label: 'Experiment ID',
+        desc: '12 ASCII bytes at idxSDEXPIDName, 0xFF-padded.',
+        kind: 'ascii12',
+        layoutKey: 'idxSDEXPIDName',
+        max: 12,
+        group: 'trial',
+        appliesTo: ALL,
+        configKey: 'trialName',
+    },
+    {
+        key: 'configTime',
+        label: 'Configuration Time',
+        desc: 'Unix seconds, big-endian u32 at idxSDConfigTime0-3 (bitShiftSDConfigTime0=24 … 3=0).',
+        kind: 'u32be',
+        layoutKey: 'idxSDConfigTime0',
+        group: 'trial',
+        appliesTo: ALL,
+        configKey: 'configTime',
+    },
+    {
+        key: 'trialId',
+        label: 'Trial ID',
+        desc: 'Single byte at idxSDMyTrialID (FW myTrialID).',
+        kind: 'u8',
+        layoutKey: 'idxSDMyTrialID',
+        min: 0,
+        max: 255,
+        group: 'trial',
+        appliesTo: ALL,
+        configKey: 'trial.id',
+    },
+    {
+        key: 'numShimmers',
+        label: 'Number Of Shimmers In Trial',
+        desc: 'Single byte at idxSDNumOfShimmers (FW numberOfShimmers).',
+        kind: 'u8',
+        layoutKey: 'idxSDNumOfShimmers',
+        min: 0,
+        max: 21,
+        group: 'trial',
+        appliesTo: ALL,
+        configKey: 'trial.numShimmers',
+    },
+    // ---- Multi-Shimmer sync
+    {
+        key: 'syncWhenLogging',
+        label: 'Sync While Logging',
+        desc: 'ExperimentConfig0 bit 2 (bitShiftTimeSyncWhenLogging=2, FW syncEnable).',
+        kind: 'bit',
+        layoutKey: 'idxSDExperimentConfig0',
+        shift: 2,
+        width: 1,
+        options: ON_OFF,
+        group: 'sync',
+        appliesTo: ALL,
+        configKey: 'trial.syncWhenLogging',
+    },
+    {
+        key: 'masterShimmer',
+        label: 'Sync Master',
+        desc: 'ExperimentConfig0 bit 1 (bitShiftMasterShimmer=1, FW masterEnable).',
+        kind: 'bit',
+        layoutKey: 'idxSDExperimentConfig0',
+        shift: 1,
+        width: 1,
+        options: ON_OFF,
+        group: 'sync',
+        appliesTo: ALL,
+        configKey: 'trial.masterShimmer',
+    },
+    {
+        key: 'btInterval',
+        label: 'Sync Broadcast Interval (s)',
+        desc: 'Single byte at idxSDBTInterval (FW btIntervalSecs, ShimmerObject.java:5313).',
+        kind: 'u8',
+        layoutKey: 'idxSDBTInterval',
+        min: 0,
+        max: 255,
+        group: 'sync',
+        appliesTo: ALL,
+        configKey: 'sd.btInterval',
+    },
+    {
+        key: 'syncNodes',
+        label: 'Sync Node MACs',
+        desc: 'Up to 21 six-byte MACs from idxNode0 (256), terminated by the first all-0xFF slot.',
+        kind: 'mac6[]',
+        layoutKey: 'idxNode0',
+        max: 21,
+        group: 'sync',
+        appliesTo: ALL,
+        configKey: 'syncNodes',
+    },
+    // ---- Calibration blocks
+    {
+        key: 'calib.lnAccel',
+        label: 'LN Accel Calibration',
+        desc: '21-byte kinematic block at idxAnalogAccelCalibration (FW NV_LN_ACCEL_CALIBRATION).',
+        kind: 'bytes21',
+        layoutKey: 'idxAnalogAccelCalibration',
+        group: 'calibration',
+        appliesTo: ALL,
+        configKey: 'calibration.lnAccel',
+    },
+    {
+        key: 'calib.gyro',
+        label: 'Gyro Calibration',
+        desc: '21-byte kinematic block at idxMPU9150GyroCalibration (FW NV_GYRO_CALIBRATION).',
+        kind: 'bytes21',
+        layoutKey: 'idxMPU9150GyroCalibration',
+        group: 'calibration',
+        appliesTo: ALL,
+        configKey: 'calibration.gyro',
+    },
+    {
+        key: 'calib.mag',
+        label: 'Mag Calibration',
+        desc: '21-byte kinematic block at idxLSM303DLHCMagCalibration (FW NV_MAG_CALIBRATION).',
+        kind: 'bytes21',
+        layoutKey: 'idxLSM303DLHCMagCalibration',
+        group: 'calibration',
+        appliesTo: ALL,
+        configKey: 'calibration.mag',
+    },
+    {
+        key: 'calib.wrAccel',
+        label: 'WR Accel Calibration',
+        desc: '21-byte kinematic block at idxLSM303DLHCAccelCalibration (FW NV_WR_ACCEL_CALIBRATION).',
+        kind: 'bytes21',
+        layoutKey: 'idxLSM303DLHCAccelCalibration',
+        group: 'calibration',
+        appliesTo: ALL,
+        configKey: 'calibration.wrAccel',
+    },
+    {
+        key: 'calib.altAccel',
+        label: 'Alt Accel Calibration',
+        desc: '21-byte kinematic block at idxADXL371AltAccelCalibration (133, FW NV_ALT_ACCEL_CALIBRATION). Shimmer3R only — on Shimmer3 those bytes are the unmodelled MPL accel region.',
+        kind: 'bytes21',
+        layoutKey: 'idxADXL371AltAccelCalibration',
+        group: 'calibration',
+        appliesTo: S3R_ONLY,
+        configKey: 'calibration.altAccel',
+    },
+    {
+        key: 'calib.altMag',
+        label: 'Alt Mag Calibration',
+        desc: '21-byte kinematic block at idxLIS3MDLAltMagCalibration (154, FW NV_ALT_MAG_CALIBRATION). Shimmer3R only — on Shimmer3 those bytes are the unmodelled MPL mag region.',
+        kind: 'bytes21',
+        layoutKey: 'idxLIS3MDLAltMagCalibration',
+        group: 'calibration',
+        appliesTo: S3R_ONLY,
+        configKey: 'calibration.altMag',
+    },
+]);
+// ---------------------------------------------------------------------------
+// Accessors
+// ---------------------------------------------------------------------------
+/** Resolve a field's byte offset against a firmware/hardware-resolved layout. */
+function resolveFieldIndex(field, layout) {
+    const value = layout[field.layoutKey];
+    if (typeof value !== 'number') {
+        throw new TypeError(`InfoMem layout key '${String(field.layoutKey)}' is not a byte index`);
+    }
+    return value;
+}
+const GENERAL_CALIB_LEN = 21;
+const NAME_LEN = 12;
+const MAC_LEN = 6;
+const MAX_NODES = 21;
+function hex2(b) {
+    return (b & 0xff).toString(16).toUpperCase().padStart(2, '0');
+}
+/** Resolve a COMPOSITE field's high-part byte offset, or `undefined`. */
+function resolveMsbIndex(field, layout) {
+    if (field.msbLayoutKey === undefined)
+        return undefined;
+    const value = layout[field.msbLayoutKey];
+    return typeof value === 'number' ? value : undefined;
+}
+/**
+ * Read one schema field's raw value straight out of an InfoMem byte array.
+ *
+ * A COMPOSITE `bit` field (one declaring `msbLayoutKey`) returns the FULL
+ * combined value, `(msb << width) | lsb`, matching
+ * {@link import('./parse.js').parseInfoMem}.
+ */
+function readInfoMemFieldValue(bytes, field, layout) {
+    const idx = resolveFieldIndex(field, layout);
+    switch (field.kind) {
+        case 'bit': {
+            const shift = field.shift ?? 0;
+            const width = field.width ?? 1;
+            const mask = (1 << width) - 1;
+            const lsb = ((bytes[idx] ?? 0) >> shift) & mask;
+            const msbIdx = resolveMsbIndex(field, layout);
+            if (msbIdx === undefined)
+                return lsb;
+            const msbMask = (1 << (field.msbWidth ?? 1)) - 1;
+            const msb = ((bytes[msbIdx] ?? 0) >> (field.msbShift ?? 0)) & msbMask;
+            return (msb << width) | lsb;
+        }
+        case 'u8':
+            return bytes[idx] ?? 0;
+        case 'u16le':
+            return ((bytes[idx] ?? 0) & 0xff) | (((bytes[idx + 1] ?? 0) & 0xff) << 8);
+        case 'u16be':
+            return (((bytes[idx] ?? 0) & 0xff) << 8) | ((bytes[idx + 1] ?? 0) & 0xff);
+        case 'u32be': {
+            let v = 0;
+            for (let i = 0; i < 4; i++)
+                v = v * 256 + ((bytes[idx + i] ?? 0) & 0xff);
+            return v;
+        }
+        case 'ascii12': {
+            let s = '';
+            for (let i = 0; i < NAME_LEN; i++) {
+                const b = bytes[idx + i];
+                if (b === undefined || b < 0x20 || b >= 0x7f)
+                    break;
+                s += String.fromCharCode(b);
+            }
+            return s;
+        }
+        case 'bytes21': {
+            const out = new Uint8Array(GENERAL_CALIB_LEN);
+            out.set(bytes.subarray(idx, idx + GENERAL_CALIB_LEN), 0);
+            return out;
+        }
+        case 'mac6[]': {
+            const nodes = [];
+            for (let n = 0; n < MAX_NODES; n++) {
+                const at = idx + n * MAC_LEN;
+                let allFf = true;
+                let mac = '';
+                for (let b = 0; b < MAC_LEN; b++) {
+                    const v = bytes[at + b] ?? 0xff;
+                    if (v !== 0xff)
+                        allFf = false;
+                    mac += hex2(v);
+                }
+                if (allFf)
+                    break;
+                nodes.push(mac);
+            }
+            return nodes;
+        }
+    }
+}
+/**
+ * Write one schema field's raw value into an InfoMem byte array, in place.
+ *
+ * `bit` fields are read-modify-write, so the other bits of the byte survive. A
+ * COMPOSITE field splits the value across its two declared bytes, so both are
+ * updated (and both read-modify-write).
+ */
+function writeInfoMemFieldValue(bytes, field, layout, value) {
+    const idx = resolveFieldIndex(field, layout);
+    switch (field.kind) {
+        case 'bit': {
+            const shift = field.shift ?? 0;
+            const width = field.width ?? 1;
+            const mask = (1 << width) - 1;
+            const raw = Number(value);
+            bytes[idx] = ((bytes[idx] & ~(mask << shift)) | ((raw & mask) << shift)) & 0xff;
+            const msbIdx = resolveMsbIndex(field, layout);
+            if (msbIdx === undefined)
+                return;
+            const msbShift = field.msbShift ?? 0;
+            const msbMask = (1 << (field.msbWidth ?? 1)) - 1;
+            const msb = (raw >> width) & msbMask;
+            bytes[msbIdx] = ((bytes[msbIdx] & ~(msbMask << msbShift)) | (msb << msbShift)) & 0xff;
+            return;
+        }
+        case 'u8':
+            bytes[idx] = Number(value) & 0xff;
+            return;
+        case 'u16le': {
+            const v = Number(value) & 0xffff;
+            bytes[idx] = v & 0xff;
+            bytes[idx + 1] = (v >> 8) & 0xff;
+            return;
+        }
+        case 'u16be': {
+            const v = Number(value) & 0xffff;
+            bytes[idx] = (v >> 8) & 0xff;
+            bytes[idx + 1] = v & 0xff;
+            return;
+        }
+        case 'u32be': {
+            const v = Number(value);
+            for (let i = 0; i < 4; i++) {
+                bytes[idx + i] = Math.floor(v / 2 ** (8 * (3 - i))) & 0xff;
+            }
+            return;
+        }
+        case 'ascii12': {
+            const s = String(value);
+            for (let i = 0; i < NAME_LEN; i++) {
+                bytes[idx + i] = i < s.length ? s.charCodeAt(i) & 0xff : 0xff;
+            }
+            return;
+        }
+        case 'bytes21': {
+            const src = value;
+            for (let i = 0; i < GENERAL_CALIB_LEN; i++)
+                bytes[idx + i] = (src[i] ?? 0) & 0xff;
+            return;
+        }
+        case 'mac6[]': {
+            const macs = value;
+            for (let n = 0; n < MAX_NODES; n++) {
+                const at = idx + n * MAC_LEN;
+                const mac = macs[n];
+                if (mac === undefined || !/^[0-9a-fA-F]{12}$/.test(mac)) {
+                    for (let b = 0; b < MAC_LEN; b++)
+                        bytes[at + b] = 0xff;
+                }
+                else {
+                    for (let b = 0; b < MAC_LEN; b++) {
+                        bytes[at + b] = Number.parseInt(mac.slice(b * 2, b * 2 + 2), 16);
+                    }
+                }
+            }
+            return;
+        }
+    }
+}
+/** The schema fields that apply to a given part generation, in schema order. */
+function infoMemFieldsFor(generation) {
+    return SHIMMER3_INFOMEM_FIELD_SCHEMA.filter((f) => f.appliesTo.includes(generation));
+}
+/**
+ * Expansion-board revision that marks a Shimmer3 base board as "new IMU"
+ * (LSM303AH + ICM20948 instead of LSM303DLHC + MPU9150).
+ * `Configuration.Shimmer3.NEW_IMU_EXP_REV` (Configuration.java:1300-1309).
+ *
+ * HARDWARE-VERIFY: this table is transcribed from the Java driver and has not
+ * been checked against physical boards of each revision.
+ */
+const NEW_IMU_EXP_REV = Object.freeze({
+    /** SR31-6-0 and later base board (HW_ID_SR_CODES.SHIMMER3 = 31). */
+    IMU: 6,
+    /** SR48-3-0 GSR-unified. */
+    GSR_UNIFIED: 3,
+    /** SR47-3-0 ExG-unified (SR48-2 was skipped). */
+    EXG_UNIFIED: 3,
+    /** SR49-3-0 bridge-amp-unified. */
+    BRIDGE_AMP: 3,
+    PROTO3_DELUXE: 3,
+    PROTO3_MINI: 3,
+    /** SRx-x-171: any expansion board attached to a new-IMU base board. */
+    ANY_EXP_BRD_WITH_SPECIAL_REV: 171,
+});
+/** `HW_ID_SR_CODES.SHIMMER3` — the base board's own SR code. */
+const SR_CODE_SHIMMER3 = 31;
+/**
+ * Decide which part generation a device is.
+ *
+ * - hardware id 10 (`HW_ID.SHIMMER_3R`) → `'shimmer3r'`
+ * - hardware id 3 → new-vs-old IMU from the expansion-board revision:
+ *   revision >= the board's {@link NEW_IMU_EXP_REV} threshold (or the
+ *   `ANY_EXP_BRD_WITH_SPECIAL_REV` sentinel 171) means new IMU
+ * - anything else, or no board info → `'shimmer3-old-imu'` (the safe default:
+ *   the LSM303DLHC/MPU9150 option tables are the older, narrower ones)
+ */
+function inferShimmer3Generation(ctx, expansionBoard) {
+    if (ctx.hardwareVersion === HW_ID.SHIMMER_3R)
+        return 'shimmer3r';
+    if (ctx.hardwareVersion !== HW_ID.SHIMMER_3 || expansionBoard === undefined) {
+        return 'shimmer3-old-imu';
+    }
+    const { boardId, boardRev } = expansionBoard;
+    if (boardRev === NEW_IMU_EXP_REV.ANY_EXP_BRD_WITH_SPECIAL_REV)
+        return 'shimmer3-new-imu';
+    // The base board itself (SR31) uses the IMU threshold; every expansion board
+    // in the Java table shares the "unified" threshold of 3.
+    const threshold = boardId === SR_CODE_SHIMMER3 ? NEW_IMU_EXP_REV.IMU : NEW_IMU_EXP_REV.GSR_UNIFIED;
+    return boardRev >= threshold ? 'shimmer3-new-imu' : 'shimmer3-old-imu';
 }
 
 // ---------------------------------------------------------------------------
@@ -9041,8 +11502,10 @@ class WiredShimmerClient extends BaseShimmerClient {
         this._queue = Promise.resolve();
         // Cached device info
         this.identity = null;
-        this._handleTransportDisconnect = () => {
+        /** Handle an unexpected transport disconnect (the dock UART went away). */
+        this._handleTransportDisconnect = (reason) => {
             this._emitStatus('Dock disconnected');
+            this._emitDisconnect(reason);
         };
         // ---------------------------------------------------------------------------
         // RX: accumulate an unframed byte stream, extract complete packets
@@ -9081,6 +11544,7 @@ class WiredShimmerClient extends BaseShimmerClient {
                 '({ transport }) or connect(transport).');
         }
         this._transport = t;
+        this._armDisconnectNotification();
         this._notifyUnsub = t.onNotify(this._handleNotify);
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         this._emitStatus('Opening dock UART connection…');
@@ -9089,6 +11553,9 @@ class WiredShimmerClient extends BaseShimmerClient {
         this._emitStatus(`Connected: ${this._deviceLabel()}`);
     }
     async disconnect() {
+        // Application-initiated teardown is not a fault, so `onDisconnect` stays
+        // silent — including when this call is the cleanup that follows a drop.
+        this._suppressDisconnectNotification();
         try {
             this._notifyUnsub?.();
             this._disconnectUnsub?.();
@@ -19430,5 +21897,5 @@ function verisenseFactoryTestReportToCsvRows(parsed, meta = {}) {
     return [header, values];
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, FW_ID$1 as INFOMEM_FW_ID, HW_ID as INFOMEM_HW_ID, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NEED_MORE$1 as NEED_MORE, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC$1 as RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_DEFAULTS, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, NACK as SHIMMER3_NACK, NEED_MORE as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, deviceWriteDivergentRanges, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readVerisenseOperationalFieldValue, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeVerisenseOperationalFieldValue };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readInfoMemFieldValue, readVerisenseOperationalFieldValue, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3SensorLabel, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map
