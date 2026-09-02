@@ -53,7 +53,7 @@ The full Verisense control console now lives in a dedicated repository:
 | Spell caster (gyro gestures) | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/) |
 | Configure, stream, plot and record one sensor | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
 | Consensys trial export + Bluetooth RTC set | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) |
-| RTC drift test (32k crystal, DEV-866) | [rtc-drift-test](https://shimmerresearch.github.io/webBLEDemos/rtc-drift-test/) |
+| RTC drift test (32 kHz crystal) | [rtc-drift-test](https://shimmerresearch.github.io/webBLEDemos/rtc-drift-test/) |
 | SD-card file browse + download | [sd-download](https://shimmerresearch.github.io/webBLEDemos/sd-download/) |
 | Advertising / product name branding | [eeprom-branding](https://shimmerresearch.github.io/webBLEDemos/eeprom-branding/) |
 
