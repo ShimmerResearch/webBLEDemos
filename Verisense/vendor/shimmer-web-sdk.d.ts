@@ -1274,6 +1274,252 @@ type TimestampFmt = 'u16' | 'u24';
 declare const GSR_NAME = "GSR";
 
 /**
+ * Channel format descriptor for a single Shimmer3 / Shimmer3R data channel.
+ */
+interface ChannelFormat {
+    /** Human-readable signal name stored in ObjectCluster fields. */
+    name: string;
+    /** Encoding format: i16, u16, i24, u24, i12*, u8. */
+    fmt: 'i16' | 'u16' | 'i24' | 'u24' | 'i12*' | 'u8';
+    /** Byte order for multi-byte values. */
+    endian: 'le' | 'be';
+    /** Number of bytes this channel occupies in the packet. */
+    sizeBytes: number;
+}
+/**
+ * Which hardware family a channel list came from.
+ *
+ * The channel ID byte is *not* self-describing: the same ID can mean a
+ * different signal, and occupy a different number of bytes, on the two
+ * generations. See {@link resolveChannelFormat}.
+ */
+type ShimmerGeneration = 'shimmer3' | 'shimmer3r';
+/**
+ * Map a DEVICE_VERSION_RESPONSE hardware id onto a generation, or `null` when
+ * the id is unknown/absent (the caller then has to pick a default and say so —
+ * see `Shimmer3RClient.generation`).
+ */
+declare function generationFromHardwareVersion(hardwareVersion: number | null | undefined): ShimmerGeneration | null;
+/**
+ * Mapping from channel ID byte to its format descriptor, for the channels
+ * whose name, width and encoding are **identical on Shimmer3 and Shimmer3R**.
+ * Channel IDs are reported in the INQUIRY_RSP payload.
+ *
+ * This is the base layer of a two-layer table. Prefer
+ * {@link channelFormatsFor} or {@link resolveChannelFormat}, which apply the
+ * per-generation layer on top — a lookup straight into this map silently
+ * misses every channel in {@link CHANNEL_FORMAT_OVERRIDES}, including the
+ * pressure/temperature pair whose *width* differs between the generations.
+ *
+ * Two entries are kept generation-independent for API stability even though
+ * the firmware names them differently on each platform:
+ *
+ * - `0x12` → `PPG`. The firmware calls it `INTERNAL_ADC_13` on a Shimmer3 and
+ *   `INTERNAL_ADC_1` on a Shimmer3R (`shimmer_sensing.h:107-122`); it is the
+ *   internal ADC line the optical front end sits on, and `PPG` is the name
+ *   this SDK has always emitted for it. Width and encoding are the same on
+ *   both, so nothing decodes wrongly — only the label is platform-neutral.
+ * - `0x14`-`0x16` → `HG_ACCEL_*`. The firmware calls these `X/Y/Z_ALT_ACCEL`.
+ */
+declare const CHANNEL_FORMATS: Readonly<Record<number, ChannelFormat>>;
+/**
+ * Per-generation channel table, layered over {@link CHANNEL_FORMATS}.
+ *
+ * Two kinds of entry live here, and only one of them is cosmetic:
+ *
+ * 1. **The ADC block, `0x0D`-`0x13`.** The IDs are reused with different
+ *    meanings on the two platforms — `shimmer_sensing.h:107-122` defines
+ *    `EXTERNAL_ADC_7/6/15` and `INTERNAL_ADC_1/12/13/14` under
+ *    `#elif defined(SHIMMER3)` and `EXTERNAL_ADC_0/1/2` +
+ *    `INTERNAL_ADC_3/0/1/2` under `#if defined(SHIMMER3R)`. All are 2 bytes
+ *    little-endian on both, so picking the wrong platform costs a wrong
+ *    *label*, not a wrong number.
+ * 2. **`0x1A` BMP_TEMPERATURE and `0x1B` BMP_PRESSURE.** These differ in
+ *    **width and byte order**, which is what makes the table generation-aware
+ *    rather than merely generation-labelled:
+ *
+ *    - Shimmer3 carries a BMP180/BMP280 read over I²C, MSB first:
+ *      2 big-endian bytes of temperature followed by 3 big-endian bytes of
+ *      pressure (`LogAndStream_Shimmer3/i2c.c:389-394` emits
+ *      `BMP_TEMPERATURE` then `BMP_PRESSURE` and advances `sensing.dataLen`
+ *      by `BMPX80_PACKET_SIZE`, which `Shimmer_Driver/BMPX80/bmpX80.h:103-105`
+ *      defines as `BMPX80_TEMP_BUFF_SIZE 0x02 + BMPX80_PRESS_BUFF_SIZE 0x03`).
+ *    - Shimmer3R carries a BMP390/BMP581 read over SPI, LSB first: 3
+ *      little-endian bytes each, **pressure first**
+ *      (`LogAndStream_Shimmer3R/Core/Src/spi.c:739-756`, the
+ *      `#if defined(SHIMMER3R)` arm, `sensing.dataLen += 3` twice).
+ *
+ *    So enabling the stock pressure sensor makes a Shimmer3 packet 1 byte and
+ *    a Shimmer3R packet 2 bytes longer than a 2-bytes-per-channel assumption
+ *    predicts, and every channel after pressure decodes from the wrong offset.
+ *    The emission *order* of the pair is also reversed between the two
+ *    generations, which is why a host must always take the channel order from
+ *    the inquiry response rather than from a fixed list of its own.
+ * 3. **`0x27`/`0x28` STRAIN_HIGH/STRAIN_LOW.** Shimmer3-only: the bridge
+ *    amplifier is an expansion board with no Shimmer3R equivalent, so these
+ *    are deliberately absent from the `shimmer3r` table and a Shimmer3R
+ *    reporting them is reported as an unknown channel rather than guessed at.
+ *
+ * Names follow the SD-log channel tables in `devices/sdlog/channels.ts` so the
+ * streamed and logged copies of the same signal carry the same label. The one
+ * exception is the BMP pair: the SD-log header names the exact part
+ * (`TEMPERATURE_BMP390`, `PRESSURE_BMP280`) because it records it, whereas the
+ * inquiry response does not say which sensor is fitted, so the streaming names
+ * stay unqualified.
+ *
+ * The ADC block's Shimmer3R names are the firmware's logical indices
+ * (`EXTERNAL_ADC_0`…), which is what `devices/sdlog/channels.ts` already uses.
+ * The Java driver instead names the same channels after the STM32 ADC lines
+ * they sit on — `ExtAdc9`/`ExtAdc11`/`ExtAdc12`, `IntAdc17`/`IntAdc10`/
+ * `IntAdc16` (`Configuration.java:594-601`, a second block of constants for the
+ * same ID values) — so a Shimmer3R CSV from the Java tools labels these columns
+ * differently. Same channel, same bytes, different vocabulary.
+ *
+ * HARDWARE-VERIFY: every width and byte order here is read out of the firmware
+ * sources cited above and pinned by unit tests, but no packet from a real sensor
+ * with pressure/temperature enabled has been decoded yet, on either generation.
+ * The endianness in particular is inferred from the sensors' register order
+ * (BMP180/BMP280 burst MSB first over I²C; BMP390/BMP581 LSB first over SPI)
+ * and agrees with the Java driver's `u16r`/`u24r` vs `u24` type strings.
+ */
+declare const CHANNEL_FORMAT_OVERRIDES: Readonly<Record<ShimmerGeneration, Readonly<Record<number, ChannelFormat>>>>;
+/**
+ * The complete channel table for one hardware generation: every entry of
+ * {@link CHANNEL_FORMATS} with {@link CHANNEL_FORMAT_OVERRIDES} applied on top.
+ *
+ * Frozen and pre-built, so this is a lookup rather than a merge per call.
+ */
+declare function channelFormatsFor(generation: ShimmerGeneration): Readonly<Record<number, ChannelFormat>>;
+/**
+ * Resolve one channel ID for one generation, or `undefined` when this SDK has
+ * no description for it.
+ *
+ * `undefined` is the honest answer and callers must treat it as one: a channel
+ * whose width is unknown makes the offset of every channel *after* it in the
+ * packet unknown too, because the packet carries no per-channel length. Never
+ * substitute a guessed width silently — see how
+ * `Shimmer3RClient._buildSchemaFromChannels` and `buildShimmer3Schema` flag it.
+ */
+declare function resolveChannelFormat(id: number, generation: ShimmerGeneration): ChannelFormat | undefined;
+/**
+ * True when this channel ID means a different signal, or occupies a different
+ * number of bytes, depending on the hardware generation — i.e. when getting the
+ * generation wrong would mislabel or misdecode it.
+ *
+ * A schema built without knowing the generation is only trustworthy if none of
+ * its channels answers true here.
+ */
+declare function isGenerationSensitiveChannel(id: number): boolean;
+/**
+ * The width assumed for a channel ID this SDK cannot describe.
+ *
+ * Two bytes is the commonest width by far, so it is the least-bad guess and it
+ * keeps a packet with one unfamiliar channel decodable instead of undecodable.
+ * It is only ever a guess, though: when a schema uses it, the schema is marked
+ * untrustworthy (`StreamSchema.trusted === false`, the offending IDs listed in
+ * `unknownChannelIds`) and every field from the guess onwards is marked
+ * `offsetTrusted: false`. A host seeing that should treat those fields as
+ * unusable and update the SDK, not publish the numbers.
+ */
+declare const UNKNOWN_CHANNEL_ASSUMED_BYTES = 2;
+
+/**
+ * Building the streaming packet schema from an inquiry response's channel list.
+ *
+ * Shared by both families: `Shimmer3RClient` (framed BLE) and
+ * `buildShimmer3Schema` (unframed classic Bluetooth) put the same channel-ID
+ * bytes through the same table, and any difference in how they treat a channel
+ * they do not recognise would be a difference in how quietly they corrupt data.
+ * So the logic lives here once.
+ *
+ * The packet itself carries no per-channel length — a data frame is a preamble
+ * byte, a timestamp, and then the channels' bytes back to back in the order the
+ * inquiry listed them. The channel ID is therefore the *only* thing that says
+ * how wide a channel is, and a wrong width does not fail: it shifts every
+ * channel after it and decodes plausible-looking rubbish. That is why an
+ * unrecognised ID has to be reported rather than assumed away.
+ */
+
+/** One decoded channel within a streaming data frame. */
+interface StreamSchemaField {
+    id: number;
+    name: string;
+    fmt: string;
+    endian: string;
+    sizeBytes: number;
+    /**
+     * True when this SDK has no description for the channel ID and
+     * {@link UNKNOWN_CHANNEL_ASSUMED_BYTES} was assumed. The value decoded into
+     * this field is meaningless.
+     */
+    assumed?: boolean;
+    /**
+     * False when this field's byte offset within the frame sits at or after an
+     * assumed width, so the offset — and therefore the value — cannot be relied
+     * on. Absent or true means the offset came entirely from described channels.
+     */
+    offsetTrusted?: boolean;
+}
+/** Describes how to slice a streaming data frame, built from an inquiry. */
+interface StreamSchemaBase {
+    timestampFmt: TimestampFmt;
+    fields: StreamSchemaField[];
+    /** Total bytes per frame, including the preamble byte. */
+    frameBytes: number;
+    enabledSensors: number;
+    dataPreambleByte: number;
+    /** Which generation's channel table resolved the IDs. */
+    generation?: ShimmerGeneration;
+    /**
+     * True when {@link generation} was a default rather than something the device
+     * was asked for. Harmless unless the channel list contains a
+     * generation-sensitive channel, in which case {@link trusted} is false.
+     */
+    generationAssumed?: boolean;
+    /**
+     * Channel IDs in the inquiry that this SDK cannot describe. Empty when every
+     * channel was recognised.
+     */
+    unknownChannelIds?: number[];
+    /**
+     * False when the field offsets, and hence `frameBytes`, may not match the
+     * packet the firmware is actually sending. Absent or true means they do.
+     *
+     * A host must check this before publishing or storing the decoded values: a
+     * false here means at least one channel's width was guessed, or the hardware
+     * generation was, and the numbers after that point are not measurements. The
+     * fixes, in order of preference, are to update this SDK so the channel is
+     * described, to call `readDeviceVersion()` before `inquiry()` so the
+     * generation is known rather than assumed, or to disable the offending sensor.
+     */
+    trusted?: boolean;
+}
+/** What {@link buildStreamSchema} needs beyond the channel list. */
+interface BuildStreamSchemaOptions {
+    /** Generation whose channel table resolves the IDs. */
+    generation: ShimmerGeneration;
+    /** True when `generation` is this SDK's default rather than the device's answer. */
+    generationAssumed?: boolean;
+    /** Frame preamble byte (DATA_PACKET, 0x00 on both families). */
+    dataPreambleByte?: number;
+    /**
+     * Called once per problem found, with a sentence fit for a status log. Wired
+     * to the client's `onStatus` so an unrecognised channel is visible to the
+     * host rather than only to the schema.
+     */
+    onProblem?: (message: string) => void;
+}
+/**
+ * Build a stream schema from the channel-ID list reported by an inquiry.
+ *
+ * Mirrors `ShimmerObject#interpretDataPacketFormat`, with one deliberate
+ * departure: where the Java driver falls through to a default width for an
+ * unrecognised signal ID, this records the guess. See
+ * {@link StreamSchemaBase.trusted}.
+ */
+declare function buildStreamSchema(channelIds: ArrayLike<number>, timestampFmt: TimestampFmt, opts: BuildStreamSchemaOptions): Required<Pick<StreamSchemaBase, 'generation' | 'unknownChannelIds' | 'trusted'>> & StreamSchemaBase;
+
+/**
  * Decoded STATUS_RESPONSE payload: what the sensor is doing right now.
  *
  * The firmware sends this both on request (GET_STATUS_COMMAND) and unprompted
@@ -1738,23 +1984,23 @@ declare const SHIMMER3_INQ_NUM_CHANNELS_OFFSET: number;
 declare const SHIMMER3_INQ_CHANNELS_OFFSET: number;
 /** The sampling clock frequency (Hz) used for divisor↔rate conversion. */
 declare const SHIMMER3_SAMPLING_CLOCK_FREQ = 32768;
-/** One decoded channel within a streaming data frame. */
-interface Shimmer3ChannelField {
-    id: number;
-    name: string;
-    fmt: string;
-    endian: string;
-    sizeBytes: number;
-}
-/** Describes how to slice a streaming data frame, built from an inquiry. */
-interface Shimmer3StreamSchema {
-    timestampFmt: TimestampFmt;
-    fields: Shimmer3ChannelField[];
-    /** Total bytes per frame, including the 0x00 DATA_PACKET preamble byte. */
-    frameBytes: number;
-    enabledSensors: number;
-    dataPreambleByte: number;
-}
+/**
+ * One decoded channel within a streaming data frame.
+ *
+ * Structurally identical to the Shimmer3R client's field type — the two
+ * families share the channel vocabulary — and kept as its own name because it
+ * is exported. See {@link StreamSchemaField} for what `assumed` and
+ * `offsetTrusted` mean.
+ */
+type Shimmer3ChannelField = StreamSchemaField;
+/**
+ * Describes how to slice a streaming data frame, built from an inquiry.
+ *
+ * `dataPreambleByte` is 0x00 (DATA_PACKET) and `frameBytes` includes it.
+ * `trusted` is the field to check before believing the numbers — see
+ * {@link StreamSchemaBase.trusted}.
+ */
+type Shimmer3StreamSchema = StreamSchemaBase;
 /** Typed result of decoding an INQUIRY_RESPONSE. */
 interface Shimmer3InquiryResult {
     opcode: number;
@@ -1778,13 +2024,22 @@ interface Shimmer3InquiryResult {
 /**
  * Build a stream schema from the channel-ID list reported by the inquiry.
  *
- * Mirrors ShimmerObject#interpretDataPacketFormat (the channel→format mapping is
- * identical for Shimmer3 and Shimmer3R, so `CHANNEL_FORMATS` and
- * `SensorBitmapShimmer3` are reused verbatim). The only Shimmer3-relevant knob is
- * the timestamp width (u24 for firmware code ≥ 6, else u16 — see
- * ShimmerObject#updateTimestampByteLength).
+ * Mirrors ShimmerObject#interpretDataPacketFormat. The generation is fixed at
+ * `'shimmer3'`: this file is the classic-Bluetooth Shimmer3 path, so unlike
+ * `Shimmer3RClient` — which the same firmware answers on both platforms — there
+ * is nothing to determine and nothing to assume. That matters for the BMP
+ * channels, which are 2-byte big-endian temperature + 3-byte big-endian
+ * pressure here and 3 little-endian bytes each on a Shimmer3R
+ * (see `CHANNEL_FORMAT_OVERRIDES`).
+ *
+ * The only Shimmer3-relevant knob is the timestamp width (u24 for firmware code
+ * ≥ 6, else u16 — see ShimmerObject#updateTimestampByteLength).
+ *
+ * @param onProblem optional sink for the message an unrecognised channel ID
+ *   produces; `Shimmer3Client` wires it to `onStatus`. The schema's `trusted`
+ *   and `unknownChannelIds` say the same thing to code rather than to a log.
  */
-declare function buildShimmer3Schema(channelIds: number[], timestampFmt: TimestampFmt): Shimmer3StreamSchema;
+declare function buildShimmer3Schema(channelIds: number[], timestampFmt: TimestampFmt, onProblem?: (message: string) => void): Shimmer3StreamSchema;
 /**
  * Decode an INQUIRY_RESPONSE using the Shimmer3 (classic) layout.
  *
@@ -1793,8 +2048,11 @@ declare function buildShimmer3Schema(channelIds: number[], timestampFmt: Timesta
  * works, matching Shimmer3RClient's `base` handling).
  *
  * Ported from ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch.
+ *
+ * @param onProblem optional sink for schema problems (an unrecognised channel
+ *   ID); see {@link buildShimmer3Schema}.
  */
-declare function interpretShimmer3InquiryResponse(u8: Uint8Array, timestampFmt?: TimestampFmt): Shimmer3InquiryResult;
+declare function interpretShimmer3InquiryResponse(u8: Uint8Array, timestampFmt?: TimestampFmt, onProblem?: (message: string) => void): Shimmer3InquiryResult;
 /** Parsed DEVICE_VERSION (a.k.a. Shimmer HW version) response. */
 interface Shimmer3DeviceVersion {
     hardwareVersion: number;
@@ -2849,6 +3107,21 @@ declare const SensorBitmapShimmer3: Readonly<{
     readonly SENSOR_INT_A2: 8388608;
 }>;
 type SensorBitmapShimmer3Key = keyof typeof SensorBitmapShimmer3;
+/**
+ * Map a channel/signal ID from an inquiry response onto the
+ * {@link SensorBitmapShimmer3} bit that enables it, or 0 when the ID has no
+ * enable bit of its own.
+ *
+ * ORing these over a channel list reconstructs the enabled-sensor mask the
+ * device is actually running, which is what `SET_SENSORS_CMD` would have to
+ * send to reproduce it. Ported from
+ * `ShimmerObject#interpretDataPacketFormat`, whose Shimmer3 and Shimmer3R
+ * branches map the two generations' names for the shared ADC IDs onto the same
+ * bits (`ShimmerObject.java:4081-4126`) — e.g. 0x0D is `ExtAdc7` on a Shimmer3
+ * and `ExtAdc9` on a Shimmer3R, and both set `SENSOR_EXT_A0`. So this mapping
+ * needs no generation of its own, unlike the channel *format* table.
+ */
+declare function channelIdToSensorBit(id: number): number;
 
 /**
  * Configuration option tables for the Shimmer3 / Shimmer3R families.
@@ -3428,21 +3701,6 @@ interface SdExtractResult {
  */
 declare function tryExtractSdMessage(buf: Uint8Array): SdExtractResult;
 
-interface ChannelField {
-    id: number;
-    name: string;
-    fmt: string;
-    endian: string;
-    sizeBytes: number;
-}
-interface StreamSchema {
-    timestampFmt: TimestampFmt;
-    fields: ChannelField[];
-    /** Total bytes per frame, including the 0x00 preamble byte. */
-    frameBytes: number;
-    enabledSensors: number;
-    dataPreambleByte: number;
-}
 interface Shimmer3RClientOptions extends ShimmerClientOptions {
     /** BLE service UUID override (default: Shimmer3R service UUID). */
     serviceUUID?: string;
@@ -3695,7 +3953,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
         numChannels: number;
         bufferSize: number;
         channelIds: number[];
-        schema: StreamSchema;
+        schema: StreamSchemaBase;
         bytes: Uint8Array<ArrayBuffer>;
     }>;
     /**
@@ -4064,6 +4322,28 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /** Stop streaming AND SD card logging. */
     stopStreamingAndLogging(): Promise<void>;
     private _interpretInquiryResponseShimmer3R;
+    /**
+     * Which generation's channel table this client uses to decode a packet.
+     *
+     * Read from the cached DEVICE_VERSION_RESPONSE when the host has asked for it
+     * ({@link readDeviceVersion}); `'shimmer3r'` otherwise, because that is what
+     * this client is named for and what its default transport connects to.
+     *
+     * The default is not always harmless. This client also drives a classic
+     * Shimmer3 over an RFCOMM byte stream (the two platforms share this command
+     * set), and the two generations disagree about the width of the
+     * pressure/temperature channels — a Shimmer3 sends 2 big-endian bytes of
+     * temperature where a Shimmer3R sends 3 little-endian ones, and reverses the
+     * order of the pair. So call `readDeviceVersion()` before `inquiry()` on any
+     * link that might be a Shimmer3; `inquiry()` deliberately does not send that
+     * command itself, to keep the schema rebuild after `setSensors()` a single
+     * round trip. When the generation is assumed *and* the channel list contains a
+     * channel that depends on it, the schema says so (`trusted === false`) and a
+     * status message names the channels.
+     */
+    get generation(): ShimmerGeneration;
+    /** True when {@link generation} is this SDK's default rather than the device's answer. */
+    get generationIsAssumed(): boolean;
     private _buildSchemaFromChannels;
     private _calibrateData;
     private _parseBySchema;
@@ -4312,25 +4592,6 @@ interface Shimmer3RFramingOptions {
  * to its schema parser instead of through this function.
  */
 declare function shimmer3rControlMessageLength(buf: Uint8Array, opts?: Shimmer3RFramingOptions): number;
-
-/**
- * Channel format descriptor for a single Shimmer3R data channel.
- */
-interface ChannelFormat {
-    /** Human-readable signal name stored in ObjectCluster fields. */
-    name: string;
-    /** Encoding format: i16, u16, i24, u24, i12*, u8. */
-    fmt: 'i16' | 'u16' | 'i24' | 'u24' | 'i12*' | 'u8';
-    /** Byte order for multi-byte values. */
-    endian: 'le' | 'be';
-    /** Number of bytes this channel occupies in the packet. */
-    sizeBytes: number;
-}
-/**
- * Mapping from Shimmer3R channel ID byte to its format descriptor.
- * Channel IDs are reported in the INQUIRY_RSP payload.
- */
-declare const CHANNEL_FORMATS: Readonly<Record<number, ChannelFormat>>;
 
 /**
  * Convert a Shimmer3R 12-bit ADC value to millivolts.
@@ -9324,5 +9585,5 @@ declare function parseVerisenseFactoryTestReport(text: string): VerisenseFactory
  */
 declare function verisenseFactoryTestReportToCsvRows(parsed: VerisenseFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readInfoMemFieldValue, readVerisenseOperationalFieldValue, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3SensorLabel, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BrandRecord, BrandRecordFields, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CONSENSYS_UNKNOWN_DEVICE, CalibQuality, CalibSensorId, DEBUG_COMMAND_ID, FW_ID$1 as FW_ID, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, RESYNC, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readInfoMemFieldValue, readVerisenseOperationalFieldValue, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3SensorLabel, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, EvaluateParsedSplitInput, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerGeneration, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };

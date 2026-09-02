@@ -1671,21 +1671,147 @@
         SENSOR_INT_A1: 0x000100,
         SENSOR_INT_A2: 0x800000,
     });
-
     /**
-     * Mapping from Shimmer3R channel ID byte to its format descriptor.
+     * Map a channel/signal ID from an inquiry response onto the
+     * {@link SensorBitmapShimmer3} bit that enables it, or 0 when the ID has no
+     * enable bit of its own.
+     *
+     * ORing these over a channel list reconstructs the enabled-sensor mask the
+     * device is actually running, which is what `SET_SENSORS_CMD` would have to
+     * send to reproduce it. Ported from
+     * `ShimmerObject#interpretDataPacketFormat`, whose Shimmer3 and Shimmer3R
+     * branches map the two generations' names for the shared ADC IDs onto the same
+     * bits (`ShimmerObject.java:4081-4126`) — e.g. 0x0D is `ExtAdc7` on a Shimmer3
+     * and `ExtAdc9` on a Shimmer3R, and both set `SENSOR_EXT_A0`. So this mapping
+     * needs no generation of its own, unlike the channel *format* table.
+     */
+    function channelIdToSensorBit(id) {
+        switch (id) {
+            case 0x00:
+            case 0x01:
+            case 0x02:
+                return SensorBitmapShimmer3.SENSOR_A_ACCEL;
+            case 0x03:
+                return SensorBitmapShimmer3.SENSOR_VBATT;
+            case 0x04:
+            case 0x05:
+            case 0x06:
+                return SensorBitmapShimmer3.SENSOR_D_ACCEL;
+            case 0x07:
+            case 0x08:
+            case 0x09:
+                return SensorBitmapShimmer3.SENSOR_MAG;
+            case 0x0a:
+            case 0x0b:
+            case 0x0c:
+                return SensorBitmapShimmer3.SENSOR_GYRO;
+            case 0x0d:
+                return SensorBitmapShimmer3.SENSOR_EXT_A0;
+            case 0x0e:
+                return SensorBitmapShimmer3.SENSOR_EXT_A1;
+            case 0x0f:
+                return SensorBitmapShimmer3.SENSOR_EXT_A2;
+            case 0x10:
+                return SensorBitmapShimmer3.SENSOR_INT_A3;
+            case 0x11:
+                return SensorBitmapShimmer3.SENSOR_INT_A0;
+            case 0x12:
+                return SensorBitmapShimmer3.SENSOR_INT_A1;
+            case 0x13:
+                return SensorBitmapShimmer3.SENSOR_INT_A2;
+            case 0x14:
+            case 0x15:
+            case 0x16:
+                return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
+            case 0x17:
+            case 0x18:
+            case 0x19:
+                return SensorBitmapShimmer3.SENSOR_MAG_ALT;
+            // Pressure and temperature are enabled together by one bit — the firmware
+            // packs the pair or neither (`chEnPressureAndTemperature`).
+            case 0x1a:
+            case 0x1b:
+                return SensorBitmapShimmer3.SENSOR_PRESSURE;
+            case 0x1c:
+                return SensorBitmapShimmer3.SENSOR_GSR;
+            case 0x1e:
+            case 0x1f:
+                return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
+            case 0x21:
+            case 0x22:
+                return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
+            case 0x23:
+            case 0x24:
+                return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
+            case 0x25:
+            case 0x26:
+                return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
+            case 0x27:
+            case 0x28:
+                return SensorBitmapShimmer3.SENSOR_BRIDGE_AMP;
+            // 0x1D / 0x20 are the ExG status bytes: they ride along with whichever ExG
+            // block is enabled and have no bit of their own.
+            default:
+                return 0;
+        }
+    }
+
+    /** `ShimmerVerDetails.HW_ID` values that map onto a {@link ShimmerGeneration}. */
+    const HW_ID_SHIMMER_3 = 3;
+    const HW_ID_SHIMMER_3R = 10;
+    /**
+     * Map a DEVICE_VERSION_RESPONSE hardware id onto a generation, or `null` when
+     * the id is unknown/absent (the caller then has to pick a default and say so —
+     * see `Shimmer3RClient.generation`).
+     */
+    function generationFromHardwareVersion(hardwareVersion) {
+        if (hardwareVersion === HW_ID_SHIMMER_3)
+            return 'shimmer3';
+        if (hardwareVersion === HW_ID_SHIMMER_3R)
+            return 'shimmer3r';
+        return null;
+    }
+    /**
+     * Mapping from channel ID byte to its format descriptor, for the channels
+     * whose name, width and encoding are **identical on Shimmer3 and Shimmer3R**.
      * Channel IDs are reported in the INQUIRY_RSP payload.
+     *
+     * This is the base layer of a two-layer table. Prefer
+     * {@link channelFormatsFor} or {@link resolveChannelFormat}, which apply the
+     * per-generation layer on top — a lookup straight into this map silently
+     * misses every channel in {@link CHANNEL_FORMAT_OVERRIDES}, including the
+     * pressure/temperature pair whose *width* differs between the generations.
+     *
+     * Two entries are kept generation-independent for API stability even though
+     * the firmware names them differently on each platform:
+     *
+     * - `0x12` → `PPG`. The firmware calls it `INTERNAL_ADC_13` on a Shimmer3 and
+     *   `INTERNAL_ADC_1` on a Shimmer3R (`shimmer_sensing.h:107-122`); it is the
+     *   internal ADC line the optical front end sits on, and `PPG` is the name
+     *   this SDK has always emitted for it. Width and encoding are the same on
+     *   both, so nothing decodes wrongly — only the label is platform-neutral.
+     * - `0x14`-`0x16` → `HG_ACCEL_*`. The firmware calls these `X/Y/Z_ALT_ACCEL`.
      */
     const CHANNEL_FORMATS = Object.freeze({
         0x00: { name: 'LN_ACCEL_X', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x01: { name: 'LN_ACCEL_Y', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x02: { name: 'LN_ACCEL_Z', fmt: 'i16', endian: 'le', sizeBytes: 2 },
+        // Battery is a 12-bit ADC reading right-aligned in two little-endian bytes,
+        // so `u16` decodes it losslessly and can never invent a negative value. (The
+        // Java driver types it `i16` on a Shimmer3 and `u12` on a Shimmer3R, and the
+        // SD-log path ported that `i16` verbatim — see the HARDWARE-VERIFY note on
+        // `sdlog/channels.ts` 0x03. Both agree with `u16` over the 0-4095 range the
+        // ADC can actually produce.)
+        0x03: { name: 'BATTERY', fmt: 'u16', endian: 'le', sizeBytes: 2 },
         0x04: { name: 'WR_ACCEL_X', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x05: { name: 'WR_ACCEL_Y', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x06: { name: 'WR_ACCEL_Z', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x14: { name: 'HG_ACCEL_X', fmt: 'i12*', endian: 'le', sizeBytes: 2 },
         0x15: { name: 'HG_ACCEL_Y', fmt: 'i12*', endian: 'le', sizeBytes: 2 },
         0x16: { name: 'HG_ACCEL_Z', fmt: 'i12*', endian: 'le', sizeBytes: 2 },
+        0x17: { name: 'ALT_MAG_X', fmt: 'i16', endian: 'le', sizeBytes: 2 },
+        0x18: { name: 'ALT_MAG_Y', fmt: 'i16', endian: 'le', sizeBytes: 2 },
+        0x19: { name: 'ALT_MAG_Z', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x0a: { name: 'GYRO_X', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x0b: { name: 'GYRO_Y', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x0c: { name: 'GYRO_Z', fmt: 'i16', endian: 'le', sizeBytes: 2 },
@@ -1705,6 +1831,305 @@
         0x12: { name: 'PPG', fmt: 'i16', endian: 'le', sizeBytes: 2 },
         0x1c: { name: 'GSR', fmt: 'u16', endian: 'le', sizeBytes: 2 },
     });
+    /** Shimmer3-only layer of {@link CHANNEL_FORMAT_OVERRIDES}. */
+    const SHIMMER3_CHANNEL_FORMATS = Object.freeze({
+        0x0d: { name: 'EXT_EXP_ADC_A7', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x0e: { name: 'EXT_EXP_ADC_A6', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x0f: { name: 'EXT_EXP_ADC_A15', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x10: { name: 'INT_EXP_ADC_A1', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x11: { name: 'INT_EXP_ADC_A12', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x13: { name: 'INT_EXP_ADC_A14', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x1a: { name: 'TEMPERATURE', fmt: 'u16', endian: 'be', sizeBytes: 2 },
+        0x1b: { name: 'PRESSURE', fmt: 'u24', endian: 'be', sizeBytes: 3 },
+        0x27: { name: 'BRIDGE_AMP_HIGH', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x28: { name: 'BRIDGE_AMP_LOW', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+    });
+    /** Shimmer3R-only layer of {@link CHANNEL_FORMAT_OVERRIDES}. */
+    const SHIMMER3R_CHANNEL_FORMATS = Object.freeze({
+        0x0d: { name: 'EXT_ADC_0', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x0e: { name: 'EXT_ADC_1', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x0f: { name: 'EXT_ADC_2', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x10: { name: 'INT_ADC_3', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x11: { name: 'INT_ADC_0', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x13: { name: 'INT_ADC_2', fmt: 'u16', endian: 'le', sizeBytes: 2 },
+        0x1a: { name: 'TEMPERATURE', fmt: 'u24', endian: 'le', sizeBytes: 3 },
+        0x1b: { name: 'PRESSURE', fmt: 'u24', endian: 'le', sizeBytes: 3 },
+    });
+    /**
+     * Per-generation channel table, layered over {@link CHANNEL_FORMATS}.
+     *
+     * Two kinds of entry live here, and only one of them is cosmetic:
+     *
+     * 1. **The ADC block, `0x0D`-`0x13`.** The IDs are reused with different
+     *    meanings on the two platforms — `shimmer_sensing.h:107-122` defines
+     *    `EXTERNAL_ADC_7/6/15` and `INTERNAL_ADC_1/12/13/14` under
+     *    `#elif defined(SHIMMER3)` and `EXTERNAL_ADC_0/1/2` +
+     *    `INTERNAL_ADC_3/0/1/2` under `#if defined(SHIMMER3R)`. All are 2 bytes
+     *    little-endian on both, so picking the wrong platform costs a wrong
+     *    *label*, not a wrong number.
+     * 2. **`0x1A` BMP_TEMPERATURE and `0x1B` BMP_PRESSURE.** These differ in
+     *    **width and byte order**, which is what makes the table generation-aware
+     *    rather than merely generation-labelled:
+     *
+     *    - Shimmer3 carries a BMP180/BMP280 read over I²C, MSB first:
+     *      2 big-endian bytes of temperature followed by 3 big-endian bytes of
+     *      pressure (`LogAndStream_Shimmer3/i2c.c:389-394` emits
+     *      `BMP_TEMPERATURE` then `BMP_PRESSURE` and advances `sensing.dataLen`
+     *      by `BMPX80_PACKET_SIZE`, which `Shimmer_Driver/BMPX80/bmpX80.h:103-105`
+     *      defines as `BMPX80_TEMP_BUFF_SIZE 0x02 + BMPX80_PRESS_BUFF_SIZE 0x03`).
+     *    - Shimmer3R carries a BMP390/BMP581 read over SPI, LSB first: 3
+     *      little-endian bytes each, **pressure first**
+     *      (`LogAndStream_Shimmer3R/Core/Src/spi.c:739-756`, the
+     *      `#if defined(SHIMMER3R)` arm, `sensing.dataLen += 3` twice).
+     *
+     *    So enabling the stock pressure sensor makes a Shimmer3 packet 1 byte and
+     *    a Shimmer3R packet 2 bytes longer than a 2-bytes-per-channel assumption
+     *    predicts, and every channel after pressure decodes from the wrong offset.
+     *    The emission *order* of the pair is also reversed between the two
+     *    generations, which is why a host must always take the channel order from
+     *    the inquiry response rather than from a fixed list of its own.
+     * 3. **`0x27`/`0x28` STRAIN_HIGH/STRAIN_LOW.** Shimmer3-only: the bridge
+     *    amplifier is an expansion board with no Shimmer3R equivalent, so these
+     *    are deliberately absent from the `shimmer3r` table and a Shimmer3R
+     *    reporting them is reported as an unknown channel rather than guessed at.
+     *
+     * Names follow the SD-log channel tables in `devices/sdlog/channels.ts` so the
+     * streamed and logged copies of the same signal carry the same label. The one
+     * exception is the BMP pair: the SD-log header names the exact part
+     * (`TEMPERATURE_BMP390`, `PRESSURE_BMP280`) because it records it, whereas the
+     * inquiry response does not say which sensor is fitted, so the streaming names
+     * stay unqualified.
+     *
+     * The ADC block's Shimmer3R names are the firmware's logical indices
+     * (`EXTERNAL_ADC_0`…), which is what `devices/sdlog/channels.ts` already uses.
+     * The Java driver instead names the same channels after the STM32 ADC lines
+     * they sit on — `ExtAdc9`/`ExtAdc11`/`ExtAdc12`, `IntAdc17`/`IntAdc10`/
+     * `IntAdc16` (`Configuration.java:594-601`, a second block of constants for the
+     * same ID values) — so a Shimmer3R CSV from the Java tools labels these columns
+     * differently. Same channel, same bytes, different vocabulary.
+     *
+     * HARDWARE-VERIFY: every width and byte order here is read out of the firmware
+     * sources cited above and pinned by unit tests, but no packet from a real sensor
+     * with pressure/temperature enabled has been decoded yet, on either generation.
+     * The endianness in particular is inferred from the sensors' register order
+     * (BMP180/BMP280 burst MSB first over I²C; BMP390/BMP581 LSB first over SPI)
+     * and agrees with the Java driver's `u16r`/`u24r` vs `u24` type strings.
+     */
+    const CHANNEL_FORMAT_OVERRIDES = Object.freeze({
+        shimmer3: SHIMMER3_CHANNEL_FORMATS,
+        shimmer3r: SHIMMER3R_CHANNEL_FORMATS,
+    });
+    const RESOLVED = {
+        shimmer3: Object.freeze({ ...CHANNEL_FORMATS, ...CHANNEL_FORMAT_OVERRIDES.shimmer3 }),
+        shimmer3r: Object.freeze({ ...CHANNEL_FORMATS, ...CHANNEL_FORMAT_OVERRIDES.shimmer3r }),
+    };
+    /**
+     * The complete channel table for one hardware generation: every entry of
+     * {@link CHANNEL_FORMATS} with {@link CHANNEL_FORMAT_OVERRIDES} applied on top.
+     *
+     * Frozen and pre-built, so this is a lookup rather than a merge per call.
+     */
+    function channelFormatsFor(generation) {
+        return RESOLVED[generation];
+    }
+    /**
+     * Resolve one channel ID for one generation, or `undefined` when this SDK has
+     * no description for it.
+     *
+     * `undefined` is the honest answer and callers must treat it as one: a channel
+     * whose width is unknown makes the offset of every channel *after* it in the
+     * packet unknown too, because the packet carries no per-channel length. Never
+     * substitute a guessed width silently — see how
+     * `Shimmer3RClient._buildSchemaFromChannels` and `buildShimmer3Schema` flag it.
+     */
+    function resolveChannelFormat(id, generation) {
+        return RESOLVED[generation][id];
+    }
+    /**
+     * True when this channel ID means a different signal, or occupies a different
+     * number of bytes, depending on the hardware generation — i.e. when getting the
+     * generation wrong would mislabel or misdecode it.
+     *
+     * A schema built without knowing the generation is only trustworthy if none of
+     * its channels answers true here.
+     */
+    function isGenerationSensitiveChannel(id) {
+        return (CHANNEL_FORMAT_OVERRIDES.shimmer3[id] !== undefined ||
+            CHANNEL_FORMAT_OVERRIDES.shimmer3r[id] !== undefined);
+    }
+    /**
+     * The width assumed for a channel ID this SDK cannot describe.
+     *
+     * Two bytes is the commonest width by far, so it is the least-bad guess and it
+     * keeps a packet with one unfamiliar channel decodable instead of undecodable.
+     * It is only ever a guess, though: when a schema uses it, the schema is marked
+     * untrustworthy (`StreamSchema.trusted === false`, the offending IDs listed in
+     * `unknownChannelIds`) and every field from the guess onwards is marked
+     * `offsetTrusted: false`. A host seeing that should treat those fields as
+     * unusable and update the SDK, not publish the numbers.
+     */
+    const UNKNOWN_CHANNEL_ASSUMED_BYTES = 2;
+
+    /**
+     * Low-level byte-manipulation utilities used by the Shimmer3R protocol decoder.
+     * All functions are pure and have no side-effects, making them straightforward
+     * to unit-test without a BLE device.
+     */
+    /** Concatenate two Uint8Arrays. */
+    function concatU8(a, b) {
+        const out = new Uint8Array(a.length + b.length);
+        out.set(a);
+        out.set(b, a.length);
+        return out;
+    }
+    /** Read a 16-bit unsigned integer, little-endian. */
+    function u16le$3(b, o) {
+        return (b[o] | (b[o + 1] << 8)) >>> 0;
+    }
+    /** Read a 16-bit unsigned integer, big-endian. */
+    function u16be$1(b, o) {
+        return ((b[o] << 8) | b[o + 1]) >>> 0;
+    }
+    /** Read a 24-bit unsigned integer, little-endian. */
+    function u24le$1(b, o) {
+        return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) >>> 0;
+    }
+    /** Read a 24-bit unsigned integer, big-endian. */
+    function u24be(b, o) {
+        return ((b[o] << 16) | (b[o + 1] << 8) | b[o + 2]) >>> 0;
+    }
+    /** Sign-extend a 16-bit value to a signed integer. */
+    function sign16(v) {
+        return v & 0x8000 ? v | 0xffff0000 : v;
+    }
+    /** Sign-extend a 24-bit value to a signed integer. */
+    function sign24(v) {
+        return v & 0x800000 ? v | 0xff000000 : v;
+    }
+    /** Format a byte as a 2-digit uppercase hex string. */
+    function hex2$1(v) {
+        return v.toString(16).padStart(2, '0').toUpperCase();
+    }
+    /**
+     * Decode the status bytes of a STATUS_RESPONSE.
+     *
+     * Takes the payload ONLY — the bytes after `[0x8A][0x71]`. It cannot be lenient
+     * about a leading header the way `parseShimmer3DeviceVersionResponse` is,
+     * because a status byte of 0x8A is a perfectly ordinary reading (red LED + SD
+     * logging + sensing), so there is nothing to test a header against.
+     *
+     * Bit assignment from `ShimBt_assembleStatusBytes`
+     * (log-and-stream-common `Comms/shimmer_bt_uart.c:2920-2932`): bit 7
+     * toggleLedRedCmd, 6 sdBadFile, 5 sdInserted, 4 btStreaming, 3 sdLogging,
+     * 2 RTC set, 1 sensing, 0 docked.
+     *
+     * The second byte (usbPluggedIn) exists only under `#if defined(SHIMMER3R)`, so
+     * `STATUS_BYTE_COUNT` is 2 on a Shimmer3R and 1 on a Shimmer3
+     * (`Comms/shimmer_bt_uart.h:259-263`) — hence the nullable field rather than a
+     * plain boolean.
+     */
+    function parseShimmer3StatusBytes(bytes) {
+        if (bytes.length < 1)
+            throw new Error('status payload too short (need at least 1 byte)');
+        const s0 = bytes[0] & 0xff;
+        return {
+            docked: (s0 & 0x01) !== 0,
+            sensing: (s0 & 0x02) !== 0,
+            rtcSet: (s0 & 0x04) !== 0,
+            sdLogging: (s0 & 0x08) !== 0,
+            streaming: (s0 & 0x10) !== 0,
+            sdPresent: (s0 & 0x20) !== 0,
+            sdError: (s0 & 0x40) !== 0,
+            redLedOn: (s0 & 0x80) !== 0,
+            usbPluggedIn: bytes.length >= 2 ? (bytes[1] & 0xff) !== 0 : null,
+            raw: new Uint8Array(bytes),
+        };
+    }
+
+    /**
+     * Building the streaming packet schema from an inquiry response's channel list.
+     *
+     * Shared by both families: `Shimmer3RClient` (framed BLE) and
+     * `buildShimmer3Schema` (unframed classic Bluetooth) put the same channel-ID
+     * bytes through the same table, and any difference in how they treat a channel
+     * they do not recognise would be a difference in how quietly they corrupt data.
+     * So the logic lives here once.
+     *
+     * The packet itself carries no per-channel length — a data frame is a preamble
+     * byte, a timestamp, and then the channels' bytes back to back in the order the
+     * inquiry listed them. The channel ID is therefore the *only* thing that says
+     * how wide a channel is, and a wrong width does not fail: it shifts every
+     * channel after it and decodes plausible-looking rubbish. That is why an
+     * unrecognised ID has to be reported rather than assumed away.
+     */
+    /**
+     * Build a stream schema from the channel-ID list reported by an inquiry.
+     *
+     * Mirrors `ShimmerObject#interpretDataPacketFormat`, with one deliberate
+     * departure: where the Java driver falls through to a default width for an
+     * unrecognised signal ID, this records the guess. See
+     * {@link StreamSchemaBase.trusted}.
+     */
+    function buildStreamSchema(channelIds, timestampFmt, opts) {
+        const { generation, generationAssumed = false, dataPreambleByte = 0x00, onProblem } = opts;
+        const fields = [];
+        const ts = timestampFmt === 'u24' ? TIMESTAMP_FIELD.u24 : TIMESTAMP_FIELD.u16;
+        let frameBytes = 1 + ts.sizeBytes; // 1 = preamble byte
+        let enabledSensors = 0;
+        const unknownChannelIds = [];
+        // Once a width has been guessed every later offset is downstream of the
+        // guess, so trust is lost for the rest of the frame and never regained.
+        let offsetTrusted = true;
+        for (let i = 0; i < channelIds.length; i++) {
+            const id = channelIds[i];
+            const fmt = resolveChannelFormat(id, generation);
+            if (!fmt) {
+                unknownChannelIds.push(id);
+                // Keep the historical `CH_xx` name and 2-byte width so a packet with one
+                // unfamiliar channel stays decodable up to that point, and so a consumer
+                // that already reads `CH_xx` fields keeps seeing them.
+                fields.push({
+                    id,
+                    name: `CH_${hex2$1(id)}`,
+                    fmt: 'i16',
+                    endian: 'le',
+                    sizeBytes: UNKNOWN_CHANNEL_ASSUMED_BYTES,
+                    assumed: true,
+                    offsetTrusted,
+                });
+                frameBytes += UNKNOWN_CHANNEL_ASSUMED_BYTES;
+                offsetTrusted = false;
+                onProblem?.(`Unknown channel ID 0x${hex2$1(id)} at position ${i} of the inquiry's channel list. ` +
+                    `This SDK has no width for it, so ${UNKNOWN_CHANNEL_ASSUMED_BYTES} bytes were assumed ` +
+                    `and every channel after it may be decoding from the wrong offset. ` +
+                    `Treat this frame's values as unusable (schema.trusted === false) and update the SDK.`);
+                continue;
+            }
+            fields.push({ id, ...fmt, offsetTrusted });
+            frameBytes += fmt.sizeBytes;
+            enabledSensors |= channelIdToSensorBit(id);
+        }
+        // An assumed generation only matters if something in the list actually
+        // depends on it — a gyro-only packet decodes identically either way.
+        const sensitive = [...new Set(Array.from(channelIds).filter(isGenerationSensitiveChannel))];
+        const generationMatters = generationAssumed && sensitive.length > 0;
+        if (generationMatters) {
+            onProblem?.(`Channel(s) ${sensitive.map((id) => `0x${hex2$1(id)}`).join(', ')} are decoded differently on ` +
+                `a Shimmer3 and a Shimmer3R, and this schema assumed ${generation} because the device ` +
+                `version has not been read. Call readDeviceVersion() before inquiry() to settle it.`);
+        }
+        return {
+            timestampFmt,
+            fields,
+            frameBytes,
+            enabledSensors,
+            dataPreambleByte,
+            generation,
+            generationAssumed,
+            unknownChannelIds,
+            trusted: unknownChannelIds.length === 0 && !generationMatters,
+        };
+    }
 
     // ---------------------------------------------------------------------------
     // ADC helpers
@@ -1798,82 +2223,6 @@
         if (samplingRate < 4000)
             return 5;
         return 6; // ≥ 4000 Hz
-    }
-
-    /**
-     * Low-level byte-manipulation utilities used by the Shimmer3R protocol decoder.
-     * All functions are pure and have no side-effects, making them straightforward
-     * to unit-test without a BLE device.
-     */
-    /** Concatenate two Uint8Arrays. */
-    function concatU8(a, b) {
-        const out = new Uint8Array(a.length + b.length);
-        out.set(a);
-        out.set(b, a.length);
-        return out;
-    }
-    /** Read a 16-bit unsigned integer, little-endian. */
-    function u16le$3(b, o) {
-        return (b[o] | (b[o + 1] << 8)) >>> 0;
-    }
-    /** Read a 16-bit unsigned integer, big-endian. */
-    function u16be$1(b, o) {
-        return ((b[o] << 8) | b[o + 1]) >>> 0;
-    }
-    /** Read a 24-bit unsigned integer, little-endian. */
-    function u24le$1(b, o) {
-        return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) >>> 0;
-    }
-    /** Read a 24-bit unsigned integer, big-endian. */
-    function u24be(b, o) {
-        return ((b[o] << 16) | (b[o + 1] << 8) | b[o + 2]) >>> 0;
-    }
-    /** Sign-extend a 16-bit value to a signed integer. */
-    function sign16(v) {
-        return v & 0x8000 ? v | 0xffff0000 : v;
-    }
-    /** Sign-extend a 24-bit value to a signed integer. */
-    function sign24(v) {
-        return v & 0x800000 ? v | 0xff000000 : v;
-    }
-    /** Format a byte as a 2-digit uppercase hex string. */
-    function hex2$1(v) {
-        return v.toString(16).padStart(2, '0').toUpperCase();
-    }
-    /**
-     * Decode the status bytes of a STATUS_RESPONSE.
-     *
-     * Takes the payload ONLY — the bytes after `[0x8A][0x71]`. It cannot be lenient
-     * about a leading header the way `parseShimmer3DeviceVersionResponse` is,
-     * because a status byte of 0x8A is a perfectly ordinary reading (red LED + SD
-     * logging + sensing), so there is nothing to test a header against.
-     *
-     * Bit assignment from `ShimBt_assembleStatusBytes`
-     * (log-and-stream-common `Comms/shimmer_bt_uart.c:2920-2932`): bit 7
-     * toggleLedRedCmd, 6 sdBadFile, 5 sdInserted, 4 btStreaming, 3 sdLogging,
-     * 2 RTC set, 1 sensing, 0 docked.
-     *
-     * The second byte (usbPluggedIn) exists only under `#if defined(SHIMMER3R)`, so
-     * `STATUS_BYTE_COUNT` is 2 on a Shimmer3R and 1 on a Shimmer3
-     * (`Comms/shimmer_bt_uart.h:259-263`) — hence the nullable field rather than a
-     * plain boolean.
-     */
-    function parseShimmer3StatusBytes(bytes) {
-        if (bytes.length < 1)
-            throw new Error('status payload too short (need at least 1 byte)');
-        const s0 = bytes[0] & 0xff;
-        return {
-            docked: (s0 & 0x01) !== 0,
-            sensing: (s0 & 0x02) !== 0,
-            rtcSet: (s0 & 0x04) !== 0,
-            sdLogging: (s0 & 0x08) !== 0,
-            streaming: (s0 & 0x10) !== 0,
-            sdPresent: (s0 & 0x20) !== 0,
-            sdError: (s0 & 0x40) !== 0,
-            redLedOn: (s0 & 0x80) !== 0,
-            usbPluggedIn: bytes.length >= 2 ? (bytes[1] & 0xff) !== 0 : null,
-            raw: new Uint8Array(bytes),
-        };
     }
 
     /**
@@ -2587,72 +2936,27 @@
     /**
      * Build a stream schema from the channel-ID list reported by the inquiry.
      *
-     * Mirrors ShimmerObject#interpretDataPacketFormat (the channel→format mapping is
-     * identical for Shimmer3 and Shimmer3R, so `CHANNEL_FORMATS` and
-     * `SensorBitmapShimmer3` are reused verbatim). The only Shimmer3-relevant knob is
-     * the timestamp width (u24 for firmware code ≥ 6, else u16 — see
-     * ShimmerObject#updateTimestampByteLength).
+     * Mirrors ShimmerObject#interpretDataPacketFormat. The generation is fixed at
+     * `'shimmer3'`: this file is the classic-Bluetooth Shimmer3 path, so unlike
+     * `Shimmer3RClient` — which the same firmware answers on both platforms — there
+     * is nothing to determine and nothing to assume. That matters for the BMP
+     * channels, which are 2-byte big-endian temperature + 3-byte big-endian
+     * pressure here and 3 little-endian bytes each on a Shimmer3R
+     * (see `CHANNEL_FORMAT_OVERRIDES`).
+     *
+     * The only Shimmer3-relevant knob is the timestamp width (u24 for firmware code
+     * ≥ 6, else u16 — see ShimmerObject#updateTimestampByteLength).
+     *
+     * @param onProblem optional sink for the message an unrecognised channel ID
+     *   produces; `Shimmer3Client` wires it to `onStatus`. The schema's `trusted`
+     *   and `unknownChannelIds` say the same thing to code rather than to a log.
      */
-    function buildShimmer3Schema(channelIds, timestampFmt) {
-        const fields = [];
-        const ts = timestampFmt === 'u24' ? TIMESTAMP_FIELD.u24 : TIMESTAMP_FIELD.u16;
-        let frameBytes = 1 + ts.sizeBytes; // 1 = DATA_PACKET (0x00) preamble
-        let enabledSensors = 0;
-        for (const id of channelIds) {
-            const fmt = CHANNEL_FORMATS[id];
-            if (!fmt) {
-                fields.push({ id, name: `CH_${hex2$1(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
-                frameBytes += 2;
-                continue;
-            }
-            fields.push({ id, ...fmt });
-            frameBytes += fmt.sizeBytes ?? 2;
-            enabledSensors |= channelIdToSensorBit(id);
-        }
-        return { timestampFmt, fields, frameBytes, enabledSensors, dataPreambleByte: 0x00 };
-    }
-    /** Map a channel/signal ID to its SensorBitmapShimmer3 enable bit (0 if none). */
-    function channelIdToSensorBit(id) {
-        switch (id) {
-            case 0x00:
-            case 0x01:
-            case 0x02:
-                return SensorBitmapShimmer3.SENSOR_A_ACCEL;
-            case 0x04:
-            case 0x05:
-            case 0x06:
-                return SensorBitmapShimmer3.SENSOR_D_ACCEL;
-            case 0x14:
-            case 0x15:
-            case 0x16:
-                return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
-            case 0x07:
-            case 0x08:
-            case 0x09:
-                return SensorBitmapShimmer3.SENSOR_MAG;
-            case 0x0a:
-            case 0x0b:
-            case 0x0c:
-                return SensorBitmapShimmer3.SENSOR_GYRO;
-            case 0x12:
-                return SensorBitmapShimmer3.SENSOR_INT_A1;
-            case 0x1c:
-                return SensorBitmapShimmer3.SENSOR_GSR;
-            case 0x23:
-            case 0x24:
-                return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
-            case 0x25:
-            case 0x26:
-                return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
-            case 0x1e:
-            case 0x1f:
-                return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
-            case 0x21:
-            case 0x22:
-                return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
-            default:
-                return 0;
-        }
+    function buildShimmer3Schema(channelIds, timestampFmt, onProblem) {
+        return buildStreamSchema(channelIds, timestampFmt, {
+            generation: 'shimmer3',
+            dataPreambleByte: 0x00,
+            onProblem,
+        });
     }
     /**
      * Decode an INQUIRY_RESPONSE using the Shimmer3 (classic) layout.
@@ -2662,8 +2966,11 @@
      * works, matching Shimmer3RClient's `base` handling).
      *
      * Ported from ShimmerObject#interpretInqResponse, HW_ID.SHIMMER_3 branch.
+     *
+     * @param onProblem optional sink for schema problems (an unrecognised channel
+     *   ID); see {@link buildShimmer3Schema}.
      */
-    function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24') {
+    function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
         let base = 0;
         if (u8[0] === OPCODES.INQUIRY_RESPONSE)
             base = 1;
@@ -2681,7 +2988,7 @@
         const bufferSize = u8[base + 7] ?? 0;
         const chStart = base + 8;
         const channelIds = [...u8.slice(chStart, chStart + numChannels)];
-        const schema = buildShimmer3Schema(channelIds, timestampFmt);
+        const schema = buildShimmer3Schema(channelIds, timestampFmt, onProblem);
         return {
             opcode: u8[0],
             adcRaw,
@@ -8059,74 +8366,44 @@
                 bytes: u8.slice(0),
             };
         }
+        /**
+         * Which generation's channel table this client uses to decode a packet.
+         *
+         * Read from the cached DEVICE_VERSION_RESPONSE when the host has asked for it
+         * ({@link readDeviceVersion}); `'shimmer3r'` otherwise, because that is what
+         * this client is named for and what its default transport connects to.
+         *
+         * The default is not always harmless. This client also drives a classic
+         * Shimmer3 over an RFCOMM byte stream (the two platforms share this command
+         * set), and the two generations disagree about the width of the
+         * pressure/temperature channels — a Shimmer3 sends 2 big-endian bytes of
+         * temperature where a Shimmer3R sends 3 little-endian ones, and reverses the
+         * order of the pair. So call `readDeviceVersion()` before `inquiry()` on any
+         * link that might be a Shimmer3; `inquiry()` deliberately does not send that
+         * command itself, to keep the schema rebuild after `setSensors()` a single
+         * round trip. When the generation is assumed *and* the channel list contains a
+         * channel that depends on it, the schema says so (`trusted === false`) and a
+         * status message names the channels.
+         */
+        get generation() {
+            return generationFromHardwareVersion(this._deviceVersionCache?.hardwareVersion) ?? 'shimmer3r';
+        }
+        /** True when {@link generation} is this SDK's default rather than the device's answer. */
+        get generationIsAssumed() {
+            return generationFromHardwareVersion(this._deviceVersionCache?.hardwareVersion) === null;
+        }
         _buildSchemaFromChannels(channelIds, timestampFmt) {
-            const fields = [];
-            const ts = timestampFmt === 'u24' ? TIMESTAMP_FIELD.u24 : TIMESTAMP_FIELD.u16;
-            let packetSize = 1 + ts.sizeBytes; // 1 = preamble 0x00
-            let enabledSensors = 0;
-            for (const id of channelIds) {
-                const fmt = CHANNEL_FORMATS[id];
-                if (!fmt) {
-                    fields.push({ id, name: `CH_${hex2$1(id)}`, fmt: 'i16', endian: 'le', sizeBytes: 2 });
-                    packetSize += 2;
-                    continue;
-                }
-                fields.push({ id, ...fmt });
-                packetSize += fmt.sizeBytes ?? 2;
-                switch (id) {
-                    case 0x00:
-                    case 0x01:
-                    case 0x02:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_A_ACCEL;
-                        break;
-                    case 0x04:
-                    case 0x05:
-                    case 0x06:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_D_ACCEL;
-                        break;
-                    case 0x14:
-                    case 0x15:
-                    case 0x16:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
-                        break;
-                    case 0x07:
-                    case 0x08:
-                    case 0x09:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_MAG;
-                        break;
-                    case 0x0a:
-                    case 0x0b:
-                    case 0x0c:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_GYRO;
-                        break;
-                    case 0x12:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_INT_A1;
-                        break;
-                    case 0x1c:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_GSR;
-                        break;
-                    case 0x23:
-                    case 0x24:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
-                        break;
-                    case 0x25:
-                    case 0x26:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
-                        break;
-                    case 0x1e:
-                    case 0x1f:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
-                        break;
-                    case 0x21:
-                    case 0x22:
-                        enabledSensors |= SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
-                        break;
-                    default:
-                        console.warn(`⚠️ Unmapped channel ID 0x${id.toString(16)} — added as generic i16.`);
-                }
-            }
-            this.enabledSensors = enabledSensors;
-            return { timestampFmt, fields, frameBytes: packetSize, enabledSensors, dataPreambleByte: 0x00 };
+            const schema = buildStreamSchema(channelIds, timestampFmt, {
+                generation: this.generation,
+                generationAssumed: this.generationIsAssumed,
+                dataPreambleByte: 0x00,
+                // Schema problems have to reach the host, not just the schema object: a
+                // guessed width shifts every later channel in the frame, and the decode
+                // fails silently rather than throwing.
+                onProblem: (m) => this._emitStatus(`⚠️ ${m}`),
+            });
+            this.enabledSensors = schema.enabledSensors;
+            return schema;
         }
         // ---------------------------------------------------------------------------
         // GSR calibration (applied inline during stream parsing)
@@ -11198,7 +11475,10 @@
             this._emitStatus('INQUIRY → waiting for response…');
             await this._write(new Uint8Array([OPCODES.INQUIRY_COMMAND]));
             const rsp = await this._waitForResponse(OPCODES.INQUIRY_RESPONSE, SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS);
-            const info = interpretShimmer3InquiryResponse(rsp, this._timestampFmt);
+            // A channel ID this SDK cannot describe has to reach the host, not just the
+            // schema: its width was guessed, so every later channel in the frame may be
+            // decoding from the wrong offset (see `buildShimmer3Schema`).
+            const info = interpretShimmer3InquiryResponse(rsp, this._timestampFmt, (m) => this._emitStatus(`⚠️ ${m}`));
             this.schema = info.schema;
             this.samplingRateHz = info.samplingRateHz;
             this.enabledSensors = info.schema.enabledSensors;
@@ -22214,6 +22494,7 @@
     exports.BaseShimmerClient = BaseShimmerClient;
     exports.CALIB_READ_SOURCE = CALIB_READ_SOURCE;
     exports.CHANNEL_FORMATS = CHANNEL_FORMATS;
+    exports.CHANNEL_FORMAT_OVERRIDES = CHANNEL_FORMAT_OVERRIDES;
     exports.CHARGING_STATUS_BYTE = CHARGING_STATUS_BYTE;
     exports.CONSENSYS_UNKNOWN_DEVICE = CONSENSYS_UNKNOWN_DEVICE;
     exports.CalibQuality = CalibQuality;
@@ -22367,6 +22648,7 @@
     exports.UART_PACKET_CMD = UART_PACKET_CMD;
     exports.UART_PACKET_HEADER = UART_PACKET_HEADER;
     exports.UART_PROP = UART_PROP;
+    exports.UNKNOWN_CHANNEL_ASSUMED_BYTES = UNKNOWN_CHANNEL_ASSUMED_BYTES;
     exports.VERISENSE_BLE_SCHEDULE_DEFAULTS = VERISENSE_BLE_SCHEDULE_DEFAULTS;
     exports.VERISENSE_BLE_SCHEDULE_RANGES = VERISENSE_BLE_SCHEDULE_RANGES;
     exports.VERISENSE_BLE_SYNC_SCHEDULES = VERISENSE_BLE_SYNC_SCHEDULES;
@@ -22434,6 +22716,7 @@
     exports.buildSelectSlotCommand = buildSelectSlotCommand;
     exports.buildShimmer3Schema = buildShimmer3Schema;
     exports.buildStatCmd = buildStatCmd;
+    exports.buildStreamSchema = buildStreamSchema;
     exports.buildUartPacket = buildUartPacket;
     exports.buildUploadBinaryFileName = buildUploadBinaryFileName;
     exports.buildVerisenseAdvertisedName = buildVerisenseAdvertisedName;
@@ -22445,6 +22728,8 @@
     exports.calibrateU12AdcValue = calibrateU12AdcValue;
     exports.calibrateVector3 = calibrateVector3;
     exports.calibrationBlobCrc = calibrationBlobCrc;
+    exports.channelFormatsFor = channelFormatsFor;
+    exports.channelIdToSensorBit = channelIdToSensorBit;
     exports.checkConfigBytesValid = checkConfigBytesValid;
     exports.classifyBaseResponse = classifyBaseResponse;
     exports.classifyVerisenseDfuError = classifyVerisenseDfuError;
@@ -22492,6 +22777,7 @@
     exports.generateCalibDump = generateCalibDump;
     exports.generateInfoMem = generateInfoMem;
     exports.generateKinematicCalibBlock = generateKinematicCalibBlock;
+    exports.generationFromHardwareVersion = generationFromHardwareVersion;
     exports.getDefaultCalibration = getDefaultCalibration;
     exports.getFirstPayloadIndex = getFirstPayloadIndex;
     exports.getGroupDefaults = getGroupDefaults;
@@ -22514,6 +22800,7 @@
     exports.interpretShimmer3InquiryResponse = interpretShimmer3InquiryResponse;
     exports.isAckCommand = isAckCommand;
     exports.isBadResponse = isBadResponse;
+    exports.isGenerationSensitiveChannel = isGenerationSensitiveChannel;
     exports.isNackCommand = isNackCommand;
     exports.isNewImuSensors = isNewImuSensors;
     exports.isRoutineVerisenseDfuLogMessage = isRoutineVerisenseDfuLogMessage;
@@ -22584,6 +22871,7 @@
     exports.promiseWithTimeout = promiseWithTimeout;
     exports.readInfoMemFieldValue = readInfoMemFieldValue;
     exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
+    exports.resolveChannelFormat = resolveChannelFormat;
     exports.resolveFieldIndex = resolveFieldIndex;
     exports.resolveInfoMemLayout = resolveInfoMemLayout;
     exports.resolveVerisenseSensorRateFieldKey = resolveVerisenseSensorRateFieldKey;
