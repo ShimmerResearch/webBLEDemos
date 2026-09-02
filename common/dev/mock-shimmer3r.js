@@ -280,7 +280,8 @@ export function createMockShimmer3RTransport(opts = {}) {
     }
 
     for (let i = 0; i < 6; i++) {
-      infoMem[IM.macAddress + i] = parseInt(mac.slice(i * 2, i * 2 + 2), 16) || 0;
+      infoMem[IM.macAddress + i] =
+        parseInt(mac.slice(i * 2, i * 2 + 2), 16) || 0;
     }
   }
 
@@ -382,7 +383,7 @@ export function createMockShimmer3RTransport(opts = {}) {
       : (1 << (width.bytes * 8 - 1)) - 1;
     const t = n / state.rateHz;
     const phase = ((id * 37) % 360) * (Math.PI / 180);
-    const freq = 0.7 + ((id % 5) * 0.4);
+    const freq = 0.7 + (id % 5) * 0.4;
     const swing = Math.sin(2 * Math.PI * freq * t + phase);
     if (width.unsigned) return Math.round(full * (0.5 + 0.3 * swing));
     return Math.round(full * 0.45 * swing);
@@ -425,7 +426,9 @@ export function createMockShimmer3RTransport(opts = {}) {
       const elapsed = (performance.now() - streamStartMs) / 1000;
       const due = Math.floor(elapsed * state.rateHz) - samplesEmitted;
       for (let i = 0; i < due; i++) {
-        replyStream(dataFrame(ids, Math.round(streamTicks) & 0xffffff, samplesEmitted));
+        replyStream(
+          dataFrame(ids, Math.round(streamTicks) & 0xffffff, samplesEmitted),
+        );
         streamTicks = (streamTicks + ticksPerSample) % 0x1000000;
         samplesEmitted++;
       }
@@ -480,7 +483,13 @@ export function createMockShimmer3RTransport(opts = {}) {
       case CMD.GET_STATUS:
         // Status arrives wrapped in an in-stream response, because on real
         // firmware it can be answered mid-stream.
-        reply([ACK, CMD.INSTREAM_CMD_RESPONSE, CMD.STATUS_RESPONSE, 0x00, 0x00]);
+        reply([
+          ACK,
+          CMD.INSTREAM_CMD_RESPONSE,
+          CMD.STATUS_RESPONSE,
+          0x00,
+          0x00,
+        ]);
         return;
 
       case CMD.GET_VBATT: {
@@ -524,7 +533,8 @@ export function createMockShimmer3RTransport(opts = {}) {
         // inquiry after a config write reports the new rate and sensors —
         // which is exactly what the firmware does on undock.
         if (off === 0 && len >= 6) {
-          const divisor = infoMem[IM.samplingRate] | (infoMem[IM.samplingRate + 1] << 8);
+          const divisor =
+            infoMem[IM.samplingRate] | (infoMem[IM.samplingRate + 1] << 8);
           if (divisor > 0) state.rateHz = SAMPLING_CLOCK_HZ / divisor;
           state.sensors =
             infoMem[IM.sensors0] |
@@ -549,7 +559,8 @@ export function createMockShimmer3RTransport(opts = {}) {
 
       case CMD.SET_RWC: {
         let ticks = 0n;
-        for (let i = 8; i >= 1; i--) ticks = (ticks << 8n) | BigInt(cmd[i] ?? 0);
+        for (let i = 8; i >= 1; i--)
+          ticks = (ticks << 8n) | BigInt(cmd[i] ?? 0);
         state.rwcTicks = ticks;
         reply([ACK]);
         return;
@@ -620,7 +631,8 @@ export function createMockShimmer3RTransport(opts = {}) {
          * opcode, and silence here would surface as a command timeout —
          * sending whoever is debugging the page looking for a link fault
          * instead of a missing mock command. */
-        if (debug) console.warn(`[mock] unhandled command 0x${op.toString(16)}`);
+        if (debug)
+          console.warn(`[mock] unhandled command 0x${op.toString(16)}`);
         reply([NACK]);
         return;
     }

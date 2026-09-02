@@ -147,7 +147,9 @@ export function createConnectController(cfg) {
     if (els.usb) els.usb.disabled = on || connecting || !support.webSerial;
     if (els.disconnect) els.disconnect.disabled = !on;
     if (els.pill) {
-      els.pill.textContent = on ? (label ?? session?.label ?? "connected") : "disconnected";
+      els.pill.textContent = on
+        ? (label ?? session?.label ?? "connected")
+        : "disconnected";
       els.pill.classList.toggle("on", !!on);
     }
   }
@@ -364,7 +366,9 @@ export function createConnectController(cfg) {
       try {
         await cfg.afterConnect?.(session);
       } catch (hookErr) {
-        error(`post-connect diagnostics failed: ${hookErr?.message ?? hookErr}`);
+        error(
+          `post-connect diagnostics failed: ${hookErr?.message ?? hookErr}`,
+        );
       }
       return true;
     } catch (e) {

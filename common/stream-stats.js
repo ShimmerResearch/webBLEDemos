@@ -215,7 +215,9 @@ export function createStreamStats(container, opts = {}) {
       ? `${(snap.throughputBps / 1024).toFixed(1)} kB/s`
       : "–";
     values.frames.textContent = frames.toLocaleString();
-    values.duration.textContent = frames ? fmtDuration(snap.durationMillis) : "–";
+    values.duration.textContent = frames
+      ? fmtDuration(snap.durationMillis)
+      : "–";
   }
 
   return { reset, onFrame, render, snapshot };

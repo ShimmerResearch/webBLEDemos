@@ -57,7 +57,8 @@ export function el(tag, attrs, ...children) {
     else if (k === "text" || k === "textContent") node.textContent = String(v);
     else if (k === "html") node.innerHTML = String(v);
     else if (k === "dataset") Object.assign(node.dataset, v);
-    else if (k === "style" && typeof v === "object") Object.assign(node.style, v);
+    else if (k === "style" && typeof v === "object")
+      Object.assign(node.style, v);
     else if (k.startsWith("on") && typeof v === "function")
       node.addEventListener(k.slice(2).toLowerCase(), v);
     else if (v === true) node.setAttribute(k, "");

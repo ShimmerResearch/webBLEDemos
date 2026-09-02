@@ -18,7 +18,10 @@ export const THEME_STORAGE_KEY = "uiTheme";
 export const THEME_CHANGE_EVENT = "ui-theme-change";
 
 /** `<meta name="theme-color">` values. These mirror --bg in theme.css. */
-export const THEME_COLORS = Object.freeze({ light: "#f4f6f8", dark: "#0d1117" });
+export const THEME_COLORS = Object.freeze({
+  light: "#f4f6f8",
+  dark: "#0d1117",
+});
 
 /**
  * The inline <head> script, as source text.
@@ -59,7 +62,8 @@ export function getTheme() {
   const attr = document.documentElement.dataset.theme;
   if (attr === "dark" || attr === "light") return attr;
   try {
-    if (window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
+    if (window.matchMedia("(prefers-color-scheme: dark)").matches)
+      return "dark";
   } catch {
     /* matchMedia missing — fall through to light */
   }

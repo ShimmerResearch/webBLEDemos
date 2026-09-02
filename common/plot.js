@@ -94,7 +94,10 @@ export function groupForField(name) {
   if (n.startsWith("MAG")) return "MAG";
   // The ExG status byte is a register readback, not a signal, so it is not an
   // ExG trace — it falls through to OTHER with the rest of the odds and ends.
-  if ((n.startsWith("Exg1_") || n.startsWith("Exg2_")) && !n.endsWith("_Status"))
+  if (
+    (n.startsWith("Exg1_") || n.startsWith("Exg2_")) &&
+    !n.endsWith("_Status")
+  )
     return "EXG";
   if (n.startsWith("GSR")) return "GSR";
   if (n.startsWith("PPG")) return "PPG";
@@ -161,7 +164,7 @@ export function createStreamPlot(host, opts = {}) {
   const ChartCtor = globalThis.Chart;
   if (!ChartCtor) {
     throw new Error(
-      "Chart.js is not loaded — add <script src=\"../common/vendor/chart.umd.min.js\"></script> before importing common/plot.js",
+      'Chart.js is not loaded — add <script src="../common/vendor/chart.umd.min.js"></script> before importing common/plot.js',
     );
   }
 
@@ -246,7 +249,10 @@ export function createStreamPlot(host, opts = {}) {
         responsive: true,
         maintainAspectRatio: false,
         spanGaps: false,
-        elements: { point: { radius: 0 }, line: { borderWidth: 1.4, tension: 0 } },
+        elements: {
+          point: { radius: 0 },
+          line: { borderWidth: 1.4, tension: 0 },
+        },
         scales: {
           x: {
             type: "linear",

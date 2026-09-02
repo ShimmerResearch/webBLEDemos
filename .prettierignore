@@ -1,0 +1,13 @@
+# Vendored third-party bundles. They are checked in byte-identical to the
+# upstream build (see common/vendor/README.md), and prettier un-minifies a
+# minified file -- chart.umd.min.js grows from 204 KB to 342 KB, and the diff
+# is the whole library. Nothing here is ours to format.
+#
+# The HTML formatting workflow (.github/workflows/html-format.yml) only ever
+# touches **/*.html, so this file changes nothing for it; it exists to protect
+# these bundles from anyone running prettier over the repo by hand.
+common/vendor/chart.umd.min.js
+shimmer-extension/chart.min.js
+shimmer-extension/jszip.min.js
+shimmer-extension/vendor/
+Verisense/vendor/

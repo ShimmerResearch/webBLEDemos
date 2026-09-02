@@ -60,7 +60,8 @@ export function createCsvRecorder(opts = {}) {
   const unitsRow = opts.unitsRow !== false;
   const hostTimeColumn = opts.hostTimeColumn !== false;
 
-  const logger = typeof opts.log === "function" ? { log: opts.log } : (opts.log ?? {});
+  const logger =
+    typeof opts.log === "function" ? { log: opts.log } : (opts.log ?? {});
   const warn = (m) => (logger.warn ?? logger.log)?.(String(m));
 
   let active = false;
@@ -235,9 +236,9 @@ export function createCsvRecorder(opts = {}) {
       return false;
     }
 
-    const cells = new Array(
-      columns.length + 1 + (hostTimeColumn ? 1 : 0),
-    ).fill("");
+    const cells = new Array(columns.length + 1 + (hostTimeColumn ? 1 : 0)).fill(
+      "",
+    );
     let at = 0;
     if (hostTimeColumn) cells[at++] = Math.round(hostMs);
     const tsAt = at++;

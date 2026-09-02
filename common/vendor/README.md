@@ -6,13 +6,13 @@ there is no `npm install` to reproduce it and nothing resolves at runtime.
 
 ## `chart.umd.min.js`
 
-| | |
-| --- | --- |
-| Library | [Chart.js](https://www.chartjs.org) |
-| Version | **4.5.1** (pinned) |
-| Build | UMD, minified — defines the global `Chart` |
-| Licence | MIT (header retained at the top of the file) |
-| Source | `shimmer-extension/chart.min.js` in this repo, itself the upstream `chart.umd.min.js` from `chart.js@4.5.1`; byte-identical copy |
+|         |                                                                                                                                  |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Library | [Chart.js](https://www.chartjs.org)                                                                                              |
+| Version | **4.5.1** (pinned)                                                                                                               |
+| Build   | UMD, minified — defines the global `Chart`                                                                                       |
+| Licence | MIT (header retained at the top of the file)                                                                                     |
+| Source  | `shimmer-extension/chart.min.js` in this repo, itself the upstream `chart.umd.min.js` from `chart.js@4.5.1`; byte-identical copy |
 
 Load it before any module that uses it, so the global exists first:
 
