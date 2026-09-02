@@ -373,6 +373,8 @@ export function createConfigForm(host, cfg) {
   const entries = new Map();
   /** @type {Map<string, HTMLElement>} group id -> its <details> */
   const groupNodes = new Map();
+  /** @type {Map<string, HTMLElement>} group id -> its [data-group-body] slot */
+  const groupBodies = new Map();
   /** @type {Map<string, HTMLElement>} group/subgroup id -> the .grid it fills */
   const grids = new Map();
 
@@ -419,6 +421,7 @@ export function createConfigForm(host, cfg) {
         class: "group-body",
         dataset: { groupBody: g.id },
       });
+      groupBodies.set(g.id, body);
       // Ungrouped fields fill this grid; labelled subpanels follow it.
       const grid = el("div", { class: "grid" });
       body.appendChild(grid);
@@ -763,8 +766,10 @@ export function createConfigForm(host, cfg) {
       );
       // An empty group (the sensor-enable bitmaps are not schema fields, so
       // "Sensor Enables" arrives with none) is hidden unless the page has put
-      // its own controls into the group's [data-group-body] slot.
-      const injected = details.querySelector(`[data-group-body="${g.id}"]`);
+      // its own controls into the group's [data-group-body] slot. Held as a
+      // direct reference rather than looked up by selector, so a group id
+      // with a quote or a dot in it cannot break the query.
+      const injected = groupBodies.get(g.id);
       const hasOwnContent =
         !!injected &&
         [...injected.children].some(
@@ -868,6 +873,7 @@ export function createConfigForm(host, cfg) {
       host.replaceChildren();
       entries.clear();
       groupNodes.clear();
+      groupBodies.clear();
       grids.clear();
     },
   };
