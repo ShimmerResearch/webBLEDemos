@@ -793,7 +793,15 @@ declare function objectClusterColumns(oc: ObjectCluster, opts?: ObjectClusterCol
  *
  * Matches on the column's kind EXACTLY, which `ObjectCluster.get` deliberately
  * does not — it treats a null `kind` as "any kind", so a kindless column would
- * pick up a raw field that shares its name.
+ * pick up a raw field that shares its name. Hence the index below is keyed by
+ * kind first: the three buckets can never see each other.
+ *
+ * The index is built once per call rather than scanning `oc.fields` per column,
+ * which made the projection O(columns × fields). This runs on the streaming
+ * path — a Shimmer3R can put twenty-odd channels through it at 1024 Hz, and
+ * both factors grow with the channel count together — so the quadratic term is
+ * the whole cost. Keyed by kind then name rather than by a joined string so
+ * there is no per-field key allocation to collect afterwards.
  */
 declare function objectClusterRow(oc: ObjectCluster, columns: readonly ObjectClusterColumn[]): (number | null)[];
 
@@ -2525,16 +2533,26 @@ interface InfoMemImuConfig {
      */
     pressureOversampling: number;
     /**
-     * Alt-mag (LIS3MDL) sampling rate, Shimmer3R only. ConfigSetupByte5 (idx
-     * 131) bits 0-5 (`maskLIS3MDLAltMagSamplingRate` 0x3F,
-     * SensorLIS3MDL.java:809; FW `altMagRate`). Raw LIS3MDL CTRL_REG1 code, e.g.
-     * 0x01 = 1000 Hz.
+     * Alt-mag (LIS3MDL) sampling rate. ConfigSetupByte5 (idx 131) bits 0-5
+     * (`maskLIS3MDLAltMagSamplingRate` 0x3F, SensorLIS3MDL.java:809; FW
+     * `altMagRate`). Raw LIS3MDL CTRL_REG1 code, e.g. 0x01 = 1000 Hz.
+     *
+     * The byte means this on **both** generations — the field sits outside every
+     * `#if` in the shared firmware's config struct (`Configuration/
+     * shimmer_config.h`, "Idx 131") — but only a Shimmer3R carries the LIS3MDL
+     * it configures, so on a Shimmer3 it is inert rather than absent. It is
+     * parsed and written back unconditionally so a read-modify-write preserves
+     * whatever the byte held; a host should offer it only where the hardware has
+     * the part, which is what the field schema's `appliesTo` expresses.
      */
     altMagRate: number;
     /**
-     * Alt-accel (ADXL371) sampling rate, Shimmer3R only. ConfigSetupByte4 bits
-     * 6-7 (`bitShiftADXL371AltAccelSamplingRate`, SensorADXL371.java:356; FW
+     * Alt-accel (ADXL371) sampling rate. ConfigSetupByte4 bits 6-7
+     * (`bitShiftADXL371AltAccelSamplingRate`, SensorADXL371.java:356; FW
      * `altAccelRate`). 0-3 = 320/640/1280/2560 Hz.
+     *
+     * As with {@link InfoMemImuConfig.altMagRate}, the byte carries this meaning
+     * on both generations and is inert on a Shimmer3, which has no ADXL371.
      */
     altAccelRate: number;
 }
@@ -3788,6 +3806,22 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * two callers may be awaiting at once.
      */
     private _statusReadsInFlight;
+    /**
+     * How many status payload bytes a STATUS_RESPONSE must carry before it is
+     * worth parsing.
+     *
+     * Once {@link readDeviceVersion} has answered, {@link _statusPayloadBytes} is
+     * a contract — the firmware sends exactly that many — so a shorter message is
+     * a truncated one, not a shorter platform. Parsing it anyway would report
+     * `usbPluggedIn: null`, which means "this hardware has no such field" and NOT
+     * "the byte did not arrive"; the caller cannot tell those apart, so the
+     * shorter message must not be surfaced as a status at all.
+     *
+     * Before the platform is known the 2 is only a guess biased towards this
+     * client's namesake, so demanding it would reject — or time out on — the
+     * perfectly valid one-byte status a Shimmer3 sends.
+     */
+    private get _minStatusPayloadBytes();
     enabledSensors: number;
     samplingRateHz: number;
     gsrRangeSetting: number;
@@ -3817,6 +3851,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      *
      * The answer to a {@link getStatus} call is NOT delivered here — that would
      * report every state twice.
+     *
+     * A push whose payload is short of the connected platform's status length is
+     * dropped (with a debug log) rather than parsed, so `usbPluggedIn: null` here
+     * always means "a Shimmer3, which has no such field" and never "the byte went
+     * missing". See {@link readDeviceVersion} for how that length is learnt.
      *
      * **Only fires while idle.** Once streaming, every inbound byte belongs to the
      * data plane and goes to the schema parser, which has no way to tell a status
@@ -4393,6 +4432,12 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * Shimmer3 answers with one status byte where a Shimmer3R sends two, and over
      * a byte stream the framer needs to know which before it can split the
      * message. Getting it wrong there consumes the ACK that follows.
+     *
+     * Calling it first also sharpens the failure mode here: with the platform
+     * known, an answer shorter than that platform's status is a truncated message
+     * and this rejects on timeout rather than returning a status whose
+     * `usbPluggedIn` is `null`. While the platform is unknown the short answer is
+     * still accepted, because it is indistinguishable from a Shimmer3's.
      */
     getStatus(): Promise<Shimmer3DeviceStatus>;
     /**

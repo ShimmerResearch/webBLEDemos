@@ -983,11 +983,29 @@ function objectClusterColumns(oc, opts = {}) {
  *
  * Matches on the column's kind EXACTLY, which `ObjectCluster.get` deliberately
  * does not — it treats a null `kind` as "any kind", so a kindless column would
- * pick up a raw field that shares its name.
+ * pick up a raw field that shares its name. Hence the index below is keyed by
+ * kind first: the three buckets can never see each other.
+ *
+ * The index is built once per call rather than scanning `oc.fields` per column,
+ * which made the projection O(columns × fields). This runs on the streaming
+ * path — a Shimmer3R can put twenty-odd channels through it at 1024 Hz, and
+ * both factors grow with the channel count together — so the quadratic term is
+ * the whole cost. Keyed by kind then name rather than by a joined string so
+ * there is no per-field key allocation to collect afterwards.
  */
 function objectClusterRow(oc, columns) {
+    const byKind = new Map();
+    for (const field of oc.fields) {
+        let byName = byKind.get(field.kind);
+        if (!byName)
+            byKind.set(field.kind, (byName = new Map()));
+        // First occurrence wins, as `Array.find` did and as
+        // {@link objectClusterColumns} promises when a frame repeats a name/kind.
+        if (!byName.has(field.name))
+            byName.set(field.name, field);
+    }
     return columns.map((column) => {
-        const field = oc.fields.find((f) => f.name === column.name && f.kind === column.kind);
+        const field = byKind.get(column.kind)?.get(column.name);
         return field ? field.value : null;
     });
 }
@@ -6849,6 +6867,24 @@ const CALIB_DUMP_CHUNK_BYTES = 128;
  * ```
  */
 class Shimmer3RClient extends BaseShimmerClient {
+    /**
+     * How many status payload bytes a STATUS_RESPONSE must carry before it is
+     * worth parsing.
+     *
+     * Once {@link readDeviceVersion} has answered, {@link _statusPayloadBytes} is
+     * a contract — the firmware sends exactly that many — so a shorter message is
+     * a truncated one, not a shorter platform. Parsing it anyway would report
+     * `usbPluggedIn: null`, which means "this hardware has no such field" and NOT
+     * "the byte did not arrive"; the caller cannot tell those apart, so the
+     * shorter message must not be surfaced as a status at all.
+     *
+     * Before the platform is known the 2 is only a guess biased towards this
+     * client's namesake, so demanding it would reject — or time out on — the
+     * perfectly valid one-byte status a Shimmer3 sends.
+     */
+    get _minStatusPayloadBytes() {
+        return this._deviceVersionCache ? this._statusPayloadBytes : 1;
+    }
     constructor(opts = {}) {
         super(opts);
         /**
@@ -6925,6 +6961,11 @@ class Shimmer3RClient extends BaseShimmerClient {
          *
          * The answer to a {@link getStatus} call is NOT delivered here — that would
          * report every state twice.
+         *
+         * A push whose payload is short of the connected platform's status length is
+         * dropped (with a debug log) rather than parsed, so `usbPluggedIn: null` here
+         * always means "a Shimmer3, which has no such field" and never "the byte went
+         * missing". See {@link readDeviceVersion} for how that length is learnt.
          *
          * **Only fires while idle.** Once streaming, every inbound byte belongs to the
          * data plane and goes to the schema parser, which has no way to tell a status
@@ -7193,8 +7234,6 @@ class Shimmer3RClient extends BaseShimmerClient {
         // there. On a byte stream the drain has already split the ACK off, but over
         // BLE it shares the notification.
         const at = chunk[0] === OPCODES.ACK_COMMAND_PROCESSED ? 1 : 0;
-        if (chunk.length < at + 3)
-            return;
         if (chunk[at] !== OPCODES.INSTREAM_CMD_RESPONSE)
             return;
         if (chunk[at + 1] !== OPCODES.STATUS_RESPONSE)
@@ -7202,6 +7241,20 @@ class Shimmer3RClient extends BaseShimmerClient {
         // Somebody's answer, not news: `getStatus` reports it to its own caller.
         if (this._statusReadsInFlight > 0)
             return;
+        // The payload must be ALL there, not merely started. A guard of `at + 3`
+        // let a push with one status byte through on a two-byte platform, and the
+        // parser then reported `usbPluggedIn: null` — indistinguishable, to the
+        // caller, from a Shimmer3 that has no such field.
+        const need = this._minStatusPayloadBytes;
+        if (chunk.length < at + 2 + need) {
+            // Dropped rather than surfaced: nobody asked for this message, so there
+            // is no caller waiting to be failed, and inventing a status is worse than
+            // missing one the firmware will push again on the next change. Logged
+            // because a short push means the framing is wrong, which is exactly the
+            // kind of thing whoever turned `debug` on is looking for.
+            this._log('Dropping truncated STATUS push:', chunk.length - at - 2, 'payload byte(s), need', need);
+            return;
+        }
         try {
             this.onDeviceStatus(parseShimmer3StatusBytes(chunk.subarray(at + 2, at + 2 + this._statusPayloadBytes)));
         }
@@ -7504,14 +7557,33 @@ class Shimmer3RClient extends BaseShimmerClient {
      * length that was asked for, so a response with no header at all still
      * reaches the caller intact.
      */
-    async _readLengthPrefixedResponse(cmd, respOpcode, expectedLen, label, headerBytes = 1, ackTimeoutMs = 1500, responseTimeoutMs = 2000) {
+    async _readLengthPrefixedResponse(cmd, respOpcode, expectedLen, label, headerBytes = 1, ackTimeoutMs = 1500, responseTimeoutMs = 2000, expectedOffset) {
         const remainder = await this._writeExpectingAck(cmd, ackTimeoutMs);
         const first = remainder && remainder[0] === respOpcode
             ? remainder
             : await this._waitForResponse(respOpcode, responseTimeoutMs);
         /* Bytes after the response opcode. */
         let acc = first[0] === respOpcode ? first.subarray(1) : first;
-        const dataOf = (buf) => buf.length >= headerBytes && buf[0] === expectedLen ? buf.subarray(headerBytes) : buf;
+        /* Whether a header is present is decided by reading it, because a response
+         * without one is a case this client supports (see the loopback test for an
+         * InfoMem reply with no length byte). That check is unavoidably a guess for
+         * a one-byte header: `[6][six bytes]` and `[six bytes beginning 0x06]` are
+         * not distinguishable, and guessing wrong slices real data off the front.
+         *
+         * The three-byte calibration header is not in that position, so it is not
+         * treated as if it were. Its two offset bytes echo the offset that was
+         * requested, and checking them alongside the length turns a coincidence on
+         * one byte into a coincidence on three. Previously only `buf[0]` was
+         * examined and the offset bytes were ignored entirely. */
+        const hasHeader = (buf) => {
+            if (buf.length < headerBytes || buf[0] !== expectedLen)
+                return false;
+            if (headerBytes >= 3 && expectedOffset !== undefined) {
+                return (buf[1] | (buf[2] << 8)) === expectedOffset;
+            }
+            return true;
+        };
+        const dataOf = (buf) => hasHeader(buf) ? buf.subarray(headerBytes) : buf;
         if (dataOf(acc).length >= expectedLen) {
             return dataOf(acc).slice(0, expectedLen);
         }
@@ -8242,7 +8314,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             (offset >> 8) & 0xff,
         ]);
         this._emitStatus(`GET_CALIB_DUMP ${length}B @ ${offset} → waiting for ACK then RSP…`);
-        return this._readLengthPrefixedResponse(cmd, OPCODES.RSP_CALIB_DUMP_COMMAND, length, 'Calibration dump read', 3);
+        return this._readLengthPrefixedResponse(cmd, OPCODES.RSP_CALIB_DUMP_COMMAND, length, 'Calibration dump read', 3, 1500, 2000, offset);
     }
     // ---------------------------------------------------------------------------
     // Streaming
@@ -8724,6 +8796,12 @@ class Shimmer3RClient extends BaseShimmerClient {
      * Shimmer3 answers with one status byte where a Shimmer3R sends two, and over
      * a byte stream the framer needs to know which before it can split the
      * message. Getting it wrong there consumes the ACK that follows.
+     *
+     * Calling it first also sharpens the failure mode here: with the platform
+     * known, an answer shorter than that platform's status is a truncated message
+     * and this rejects on timeout rather than returning a status whose
+     * `usbPluggedIn` is `null`. While the platform is unknown the short answer is
+     * still accepted, because it is indistinguishable from a Shimmer3's.
      */
     async getStatus() {
         if (!this._transport)
@@ -8735,12 +8813,16 @@ class Shimmer3RClient extends BaseShimmerClient {
         try {
             this._emitStatus('GET_STATUS → waiting for ACK then RSP…');
             const ackRemainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_STATUS_COMMAND]), 1500);
+            // Read once, so the ACK-remainder shortcut and the waiter that backs it
+            // up agree on what counts as a whole message even if another caller
+            // learns the platform mid-await.
+            const need = this._minStatusPayloadBytes;
             const rsp = ackRemainder &&
-                ackRemainder.length >= 3 &&
+                ackRemainder.length >= 2 + need &&
                 ackRemainder[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
                 ackRemainder[1] === OPCODES.STATUS_RESPONSE
                 ? ackRemainder
-                : await this._waitForInstreamResponse(OPCODES.STATUS_RESPONSE, 1, 1500);
+                : await this._waitForInstreamResponse(OPCODES.STATUS_RESPONSE, need, 1500);
             const status = parseShimmer3StatusBytes(rsp.subarray(2, 2 + this._statusPayloadBytes));
             this._emitStatus(`Status: docked=${status.docked} sensing=${status.sensing} ` +
                 `logging=${status.sdLogging} streaming=${status.streaming} ` +
