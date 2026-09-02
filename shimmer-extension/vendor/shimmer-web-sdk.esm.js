@@ -10389,210 +10389,26 @@ function writeName(out, offset, name) {
 // ---------------------------------------------------------------------------
 // Option tables
 // ---------------------------------------------------------------------------
-// TODO(next PR): source these from devices/shimmer3/sensorOptions.ts once that
-// module lands. The tuple shape ([value, label]) is identical, so the swap is a
-// mechanical import change — every table below is transcribed verbatim from the
-// Java `Listof…` / `Listof…ConfigValues` pairs cited on each constant.
+// Every Java-derived option table lives in devices/shimmer3/sensorOptions.ts,
+// which ports the driver's `Listof…` / `Listof…ConfigValues` pairs verbatim with
+// a file:line citation on each. The fields below reference those arrays
+// DIRECTLY — same object, no local copy — because a second transcription is a
+// second chance to get a register encoding wrong, and this file used to have
+// three such mistakes (an LSM303AH range built from label indexes instead of the
+// chip's {0,2,3,1} FS bits, an LSM303DLHC rate list hand-merged out of the
+// high-resolution and low-power lists, and the Shimmer2 GSR bands on a Shimmer3
+// field). `tests/infomem/schema.test.ts` asserts the reference identity so the
+// duplication cannot come back.
+//
+// `ON_OFF` below is the one local table: it renders a 1-bit flag and has no
+// Java `Listof…` counterpart to cite.
 const ALL = ['shimmer3-old-imu', 'shimmer3-new-imu', 'shimmer3r'];
 const SHIMMER3_ONLY = ['shimmer3-old-imu', 'shimmer3-new-imu'];
 const S3R_ONLY = ['shimmer3r'];
 const OLD_IMU_ONLY = ['shimmer3-old-imu'];
 const NEW_IMU_ONLY = ['shimmer3-new-imu'];
-/** `SensorLSM303.ListofLSM303AccelRange` / `SensorLIS2DW12.ListofLIS2DW12AccelRange` (identical). */
-const WR_ACCEL_RANGE = [
-    [0, '± 2 g'],
-    [1, '± 4 g'],
-    [2, '± 8 g'],
-    [3, '± 16 g'],
-];
-/** `SensorLSM303DLHC.ListofLSM303DLHCAccelRateHr` + `…ConfigValues` (note: no value 8). */
-const WR_ACCEL_RATE_LSM303DLHC = [
-    [0, 'Power-down'],
-    [1, '1.0 Hz'],
-    [2, '10.0 Hz'],
-    [3, '25.0 Hz'],
-    [4, '50.0 Hz'],
-    [5, '100.0 Hz'],
-    [6, '200.0 Hz'],
-    [7, '400.0 Hz'],
-    [8, '1620.0 Hz (low-power only)'],
-    [9, '1344.0 Hz / 5376.0 Hz (low-power)'],
-];
-/** `SensorLSM303AH.ListofLSM303AHAccelRateHr` + `…ConfigValues`. */
-const WR_ACCEL_RATE_LSM303AH = [
-    [0, 'Power-down'],
-    [1, '12.5 Hz'],
-    [2, '25.0 Hz'],
-    [3, '50.0 Hz'],
-    [4, '100.0 Hz'],
-    [5, '200.0 Hz'],
-    [6, '400.0 Hz'],
-    [7, '800.0 Hz'],
-    [8, '1600.0 Hz'],
-    [9, '3200.0 Hz'],
-    [10, '6400.0 Hz'],
-];
-/** `SensorLIS2DW12.ListofLIS2DW12AccelRateHpm` + `…ConfigValues`. */
-const WR_ACCEL_RATE_LIS2DW12 = [
-    [0, 'Power-down'],
-    [1, '12.5 Hz'],
-    [2, '12.5 Hz'],
-    [3, '25.0 Hz'],
-    [4, '50.0 Hz'],
-    [5, '100.0 Hz'],
-    [6, '200.0 Hz'],
-    [7, '400.0 Hz'],
-    [8, '800.0 Hz'],
-    [9, '1600.0 Hz'],
-];
-/** `SensorMPU9X50.ListofGyroRange` + `ListofMPU9X50GyroRangeConfigValues`. */
-const GYRO_RANGE_MPU9X50 = [
-    [0, '± 250 dps'],
-    [1, '± 500 dps'],
-    [2, '± 1000 dps'],
-    [3, '± 2000 dps'],
-];
-/** `SensorLSM6DSV.ListofGyroRange` + `ListofLSM6DSVGyroRangeConfigValues`. */
-const GYRO_RANGE_LSM6DSV = [
-    [0, '± 125 dps'],
-    [1, '± 250 dps'],
-    [2, '± 500 dps'],
-    [3, '± 1000 dps'],
-    [4, '± 2000 dps'],
-    [5, '± 4000 dps'],
-];
-/**
- * `SensorLSM6DSV.ListofLSM6DSVGyroRate` + `…ConfigValues`. NOTE: the Java
- * label array has 13 entries (values 0-12) while `…ConfigValues` lists 0-13, so
- * value 13 has no Java label; it is omitted here rather than invented.
- */
-const IMU_RATE_LSM6DSV = [
-    [0, 'Power-down'],
-    [1, '1.875 Hz'],
-    [2, '7.5 Hz'],
-    [3, '12.0 Hz'],
-    [4, '30.0 Hz'],
-    [5, '60.0 Hz'],
-    [6, '120.0 Hz'],
-    [7, '240.0 Hz'],
-    [8, '480.0 Hz'],
-    [9, '960.0 Hz'],
-    [10, '1920.0 Hz'],
-    [11, '3840.0 Hz'],
-    [12, '7680.0 Hz'],
-];
-/** `SensorLSM303DLHC.ListofLSM303DLHCMagRange` + `…ConfigValues` (no '0' option). */
-const MAG_RANGE_LSM303DLHC = [
-    [1, '± 1.3 Ga'],
-    [2, '± 1.9 Ga'],
-    [3, '± 2.5 Ga'],
-    [4, '± 4.0 Ga'],
-    [5, '± 4.7 Ga'],
-    [6, '± 5.6 Ga'],
-    [7, '± 8.1 Ga'],
-];
-/** `SensorLIS3MDL.ListofLIS3MDLAltMagRange` + `…ConfigValues`. */
-const ALT_MAG_RANGE_LIS3MDL = [
-    [0, '± 4 Ga'],
-    [1, '± 8 Ga'],
-    [2, '± 12 Ga'],
-    [3, '± 16 Ga'],
-];
-/** `SensorLSM303DLHC.ListofLSM303DLHCMagRate` + `…ConfigValues`. */
-const MAG_RATE_LSM303DLHC = [
-    [0, '0.75 Hz'],
-    [1, '1.5 Hz'],
-    [2, '3.0 Hz'],
-    [3, '7.5 Hz'],
-    [4, '15.0 Hz'],
-    [5, '30.0 Hz'],
-    [6, '75.0 Hz'],
-    [7, '220.0 Hz'],
-];
-/**
- * `SensorLSM303AH.ListofLSM303AHMagRate` and
- * `SensorLIS2MDL.ListofLIS2MDLMagRate` — identical tables.
- */
-const MAG_RATE_LIS2MDL = [
-    [0, '10.0 Hz'],
-    [1, '20.0 Hz'],
-    [2, '50.0 Hz'],
-    [3, '100.0 Hz'],
-];
-/** `SensorLIS3MDL.ListofLIS3MDLAltMagRate` + `…ConfigValues` (raw CTRL_REG1 codes). */
-const ALT_MAG_RATE_LIS3MDL = [
-    [0x01, '1000 Hz'],
-    [0x11, '560 Hz'],
-    [0x21, '300 Hz'],
-    [0x31, '155 Hz'],
-    [0x3e, '80 Hz'],
-    [0x3a, '20 Hz'],
-    [0x08, '10 Hz'],
-];
-/** `SensorADXL371.ListofADXL371AccelRate` + `…ConfigValues`. */
-const ALT_ACCEL_RATE_ADXL371 = [
-    [0, '320 Hz'],
-    [1, '640 Hz'],
-    [2, '1280 Hz'],
-    [3, '2560 Hz'],
-];
-/** `SensorMPU9X50.ListofMPU9X50AccelRange` + `…ConfigValues`. */
-const ALT_ACCEL_RANGE_MPU9X50 = [
-    [0, '± 2 g'],
-    [1, '± 4 g'],
-    [2, '± 8 g'],
-    [3, '± 16 g'],
-];
-/** `SensorLSM6DSV.ListofLSM6DSVAccelRange` + `…ConfigValues` (same bits on Shimmer3R). */
-const LN_ACCEL_RANGE_LSM6DSV = [
-    [0, '± 2 g'],
-    [1, '± 4 g'],
-    [2, '± 8 g'],
-    [3, '± 16 g'],
-];
-/** `SensorBMP180.ListofPressureResolution` (BMP180/BMP280, 2-bit field). */
-const PRESSURE_OVERSAMPLING_BMPX80 = [
-    [0, 'Low'],
-    [1, 'Standard'],
-    [2, 'High'],
-    [3, 'Very High'],
-];
-/**
- * `SensorBMP581.ListofPressureResolutionBMP581` + `…ConfigValues` — the widest
- * table for the 3-bit composite field (`SensorBMP390`'s stops at 5).
- */
-const PRESSURE_OVERSAMPLING_BMP581 = [
-    [0, 'Lowest Power'],
-    [1, 'Low'],
-    [2, 'Standard'],
-    [3, 'High'],
-    [4, 'High Res'],
-    [5, 'Very High Res'],
-    [6, 'Ultra High Res'],
-    [7, 'Highest Res'],
-];
-/** `Configuration.Shimmer2.ListofGSRRange` (index 4 = auto). */
-const GSR_RANGE = [
-    [0, '10 kOhm to 56 kOhm'],
-    [1, '56 kOhm to 220 kOhm'],
-    [2, '220 kOhm to 680 kOhm'],
-    [3, '680 kOhm to 4.7 MOhm'],
-    [4, 'Auto Range'],
-];
-/** `Configuration.Shimmer3.ListofBluetoothBaudRates` + `…ConfigValues`. */
-const BT_BAUD_RATE = [
-    [0, '115200'],
-    [1, '1200'],
-    [2, '2400'],
-    [3, '4800'],
-    [4, '9600'],
-    [5, '19200'],
-    [6, '38400'],
-    [7, '57600'],
-    [8, '230400'],
-    [9, '460800'],
-    [10, '921600'],
-];
+/** The generations whose wide-range accelerometer is NOT an LSM303AH. */
+const LSM303DLHC_AND_LIS2DW12 = ['shimmer3-old-imu', 'shimmer3r'];
 const ON_OFF = [
     [0, 'Disabled'],
     [1, 'Enabled'],
@@ -10651,7 +10467,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte3',
         shift: 6,
         width: 2,
-        options: LN_ACCEL_RANGE_LSM6DSV,
+        options: SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS,
         group: 'lnAccel',
         appliesTo: S3R_ONLY,
         configKey: 'imu.altAccelRange',
@@ -10660,25 +10476,38 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'wrAccelRange',
         label: 'WR Accel Range',
-        desc: 'ConfigSetupByte0 bits 2-3 (bitShiftLSM303DLHCAccelRange=2, mask 0x03).',
+        desc: 'LSM303DLHC / LIS2DW12 range — ConfigSetupByte0 bits 2-3 (bitShiftLSM303DLHCAccelRange=2, mask 0x03). One table for both chips because their Java lists are identical (SensorLSM303DLHC.java:325, SensorLIS2DW12.java:236).',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 2,
         width: 2,
-        options: WR_ACCEL_RANGE,
+        options: SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS,
         group: 'wrAccel',
-        appliesTo: ALL,
+        appliesTo: LSM303DLHC_AND_LIS2DW12,
+        configKey: 'imu.wrAccelRange',
+    },
+    {
+        key: 'wrAccelRange.lsm303ah',
+        label: 'WR Accel Range',
+        desc: 'LSM303AH (new-IMU Shimmer3) range — the same ConfigSetupByte0 bits 2-3, but the config values are {0,2,3,1}, not {0,1,2,3} (SensorLSM303AH.java:174).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 2,
+        width: 2,
+        options: SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS,
+        group: 'wrAccel',
+        appliesTo: NEW_IMU_ONLY,
         configKey: 'imu.wrAccelRange',
     },
     {
         key: 'wrAccelRate.lsm303dlhc',
         label: 'WR Accel Rate',
-        desc: 'LSM303DLHC rate — ConfigSetupByte0 bits 4-7 (bitShiftLSM303DLHCAccelSamplingRate=4, mask 0x0F).',
+        desc: 'LSM303DLHC rate — ConfigSetupByte0 bits 4-7 (bitShiftLSM303DLHCAccelSamplingRate=4, mask 0x0F). High-resolution list: it skips code 8 (low-power-only 1620Hz), so 1344Hz is code 9. Low-power rates are a separate Java list reached through wrAccelLpm.',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 4,
         width: 4,
-        options: WR_ACCEL_RATE_LSM303DLHC,
+        options: SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS,
         group: 'wrAccel',
         appliesTo: OLD_IMU_ONLY,
         configKey: 'imu.wrAccelRate',
@@ -10691,7 +10520,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte0',
         shift: 4,
         width: 4,
-        options: WR_ACCEL_RATE_LSM303AH,
+        options: SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS,
         group: 'wrAccel',
         appliesTo: NEW_IMU_ONLY,
         configKey: 'imu.wrAccelRate',
@@ -10704,7 +10533,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte0',
         shift: 4,
         width: 4,
-        options: WR_ACCEL_RATE_LIS2DW12,
+        options: SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS,
         group: 'wrAccel',
         appliesTo: S3R_ONLY,
         configKey: 'imu.wrAccelRate',
@@ -10744,7 +10573,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte2',
         shift: 0,
         width: 2,
-        options: GYRO_RANGE_MPU9X50,
+        options: SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS,
         group: 'gyro',
         appliesTo: SHIMMER3_ONLY,
         configKey: 'imu.gyroRange',
@@ -10760,7 +10589,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         msbLayoutKey: 'idxConfigSetupByte4',
         msbShift: 2,
         msbWidth: 1,
-        options: GYRO_RANGE_LSM6DSV,
+        options: SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS,
         group: 'gyro',
         appliesTo: S3R_ONLY,
         configKey: 'imu.gyroRange',
@@ -10780,10 +10609,10 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'imuRate.lsm6dsv',
         label: 'Gyro/Accel Rate',
-        desc: 'LSM6DSV ODR enum — the whole of ConfigSetupByte1 (SensorLSM6DSV.java:977).',
+        desc: 'LSM6DSV ODR enum — the whole of ConfigSetupByte1 (SensorLSM6DSV.java:977). Java lists 14 config values for 13 labels, so value 13 is writable but unnamed and is not offered.',
         kind: 'u8',
         layoutKey: 'idxConfigSetupByte1',
-        options: IMU_RATE_LSM6DSV,
+        options: SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS,
         group: 'gyro',
         appliesTo: S3R_ONLY,
         configKey: 'imu.imuRate',
@@ -10797,7 +10626,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte2',
         shift: 5,
         width: 3,
-        options: MAG_RANGE_LSM303DLHC,
+        options: SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS,
         group: 'mag',
         appliesTo: OLD_IMU_ONLY,
         configKey: 'imu.magRange',
@@ -10810,7 +10639,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte2',
         shift: 2,
         width: 3,
-        options: MAG_RATE_LSM303DLHC,
+        options: SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS,
         group: 'mag',
         appliesTo: OLD_IMU_ONLY,
         configKey: 'imu.magRate',
@@ -10818,12 +10647,12 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'magRate.lis2mdl',
         label: 'Mag Rate',
-        desc: 'LSM303AH / LIS2MDL rate — ConfigSetupByte2 bits 2-4 (SensorLIS2MDL.java:580). NOT composite: the declared LIS2MDL rate MSB is commented out in Java and absent from the firmware struct.',
+        desc: 'LSM303AH / LIS2MDL rate — ConfigSetupByte2 bits 2-4 (SensorLIS2MDL.java:580). One table for both chips: SensorLSM303AH.java:202-203 and SensorLIS2MDL.java:147-148 are identical. NOT composite: the declared LIS2MDL rate MSB is commented out in Java and absent from the firmware struct.',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte2',
         shift: 2,
         width: 3,
-        options: MAG_RATE_LIS2MDL,
+        options: SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS,
         group: 'mag',
         appliesTo: ['shimmer3-new-imu', 'shimmer3r'],
         configKey: 'imu.magRate',
@@ -10837,7 +10666,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte3',
         shift: 6,
         width: 2,
-        options: ALT_ACCEL_RANGE_MPU9X50,
+        options: SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS,
         group: 'altAccel',
         appliesTo: SHIMMER3_ONLY,
         configKey: 'imu.altAccelRange',
@@ -10850,7 +10679,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte4',
         shift: 6,
         width: 2,
-        options: ALT_ACCEL_RATE_ADXL371,
+        options: SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS,
         group: 'altAccel',
         appliesTo: S3R_ONLY,
         configKey: 'imu.altAccelRate',
@@ -10864,7 +10693,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte2',
         shift: 5,
         width: 3,
-        options: ALT_MAG_RANGE_LIS3MDL,
+        options: SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS,
         group: 'altMag',
         appliesTo: S3R_ONLY,
         configKey: 'imu.magRange',
@@ -10877,7 +10706,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         layoutKey: 'idxConfigSetupByte5',
         shift: 0,
         width: 6,
-        options: ALT_MAG_RATE_LIS3MDL,
+        options: SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS,
         group: 'altMag',
         appliesTo: S3R_ONLY,
         configKey: 'imu.altMagRate',
@@ -10886,12 +10715,12 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'pressureOversampling.bmpX80',
         label: 'Pressure Resolution',
-        desc: 'BMP180/BMP280 oversampling — ConfigSetupByte3 bits 4-5 (bitShiftBMPX80PressureResolution=4, mask 0x03).',
+        desc: 'BMP180/BMP280 oversampling — ConfigSetupByte3 bits 4-5 (bitShiftBMPX80PressureResolution=4, mask 0x03). Shows the BMP180 labels; a new-IMU Shimmer3 carries a BMP280, whose top step Java spells "Ultra High" rather than "Very High" (SensorBMP280.java:112).',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte3',
         shift: 4,
         width: 2,
-        options: PRESSURE_OVERSAMPLING_BMPX80,
+        options: SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS,
         group: 'pressure',
         appliesTo: SHIMMER3_ONLY,
         configKey: 'imu.pressureOversampling',
@@ -10899,7 +10728,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'pressureOversampling.bmp390_581',
         label: 'Pressure Oversampling',
-        desc: 'BMP390/BMP581 oversampling, COMPOSITE: ConfigSetupByte3 bits 4-5 plus the MSB at ConfigSetupByte4 bit 0 (SensorBMP390.java:499, SensorBMP581.java:380; FW pressureOversamplingRatioMsb).',
+        desc: 'BMP390/BMP581 oversampling, COMPOSITE: ConfigSetupByte3 bits 4-5 plus the MSB at ConfigSetupByte4 bit 0 (SensorBMP390.java:499, SensorBMP581.java:380; FW pressureOversamplingRatioMsb). Shows the BMP581 list, the wider of the two — the BMP390 stops at 5.',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte3',
         shift: 4,
@@ -10907,7 +10736,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         msbLayoutKey: 'idxConfigSetupByte4',
         msbShift: 0,
         msbWidth: 1,
-        options: PRESSURE_OVERSAMPLING_BMP581,
+        options: SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS,
         group: 'pressure',
         appliesTo: S3R_ONLY,
         configKey: 'imu.pressureOversampling',
@@ -10916,12 +10745,12 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'gsrRange',
         label: 'GSR Range',
-        desc: 'ConfigSetupByte3 bits 1-3 (bitShiftGSRRange=1, mask 0x07).',
+        desc: 'ConfigSetupByte3 bits 1-3 (bitShiftGSRRange=1, mask 0x07). Ranges are labelled by resistance, as the Shimmer software does; SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS is the same four ranges in conductance for a study that reports in µS.',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte3',
         shift: 1,
         width: 3,
-        options: GSR_RANGE,
+        options: SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS,
         group: 'gsr',
         appliesTo: ALL,
         configKey: 'gsrRange',
@@ -10967,7 +10796,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         desc: 'RN42/RN4678 UART baud index — byte 30 (maskBaudRate 0xFF).',
         kind: 'u8',
         layoutKey: 'idxBtCommBaudRate',
-        options: BT_BAUD_RATE,
+        options: SHIMMER3_BT_BAUD_RATE_OPTIONS,
         group: 'bluetooth',
         appliesTo: ALL,
         configKey: 'btBaudRate',

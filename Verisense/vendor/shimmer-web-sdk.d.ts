@@ -4585,8 +4585,14 @@ declare function deviceWriteDivergentRanges(ctx: InfoMemContext): DeviceWriteDiv
 type Shimmer3Generation = 'shimmer3-old-imu' | 'shimmer3-new-imu' | 'shimmer3r';
 /** How a field's value is encoded in the InfoMem bytes. */
 type InfoMemFieldKind = 'bit' | 'u8' | 'u16le' | 'u16be' | 'u32be' | 'ascii12' | 'bytes21' | 'mac6[]';
-/** `[value, label]`, same tuple shape as the Java `Listof…ConfigValues` pairs. */
-type InfoMemFieldOption = readonly [number, string];
+/**
+ * `[value, label]`, same tuple shape as the Java `Listof…ConfigValues` pairs.
+ *
+ * An alias of {@link Shimmer3SensorOption} rather than a second declaration of
+ * the same tuple, so a field's `options` can BE a shared table from
+ * `devices/shimmer3/sensorOptions.ts` — the same array object, not a copy of it.
+ */
+type InfoMemFieldOption = Shimmer3SensorOption;
 interface InfoMemFieldDefinition {
     /** Stable identifier, unique across the schema. */
     readonly key: string;
