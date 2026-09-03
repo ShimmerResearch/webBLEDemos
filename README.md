@@ -109,7 +109,7 @@ The file that controls where vendor artifacts come from is `sdk-source.json`:
 ```json
 {
   "sourceMode": "local-repo",
-  "version": "0.1.7"
+  "version": "0.1.11"
 }
 ```
 
