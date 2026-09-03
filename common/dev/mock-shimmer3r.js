@@ -390,8 +390,16 @@ export function createMockShimmer3RTransport(opts = {}) {
   const debug = !!opts.debug;
   const mac = (opts.mac ?? "000666668091").replace(/[^0-9a-fA-F]/g, "");
   const fw = { major: 1, minor: 1, patch: 12, ...(opts.firmware ?? {}) };
+  /* `undefined` means "not asked for" and gets the Shimmer3R default; `null`
+     means "this sensor will not say", which NACKs GET_DEVICE_VERSION. Anything
+     non-finite is neither -- it used to reach `hardwareVersion & 0xff` and
+     answer 0, a fourth behaviour nobody asked for -- so it is read as the
+     default, the same as not passing one. */
   const hardwareVersion =
-    opts.hardwareVersion === undefined ? 10 : opts.hardwareVersion;
+    opts.hardwareVersion === undefined ||
+    (opts.hardwareVersion !== null && !Number.isFinite(opts.hardwareVersion))
+      ? 10
+      : opts.hardwareVersion;
   const sdKBps = Math.max(1, opts.sdKBps ?? SD_DEFAULT_KBPS);
   const linkKBps = Math.max(1, opts.linkKBps ?? LINK_DEFAULT_KBPS);
 

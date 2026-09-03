@@ -2626,12 +2626,24 @@
         /* `hw=none` (or `hw=0`) NACKs GET_DEVICE_VERSION, so the page cannot
            identify the sensor. Anything else is a hardware id. */
         const hwParam = params.get("hw");
+        /* A hw= that is not a number is a typo, not a hardware id. Passing the
+           NaN on gave GET_DEVICE_VERSION a masked 0 -- a fourth answer that is
+           neither a real id, nor the default, nor the unidentified sensor the
+           author was probably reaching for. Treated as absent instead. */
+        const hwNumber = hwParam == null ? NaN : Number(hwParam);
         const hardwareVersion =
           hwParam == null
             ? undefined
             : /^(none|null|0)$/i.test(hwParam)
               ? null
-              : Number(hwParam);
+              : Number.isFinite(hwNumber)
+                ? hwNumber
+                : undefined;
+        if (hwParam != null && hardwareVersion === undefined) {
+          log.warn(
+            `mock mode: ignoring hw="${hwParam}" — not a hardware id. Use a number, or "none" for a sensor that will not identify itself.`,
+          );
+        }
         const btn = $("btnMock");
         btn.hidden = false;
         btn.textContent = `Connect (mock, ${framed ? "framed" : "unframed"})`;
