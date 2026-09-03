@@ -4662,7 +4662,13 @@
                     continue;
                 }
                 const ch = String.fromCharCode(b);
-                text += ch;
+                /* Only the caller that will USE the text builds it. A drain reads
+                   nothing but the sentinel out of `_line`, and it can run for the length
+                   of the suite -- over a minute for the LED-state walk -- so appending
+                   every byte to a string nobody reads is a per-byte allocation for
+                   nothing. */
+                if (accumulate)
+                    text += ch;
                 this._line += ch;
                 if (b !== 0x0a)
                     continue;
@@ -4851,8 +4857,10 @@
      * The four types in firmware order.
      *
      * The durations are the firmware's own step counts, not measurements: the LED
-     * suite is 9 steps of 2 s and the operational-state walk-through 14 of 5 s
-     * (`Test/shimmer_test_leds_states.c`), and the IC suite's chip probes dominate
+     * suite is 9 steps of 2 s, and the operational-state walk-through holds 15
+     * states for 5 s each — 2 with Bluetooth disabled, 6 with it enabled, 5 under
+     * SD sync and 2 others, one `platform_delayMs` apiece
+     * (`Test/shimmer_test_leds_states.c`). The IC suite's chip probes dominate
      * MAIN. HARDWARE-VERIFY: they have not been timed on a real Shimmer3 or
      * Shimmer3R, so the default timeouts carry generous headroom over them.
      */
@@ -4890,7 +4898,7 @@
             label: 'LED operating states',
             description: 'Holds each operational LED state for five seconds so it can be compared against the sensor. ' +
                 'No overall verdict, and the longest of the four.',
-            expectedDurationMs: 70000,
+            expectedDurationMs: 75000,
             defaultTimeoutMs: 120000,
             hasOverall: false,
         }),
@@ -11585,12 +11593,23 @@
                      * guard the run it was just told had ended. */
                     if (state === 'idle')
                         this._releaseFactoryTest();
-                    try {
-                        this.onFactoryTestStateChange?.(state);
-                    }
-                    catch (e) {
-                        this._log('onFactoryTestStateChange handler error', e);
-                    }
+                    /* …and the host is told on a MICROTASK, not from inside `feed()`.
+                     * The capture is called from the notify handler, which has not yet
+                     * routed the tail bytes `feed()` just handed back — a late ACK, or a
+                     * status push glued to the TEST END banner. A host that sent its next
+                     * command straight out of a synchronous callback could have that
+                     * command's acknowledgement satisfied by the test's own leftovers.
+                     * Deferring by one microtask puts the callback after the routing and
+                     * before anything else, which is also where `whenFactoryTestIdle()`
+                     * already resolves. */
+                    queueMicrotask(() => {
+                        try {
+                            this.onFactoryTestStateChange?.(state);
+                        }
+                        catch (e) {
+                            this._log('onFactoryTestStateChange handler error', e);
+                        }
+                    });
                 },
             });
             this._factoryTest = capture;
@@ -15270,12 +15289,23 @@
                        was just told had ended. */
                     if (state === 'idle')
                         this._releaseFactoryTest();
-                    try {
-                        this.onFactoryTestStateChange?.(state);
-                    }
-                    catch (e) {
-                        this._log('onFactoryTestStateChange handler error', e);
-                    }
+                    /* …and the host is told on a MICROTASK, not from inside `feed()`.
+                     * The capture is called from the notify handler, which has not yet
+                     * routed the tail bytes `feed()` just handed back — a late ACK, or a
+                     * status push glued to the TEST END banner. A host that sent its next
+                     * command straight out of a synchronous callback could have that
+                     * command's acknowledgement satisfied by the test's own leftovers.
+                     * Deferring by one microtask puts the callback after the routing and
+                     * before anything else, which is also where `whenFactoryTestIdle()`
+                     * already resolves. */
+                    queueMicrotask(() => {
+                        try {
+                            this.onFactoryTestStateChange?.(state);
+                        }
+                        catch (e) {
+                            this._log('onFactoryTestStateChange handler error', e);
+                        }
+                    });
                 },
             });
             this._factoryTest = capture;
