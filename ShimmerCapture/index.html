@@ -509,6 +509,9 @@
         <button data-tab="tabConfig" class="active" type="button">
           Configure
         </button>
+        <button data-tab="tabCal" id="tabBtnCal" type="button">
+          Calibration
+        </button>
         <button data-tab="tabStream" id="tabBtnStream" type="button">
           Stream &amp; record
         </button>
@@ -596,58 +599,6 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-title">Calibration</div>
-          <div class="row">
-            <button
-              id="btnCalRead"
-              type="button"
-              data-requires="idle"
-              data-cap="calibDump"
-            >
-              Read dump
-            </button>
-            <button id="btnCalSave" type="button">Save dump</button>
-            <button id="btnCalLoad" type="button">Load dump</button>
-            <button
-              id="btnCalWrite"
-              type="button"
-              class="warn"
-              data-requires="idle"
-              data-cap="calibWrite"
-            >
-              Write dump
-            </button>
-            <input
-              type="file"
-              id="calFile"
-              accept=".bin,application/octet-stream"
-              hidden
-            />
-            <span class="pill" id="calPill">not read</span>
-          </div>
-          <div class="banner" id="calBanner"></div>
-          <div class="table-wrap">
-            <table class="records" id="calTable" hidden>
-              <thead>
-                <tr>
-                  <th>Sensor</th>
-                  <th>Range</th>
-                  <th>Calibrated</th>
-                  <th>Bytes</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div class="field-hint" style="margin-top: 8px">
-            The dump is the sensor's own record of every per-sensor calibration
-            it holds. Writing a configuration image regenerates it from the
-            configuration bytes, so write a dump
-            <strong>after</strong> a configuration, never before.
-          </div>
-        </div>
-
         <div class="action-bar row">
           <button
             id="btnRead"
@@ -672,6 +623,27 @@
           </button>
           <span class="spacer"></span>
           <span class="muted" id="applyNote"></span>
+        </div>
+      </section>
+
+      <!-- =============================================== Calibration ===== -->
+      <section class="tab" id="tabCal">
+        <div class="banner" id="calBanner"></div>
+        <!-- common/calibration-editor.js builds the whole panel in here. -->
+        <div id="calPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            Calibration turns the sensor's raw counts into physical units:
+            <em>C</em> = <em>R</em><sup>−1</sup>·<em>K</em><sup>−1</sup>·(<em
+              >U</em
+            >
+            − <em>B</em>), with <em>B</em> the offset, <em>K</em> the diagonal
+            sensitivity and <em>R</em> the alignment. It is per sensor and per
+            range, so a sensor calibrated at ± 2 g has nothing stored for ± 16 g
+            and falls back to the factory defaults there — which is normal, not
+            a fault. Nothing on this tab changes what the sensor
+            <em>measures</em>; it changes how those measurements are read.
+          </div>
         </div>
       </section>
 
@@ -900,6 +872,7 @@
       import { createCsvRecorder } from "../common/csv-recorder.js";
       import { createSdBrowser } from "../common/sd-browser.js";
       import { createBrandEditor } from "../common/brand-editor.js";
+      import { createCalibrationEditor } from "../common/calibration-editor.js";
       import {
         createMockShimmer3RTransport,
         mockEnabledFromUrl,
@@ -945,16 +918,6 @@
         2: "SDLog",
         3: "LogAndStream",
         15: "StroKare",
-      });
-
-      /** Calibration sensor id -> label, for the dump records table. */
-      const CALIB_SENSOR_LABELS = Object.freeze({
-        37: "LSM6DSV accelerometer",
-        38: "LSM6DSV gyroscope",
-        39: "LIS2DW12 accelerometer",
-        40: "LSM6DS3 accelerometer",
-        41: "LSM6DS3 gyroscope",
-        42: "LIS2MDL magnetometer",
       });
 
       // =====================================================================
@@ -1299,8 +1262,8 @@
       let deviceMac = "";
       let deviceName = "";
 
-      /** The calibration dump last read or loaded. */
-      let calibBytes = null;
+      /** True while the calibration panel is reading or writing. */
+      let calibBusy = false;
 
       // =====================================================================
       // Small helpers
@@ -1356,7 +1319,6 @@
       function regate() {
         // Capability floors the markup gates on but only the page can know.
         caps.record = !!csvColumns;
-        caps.calibWrite = !!caps.calibDump && !!calibBytes;
         /* Exactly one stop button is live at a time. STOP_STREAMING (0x20)
            and STOP_SDBT (0x97) are different commands: the first leaves an SD
            recording running, so offering both would let one click end a
@@ -1364,16 +1326,16 @@
         caps.btStop = streaming && !sdLogging;
         caps.sdStop = sdLogging;
 
-        /* An SD download, a name write and everything else on this page
-           compete for one link, so either in flight counts as busy for every
-           other control — Apply included. Neither panel's own controls are
-           gated from here; each owns its own (see the `setEnabled` calls
-           below). */
+        /* An SD download, a name write, a calibration write and everything
+           else on this page compete for one link, so any of them in flight
+           counts as busy for every other control — Apply included. No panel's
+           own controls are gated from here; each owns its own (see the
+           `setEnabled` calls below). */
         gate.apply({
           connected: !!client,
           streaming,
           recording: recorder.active,
-          busy: busy || sdBusy || brandBusy,
+          busy: busy || sdBusy || brandBusy || calibBusy,
           caps,
         });
 
@@ -1381,15 +1343,16 @@
            is the floor for whether the LINK can do the thing at all, and each
            panel already refuses a second operation of its own. Folding a
            panel's own flag back in here would have the first progress event
-           tear down the panel reporting it. The OTHER panel's flag does
-           belong, because the two share one link. */
+           tear down the panel reporting it. The OTHER panels' flags do
+           belong, because all three share one link. */
         sd.setEnabled(
           !!client &&
             !!caps.sdTransfer &&
             !streaming &&
             !sdLogging &&
             !busy &&
-            !brandBusy,
+            !brandBusy &&
+            !calibBusy,
         );
         paintSdGating();
 
@@ -1399,16 +1362,33 @@
             !streaming &&
             !sdLogging &&
             !busy &&
-            !sdBusy,
+            !sdBusy &&
+            !calibBusy,
         );
         paintBrandGating();
+
+        /* Not gated on `caps.calibration`: a link without the dump commands
+           still shows the calibration blocks out of the configuration image,
+           read-only, and the panel itself decides which store that is. What
+           it IS gated on is the link being free — the firmware NACKs a
+           calibration command while sensing, exactly as it does a
+           configuration one. */
+        cal.setEnabled(
+          !!client &&
+            (!!caps.calibration || !!caps.infomem) &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !sdBusy &&
+            !brandBusy,
+        );
+        paintCalibGating();
 
         // Page state, not device state: these must work while disconnected so
         // an image can be inspected, saved or thrown away.
         $("btnDiscard").disabled = !form || busy;
         $("btnImSave").disabled = !form;
         $("btnImLoad").disabled = !form || busy;
-        $("btnCalSave").disabled = !calibBytes;
         const mockBtn = $("btnMock");
         if (!mockBtn.hidden) mockBtn.disabled = !!client || busy;
 
@@ -1432,6 +1412,9 @@
         } else if (brandBusy) {
           $("applyNote").textContent =
             "Waiting for the device-naming write to finish — a name write and a configuration write cannot share the link.";
+        } else if (calibBusy) {
+          $("applyNote").textContent =
+            "Waiting for the calibration write to finish — and worth waiting for in this order, because a configuration write rebuilds the calibration dump from the configuration bytes.";
         } else {
           $("applyNote").textContent = "";
         }
@@ -2408,102 +2391,6 @@
       }
 
       // =====================================================================
-      // Calibration
-      // =====================================================================
-
-      function renderCalibDump(dump) {
-        const table = $("calTable");
-        const body = table.querySelector("tbody");
-        const records = dump?.records ?? [];
-        if (!records.length) {
-          table.hidden = true;
-          banner(
-            "calBanner",
-            "warn",
-            "The dump holds no calibration records — this sensor has most likely never been calibrated.",
-          );
-          return;
-        }
-        body.replaceChildren(
-          ...records.map((r) => {
-            const seconds = sdk.calibTsBytesToUnixSeconds?.(r.timestampTicks);
-            const when =
-              r.isDefault || !seconds
-                ? "default / seeded"
-                : formatClock(seconds * 1000);
-            return el(
-              "tr",
-              {},
-              el(
-                "td",
-                {},
-                CALIB_SENSOR_LABELS[r.sensorId] ?? `sensor id ${r.sensorId}`,
-              ),
-              el("td", {}, String(r.range)),
-              el("td", {}, when),
-              el("td", {}, `${r.calibLen} B`),
-            );
-          }),
-        );
-        table.hidden = false;
-        const v = dump.version;
-        banner(
-          "calBanner",
-          "ok",
-          `${records.length} record${records.length === 1 ? "" : "s"}, ` +
-            `${dump.packetLength} bytes, written by hardware id ${v.hardwareId} ` +
-            `firmware ${v.firmwareMajor}.${v.firmwareMinor}.${v.firmwareInternal}.`,
-        );
-      }
-
-      async function readCalibration() {
-        const result = await withDevice("read the calibration dump", () =>
-          client.readCalibDump(),
-        );
-        if (!result) return;
-        calibBytes = result.bytes;
-        $("calPill").textContent = `${calibBytes.length} bytes read`;
-        $("calPill").classList.add("on");
-        renderCalibDump(result.dump);
-        regate();
-      }
-
-      async function writeCalibration() {
-        if (!calibBytes) return;
-        let dump;
-        try {
-          dump = sdk.parseCalibDump(calibBytes);
-        } catch (err) {
-          showToast(
-            `That file is not a calibration dump: ${err.message}`,
-            "err",
-          );
-          return;
-        }
-        const n = dump.records.length;
-        if (
-          !window.confirm(
-            `Write ${calibBytes.length} bytes of calibration to the sensor?\n\n` +
-              `${n} record${n === 1 ? "" : "s"} will replace the calibration the ` +
-              `sensor holds. Note that a later configuration write regenerates ` +
-              `the dump from the configuration bytes, so write the ` +
-              `configuration first and the dump after it.`,
-          )
-        ) {
-          log.log("calibration write cancelled");
-          return;
-        }
-        try {
-          await withDevice("write the calibration dump", () =>
-            client.writeCalibDump(calibBytes),
-          );
-          showToast("Calibration dump written", "ok");
-        } catch {
-          /* logged by withDevice */
-        }
-      }
-
-      // =====================================================================
       // Streaming, plotting and recording
       // =====================================================================
 
@@ -2598,6 +2485,128 @@
         btn.disabled = permanent || streaming || sdLogging;
         btn.title = reason ?? "";
         if (permanent && tabs.selected() === "tabSd") tabs.select("tabConfig");
+      }
+
+      // =====================================================================
+      // Calibration
+      // =====================================================================
+
+      /* Mounted once and handed GETTERS, like the other two panels.
+         `generation` is what `inferShimmer3Generation` decided, which is what
+         picks the sensor list and the default calibration tables — a Shimmer3
+         has no high-g accel and no alternate magnetometer, and offering them
+         would say a calibration could be set for a chip that is not there.
+
+         `infoMemBlocks` and `readInfoMem` are the read-only fallback for a
+         link with no calibration-dump commands (the USB-C dock, and the
+         classic `Shimmer3Client`): the panel then shows the six calibration
+         blocks out of the configuration image the page already holds, rather
+         than showing nothing. It does not write them — that image belongs to
+         the form above, unsaved edits and all. */
+      const cal = createCalibrationEditor($("calPanel"), {
+        client: () => client,
+        generation: () => generation,
+        hardwareVersion: () => identifiedHardwareVersion,
+        activeRanges: () => configuredCalibRanges(),
+        infoMemBlocks: () => infoMemCalibrationBlocks(),
+        readInfoMem: () => readConfiguration(),
+        log,
+        toast: showToast,
+        fileNamePrefix: () => `Shimmer3R_${macTail()}`,
+        onBusyChange: (working) => {
+          calibBusy = working;
+          regate();
+        },
+      });
+
+      /**
+       * The ranges the sensor is configured for, so each card opens on the
+       * range that is actually in use rather than on range 0.
+       *
+       * Read from the FORM's image rather than from `deviceImage`, so changing
+       * a range in the configuration form moves the calibration tab with it —
+       * which is the honest reading: the calibration that will end up being
+       * applied is the one for the range the sensor ends up configured at.
+       *
+       * The low-noise accel and the alternate magnetometer are missing from
+       * the list on purpose: the SDK's InfoMem model carries no range field
+       * for either, so there is nothing to say about them and the panel falls
+       * back to whichever range holds a record.
+       */
+      function configuredCalibRanges() {
+        const image = form ? form.getImage() : deviceImage;
+        if (!image || !context) return null;
+        try {
+          const imu = sdk.parseInfoMem(image, context).imu;
+          return {
+            wrAccel: imu.wrAccelRange,
+            gyro: imu.gyroRange,
+            mag: imu.magRange,
+            altAccel: imu.altAccelRange,
+          };
+        } catch {
+          return null;
+        }
+      }
+
+      /** The six 21-byte calibration blocks in the image the page holds. */
+      function infoMemCalibrationBlocks() {
+        if (!deviceImage || !context) return null;
+        try {
+          return sdk.parseInfoMem(deviceImage, context).calibration ?? null;
+        } catch {
+          /* A blank or unreadable image is not an error worth a log line
+             here — the configuration card has already said so. */
+          return null;
+        }
+      }
+
+      /**
+       * Why calibration cannot be changed right now, in plain language, or
+       * null.
+       *
+       * The InfoMem fallback is deliberately NOT a refusal: on that link the
+       * tab still shows what the sensor is calibrated to, which is most of
+       * what anyone opens it for. The panel's own banner says the values are
+       * read-only there and why.
+       */
+      function calibUnavailableReason() {
+        if (!client) {
+          return "Connect a sensor to see what it is calibrated to.";
+        }
+        if (!caps.calibration && !caps.infomem) {
+          return "This link can reach neither the calibration dump nor the configuration image, so there is no calibration to show.";
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses every configuration command while it is. Stop the stream before reading or writing calibration.";
+        }
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. A calibration write and a download cannot share it — wait for the transfer to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link. Wait for it to finish.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off while the link is busy.
+       *
+       * Nothing here is permanent the way the SD tab's USB refusal is: every
+       * link this page speaks reaches one calibration store or the other, so
+       * the tab is never bounced back to Configure. It closes only while the
+       * sensor is sensing or the link is held, both of which end by
+       * themselves.
+       */
+      function paintCalibGating() {
+        const reason = calibUnavailableReason();
+        banner("calBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const btn = $("tabBtnCal");
+        btn.disabled = !!client && (streaming || sdLogging || sdBusy);
+        btn.title = reason ?? "";
       }
 
       // =====================================================================
@@ -2998,12 +3007,9 @@
         client = session.client;
         mode = session.mode;
         caps = describeShimmer3Caps(client, mode);
-        /* Two capabilities the shared feature detection does not cover: the
-           whole-dump calibration path, and a clock write, which the dock client
-           spells `writeRtcFromHostTime` rather than `setRtcTime`. */
-        caps.calibDump =
-          typeof client.readCalibDump === "function" &&
-          typeof client.writeCalibDump === "function";
+        /* One capability the shared feature detection does not cover: a clock
+           write, which the dock client spells `writeRtcFromHostTime` rather
+           than `setRtcTime`. */
         caps.rtcWrite =
           typeof client.setRtcTime === "function" ||
           typeof client.writeRtcFromHostTime === "function";
@@ -3560,30 +3566,8 @@
         );
       });
 
-      $("btnCalRead").addEventListener("click", reported(readCalibration));
-      $("btnCalSave").addEventListener("click", () => {
-        if (!calibBytes) return;
-        downloadBlob(
-          `calibration_${macTail()}_${stampNow()}.bin`,
-          new Blob([calibBytes], { type: "application/octet-stream" }),
-        );
-        log.log("calibration dump saved");
-      });
-      $("btnCalLoad").addEventListener("click", () => $("calFile").click());
-      $("calFile").addEventListener("change", async (event) => {
-        const file = event.target.files?.[0];
-        event.target.value = "";
-        if (!file) return;
-        calibBytes = new Uint8Array(await file.arrayBuffer());
-        $("calPill").textContent = `${calibBytes.length} bytes loaded`;
-        try {
-          renderCalibDump(sdk.parseCalibDump(calibBytes));
-        } catch (err) {
-          banner("calBanner", "err", `Not a calibration dump: ${err.message}`);
-        }
-        regate();
-      });
-      $("btnCalWrite").addEventListener("click", reported(writeCalibration));
+      /* Nothing here for calibration: `common/calibration-editor.js` owns its
+         own buttons, exactly as the SD and device-naming panels do. */
 
       $("btnStreamStart").addEventListener(
         "click",

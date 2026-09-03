@@ -319,8 +319,9 @@ const I8_MAX = 127;
  * @param {(message: string, kind?: string) => void} [opts.toast]
  * @param {(text: string) => boolean} [opts.confirm] defaults to
  *   `window.confirm`
- * @param {string} [opts.fileNamePrefix="shimmer"] leading part of the saved
- *   dump's file name
+ * @param {string|(() => string|null)} [opts.fileNamePrefix="shimmer"] leading
+ *   part of the saved dump's file name; a getter, so a page can name the file
+ *   after a sensor that was not connected when the panel was mounted
  * @returns {{
  *   read: () => Promise<object|null>,
  *   write: () => Promise<boolean>,
@@ -348,7 +349,9 @@ export function createCalibrationEditor(host, opts = {}) {
   const getHardware = asGetter(opts.hardwareVersion);
   const getActiveRanges = asGetter(opts.activeRanges);
   const getInfoMemBlocks = asGetter(opts.infoMemBlocks);
-  const filePrefix = opts.fileNamePrefix ?? "shimmer";
+  /* A getter as well as a value: a page names the file after the sensor, and
+     the sensor is not connected when the panel is mounted. */
+  const getFilePrefix = asGetter(opts.fileNamePrefix);
 
   /* A vendored bundle from before the calibration codec shipped: say so once,
      here, rather than throwing from the first button press. */
@@ -694,6 +697,7 @@ export function createCalibrationEditor(host, opts = {}) {
          The three-state rule applies to the whole list rather than to one
          card: showing a Shimmer3R's six sensors on what might be a Shimmer3
          would offer two that do not exist. */
+      const connected = !!getClient();
       sensorHost.replaceChildren(
         el(
           "div",
@@ -701,11 +705,15 @@ export function createCalibrationEditor(host, opts = {}) {
           el("div", { class: "card-title" }, "Sensors"),
           el(
             "div",
-            { class: "banner warn" },
-            "This sensor has not said what hardware it is, and no calibration " +
-              "dump has been read from it, so which sensors it carries is " +
-              "unknown. Read the calibration to find out — the dump names the " +
-              "hardware that wrote it.",
+            { class: connected ? "banner warn" : "banner" },
+            connected
+              ? "This sensor has not said what hardware it is, and no " +
+                  "calibration has been read from it, so which sensors it " +
+                  "carries is unknown. Read from sensor to find out — the " +
+                  "dump names the hardware that wrote it."
+              : "Which sensors appear here depends on the hardware. Connect a " +
+                  "sensor, or load a saved dump — a dump names the hardware " +
+                  "that wrote it.",
           ),
         ),
       );
@@ -893,20 +901,35 @@ export function createCalibrationEditor(host, opts = {}) {
   const recordKey = (sensorId, range) => `${sensorId}:${range}`;
   const editKey = (key, range) => `${key}:${range}`;
 
-  /** The 21-byte block stored for this sensor at this range, or null. */
+  /**
+   * The 21-byte block stored for this sensor at this range, or null.
+   *
+   * A block that is all-0xFF or all-zero counts as NOT stored, because that
+   * is exactly what those two patterns mean (`UtilShimmer.isAllFF` /
+   * `isAllZeros`, which is why `parseKinematicCalibBlock` answers null for
+   * them). A record can exist and say nothing — a Shimmer3R ships with one
+   * like that for its alternate magnetometer — and the difference between
+   * "never calibrated" and "calibrated to 65535" is the whole point of
+   * showing calibration at all.
+   */
   function storedBlock(entry, range) {
+    const usable = (block) =>
+      block &&
+      block.length >= BLOCK_BYTES &&
+      sdk.parseKinematicCalibBlock(block, {
+        sensitivityScale: entry.sensitivityScale,
+      })
+        ? block
+        : null;
     if (store() === "infomem") {
       /* One block per sensor, for whatever range is configured. Showing it
          under another range would claim the device holds something it does
          not. */
       if (!infoMemShown) return null;
       if (range !== configuredRange(entry)) return null;
-      const block = infoMemShown[entry.row.group];
-      return block && block.length >= BLOCK_BYTES ? block : null;
+      return usable(infoMemShown[entry.row.group]);
     }
-    const rec = records.get(recordKey(entry.row.id, range));
-    if (!rec) return null;
-    return rec.calibBytes?.length >= BLOCK_BYTES ? rec.calibBytes : null;
+    return usable(records.get(recordKey(entry.row.id, range))?.calibBytes);
   }
 
   /** The dump record for this sensor at this range, or null. */
@@ -1001,15 +1024,32 @@ export function createCalibrationEditor(host, opts = {}) {
     return true;
   }
 
-  /** The 8-byte tick stamp as a local date, or null when it says nothing. */
-  function stampToDate(ticks) {
-    if (!ticks || ticks.length < 8) return null;
+  /**
+   * What the record's 8-byte stamp says: a `Date`, `"none"` or `"unset"`.
+   *
+   * The three are genuinely different and none of them is the others:
+   *
+   *   a Date   the sensor's real-world clock when the calibration was stored
+   *   "none"   an all-zero stamp — the firmware's mark for a calibration it
+   *            seeded itself rather than one anybody measured
+   *   "unset"  a stamp that decodes to a date nobody could have calibrated
+   *            on, which happens when the sensor's clock had never been set:
+   *            the tick count is then measured from boot and lands in 1970
+   *
+   * Note the unit. This is a 64-bit count of 32768 Hz ticks
+   * (`RTC_getRwcTime()`, `Calibration/shimmer_calibration.c:1054`), NOT the
+   * Unix seconds the SDK's `calibTsBytesToUnixSeconds` decodes for the
+   * Verisense blob — reading it as seconds puts every calibration about 1.8
+   * million years into the future.
+   */
+  function readStamp(ticks) {
+    if (!ticks || ticks.length < 8) return "none";
     let v = 0;
     for (let i = 7; i >= 0; i--) v = v * 256 + (ticks[i] & 0xff);
-    if (v === 0) return null;
+    if (v === 0) return "none";
     const ms = (v / RTC_TICKS_PER_SECOND) * 1000;
     if (!Number.isFinite(ms) || ms < STAMP_MIN_MS || ms > STAMP_MAX_MS) {
-      return null;
+      return "unset";
     }
     return new Date(ms);
   }
@@ -1070,23 +1110,25 @@ export function createCalibrationEditor(host, opts = {}) {
       const rec =
         records.get(recordKey(entry.row.id, 0)) ?? firstRecordFor(entry.row.id);
       if (rec) {
-        const date = stampToDate(rec.timestampTicks);
-        entry.statePill.textContent = date
-          ? `stored ${formatStamp(date)}`
-          : "stored, no date";
+        const stamp = readStamp(rec.timestampTicks);
+        entry.statePill.textContent =
+          stamp instanceof Date
+            ? `stored ${formatStamp(stamp)}`
+            : "stored, no date";
         entry.statePill.className = "pill";
         entry.noteNode.textContent = `${rec.calibLen} bytes at range ${rec.range}.`;
+        entry.card.dataset.calState = "unmodelled";
       } else {
         entry.statePill.textContent = "no record";
         entry.statePill.className = "pill";
         entry.noteNode.textContent = "";
+        entry.card.dataset.calState = "unmodelled";
       }
       return;
     }
 
     const range = shownRange.get(entry.key);
     const stored = storedBlock(entry, range);
-    const storedValues = valuesFromBlock(entry, stored);
     const def = defaultBlock(entry, range);
     const rec = storedRecord(entry, range);
     setPlaceholders(entry, range);
@@ -1099,7 +1141,8 @@ export function createCalibrationEditor(host, opts = {}) {
     const dirty = !!typed && !bytesEqual(typed, stored);
 
     // ---- the "as of" readout
-    const date = rec ? stampToDate(rec.timestampTicks) : null;
+    const stamp = rec ? readStamp(rec.timestampTicks) : "none";
+    const date = stamp instanceof Date ? stamp : null;
     if (store() === "infomem") {
       entry.asOf.textContent = stored
         ? "no date — the configuration image stores no calibration date"
@@ -1108,9 +1151,11 @@ export function createCalibrationEditor(host, opts = {}) {
       entry.asOf.textContent = "";
     } else if (date) {
       entry.asOf.textContent = `as of ${formatStamp(date)}`;
-    } else {
+    } else if (stamp === "unset") {
       entry.asOf.textContent =
-        "as of an unknown date — the sensor's clock was not set";
+        "date unreadable — the sensor's clock had not been set when this was stored";
+    } else {
+      entry.asOf.textContent = "no date — the firmware seeded this itself";
     }
 
     // ---- the state pill: never calibrated / defaults / this device's own
@@ -1141,19 +1186,21 @@ export function createCalibrationEditor(host, opts = {}) {
       note =
         "What is stored is byte-for-byte the factory default for this range, " +
         "so this sensor has no calibration of its own here.";
-    } else if (rec?.isDefault || (!date && store() !== "infomem")) {
+    } else if (date) {
+      pill = `calibrated ${formatStamp(date)}`;
+      pillClass = "pill on";
+      note = "";
+    } else {
       pill = "this sensor's own values, no date";
       pillClass = "pill on";
       note =
-        "Values that are not the factory defaults, but with no calibration " +
-        "date — either seeded by the firmware or written by a host that did " +
-        "not stamp them.";
-    } else {
-      pill = date
-        ? `calibrated ${formatStamp(date)}`
-        : "this sensor's own values";
-      pillClass = "pill on";
-      note = "";
+        store() === "infomem"
+          ? "Values that are not the factory defaults. The configuration " +
+            "image keeps no calibration date, so when they were measured is " +
+            "not recorded there."
+          : "Values that are not the factory defaults, but with no usable " +
+            "calibration date — either seeded by the firmware or stored " +
+            "while the sensor's clock had never been set.";
     }
     if (built.problems?.length) {
       pill = "value out of range";
@@ -1838,7 +1885,7 @@ export function createCalibrationEditor(host, opts = {}) {
     const bytes = edits ?? dumpBytes;
     const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
     downloadBlob(
-      `${filePrefix}-calibration-${stamp}.bin`,
+      `${getFilePrefix() ?? "shimmer"}-calibration-${stamp}.bin`,
       new Blob([bytes], { type: "application/octet-stream" }),
     );
     log.log(
