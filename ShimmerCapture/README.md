@@ -112,13 +112,37 @@ read back, because the dock protocol has a write for it and no read.
 
 ## Calibration
 
-The calibration dump is the sensor's own record of every per-sensor calibration
-it holds: which sensor, at which range, calibrated when. The page reads it into
-a table, saves it to a file and writes one back, over a Bluetooth link — the
-dock protocol has no calibration-dump command, so these controls are greyed out
-over USB. Note the ordering the firmware imposes: writing a configuration image
-regenerates the dump from the configuration bytes, so a dump must be written
-**after** a configuration, never before.
+Its own tab, because calibration is per-sensor and per-range rather than a
+device setting, and because reading nine numbers off a hex dump is not a way to
+check whether a sensor is calibrated.
+
+Each sensor gets a card: an offset per axis, a sensitivity per axis in that
+sensor's own units, and a 3x3 alignment matrix, with the range the values apply
+to and the date they were written. Sensitivity is three numbers rather than a
+matrix because that is what the 21-byte block holds — a 3x3 grid would offer
+six cells that cannot be saved. Alignment entries are signed bytes scaled by a
+hundredth, so they are bounded, and a value the format cannot hold is refused
+rather than quietly clamped on the way out.
+
+A sensor the hardware does not have is not offered: a Shimmer3 has neither the
+high-g accelerometer nor the second magnetometer a Shimmer3R carries. Where the
+sensor never said what hardware it is, the panel takes the hardware identity
+from the dump's own version header rather than from the page's default, so it
+cannot invite edits to sensors that may not exist.
+
+Three states are worth telling apart, and the panel does: values written for
+this particular device, values that are still the factory seed, and no record
+at all. The last is not zero — an unwritten block reads back as all ones or all
+zeros, and showing that as a calibration of zero would be a lie about a sensor
+that has never been calibrated. A per-sensor restore puts the factory seed back
+for the selected range.
+
+Reads, writes and the raw dump's save and load all work over a Bluetooth link.
+The dock protocol has no calibration-dump command, so the controls are greyed
+out over USB. One ordering the firmware imposes and the tab says out loud:
+writing a configuration image regenerates the dump from the configuration
+bytes, so a calibration must be written **after** a configuration, never
+before.
 
 ## Streaming, plotting and recording
 
