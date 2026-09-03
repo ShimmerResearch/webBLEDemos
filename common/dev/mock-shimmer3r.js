@@ -78,6 +78,7 @@ const CMD = Object.freeze({
   GET_STATUS: 0x72,
   SET_DATA_RATE_TEST: 0xa4,
   DATA_RATE_TEST_RESPONSE: 0xa5,
+  SET_FACTORY_TEST: 0xa8,
   INSTREAM_CMD_RESPONSE: 0x8a,
   SET_INFOMEM: 0x8c,
   INFOMEM_RESPONSE: 0x8d,
@@ -94,6 +95,19 @@ const CMD = Object.freeze({
   UPD_CALIB_DUMP: 0x9b,
   SET_FEATURE: 0xb7,
 });
+
+/**
+ * The firmware's `factory_test_t` (log-and-stream-common
+ * `Test/shimmer_test.h:21-27`), which is also SET_FACTORY_TEST's argument byte.
+ */
+const FACTORY_TEST_TYPE = Object.freeze({
+  MAIN: 0,
+  LEDS: 1,
+  ICS: 2,
+  LED_STATES: 3,
+});
+/** `FACTORY_TEST_COUNT` — the firmware ignores anything at or above it. */
+const FACTORY_TEST_TYPE_COUNT = 4;
 
 /** Feature ids for SET_FEATURE, mirroring the SDK's `BT_FEATURE`. */
 const FEATURE = Object.freeze({
@@ -601,7 +615,9 @@ export function mockEnabledFromUrl() {
  *   as it now stands and a count of the chunks the firmware dropped; and
  *   `transport.status` docks, undocks or pushes an unsolicited
  *   STATUS_RESPONSE, which is how the firmware tells a host about a change
- *   the host did not cause.
+ *   the host did not cause. `transport.factoryTest` is the self-test run
+ *   count, whether a report is still printing and the exact text printed;
+ *   `transport.rtc` exposes the sensor's own running clock.
  */
 export function createMockShimmer3RTransport(opts = {}) {
   const framed = opts.framed !== false;
@@ -621,6 +637,25 @@ export function createMockShimmer3RTransport(opts = {}) {
       : opts.hardwareVersion;
   const sdKBps = Math.max(1, opts.sdKBps ?? SD_DEFAULT_KBPS);
   const linkKBps = Math.max(1, opts.linkKBps ?? LINK_DEFAULT_KBPS);
+
+  /* A real-world clock that RUNS, and runs at a settable error. A frozen
+     clock (what a stored tick count gives) reads back correctly but has no
+     slope, so nothing that measures drift can be exercised against it.
+     `clockBase: "local"` starts the sensor on this host's civil time instead
+     of UTC, which is what a sensor set by a tool using the other convention
+     looks like — the case a host's clock-base detection exists for. */
+  const rtcOpts = opts.rtc ?? {};
+  const rtcPpm = Number.isFinite(rtcOpts.ppm) ? Number(rtcOpts.ppm) : 0;
+  const rtcClockBase = rtcOpts.clockBase === "local" ? "local" : "utc";
+  const rtc = {
+    devMsAtSet:
+      Date.now() +
+      (rtcClockBase === "local" ? -new Date().getTimezoneOffset() * 60000 : 0),
+    setAtHostMs: Date.now(),
+  };
+  /** The sensor's clock now, in its own epoch, drifting at `rtcPpm`. */
+  const deviceNowMs = () =>
+    rtc.devMsAtSet + (Date.now() - rtc.setAtHostMs) * (1 + rtcPpm / 1e6);
 
   const state = {
     rateHz: opts.rateHz ?? 51.2,
@@ -651,6 +686,8 @@ export function createMockShimmer3RTransport(opts = {}) {
     rebootArmed: false,
     /** How many times the armed restart has actually fired. */
     reboots: 0,
+    /** Self-test bookkeeping, read through `transport.factoryTest`. */
+    factoryTest: { runs: 0, running: false, lastType: null },
   };
 
   const infoMem = new Uint8Array(INFOMEM_STORE_BYTES);
@@ -862,6 +899,33 @@ export function createMockShimmer3RTransport(opts = {}) {
     push: () => reply(statusResponse()),
     /** The frame a push (or a GET_STATUS answer) carries, for comparison. */
     bytes: () => new Uint8Array(statusResponse()),
+  };
+
+  transport.factoryTest = {
+    /** How many self-tests this sensor has been asked to run. */
+    get runs() {
+      return state.factoryTest.runs;
+    },
+    /** True while the report is still printing — a cancel cannot stop it. */
+    get running() {
+      return state.factoryTest.running;
+    },
+    get lastType() {
+      return state.factoryTest.lastType;
+    },
+    /** Exactly the text put on the wire, for a byte-for-byte comparison. */
+    text: () => testText,
+  };
+
+  transport.rtc = {
+    get ppm() {
+      return rtcPpm;
+    },
+    get clockBase() {
+      return rtcClockBase;
+    },
+    /** The sensor's own clock, in its own epoch. */
+    deviceNowMs,
   };
 
   /* A normal disconnect does NOT fire LoopbackTransport's onDisconnect
@@ -1489,6 +1553,7 @@ export function createMockShimmer3RTransport(opts = {}) {
     applyPendingReboot();
     stopStreaming();
     stopRateTest();
+    stopFactoryTest();
     if (sdRead) {
       clearInterval(sdRead.timer);
       sdRead = null;
@@ -1496,6 +1561,373 @@ export function createMockShimmer3RTransport(opts = {}) {
     state.streaming = false;
     state.logging = false;
   });
+
+  // -------------------------------------------------------------------------
+  // Factory self-test (SET_FACTORY_TEST)
+  //
+  // The firmware ACKs, then prints its report as RAW TEXT on the same link:
+  // no opcode, no length, no CRC, one write per line, each write truncated
+  // (not split) at MAX_TEST_REPORT_LENGTH = 128 characters — which drops that
+  // line's own terminator and glues the next line onto it
+  // (log-and-stream-common `Test/shimmer_test.c:69-88`,
+  // `Comms/shimmer_bt_uart.c:1285-1293`). Reproduced here, truncation
+  // included, because a host that cannot survive it cannot read a real report.
+  // -------------------------------------------------------------------------
+
+  /** What the firmware caps a single report write at. */
+  const TEST_REPORT_MAX_CHARS = 128;
+  /** Bytes per notification while framed — small enough to split every line. */
+  const TEST_REPORT_NOTIFY_BYTES = 13;
+
+  const TEST_START_BANNER =
+    "//**************************** TEST START " +
+    "************************************//\r\n";
+  const TEST_END_BANNER =
+    "//***************************** TEST END " +
+    "*************************************//\r\n";
+
+  const factoryTestOpts = opts.factoryTest ?? {};
+  /** Milliseconds the firmware dwells on each LED step (`DELAY_BETWEEN_LED_CHANGES_MS`). */
+  const testStepMs = Math.max(1, factoryTestOpts.stepMs ?? 2000);
+  /** Report a failing unit: a FAIL line, an over-long line, and a fail mask. */
+  const testFails = !!factoryTestOpts.fail;
+
+  let testTimer = null;
+  let testQueue = [];
+  let testText = "";
+
+  function stopFactoryTest() {
+    if (testTimer) {
+      clearTimeout(testTimer);
+      testTimer = null;
+    }
+    testQueue = [];
+    state.factoryTest.running = false;
+  }
+
+  /** Push one already-truncated entry onto the wire, chunked mid-line. */
+  function emitTestChunkedText(text) {
+    testText += text;
+    const bytes = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+    const size = framed ? TEST_REPORT_NOTIFY_BYTES : dribbleBytes;
+    for (let off = 0; off < bytes.length; off += size) {
+      transport.notify(bytes.slice(off, off + size));
+    }
+  }
+
+  function pumpFactoryTest() {
+    testTimer = null;
+    const entry = testQueue.shift();
+    if (!entry) {
+      state.factoryTest.running = false;
+      return;
+    }
+    /* The firmware's own rule, applied before anything reaches the link:
+       longer than the buffer and the tail — terminator and all — is lost. */
+    emitTestChunkedText(
+      entry.text.length > TEST_REPORT_MAX_CHARS
+        ? entry.text.slice(0, TEST_REPORT_MAX_CHARS)
+        : entry.text,
+    );
+    testTimer = setTimeout(pumpFactoryTest, entry.delayMs);
+  }
+
+  /**
+   * `[0xA8][type]` — run one of the firmware's four self-tests.
+   *
+   * NACKed while sensing, exactly as `ShimBt_isCmdBlockedWhileSensing`
+   * (`Comms/shimmer_bt_uart.c:2985`) refuses it. A type at or above
+   * FACTORY_TEST_COUNT is NACKed here where the firmware ACKs and silently
+   * runs nothing (`:1287`): a page cannot reach that case through its own
+   * type list, and a mock that answered nothing would look like a dead link.
+   */
+  function handleFactoryTest(cmd) {
+    if (cmd[0] !== CMD.SET_FACTORY_TEST) return false;
+    if (state.streaming || state.logging) {
+      reply([NACK]);
+      return true;
+    }
+    const type = cmd[1] ?? 0;
+    if (type >= FACTORY_TEST_TYPE_COUNT) {
+      reply([NACK]);
+      return true;
+    }
+    stopFactoryTest();
+    // ACK first: `reply` defers by a macrotask, so the report cannot bury the
+    // acknowledgement the host is waiting for — the firmware's own ordering,
+    // where TASK_BT_RESPOND outranks TASK_FACTORY_TEST.
+    reply([ACK]);
+    state.factoryTest.runs += 1;
+    state.factoryTest.lastType = type;
+    state.factoryTest.running = true;
+    testText = "";
+    testQueue = buildFactoryTestReport(type);
+    testTimer = setTimeout(pumpFactoryTest, REPLY_DELAY_MS + 1);
+    return true;
+  }
+
+  /**
+   * The report a Shimmer3R (or, with `hw=3`, a Shimmer3) prints, as a queue of
+   * `{ text, delayMs }` writes — one entry per firmware `sendReport` call, so
+   * the two-write model line and the paced LED narration reach the host the
+   * way they really do.
+   */
+  function buildFactoryTestReport(type) {
+    const line = (
+      text,
+      delayMs = Math.max(1, Math.round(testStepMs / 10)),
+    ) => ({
+      text,
+      delayMs,
+    });
+    const led = (text) => line(text, testStepMs);
+    const stateLine = (text) => line(text, Math.round(testStepMs * 2.5));
+    const shimmer3 = hardwareVersion === 3;
+    const isMain = type === FACTORY_TEST_TYPE.MAIN;
+    const isIcs = type === FACTORY_TEST_TYPE.ICS;
+    const isLeds = type === FACTORY_TEST_TYPE.LEDS;
+    const isLedStates = type === FACTORY_TEST_TYPE.LED_STATES;
+    const id = (n, rest) =>
+      shimmer3 ? ` - ${rest}\r\n` : ` - S3R_TEST_${n} - ${rest}\r\n`;
+    const out = [line(TEST_START_BANNER)];
+    out.push(
+      line(
+        `Firmware version: v${fw.major}.${String(fw.minor).padStart(2, "0")}.` +
+          `${String(fw.patch).padStart(3, "0")}\r\n`,
+      ),
+    );
+
+    if (isIcs || isMain) {
+      const now = new Date();
+      const p2 = (n) => String(n).padStart(2, "0");
+      if (!shimmer3) {
+        out.push(
+          line(
+            `Date (yyyy-mm-dd): ${now.getUTCFullYear()}-` +
+              `${p2(now.getUTCMonth() + 1)}-${p2(now.getUTCDate())}\r\n`,
+          ),
+          line(
+            `Time (hh:mm:ss): ${p2(now.getUTCHours())}:` +
+              `${p2(now.getUTCMinutes())}:${p2(now.getUTCSeconds())} (UTC)\r\n`,
+          ),
+          line("\r\n"),
+          line("INFO: Temperature pass range set to 15-35 degC\r\n"),
+        );
+      }
+      out.push(line("\r\n"), line("Shimmer model:\r\n"));
+      /* Two writes, no terminator on the first: the firmware prints the card
+         id and its SR revision separately (`hal_FactoryTest.c:414-419`), so a
+         host that reassembles per notification would show a broken line. */
+      out.push(
+        line(
+          shimmer3
+            ? " - PASS: Shimmer3 GSR+"
+            : " - S3R_TEST_0003 - PASS: Shimmer3R IMU",
+        ),
+        line(shimmer3 ? " (SR48-4-0)\r\n" : " (SR68-1-0)\r\n"),
+      );
+
+      out.push(line("\r\n"), line("MCU:\r\n"));
+      if (shimmer3) {
+        out.push(line(" - Last reset reason = Power on\r\n"));
+      } else {
+        out.push(
+          line(" - Device ID = 1126\r\n"),
+          line(" - Revision ID = 4104\r\n"),
+          line(" - Unique ID = 0x0033002E3438510B00313437\r\n"),
+        );
+      }
+      out.push(
+        line(
+          id(
+            "0007",
+            testFails
+              ? "FAIL: VRef = 2900mV (3200-3400mV)"
+              : "PASS: VRef = 3301mV (3200-3400mV)",
+          ),
+        ),
+      );
+      if (!shimmer3) {
+        out.push(
+          line(id("0008", "PASS: VCore = 1376mV (900-1800mV)")),
+          line(id("0009", "PASS: VBatt pin = 1802mV (1750-1850mV)")),
+          line(id("0010", "PASS: Temperature = 24 degC")),
+          /* Deliberately over 128 characters in the failing build: the
+             firmware would drop this line's terminator and glue the next
+             line onto it, which is the case a report reader must survive. */
+          line(
+            testFails
+              ? id(
+                  "0028",
+                  "FAIL: 32k LSE vs 16M HSE error not measurable " +
+                    "(LSE not ready, L 0/32769 H 62501/62501, retries exhausted, " +
+                    "drive ladder walked to MEDIUMHIGH)",
+                )
+              : id(
+                  "0028",
+                  "PASS: 32k LSE vs 16M HSE error = -9.3 ppm " +
+                    "(limit +/-35.0 ppm, HSE-fixed caps rev)",
+                ),
+          ),
+          line(" - LSE drive applied at boot: MEDIUMLOW\r\n"),
+          line(" - I/O status:\r\n"),
+          line("    - Docked: No\r\n"),
+          line("    - BT connected: Yes\r\n"),
+          line("    - Button pressed: No\r\n"),
+          line("    - USB connected: No\r\n"),
+          line("\r\n"),
+          line("Battery:\r\n"),
+          line(id("0011", "PASS: VBatt = 4012mV (2980-4750mV)")),
+          line(id("0012", "PASS: Charger chip status = Charge is completed")),
+          line(" - Determined charging status = Fully Charged\r\n"),
+        );
+      }
+
+      out.push(line("\r\n"), line("SD Card:\r\n"));
+      out.push(
+        shimmer3
+          ? line(" - PASS: SD card detected\r\n")
+          : line(" - Manufacturer: SanDisk\r\n"),
+      );
+      if (!shimmer3) out.push(line(id("0013", "PASS: MCU read/write test")));
+
+      out.push(line("\r\n"), line("BT Module:\r\n"));
+      out.push(line(` - MAC ID: ${mac.toUpperCase()}\r\n`));
+      if (shimmer3) {
+        out.push(
+          line(" - RN4678 V1.23\r\n"),
+          line(" - PASS\r\n"),
+          line(" - Counts:\r\n"),
+          line("   - BT data-rate test blockages = 12\r\n"),
+          line("   - BT disconnects while streaming = 0\r\n"),
+        );
+      } else {
+        out.push(
+          line(" - v01.04.18.18\r\n"),
+          line(id("0014", "PASS: Correct BT firmware version")),
+        );
+      }
+
+      if (shimmer3) {
+        out.push(
+          line("\r\n"),
+          line("I2C:\r\n"),
+          line(" - PASS: CAT24C16\r\n"),
+          line(" - LSM303AH detected (self-test not implemented yet)\r\n"),
+          line(" - MPU9x50 detected (self-test not implemented yet)\r\n"),
+          line(" - BMP280 detected (self-test not implemented yet)\r\n"),
+          line("\r\n"),
+          line("SPI:\r\n"),
+          line(" - PASS: ADS1292R Chip1 detect\r\n"),
+          line(" - PASS: ADS1292R Chip2 detect\r\n"),
+        );
+      } else {
+        out.push(
+          line("\r\n"),
+          line("SPI1:\r\n"),
+          line(id("0015", "PASS: ADS7028")),
+          line(id("0016", "PASS: LSM6DSV (27.31 degC)")),
+          line(id("0017", "PASS: BMP390 (26.94 degC)")),
+          line(id("0018", "ADXL371 test not applicable for this model")),
+          line("SPI2:\r\n"),
+          line(id("0019", "LIS3MDL test not applicable for this model")),
+          line(id("0020", "PASS: LIS2DW12 (27.02 degC)")),
+          line("SPI3:\r\n"),
+          line(id("0021", "PASS: ADS1292R Chip1 detect")),
+          line(id("0021", "PASS: ADS1292R Chip2 detect")),
+          line("\r\n"),
+          line("I2C1:\r\n"),
+          line(id("0022", "PASS: LIS2MDL (27.10 degC)")),
+          line(id("0023", "PASS: CAT24C16")),
+          line("I2C4:\r\n"),
+          line(id("0024", "I2C4 test not applicable for this model")),
+          line(id("0025", "WARNING: GSR - Correct test rig not detected")),
+          line("\r\n"),
+          line("Microphone:\r\n"),
+          line(id("0026", "PASS")),
+        );
+      }
+    }
+
+    if (isMain || isLeds) {
+      out.push(line("\r\n"));
+      out.push(
+        line(shimmer3 ? "LED test:\r\n" : "LED test (S3R_TEST_0027):\r\n"),
+      );
+      const sequence = shimmer3
+        ? [
+            "All LEDs off",
+            "Lower Green LED on",
+            "Lower Yellow LED on",
+            "Lower Red LED on",
+            "Upper Green LED on",
+            "Upper Blue LED on",
+            "All LEDs off",
+            "All LEDs on",
+          ]
+        : [
+            "All LEDs off",
+            "Lower Red LED on",
+            "Lower Green LED on",
+            "Lower Blue LED on",
+            "Upper Red LED on",
+            "Upper Green LED on",
+            "Upper Blue LED on",
+            "All LEDs off",
+            "All LEDs on",
+          ];
+      for (const step of sequence) out.push(led(` - ${step}\r\n`));
+    }
+
+    if (isLedStates) {
+      out.push(line("Testing Operational LED states - Start\r\n"));
+      const groups = [
+        ["BT Disabled:", ["Idle...", "SD Logging..."]],
+        [
+          "BT Enabled:",
+          [
+            "Idle...",
+            "SD Logging...",
+            "BT Streaming...",
+            "BT Streaming and SD Logging...",
+            "BT Connected...",
+            "BT Connected and SD Logging...",
+          ],
+        ],
+        [
+          "SD Sync Enabled:",
+          [
+            "Idle...",
+            "SD Logging waiting for initial sync (slave)...",
+            "SD Logging waiting for initial sync (master)...",
+            "SD Logging and BT advertising...",
+            "SD Logging and syncing...",
+          ],
+        ],
+        ["Other:", ["Configuring...", "Time not set..."]],
+      ];
+      for (const [heading, states] of groups) {
+        out.push(line(`${heading}\r\n`));
+        for (const s of states) out.push(stateLine(`\t-> ${s}\r\n`));
+      }
+      out.push(line("Testing Operational LED states - End\r\n"));
+    }
+
+    /* Only MAIN and ICS carry a verdict line — the two LED tests are watched,
+       not scored, and set no bits (`Test/shimmer_test.c:43-55`). */
+    if (isMain || isIcs) {
+      out.push(
+        line(
+          testFails
+            ? "\r\nOverall Result = FAIL (0x00000040)\r\n"
+            : "\r\nOverall Result = PASS\r\n",
+        ),
+      );
+    }
+    out.push(line(TEST_END_BANNER));
+    return out;
+  }
 
   // -------------------------------------------------------------------------
   // Command handling
@@ -1517,6 +1949,7 @@ export function createMockShimmer3RTransport(opts = {}) {
        their own — see the SD card section above. */
     if (handleSdCommand(cmd)) return;
     if (handleDataRateTest(cmd)) return;
+    if (handleFactoryTest(cmd)) return;
 
     switch (op) {
       case CMD.INQUIRY:
@@ -1793,7 +2226,7 @@ export function createMockShimmer3RTransport(opts = {}) {
       case CMD.GET_RWC: {
         const out = new Uint8Array(9);
         out[0] = CMD.RWC_RESPONSE;
-        let ticks = state.rwcTicks || BigInt(Math.round(Date.now() * 32.768));
+        let ticks = BigInt(Math.round(deviceNowMs() * 32.768));
         for (let i = 0; i < 8; i++) {
           out[1 + i] = Number(ticks & 0xffn);
           ticks >>= 8n;
@@ -1807,6 +2240,10 @@ export function createMockShimmer3RTransport(opts = {}) {
         for (let i = 8; i >= 1; i--)
           ticks = (ticks << 8n) | BigInt(cmd[i] ?? 0);
         state.rwcTicks = ticks;
+        // Re-seat the running clock on what the host wrote: from here the
+        // sensor keeps its own time, and keeps drifting at `rtc.ppm`.
+        rtc.devMsAtSet = Number(ticks) / 32.768;
+        rtc.setAtHostMs = Date.now();
         // What the "Clock set" status bit means: not that the clock reads
         // something, but that a host has set it since the sensor last lost
         // power (`RTC_isRwcTimeSet`).
