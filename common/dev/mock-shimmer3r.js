@@ -33,6 +33,9 @@ import {
   SD_TRANSFER_OPCODES,
   SD_XFER,
   buildBrandRecord,
+  generateCalibDump,
+  generateKinematicCalibBlock,
+  getDefaultCalibration,
   parseBrandRecord,
   sdCrc16,
 } from "../../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
@@ -82,6 +85,10 @@ const CMD = Object.freeze({
   VBATT_RESPONSE: 0x94,
   GET_VBATT: 0x95,
   STOP_SDBT: 0x97,
+  SET_CALIB_DUMP: 0x98,
+  RSP_CALIB_DUMP: 0x99,
+  GET_CALIB_DUMP: 0x9a,
+  UPD_CALIB_DUMP: 0x9b,
   SET_FEATURE: 0xb7,
 });
 
@@ -195,6 +202,213 @@ const EEPROM_HOST_BYTES = 2032;
 
 /** Firmware's ceiling on one daughter-card read or write. */
 const EEPROM_MAX_PER_CALL = 128;
+
+// ---------------------------------------------------------------------------
+// Calibration dump
+// ---------------------------------------------------------------------------
+
+/**
+ * Calibration RAM, `SHIMMER_CALIB_RAM_MAX` in log-and-stream-common
+ * `Calibration/shimmer_calibration.h:16-20`. The dump lives at the front of
+ * it and the rest reads as zeros, which is what a read past the end of a real
+ * dump returns.
+ */
+const CALIB_RAM_BYTES = 1024;
+
+/**
+ * Bytes the firmware will move in one GET_CALIB_DUMP / SET_CALIB_DUMP
+ * (`Comms/shimmer_bt_uart.c:2241-2249`). Bigger requests are refused rather
+ * than served short, because the SDK sizes its pages against this.
+ */
+const CALIB_MAX_PER_CALL = 128;
+
+/**
+ * Calibration-domain sensor ids, `SC_SENSOR_*` in log-and-stream-common
+ * `Calibration/shimmer_calibration.h:96-112`. NOT the SDK's `CalibSensorId`,
+ * which is the Verisense domain and disagrees on 40 and 41.
+ */
+const SC_SENSOR = Object.freeze({
+  ANALOG_ACCEL: 2,
+  MPU9X50_GYRO: 30,
+  LSM303_ACCEL: 31,
+  LSM303_MAG: 32,
+  BMP180_PRESSURE: 36,
+  LSM6DSV_ACCEL: 37,
+  LSM6DSV_GYRO: 38,
+  LIS2DW12_ACCEL: 39,
+  ADXL371_ACCEL: 40,
+  LIS3MDL_MAG: 41,
+  LIS2MDL_MAG: 42,
+  BMP390_PRESSURE: 43,
+});
+
+/** 32768 Hz ticks, the unit `RTC_getRwcTime()` stamps a calibration with. */
+function calibStamp(unixSeconds) {
+  const out = new Uint8Array(8);
+  let ticks = BigInt(Math.round(unixSeconds * 32768));
+  for (let i = 0; i < 8; i++) {
+    out[i] = Number(ticks & 0xffn);
+    ticks >>= 8n;
+  }
+  return out;
+}
+
+/** The all-zero stamp the firmware writes for a seeded (default) calibration. */
+const CALIB_STAMP_NONE = new Uint8Array(8);
+
+/**
+ * A 21-byte kinematic block built from the SDK's own defaults for a family,
+ * group and range, optionally perturbed to stand in for a per-unit
+ * calibration.
+ *
+ * Built through `generateKinematicCalibBlock` rather than typed out as bytes
+ * so the fixture cannot drift away from the parser that reads it: if the
+ * codec changes, this changes with it.
+ */
+function calibBlock(family, group, range, tweak) {
+  const d = getDefaultCalibration(family, group, range);
+  if (!d) return null;
+  const offset = [...d.calibration.offset];
+  const sensitivity = [...d.calibration.sensitivity];
+  const alignment = [...d.calibration.alignment];
+  if (tweak) {
+    tweak.offset?.forEach((v, i) => (offset[i] = v));
+    tweak.sensitivity?.forEach((v, i) => (sensitivity[i] = v));
+    tweak.alignment?.forEach((v, i) => (alignment[i] = v));
+  }
+  return generateKinematicCalibBlock(offset, sensitivity, alignment, {
+    sensitivityScale: d.sensitivityScale,
+  });
+}
+
+function calibRecord(sensorId, range, bytes, ts) {
+  return {
+    sensorId,
+    range,
+    calibLen: bytes.length,
+    timestampTicks: ts,
+    calibBytes: bytes,
+    isDefault: ts.every((b) => b === 0),
+  };
+}
+
+/**
+ * The synthetic calibration dump, mixed on purpose so every state the
+ * calibration UI has to render is reachable without hardware:
+ *
+ *   - the low-noise accel and the magnetometer hold this unit's OWN values
+ *     with a real calibration date;
+ *   - the gyro and the wide-range accel hold the factory defaults, stamped
+ *     all-zero exactly as the firmware seeds them;
+ *   - the gyro's record is at ONE range only, so every other gyro range has
+ *     no record at all — the "never calibrated" state, reached by moving the
+ *     range selector rather than by finding a different sensor;
+ *   - on a Shimmer3R the alt-magnetometer's record is an all-0xFF block (the
+ *     other flavour of "nothing stored": a record that exists and says
+ *     nothing) and the high-g accel has NO record at all;
+ *   - the pressure sensor holds a 22-byte coefficient block, which is not a
+ *     kinematic set and must not be offered as one.
+ *
+ * @param {number|null} hardwareVersion 3, 10, or null (treated as 10)
+ * @param {{major: number, minor: number, patch: number}} fw
+ */
+function buildSyntheticCalibDump(hardwareVersion, fw) {
+  const hw = hardwareVersion == null ? 10 : hardwareVersion;
+  const version = {
+    hardwareId: hw,
+    firmwareId: 3, // LogAndStream
+    firmwareMajor: fw.major,
+    firmwareMinor: fw.minor,
+    firmwareInternal: fw.patch,
+  };
+  /* Fixed civil dates so a screenshot and a test see the same thing every
+     run. Midday, so a host time zone either side of UTC still reads the day
+     the fixture names. */
+  const CAL_A = Date.UTC(2026, 5, 11, 12, 0, 0) / 1000;
+  const CAL_B = Date.UTC(2026, 3, 2, 12, 0, 0) / 1000;
+  /* Not a kinematic block: the pressure chips' factory coefficients, which
+     the calibration tab has to show as present-but-not-editable. */
+  const pressure = Uint8Array.from({ length: 22 }, (_, i) => 0x40 + i);
+
+  if (hw === 3) {
+    const family = "shimmer3-old";
+    return generateCalibDump(version, [
+      calibRecord(
+        SC_SENSOR.ANALOG_ACCEL,
+        0,
+        calibBlock(family, "lnAccel", 0, {
+          offset: [2051, 2043, 2049],
+          sensitivity: [84, 83, 82],
+        }),
+        calibStamp(CAL_A),
+      ),
+      calibRecord(
+        SC_SENSOR.MPU9X50_GYRO,
+        3,
+        calibBlock(family, "gyro", 3),
+        CALIB_STAMP_NONE,
+      ),
+      calibRecord(
+        SC_SENSOR.LSM303_ACCEL,
+        0,
+        calibBlock(family, "wrAccel", 0),
+        CALIB_STAMP_NONE,
+      ),
+      calibRecord(
+        SC_SENSOR.LSM303_MAG,
+        1,
+        calibBlock(family, "mag", 1, { sensitivity: [1104, 1098, 981] }),
+        calibStamp(CAL_B),
+      ),
+      calibRecord(SC_SENSOR.BMP180_PRESSURE, 0, pressure, calibStamp(CAL_B)),
+    ]);
+  }
+
+  const family = "shimmer3r";
+  return generateCalibDump(version, [
+    calibRecord(
+      SC_SENSOR.LSM6DSV_ACCEL,
+      0,
+      calibBlock(family, "lnAccel", 0, {
+        offset: [12, -30, 4],
+        sensitivity: [1674, 1670, 1673],
+      }),
+      calibStamp(CAL_A),
+    ),
+    calibRecord(
+      SC_SENSOR.LSM6DSV_GYRO,
+      3,
+      calibBlock(family, "gyro", 3),
+      CALIB_STAMP_NONE,
+    ),
+    calibRecord(
+      SC_SENSOR.LIS2DW12_ACCEL,
+      0,
+      calibBlock(family, "wrAccel", 0),
+      CALIB_STAMP_NONE,
+    ),
+    calibRecord(
+      SC_SENSOR.LIS2MDL_MAG,
+      0,
+      calibBlock(family, "mag", 0, {
+        offset: [-6, 11, 2],
+        sensitivity: [669, 664, 671],
+      }),
+      calibStamp(CAL_B),
+    ),
+    /* A record that exists and stores nothing — `parseKinematicCalibBlock`
+       answers null for an all-0xFF block, and the UI must say "never
+       calibrated" rather than printing 65535s. */
+    calibRecord(
+      SC_SENSOR.LIS3MDL_MAG,
+      0,
+      new Uint8Array(21).fill(0xff),
+      CALIB_STAMP_NONE,
+    ),
+    calibRecord(SC_SENSOR.BMP390_PRESSURE, 0, pressure, calibStamp(CAL_B)),
+    /* No ADXL371 record at all: deliberately absent. */
+  ]);
+}
 
 /** How long the mock waits before answering, in ms. */
 const REPLY_DELAY_MS = 0;
@@ -375,8 +589,10 @@ export function mockEnabledFromUrl() {
  *   `transport.emitDisconnect()` simulates a dropped link;
  *   `transport.writes` is every command the page sent; `transport.sdCard`
  *   is the synthetic card, with a `bytes(path)` that returns exactly what a
- *   download of that file should produce; and `transport.eeprom` is the
- *   expansion-board EEPROM, with the brand record and the restart bookkeeping.
+ *   download of that file should produce; `transport.eeprom` is the
+ *   expansion-board EEPROM, with the brand record and the restart
+ *   bookkeeping; and `transport.calib` is the calibration RAM, with the dump
+ *   as it now stands and a count of the chunks the firmware dropped.
  */
 export function createMockShimmer3RTransport(opts = {}) {
   const framed = opts.framed !== false;
@@ -419,6 +635,23 @@ export function createMockShimmer3RTransport(opts = {}) {
   const eeprom = new Uint8Array(EEPROM_HOST_BYTES).fill(0xff);
   const stockBrand = buildStockBrandRecord(hardwareVersion);
   eeprom.set(stockBrand, BRAND_RECORD_HOST_OFFSET);
+
+  /* Calibration RAM with the synthetic dump at the front of it. Everything
+     past the dump reads as zeros, which is what a read past a real dump
+     returns — and what makes the SDK's "take the total from the first
+     chunk's header" paging worth exercising. */
+  const calibRam = new Uint8Array(CALIB_RAM_BYTES);
+  calibRam.set(buildSyntheticCalibDump(hardwareVersion, fw), 0);
+  /**
+   * A SET_CALIB_DUMP in progress. The firmware takes the dump's total length
+   * from the FIRST chunk's own header and counts the rest in, refusing a
+   * write that does not start at the beginning
+   * (`ShimCalib_ramWrite`, `Calibration/shimmer_calibration.c:330-370`).
+   * `null` between writes.
+   */
+  let calibStaging = null;
+  /** Bookkeeping the harness reads: applies, and writes the firmware dropped. */
+  const calibStats = { updates: 0, discarded: 0 };
 
   const transport = new LoopbackTransport({
     capabilities: { framed },
@@ -545,6 +778,27 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
     get reboots() {
       return state.reboots;
+    },
+  };
+
+  /**
+   * The calibration RAM, exposed for development and for tests. `bytes()` is
+   * the dump as it stands now — after any SET_CALIB_DUMP the firmware
+   * accepted — `updates` counts UPD_CALIB_DUMP, and `discarded` counts the
+   * chunks the firmware dropped while still ACKing them, which is how a test
+   * proves an out-of-order write really did go nowhere.
+   */
+  transport.calib = {
+    bytes: () => {
+      const total = (calibRam[0] | (calibRam[1] << 8)) + 2;
+      return calibRam.slice(0, Math.min(Math.max(total, 2), calibRam.length));
+    },
+    ram: () => calibRam.slice(),
+    get updates() {
+      return calibStats.updates;
+    },
+    get discarded() {
+      return calibStats.discarded;
     },
   };
 
@@ -1255,6 +1509,87 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply([ACK]);
         return;
       }
+
+      case CMD.GET_CALIB_DUMP: {
+        // [0x9A][len][offsetLo][offsetHi] → [0x99][len][offsetLo][offsetHi][data…]
+        const len = cmd[1] ?? 0;
+        const off = (cmd[2] ?? 0) | ((cmd[3] ?? 0) << 8);
+        if (len < 1 || len > CALIB_MAX_PER_CALL || off >= calibRam.length) {
+          reply([NACK]);
+          return;
+        }
+        const out = new Uint8Array(4 + len);
+        out[0] = CMD.RSP_CALIB_DUMP;
+        out[1] = len;
+        out[2] = off & 0xff;
+        out[3] = (off >> 8) & 0xff;
+        /* Short at the end of RAM rather than wrapping: `subarray` stops
+           there and the rest of `out` stays zero, which is the flash read a
+           real device does. */
+        out.set(
+          calibRam.subarray(off, Math.min(off + len, calibRam.length)),
+          4,
+        );
+        reply(concat([ACK], out));
+        return;
+      }
+
+      case CMD.SET_CALIB_DUMP: {
+        // [0x98][len][offsetLo][offsetHi][data…]
+        const len = cmd[1] ?? 0;
+        const off = (cmd[2] ?? 0) | ((cmd[3] ?? 0) << 8);
+        const data = cmd.subarray(4, 4 + len);
+        /* Always ACKed, even when dropped. The firmware's handler ignores
+           `ShimCalib_ramWrite`'s failure return, so a host that starts in the
+           middle of the dump gets an ACK for a write that went nowhere — the
+           single most surprising thing about this command, and worth
+           reproducing rather than smoothing over. */
+        reply([ACK]);
+        if (len < 1 || len > CALIB_MAX_PER_CALL) {
+          calibStats.discarded++;
+          return;
+        }
+        if (off === 0) {
+          if (data.length < 2) {
+            calibStats.discarded++;
+            return;
+          }
+          // +2: the u16 length field counts the bytes after itself.
+          const total = (data[0] | (data[1] << 8)) + 2;
+          if (total <= 2 || total > calibRam.length) {
+            calibStaging = null;
+            calibStats.discarded++;
+            return;
+          }
+          calibStaging = { total, received: 0, buf: new Uint8Array(total) };
+        } else if (!calibStaging || off !== calibStaging.received) {
+          /* "starting with offset > 2 is not accepted" — and neither is a
+             chunk that skips forward. Dropped, silently, exactly as the
+             firmware drops it. */
+          calibStaging = null;
+          calibStats.discarded++;
+          return;
+        }
+        const room = Math.min(data.length, calibStaging.total - off);
+        calibStaging.buf.set(data.subarray(0, room), off);
+        calibStaging.received = off + room;
+        if (calibStaging.received >= calibStaging.total) {
+          /* The firmware applies the dump the moment the bytes it has add up
+             to the length its own header declared, without waiting for
+             UPD_CALIB_DUMP. */
+          calibRam.fill(0);
+          calibRam.set(calibStaging.buf, 0);
+          calibStaging = null;
+        }
+        return;
+      }
+
+      case CMD.UPD_CALIB_DUMP:
+        // Apply the in-RAM dump to the configuration bytes and the SD header.
+        // Nothing here models the configuration side, so this only counts.
+        calibStats.updates++;
+        reply([ACK]);
+        return;
 
       case CMD.GET_DAUGHTER_CARD_MEM: {
         // [0x69][len][offsetLo][offsetHi] → [0x68][len][data…]

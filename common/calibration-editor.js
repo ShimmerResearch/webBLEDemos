@@ -502,18 +502,26 @@ export function createCalibrationEditor(host, opts = {}) {
     return null;
   }
 
-  /** Which store this link can use: the dump, the InfoMem blocks, or neither. */
+  /**
+   * Which store is in play: the calibration dump, the InfoMem blocks, or
+   * neither.
+   *
+   * Decided by the CLIENT first, because that is what decides where a Write
+   * would land — a link with `readCalibDump`/`writeCalibDump` edits the dump,
+   * any other link can only be shown the InfoMem blocks. With nothing
+   * connected it follows whatever is on screen, so a dump loaded from a file
+   * can still be read, edited and saved with no sensor on the desk.
+   */
   function store() {
     const client = getClient();
-    if (
-      client &&
-      typeof client.readCalibDump === "function" &&
-      typeof client.writeCalibDump === "function"
-    ) {
-      return "dump";
+    if (client) {
+      return typeof client.readCalibDump === "function" &&
+        typeof client.writeCalibDump === "function"
+        ? "dump"
+        : "infomem";
     }
-    if (client || infoMemShown || getInfoMemBlocks()) return "infomem";
-    return "none";
+    if (dumpBytes) return "dump";
+    return infoMemShown ? "infomem" : "none";
   }
 
   const STORE_LABEL = Object.freeze({
@@ -545,30 +553,28 @@ export function createCalibrationEditor(host, opts = {}) {
   function limitsFor(part, sensitivityScale) {
     if (part === "offset") {
       return {
+        scale: 1,
         min: I16_MIN,
         max: I16_MAX,
-        step: 1,
         describe: `a whole number from ${I16_MIN} to ${I16_MAX}`,
       };
     }
     if (part === "sens") {
       const scale = sensitivityScale || 1;
-      const min = I16_MIN / scale;
-      const max = I16_MAX / scale;
       return {
-        min,
-        max,
-        step: 1 / scale,
+        scale,
+        min: I16_MIN / scale,
+        max: I16_MAX / scale,
         describe:
           scale === 1
             ? `a whole number from ${I16_MIN} to ${I16_MAX}`
-            : `${num(min)} to ${num(max)} in steps of ${num(1 / scale)}`,
+            : `${num(I16_MIN / scale)} to ${num(I16_MAX / scale)} in steps of ${num(1 / scale)}`,
       };
     }
     return {
+      scale: 100,
       min: I8_MIN / 100,
       max: I8_MAX / 100,
-      step: 0.01,
       describe: `${num(I8_MIN / 100)} to ${num(I8_MAX / 100)} in steps of 0.01`,
     };
   }
@@ -596,16 +602,13 @@ export function createCalibrationEditor(host, opts = {}) {
     /* The encoder rounds sensitivity and alignment and TRUNCATES offset. A
        value that would not survive that round trip is refused here, so the
        number in the box is always the number on the device. */
-    const scaled =
-      part === "offset" ? v : v * (lim.step === 1 ? 1 : 1 / lim.step);
-    const settled = part === "offset" ? Math.trunc(v) : Math.round(scaled);
-    const back = part === "offset" ? settled : settled * lim.step;
-    if (Math.abs(back - v) > 1e-9) {
+    const settled = Math.round(v * lim.scale) / lim.scale;
+    if (Math.abs(settled - v) > 1e-9) {
       return {
         problem:
-          part === "offset"
+          lim.scale === 1
             ? "must be a whole number"
-            : `must be a multiple of ${num(lim.step)}`,
+            : `must be a multiple of ${num(1 / lim.scale)}`,
       };
     }
     return { value: v };
@@ -1026,14 +1029,24 @@ export function createCalibrationEditor(host, opts = {}) {
    *   problem: string}[]}|{empty: true}}
    */
   function blockFromCells(entry) {
-    const values = readCells(entry);
-    const allBlank = ["offset", "sens", "align"].every((part) =>
-      values[part].every((v) => String(v).trim() === ""),
-    );
-    if (allBlank) return { empty: true };
+    return blockFromValues(entry, readCells(entry));
+  }
+
+  /**
+   * The 21 bytes one set of typed strings describes.
+   *
+   * A card with every box empty is `{empty: true}` rather than fifteen "needs
+   * a value" problems: nothing typed is not the same as something wrong, and
+   * it is the state a never-calibrated sensor starts in.
+   */
+  function blockFromValues(entry, values) {
+    const parts = ["offset", "sens", "align"];
+    if (parts.every((p) => values[p].every((v) => String(v).trim() === ""))) {
+      return { empty: true };
+    }
     const problems = [];
     const nums = { offset: [], sens: [], align: [] };
-    for (const part of ["offset", "sens", "align"]) {
+    for (const part of parts) {
       values[part].forEach((raw, index) => {
         const r = checkValue(raw, part, entry.sensitivityScale);
         if (r.problem) problems.push({ part, index, problem: r.problem });
@@ -1046,9 +1059,7 @@ export function createCalibrationEditor(host, opts = {}) {
         nums.offset,
         nums.sens,
         nums.align,
-        {
-          sensitivityScale: entry.sensitivityScale,
-        },
+        { sensitivityScale: entry.sensitivityScale },
       ),
     };
   }
@@ -1082,9 +1093,10 @@ export function createCalibrationEditor(host, opts = {}) {
 
     const built = blockFromCells(entry);
     const typed = built.bytes ?? null;
-    const dirty = built.empty
-      ? !!stored
-      : !!typed && !bytesEqual(typed, stored);
+    /* Empty boxes are never "dirty": there is nothing to write, so saying so
+       would light up a Write that is refused. Emptying them is how a reader
+       clears the editor and goes back to what the sensor holds. */
+    const dirty = !!typed && !bytesEqual(typed, stored);
 
     // ---- the "as of" readout
     const date = rec ? stampToDate(rec.timestampTicks) : null;
@@ -1108,19 +1120,22 @@ export function createCalibrationEditor(host, opts = {}) {
     if (!stored) {
       pill = "never calibrated";
       pillClass = "pill warn";
-      note =
-        store() === "infomem"
-          ? "The configuration image holds no calibration for this sensor" +
-            (configuredRange(entry) === null
-              ? "."
-              : range === configuredRange(entry)
-                ? "."
-                : " at the configured range, and it can hold only one range at a time.") +
-            " The values shown greyed are the factory defaults the sensor falls back to."
-          : "Nothing is stored for this sensor at this range, so the sensor " +
-            "falls back to the factory defaults shown greyed below. That is " +
-            "not a fault — most sensors leave the factory with defaults for " +
-            "every range but the one they were calibrated at.";
+      if (store() !== "infomem") {
+        note =
+          "Nothing is stored for this sensor at this range, so the sensor " +
+          "falls back to the factory defaults shown greyed below. That is " +
+          "not a fault — most sensors leave the factory with defaults for " +
+          "every range but the one they were calibrated at.";
+      } else {
+        const cfg = configuredRange(entry);
+        note =
+          "The configuration image holds no calibration for this sensor" +
+          (cfg !== null && range !== cfg
+            ? " at this range — it stores one range at a time, and the sensor " +
+              "is configured for another."
+            : ".") +
+          " The values shown greyed are the factory defaults it falls back to.";
+      }
     } else if (def && bytesEqual(stored, def)) {
       pill = "factory defaults";
       note =
@@ -1140,8 +1155,11 @@ export function createCalibrationEditor(host, opts = {}) {
       pillClass = "pill on";
       note = "";
     }
-    if (dirty) {
-      pill = built.empty ? "cleared, not written" : "edited, not written";
+    if (built.problems?.length) {
+      pill = "value out of range";
+      pillClass = "pill err";
+    } else if (dirty) {
+      pill = "edited, not written";
       pillClass = "pill warn";
     }
     entry.statePill.textContent = pill;
@@ -1283,30 +1301,6 @@ export function createCalibrationEditor(host, opts = {}) {
     return out;
   }
 
-  /** `blockFromCells` for a stashed set of strings rather than live boxes. */
-  function blockFromValues(entry, values) {
-    const problems = [];
-    const nums = { offset: [], sens: [], align: [] };
-    for (const part of ["offset", "sens", "align"]) {
-      values[part].forEach((raw, index) => {
-        const r = checkValue(raw, part, entry.sensitivityScale);
-        if (r.problem) problems.push({ part, index, problem: r.problem });
-        else nums[part].push(r.value);
-      });
-    }
-    if (problems.length) return { problems };
-    return {
-      bytes: sdk.generateKinematicCalibBlock(
-        nums.offset,
-        nums.sens,
-        nums.align,
-        {
-          sensitivityScale: entry.sensitivityScale,
-        },
-      ),
-    };
-  }
-
   function rangeLabel(entry, value) {
     const found = entry.ranges.find(([v]) => v === value);
     return found ? found[1] : `range ${value}`;
@@ -1412,9 +1406,13 @@ export function createCalibrationEditor(host, opts = {}) {
     const which = store();
     const live = enabled && !busy && !!getClient();
     const editable = which === "dump";
-    btnRead.disabled = !live || which === "none";
+    btnRead.disabled = !live;
     btnSave.disabled = !dumpBytes;
-    btnLoad.disabled = busy || !editable;
+    /* Loading a dump works with nothing connected — inspecting and editing a
+       saved dump is half of what saving one is for. It is refused only on a
+       link whose store is the configuration image, where a loaded dump would
+       be values with nowhere to go. */
+    btnLoad.disabled = busy || which === "infomem";
     btnWrite.disabled =
       !live ||
       !editable ||
@@ -1827,15 +1825,25 @@ export function createCalibrationEditor(host, opts = {}) {
     return true;
   }
 
-  /** Save the dump exactly as read or loaded. */
+  /**
+   * Save the dump to a file — the edits included.
+   *
+   * Deliberately what is ON SCREEN rather than what was read: a file that
+   * silently dropped the edits above it would be the one thing on this page
+   * that did not mean what it showed.
+   */
   function save() {
     if (!dumpBytes) return false;
+    const edits = problems().length ? null : buildDump();
+    const bytes = edits ?? dumpBytes;
     const stamp = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
     downloadBlob(
       `${filePrefix}-calibration-${stamp}.bin`,
-      new Blob([dumpBytes], { type: "application/octet-stream" }),
+      new Blob([bytes], { type: "application/octet-stream" }),
     );
-    log.log(`calibration dump saved (${dumpBytes.length} bytes)`);
+    log.log(
+      `calibration dump saved (${bytes.length} bytes${edits ? ", including the edits on screen" : ""})`,
+    );
     return true;
   }
 
