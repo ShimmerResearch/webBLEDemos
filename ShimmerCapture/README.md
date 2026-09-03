@@ -80,14 +80,30 @@ sensor what it now says rather than trusting what was written. **The firmware
 refuses configuration commands while the sensor is sensing**, so Apply is
 greyed out with that reason while a stream or a recording is running.
 
-## Device and clock
+## Device identity, on every tab
 
-A refresh reads the battery voltage and charge, and over a Bluetooth link the
-decoded device status flags — docked, sensing, streaming, logging, SD card
-present, SD file error, clock set, USB plugged in — and the real-world clock.
-Those flags are the only way to learn that the sensor was started from its own
-button, or that its firmware could not open its SD file; the page says so in
-the log when it sees them.
+The panel beside the Sensor link card carries what is true of the sensor
+whatever tab you are on: its name, MAC, hardware and firmware, the battery
+voltage, charge and charger state, which link it is on, and — over a Bluetooth
+link — the decoded device status flags: docked, sensing, streaming, logging,
+SD card present, SD file error, clock set, USB plugged in.
+
+It sits there rather than on the Configure tab because two of those facts gate
+work everywhere else. Whether the sensor is sensing decides both an SD download
+and a name write, and the battery is the thing to check before starting a long
+download. The flags are also the only way to learn that the sensor was started
+from its own button, or that its firmware could not open its SD file; the page
+says so in the log when it sees them.
+
+**Measure link speed** is next to the connect buttons, because it measures the
+link and not the card: it free-runs the firmware's data-rate test, which
+reports the pipe itself — connection interval and MTU on BLE, buffering on
+classic Bluetooth — rather than the file-transfer protocol on top of it. It is
+Bluetooth-only (the dock command set has no data-rate test) and refused while
+the sensor is sensing or a transfer is running, because it saturates the link
+on purpose. The figure it produces also drives the download ETAs on the SD tab.
+
+## The clock
 
 The sensor keeps its clock in **local civil time**, which is what the offline
 file parser expects, so setting it from the host applies the host's time-zone
@@ -121,9 +137,26 @@ stream straight to the file you pick instead of being held in memory — a long
 session is not lost if the tab closes. If the link drops mid-recording the file
 is closed properly and what was captured is kept.
 
-An event log below the tabs carries every command, reply and status message,
-filterable by text and severity, and downloadable — which is the first thing to
-attach to a support request.
+## The event log
+
+A drawer docked to the bottom of the viewport carries every command, reply and
+status message, filterable by text and severity, and downloadable — which is
+the first thing to attach to a support request.
+
+Collapsed it is a single bar showing the newest line, with a badge counting the
+errors and warnings since it was last opened; opening it clears the badge.
+Expanded it keeps the full page width, and whether it is open is remembered per
+browser. The page reserves the space it occupies in either state, so it never
+covers what is underneath it.
+
+**Log raw TX/RX bytes** adds the bytes themselves, in both directions, on any
+of the three links — the diagnostic to reach for when a sensor answers
+something unexpected, or answers nothing. It is off until asked, and it leaves
+out the streaming data packets unless you tick the second box, because a sensor
+at 1024 Hz sends one every millisecond. Either way it is capped at 100 lines a
+second, with one line saying what was held back. The severity filter's
+**TX / RX** option shows exactly these lines; if the two controls are set so
+that nothing can appear, the drawer says which one to change.
 
 ## The SD card
 
