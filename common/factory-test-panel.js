@@ -767,7 +767,7 @@ export function createFactoryTestPanel(host, opts = {}) {
        Excel reads the degree signs as mojibake. */
     downloadBlob(
       `${baseName()}.csv`,
-      new Blob(["﻿", rows.join("\n")], {
+      new Blob(["\ufeff", rows.join("\n")], {
         type: "text/csv;charset=utf-8",
       }),
     );
