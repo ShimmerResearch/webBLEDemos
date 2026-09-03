@@ -180,8 +180,8 @@
         <div>
           <h1>Shimmer Capture</h1>
           <div class="subtitle">
-            Example: configure, stream, plot and record a single Shimmer3R from
-            the browser
+            Example: configure, stream, plot, record, rename and download the SD
+            card of a single Shimmer3R from the browser
           </div>
         </div>
         <span class="spacer"></span>
@@ -228,6 +228,10 @@
         </button>
         <button data-tab="tabStream" id="tabBtnStream" type="button">
           Stream &amp; record
+        </button>
+        <button data-tab="tabSd" id="tabBtnSd" type="button">SD card</button>
+        <button data-tab="tabBrand" id="tabBtnBrand" type="button">
+          Device naming
         </button>
       </div>
 
@@ -491,6 +495,41 @@
         <div id="plots"></div>
       </section>
 
+      <!-- =================================================== SD card ===== -->
+      <section class="tab" id="tabSd">
+        <div class="banner" id="sdBanner"></div>
+        <!-- common/sd-browser.js builds the whole panel in here. -->
+        <div id="sdPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            Files are pulled off the card over the same Bluetooth link that
+            carries the configuration, so a download and a live stream cannot
+            run at once. Each file is verified by size on this host before it is
+            deleted from the card, and an interrupted download resumes from what
+            is already on disk — re-running it is always safe.
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================= Device naming ===== -->
+      <section class="tab" id="tabBrand">
+        <div class="banner" id="brandBanner"></div>
+        <!-- common/brand-editor.js builds the whole panel in here. -->
+        <div id="brandPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            These names live in a record in the sensor's expansion-board EEPROM,
+            not in its configuration image, so they survive a configuration
+            write and are not part of a saved
+            <code>.bin</code>. The firmware seeds the record with the factory
+            names at first boot and treats it as the only source of truth
+            afterwards, so what is shown above is what the sensor really
+            announces. Every link reaches the record — BLE, classic Bluetooth
+            and the USB-C/dock connection alike.
+          </div>
+        </div>
+      </section>
+
       <!-- ================================================= Event log ===== -->
       <div class="card">
         <details class="group" open>
@@ -546,6 +585,8 @@
       import { createStreamPlot } from "../common/plot.js";
       import { createStreamStats } from "../common/stream-stats.js";
       import { createCsvRecorder } from "../common/csv-recorder.js";
+      import { createSdBrowser } from "../common/sd-browser.js";
+      import { createBrandEditor } from "../common/brand-editor.js";
       import {
         createMockShimmer3RTransport,
         mockEnabledFromUrl,
@@ -621,6 +662,15 @@
       const tabs = initTabs(document, {
         onSelect: (id) => {
           if (id === "tabStream") refreshRecordName();
+          /* The names are what the naming tab is FOR, so opening it reads
+             them — but only once per link, and only if nothing has been read
+             yet, so switching back and forth is not a round trip each time.
+             Deliberately not on connect: a page that read the brand record
+             every time anything connected would spend a round trip on it for
+             the majority of sessions that never open this tab. */
+          if (id === "tabBrand" && client && caps.branding && !brand.record()) {
+            brand.read().catch(() => {});
+          }
         },
       });
 
@@ -642,6 +692,36 @@
       let busy = false;
       let streaming = false;
       let sdLogging = false;
+      /**
+       * True while the SD panel is transferring or measuring the link.
+       *
+       * Held separately from `busy` because the two are used in opposite
+       * directions: it is folded INTO the gate state, so everything that
+       * shares the link is refused during a download — but it must stay OUT
+       * of what the SD panel itself is enabled on, or the first progress
+       * event would tear down the panel that is reporting it.
+       */
+      let sdBusy = false;
+      /** True while the device-naming panel is reading or writing the record. */
+      let brandBusy = false;
+      /**
+       * Why this sensor cannot transfer SD files, when it cannot. Set from
+       * the firmware version at connect time; null when it can.
+       */
+      let sdFirmwareNote = null;
+
+      /**
+       * The hardware id the sensor ACTUALLY REPORTED, or null when the
+       * identification read failed.
+       *
+       * Held separately from the `hardwareVersion` in `context` on purpose.
+       * That one is defaulted to 10 (Shimmer3R) when the read fails, because
+       * the field schema needs *some* layout to render a form at all; this
+       * one is never defaulted, because the device-naming panel narrows the
+       * BLE prefix length with it and a defaulted Shimmer3R would hand an
+       * unidentified Shimmer3 a name its own firmware truncates on air.
+       */
+      let identifiedHardwareVersion = null;
 
       /** The configuration form, the schema it was built from, and its layout. */
       let form = null;
@@ -746,13 +826,44 @@
         caps.btStop = streaming && !sdLogging;
         caps.sdStop = sdLogging;
 
+        /* An SD download, a name write and everything else on this page
+           compete for one link, so either in flight counts as busy for every
+           other control — Apply included. Neither panel's own controls are
+           gated from here; each owns its own (see the `setEnabled` calls
+           below). */
         gate.apply({
           connected: !!client,
           streaming,
           recording: recorder.active,
-          busy,
+          busy: busy || sdBusy || brandBusy,
           caps,
         });
+
+        /* Each panel is enabled on everything EXCEPT its own busy flag: this
+           is the floor for whether the LINK can do the thing at all, and each
+           panel already refuses a second operation of its own. Folding a
+           panel's own flag back in here would have the first progress event
+           tear down the panel reporting it. The OTHER panel's flag does
+           belong, because the two share one link. */
+        sd.setEnabled(
+          !!client &&
+            !!caps.sdTransfer &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !brandBusy,
+        );
+        paintSdGating();
+
+        brand.setEnabled(
+          !!client &&
+            !!caps.branding &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !sdBusy,
+        );
+        paintBrandGating();
 
         // Page state, not device state: these must work while disconnected so
         // an image can be inspected, saved or thrown away.
@@ -771,6 +882,15 @@
         if (plan?.blocked) {
           $("btnApply").disabled = true;
           $("applyNote").textContent = plan.blocked;
+        } else if (sdBusy) {
+          /* Not the firmware refusing this time — the page is. One link, one
+             conversation: a configuration write in the middle of a file
+             transfer would interleave with the block stream. */
+          $("applyNote").textContent =
+            "Waiting for the SD card transfer to finish — a download and a configuration write cannot share the link.";
+        } else if (brandBusy) {
+          $("applyNote").textContent =
+            "Waiting for the device-naming write to finish — a name write and a configuration write cannot share the link.";
         } else {
           $("applyNote").textContent = "";
         }
@@ -1811,6 +1931,150 @@
         },
       });
 
+      // =====================================================================
+      // SD card
+      // =====================================================================
+
+      /* The panel is mounted once and handed a GETTER for the client, so it
+         reads whatever is connected now rather than holding the client the
+         page happened to have at startup (which is none). */
+      const sd = createSdBrowser($("sdPanel"), {
+        client: () => client,
+        log,
+        fmtBytes,
+        onBusyChange: (transferring) => {
+          sdBusy = transferring;
+          regate();
+        },
+      });
+
+      /**
+       * Why the card cannot be browsed right now, in plain language, or null.
+       *
+       * Same shape as the stream tab's USB refusal: a reason on screen beats
+       * a dead tab, because every one of these has a different fix — connect,
+       * use a different link, update the firmware, or stop the stream.
+       */
+      function sdUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE or classic Bluetooth to browse the sensor's SD card and download from it.";
+        }
+        if (mode === "usb") {
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one — the dock command set has no file-transfer commands at all. Connect over BLE or classic Bluetooth to download from the card.";
+        }
+        if (!caps.sdTransfer) {
+          return (
+            sdFirmwareNote ??
+            "This sensor cannot transfer files from its SD card over Bluetooth. Update it to LogAndStream_Shimmer3R v1.01.011 or later."
+          );
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses every SD command while it is — a download and a live stream would compete for the same link. Stop the stream to download from the card.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off when the reason is not going
+       * to change by itself.
+       *
+       * A disconnected page keeps the tab open, because reading the reason is
+       * the point. USB and old firmware close it and bounce back to
+       * Configure: nothing on it can ever work over that link. Streaming only
+       * closes it — no bounce, because the state is transient and the reader
+       * is on the stream tab anyway.
+       */
+      function paintSdGating() {
+        const reason = sdUnavailableReason();
+        banner("sdBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const permanent = !!client && (mode === "usb" || !caps.sdTransfer);
+        const btn = $("tabBtnSd");
+        btn.disabled = permanent || streaming || sdLogging;
+        btn.title = reason ?? "";
+        if (permanent && tabs.selected() === "tabSd") tabs.select("tabConfig");
+      }
+
+      // =====================================================================
+      // Device naming
+      // =====================================================================
+
+      /* Mounted once and handed GETTERS for everything that changes with the
+         link, so it reads whatever is connected now.
+
+         `identifiedHardwareVersion` is the raw identification result, NOT the
+         `?? 10` default the InfoMem context uses: the panel narrows the BLE
+         prefix length with it, and a defaulted Shimmer3R would defeat that
+         narrowing in exactly the case it exists for. */
+      const brand = createBrandEditor($("brandPanel"), {
+        client: () => client,
+        identifiedHardwareVersion: () => identifiedHardwareVersion,
+        macSuffix: () => (deviceMac ? macTail() : null),
+        mode: () => mode,
+        log,
+        toast: showToast,
+        onBusyChange: (writing) => {
+          brandBusy = writing;
+          regate();
+        },
+        /* The panel arms the restart and then needs the link dropped for it
+           to fire. Its own default would call `client.disconnect()`, which on
+           this page would leave a recording unclosed and the UI still showing
+           a connected sensor — so it gets the page's own teardown instead. */
+        disconnect: () => disconnectFromSensor(),
+      });
+
+      /**
+       * Why the names cannot be changed right now, in plain language, or null.
+       *
+       * Unlike the SD tab there is no link that cannot do this: every client
+       * carries the two daughter-card calls and every link reaches the same
+       * EEPROM. What is left is a sensor that is not connected, a sensor that
+       * is sensing, and an SD transfer holding the link.
+       */
+      function brandUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE, classic Bluetooth or USB-C to see the names this sensor advertises, and to change them.";
+        }
+        if (!caps.branding) {
+          return "This SDK build cannot reach the expansion-board memory the names are stored in. Re-vendor the SDK bundle.";
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing. New names only take effect when it restarts, and the firmware skips a restart while it is sensing so a recording can never be truncated — stop the stream before changing the names.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. A name write and a download cannot share it — wait for the transfer to finish.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off when the reason is not going
+       * to change by itself.
+       *
+       * A disconnected page keeps the tab open, because reading the reason is
+       * the point. An SDK with no brand-record support closes it and bounces
+       * back to Configure: nothing on it can ever work. Sensing and an SD
+       * transfer only close it — no bounce, because both are transient and
+       * the reader is on another tab anyway.
+       *
+       * The reverse does NOT close the SD tab: a card download runs for
+       * minutes and is worth locking a rename out of, while a name write is
+       * two round trips and closing a tab for it would only flicker. The SD
+       * panel's own controls are disabled for the duration either way, from
+       * `regate`.
+       */
+      function paintBrandGating() {
+        const reason = brandUnavailableReason();
+        banner("brandBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const permanent = !!client && !caps.branding;
+        const btn = $("tabBtnBrand");
+        btn.disabled = permanent || streaming || sdLogging || sdBusy;
+        btn.title = reason ?? "";
+        if (permanent && tabs.selected() === "tabBrand") {
+          tabs.select("tabConfig");
+        }
+      }
+
       function macTail() {
         const mac = (deviceMac || "").replace(/[^0-9A-Fa-f]/g, "");
         return mac ? mac.slice(-4).toUpperCase() : "0000";
@@ -2095,6 +2359,34 @@
           client.getMacAddress(),
         );
         if (mac) deviceMac = mac;
+        /* The raw answer, deliberately NOT defaulted — see the declaration.
+           `hw` is undefined when the read was refused or timed out. */
+        identifiedHardwareVersion = hw?.hardwareVersion ?? null;
+        if (identifiedHardwareVersion === null) {
+          log.warn(
+            "the sensor did not report its hardware version, so this page assumes a Shimmer3R for the configuration layout — the device-naming tab stays on the shorter Shimmer3 BLE name limit, which is safe on either platform",
+          );
+        }
+
+        /* The firmware gate on top of the method-and-link check
+           `describeShimmer3Caps` did: v1.01.009 and v1.01.010 serve the
+           SD-transfer protocol and ship every 512-byte block shifted three
+           bytes, so the corruption arrives as valid frames nothing on the
+           host can detect. The version is the only reliable probe, and
+           `supportsSdTransfer` owns the threshold — it reuses the version
+           just read, so this costs no extra round trip. */
+        if (caps.sdTransfer) {
+          const ok = await client.supportsSdTransfer().catch(() => false);
+          caps.sdTransfer = ok === true;
+          sdFirmwareNote = ok
+            ? null
+            : `${firmwareLabel(fw) ?? "This firmware"} cannot transfer SD files intact. It needs LogAndStream_Shimmer3R v1.01.011 or later — v1.01.009 and v1.01.010 corrupt every block they send.`;
+          log.log(
+            caps.sdTransfer
+              ? "SD file transfer supported by this firmware"
+              : `SD file transfer unavailable: ${sdFirmwareNote}`,
+          );
+        }
 
         setIdentity({
           idName: deviceName || "(name not reported)",
@@ -2164,6 +2456,8 @@
           client.identify(),
         );
         if (id?.mac) deviceMac = id.mac;
+        // The raw answer, deliberately NOT defaulted — see the declaration.
+        identifiedHardwareVersion = id?.hardwareVersion ?? null;
         const batt = await tryDevice("read the battery", () =>
           client.getStatus(),
         );
@@ -2225,8 +2519,10 @@
        * What each link can and cannot do.
        *
        * The USB-C port configures a sensor perfectly well and cannot carry a
-       * single sample, so the stream tab is closed off with a reason rather
-       * than left to fail on the first button press.
+       * single sample or a single card block, so the stream and SD tabs are
+       * both closed off with a reason rather than left to fail on the first
+       * button press. The SD half of that lives in `paintSdGating`, which
+       * `regate` calls — its reason depends on the firmware too.
        */
       function applyModeGating() {
         const wired = mode === "usb";
@@ -2239,7 +2535,7 @@
           banner(
             "streamBanner",
             "warn",
-            "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one. Configuration, the clock, the configuration image and calibration all work over USB; live data does not. Connect over BLE or classic Bluetooth to stream and record.",
+            "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one. Configuration, the clock, the configuration image, calibration and the device's names all work over USB; live data does not. Connect over BLE or classic Bluetooth to stream and record.",
           );
         } else {
           banner("streamBanner", "", "");
@@ -2252,9 +2548,15 @@
         sdLogging = false;
         csvColumns = null;
         schemaFromFrame = false;
+        /* A transfer that outlived its link would keep writing zero-length
+           windows into the destination folder. Abort first, then drop the
+           client the panel reads through. */
+        sd.abort();
         client = null;
         mode = null;
         caps = {};
+        sdFirmwareNote = null;
+        identifiedHardwareVersion = null;
         form?.setEnabled(false);
         clearIdentity();
         $("tabBtnStream").disabled = false;
@@ -2300,6 +2602,11 @@
        *   ?mock=1              framed, like BLE
        *   ?mock=1&framed=0     an unframed byte stream, like classic Bluetooth
        *   ?mock=1&rate=204.8   pick the sampling rate
+       *   ?mock=1&fw=1.01.010  report a firmware version (gates the SD tab)
+       *   ?mock=1&hw=3         report a hardware id; `none` refuses to
+       *                        report one at all, which is how the
+       *                        unidentified-sensor path gets exercised
+       *   ?mock=1&sdKBps=400   pace the synthetic card's file blocks
        *   ?mock=1&debug=1      log every command and reply to the console
        */
       function setUpMock() {
@@ -2307,6 +2614,36 @@
         const params = new URLSearchParams(location.search);
         const framed = params.get("framed") !== "0";
         const rateHz = Number(params.get("rate")) || 51.2;
+        /* `1.01.010` — major.minor.patch, the way the firmware releases are
+           named, so the value pasted into the URL is the one from the
+           release notes. */
+        const fwParts = (params.get("fw") ?? "").split(".").map(Number);
+        const firmware =
+          fwParts.length === 3 && fwParts.every(Number.isFinite)
+            ? { major: fwParts[0], minor: fwParts[1], patch: fwParts[2] }
+            : undefined;
+        const sdKBps = Number(params.get("sdKBps")) || undefined;
+        /* `hw=none` (or `hw=0`) NACKs GET_DEVICE_VERSION, so the page cannot
+           identify the sensor. Anything else is a hardware id. */
+        const hwParam = params.get("hw");
+        /* A hw= that is not a number is a typo, not a hardware id. Passing the
+           NaN on gave GET_DEVICE_VERSION a masked 0 -- a fourth answer that is
+           neither a real id, nor the default, nor the unidentified sensor the
+           author was probably reaching for. Treated as absent instead. */
+        const hwNumber = hwParam == null ? NaN : Number(hwParam);
+        const hardwareVersion =
+          hwParam == null
+            ? undefined
+            : /^(none|null|0)$/i.test(hwParam)
+              ? null
+              : Number.isFinite(hwNumber)
+                ? hwNumber
+                : undefined;
+        if (hwParam != null && hardwareVersion === undefined) {
+          log.warn(
+            `mock mode: ignoring hw="${hwParam}" — not a hardware id. Use a number, or "none" for a sensor that will not identify itself.`,
+          );
+        }
         const btn = $("btnMock");
         btn.hidden = false;
         btn.textContent = `Connect (mock, ${framed ? "framed" : "unframed"})`;
@@ -2322,12 +2659,21 @@
           const transport = createMockShimmer3RTransport({
             framed,
             rateHz,
+            firmware,
+            hardwareVersion,
+            sdKBps,
             debug: params.get("debug") === "1",
           });
-          // A hook for driving the page from the console while developing:
-          // `mockTransport.writes` is every command the page sent, and
-          // `mockTransport.emitDisconnect()` simulates a dropped link.
+          // Hooks for driving the page from the console while developing:
+          // `mockTransport.writes` is every command the page sent,
+          // `mockTransport.emitDisconnect()` simulates a dropped link,
+          // `mockTransport.sdCard.bytes(path)` is what a download of that
+          // card file should produce, `mockTransport.eeprom.brandBytes()` is
+          // the brand record as the mock now holds it, and `sdBrowser` /
+          // `brandEditor` are the two panels' APIs.
           window.mockTransport = transport;
+          window.sdBrowser = sd;
+          window.brandEditor = brand;
           const mockClient = new sdk.Shimmer3RClient({
             debug: false,
             transport,
@@ -2376,7 +2722,18 @@
       $("btnBt").addEventListener("click", () => connect.connectVia("rfcomm"));
       $("btnUsb").addEventListener("click", () => connect.connectVia("usb"));
 
-      $("btnDisconnect").addEventListener("click", async () => {
+      /**
+       * Put the sensor down properly: abort a transfer, stop a stream, close
+       * the CSV, then drop the link.
+       *
+       * A named function rather than an inline click handler because the
+       * device-naming panel needs exactly this after arming a restart — the
+       * restart only fires when the link goes, and a bare
+       * `client.disconnect()` there would leave a recording unclosed and the
+       * page still believing it was connected.
+       */
+      async function disconnectFromSensor() {
+        sd.abort();
         if (streaming) await stopStream(sdLogging);
         if (recorder.active) await stopRecording();
         if (connect.session) {
@@ -2393,6 +2750,13 @@
           log.log("disconnected");
         }
         resetAfterDisconnect();
+      }
+
+      /* NOT wrapped in `reported`: an error escaping the teardown is a bug
+         worth seeing, and the page's unhandledrejection handler puts it in
+         the downloadable log. */
+      $("btnDisconnect").addEventListener("click", () => {
+        void disconnectFromSensor();
       });
 
       $("btnRefreshDevice").addEventListener(
@@ -2592,7 +2956,7 @@
       setUpMock();
       regate();
       log.log(
-        "ready — connect over BLE or classic Bluetooth to configure, stream and record, or over USB-C to configure only",
+        "ready — connect over BLE or classic Bluetooth to configure, stream, record, download from the SD card and change the sensor's names, or over USB-C to configure and rename only",
       );
     </script>
   </body>

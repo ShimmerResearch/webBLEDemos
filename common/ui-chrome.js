@@ -9,7 +9,7 @@
  *     `formatLogTime` (L2259-2274), the tab wiring (L7777-7817) and the
  *     declarative `data-requires-connection` gating (L1889-1975, simplified).
  *   - verisense-device-console/console-ui.js — `showToast` (L437-455).
- *   - sd-download/index.html — `$` and `fmtBytes` (L286-292).
+ *   - the retired sd-download demo — `$` and `fmtBytes`.
  *
  * Nothing here touches `document` at import time; every function does its
  * DOM work when called.
@@ -497,7 +497,7 @@ export function downloadBlob(filename, blob) {
 }
 
 /**
- * Byte count as B / KB / MB / GB. Source: sd-download/index.html L286-292.
+ * Byte count as B / KB / MB / GB. Source: the retired sd-download demo.
  *
  * @param {number|null|undefined} n
  * @returns {string}

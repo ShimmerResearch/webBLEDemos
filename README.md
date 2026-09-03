@@ -20,9 +20,7 @@ video-ppg/           │
 spell-gyro/          │
 ShimmerCapture/      │
 consensys-export/    │
-rtc-drift-test/      │
-sd-download/         ┘
-eeprom-branding/     ←  Shimmer3/Shimmer3R advertising-name branding tool
+rtc-drift-test/      ┘
 Verisense/           ←  Verisense demo
 shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpacked in Chrome)
 sdk-source.json      ←  Single source-of-truth for SDK source mode/version
@@ -40,42 +38,39 @@ The full Verisense control console now lives in a dedicated repository:
 ## Live Demos
 
 ### Shimmer3R
+
 **Requirements:** Shimmer3R device, firmware ≥ v1.0.22, Chrome/Edge (Web Bluetooth required)
 
-| Demo | Link |
-|---|---|
-| Gyro breakout game | [break-gyro](https://shimmerresearch.github.io/webBLEDemos/break-gyro/) |
-| EMG breakout game | [break-emg](https://shimmerresearch.github.io/webBLEDemos/break-emg/) |
-| 200 G accel punch detector | [punch-highG](https://shimmerresearch.github.io/webBLEDemos/punch-highG/) |
-| EMG + Gyro rhythm game | [rythmgame-emggyro](https://shimmerresearch.github.io/webBLEDemos/rythmgame-emggyro/) |
-| PPG heart-rate visualiser | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/video-ppg/) |
-| Two-device gyro brick game | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/) |
-| Spell caster (gyro gestures) | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/) |
-| Configure, stream, plot and record one sensor | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/) |
-| Consensys trial export + Bluetooth RTC set | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/) |
-| RTC drift test (32 kHz crystal) | [rtc-drift-test](https://shimmerresearch.github.io/webBLEDemos/rtc-drift-test/) |
-| SD-card file browse + download | [sd-download](https://shimmerresearch.github.io/webBLEDemos/sd-download/) |
-| Advertising / product name branding | [eeprom-branding](https://shimmerresearch.github.io/webBLEDemos/eeprom-branding/) |
+| Demo                                                                     | Link                                                                                  |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| Gyro breakout game                                                       | [break-gyro](https://shimmerresearch.github.io/webBLEDemos/break-gyro/)               |
+| EMG breakout game                                                        | [break-emg](https://shimmerresearch.github.io/webBLEDemos/break-emg/)                 |
+| 200 G accel punch detector                                               | [punch-highG](https://shimmerresearch.github.io/webBLEDemos/punch-highG/)             |
+| EMG + Gyro rhythm game                                                   | [rythmgame-emggyro](https://shimmerresearch.github.io/webBLEDemos/rythmgame-emggyro/) |
+| PPG heart-rate visualiser                                                | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/video-ppg/)                 |
+| Two-device gyro brick game                                               | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/)                         |
+| Spell caster (gyro gestures)                                             | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/)               |
+| Configure, stream, plot, record, browse the SD card and set device names | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)       |
+| Consensys trial export + Bluetooth RTC set                               | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/)   |
+| RTC drift test (32 kHz crystal)                                          | [rtc-drift-test](https://shimmerresearch.github.io/webBLEDemos/rtc-drift-test/)       |
 
 **Consensys Export** packages a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zips it, and shares it. It also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
 
 **RTC Drift Test** measures the Shimmer3R real-world-clock drift against the host clock and least-squares fits the slope in ppm, with NTP host-step detection and CSV export. Also works over the dock UART (Web Serial — preferred, lower jitter than BLE).
 
-**SD Download** browses the Shimmer3R SD card and pulls logged files off it over BLE, either a selection or the whole card, with a live throughput readout and an abort control. Files can be saved in the Consensys import folder layout, and optionally deleted from the card once a download has been verified. **Requires Shimmer3R firmware v1.01.011 or later** — older firmware either does not implement the SD file-transfer commands, or (v1.01.009/v1.01.010) implements them but corrupts every 512-byte block in transit, so the page refuses to start a transfer.
-
-**Shimmer Capture** is a worked example of driving a single Shimmer3R from a browser: connect over **BLE**, **classic Bluetooth** (a paired COM port, via Web Serial) or **USB-C**, then configure it, stream from it, plot it and record a CSV. The configuration editor is generated from the SDK's description of the InfoMem, so it covers the whole LogAndStream option set — sampling rate, every sensor's range and rate, GSR, expansion power, the SD-logging and trial settings, the sync settings — and it edits the 384-byte image in place, so the bytes no field on the page models survive a read, an edit and a write untouched. There is a hex view of that image with save and load, a calibration-dump reader and writer, the decoded device status flags and a real-world-clock set. Note that **the Shimmer3R's USB-C port speaks the dock protocol, not the Bluetooth one**, so over USB the page configures the sensor but cannot stream from it; it says so rather than offering a button that cannot work. Append `?mock=1` to the URL to drive the whole page against a scripted sensor with no hardware on the desk. It is an example for one device, not a replacement for the desktop application. See the [demo README](./ShimmerCapture/README.md).
-
-**EEPROM Branding** reads and writes the record in the sensor's EEPROM that holds its Bluetooth Classic, BLE and USB names, so a device can advertise a customer's branding instead of the Shimmer defaults. Works over **BLE** (Shimmer3R) or **USB / dock serial** (Shimmer3 in a base, Shimmer3R directly over USB-C — the browser cannot reach a Shimmer3 over Bluetooth). New names only take effect after a restart: over BLE the page can arm a soft reboot and trigger it by disconnecting, and on the wired path it walks you through a manual power-cycle. Writes are CRC-protected and a "restore stock defaults" control returns the device to its factory names. Requires firmware with EEPROM brand-record support.
+**Shimmer Capture** is a worked example of driving a single Shimmer3R from a browser: connect over **BLE**, **classic Bluetooth** (a paired COM port, via Web Serial) or **USB-C**, then configure it, stream from it, plot it and record a CSV. The configuration editor is generated from the SDK's description of the InfoMem, so it covers the whole LogAndStream option set — sampling rate, every sensor's range and rate, GSR, expansion power, the SD-logging and trial settings, the sync settings — and it edits the 384-byte image in place, so the bytes no field on the page models survive a read, an edit and a write untouched. There is a hex view of that image with save and load, a calibration-dump reader and writer, the decoded device status flags and a real-world-clock set. Note that **the Shimmer3R's USB-C port speaks the dock protocol, not the Bluetooth one**, so over USB the page configures the sensor but cannot stream from it; it says so rather than offering a button that cannot work. Append `?mock=1` to the URL to drive the whole page against a scripted sensor with no hardware on the desk. Two further tabs cover what used to be separate pages: **SD card** browses the sensor's card and pulls logged sessions off it, in the Consensys import layout or as the card is laid out, with a live throughput readout, an abort, resume after an abort, and an option to delete a file only once its download has been verified; **Device naming** reads and writes the EEPROM record holding the classic-Bluetooth, BLE and USB names, so a sensor advertises a customer's branding instead of the Shimmer defaults, with a restore-to-factory control and the restart a new name needs (armed over Bluetooth, walked through by hand over the dock). The standalone `sd-download` and `eeprom-branding` pages have been removed in favour of these tabs. It is an example for one device, not a replacement for the desktop application. See the [demo README](./ShimmerCapture/README.md).
 
 ### Verisense
+
 **Requirements:** Verisense device (IMU or Pulse+), Chrome/Edge
 
-| Demo | Link |
-|---|---|
-| Wrist sensor (accel + GSR streaming) | [Verisense](https://shimmerresearch.github.io/webBLEDemos/Verisense/) |
+| Demo                                           | Link                                                                                    |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Wrist sensor (accel + GSR streaming)           | [Verisense](https://shimmerresearch.github.io/webBLEDemos/Verisense/)                   |
 | Verisense Device Console (full SDK operations) | [verisense-device-console](https://shimmerresearch.github.io/verisense-device-console/) |
 
 ### Chrome Extension
+
 [Shimmer Companion Chrome extension](./shimmer-extension/) — a locally loaded Chrome extension for streaming PPG and GSR, capturing screenshots and media context, generating session reports, and optionally adding on-device webcam face/head-state analysis. It supports selecting between multiple cameras and uploading session files to a compatible ASM Cloud deployment. See the [extension README](./shimmer-extension/README.md) for installation, privacy, export, and server requirements.
 
 Load via **chrome://extensions → Developer mode → Load unpacked**. This is optional and is **not required** for running the web demos in this repository.
@@ -113,8 +108,8 @@ The file that controls where vendor artifacts come from is `sdk-source.json`:
 
 ```json
 {
-	"sourceMode": "local-repo",
-	"version": "0.1.7"
+  "sourceMode": "local-repo",
+  "version": "0.1.11"
 }
 ```
 
@@ -138,11 +133,11 @@ If you are using local SDK changes, rebuild and sync the vendored SDK files:
 
 Script reference:
 
-| Script | What it does | Typical use |
-|---|---|---|
+| Script                 | What it does                                                                          | Typical use                            |
+| ---------------------- | ------------------------------------------------------------------------------------- | -------------------------------------- |
 | `update-local-sdk.ps1` | Uses `sdk-source.json`; builds SDK only for `local-repo`, then syncs vendor artifacts | Main workflow after SDK/source changes |
-| `sync-local-sdk.ps1` | Uses `sdk-source.json` to sync vendor artifacts only (no build) | You already built SDK elsewhere |
-| `update-local-sdk.cmd` | Windows CMD launcher for `update-local-sdk.ps1` | Double-click or cmd.exe usage |
+| `sync-local-sdk.ps1`   | Uses `sdk-source.json` to sync vendor artifacts only (no build)                       | You already built SDK elsewhere        |
+| `update-local-sdk.cmd` | Windows CMD launcher for `update-local-sdk.ps1`                                       | Double-click or cmd.exe usage          |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1
@@ -204,7 +199,7 @@ Use the localhost URL opened by Live Server (commonly `http://localhost:5500/...
 The demos import the SDK from vendored files in this repository, using relative paths that work both on localhost and on GitHub Pages:
 
 ```js
-import { Shimmer3RClient } from '../shimmer-extension/vendor/shimmer-web-sdk.esm.js';
+import { Shimmer3RClient } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 ```
 
 This means:
@@ -216,7 +211,7 @@ This means:
 For the Verisense demo in this repository:
 
 ```js
-import { VerisenseBleDevice } from './vendor/shimmer-web-sdk.esm.js';
+import { VerisenseBleDevice } from "./vendor/shimmer-web-sdk.esm.js";
 ```
 
 ### Update vendored SDK from local source

@@ -31,6 +31,7 @@ Three rules the whole library follows, so a page can rely on them:
 | `plot.js`                   | `createStreamPlot` — one Chart.js panel per sensor group, fed from ring buffers. Also `groupForField`, `padRange`, `PLOT_GROUPS`, `SHIMMER_TRACE_PALETTE`.                                                                                                                                                       |
 | `stream-stats.js`           | `createStreamStats` — rate, expected rate, loss, throughput, frames and duration, over the SDK's `StreamStatsTracker`.                                                                                                                                                                                           |
 | `csv-recorder.js`           | `createCsvRecorder` — streams rows to a file the user picks, or buffers and downloads.                                                                                                                                                                                                                           |
+| `sd-browser.js`             | `createSdBrowser` — the on-card tree, a destination folder remembered across sessions, the Consensys-Backup layout, progress with a rolling rate and an ETA, delete-after-verified, abort and the firmware link-speed test. Also `fmtEta`.                                                                       |
 | `vendor/chart.umd.min.js`   | Chart.js 4.5.1, pinned. See `vendor/README.md`.                                                                                                                                                                                                                                                                  |
 | `dev/mock-shimmer3r.js`     | `createMockShimmer3RTransport`, `mockEnabledFromUrl` — a scripted Shimmer3R for developing without hardware.                                                                                                                                                                                                     |
 
@@ -91,20 +92,35 @@ const client = new Shimmer3RClient({ transport });
 The mock answers ACK/NACK, INQUIRY, firmware and device version, status,
 battery, InfoMem read/write, the RTC, the sensor/rate/range setters and
 start/stop for both streaming and SD-plus-Bluetooth logging, and emits
-synthetic sine data at the configured rate. Two options are worth knowing:
+synthetic sine data at the configured rate. It also serves a small
+synthetic SD card — one trial folder holding two session folders, sizes
+that are not round, one file large enough to span three read windows —
+over the real transfer protocol: `SD_LIST_DIR` with paging,
+`SD_FILE_STAT`, `SD_FILE_READ` as CRC'd block frames, `SD_TRANSFER_ABORT`,
+`SD_FREE_SPACE` and `SD_DELETE`, plus `SET_DATA_RATE_TEST` for a
+link-speed readout. Options worth knowing:
 
 - `framed: false` makes it behave like an RFCOMM byte stream, delivering
   every reply in 3-byte dribbles — that is how to exercise the SDK's
   control-plane re-framing without a paired sensor.
+- `firmware: {major, minor, patch}` sets what `GET_FW_VERSION` reports.
+  The default v1.01.012 is above the SD-transfer gate; pass v1.01.010 to
+  exercise a page's refusal path.
+- `sdKBps` paces the streamed file blocks, so a download takes long
+  enough to have a progress bar, a throughput readout and an ETA worth
+  looking at, and long enough to abort mid-flight.
 - `debug: true` logs every command and reply to the console.
 
-`transport.emitDisconnect()` simulates a dropped link, and
-`transport.writes` is every command the page sent.
+`transport.emitDisconnect()` simulates a dropped link,
+`transport.writes` is every command the page sent, and
+`transport.sdCard.bytes(path)` is exactly what a download of that card
+file should produce — which is what a test compares against.
 
 It is a development aid, not a firmware simulator: it does not model
-timing, power, the SD card or error paths. It is opt-in from the URL only,
-deliberately — a page that reached for the mock on its own would quietly
-show fake data to someone debugging real hardware.
+power or most error paths, and its timing is plausible rather than real.
+It is opt-in from the URL only, deliberately — a page that reached for
+the mock on its own would quietly show fake data to someone debugging
+real hardware.
 
 ## Formatting
 

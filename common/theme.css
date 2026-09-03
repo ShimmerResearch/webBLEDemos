@@ -945,6 +945,140 @@ details.group > summary::-webkit-details-marker {
 }
 
 /* =========================================================================
+   SD card browser — the selectable on-card tree and the transfer progress
+   bar (common/sd-browser.js). Monospace, because a card path is a path.
+   ========================================================================= */
+
+.sd-tree {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 8px 10px;
+}
+
+.sd-tree ul {
+  list-style: none;
+  margin: 0;
+  padding-left: 20px;
+}
+
+/* The outermost list sits flush: the checkbox is the indent. */
+.sd-tree > ul {
+  padding-left: 0;
+}
+
+.sd-tree label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: var(--ink-strong);
+  font-weight: 600;
+}
+
+.sd-tree label input {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.sd-tree .sd-size {
+  color: var(--muted);
+  margin-left: 8px;
+  font-weight: 400;
+}
+
+.sd-tree .sd-file {
+  color: var(--muted);
+}
+
+/* Painted from the tokens rather than left to the UA widget: a <progress>
+   follows the OPERATING SYSTEM colour scheme, not the page's data-theme, so
+   an explicitly-light page on a dark host was drawing a black bar. */
+.sd-progress {
+  width: 100%;
+  height: 14px;
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-inset);
+  overflow: hidden;
+}
+
+.sd-progress::-webkit-progress-bar {
+  background: var(--surface-inset);
+}
+
+.sd-progress::-webkit-progress-value {
+  background: var(--accent);
+}
+
+.sd-progress::-moz-progress-bar {
+  background: var(--accent);
+}
+
+/* =========================================================================
+   Device naming — the per-field preview and error under each name box
+   (common/brand-editor.js). Both live inside a .field, so they inherit its
+   column and only need their own type and colour.
+   ========================================================================= */
+
+/* The panel puts its input INSIDE its label rather than tying the two
+   together by id, because a panel a page can mount twice must not plant
+   fixed ids. `.field > label` is a flex ROW, though, so a full-width input
+   next to the label text squeezes the text into three lines — block here
+   stacks them, which is what every other field on the page looks like. */
+.field[data-brand-field] > label {
+  display: block;
+}
+
+.field[data-brand-field] > label input {
+  margin-top: 5px;
+}
+
+.brand-preview {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  /* A preview is a name plus a MAC suffix plus, on an unidentified sensor,
+     both platforms' forms — so it wraps rather than widening the column. */
+  overflow-wrap: anywhere;
+}
+
+.brand-error {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+/* Neither takes any space when there is nothing to say, so a field with a
+   valid name is exactly as tall as one with no preview at all. */
+.brand-preview:empty,
+.brand-error:empty {
+  display: none;
+}
+
+/* The box a name cannot be written from. Also on :focus-visible, or the
+   focus ring's border colour hides the very field it is reporting. */
+.field input.bad,
+.field input.bad:focus-visible {
+  border-color: var(--danger);
+}
+
+.brand-steps {
+  margin: 6px 0 0 18px;
+  padding: 0;
+}
+
+.brand-steps li {
+  margin: 2px 0;
+}
+
+/* =========================================================================
    Narrow screens: one column everywhere.
    ========================================================================= */
 

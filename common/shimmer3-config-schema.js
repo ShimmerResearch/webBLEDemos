@@ -45,12 +45,24 @@
  *
  *   <button data-requires="idle" data-cap="infomem">Read configuration</button>
  *
+ * ONE KEY HERE IS ONLY HALF THE ANSWER. `sdTransfer` reports that this client
+ * and this link CAN carry SD file transfer; it cannot report whether the
+ * connected firmware transfers files intact, because that needs a firmware
+ * version read and this function is synchronous. A caller that offers a
+ * download must narrow it afterwards with the client's own asynchronous gate:
+ *
+ *   caps.sdTransfer = caps.sdTransfer && (await client.supportsSdTransfer());
+ *
+ * v1.01.009 and v1.01.010 speak the protocol and corrupt every block, so
+ * skipping that step hands the user silently wrong data.
+ *
  * @param {object|null} client a Shimmer3Client / Shimmer3RClient / wired client
  * @param {"ble"|"rfcomm"|"usb"|string} [mode] the link the client is on
  * @returns {{
  *   stream: boolean, sdbt: boolean, infomem: boolean, sdlog: boolean,
  *   calib: boolean, rtc: boolean, ranges: boolean, exg: boolean,
  *   sensors: boolean, battery: boolean, status: boolean,
+ *   sdTransfer: boolean, branding: boolean,
  * }}
  */
 export function describeShimmer3Caps(client, mode) {
@@ -80,6 +92,21 @@ export function describeShimmer3Caps(client, mode) {
     sensors: has("setSensors"),
     battery: has("readBattery") || has("getBattery"),
     status: has("readStatus") || has("getStatus"),
+    /* SD file transfer, and radio-only for the same reason streaming is: the
+       Shimmer3R's USB-C port speaks the DOCK protocol, which has no
+       SD_LIST_DIR/SD_FILE_READ at all — the wired client therefore does not
+       carry these methods either, but naming the link keeps the reason
+       visible rather than making it an accident of feature detection. */
+    sdTransfer: has("sdListDir") && has("sdReadFileWindow") && mode !== "usb",
+    /* The expansion-board EEPROM, which is where the brand record lives — the
+       names a sensor advertises over classic Bluetooth and BLE, and presents
+       over USB. Deliberately NOT link-gated, unlike `sdTransfer` and
+       `stream`: every client carries these two calls and every link reaches
+       the same EEPROM, because the dock protocol has a daughter-card memory
+       property of its own (`UART_PROP.DAUGHTER_CARD.CARD_MEM`) that takes the
+       same host offsets. A docked sensor is in fact the easiest one to
+       rebrand — no pairing needed. */
+    branding: has("readDaughterCardMem") && has("writeDaughterCardMem"),
   };
 }
 

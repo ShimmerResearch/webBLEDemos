@@ -5,11 +5,11 @@
  * identity logging, platform advice and disconnect detection.
  *
  * Ported from the two pages that grew this logic independently:
- *   - sd-download/index.html    — setConnected (L370-387), connectVia
+ *   - the retired sd-download demo — setConnected (L370-387), connectVia
  *                                 (L470-550), connectFailureHints (L559-576),
  *                                 logPortIdentity (L600-624), the startup
  *                                 advice (L872-885)
- *   - eeprom-branding/index.html — the three-button setConnected (L527-544),
+ *   - the retired eeprom-branding demo — the three-button setConnected (L527-544),
  *                                 the classic-BT catch (L875-889), the SDK
  *                                 version probe (L1053-1063) and the
  *                                 transportAdvice loop (L1075-1078)
