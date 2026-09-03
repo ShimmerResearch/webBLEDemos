@@ -102,6 +102,19 @@
         flex: 0 0 auto;
       }
 
+      /* Hairline between the two Bluetooth connect buttons and the wired one.
+         Both radio links need the sensor paired with this host first and both
+         can stream; the dock link does neither, so it reads as the odd one
+         out rather than as a third of a kind. */
+      .link-sep {
+        flex: 0 0 auto;
+        align-self: stretch;
+        width: 1px;
+        min-height: 22px;
+        margin: 0 3px;
+        background: var(--line-strong);
+      }
+
       .action-bar {
         position: sticky;
         bottom: 0;
@@ -194,10 +207,16 @@
       <!-- ================================================== Connect ====== -->
       <div class="card">
         <div class="card-title">Sensor link</div>
+        <!-- BLE and classic Bluetooth first and adjacent: both are radio links
+             that need the sensor paired with this host first, so they share a
+             story and a failure mode. The wired link is last and separated —
+             it needs no pairing, and it speaks a different protocol with no
+             stream and no card access at all. -->
         <div class="row">
           <button id="btnBle" class="primary" type="button">Connect BLE</button>
-          <button id="btnUsb" type="button">Connect USB</button>
           <button id="btnBt" type="button">Connect classic Bluetooth</button>
+          <span class="link-sep" aria-hidden="true"></span>
+          <button id="btnUsb" type="button">Connect USB</button>
           <button id="btnMock" type="button" hidden>Connect (mock)</button>
           <button id="btnDisconnect" class="secondary" type="button">
             Disconnect
