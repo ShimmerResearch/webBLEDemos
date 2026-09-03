@@ -1027,6 +1027,19 @@ details.group > summary::-webkit-details-marker {
    column and only need their own type and colour.
    ========================================================================= */
 
+/* The panel puts its input INSIDE its label rather than tying the two
+   together by id, because a panel a page can mount twice must not plant
+   fixed ids. `.field > label` is a flex ROW, though, so a full-width input
+   next to the label text squeezes the text into three lines — block here
+   stacks them, which is what every other field on the page looks like. */
+.field[data-brand-field] > label {
+  display: block;
+}
+
+.field[data-brand-field] > label input {
+  margin-top: 5px;
+}
+
 .brand-preview {
   font-family: var(--font-mono);
   font-size: 11px;

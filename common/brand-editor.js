@@ -513,6 +513,15 @@ export function createBrandEditor(host, opts = {}) {
    * prefix when left blank, so a customer need only type one name. The USB
    * *manufacturer* never derives: the device descriptor uses it verbatim.
    *
+   * A TYPED name is taken exactly as typed, so one that is too long is
+   * refused by the validation below rather than quietly shortened; only a
+   * DERIVED name is truncated to fit, because nobody typed it and the
+   * alternative is refusing a classic prefix for being too long for a field
+   * the user never filled in. The original demo truncated both, and its BLE
+   * box kept a fixed maxlength of 10 while the cap could be 8 — so on a
+   * Shimmer3 a name typed in full was silently cut by two characters with
+   * nothing on screen to say so.
+   *
    * @returns {{btClassic: string, ble: string, usbProduct: string, usbManufacturer: string}}
    */
   function effectiveFields() {
@@ -521,11 +530,9 @@ export function createBrandEditor(host, opts = {}) {
     const rawProduct = rows.get("usbProduct").input.value.trim();
     return {
       btClassic,
-      ble: (rawBle || btClassic).slice(0, bleCap()),
-      usbProduct: (rawProduct || btClassic).slice(
-        0,
-        sdk.BRAND_USB_PRODUCT_MAX_CHARS,
-      ),
+      ble: rawBle || btClassic.slice(0, bleCap()),
+      usbProduct:
+        rawProduct || btClassic.slice(0, sdk.BRAND_USB_PRODUCT_MAX_CHARS),
       usbManufacturer: rows.get("usbManufacturer").input.value.trim(),
     };
   }
@@ -618,6 +625,37 @@ export function createBrandEditor(host, opts = {}) {
     btnRestore.disabled = !usable;
     btnRestart.disabled = !usable || !canSoftRestart();
     paintRestartBanner();
+  }
+
+  /**
+   * The guard every device operation starts with.
+   *
+   * `enabled` is checked here and not only on the buttons: it is the host
+   * page's statement that this link can be used for this right now — a stream
+   * is not running, an SD transfer is not holding the link — and a
+   * programmatic caller must be held to it too, or a name write could
+   * interleave with a file transfer's block stream on the one link they share.
+   *
+   * @param {string} what
+   * @returns {object|null} the client to use, or null when it must not proceed
+   */
+  function clientFor(what) {
+    const client = getClient();
+    if (!client) {
+      log.warn(`Connect a sensor before ${what}.`);
+      return null;
+    }
+    if (!enabled) {
+      log.warn(
+        `Not ${what}: the sensor's names cannot be reached over this link right now.`,
+      );
+      return null;
+    }
+    if (busy) {
+      log.warn("A device-naming operation is already running.");
+      return null;
+    }
+    return client;
   }
 
   function setBusy(next) {
@@ -774,15 +812,8 @@ export function createBrandEditor(host, opts = {}) {
    * @returns {Promise<object|null>} the parsed record, or null on failure
    */
   async function read() {
-    const client = getClient();
-    if (!client) {
-      log.warn("Connect a sensor before reading the names it advertises.");
-      return null;
-    }
-    if (busy) {
-      log.warn("A device-naming operation is already running.");
-      return null;
-    }
+    const client = clientFor("reading the names it advertises");
+    if (!client) return null;
     setBusy(true);
     try {
       log.log(
@@ -838,15 +869,8 @@ export function createBrandEditor(host, opts = {}) {
    * @returns {Promise<boolean>} true when the write verified
    */
   async function write() {
-    const client = getClient();
-    if (!client) {
-      log.warn("Connect a sensor before changing the names it advertises.");
-      return false;
-    }
-    if (busy) {
-      log.warn("A device-naming operation is already running.");
-      return false;
-    }
+    const client = clientFor("changing the names it advertises");
+    if (!client) return false;
     const eff = effectiveFields();
     const problems = fieldProblems(eff);
     const bad = FIELD_DEFS.filter((def) => problems[def.key]);
@@ -937,15 +961,8 @@ export function createBrandEditor(host, opts = {}) {
    * @returns {Promise<boolean>} true when the erase verified
    */
   async function restoreDefaults() {
-    const client = getClient();
-    if (!client) {
-      log.warn("Connect a sensor before restoring its factory names.");
-      return false;
-    }
-    if (busy) {
-      log.warn("A device-naming operation is already running.");
-      return false;
-    }
+    const client = clientFor("restoring its factory names");
+    if (!client) return false;
     const d = stockDefaults();
     if (
       !ask(
@@ -1018,8 +1035,9 @@ export function createBrandEditor(host, opts = {}) {
    *   dropped
    */
   async function armRestart() {
-    const client = getClient();
-    if (!canSoftRestart() || !client) {
+    const client = clientFor("asking the sensor to restart");
+    if (!client) return false;
+    if (!canSoftRestart()) {
       log.warn(
         "This link cannot ask the sensor to restart — power-cycle it by hand.",
       );
