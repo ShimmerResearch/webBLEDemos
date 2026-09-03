@@ -1237,7 +1237,9 @@ export function createCalibrationEditor(host, opts = {}) {
       entry.errorNode.textContent =
         `${partName} ${where}: ${first.problem}.` +
         (built.problems.length > 1
-          ? ` ${built.problems.length - 1} other value${built.problems.length === 2 ? "" : "s"} also need attention.`
+          ? built.problems.length === 2
+            ? " One other value also needs attention."
+            : ` ${built.problems.length - 1} other values also need attention.`
           : "") +
         " Nothing is written while a value is out of range.";
       entry.errorNode.hidden = false;
@@ -1467,13 +1469,19 @@ export function createCalibrationEditor(host, opts = {}) {
       problems().length > 0 ||
       changes().length === 0;
 
+    /* A sensor that is connected but gated — sensing, or another panel
+       holding the link — locks the boxes: an edit made now could not be
+       written, and a box that accepts a value it cannot send is a lie. With
+       NOTHING connected they stay open, because editing a dump loaded from a
+       file and saving it back is half of what saving one is for. */
+    const linkFree = !getClient() || enabled;
     for (const entry of cards.values()) {
       if (entry.row.unmodelled) continue;
       entry.rangeSel.disabled = busy || which === "none";
-      entry.btnDefaults.disabled = busy || !editable;
+      entry.btnDefaults.disabled = busy || !editable || !linkFree;
       for (const part of ["offset", "sens", "align"]) {
         for (const input of entry.cells[part]) {
-          input.disabled = busy || !editable;
+          input.disabled = busy || !editable || !linkFree;
           input.readOnly = !editable;
         }
       }
@@ -1956,16 +1964,19 @@ export function createCalibrationEditor(host, opts = {}) {
     setEnabled(next) {
       const was = enabled;
       enabled = !!next;
-      /* On the falling edge only, and for the same reason the device-naming
-         panel clears its record: a link that can no longer reach calibration
-         has none to show, and keeping the last sensor's values would let the
-         next one be judged calibrated on numbers that were never its own.
+      /* Cleared when the LINK has gone, not merely when the panel has been
+         gated: keeping the last sensor's values would let the next one be
+         judged calibrated on numbers that were never its own, but throwing
+         away a read because somebody started a stream would be losing work
+         for nothing. (The device-naming panel clears on every falling edge;
+         it can afford to, because a name is two round trips to read again.
+         A dump is a paged read and a screen of numbers.)
          This runs on every re-gate, so it must not fire while already
          disabled or it would wipe the panel continuously.
          NOTE for the host page: do NOT fold this panel's own busy state back
          into what you pass here, or the read-back that follows a write clears
          the values the write just verified. */
-      if (was && !enabled) {
+      if (was && !enabled && !getClient()) {
         dumpBytes = null;
         dumpParsed = null;
         records = new Map();

@@ -2505,7 +2505,18 @@
          the form above, unsaved edits and all. */
       const cal = createCalibrationEditor($("calPanel"), {
         client: () => client,
-        generation: () => generation,
+        /* Only when the sensor really said what it is. `generation` is
+           derived from the InfoMem context's hardware version, which is
+           DEFAULTED to a Shimmer3R when the identification read fails —
+           because the field schema needs some layout to render a form at
+           all. Passing that default here would offer a possibly-Shimmer3 two
+           sensors it does not have, which is the exact mistake the
+           device-naming panel's `identifiedHardwareVersion` note is about.
+           With nothing passed, the panel takes the hardware id out of the
+           dump's own version header instead — the device's own statement
+           about what wrote those records. */
+        generation: () =>
+          identifiedHardwareVersion == null ? null : generation,
         hardwareVersion: () => identifiedHardwareVersion,
         activeRanges: () => configuredCalibRanges(),
         infoMemBlocks: () => infoMemCalibrationBlocks(),
@@ -3352,11 +3363,18 @@
           // `mockTransport.emitDisconnect()` simulates a dropped link,
           // `mockTransport.sdCard.bytes(path)` is what a download of that
           // card file should produce, `mockTransport.eeprom.brandBytes()` is
-          // the brand record as the mock now holds it, and `sdBrowser` /
-          // `brandEditor` are the two panels' APIs.
+          // the brand record as the mock now holds it,
+          // `mockTransport.calib.bytes()` is the calibration dump as it now
+          // stands, and `sdBrowser` / `brandEditor` / `calibrationEditor` are
+          // the three panels' APIs.
           window.mockTransport = transport;
           window.sdBrowser = sd;
           window.brandEditor = brand;
+          window.calibrationEditor = cal;
+          /* Also the client itself, so a link's feature set can be taken
+             apart from the console: shadowing a method on it is how the
+             "this link cannot do X" paths get exercised without owning the
+             hardware that cannot do X. */
           const mockClient = new sdk.Shimmer3RClient({
             debug: false,
             /* Tapped like every real link, so the raw byte log can be
@@ -3366,6 +3384,7 @@
                for, and reading them through the tap would prove nothing. */
             transport: tapTransport(transport),
           });
+          window.mockClient = mockClient;
           btn.disabled = true;
           try {
             mockClient.onStatus = (m) => log.log(m);
