@@ -591,8 +591,11 @@ export function mockEnabledFromUrl() {
  *   is the synthetic card, with a `bytes(path)` that returns exactly what a
  *   download of that file should produce; `transport.eeprom` is the
  *   expansion-board EEPROM, with the brand record and the restart
- *   bookkeeping; and `transport.calib` is the calibration RAM, with the dump
- *   as it now stands and a count of the chunks the firmware dropped.
+ *   bookkeeping; `transport.calib` is the calibration RAM, with the dump
+ *   as it now stands and a count of the chunks the firmware dropped; and
+ *   `transport.status` docks, undocks or pushes an unsolicited
+ *   STATUS_RESPONSE, which is how the firmware tells a host about a change
+ *   the host did not cause.
  */
 export function createMockShimmer3RTransport(opts = {}) {
   const framed = opts.framed !== false;
@@ -610,6 +613,18 @@ export function createMockShimmer3RTransport(opts = {}) {
     sensors: opts.sensors ?? 0x00e0,
     streaming: false,
     logging: false,
+    /** Seated in a dock. Toggled through `transport.status`, which pushes. */
+    docked: false,
+    /** A card is in the slot — this mock serves one, see `buildSyntheticCard`. */
+    sdInserted: true,
+    /** The firmware could not open its log file. */
+    sdBadFile: false,
+    /** The clock has been set since the sensor last lost power. */
+    rwcSet: false,
+    /** The red LED, as TOGGLE_LED leaves it. */
+    redLedOn: false,
+    /** The USB rail — the Shimmer3R's second status byte. */
+    usbPluggedIn: false,
     wrAccelRange: 0,
     gyroRange: 3,
     altAccelRange: 0,
@@ -802,6 +817,39 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
   };
 
+  /**
+   * The sensor's own news: dock it, undock it, or push the status as it
+   * stands.
+   *
+   * On real firmware a dock and an undock each send an unsolicited
+   * STATUS_RESPONSE to whatever host is connected
+   * (`LogAndStream_setupDock` / `LogAndStream_setupUndock`,
+   * log-and-stream-common `log_and_stream_common.c`), and so does a sensing
+   * change the firmware made itself — the user button, a trial ending, a low
+   * battery. That is the only way a host hears about any of them, and it is
+   * what `Shimmer3RClient.onDeviceStatus` exists to deliver.
+   *
+   * Deliberately NOT sent when this mock's own state changes because of a
+   * command: the firmware suppresses that one
+   * (`ShimBt_instreamStatusRespSendIfNotBtCmd`) rather than echo back what
+   * the host just asked for, so a page that wants to show its own start or
+   * stop has to reflect it itself.
+   */
+  transport.status = {
+    get docked() {
+      return state.docked;
+    },
+    /** Dock or undock, pushing the status the change produced. */
+    setDocked: (docked) => {
+      state.docked = !!docked;
+      reply(statusResponse());
+    },
+    /** Push the status as it stands, without changing anything. */
+    push: () => reply(statusResponse()),
+    /** The frame a push (or a GET_STATUS answer) carries, for comparison. */
+    bytes: () => new Uint8Array(statusResponse()),
+  };
+
   /* A normal disconnect does NOT fire LoopbackTransport's onDisconnect
      callbacks — only `emitDisconnect` does — so the restart is hooked on both
      paths. `applyPendingReboot` is one-shot, so being reached twice is
@@ -851,6 +899,47 @@ export function createMockShimmer3RTransport(opts = {}) {
 
   function hex(u8) {
     return Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join(" ");
+  }
+
+  // -------------------------------------------------------------------------
+  // Device status
+  // -------------------------------------------------------------------------
+
+  /**
+   * `[0x8A][0x71][status0][status1]` — the in-stream status message.
+   *
+   * ONE builder for both the answer to GET_STATUS and the unsolicited push, so
+   * the two cannot drift apart: on the wire they are the same message, and a
+   * mock whose push disagreed with its own reply would let a page's status
+   * handling look right while being wrong.
+   *
+   * Bit order is `ShimBt_assembleStatusBytes` (log-and-stream-common
+   * `Comms/shimmer_bt_uart.c`): docked, sensing, RTC set, SD logging,
+   * streaming, card inserted, bad file, red LED. `sensing` is set by either
+   * kind of recording, which is how the firmware reports it — it is not a
+   * fourth thing the host can start.
+   *
+   * Always two bytes, the Shimmer3R length: a Shimmer3 sends one, but this
+   * mock answers as a Shimmer3R whatever hardware id it is told to report,
+   * and the SDK reads only as many bytes as the platform it identified has.
+   */
+  function statusResponse() {
+    const sensing = state.streaming || state.logging;
+    const status0 =
+      (state.docked ? 0x01 : 0) |
+      (sensing ? 0x02 : 0) |
+      (state.rwcSet ? 0x04 : 0) |
+      (state.logging ? 0x08 : 0) |
+      (state.streaming ? 0x10 : 0) |
+      (state.sdInserted ? 0x20 : 0) |
+      (state.sdBadFile ? 0x40 : 0) |
+      (state.redLedOn ? 0x80 : 0);
+    return [
+      CMD.INSTREAM_CMD_RESPONSE,
+      CMD.STATUS_RESPONSE,
+      status0,
+      state.usbPluggedIn ? 1 : 0,
+    ];
   }
 
   // -------------------------------------------------------------------------
@@ -1447,14 +1536,9 @@ export function createMockShimmer3RTransport(opts = {}) {
 
       case CMD.GET_STATUS:
         // Status arrives wrapped in an in-stream response, because on real
-        // firmware it can be answered mid-stream.
-        reply([
-          ACK,
-          CMD.INSTREAM_CMD_RESPONSE,
-          CMD.STATUS_RESPONSE,
-          0x00,
-          0x00,
-        ]);
+        // firmware it can be answered mid-stream. Same frame as an
+        // unsolicited push, built by the same function — see `statusResponse`.
+        reply(concat([ACK], statusResponse()));
         return;
 
       case CMD.GET_VBATT: {
@@ -1663,6 +1747,10 @@ export function createMockShimmer3RTransport(opts = {}) {
         for (let i = 8; i >= 1; i--)
           ticks = (ticks << 8n) | BigInt(cmd[i] ?? 0);
         state.rwcTicks = ticks;
+        // What the "Clock set" status bit means: not that the clock reads
+        // something, but that a host has set it since the sensor last lost
+        // power (`RTC_isRwcTimeSet`).
+        state.rwcSet = true;
         reply([ACK]);
         return;
       }
@@ -1724,6 +1812,9 @@ export function createMockShimmer3RTransport(opts = {}) {
         return;
 
       case CMD.TOGGLE_LED:
+        // The status bit the firmware reports is the toggle state, not a
+        // command echo (`shimmerStatus.toggleLedRedCmd`).
+        state.redLedOn = !state.redLedOn;
         reply([ACK]);
         return;
 
