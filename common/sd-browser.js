@@ -512,7 +512,29 @@ export function createSdBrowser(host, opts = {}) {
   async function refresh() {
     const client = getClient();
     if (!client) return;
+    /* Listing the card is real traffic on the one link everything shares: a
+       free-space query, then a directory walk that pages until the card is
+       exhausted. Without holding the busy flag for it the page happily let a
+       stream start, an Apply run or a name be written on top of a listing
+       already in flight -- the very contention the flag exists to prevent, and
+       the reason download and the speed test have always taken it. Re-entry is
+       refused rather than queued: two listings would interleave their requests
+       on the link and neither result would be trustworthy. */
+    if (busy) {
+      log.warn(
+        "The card is already busy; wait for the current operation to finish.",
+      );
+      return;
+    }
+    setBusy(true);
+    try {
+      await refreshImpl(client);
+    } finally {
+      setBusy(false);
+    }
+  }
 
+  async function refreshImpl(client) {
     if (typeof client.sdGetFreeSpace === "function") {
       try {
         const space = await client.sdGetFreeSpace();
