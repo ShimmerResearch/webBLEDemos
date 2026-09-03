@@ -945,6 +945,64 @@ details.group > summary::-webkit-details-marker {
 }
 
 /* =========================================================================
+   SD card browser — the selectable on-card tree and the transfer progress
+   bar (common/sd-browser.js). Monospace, because a card path is a path.
+   ========================================================================= */
+
+.sd-tree {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 8px 10px;
+}
+
+.sd-tree ul {
+  list-style: none;
+  margin: 0;
+  padding-left: 20px;
+}
+
+/* The outermost list sits flush: the checkbox is the indent. */
+.sd-tree > ul {
+  padding-left: 0;
+}
+
+.sd-tree label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: var(--ink-strong);
+  font-weight: 600;
+}
+
+.sd-tree label input {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.sd-tree .sd-size {
+  color: var(--muted);
+  margin-left: 8px;
+  font-weight: 400;
+}
+
+.sd-tree .sd-file {
+  color: var(--muted);
+}
+
+.sd-progress {
+  width: 100%;
+  height: 14px;
+  accent-color: var(--accent);
+}
+
+/* =========================================================================
    Narrow screens: one column everywhere.
    ========================================================================= */
 
