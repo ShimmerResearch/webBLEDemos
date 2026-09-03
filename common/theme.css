@@ -996,10 +996,29 @@ details.group > summary::-webkit-details-marker {
   color: var(--muted);
 }
 
+/* Painted from the tokens rather than left to the UA widget: a <progress>
+   follows the OPERATING SYSTEM colour scheme, not the page's data-theme, so
+   an explicitly-light page on a dark host was drawing a black bar. */
 .sd-progress {
   width: 100%;
   height: 14px;
-  accent-color: var(--accent);
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-inset);
+  overflow: hidden;
+}
+
+.sd-progress::-webkit-progress-bar {
+  background: var(--surface-inset);
+}
+
+.sd-progress::-webkit-progress-value {
+  background: var(--accent);
+}
+
+.sd-progress::-moz-progress-bar {
+  background: var(--accent);
 }
 
 /* =========================================================================

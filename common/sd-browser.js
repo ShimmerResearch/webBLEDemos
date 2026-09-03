@@ -548,7 +548,9 @@ export function createSdBrowser(host, opts = {}) {
           ? `Cannot list card: ${err.message}`
           : `Listing failed: ${err?.message ?? err}`;
       log.error(treeState.textContent);
-      renderTree();
+      /* Deliberately NOT `renderTree()`: with no listing it would print "No
+         data files on card", which is a claim about the card next to a
+         message saying the card could not be read. */
     }
     syncControls();
   }
