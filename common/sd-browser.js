@@ -3,6 +3,12 @@
  * this host, and pull sessions off the card with progress, a rolling
  * throughput readout, an ETA and a resumable abort.
  *
+ * The one thing in here that is NOT about the card is `measureLinkSpeed`: it
+ * measures the Bluetooth link, reads the same whether or not a card is
+ * fitted, and the dock protocol cannot run it at all. The method stays here
+ * because its result belongs in the card's stats strip and its ETA guidance,
+ * but the BUTTON lives with the connect buttons on the mounting page.
+ *
  * Extracted from the retired `sd-download` demo: the card readouts and the
  * link-speed test (L182-211, L433-463), the selectable tree (L655-715), the
  * destination folder remembered in IndexedDB (L304-369, L717-740), the layout
@@ -179,6 +185,10 @@ export function fmtEta(seconds) {
  *   or a link test starts and finishes. A host page folds this into its own
  *   busy state, so the controls that share the link (Apply, a configuration
  *   read) are refused while a download is in flight.
+ * @param {(kBps: number|null, final: boolean) => void} [opts.onLinkSpeed]
+ *   the running and then final figure from `measureLinkSpeed`, for a page
+ *   that shows it somewhere of its own; null when the test failed. The panel
+ *   has no button for that test — see the note on `measureLinkSpeed`.
  * @param {(n: number) => string} [opts.fmtBytes] byte formatter
  * @param {string} [opts.rootPath="data"] tree to walk on the card
  * @returns {{
@@ -189,7 +199,7 @@ export function fmtEta(seconds) {
  *   pickDestination: () => Promise<boolean>,
  *   download: (paths: string[], opts?: {deleteVerified?: boolean}) => Promise<void>,
  *   abort: () => void,
- *   measureLinkSpeed: (durationMs?: number) => Promise<void>,
+ *   measureLinkSpeed: (durationMs?: number) => Promise<object|null>,
  *   setEnabled: (enabled: boolean) => void,
  *   destroy: () => void,
  * }}
@@ -254,17 +264,6 @@ export function createSdBrowser(host, opts = {}) {
     "button",
     { type: "button", dataset: { sdRole: "refresh" } },
     "Refresh card contents",
-  );
-  const btnLinkTest = el(
-    "button",
-    {
-      type: "button",
-      dataset: { sdRole: "linkTest" },
-      title:
-        "Free-runs the firmware's data-rate test, which measures the link " +
-        "itself rather than the file-transfer protocol",
-    },
-    `Measure link speed (${LINK_TEST_MS / 1000} s)`,
   );
   const treeState = el("span", {
     class: "muted",
@@ -346,7 +345,7 @@ export function createSdBrowser(host, opts = {}) {
       { class: "card" },
       el("div", { class: "card-title" }, "Card"),
       statsStrip,
-      el("div", { class: "row" }, btnRefresh, btnLinkTest, treeState),
+      el("div", { class: "row" }, btnRefresh, treeState),
       treeHost,
     ),
     el(
@@ -393,7 +392,6 @@ export function createSdBrowser(host, opts = {}) {
     const usable = enabled && !!getClient() && !busy;
     const ready = usable && !!destRoot && !!tree;
     btnRefresh.disabled = !usable;
-    btnLinkTest.disabled = !usable;
     btnDownloadSel.disabled = !ready || selectedPaths().length === 0;
     btnDownloadAll.disabled = !ready || !tree?.files.length;
     btnAbort.disabled = abortCtl === null;
@@ -846,16 +844,32 @@ export function createSdBrowser(host, opts = {}) {
    * buffering — not the file-transfer protocol, so it is the honest upper
    * bound to quote before a long download, and a direct A/B between BLE and
    * classic Bluetooth on the same host.
+   *
+   * NO BUTTON IN THIS PANEL DRIVES THIS. What it measures is the link, not
+   * the card: the number is the same whether or not a card is fitted, and it
+   * is a Bluetooth-only test because the dock protocol has no data-rate
+   * command at all — so the button belongs with the connect buttons, and the
+   * mounting page owns it. The result still lands in this panel's stats strip
+   * and in the ETA guidance below, because that is where it gets used.
+   *
+   * The panel's own busy flag IS taken for the duration: the test saturates
+   * the link deliberately, so a download must not start underneath it. What
+   * the panel cannot know is whether the sensor is streaming, or whether some
+   * other panel holds the link — the mounting page gates the button on that.
+   *
+   * @param {number} [durationMs]
+   * @returns {Promise<{kBps: number, bytesReceived: number,
+   *   durationMs: number}|null>} null when the test was refused or failed
    */
   async function measureLinkSpeed(durationMs = LINK_TEST_MS) {
     const client = getClient();
     if (typeof client?.runDataRateTest !== "function") {
       log.warn("This SDK build has no data-rate test.");
-      return;
+      return null;
     }
     if (busy) {
       log.warn("A card operation is already running.");
-      return;
+      return null;
     }
     setBusy(true);
     log.log(
@@ -863,9 +877,12 @@ export function createSdBrowser(host, opts = {}) {
     );
     try {
       const res = await client.runDataRateTest(durationMs, (bytes, ms) => {
-        setStat("link", `${(bytes / 1024 / (ms / 1000)).toFixed(1)} KB/s`);
+        const kBps = bytes / 1024 / (ms / 1000);
+        setStat("link", `${kBps.toFixed(1)} KB/s`);
+        reportLinkSpeed(kBps, false);
       });
       setStat("link", `${res.kBps.toFixed(1)} KB/s`);
+      reportLinkSpeed(res.kBps, true);
       log.log(
         `raw link speed: ${res.kBps.toFixed(1)} KB/s ` +
           `(${fmtBytes(res.bytesReceived)} in ${(res.durationMs / 1000).toFixed(1)}s).`,
@@ -884,10 +901,22 @@ export function createSdBrowser(host, opts = {}) {
           );
         }
       }
+      return res;
     } catch (err) {
       log.error(`Link speed test failed: ${err?.message ?? err}`);
+      reportLinkSpeed(null, true);
+      return null;
     } finally {
       setBusy(false);
+    }
+  }
+
+  /** Hand the running (and then final) figure to whoever owns the button. */
+  function reportLinkSpeed(kBps, final) {
+    try {
+      opts.onLinkSpeed?.(kBps, final);
+    } catch (err) {
+      log.warn(`SD link-speed handler failed: ${err?.message ?? err}`);
     }
   }
 
@@ -897,9 +926,6 @@ export function createSdBrowser(host, opts = {}) {
 
   btnRefresh.addEventListener("click", () => {
     refresh().catch((err) => log.error(`refresh failed: ${err?.message}`));
-  });
-  btnLinkTest.addEventListener("click", () => {
-    measureLinkSpeed().catch(() => {});
   });
   /* NOT deferred behind anything: showDirectoryPicker is gesture-gated, so it
      has to be reached straight off the click. */

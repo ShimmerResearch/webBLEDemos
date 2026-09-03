@@ -310,6 +310,22 @@
             <span class="pill" id="connPill">disconnected</span>
           </div>
           <div class="banner" id="platformBanner"></div>
+          <!-- Measures the LINK, not the card, so it belongs with the connect
+               buttons rather than in the SD panel it used to live in. The
+               result still lands in that panel's stats strip and its download
+               ETAs, which is where it gets used. -->
+          <div class="row">
+            <button
+              id="btnLinkTest"
+              type="button"
+              data-requires="idle"
+              data-cap="linkTest"
+            >
+              Measure link speed (5 s)
+            </button>
+            <span class="pill" id="linkSpeedPill">not measured</span>
+          </div>
+          <div class="field-hint" id="linkTestNote"></div>
         </div>
 
         <aside class="card device-panel" id="devicePanel">
@@ -931,6 +947,15 @@
        * event would tear down the panel that is reporting it.
        */
       let sdBusy = false;
+      /**
+       * True while the link-speed test is running.
+       *
+       * The test is run BY the SD panel (its result belongs in the card stats
+       * and the download ETAs), so it raises `sdBusy` like a transfer does —
+       * but it is not a transfer, and three refusal messages name what is
+       * holding the link. This is how they tell the two apart.
+       */
+      let linkTesting = false;
       /** True while the device-naming panel is reading or writing the record. */
       let brandBusy = false;
       /**
@@ -1111,6 +1136,9 @@
         if (plan?.blocked) {
           $("btnApply").disabled = true;
           $("applyNote").textContent = plan.blocked;
+        } else if (linkTesting) {
+          $("applyNote").textContent =
+            "Waiting for the link-speed test to finish — it saturates the link on purpose, which is the whole point of it.";
         } else if (sdBusy) {
           /* Not the firmware refusing this time — the page is. One link, one
              conversation: a configuration write in the middle of a file
@@ -1124,11 +1152,58 @@
           $("applyNote").textContent = "";
         }
 
+        paintLinkTestGating();
         updateDirtyPill();
         refreshRecordName();
         /* The tap note depends on whether anything is connected, so it is
            re-evaluated wherever the connection state is. */
         updateTapNote();
+      }
+
+      /**
+       * Why the link cannot be measured right now, in plain language, or null.
+       *
+       * The test free-runs the firmware's data-rate command, which saturates
+       * the link on purpose — so it is refused for the same reasons a
+       * download is, plus one of its own: the dock protocol has no data-rate
+       * command at all, which is a fact about the link and not about the
+       * sensor, and worth saying rather than leaving as a greyed button.
+       *
+       * A plain `busy` — one round trip in flight — returns null: the button
+       * greys for a fraction of a second and a hint that flickers with it is
+       * worse than no hint.
+       */
+      function linkTestUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE or classic Bluetooth to measure the link.";
+        }
+        if (mode === "usb") {
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol — there is no data-rate test in that command set. Connect over BLE or classic Bluetooth to measure a link.";
+        }
+        if (!caps.linkTest) {
+          return "This SDK build has no data-rate test. Re-vendor the SDK bundle.";
+        }
+        if (linkTesting) {
+          return "Measuring — it takes 5 seconds and saturates the link, so everything else on the page waits.";
+        }
+        if (streaming || sdLogging) {
+          return "The test deliberately saturates the link, so it is refused while the sensor is sensing — it would compete with the samples coming the other way. Stop the stream first.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. The test would compete with it for the same pipe — wait for the transfer to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link — wait for it to finish.";
+        }
+        return null;
+      }
+
+      function paintLinkTestGating() {
+        const reason = linkTestUnavailableReason();
+        $("linkTestNote").textContent = reason ?? "";
+        $("btnLinkTest").title =
+          reason ??
+          "Free-runs the firmware's data-rate test, which measures the pipe itself — connection interval and MTU on BLE, buffering on classic Bluetooth — rather than the file-transfer protocol on top of it.";
       }
 
       // =====================================================================
@@ -2185,6 +2260,14 @@
           sdBusy = transferring;
           regate();
         },
+        /* The link-speed button lives in the Sensor link card, so the running
+           figure has to come back out of the panel to be shown there. */
+        onLinkSpeed: (kBps, final) => {
+          $("linkSpeedPill").textContent =
+            kBps == null
+              ? "not measured"
+              : `${kBps.toFixed(1)} KB/s${final ? "" : " …"}`;
+        },
       });
 
       /**
@@ -2279,6 +2362,9 @@
         }
         if (streaming || sdLogging) {
           return "The sensor is sensing. New names only take effect when it restarts, and the firmware skips a restart while it is sensing so a recording can never be truncated — stop the stream before changing the names.";
+        }
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
         }
         if (sdBusy) {
           return "An SD card transfer is using the link. A name write and a download cannot share it — wait for the transfer to finish.";
@@ -2637,6 +2723,11 @@
         caps.rtcWrite =
           typeof client.setRtcTime === "function" ||
           typeof client.writeRtcFromHostTime === "function";
+        /* Deliberately gated on the link as well as on the method: the dock
+           command set has no data-rate test, so the reason the button is off
+           over USB is the protocol, not a missing SDK export. */
+        caps.linkTest =
+          mode !== "usb" && typeof client.runDataRateTest === "function";
         regate();
 
         deviceName = client.device?.name ?? session.transport?.deviceName ?? "";
@@ -2864,6 +2955,9 @@
         sdFirmwareNote = null;
         identifiedHardwareVersion = null;
         form?.setEnabled(false);
+        /* A KB/s figure belongs to the link that produced it, so it goes with
+           the link rather than lingering beside the next one. */
+        $("linkSpeedPill").textContent = "not measured";
         clearIdentity();
         $("tabBtnStream").disabled = false;
         $("tabBtnStream").title = "";
@@ -3067,6 +3161,21 @@
         "click",
         reported(refreshDeviceState),
       );
+
+      /* The panel still owns the measurement — its result belongs in the card
+         stats and the download ETAs — but the button that starts it belongs
+         with the link it measures. */
+      $("btnLinkTest").addEventListener("click", () => {
+        $("linkSpeedPill").textContent = "measuring…";
+        linkTesting = true;
+        regate();
+        sd.measureLinkSpeed()
+          .catch(() => {})
+          .finally(() => {
+            linkTesting = false;
+            regate();
+          });
+      });
       $("btnSetClock").addEventListener("click", reported(setDeviceClock));
 
       $("btnRead").addEventListener("click", reported(readConfiguration));
