@@ -3448,7 +3448,11 @@ const stampTokyo = await evaluate(`
   const c = P().querySelector('[data-cal-sensor="lnAccel"]');
   return c.querySelector('[data-cal-as-of]')?.textContent ?? '';
 `);
-await send("Emulation.setTimezoneOverride", { timezoneId: "" });
+/* Explicitly UTC, not "" — clearing the override returns the page to THIS
+   MACHINE's zone, which is an hour off UTC for half the year, and the
+   assertion below would then be 480 minutes on a summer afternoon in
+   Dublin and 540 in January. The check is about the page, not the bench. */
+await send("Emulation.setTimezoneOverride", { timezoneId: "UTC" });
 await goto(`${BASE}?mock=1`);
 await evaluate(CONNECT);
 const stampUtc = await evaluate(`
@@ -3472,6 +3476,8 @@ check(
   stampDate(stampTokyo).length === 16 && stampApart === 540,
   `+09:00 "${stampTokyo}" vs UTC "${stampUtc}" (${stampApart} min apart, want 540)`,
 );
+// Back to this machine's own zone for everything after this section.
+await send("Emulation.setTimezoneOverride", { timezoneId: "" });
 
 // ===========================================================================
 console.log("\n--- ExG presets ---");
