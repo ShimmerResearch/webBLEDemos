@@ -102,6 +102,70 @@
         flex: 0 0 auto;
       }
 
+      /* Sensor link on the left, device identity on the right.
+
+         `minmax(0, …)` on both tracks rather than `1fr 340px`: a grid item's
+         default minimum is its content, so a long firmware string or a wide
+         button row would otherwise push the track past the container and give
+         the whole PAGE a horizontal scrollbar. Below 800px the two stack, so
+         a phone gets one readable column instead of two squeezed ones. */
+      .link-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 340px);
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .link-row > .card {
+        margin-bottom: 0;
+        min-width: 0;
+      }
+
+      @media (max-width: 800px) {
+        .link-row {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        /* Once the connect buttons wrap onto several lines a vertical rule
+           between two of them reads as a stray mark rather than a divider. */
+        .link-sep {
+          display: none;
+        }
+      }
+
+      /* The identity panel sits above the tab strip, which is the page's
+         primary navigation, so every line in it is a line the tabs move down
+         by. Hence the tighter grid, the smaller flags, the Refresh button on
+         the title line and no clock rows — those went to the Configure tab
+         with the clock button. Measured: this brings the panel back to the
+         height of the identity list it replaced, so the tabs sit where they
+         always did (~425px into a 1366x700 laptop viewport). */
+      .device-panel {
+        padding: 12px;
+      }
+
+      .device-panel-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .device-panel .kv-tight {
+        grid-template-columns: 84px minmax(0, 1fr);
+        gap: 2px 8px;
+        font-size: 12px;
+      }
+
+      .device-panel .flags {
+        margin-top: 7px;
+        padding-top: 7px;
+        border-top: 1px solid var(--line-soft);
+        font-size: 12px;
+        line-height: 1.35;
+        gap: 2px 10px;
+      }
+
       /* Hairline between the two Bluetooth connect buttons and the wired one.
          Both radio links need the sensor paired with this host first and both
          can stream; the dock link does neither, so it reads as the odd one
@@ -219,40 +283,64 @@
         <button id="themeBtn" type="button"></button>
       </header>
 
-      <!-- ================================================== Connect ====== -->
-      <div class="card">
-        <div class="card-title">Sensor link</div>
-        <!-- BLE and classic Bluetooth first and adjacent: both are radio links
-             that need the sensor paired with this host first, so they share a
-             story and a failure mode. The wired link is last and separated —
-             it needs no pairing, and it speaks a different protocol with no
-             stream and no card access at all. -->
-        <div class="row">
-          <button id="btnBle" class="primary" type="button">Connect BLE</button>
-          <button id="btnBt" type="button">Connect classic Bluetooth</button>
-          <span class="link-sep" aria-hidden="true"></span>
-          <button id="btnUsb" type="button">Connect USB</button>
-          <button id="btnMock" type="button" hidden>Connect (mock)</button>
-          <button id="btnDisconnect" class="secondary" type="button">
-            Disconnect
-          </button>
-          <span class="pill" id="connPill">disconnected</span>
+      <!-- ================================ Connect and device identity ====
+           Two columns above the tab strip, because the right-hand half is
+           read-mostly and true on every tab: whether the sensor is sensing
+           gates an SD transfer AND a name write, and the battery matters most
+           right before a long download. Stacks below 800px. -->
+      <div class="link-row">
+        <div class="card">
+          <div class="card-title">Sensor link</div>
+          <!-- BLE and classic Bluetooth first and adjacent: both are radio
+               links that need the sensor paired with this host first, so they
+               share a story and a failure mode. The wired link is last and
+               separated — it needs no pairing, and it speaks a different
+               protocol with no stream and no card access at all. -->
+          <div class="row">
+            <button id="btnBle" class="primary" type="button">
+              Connect BLE
+            </button>
+            <button id="btnBt" type="button">Connect classic Bluetooth</button>
+            <span class="link-sep" aria-hidden="true"></span>
+            <button id="btnUsb" type="button">Connect USB</button>
+            <button id="btnMock" type="button" hidden>Connect (mock)</button>
+            <button id="btnDisconnect" class="secondary" type="button">
+              Disconnect
+            </button>
+            <span class="pill" id="connPill">disconnected</span>
+          </div>
+          <div class="banner" id="platformBanner"></div>
         </div>
-        <div class="banner" id="platformBanner"></div>
-        <div class="kv" id="identityKv">
-          <div class="muted">Device</div>
-          <div id="idName">–</div>
-          <div class="muted">MAC</div>
-          <div id="idMac" class="mono">–</div>
-          <div class="muted">Hardware</div>
-          <div id="idHw">–</div>
-          <div class="muted">Firmware</div>
-          <div id="idFw">–</div>
-          <div class="muted">Battery</div>
-          <div id="idBatt">–</div>
-          <div class="muted">Link</div>
-          <div id="idLink">–</div>
-        </div>
+
+        <aside class="card device-panel" id="devicePanel">
+          <div class="card-title device-panel-title">
+            <span>Device</span>
+            <button
+              id="btnRefreshDevice"
+              type="button"
+              data-requires="idle"
+              data-cap="status"
+              title="Re-read the battery, the status flags and the sensor's real-world clock"
+            >
+              Refresh
+            </button>
+          </div>
+          <div class="kv kv-tight" id="identityKv">
+            <div class="muted">Device</div>
+            <div id="idName">–</div>
+            <div class="muted">MAC</div>
+            <div id="idMac" class="mono">–</div>
+            <div class="muted">Hardware</div>
+            <div id="idHw">–</div>
+            <div class="muted">Firmware</div>
+            <div id="idFw">–</div>
+            <div class="muted">Battery</div>
+            <div id="idBatt">–</div>
+            <div class="muted">Link</div>
+            <div id="idLink">–</div>
+          </div>
+          <div class="flags" id="statusFlags">–</div>
+        </aside>
       </div>
 
       <!-- ===================================================== Tabs ====== -->
@@ -279,17 +367,13 @@
           <div id="configForm"></div>
         </div>
 
+        <!-- What is left of "Device & clock" once the identity, the battery
+             and the status flags have moved up beside the Sensor link card:
+             the clock, which is a configuration matter and belongs on the
+             configuration tab. -->
         <div class="card">
-          <div class="card-title">Device &amp; clock</div>
+          <div class="card-title">Clock</div>
           <div class="row">
-            <button
-              id="btnRefreshDevice"
-              type="button"
-              data-requires="idle"
-              data-cap="status"
-            >
-              Refresh
-            </button>
             <button
               id="btnSetClock"
               type="button"
@@ -300,14 +384,10 @@
             </button>
           </div>
           <div class="kv">
-            <div class="muted">Status flags</div>
-            <div class="flags" id="statusFlags">–</div>
             <div class="muted">Real-world clock</div>
             <div id="rwcValue" class="mono">–</div>
             <div class="muted">Host clock</div>
             <div id="hostClock" class="mono">–</div>
-            <div class="muted">Battery</div>
-            <div id="battDetail">–</div>
           </div>
           <div class="field-hint" style="margin-top: 8px">
             The sensor keeps its real-world clock in <em>local civil</em> time,
@@ -1158,7 +1238,6 @@
         });
         $("statusFlags").textContent = "–";
         $("rwcValue").textContent = "–";
-        $("battDetail").textContent = "–";
       }
 
       function hardwareLabel(hardwareVersion) {
@@ -1175,10 +1254,22 @@
         );
       }
 
+      /**
+       * Voltage, percentage and — where the link reports one — the charger
+       * state, as one line.
+       *
+       * One line rather than the two the page used to carry (a short one in
+       * the identity list and a longer one in the device card): they were
+       * always the same reading, and the panel they now share is above the
+       * tab strip, where a duplicated row costs the tabs a row of height.
+       */
       function batteryLabel(batt) {
         if (!batt || !Number.isFinite(batt.voltage)) return null;
         const pct = batt.percentage == null ? "–" : `${batt.percentage} %`;
-        return `${batt.voltage.toFixed(2)} V (${pct})`;
+        const charger = batt.chargingStatus
+          ? ` — charger ${batt.chargingStatus}`
+          : "";
+        return `${batt.voltage.toFixed(2)} V (${pct})${charger}`;
       }
 
       /** Render the decoded status bits as a row of coloured flags. */
@@ -1229,11 +1320,7 @@
             ? client.getBattery()
             : client.getStatus(),
         );
-        if (batt) {
-          setIdentity({ idBatt: batteryLabel(batt) });
-          $("battDetail").textContent =
-            `${batteryLabel(batt)} — charger ${batt.chargingStatus}`;
-        }
+        if (batt) setIdentity({ idBatt: batteryLabel(batt) });
 
         // getStatus() on the wired client reports the battery, not the status
         // bits: only the radio protocol carries a STATUS_RESPONSE.
@@ -2694,7 +2781,6 @@
           ),
           idBatt: batteryLabel(batt),
         });
-        $("battDetail").textContent = batteryLabel(batt) ?? "–";
         $("hostClock").textContent = formatClock(Date.now());
 
         const ctx = {
