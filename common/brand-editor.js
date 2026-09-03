@@ -36,7 +36,8 @@
 import { el } from "./ui-chrome.js";
 /* The whole namespace rather than destructured names: a vendored bundle that
    predates one of the brand-record exports then degrades to a message from
-   `mount()` instead of breaking the importing page. */
+   `createBrandEditor()` instead of breaking the importing page. Destructuring
+   would throw at import time and take the whole page with it. */
 import * as sdk from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------

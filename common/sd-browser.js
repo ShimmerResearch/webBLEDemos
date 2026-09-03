@@ -27,7 +27,8 @@
 import { el, fmtBytes as defaultFmtBytes } from "./ui-chrome.js";
 /* The whole namespace rather than destructured names: a vendored bundle that
    predates one of the SD-transfer exports then degrades to a message from
-   `mount()` instead of breaking the importing page. */
+   `createSdBrowser()` instead of breaking the importing page. Destructuring
+   would throw at import time and take the whole page with it. */
 import * as sdk from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
@@ -200,6 +201,35 @@ export function createSdBrowser(host, opts = {}) {
   const log = opts.log ?? { log() {}, warn() {}, error() {} };
   const fmtBytes = opts.fmtBytes ?? defaultFmtBytes;
   const rootPath = opts.rootPath ?? CARD_ROOT;
+
+  /* A vendored bundle from before SD-over-Bluetooth shipped: say so here,
+     once, rather than throwing from the first Refresh. The sibling brand
+     editor has always done this and the comment at the import above has
+     always claimed this module did too -- it did not, so a stale bundle
+     reached `enumerateSdTree` as `undefined is not a function`, at a moment
+     when the user had just asked to read their card. `SdTransferError` is
+     included because the error paths below branch on it; without it every
+     transfer failure would report as an unknown error. */
+  const missingSdk = [
+    "enumerateSdTree",
+    "downloadSdTree",
+    "formatSdImportStamp",
+  ].filter((name) => typeof sdk[name] !== "function");
+  if (typeof sdk.SdTransferError !== "function")
+    missingSdk.push("SdTransferError");
+  if (missingSdk.length) {
+    host.replaceChildren(
+      el(
+        "div",
+        { class: "banner err" },
+        `This page is running an SDK bundle with no SD file-transfer support (missing ${missingSdk.join(", ")}). Re-vendor the SDK to browse the sensor's card or download from it.`,
+      ),
+    );
+    log.error(
+      `SD card transfer unavailable: the vendored SDK has no ${missingSdk.join(", ")}`,
+    );
+    return inertSdPanel();
+  }
 
   /** The last card listing, or null. */
   let tree = null;
@@ -991,5 +1021,28 @@ export function createSdBrowser(host, opts = {}) {
       abort();
       host.replaceChildren();
     },
+  };
+}
+
+/**
+ * The same surface, doing nothing, for a bundle that cannot transfer files.
+ *
+ * Returned rather than throwing so a page can mount the panel unconditionally
+ * and get a banner where the card would have been, instead of losing every
+ * tab that happens to be built after this one.
+ */
+function inertSdPanel() {
+  const no = async () => false;
+  return {
+    refresh: async () => {},
+    renderTree() {},
+    selectedPaths: () => [],
+    setLayout() {},
+    pickDestination: no,
+    download: no,
+    abort() {},
+    measureLinkSpeed: async () => null,
+    setEnabled() {},
+    destroy() {},
   };
 }
