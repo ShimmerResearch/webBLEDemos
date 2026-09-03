@@ -153,6 +153,7 @@ export function formatLogTime(d = new Date()) {
  *   text: () => string,
  *   setFilter: (text?: string, severity?: string) => void,
  *   lineCount: () => number,
+ *   atTail: () => boolean,
  * }}
  */
 export function createLog(container, opts = {}) {
@@ -275,6 +276,14 @@ export function createLog(container, opts = {}) {
       rerender();
     },
     lineCount: () => lines.length,
+    /**
+     * True when the view is scrolled to (or within a line or two of) the
+     * newest line, i.e. when a line arriving now would actually be seen.
+     * A caller that alerts on errors needs this: a log left open but
+     * scrolled back through history shows a new error no more than a
+     * closed one does.
+     */
+    atTail: () => nearBottom(),
   };
 
   opts.filterInput?.addEventListener("input", () =>

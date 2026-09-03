@@ -991,7 +991,14 @@
         /* The date is the same all session and the bar is one line wide, so
            only the clock time earns its place there. */
         pendingBarLine = text.replace(/^\d{4}-\d{2}-\d{2} /, "");
-        if (!logDrawerIsOpen() && (sev === "err" || sev === "warn")) {
+        /* Badge whenever the line would not in fact be seen: the drawer
+           closed, or open but scrolled back through history. Counting only
+           while closed meant that leaving the drawer open switched the alert
+           off altogether, which is the opposite of what it is for. */
+        if (
+          (sev === "err" || sev === "warn") &&
+          (!logDrawerIsOpen() || !log?.atTail?.())
+        ) {
           logAlerts++;
         }
         if (!barPaintScheduled) {
@@ -1017,6 +1024,15 @@
        * @param {boolean} [remember=true] false at startup, where the state
        *   came out of storage in the first place
        */
+      /* Scrolling back to the newest line is as much an acknowledgement as
+         opening the drawer: the lines are on screen either way. */
+      function noteLogScrolledToTail() {
+        if (logDrawerIsOpen() && log?.atTail?.() && logAlerts !== 0) {
+          logAlerts = 0;
+          paintLogBar();
+        }
+      }
+
       function setLogDrawer(open, remember = true) {
         document.documentElement.dataset.logOpen = open ? "true" : "false";
         $("btnLogDrawer").setAttribute(
@@ -1056,6 +1072,10 @@
         countEl: $("logCount"),
         fileName: "shimmer-capture-log.txt",
         onLine: noteLogLine,
+      });
+
+      $("log").addEventListener("scroll", noteLogScrolledToTail, {
+        passive: true,
       });
 
       /* The pre-paint script already applied the remembered state to the root
