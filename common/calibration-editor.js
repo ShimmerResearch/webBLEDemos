@@ -1057,8 +1057,8 @@ export function createCalibrationEditor(host, opts = {}) {
   function formatStamp(date) {
     const p2 = (n) => String(n).padStart(2, "0");
     return (
-      `${date.getFullYear()}-${p2(date.getMonth() + 1)}-${p2(date.getDate())} ` +
-      `${p2(date.getHours())}:${p2(date.getMinutes())}`
+      `${date.getUTCFullYear()}-${p2(date.getUTCMonth() + 1)}-${p2(date.getUTCDate())} ` +
+      `${p2(date.getUTCHours())}:${p2(date.getUTCMinutes())}`
     );
   }
 

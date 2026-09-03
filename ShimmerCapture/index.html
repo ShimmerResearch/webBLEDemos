@@ -1309,6 +1309,11 @@
         node.textContent = text ?? "";
       }
 
+      /**
+       * A HOST timestamp — a true Unix epoch — as local wall clock.
+       *
+       * Not for anything the sensor reported: see `formatDeviceClock`.
+       */
       function formatClock(unixMs) {
         if (!Number.isFinite(unixMs)) return "–";
         const d = new Date(unixMs);
@@ -1316,6 +1321,28 @@
         return (
           `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
           `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+        );
+      }
+
+      /**
+       * A DEVICE timestamp as the sensor's own clock reads it.
+       *
+       * The sensor keeps local civil time — the offset is already baked into
+       * the value, which is why `setDeviceClock` shifts the host's UTC into
+       * that domain before writing it. Converting the ticks back gives a
+       * number that is a wall clock wearing a Unix epoch's clothes, so it is
+       * read out with the UTC accessors: they return the digits that went in.
+       * The local accessors would add the browser's offset a second time and
+       * show a correctly-set sensor as hours out from the host clock beside
+       * it — which is exactly the comparison that line is there to support.
+       */
+      function formatDeviceClock(unixMs) {
+        if (!Number.isFinite(unixMs)) return "–";
+        const d = new Date(unixMs);
+        const p2 = (n) => String(n).padStart(2, "0");
+        return (
+          `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ` +
+          `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`
         );
       }
 
@@ -1873,7 +1900,7 @@
             client.getRtcTime(),
           );
           $("rwcValue").textContent = rtc
-            ? `${formatClock(rtc.unixMs)}  (${rtc.ticks} ticks)`
+            ? `${formatDeviceClock(rtc.unixMs)}  (${rtc.ticks} ticks)`
             : "–";
         }
         $("hostClock").textContent = formatClock(Date.now());
