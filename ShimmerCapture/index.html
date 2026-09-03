@@ -180,8 +180,8 @@
         <div>
           <h1>Shimmer Capture</h1>
           <div class="subtitle">
-            Example: configure, stream, plot and record a single Shimmer3R from
-            the browser
+            Example: configure, stream, plot, record and download the SD card of
+            a single Shimmer3R from the browser
           </div>
         </div>
         <span class="spacer"></span>
@@ -229,6 +229,7 @@
         <button data-tab="tabStream" id="tabBtnStream" type="button">
           Stream &amp; record
         </button>
+        <button data-tab="tabSd" id="tabBtnSd" type="button">SD card</button>
       </div>
 
       <!-- ================================================= Configure ===== -->
@@ -491,6 +492,22 @@
         <div id="plots"></div>
       </section>
 
+      <!-- =================================================== SD card ===== -->
+      <section class="tab" id="tabSd">
+        <div class="banner" id="sdBanner"></div>
+        <!-- common/sd-browser.js builds the whole panel in here. -->
+        <div id="sdPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            Files are pulled off the card over the same Bluetooth link that
+            carries the configuration, so a download and a live stream cannot
+            run at once. Each file is verified by size on this host before it is
+            deleted from the card, and an interrupted download resumes from what
+            is already on disk — re-running it is always safe.
+          </div>
+        </div>
+      </section>
+
       <!-- ================================================= Event log ===== -->
       <div class="card">
         <details class="group" open>
@@ -546,6 +563,7 @@
       import { createStreamPlot } from "../common/plot.js";
       import { createStreamStats } from "../common/stream-stats.js";
       import { createCsvRecorder } from "../common/csv-recorder.js";
+      import { createSdBrowser } from "../common/sd-browser.js";
       import {
         createMockShimmer3RTransport,
         mockEnabledFromUrl,
@@ -642,6 +660,21 @@
       let busy = false;
       let streaming = false;
       let sdLogging = false;
+      /**
+       * True while the SD panel is transferring or measuring the link.
+       *
+       * Held separately from `busy` because the two are used in opposite
+       * directions: it is folded INTO the gate state, so everything that
+       * shares the link is refused during a download — but it must stay OUT
+       * of what the SD panel itself is enabled on, or the first progress
+       * event would tear down the panel that is reporting it.
+       */
+      let sdBusy = false;
+      /**
+       * Why this sensor cannot transfer SD files, when it cannot. Set from
+       * the firmware version at connect time; null when it can.
+       */
+      let sdFirmwareNote = null;
 
       /** The configuration form, the schema it was built from, and its layout. */
       let form = null;
@@ -746,13 +779,25 @@
         caps.btStop = streaming && !sdLogging;
         caps.sdStop = sdLogging;
 
+        /* An SD download and everything else on this page compete for one
+           link, so a transfer in flight counts as busy for every other
+           control — Apply included. The SD panel's own controls are NOT
+           gated from here; it owns those (see `sd.setEnabled` below). */
         gate.apply({
           connected: !!client,
           streaming,
           recording: recorder.active,
-          busy,
+          busy: busy || sdBusy,
           caps,
         });
+
+        /* Deliberately `busy` and not `busy || sdBusy`: this is the floor
+           for whether the LINK can transfer at all, and the panel already
+           refuses a second operation while one of its own is running. */
+        sd.setEnabled(
+          !!client && !!caps.sdTransfer && !streaming && !sdLogging && !busy,
+        );
+        paintSdGating();
 
         // Page state, not device state: these must work while disconnected so
         // an image can be inspected, saved or thrown away.
@@ -771,6 +816,12 @@
         if (plan?.blocked) {
           $("btnApply").disabled = true;
           $("applyNote").textContent = plan.blocked;
+        } else if (sdBusy) {
+          /* Not the firmware refusing this time — the page is. One link, one
+             conversation: a configuration write in the middle of a file
+             transfer would interleave with the block stream. */
+          $("applyNote").textContent =
+            "Waiting for the SD card transfer to finish — a download and a configuration write cannot share the link.";
         } else {
           $("applyNote").textContent = "";
         }
@@ -1811,6 +1862,69 @@
         },
       });
 
+      // =====================================================================
+      // SD card
+      // =====================================================================
+
+      /* The panel is mounted once and handed a GETTER for the client, so it
+         reads whatever is connected now rather than holding the client the
+         page happened to have at startup (which is none). */
+      const sd = createSdBrowser($("sdPanel"), {
+        client: () => client,
+        log,
+        fmtBytes,
+        onBusyChange: (transferring) => {
+          sdBusy = transferring;
+          regate();
+        },
+      });
+
+      /**
+       * Why the card cannot be browsed right now, in plain language, or null.
+       *
+       * Same shape as the stream tab's USB refusal: a reason on screen beats
+       * a dead tab, because every one of these has a different fix — connect,
+       * use a different link, update the firmware, or stop the stream.
+       */
+      function sdUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE or classic Bluetooth to browse the sensor's SD card and download from it.";
+        }
+        if (mode === "usb") {
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one — the dock command set has no file-transfer commands at all. Connect over BLE or classic Bluetooth to download from the card.";
+        }
+        if (!caps.sdTransfer) {
+          return (
+            sdFirmwareNote ??
+            "This sensor cannot transfer files from its SD card over Bluetooth. Update it to LogAndStream_Shimmer3R v1.01.011 or later."
+          );
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses every SD command while it is — a download and a live stream would compete for the same link. Stop the stream to download from the card.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off when the reason is not going
+       * to change by itself.
+       *
+       * A disconnected page keeps the tab open, because reading the reason is
+       * the point. USB and old firmware close it and bounce back to
+       * Configure: nothing on it can ever work over that link. Streaming only
+       * closes it — no bounce, because the state is transient and the reader
+       * is on the stream tab anyway.
+       */
+      function paintSdGating() {
+        const reason = sdUnavailableReason();
+        banner("sdBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const permanent = !!client && (mode === "usb" || !caps.sdTransfer);
+        const btn = $("tabBtnSd");
+        btn.disabled = permanent || streaming || sdLogging;
+        btn.title = reason ?? "";
+        if (permanent && tabs.selected() === "tabSd") tabs.select("tabConfig");
+      }
+
       function macTail() {
         const mac = (deviceMac || "").replace(/[^0-9A-Fa-f]/g, "");
         return mac ? mac.slice(-4).toUpperCase() : "0000";
@@ -2096,6 +2210,26 @@
         );
         if (mac) deviceMac = mac;
 
+        /* The firmware gate on top of the method-and-link check
+           `describeShimmer3Caps` did: v1.01.009 and v1.01.010 serve the
+           SD-transfer protocol and ship every 512-byte block shifted three
+           bytes, so the corruption arrives as valid frames nothing on the
+           host can detect. The version is the only reliable probe, and
+           `supportsSdTransfer` owns the threshold — it reuses the version
+           just read, so this costs no extra round trip. */
+        if (caps.sdTransfer) {
+          const ok = await client.supportsSdTransfer().catch(() => false);
+          caps.sdTransfer = ok === true;
+          sdFirmwareNote = ok
+            ? null
+            : `${firmwareLabel(fw) ?? "This firmware"} cannot transfer SD files intact. It needs LogAndStream_Shimmer3R v1.01.011 or later — v1.01.009 and v1.01.010 corrupt every block they send.`;
+          log.log(
+            caps.sdTransfer
+              ? "SD file transfer supported by this firmware"
+              : `SD file transfer unavailable: ${sdFirmwareNote}`,
+          );
+        }
+
         setIdentity({
           idName: deviceName || "(name not reported)",
           idMac: mac ?? "(unavailable)",
@@ -2225,8 +2359,10 @@
        * What each link can and cannot do.
        *
        * The USB-C port configures a sensor perfectly well and cannot carry a
-       * single sample, so the stream tab is closed off with a reason rather
-       * than left to fail on the first button press.
+       * single sample or a single card block, so the stream and SD tabs are
+       * both closed off with a reason rather than left to fail on the first
+       * button press. The SD half of that lives in `paintSdGating`, which
+       * `regate` calls — its reason depends on the firmware too.
        */
       function applyModeGating() {
         const wired = mode === "usb";
@@ -2252,9 +2388,14 @@
         sdLogging = false;
         csvColumns = null;
         schemaFromFrame = false;
+        /* A transfer that outlived its link would keep writing zero-length
+           windows into the destination folder. Abort first, then drop the
+           client the panel reads through. */
+        sd.abort();
         client = null;
         mode = null;
         caps = {};
+        sdFirmwareNote = null;
         form?.setEnabled(false);
         clearIdentity();
         $("tabBtnStream").disabled = false;
@@ -2300,6 +2441,8 @@
        *   ?mock=1              framed, like BLE
        *   ?mock=1&framed=0     an unframed byte stream, like classic Bluetooth
        *   ?mock=1&rate=204.8   pick the sampling rate
+       *   ?mock=1&fw=1.01.010  report a firmware version (gates the SD tab)
+       *   ?mock=1&sdKBps=400   pace the synthetic card's file blocks
        *   ?mock=1&debug=1      log every command and reply to the console
        */
       function setUpMock() {
@@ -2307,6 +2450,15 @@
         const params = new URLSearchParams(location.search);
         const framed = params.get("framed") !== "0";
         const rateHz = Number(params.get("rate")) || 51.2;
+        /* `1.01.010` — major.minor.patch, the way the firmware releases are
+           named, so the value pasted into the URL is the one from the
+           release notes. */
+        const fwParts = (params.get("fw") ?? "").split(".").map(Number);
+        const firmware =
+          fwParts.length === 3 && fwParts.every(Number.isFinite)
+            ? { major: fwParts[0], minor: fwParts[1], patch: fwParts[2] }
+            : undefined;
+        const sdKBps = Number(params.get("sdKBps")) || undefined;
         const btn = $("btnMock");
         btn.hidden = false;
         btn.textContent = `Connect (mock, ${framed ? "framed" : "unframed"})`;
@@ -2322,12 +2474,17 @@
           const transport = createMockShimmer3RTransport({
             framed,
             rateHz,
+            firmware,
+            sdKBps,
             debug: params.get("debug") === "1",
           });
-          // A hook for driving the page from the console while developing:
-          // `mockTransport.writes` is every command the page sent, and
-          // `mockTransport.emitDisconnect()` simulates a dropped link.
+          // Hooks for driving the page from the console while developing:
+          // `mockTransport.writes` is every command the page sent,
+          // `mockTransport.emitDisconnect()` simulates a dropped link,
+          // `mockTransport.sdCard.bytes(path)` is what a download of that
+          // card file should produce, and `sdBrowser` is the SD panel's API.
           window.mockTransport = transport;
+          window.sdBrowser = sd;
           const mockClient = new sdk.Shimmer3RClient({
             debug: false,
             transport,
@@ -2377,6 +2534,7 @@
       $("btnUsb").addEventListener("click", () => connect.connectVia("usb"));
 
       $("btnDisconnect").addEventListener("click", async () => {
+        sd.abort();
         if (streaming) await stopStream(sdLogging);
         if (recorder.active) await stopRecording();
         if (connect.session) {
@@ -2592,7 +2750,7 @@
       setUpMock();
       regate();
       log.log(
-        "ready — connect over BLE or classic Bluetooth to configure, stream and record, or over USB-C to configure only",
+        "ready — connect over BLE or classic Bluetooth to configure, stream, record and download from the SD card, or over USB-C to configure only",
       );
     </script>
   </body>
