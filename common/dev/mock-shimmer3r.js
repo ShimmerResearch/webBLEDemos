@@ -546,7 +546,11 @@ export function createMockShimmer3RTransport(opts = {}) {
         const start = cmd[2] ?? 0;
         const len = cmd[3] ?? 0;
         const base = chip === 0 ? IM.exg1 : IM.exg2;
-        if (chip > 1 || start + len > IM.exgBankLength || cmd.length < 4 + len) {
+        if (
+          chip > 1 ||
+          start + len > IM.exgBankLength ||
+          cmd.length < 4 + len
+        ) {
           reply([NACK]);
           return;
         }
