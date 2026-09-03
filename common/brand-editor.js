@@ -38,7 +38,7 @@ import { el } from "./ui-chrome.js";
    predates one of the brand-record exports then degrades to a message from
    `createBrandEditor()` instead of breaking the importing page. Destructuring
    would throw at import time and take the whole page with it. */
-import * as sdk from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
 // Constants

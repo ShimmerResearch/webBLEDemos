@@ -22,7 +22,7 @@
  * No DOM access at import time.
  */
 
-import { csvCell } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+import { csvCell } from "../vendor/shimmer-web-sdk.esm.js";
 import { downloadBlob } from "./ui-chrome.js";
 
 /** How often buffered rows are handed to the writable stream. */

@@ -15,7 +15,7 @@
  * No DOM access at import time.
  */
 
-import { StreamStatsTracker } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+import { StreamStatsTracker } from "../vendor/shimmer-web-sdk.esm.js";
 import { el, fmtDuration, fmtHz } from "./ui-chrome.js";
 
 /**

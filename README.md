@@ -102,9 +102,12 @@ powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1 -SdkRepoPath "C:
 
 ### SDK source selection (single location)
 
-Most demos import from `../shimmer-extension/vendor/shimmer-web-sdk.esm.js`.
-The `Verisense` demo imports from `./vendor/shimmer-web-sdk.esm.js`.
-The file that controls where vendor artifacts come from is `sdk-source.json`:
+Every page and every module under `common/` imports the SDK from the shared
+`vendor/` directory at the repository root, e.g.
+`../vendor/shimmer-web-sdk.esm.js`. The Chrome extension keeps its own copy at
+`shimmer-extension/vendor/` because only that folder is packed for the store —
+see `vendor/README.md`. The file that controls where vendor artifacts come from
+is `sdk-source.json`:
 
 ```json
 {
@@ -199,7 +202,7 @@ Use the localhost URL opened by Live Server (commonly `http://localhost:5500/...
 The demos import the SDK from vendored files in this repository, using relative paths that work both on localhost and on GitHub Pages:
 
 ```js
-import { Shimmer3RClient } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+import { Shimmer3RClient } from "../vendor/shimmer-web-sdk.esm.js";
 ```
 
 This means:
@@ -208,10 +211,10 @@ This means:
 - GitHub Pages deployments also resolve the same path under the published `webBLEDemos` site.
 - The demos work on GitHub Pages as long as vendored SDK files are committed with the site.
 
-For the Verisense demo in this repository:
+The Verisense demo is no different — it sits one level down like the others:
 
 ```js
-import { VerisenseBleDevice } from "./vendor/shimmer-web-sdk.esm.js";
+import { VerisenseBleDevice } from "../vendor/shimmer-web-sdk.esm.js";
 ```
 
 ### Update vendored SDK from local source
@@ -230,8 +233,9 @@ update-local-sdk.cmd
 
 The sync script uses `sdk-source.json` to copy built artifacts from `shimmer-web-sdk/dist` into both:
 
-- `webBLEDemos/shimmer-extension/vendor`
-- `webBLEDemos/Verisense/vendor`
+- `webBLEDemos/vendor` — the shared copy every page imports
+- `webBLEDemos/shimmer-extension/vendor` — the Chrome extension's own, which
+  cannot import from outside its folder
 
 Build logic is centralized in `shimmer-web-sdk/build-local-sdk.ps1` and invoked by `update-local-sdk.ps1`.
 
