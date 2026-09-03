@@ -1054,11 +1054,24 @@ export function createCalibrationEditor(host, opts = {}) {
     return new Date(ms);
   }
 
+  /**
+   * A calibration stamp, shown in this host's local time.
+   *
+   * The stamp is a plain Unix epoch, because the sensor's real-world clock is
+   * one — desktop Consensys and the dock software both write `Date.now()`
+   * ticks. So it is read out with the LOCAL accessors, like every other date
+   * on the page, and a stamp the firmware wrote agrees with the device clock
+   * shown beside it.
+   *
+   * (These were the UTC accessors while this page believed the sensor kept
+   * local civil time. That cancelled out for a stamp this page had written and
+   * was wrong for every stamp the firmware had.)
+   */
   function formatStamp(date) {
     const p2 = (n) => String(n).padStart(2, "0");
     return (
-      `${date.getUTCFullYear()}-${p2(date.getUTCMonth() + 1)}-${p2(date.getUTCDate())} ` +
-      `${p2(date.getUTCHours())}:${p2(date.getUTCMinutes())}`
+      `${date.getFullYear()}-${p2(date.getMonth() + 1)}-${p2(date.getDate())} ` +
+      `${p2(date.getHours())}:${p2(date.getMinutes())}`
     );
   }
 
@@ -1721,12 +1734,13 @@ export function createCalibrationEditor(host, opts = {}) {
   /**
    * Now, as the 8-byte tick stamp the firmware writes.
    *
-   * Local civil time rather than UTC, deliberately: the device's real-world
-   * clock is local civil time (DEV-900), so a UTC stamp here would read back
-   * an hour or more out against every other date the sensor produces.
+   * A plain Unix epoch, matching the sensor's own real-world clock: desktop
+   * Consensys and the dock software both write `Date.now()` ticks, so a stamp
+   * written here reads back against the same scale as every other date the
+   * sensor produces.
    */
   function hostStamp() {
-    const nowMs = Date.now() - new Date().getTimezoneOffset() * 60000;
+    const nowMs = Date.now();
     let ticks = BigInt(Math.round((nowMs / 1000) * RTC_TICKS_PER_SECOND));
     const out = new Uint8Array(8);
     for (let i = 0; i < 8; i++) {
