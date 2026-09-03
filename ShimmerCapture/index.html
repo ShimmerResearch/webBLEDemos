@@ -115,6 +115,21 @@
         background: var(--line-strong);
       }
 
+      /* The two raw-byte checkboxes in the log toolbar. */
+      .tap-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      .tap-toggle input {
+        width: auto;
+        flex: 0 0 auto;
+      }
+
       .action-bar {
         position: sticky;
         bottom: 0;
@@ -567,10 +582,29 @@
                 <option value="err">Errors only</option>
                 <option value="txrx">TX / RX</option>
               </select>
+              <!-- The select above chooses what is SHOWN; these two choose
+                   what is PRODUCED. Nothing tags a line tx/rx unless the tap
+                   is recording, so the two live side by side and #tapNote
+                   below says so whenever they disagree. -->
+              <label
+                class="tap-toggle"
+                title="Log every byte this page writes to the sensor and every byte it receives. Off by default: it is a diagnostic, not a running commentary."
+              >
+                <input type="checkbox" id="chkRawBytes" />
+                Log raw TX/RX bytes
+              </label>
+              <label
+                class="tap-toggle"
+                title="Streaming frames as well as commands. A sensor at 1024 Hz sends one every millisecond, so this is capped and coalesced."
+              >
+                <input type="checkbox" id="chkRawData" disabled />
+                …including data packets
+              </label>
               <button id="btnLogClear" type="button">Clear</button>
               <button id="btnLogDownload" type="button">Download</button>
               <span class="log-count" id="logCount"></span>
             </div>
+            <div class="banner" id="tapNote"></div>
             <div class="log" id="log"></div>
           </div>
         </details>
@@ -591,6 +625,7 @@
         fmtHz,
       } from "../common/ui-chrome.js";
       import { createConnectController } from "../common/connect-ui.js";
+      import { createTransportTap } from "../common/transport-tap.js";
       import { createConfigForm, displayValue } from "../common/config-form.js";
       import {
         describeShimmer3Caps,
@@ -696,6 +731,101 @@
       $("sdkPill").textContent = sdk.SDK_VERSION
         ? `SDK ${sdk.SDK_VERSION}`
         : "SDK (unknown build)";
+
+      // =====================================================================
+      // Raw byte tap
+      // =====================================================================
+
+      /**
+       * The tap wrapped around the live transport, or null.
+       *
+       * One per link, because a transport is per link. The two checkboxes are
+       * the page's state and outlive it, so `tapTransport` pushes them onto
+       * each new tap as it is built.
+       */
+      let tap = null;
+
+      /**
+       * Wrap a transport so the bytes crossing it can be logged.
+       *
+       * Every link goes through here, BLE included — which is why the page
+       * builds the BLE transport itself rather than letting the client build
+       * one (see `makeClients.ble`).
+       */
+      function tapTransport(transport) {
+        tap = createTransportTap(transport, {
+          log,
+          enabled: $("chkRawBytes").checked,
+          includeDataPackets: $("chkRawData").checked,
+        });
+        return tap;
+      }
+
+      /**
+       * Say so when what is being SHOWN and what is being PRODUCED disagree.
+       *
+       * The severity select filters lines that already exist; the tap decides
+       * whether tx/rx lines exist at all. Two half-controls that quietly
+       * cancel each other out is how a TX / RX filter with no producer shipped
+       * in the first place, so each combination that yields nothing gets a
+       * sentence explaining which control to reach for.
+       */
+      function updateTapNote() {
+        const on = $("chkRawBytes").checked;
+        const sev = $("logSeverity").value;
+        if (sev === "txrx" && !on) {
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX logging is off, so this filter has nothing to show. Tick “Log raw TX/RX bytes” above to start recording them.",
+          );
+        } else if (sev === "txrx" && !client) {
+          /* The other half of the same trap: the tap is on, the filter is
+             right, and the log is still empty — because nothing is connected
+             for bytes to cross. */
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX logging is on. Nothing is connected yet, so there are no bytes to show — the lines start as soon as a sensor is.",
+          );
+        } else if (on && (sev === "err" || sev === "warnup")) {
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX bytes are being recorded, but this filter hides them. Choose “TX / RX” or “All” to see them.",
+          );
+        } else {
+          banner("tapNote", "", "");
+        }
+      }
+
+      $("chkRawBytes").addEventListener("change", (e) => {
+        const on = e.target.checked;
+        /* The data-packet opt-in is meaningless with the tap off, and a
+           checkbox that does nothing is worse than one that is disabled. */
+        $("chkRawData").disabled = !on;
+        tap?.tap.setEnabled(on);
+        /* Deliberately worded without a bare "TX" or "RX": those two words are
+           exactly what routes a line into the TX/RX filter, and a status line
+           about the tap is not a byte the sensor sent. */
+        log.log(
+          on
+            ? "raw byte logging on — every command and every reply crossing the link is now logged as a hex line"
+            : "raw byte logging off",
+        );
+        updateTapNote();
+      });
+
+      $("chkRawData").addEventListener("change", (e) => {
+        tap?.tap.setIncludeDataPackets(e.target.checked);
+        log.log(
+          e.target.checked
+            ? "raw byte logging now includes streaming data packets, capped at 100 lines a second"
+            : "raw byte logging is back to control traffic only",
+        );
+      });
+
+      $("logSeverity").addEventListener("change", updateTapNote);
 
       // =====================================================================
       // State
@@ -916,6 +1046,9 @@
 
         updateDirtyPill();
         refreshRecordName();
+        /* The tap note depends on whether anything is connected, so it is
+           re-evaluated wherever the connection state is. */
+        updateTapNote();
       }
 
       // =====================================================================
@@ -2294,6 +2427,37 @@
       // Connect
       // =====================================================================
 
+      /**
+       * The Web Bluetooth transport the Shimmer3R client would otherwise build
+       * for itself, wrapped in the byte tap.
+       *
+       * The three UUIDs, the picker filter and the write mode all come from
+       * the SDK's own exported defaults, so a firmware that moves its GATT
+       * layout moves this page with it. Returns null when the vendored bundle
+       * is too old to export the pieces, which the caller degrades over.
+       */
+      function makeBleTransport() {
+        const defaults = sdk.SHIMMER3R_DEFAULTS;
+        if (typeof sdk.WebBluetoothTransport !== "function" || !defaults) {
+          return null;
+        }
+        return new sdk.WebBluetoothTransport({
+          serviceUUID: defaults.SERVICE_UUID,
+          // RX is the host→device write pipe and TX the device→host notify
+          // pipe — named from the SENSOR's point of view, which is the way
+          // round that trips a reader who assumes the host's.
+          writeCharUUID: defaults.CHAR_RX_UUID,
+          notifyCharUUID: defaults.CHAR_TX_UUID,
+          requestDeviceOptions: {
+            filters: [{ services: [defaults.SERVICE_UUID] }],
+            optionalServices: [defaults.SERVICE_UUID],
+          },
+          defaultWriteWithResponse: true,
+          debug: false,
+          logTag: "[Shimmer3R:ble]",
+        });
+      }
+
       const connect = createConnectController({
         els: {
           ble: $("btnBle"),
@@ -2306,24 +2470,56 @@
         log,
         sdkNs: sdk,
         makeClients: {
-          ble: () => new sdk.Shimmer3RClient({ debug: false }),
+          /* The client would happily build its own Web Bluetooth transport,
+             and did until the raw byte tap arrived: a transport the page never
+             sees is a transport the page cannot tap, which left BLE — the link
+             most sessions use — as the one link with no byte-level
+             diagnostics.
+
+             So the page builds it, matching Shimmer3RClient._makeWebTransport
+             option for option: the same three UUIDs (read off the SDK's own
+             SHIMMER3R_DEFAULTS rather than typed out here), the same
+             requestDevice filter and optionalServices, and
+             defaultWriteWithResponse: true, which is the one that would change
+             behaviour rather than just labels if it were wrong — the Shimmer3R
+             protocol is ACK-first and its commands are written with a
+             response. */
+          ble: () => {
+            const raw = makeBleTransport();
+            if (!raw) {
+              /* An older vendored bundle with no WebBluetoothTransport export:
+                 fall back to the client's own, which costs the tap on this
+                 link and nothing else. */
+              log.warn(
+                "this SDK bundle does not export WebBluetoothTransport, so the BLE link cannot be tapped — raw TX/RX logging will be empty over BLE",
+              );
+              return new sdk.Shimmer3RClient({ debug: false });
+            }
+            const transport = tapTransport(raw);
+            return {
+              client: new sdk.Shimmer3RClient({ debug: false, transport }),
+              transport,
+            };
+          },
           bt: () => {
             /* A classic-Bluetooth link is a serial port, so the transport is
                built here and handed back alongside the client — the controller
                needs it to log which RFCOMM service class the browser's picker
                actually gave us. 64 KB of buffer because a serial read can
                arrive in one large gulp. */
-            const transport = new sdk.WebSerialTransport({
-              ...sdk.SHIMMER3_SPP_SERIAL_OPTIONS,
-              bufferSize: 64 * 1024,
-            });
+            const transport = tapTransport(
+              new sdk.WebSerialTransport({
+                ...sdk.SHIMMER3_SPP_SERIAL_OPTIONS,
+                bufferSize: 64 * 1024,
+              }),
+            );
             return {
               client: new sdk.Shimmer3RClient({ debug: false, transport }),
               transport,
             };
           },
           usb: () => {
-            const transport = new sdk.WebSerialTransport();
+            const transport = tapTransport(new sdk.WebSerialTransport());
             return {
               client: new sdk.WiredShimmerClient({ transport }),
               transport,
@@ -2571,6 +2767,11 @@
            windows into the destination folder. Abort first, then drop the
            client the panel reads through. */
         sd.abort();
+        /* Report whatever the tap was still holding back before the transport
+           it wrapped goes away — a count that never lands reads as bytes that
+           were never sent. */
+        tap?.tap.flush();
+        tap = null;
         client = null;
         mode = null;
         caps = {};
@@ -2654,6 +2855,11 @@
         const btn = $("btnMock");
         btn.hidden = false;
         btn.textContent = `Connect (mock, ${framed ? "framed" : "unframed"})`;
+        /* The BLE transport builder, so its options can be read off on a host
+           with no sensor and no Web Bluetooth — constructing one does not go
+           near the radio, only `connect()` does. Side-effect free: the tap is
+           applied by the connect factory, not here. */
+        window.makeBleTransport = makeBleTransport;
         log.warn(
           `mock mode: no real sensor is involved. The transport is ${
             framed
@@ -2683,7 +2889,12 @@
           window.brandEditor = brand;
           const mockClient = new sdk.Shimmer3RClient({
             debug: false,
-            transport,
+            /* Tapped like every real link, so the raw byte log can be
+               exercised with no hardware on the desk. `window.mockTransport`
+               stays the RAW mock deliberately: its `writes`, `sdCard` and
+               `eeprom` are what a developer (and the test harness) reaches
+               for, and reading them through the tap would prove nothing. */
+            transport: tapTransport(transport),
           });
           btn.disabled = true;
           try {
@@ -2961,6 +3172,7 @@
       renderHex();
       clearIdentity();
       setUpMock();
+      updateTapNote();
       regate();
       log.log(
         "ready — connect over BLE or classic Bluetooth to configure, stream, record, download from the SD card and change the sensor's names, or over USB-C to configure and rename only",
