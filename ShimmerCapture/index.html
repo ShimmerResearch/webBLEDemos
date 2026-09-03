@@ -1496,6 +1496,9 @@
         if (brandBusy) {
           return "A device-naming write is using the link — wait for it to finish.";
         }
+        if (calibBusy) {
+          return "A calibration write is using the link — wait for it to finish.";
+        }
         return null;
       }
 
@@ -2649,6 +2652,18 @@
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses every SD command while it is — a download and a live stream would compete for the same link. Stop the stream to download from the card.";
         }
+        /* The other holders of the one link. This panel is disabled for all
+           three (see its setEnabled call), so leaving them unsaid greyed the
+           card out with no reason on screen. */
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link. A download and a name write cannot share it — wait for it to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link. A download and a calibration write cannot share it — wait for it to finish.";
+        }
         return null;
       }
 
@@ -2773,6 +2788,20 @@
         if (!caps.calibration && !caps.infomem) {
           return "This link can reach neither the calibration dump nor the configuration image, so there is no calibration to show.";
         }
+        return calibLinkHeldReason();
+      }
+
+      /**
+       * The subset of the above that closes the tab: something else is using
+       * the one link, and it will stop by itself.
+       *
+       * Split out so the sentence and the disabled state come from the same
+       * condition. They were written separately and had already drifted — the
+       * text called the tab unavailable during a link test or a name write
+       * while the tab stayed open — and any holder added later would have
+       * drifted the same way again.
+       */
+      function calibLinkHeldReason() {
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses every configuration command while it is. Stop the stream before reading or writing calibration.";
         }
@@ -2801,7 +2830,7 @@
         const reason = calibUnavailableReason();
         banner("calBanner", reason ? (client ? "warn" : "info") : "", reason);
         const btn = $("tabBtnCal");
-        btn.disabled = !!client && (streaming || sdLogging || sdBusy);
+        btn.disabled = !!client && !!calibLinkHeldReason();
         btn.title = reason ?? "";
       }
 
@@ -2857,6 +2886,9 @@
         }
         if (sdBusy) {
           return "An SD card transfer is using the link. A name write and a download cannot share it — wait for the transfer to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link. A name write and a calibration write cannot share it — wait for it to finish.";
         }
         return null;
       }
