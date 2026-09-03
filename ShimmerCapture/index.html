@@ -41,6 +41,17 @@
         // step with the page theme. Values mirror --bg in common/theme.css.
         var meta = document.querySelector('meta[name="theme-color"]');
         if (meta) meta.content = theme === "dark" ? "#0d1117" : "#f4f6f8";
+
+        // The event log drawer, for the same reason and with the same key the
+        // module below uses (LOG_DRAWER_KEY): applied before the first paint
+        // so a remembered-open drawer does not shove the page up a frame
+        // after it settles.
+        var open = "false";
+        try {
+          if (localStorage.getItem("shimmerCaptureLogDrawer") === "open")
+            open = "true";
+        } catch (e) {}
+        document.documentElement.dataset.logOpen = open;
       })();
     </script>
 
@@ -50,6 +61,20 @@
 
     <style>
       /* Page-local layout only — everything visual comes from theme.css. */
+
+      /* How much of the viewport the docked event log occupies. One variable
+         drives three things — the drawer's own height, the space the page
+         reserves at its foot, and where the sticky action bar and the toast
+         stack stop — so the drawer can never cover content, open or shut.
+         Set on the root element by the drawer's toggle. */
+      :root {
+        --log-drawer-h: 34px;
+      }
+
+      :root[data-log-open="true"] {
+        --log-drawer-h: min(46vh, 420px);
+      }
+
       .page-head {
         display: flex;
         align-items: flex-start;
@@ -102,9 +127,242 @@
         flex: 0 0 auto;
       }
 
+      /* Sensor link on the left, device identity on the right.
+
+         `minmax(0, …)` on both tracks rather than `1fr 340px`: a grid item's
+         default minimum is its content, so a long firmware string or a wide
+         button row would otherwise push the track past the container and give
+         the whole PAGE a horizontal scrollbar. Below 800px the two stack, so
+         a phone gets one readable column instead of two squeezed ones. */
+      .link-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 340px);
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .link-row > .card {
+        margin-bottom: 0;
+        min-width: 0;
+      }
+
+      @media (max-width: 800px) {
+        .link-row {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        /* Still a bottom sheet, just a taller one: the toolbar wraps onto
+           three rows at this width, and 46vh would leave almost no log. */
+        :root[data-log-open="true"] {
+          --log-drawer-h: min(62vh, 480px);
+        }
+
+        /* Once the connect buttons wrap onto several lines a vertical rule
+           between two of them reads as a stray mark rather than a divider. */
+        .link-sep {
+          display: none;
+        }
+      }
+
+      /* The identity panel sits above the tab strip, which is the page's
+         primary navigation, so every line in it is a line the tabs move down
+         by. Hence the tighter grid, the smaller flags, the Refresh button on
+         the title line and no clock rows — those went to the Configure tab
+         with the clock button. Measured: this brings the panel back to the
+         height of the identity list it replaced, so the tabs sit where they
+         always did (~425px into a 1366x700 laptop viewport). */
+      .device-panel {
+        padding: 12px;
+      }
+
+      .device-panel-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .device-panel .kv-tight {
+        grid-template-columns: 84px minmax(0, 1fr);
+        gap: 2px 8px;
+        font-size: 12px;
+      }
+
+      .device-panel .flags {
+        margin-top: 7px;
+        padding-top: 7px;
+        border-top: 1px solid var(--line-soft);
+        font-size: 12px;
+        line-height: 1.35;
+        gap: 2px 10px;
+      }
+
+      /* How fresh the flags are: in the title row, beside Refresh, rather than
+         on a line of its own under the flags. This panel is the taller of the
+         two columns above the tab strip, so a line of its own would push the
+         tabs 18px further down — below where they sat before the panel
+         existed, which is the budget the harness holds it to. The title row
+         has the Refresh button's height to spare. */
+      .device-panel-title .status-fresh {
+        margin-left: auto;
+        font-size: 11px;
+        font-weight: 400;
+        color: var(--faint);
+        white-space: nowrap;
+      }
+
+      /* Not the sensor's word: either a value this page inferred from the
+         command it just sent, or a reading it could not confirm. */
+      .device-panel-title .status-fresh.unread,
+      .flag.inferred {
+        color: var(--warn);
+      }
+
+      /* Hairline between the two Bluetooth connect buttons and the wired one.
+         Both radio links need the sensor paired with this host first and both
+         can stream; the dock link does neither, so it reads as the odd one
+         out rather than as a third of a kind. */
+      .link-sep {
+        flex: 0 0 auto;
+        align-self: stretch;
+        width: 1px;
+        min-height: 22px;
+        margin: 0 3px;
+        background: var(--line-strong);
+      }
+
+      /* The two raw-byte checkboxes in the log toolbar. */
+      .tap-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      .tap-toggle input {
+        width: auto;
+        flex: 0 0 auto;
+      }
+
+      /* ---------------------------------------------- the log drawer ---- */
+
+      /* Everything the drawer would otherwise sit on top of is pushed clear
+         of it by the same variable the drawer is sized with. */
+      .page {
+        padding-bottom: calc(var(--log-drawer-h) + 18px);
+      }
+
+      .toast-stack {
+        bottom: calc(var(--log-drawer-h) + 14px);
+      }
+
+      .log-drawer {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 40;
+        height: var(--log-drawer-h);
+        display: flex;
+        flex-direction: column;
+        background: var(--card);
+        /* A border rather than a shadow: every shadow token in theme.css
+           casts downwards, which on a panel docked to the bottom edge lands
+           off-screen. The line does the separating work in both themes. */
+        border-top: 1px solid var(--line-strong);
+      }
+
+      .log-drawer-bar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        height: 33px;
+        border: 0;
+        border-radius: 0;
+        background: none;
+        padding: 0 14px;
+        text-align: left;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .log-drawer-bar:hover:not(:disabled) {
+        background: var(--control-hover);
+      }
+
+      .log-drawer-caret {
+        flex: 0 0 auto;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-bottom: 6px solid var(--muted);
+      }
+
+      :root[data-log-open="true"] .log-drawer-caret {
+        transform: rotate(180deg);
+      }
+
+      .log-drawer-title {
+        flex: 0 0 auto;
+        font-weight: 600;
+        color: var(--ink);
+      }
+
+      /* The count of errors and warnings that have not been seen. Red on
+         purpose: the whole reason the log moved down here is that an error at
+         the foot of a long page went unseen. */
+      .log-drawer-badge {
+        flex: 0 0 auto;
+        min-width: 18px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        border: 1px solid var(--danger-border);
+        background: var(--danger-bg);
+        color: var(--danger);
+        font-size: 11px;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      /* The newest line, whatever it was. Never wraps: the bar is one line
+         high and a raw byte dump would otherwise reflow the whole page. */
+      .log-drawer-last {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--faint);
+      }
+
+      .log-drawer-body {
+        display: none;
+        flex: 1 1 auto;
+        min-height: 0;
+        flex-direction: column;
+        padding: 0 14px 12px;
+      }
+
+      :root[data-log-open="true"] .log-drawer-body {
+        display: flex;
+      }
+
+      /* theme.css fixes the log panel at 340px, which is right for a card in
+         the page flow and wrong inside a drawer of a known height. */
+      .log-drawer .log {
+        flex: 1 1 auto;
+        height: auto;
+        min-height: 0;
+      }
+
       .action-bar {
         position: sticky;
-        bottom: 0;
+        bottom: calc(var(--log-drawer-h) + 8px);
         z-index: 20;
         background: var(--card);
         border: 1px solid var(--line);
@@ -191,40 +449,94 @@
         <button id="themeBtn" type="button"></button>
       </header>
 
-      <!-- ================================================== Connect ====== -->
-      <div class="card">
-        <div class="card-title">Sensor link</div>
-        <div class="row">
-          <button id="btnBle" class="primary" type="button">Connect BLE</button>
-          <button id="btnUsb" type="button">Connect USB</button>
-          <button id="btnBt" type="button">Connect classic Bluetooth</button>
-          <button id="btnMock" type="button" hidden>Connect (mock)</button>
-          <button id="btnDisconnect" class="secondary" type="button">
-            Disconnect
-          </button>
-          <span class="pill" id="connPill">disconnected</span>
+      <!-- ================================ Connect and device identity ====
+           Two columns above the tab strip, because the right-hand half is
+           read-mostly and true on every tab: whether the sensor is sensing
+           gates an SD transfer AND a name write, and the battery matters most
+           right before a long download. Stacks below 800px. -->
+      <div class="link-row">
+        <div class="card">
+          <div class="card-title">Sensor link</div>
+          <!-- BLE and classic Bluetooth first and adjacent: both are radio
+               links that need the sensor paired with this host first, so they
+               share a story and a failure mode. The wired link is last and
+               separated — it needs no pairing, and it speaks a different
+               protocol with no stream and no card access at all. -->
+          <div class="row">
+            <button id="btnBle" class="primary" type="button">
+              Connect BLE
+            </button>
+            <button id="btnBt" type="button">Connect classic Bluetooth</button>
+            <span class="link-sep" aria-hidden="true"></span>
+            <button id="btnUsb" type="button">Connect USB</button>
+            <button id="btnMock" type="button" hidden>Connect (mock)</button>
+            <button id="btnDisconnect" class="secondary" type="button">
+              Disconnect
+            </button>
+            <span class="pill" id="connPill">disconnected</span>
+          </div>
+          <div class="banner" id="platformBanner"></div>
+          <!-- Measures the LINK, not the card, so it belongs with the connect
+               buttons rather than in the SD panel it used to live in. The
+               result still lands in that panel's stats strip and its download
+               ETAs, which is where it gets used. -->
+          <div class="row">
+            <button
+              id="btnLinkTest"
+              type="button"
+              data-requires="idle"
+              data-cap="linkTest"
+            >
+              Measure link speed (5 s)
+            </button>
+            <span class="pill" id="linkSpeedPill">not measured</span>
+          </div>
+          <div class="field-hint" id="linkTestNote"></div>
         </div>
-        <div class="banner" id="platformBanner"></div>
-        <div class="kv" id="identityKv">
-          <div class="muted">Device</div>
-          <div id="idName">–</div>
-          <div class="muted">MAC</div>
-          <div id="idMac" class="mono">–</div>
-          <div class="muted">Hardware</div>
-          <div id="idHw">–</div>
-          <div class="muted">Firmware</div>
-          <div id="idFw">–</div>
-          <div class="muted">Battery</div>
-          <div id="idBatt">–</div>
-          <div class="muted">Link</div>
-          <div id="idLink">–</div>
-        </div>
+
+        <aside class="card device-panel" id="devicePanel">
+          <div class="card-title device-panel-title">
+            <span>Device</span>
+            <!-- Where the flags below came from and when. Three sources reach
+                 them now — a read, a push from the sensor, and this page's own
+                 last command — and a reader cannot act on a flag without
+                 knowing which. -->
+            <span class="status-fresh" id="statusFresh" hidden></span>
+            <button
+              id="btnRefreshDevice"
+              type="button"
+              data-requires="idle"
+              data-cap="status"
+              title="Re-read the battery, the status flags and the sensor's real-world clock"
+            >
+              Refresh
+            </button>
+          </div>
+          <div class="kv kv-tight" id="identityKv">
+            <div class="muted">Device</div>
+            <div id="idName">–</div>
+            <div class="muted">MAC</div>
+            <div id="idMac" class="mono">–</div>
+            <div class="muted">Hardware</div>
+            <div id="idHw">–</div>
+            <div class="muted">Firmware</div>
+            <div id="idFw">–</div>
+            <div class="muted">Battery</div>
+            <div id="idBatt">–</div>
+            <div class="muted">Link</div>
+            <div id="idLink">–</div>
+          </div>
+          <div class="flags" id="statusFlags">–</div>
+        </aside>
       </div>
 
       <!-- ===================================================== Tabs ====== -->
       <div class="tabs">
         <button data-tab="tabConfig" class="active" type="button">
           Configure
+        </button>
+        <button data-tab="tabCal" id="tabBtnCal" type="button">
+          Calibration
         </button>
         <button data-tab="tabStream" id="tabBtnStream" type="button">
           Stream &amp; record
@@ -245,17 +557,13 @@
           <div id="configForm"></div>
         </div>
 
+        <!-- What is left of "Device & clock" once the identity, the battery
+             and the status flags have moved up beside the Sensor link card:
+             the clock, which is a configuration matter and belongs on the
+             configuration tab. -->
         <div class="card">
-          <div class="card-title">Device &amp; clock</div>
+          <div class="card-title">Clock</div>
           <div class="row">
-            <button
-              id="btnRefreshDevice"
-              type="button"
-              data-requires="idle"
-              data-cap="status"
-            >
-              Refresh
-            </button>
             <button
               id="btnSetClock"
               type="button"
@@ -266,14 +574,10 @@
             </button>
           </div>
           <div class="kv">
-            <div class="muted">Status flags</div>
-            <div class="flags" id="statusFlags">–</div>
             <div class="muted">Real-world clock</div>
             <div id="rwcValue" class="mono">–</div>
             <div class="muted">Host clock</div>
             <div id="hostClock" class="mono">–</div>
-            <div class="muted">Battery</div>
-            <div id="battDetail">–</div>
           </div>
           <div class="field-hint" style="margin-top: 8px">
             The sensor keeps its real-world clock in <em>local civil</em> time,
@@ -321,58 +625,6 @@
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-title">Calibration</div>
-          <div class="row">
-            <button
-              id="btnCalRead"
-              type="button"
-              data-requires="idle"
-              data-cap="calibDump"
-            >
-              Read dump
-            </button>
-            <button id="btnCalSave" type="button">Save dump</button>
-            <button id="btnCalLoad" type="button">Load dump</button>
-            <button
-              id="btnCalWrite"
-              type="button"
-              class="warn"
-              data-requires="idle"
-              data-cap="calibWrite"
-            >
-              Write dump
-            </button>
-            <input
-              type="file"
-              id="calFile"
-              accept=".bin,application/octet-stream"
-              hidden
-            />
-            <span class="pill" id="calPill">not read</span>
-          </div>
-          <div class="banner" id="calBanner"></div>
-          <div class="table-wrap">
-            <table class="records" id="calTable" hidden>
-              <thead>
-                <tr>
-                  <th>Sensor</th>
-                  <th>Range</th>
-                  <th>Calibrated</th>
-                  <th>Bytes</th>
-                </tr>
-              </thead>
-              <tbody></tbody>
-            </table>
-          </div>
-          <div class="field-hint" style="margin-top: 8px">
-            The dump is the sensor's own record of every per-sensor calibration
-            it holds. Writing a configuration image regenerates it from the
-            configuration bytes, so write a dump
-            <strong>after</strong> a configuration, never before.
-          </div>
-        </div>
-
         <div class="action-bar row">
           <button
             id="btnRead"
@@ -397,6 +649,27 @@
           </button>
           <span class="spacer"></span>
           <span class="muted" id="applyNote"></span>
+        </div>
+      </section>
+
+      <!-- =============================================== Calibration ===== -->
+      <section class="tab" id="tabCal">
+        <div class="banner" id="calBanner"></div>
+        <!-- common/calibration-editor.js builds the whole panel in here. -->
+        <div id="calPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            Calibration turns the sensor's raw counts into physical units:
+            <em>C</em> = <em>R</em><sup>−1</sup>·<em>K</em><sup>−1</sup>·(<em
+              >U</em
+            >
+            − <em>B</em>), with <em>B</em> the offset, <em>K</em> the diagonal
+            sensitivity and <em>R</em> the alignment. It is per sensor and per
+            range, so a sensor calibrated at ± 2 g has nothing stored for ± 16 g
+            and falls back to the factory defaults there — which is normal, not
+            a fault. Nothing on this tab changes what the sensor
+            <em>measures</em>; it changes how those measurements are read.
+          </div>
         </div>
       </section>
 
@@ -529,34 +802,71 @@
           </div>
         </div>
       </section>
-
-      <!-- ================================================= Event log ===== -->
-      <div class="card">
-        <details class="group" open>
-          <summary>Event log</summary>
-          <div class="group-body">
-            <div class="log-toolbar row">
-              <input
-                type="search"
-                id="logFilter"
-                placeholder="Filter lines…"
-                autocomplete="off"
-              />
-              <select id="logSeverity">
-                <option value="all">All</option>
-                <option value="warnup">Warnings and errors</option>
-                <option value="err">Errors only</option>
-                <option value="txrx">TX / RX</option>
-              </select>
-              <button id="btnLogClear" type="button">Clear</button>
-              <button id="btnLogDownload" type="button">Download</button>
-              <span class="log-count" id="logCount"></span>
-            </div>
-            <div class="log" id="log"></div>
-          </div>
-        </details>
-      </div>
     </div>
+
+    <!-- ================================================== Event log =====
+         Docked to the bottom of the viewport rather than parked at the end
+         of the page, where an error nobody scrolled to went unnoticed.
+
+         Collapsed it is one bar carrying the newest line and a count of the
+         errors and warnings that have not been seen; the page reserves that
+         bar's height so nothing is ever permanently covered. Expanded it
+         keeps the FULL page width — deliberately not a right-hand rail,
+         because the raw byte lines above are long and a narrow column wraps
+         each of them into a ribbon. -->
+    <section class="log-drawer" id="logDrawer" aria-label="Event log">
+      <button
+        class="log-drawer-bar"
+        id="btnLogDrawer"
+        type="button"
+        aria-expanded="false"
+        aria-controls="logDrawerBody"
+      >
+        <span class="log-drawer-caret" aria-hidden="true"></span>
+        <span class="log-drawer-title">Event log</span>
+        <span class="log-drawer-badge" id="logBadge" hidden></span>
+        <span class="log-drawer-last" id="logLast">no events yet</span>
+      </button>
+      <div class="log-drawer-body" id="logDrawerBody">
+        <div class="log-toolbar row">
+          <input
+            type="search"
+            id="logFilter"
+            placeholder="Filter lines…"
+            autocomplete="off"
+          />
+          <select id="logSeverity">
+            <option value="all">All</option>
+            <option value="warnup">Warnings and errors</option>
+            <option value="err">Errors only</option>
+            <option value="txrx">TX / RX</option>
+          </select>
+          <!-- The select above chooses what is SHOWN; these two choose
+                   what is PRODUCED. Nothing tags a line tx/rx unless the tap
+                   is recording, so the two live side by side and #tapNote
+                   below says so whenever they disagree. -->
+          <label
+            class="tap-toggle"
+            title="Log every byte this page writes to the sensor and every byte it receives. Off by default: it is a diagnostic, not a running commentary."
+          >
+            <input type="checkbox" id="chkRawBytes" />
+            Log raw TX/RX bytes
+          </label>
+          <label
+            class="tap-toggle"
+            title="Streaming frames as well as commands. A sensor at 1024 Hz sends one every millisecond, so this is capped and coalesced."
+          >
+            <input type="checkbox" id="chkRawData" disabled />
+            …including data packets
+          </label>
+          <button id="btnLogClear" type="button">Clear</button>
+          <button id="btnLogDownload" type="button">Download</button>
+          <span class="log-count" id="logCount"></span>
+        </div>
+        <div class="banner" id="tapNote"></div>
+        <div class="log" id="log"></div>
+      </div>
+    </section>
 
     <script type="module">
       import { initThemeToggle } from "../common/theme.js";
@@ -572,6 +882,7 @@
         fmtHz,
       } from "../common/ui-chrome.js";
       import { createConnectController } from "../common/connect-ui.js";
+      import { createTransportTap } from "../common/transport-tap.js";
       import { createConfigForm, displayValue } from "../common/config-form.js";
       import {
         describeShimmer3Caps,
@@ -587,6 +898,7 @@
       import { createCsvRecorder } from "../common/csv-recorder.js";
       import { createSdBrowser } from "../common/sd-browser.js";
       import { createBrandEditor } from "../common/brand-editor.js";
+      import { createCalibrationEditor } from "../common/calibration-editor.js";
       import {
         createMockShimmer3RTransport,
         mockEnabledFromUrl,
@@ -634,19 +946,117 @@
         15: "StroKare",
       });
 
-      /** Calibration sensor id -> label, for the dump records table. */
-      const CALIB_SENSOR_LABELS = Object.freeze({
-        37: "LSM6DSV accelerometer",
-        38: "LSM6DSV gyroscope",
-        39: "LIS2DW12 accelerometer",
-        40: "LSM6DS3 accelerometer",
-        41: "LSM6DS3 gyroscope",
-        42: "LIS2MDL magnetometer",
-      });
-
       // =====================================================================
       // Page chrome
       // =====================================================================
+
+      /* ------------------------------------------- the event log drawer --
+         Collapsed the drawer is one bar: the newest line, and a count of the
+         errors and warnings that have not been seen — which is not the same
+         as unopened, because a drawer left open and scrolled back through
+         history is showing the user everything except the thing that just
+         went wrong. That count is the reason the log moved to the bottom of
+         the viewport at all: an error at the foot of a long page is an error
+         nobody scrolled to. */
+
+      /** localStorage key. Also read by the pre-paint script in <head>. */
+      const LOG_DRAWER_KEY = "shimmerCaptureLogDrawer";
+
+      /** Errors and warnings that arrived while the newest line was not on
+          screen. Cleared by opening the drawer, by scrolling back to the tail
+          with it open, and by clearing the log. */
+      let logAlerts = 0;
+      /** The newest line, held until the next frame paints the bar. */
+      let pendingBarLine = null;
+      let barPaintScheduled = false;
+
+      const logDrawerIsOpen = () =>
+        document.documentElement.dataset.logOpen === "true";
+
+      /**
+       * Record one line for the collapsed bar.
+       *
+       * Batched onto an animation frame for the same reason the log's own DOM
+       * writes are: with the byte tap open this runs a hundred times a
+       * second, and one textContent write per line is a hundred layouts a
+       * second nobody can read.
+       */
+      function noteLogLine(text, sev) {
+        /* The date is the same all session and the bar is one line wide, so
+           only the clock time earns its place there. */
+        pendingBarLine = text.replace(/^\d{4}-\d{2}-\d{2} /, "");
+        /* Badge whenever the line would not in fact be seen: the drawer
+           closed, or open but scrolled back through history. Counting only
+           while closed meant that leaving the drawer open switched the alert
+           off altogether, which is the opposite of what it is for. */
+        if (
+          (sev === "err" || sev === "warn") &&
+          (!logDrawerIsOpen() || !log?.atTail?.())
+        ) {
+          logAlerts++;
+        }
+        if (!barPaintScheduled) {
+          barPaintScheduled = true;
+          requestAnimationFrame(paintLogBar);
+        }
+      }
+
+      function paintLogBar() {
+        barPaintScheduled = false;
+        if (pendingBarLine !== null) {
+          $("logLast").textContent = pendingBarLine;
+          pendingBarLine = null;
+        }
+        const badge = $("logBadge");
+        badge.hidden = logAlerts === 0;
+        badge.textContent = String(logAlerts);
+        badge.title = `${logAlerts} error${logAlerts === 1 ? "" : "s"} or warning${logAlerts === 1 ? "" : "s"} you have not seen`;
+      }
+
+      /**
+       * @param {boolean} open
+       * @param {boolean} [remember=true] false at startup, where the state
+       *   came out of storage in the first place
+       */
+      /* Scrolling back to the newest line is as much an acknowledgement as
+         opening the drawer: the lines are on screen either way. */
+      function noteLogScrolledToTail() {
+        if (logDrawerIsOpen() && log?.atTail?.() && logAlerts !== 0) {
+          logAlerts = 0;
+          paintLogBar();
+        }
+      }
+
+      function setLogDrawer(open, remember = true) {
+        document.documentElement.dataset.logOpen = open ? "true" : "false";
+        $("btnLogDrawer").setAttribute(
+          "aria-expanded",
+          open ? "true" : "false",
+        );
+        if (open) {
+          /* Opening IS the acknowledgement, so the count starts again from
+             here. */
+          logAlerts = 0;
+          /* A panel that was display:none has no scroll position, so the
+             log's own stick-to-the-tail never had anything to stick to.
+             Restore it once, as the drawer becomes visible. */
+          const panel = $("log");
+          panel.scrollTop = panel.scrollHeight;
+        }
+        paintLogBar();
+        if (remember) {
+          try {
+            localStorage.setItem(LOG_DRAWER_KEY, open ? "open" : "closed");
+          } catch {
+            /* A private window throws on the first write. The drawer still
+               works; it just opens closed next time. */
+          }
+        }
+      }
+
+      $("btnLogDrawer").addEventListener("click", () =>
+        setLogDrawer(!logDrawerIsOpen()),
+      );
 
       const log = createLog($("log"), {
         filterInput: $("logFilter"),
@@ -655,6 +1065,24 @@
         downloadButton: $("btnLogDownload"),
         countEl: $("logCount"),
         fileName: "shimmer-capture-log.txt",
+        onLine: noteLogLine,
+      });
+
+      $("log").addEventListener("scroll", noteLogScrolledToTail, {
+        passive: true,
+      });
+
+      /* The pre-paint script already applied the remembered state to the root
+         element; this catches the chrome up with it without writing it back. */
+      setLogDrawer(logDrawerIsOpen(), false);
+
+      /* Clearing the log clears what the bar was reporting about it. Added
+         after createLog, which wires its own handler on the same button. */
+      $("btnLogClear").addEventListener("click", () => {
+        logAlerts = 0;
+        pendingBarLine = null;
+        $("logLast").textContent = "no events yet";
+        paintLogBar();
       });
 
       initThemeToggle($("themeBtn"));
@@ -677,6 +1105,101 @@
       $("sdkPill").textContent = sdk.SDK_VERSION
         ? `SDK ${sdk.SDK_VERSION}`
         : "SDK (unknown build)";
+
+      // =====================================================================
+      // Raw byte tap
+      // =====================================================================
+
+      /**
+       * The tap wrapped around the live transport, or null.
+       *
+       * One per link, because a transport is per link. The two checkboxes are
+       * the page's state and outlive it, so `tapTransport` pushes them onto
+       * each new tap as it is built.
+       */
+      let tap = null;
+
+      /**
+       * Wrap a transport so the bytes crossing it can be logged.
+       *
+       * Every link goes through here, BLE included — which is why the page
+       * builds the BLE transport itself rather than letting the client build
+       * one (see `makeClients.ble`).
+       */
+      function tapTransport(transport) {
+        tap = createTransportTap(transport, {
+          log,
+          enabled: $("chkRawBytes").checked,
+          includeDataPackets: $("chkRawData").checked,
+        });
+        return tap;
+      }
+
+      /**
+       * Say so when what is being SHOWN and what is being PRODUCED disagree.
+       *
+       * The severity select filters lines that already exist; the tap decides
+       * whether tx/rx lines exist at all. Two half-controls that quietly
+       * cancel each other out is how a TX / RX filter with no producer shipped
+       * in the first place, so each combination that yields nothing gets a
+       * sentence explaining which control to reach for.
+       */
+      function updateTapNote() {
+        const on = $("chkRawBytes").checked;
+        const sev = $("logSeverity").value;
+        if (sev === "txrx" && !on) {
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX logging is off, so this filter has nothing to show. Tick “Log raw TX/RX bytes” above to start recording them.",
+          );
+        } else if (sev === "txrx" && !client) {
+          /* The other half of the same trap: the tap is on, the filter is
+             right, and the log is still empty — because nothing is connected
+             for bytes to cross. */
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX logging is on. Nothing is connected yet, so there are no bytes to show — the lines start as soon as a sensor is.",
+          );
+        } else if (on && (sev === "err" || sev === "warnup")) {
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX bytes are being recorded, but this filter hides them. Choose “TX / RX” or “All” to see them.",
+          );
+        } else {
+          banner("tapNote", "", "");
+        }
+      }
+
+      $("chkRawBytes").addEventListener("change", (e) => {
+        const on = e.target.checked;
+        /* The data-packet opt-in is meaningless with the tap off, and a
+           checkbox that does nothing is worse than one that is disabled. */
+        $("chkRawData").disabled = !on;
+        tap?.tap.setEnabled(on);
+        /* Deliberately worded without a bare "TX" or "RX": those two words are
+           exactly what routes a line into the TX/RX filter, and a status line
+           about the tap is not a byte the sensor sent. */
+        log.log(
+          on
+            ? "raw byte logging on — every command and every reply crossing the link is now logged as a hex line"
+            : "raw byte logging off",
+        );
+        updateTapNote();
+      });
+
+      $("chkRawData").addEventListener("change", (e) => {
+        tap?.tap.setIncludeDataPackets(e.target.checked);
+        log.log(
+          e.target.checked
+            ? "raw byte logging now includes streaming data packets, capped at 100 lines a second"
+            : "raw byte logging is back to control traffic only",
+        );
+      });
+
+      $("logSeverity").addEventListener("change", updateTapNote);
 
       // =====================================================================
       // State
@@ -702,6 +1225,15 @@
        * event would tear down the panel that is reporting it.
        */
       let sdBusy = false;
+      /**
+       * True while the link-speed test is running.
+       *
+       * The test is run BY the SD panel (its result belongs in the card stats
+       * and the download ETAs), so it raises `sdBusy` like a transfer does —
+       * but it is not a transfer, and three refusal messages name what is
+       * holding the link. This is how they tell the two apart.
+       */
+      let linkTesting = false;
       /** True while the device-naming panel is reading or writing the record. */
       let brandBusy = false;
       /**
@@ -761,8 +1293,8 @@
       let deviceMac = "";
       let deviceName = "";
 
-      /** The calibration dump last read or loaded. */
-      let calibBytes = null;
+      /** True while the calibration panel is reading or writing. */
+      let calibBusy = false;
 
       // =====================================================================
       // Small helpers
@@ -782,6 +1314,11 @@
         node.textContent = text ?? "";
       }
 
+      /**
+       * A HOST timestamp — a true Unix epoch — as local wall clock.
+       *
+       * Not for anything the sensor reported: see `formatDeviceClock`.
+       */
       function formatClock(unixMs) {
         if (!Number.isFinite(unixMs)) return "–";
         const d = new Date(unixMs);
@@ -790,6 +1327,36 @@
           `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
           `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
         );
+      }
+
+      /**
+       * A DEVICE timestamp as the sensor's own clock reads it.
+       *
+       * The sensor keeps local civil time — the offset is already baked into
+       * the value, which is why `setDeviceClock` shifts the host's UTC into
+       * that domain before writing it. Converting the ticks back gives a
+       * number that is a wall clock wearing a Unix epoch's clothes, so it is
+       * read out with the UTC accessors: they return the digits that went in.
+       * The local accessors would add the browser's offset a second time and
+       * show a correctly-set sensor as hours out from the host clock beside
+       * it — which is exactly the comparison that line is there to support.
+       */
+      function formatDeviceClock(unixMs) {
+        if (!Number.isFinite(unixMs)) return "–";
+        const d = new Date(unixMs);
+        const p2 = (n) => String(n).padStart(2, "0");
+        return (
+          `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ` +
+          `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`
+        );
+      }
+
+      /**
+       * Time of day only, from the same formatter as the full stamps — the
+       * device panel has room for a clock but not for a date.
+       */
+      function clockTime(unixMs) {
+        return formatClock(unixMs).slice("YYYY-MM-DD ".length);
       }
 
       /** True when two decoded field values are the same value. */
@@ -818,7 +1385,6 @@
       function regate() {
         // Capability floors the markup gates on but only the page can know.
         caps.record = !!csvColumns;
-        caps.calibWrite = !!caps.calibDump && !!calibBytes;
         /* Exactly one stop button is live at a time. STOP_STREAMING (0x20)
            and STOP_SDBT (0x97) are different commands: the first leaves an SD
            recording running, so offering both would let one click end a
@@ -826,16 +1392,16 @@
         caps.btStop = streaming && !sdLogging;
         caps.sdStop = sdLogging;
 
-        /* An SD download, a name write and everything else on this page
-           compete for one link, so either in flight counts as busy for every
-           other control — Apply included. Neither panel's own controls are
-           gated from here; each owns its own (see the `setEnabled` calls
-           below). */
+        /* An SD download, a name write, a calibration write and everything
+           else on this page compete for one link, so any of them in flight
+           counts as busy for every other control — Apply included. No panel's
+           own controls are gated from here; each owns its own (see the
+           `setEnabled` calls below). */
         gate.apply({
           connected: !!client,
           streaming,
           recording: recorder.active,
-          busy: busy || sdBusy || brandBusy,
+          busy: busy || sdBusy || brandBusy || calibBusy,
           caps,
         });
 
@@ -843,15 +1409,16 @@
            is the floor for whether the LINK can do the thing at all, and each
            panel already refuses a second operation of its own. Folding a
            panel's own flag back in here would have the first progress event
-           tear down the panel reporting it. The OTHER panel's flag does
-           belong, because the two share one link. */
+           tear down the panel reporting it. The OTHER panels' flags do
+           belong, because all three share one link. */
         sd.setEnabled(
           !!client &&
             !!caps.sdTransfer &&
             !streaming &&
             !sdLogging &&
             !busy &&
-            !brandBusy,
+            !brandBusy &&
+            !calibBusy,
         );
         paintSdGating();
 
@@ -861,16 +1428,33 @@
             !streaming &&
             !sdLogging &&
             !busy &&
-            !sdBusy,
+            !sdBusy &&
+            !calibBusy,
         );
         paintBrandGating();
+
+        /* Not gated on `caps.calibration`: a link without the dump commands
+           still shows the calibration blocks out of the configuration image,
+           read-only, and the panel itself decides which store that is. What
+           it IS gated on is the link being free — the firmware NACKs a
+           calibration command while sensing, exactly as it does a
+           configuration one. */
+        cal.setEnabled(
+          !!client &&
+            (!!caps.calibration || !!caps.infomem) &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !sdBusy &&
+            !brandBusy,
+        );
+        paintCalibGating();
 
         // Page state, not device state: these must work while disconnected so
         // an image can be inspected, saved or thrown away.
         $("btnDiscard").disabled = !form || busy;
         $("btnImSave").disabled = !form;
         $("btnImLoad").disabled = !form || busy;
-        $("btnCalSave").disabled = !calibBytes;
         const mockBtn = $("btnMock");
         if (!mockBtn.hidden) mockBtn.disabled = !!client || busy;
 
@@ -882,6 +1466,9 @@
         if (plan?.blocked) {
           $("btnApply").disabled = true;
           $("applyNote").textContent = plan.blocked;
+        } else if (linkTesting) {
+          $("applyNote").textContent =
+            "Waiting for the link-speed test to finish — it saturates the link on purpose, which is the whole point of it.";
         } else if (sdBusy) {
           /* Not the firmware refusing this time — the page is. One link, one
              conversation: a configuration write in the middle of a file
@@ -891,12 +1478,68 @@
         } else if (brandBusy) {
           $("applyNote").textContent =
             "Waiting for the device-naming write to finish — a name write and a configuration write cannot share the link.";
+        } else if (calibBusy) {
+          $("applyNote").textContent =
+            "Waiting for the calibration write to finish — and worth waiting for in this order, because a configuration write rebuilds the calibration dump from the configuration bytes.";
         } else {
           $("applyNote").textContent = "";
         }
 
+        paintLinkTestGating();
         updateDirtyPill();
         refreshRecordName();
+        /* The tap note depends on whether anything is connected, so it is
+           re-evaluated wherever the connection state is. */
+        updateTapNote();
+      }
+
+      /**
+       * Why the link cannot be measured right now, in plain language, or null.
+       *
+       * The test free-runs the firmware's data-rate command, which saturates
+       * the link on purpose — so it is refused for the same reasons a
+       * download is, plus one of its own: the dock protocol has no data-rate
+       * command at all, which is a fact about the link and not about the
+       * sensor, and worth saying rather than leaving as a greyed button.
+       *
+       * A plain `busy` — one round trip in flight — returns null: the button
+       * greys for a fraction of a second and a hint that flickers with it is
+       * worse than no hint.
+       */
+      function linkTestUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE or classic Bluetooth to measure the link.";
+        }
+        if (mode === "usb") {
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol — there is no data-rate test in that command set. Connect over BLE or classic Bluetooth to measure a link.";
+        }
+        if (!caps.linkTest) {
+          return "This SDK build has no data-rate test. Re-vendor the SDK bundle.";
+        }
+        if (linkTesting) {
+          return "Measuring — it takes 5 seconds and saturates the link, so everything else on the page waits.";
+        }
+        if (streaming || sdLogging) {
+          return "The test deliberately saturates the link, so it is refused while the sensor is sensing — it would compete with the samples coming the other way. Stop the stream first.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. The test would compete with it for the same pipe — wait for the transfer to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link — wait for it to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link — wait for it to finish.";
+        }
+        return null;
+      }
+
+      function paintLinkTestGating() {
+        const reason = linkTestUnavailableReason();
+        $("linkTestNote").textContent = reason ?? "";
+        $("btnLinkTest").title =
+          reason ??
+          "Free-runs the firmware's data-rate test, which measures the pipe itself — connection interval and MTU on BLE, buffering on classic Bluetooth — rather than the file-transfer protocol on top of it.";
       }
 
       // =====================================================================
@@ -1004,9 +1647,8 @@
           idBatt: "–",
           idLink: "–",
         });
-        $("statusFlags").textContent = "–";
+        resetStatus();
         $("rwcValue").textContent = "–";
-        $("battDetail").textContent = "–";
       }
 
       function hardwareLabel(hardwareVersion) {
@@ -1023,51 +1665,214 @@
         );
       }
 
+      /**
+       * Voltage, percentage and — where the link reports one — the charger
+       * state, as one line.
+       *
+       * One line rather than the two the page used to carry (a short one in
+       * the identity list and a longer one in the device card): they were
+       * always the same reading, and the panel they now share is above the
+       * tab strip, where a duplicated row costs the tabs a row of height.
+       */
       function batteryLabel(batt) {
         if (!batt || !Number.isFinite(batt.voltage)) return null;
         const pct = batt.percentage == null ? "–" : `${batt.percentage} %`;
-        return `${batt.voltage.toFixed(2)} V (${pct})`;
+        const charger = batt.chargingStatus
+          ? ` — charger ${batt.chargingStatus}`
+          : "";
+        return `${batt.voltage.toFixed(2)} V (${pct})${charger}`;
       }
 
-      /** Render the decoded status bits as a row of coloured flags. */
-      function renderStatus(status) {
-        const host = $("statusFlags");
+      /**
+       * The status flags, in the order the panel shows them, keyed by the name
+       * `parseShimmer3StatusBytes` decodes each bit into. The third column is
+       * whether the flag being on is bad news.
+       */
+      const STATUS_FLAGS = [
+        ["docked", "Docked", false],
+        ["sensing", "Sensing", false],
+        ["streaming", "Streaming", false],
+        ["sdLogging", "SD logging", false],
+        ["sdPresent", "SD card present", false],
+        ["sdError", "SD file error", true],
+        ["rtcSet", "Clock set", false],
+        ["redLedOn", "Red LED", false],
+        ["usbPluggedIn", "USB plugged in", false],
+      ];
+
+      /**
+       * What the flags panel is showing, and how much it is worth.
+       *
+       * The values reach it from three places — a `getStatus` read, an
+       * unsolicited push from the firmware, and this page's own belief about
+       * the command it just sent — and they are not worth the same. So where
+       * they came from travels with them, and the panel says which.
+       *
+       * @type {{
+       *   status: object,
+       *   source: "read" | "push" | "inferred",
+       *   at: number,
+       *   inferred: Set<string>,
+       *   unconfirmedAt: number | null,
+       * } | null}
+       */
+      let statusView = null;
+
+      /**
+       * Take a status the sensor actually stated: an answer to `getStatus`
+       * (`"read"`) or one the firmware pushed unasked (`"push"`).
+       *
+       * A falsy `status` means the read did not answer. That does NOT wipe the
+       * panel — the last known values are still the best knowledge the page
+       * has — but it does stop the panel presenting them as current.
+       *
+       * @param {object|null|undefined} status
+       * @param {"read"|"push"} [source]
+       */
+      function renderStatus(status, source = "read") {
         if (!status) {
-          host.textContent = "–";
+          if (statusView) statusView.unconfirmedAt = Date.now();
+          paintStatus();
           return;
         }
-        const flags = [
-          ["Docked", status.docked, false],
-          ["Sensing", status.sensing, false],
-          ["Streaming", status.streaming, false],
-          ["SD logging", status.sdLogging, false],
-          ["SD card present", status.sdPresent, false],
-          ["SD file error", status.sdError, true],
-          ["Clock set", status.rtcSet, false],
-          ["Red LED", status.redLedOn, false],
-        ];
-        // null, not false: a Shimmer3 omits the second status byte entirely
-        // rather than sending a zero, so "unknown" stays distinguishable.
-        if (status.usbPluggedIn !== null) {
-          flags.push(["USB plugged in", status.usbPluggedIn, false]);
+        /* A value this page inferred and the sensor now contradicts is worth
+           saying out loud before it is quietly replaced: the command was
+           accepted but did not take effect — a full card, a bad file, a trial
+           that had already ended. This is the one moment both are known. */
+        for (const key of statusView?.inferred ?? []) {
+          if (statusView.status[key] !== status[key]) {
+            log.warn(
+              `the sensor reports ${key}=${status[key]} where this page ` +
+                `expected ${statusView.status[key]} from the command it sent — ` +
+                `the command was accepted but did not take effect`,
+            );
+          }
         }
-        host.replaceChildren(
-          ...flags.map(([label, on, badWhenOn]) =>
-            el("span", {
-              class: `flag${on ? (badWhenOn ? " bad" : " on") : ""}`,
-              text: label,
-            }),
-          ),
-        );
+        statusView = {
+          status,
+          source,
+          at: Date.now(),
+          inferred: new Set(),
+          unconfirmedAt: null,
+        };
+        paintStatus();
         /* The sensor is the authority on whether it is sensing: a status read
            is how a host learns its button was pressed while nobody was
            streaming, and every configuration command is NACKed until it
-           stops. */
+           stops. Only worth saying for something the sensor stated — an
+           inferred value can teach nobody anything. */
         if (status.sensing && !streaming) {
           log.warn(
             "the sensor reports it is sensing — it was started from its own button or by another host, and will refuse configuration commands until it stops",
           );
         }
+      }
+
+      /**
+       * Reflect a sensing change this page just made.
+       *
+       * Nothing else will. The firmware deliberately suppresses the
+       * unsolicited status for a sensing change a Bluetooth command caused
+       * (`ShimBt_instreamStatusRespSendIfNotBtCmd`, log-and-stream-common
+       * `Comms/shimmer_bt_uart.c`) rather than echo back what the host just
+       * asked for — so a start or a stop leaves no trace on the panel, which
+       * would sit there showing the flags read at connect.
+       *
+       * These values are this page's belief, not the sensor's word: an ACK
+       * says the command was accepted, not that the sensor is doing it — a
+       * full card or a bad file stops logging without failing anything. So
+       * they are marked `*`, and the next authoritative read — Refresh, a
+       * clock set, the next connect — is what turns them back into a reading,
+       * correcting them if the sensor disagrees ({@link renderStatus}).
+       *
+       * A read fired from here instead, straight after the command, would be
+       * worse than no read at all: `stopStreaming` and
+       * `stopStreamingAndLogging` deliberately do not wait for their own ACK,
+       * so a command written before that ACK lands has it counted as its own
+       * and then waits out its timeout for a reply that was already
+       * discarded. Measured against the mock, and the same race exists on any
+       * link that can put the ACK and the response in one notification.
+       *
+       * @param {Record<string, boolean>} patch flags the command changed
+       */
+      function inferStatus(patch) {
+        /* Patched onto whatever was last known, or onto nothing at all if no
+           read has ever succeeded — `paintStatus` omits a flag that is not a
+           boolean, so the flags this page did not touch stay absent rather
+           than claiming to be off. */
+        statusView = {
+          status: { ...(statusView?.status ?? {}), ...patch },
+          source: "inferred",
+          at: Date.now(),
+          inferred: new Set(Object.keys(patch)),
+          unconfirmedAt: null,
+        };
+        paintStatus();
+      }
+
+      /** Forget the flags: nothing is known about a sensor we have let go. */
+      function resetStatus() {
+        statusView = null;
+        paintStatus();
+      }
+
+      /** Paint {@link statusView}: the flags, then how fresh they are. */
+      function paintStatus() {
+        const host = $("statusFlags");
+        const fresh = $("statusFresh");
+        if (!statusView) {
+          host.textContent = "–";
+          fresh.hidden = true;
+          fresh.textContent = "";
+          fresh.title = "";
+          fresh.classList.remove("unread");
+          return;
+        }
+        const { status, source, at, inferred, unconfirmedAt } = statusView;
+        host.replaceChildren(
+          ...STATUS_FLAGS
+            /* Not a boolean, so not shown: a Shimmer3 omits the second status
+               byte entirely rather than sending a zero, which is why
+               `usbPluggedIn` can be null — and the same rule keeps a flag the
+               page inferred before it ever read one from claiming to be off. */
+            .filter(([key]) => typeof status[key] === "boolean")
+            .map(([key, label, badWhenOn]) => {
+              const on = status[key];
+              const guessed = inferred.has(key);
+              return el("span", {
+                class:
+                  `flag${on ? (badWhenOn ? " bad" : " on") : ""}` +
+                  (guessed ? " inferred" : ""),
+                text: guessed ? `${label} *` : label,
+                title: guessed
+                  ? "Set from the command this page sent, not read back from the sensor."
+                  : null,
+              });
+            }),
+        );
+
+        const clock = clockTime(at);
+        const label =
+          source === "read"
+            ? `read ${clock}`
+            : source === "push"
+              ? `pushed ${clock}`
+              : `inferred ${clock}`;
+        const why =
+          source === "read"
+            ? `Read from the sensor at ${clock}.`
+            : source === "push"
+              ? `The sensor sent these at ${clock} without being asked, which is how it reports a dock, an undock, a button press or a trial ending.`
+              : `The flags marked * were set from the command this page sent at ${clock} and have not been read back. The firmware sends nothing for a change a Bluetooth command caused, so nothing will arrive on its own — press Refresh to confirm them.`;
+        fresh.hidden = false;
+        fresh.textContent = unconfirmedAt ? `${label}, unconfirmed` : label;
+        fresh.title = unconfirmedAt
+          ? `${why} The read-back at ${clockTime(unconfirmedAt)} did not answer, so these are still the last values the page had.`
+          : why;
+        fresh.classList.toggle(
+          "unread",
+          source === "inferred" || !!unconfirmedAt,
+        );
       }
 
       /** Battery, status flags and the real-world clock. */
@@ -1077,11 +1882,7 @@
             ? client.getBattery()
             : client.getStatus(),
         );
-        if (batt) {
-          setIdentity({ idBatt: batteryLabel(batt) });
-          $("battDetail").textContent =
-            `${batteryLabel(batt)} — charger ${batt.chargingStatus}`;
-        }
+        if (batt) setIdentity({ idBatt: batteryLabel(batt) });
 
         // getStatus() on the wired client reports the battery, not the status
         // bits: only the radio protocol carries a STATUS_RESPONSE.
@@ -1104,7 +1905,7 @@
             client.getRtcTime(),
           );
           $("rwcValue").textContent = rtc
-            ? `${formatClock(rtc.unixMs)}  (${rtc.ticks} ticks)`
+            ? `${formatDeviceClock(rtc.unixMs)}  (${rtc.ticks} ticks)`
             : "–";
         }
         $("hostClock").textContent = formatClock(Date.now());
@@ -1810,102 +2611,6 @@
       }
 
       // =====================================================================
-      // Calibration
-      // =====================================================================
-
-      function renderCalibDump(dump) {
-        const table = $("calTable");
-        const body = table.querySelector("tbody");
-        const records = dump?.records ?? [];
-        if (!records.length) {
-          table.hidden = true;
-          banner(
-            "calBanner",
-            "warn",
-            "The dump holds no calibration records — this sensor has most likely never been calibrated.",
-          );
-          return;
-        }
-        body.replaceChildren(
-          ...records.map((r) => {
-            const seconds = sdk.calibTsBytesToUnixSeconds?.(r.timestampTicks);
-            const when =
-              r.isDefault || !seconds
-                ? "default / seeded"
-                : formatClock(seconds * 1000);
-            return el(
-              "tr",
-              {},
-              el(
-                "td",
-                {},
-                CALIB_SENSOR_LABELS[r.sensorId] ?? `sensor id ${r.sensorId}`,
-              ),
-              el("td", {}, String(r.range)),
-              el("td", {}, when),
-              el("td", {}, `${r.calibLen} B`),
-            );
-          }),
-        );
-        table.hidden = false;
-        const v = dump.version;
-        banner(
-          "calBanner",
-          "ok",
-          `${records.length} record${records.length === 1 ? "" : "s"}, ` +
-            `${dump.packetLength} bytes, written by hardware id ${v.hardwareId} ` +
-            `firmware ${v.firmwareMajor}.${v.firmwareMinor}.${v.firmwareInternal}.`,
-        );
-      }
-
-      async function readCalibration() {
-        const result = await withDevice("read the calibration dump", () =>
-          client.readCalibDump(),
-        );
-        if (!result) return;
-        calibBytes = result.bytes;
-        $("calPill").textContent = `${calibBytes.length} bytes read`;
-        $("calPill").classList.add("on");
-        renderCalibDump(result.dump);
-        regate();
-      }
-
-      async function writeCalibration() {
-        if (!calibBytes) return;
-        let dump;
-        try {
-          dump = sdk.parseCalibDump(calibBytes);
-        } catch (err) {
-          showToast(
-            `That file is not a calibration dump: ${err.message}`,
-            "err",
-          );
-          return;
-        }
-        const n = dump.records.length;
-        if (
-          !window.confirm(
-            `Write ${calibBytes.length} bytes of calibration to the sensor?\n\n` +
-              `${n} record${n === 1 ? "" : "s"} will replace the calibration the ` +
-              `sensor holds. Note that a later configuration write regenerates ` +
-              `the dump from the configuration bytes, so write the ` +
-              `configuration first and the dump after it.`,
-          )
-        ) {
-          log.log("calibration write cancelled");
-          return;
-        }
-        try {
-          await withDevice("write the calibration dump", () =>
-            client.writeCalibDump(calibBytes),
-          );
-          showToast("Calibration dump written", "ok");
-        } catch {
-          /* logged by withDevice */
-        }
-      }
-
-      // =====================================================================
       // Streaming, plotting and recording
       // =====================================================================
 
@@ -1946,6 +2651,14 @@
           sdBusy = transferring;
           regate();
         },
+        /* The link-speed button lives in the Sensor link card, so the running
+           figure has to come back out of the panel to be shown there. */
+        onLinkSpeed: (kBps, final) => {
+          $("linkSpeedPill").textContent =
+            kBps == null
+              ? "not measured"
+              : `${kBps.toFixed(1)} KB/s${final ? "" : " …"}`;
+        },
       });
 
       /**
@@ -1971,6 +2684,18 @@
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses every SD command while it is — a download and a live stream would compete for the same link. Stop the stream to download from the card.";
         }
+        /* The other holders of the one link. This panel is disabled for all
+           three (see its setEnabled call), so leaving them unsaid greyed the
+           card out with no reason on screen. */
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link. A download and a name write cannot share it — wait for it to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link. A download and a calibration write cannot share it — wait for it to finish.";
+        }
         return null;
       }
 
@@ -1992,6 +2717,153 @@
         btn.disabled = permanent || streaming || sdLogging;
         btn.title = reason ?? "";
         if (permanent && tabs.selected() === "tabSd") tabs.select("tabConfig");
+      }
+
+      // =====================================================================
+      // Calibration
+      // =====================================================================
+
+      /* Mounted once and handed GETTERS, like the other two panels.
+         `generation` is what `inferShimmer3Generation` decided, which is what
+         picks the sensor list and the default calibration tables — a Shimmer3
+         has no high-g accel and no alternate magnetometer, and offering them
+         would say a calibration could be set for a chip that is not there.
+
+         `infoMemBlocks` and `readInfoMem` are the read-only fallback for a
+         link with no calibration-dump commands (the USB-C dock, and the
+         classic `Shimmer3Client`): the panel then shows the six calibration
+         blocks out of the configuration image the page already holds, rather
+         than showing nothing. It does not write them — that image belongs to
+         the form above, unsaved edits and all. */
+      const cal = createCalibrationEditor($("calPanel"), {
+        client: () => client,
+        /* Only when the sensor really said what it is. `generation` is
+           derived from the InfoMem context's hardware version, which is
+           DEFAULTED to a Shimmer3R when the identification read fails —
+           because the field schema needs some layout to render a form at
+           all. Passing that default here would offer a possibly-Shimmer3 two
+           sensors it does not have, which is the exact mistake the
+           device-naming panel's `identifiedHardwareVersion` note is about.
+           With nothing passed, the panel takes the hardware id out of the
+           dump's own version header instead — the device's own statement
+           about what wrote those records. */
+        generation: () =>
+          identifiedHardwareVersion == null ? null : generation,
+        hardwareVersion: () => identifiedHardwareVersion,
+        activeRanges: () => configuredCalibRanges(),
+        infoMemBlocks: () => infoMemCalibrationBlocks(),
+        readInfoMem: () => readConfiguration(),
+        log,
+        toast: showToast,
+        fileNamePrefix: () => `Shimmer3R_${macTail()}`,
+        onBusyChange: (working) => {
+          calibBusy = working;
+          regate();
+        },
+      });
+
+      /**
+       * The ranges the sensor is configured for, so each card opens on the
+       * range that is actually in use rather than on range 0.
+       *
+       * Read from the FORM's image rather than from `deviceImage`, so changing
+       * a range in the configuration form moves the calibration tab with it —
+       * which is the honest reading: the calibration that will end up being
+       * applied is the one for the range the sensor ends up configured at.
+       *
+       * The low-noise accel and the alternate magnetometer are missing from
+       * the list on purpose: the SDK's InfoMem model carries no range field
+       * for either, so there is nothing to say about them and the panel falls
+       * back to whichever range holds a record.
+       */
+      function configuredCalibRanges() {
+        const image = form ? form.getImage() : deviceImage;
+        if (!image || !context) return null;
+        try {
+          const imu = sdk.parseInfoMem(image, context).imu;
+          return {
+            wrAccel: imu.wrAccelRange,
+            gyro: imu.gyroRange,
+            mag: imu.magRange,
+            altAccel: imu.altAccelRange,
+          };
+        } catch {
+          return null;
+        }
+      }
+
+      /** The six 21-byte calibration blocks in the image the page holds. */
+      function infoMemCalibrationBlocks() {
+        if (!deviceImage || !context) return null;
+        try {
+          return sdk.parseInfoMem(deviceImage, context).calibration ?? null;
+        } catch {
+          /* A blank or unreadable image is not an error worth a log line
+             here — the configuration card has already said so. */
+          return null;
+        }
+      }
+
+      /**
+       * Why calibration cannot be changed right now, in plain language, or
+       * null.
+       *
+       * The InfoMem fallback is deliberately NOT a refusal: on that link the
+       * tab still shows what the sensor is calibrated to, which is most of
+       * what anyone opens it for. The panel's own banner says the values are
+       * read-only there and why.
+       */
+      function calibUnavailableReason() {
+        if (!client) {
+          return "Connect a sensor to see what it is calibrated to.";
+        }
+        if (!caps.calibration && !caps.infomem) {
+          return "This link can reach neither the calibration dump nor the configuration image, so there is no calibration to show.";
+        }
+        return calibLinkHeldReason();
+      }
+
+      /**
+       * The subset of the above that closes the tab: something else is using
+       * the one link, and it will stop by itself.
+       *
+       * Split out so the sentence and the disabled state come from the same
+       * condition. They were written separately and had already drifted — the
+       * text called the tab unavailable during a link test or a name write
+       * while the tab stayed open — and any holder added later would have
+       * drifted the same way again.
+       */
+      function calibLinkHeldReason() {
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses every configuration command while it is. Stop the stream before reading or writing calibration.";
+        }
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. A calibration write and a download cannot share it — wait for the transfer to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link. Wait for it to finish.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off while the link is busy.
+       *
+       * Nothing here is permanent the way the SD tab's USB refusal is: every
+       * link this page speaks reaches one calibration store or the other, so
+       * the tab is never bounced back to Configure. It closes only while the
+       * sensor is sensing or the link is held, both of which end by
+       * themselves.
+       */
+      function paintCalibGating() {
+        const reason = calibUnavailableReason();
+        banner("calBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const btn = $("tabBtnCal");
+        btn.disabled = !!client && !!calibLinkHeldReason();
+        btn.title = reason ?? "";
       }
 
       // =====================================================================
@@ -2041,8 +2913,14 @@
         if (streaming || sdLogging) {
           return "The sensor is sensing. New names only take effect when it restarts, and the firmware skips a restart while it is sensing so a recording can never be truncated — stop the stream before changing the names.";
         }
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
         if (sdBusy) {
           return "An SD card transfer is using the link. A name write and a download cannot share it — wait for the transfer to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link. A name write and a calibration write cannot share it — wait for it to finish.";
         }
         return null;
       }
@@ -2145,6 +3023,15 @@
             ? "streaming to this host and logging to the sensor's SD card"
             : "streaming to this host",
         );
+        /* Only what this command actually changed: START_STREAMING does not
+           touch SD logging, and asserting it off would overwrite a recording
+           the sensor's own button had started. `sensing` follows because the
+           firmware sets it for either kind of recording. */
+        inferStatus(
+          withSd
+            ? { sensing: true, streaming: true, sdLogging: true }
+            : { sensing: true, streaming: true },
+        );
         regate();
       }
 
@@ -2168,6 +3055,13 @@
         // numbers rather than leaving whatever it left behind.
         stats.render();
         if (recorder.active) await stopRecording();
+        // Same reasoning as the start: only what the command changed, and the
+        // page's own belief until something reads it back.
+        inferStatus(
+          withSd
+            ? { sensing: false, streaming: false, sdLogging: false }
+            : { sensing: false, streaming: false },
+        );
         regate();
       }
 
@@ -2275,6 +3169,37 @@
       // Connect
       // =====================================================================
 
+      /**
+       * The Web Bluetooth transport the Shimmer3R client would otherwise build
+       * for itself, wrapped in the byte tap.
+       *
+       * The three UUIDs, the picker filter and the write mode all come from
+       * the SDK's own exported defaults, so a firmware that moves its GATT
+       * layout moves this page with it. Returns null when the vendored bundle
+       * is too old to export the pieces, which the caller degrades over.
+       */
+      function makeBleTransport() {
+        const defaults = sdk.SHIMMER3R_DEFAULTS;
+        if (typeof sdk.WebBluetoothTransport !== "function" || !defaults) {
+          return null;
+        }
+        return new sdk.WebBluetoothTransport({
+          serviceUUID: defaults.SERVICE_UUID,
+          // RX is the host→device write pipe and TX the device→host notify
+          // pipe — named from the SENSOR's point of view, which is the way
+          // round that trips a reader who assumes the host's.
+          writeCharUUID: defaults.CHAR_RX_UUID,
+          notifyCharUUID: defaults.CHAR_TX_UUID,
+          requestDeviceOptions: {
+            filters: [{ services: [defaults.SERVICE_UUID] }],
+            optionalServices: [defaults.SERVICE_UUID],
+          },
+          defaultWriteWithResponse: true,
+          debug: false,
+          logTag: "[Shimmer3R:ble]",
+        });
+      }
+
       const connect = createConnectController({
         els: {
           ble: $("btnBle"),
@@ -2287,24 +3212,56 @@
         log,
         sdkNs: sdk,
         makeClients: {
-          ble: () => new sdk.Shimmer3RClient({ debug: false }),
+          /* The client would happily build its own Web Bluetooth transport,
+             and did until the raw byte tap arrived: a transport the page never
+             sees is a transport the page cannot tap, which left BLE — the link
+             most sessions use — as the one link with no byte-level
+             diagnostics.
+
+             So the page builds it, matching Shimmer3RClient._makeWebTransport
+             option for option: the same three UUIDs (read off the SDK's own
+             SHIMMER3R_DEFAULTS rather than typed out here), the same
+             requestDevice filter and optionalServices, and
+             defaultWriteWithResponse: true, which is the one that would change
+             behaviour rather than just labels if it were wrong — the Shimmer3R
+             protocol is ACK-first and its commands are written with a
+             response. */
+          ble: () => {
+            const raw = makeBleTransport();
+            if (!raw) {
+              /* An older vendored bundle with no WebBluetoothTransport export:
+                 fall back to the client's own, which costs the tap on this
+                 link and nothing else. */
+              log.warn(
+                "this SDK bundle does not export WebBluetoothTransport, so the BLE link cannot be tapped — raw TX/RX logging will be empty over BLE",
+              );
+              return new sdk.Shimmer3RClient({ debug: false });
+            }
+            const transport = tapTransport(raw);
+            return {
+              client: new sdk.Shimmer3RClient({ debug: false, transport }),
+              transport,
+            };
+          },
           bt: () => {
             /* A classic-Bluetooth link is a serial port, so the transport is
                built here and handed back alongside the client — the controller
                needs it to log which RFCOMM service class the browser's picker
                actually gave us. 64 KB of buffer because a serial read can
                arrive in one large gulp. */
-            const transport = new sdk.WebSerialTransport({
-              ...sdk.SHIMMER3_SPP_SERIAL_OPTIONS,
-              bufferSize: 64 * 1024,
-            });
+            const transport = tapTransport(
+              new sdk.WebSerialTransport({
+                ...sdk.SHIMMER3_SPP_SERIAL_OPTIONS,
+                bufferSize: 64 * 1024,
+              }),
+            );
             return {
               client: new sdk.Shimmer3RClient({ debug: false, transport }),
               transport,
             };
           },
           usb: () => {
-            const transport = new sdk.WebSerialTransport();
+            const transport = tapTransport(new sdk.WebSerialTransport());
             return {
               client: new sdk.WiredShimmerClient({ transport }),
               transport,
@@ -2326,16 +3283,42 @@
         client = session.client;
         mode = session.mode;
         caps = describeShimmer3Caps(client, mode);
-        /* Two capabilities the shared feature detection does not cover: the
-           whole-dump calibration path, and a clock write, which the dock client
-           spells `writeRtcFromHostTime` rather than `setRtcTime`. */
-        caps.calibDump =
-          typeof client.readCalibDump === "function" &&
-          typeof client.writeCalibDump === "function";
+        /* One capability the shared feature detection does not cover: a clock
+           write, which the dock client spells `writeRtcFromHostTime` rather
+           than `setRtcTime`. */
         caps.rtcWrite =
           typeof client.setRtcTime === "function" ||
           typeof client.writeRtcFromHostTime === "function";
+        /* Deliberately gated on the link as well as on the method: the dock
+           command set has no data-rate test, so the reason the button is off
+           over USB is the protocol, not a missing SDK export. */
+        caps.linkTest =
+          mode !== "usb" && typeof client.runDataRateTest === "function";
         regate();
+
+        /* The sensor's own news, which nothing on this page used to hear.
+           The firmware pushes an unsolicited STATUS_RESPONSE whenever it is
+           docked or undocked (`LogAndStream_setupDock` / `setupUndock`,
+           log-and-stream-common `log_and_stream_common.c`) and on a sensing
+           change it made itself — the user button, a trial ending, a low
+           battery. A read's own answer is NOT delivered here, so this cannot
+           double-render what Refresh already showed.
+
+           It only fires while idle: once a stream is live the SDK's parser
+           consumes the push, which is why a stream start reflects its own
+           change (`inferStatus`) instead of waiting for one. Guarded by a
+           property check because the dock client has no such callback — and
+           no status bytes to put in it. */
+        if ("onDeviceStatus" in client) {
+          client.onDeviceStatus = (status) => {
+            log.log(
+              `the sensor pushed a status change: docked=${status.docked} ` +
+                `sensing=${status.sensing} streaming=${status.streaming} ` +
+                `sdLogging=${status.sdLogging}`,
+            );
+            renderStatus(status, "push");
+          };
+        }
 
         deviceName = client.device?.name ?? session.transport?.deviceName ?? "";
         setIdentity({ idLink: session.label });
@@ -2479,7 +3462,6 @@
           ),
           idBatt: batteryLabel(batt),
         });
-        $("battDetail").textContent = batteryLabel(batt) ?? "–";
         $("hostClock").textContent = formatClock(Date.now());
 
         const ctx = {
@@ -2552,12 +3534,23 @@
            windows into the destination folder. Abort first, then drop the
            client the panel reads through. */
         sd.abort();
+        /* Report whatever the tap was still holding back before the transport
+           it wrapped goes away — a count that never lands reads as bytes that
+           were never sent. */
+        tap?.tap.flush();
+        tap = null;
+        /* A status pushed by a link the page has already let go would paint a
+           departed sensor's flags into a panel that is about to say "–". */
+        if (client) client.onDeviceStatus = null;
         client = null;
         mode = null;
         caps = {};
         sdFirmwareNote = null;
         identifiedHardwareVersion = null;
         form?.setEnabled(false);
+        /* A KB/s figure belongs to the link that produced it, so it goes with
+           the link rather than lingering beside the next one. */
+        $("linkSpeedPill").textContent = "not measured";
         clearIdentity();
         $("tabBtnStream").disabled = false;
         $("tabBtnStream").title = "";
@@ -2647,6 +3640,11 @@
         const btn = $("btnMock");
         btn.hidden = false;
         btn.textContent = `Connect (mock, ${framed ? "framed" : "unframed"})`;
+        /* The BLE transport builder, so its options can be read off on a host
+           with no sensor and no Web Bluetooth — constructing one does not go
+           near the radio, only `connect()` does. Side-effect free: the tap is
+           applied by the connect factory, not here. */
+        window.makeBleTransport = makeBleTransport;
         log.warn(
           `mock mode: no real sensor is involved. The transport is ${
             framed
@@ -2669,15 +3667,29 @@
           // `mockTransport.emitDisconnect()` simulates a dropped link,
           // `mockTransport.sdCard.bytes(path)` is what a download of that
           // card file should produce, `mockTransport.eeprom.brandBytes()` is
-          // the brand record as the mock now holds it, and `sdBrowser` /
-          // `brandEditor` are the two panels' APIs.
+          // the brand record as the mock now holds it,
+          // `mockTransport.calib.bytes()` is the calibration dump as it now
+          // stands, `mockTransport.status.setDocked(true)` pushes the
+          // unsolicited status a dock produces, and `sdBrowser` /
+          // `brandEditor` / `calibrationEditor` are the three panels' APIs.
           window.mockTransport = transport;
           window.sdBrowser = sd;
           window.brandEditor = brand;
+          window.calibrationEditor = cal;
+          /* Also the client itself, so a link's feature set can be taken
+             apart from the console: shadowing a method on it is how the
+             "this link cannot do X" paths get exercised without owning the
+             hardware that cannot do X. */
           const mockClient = new sdk.Shimmer3RClient({
             debug: false,
-            transport,
+            /* Tapped like every real link, so the raw byte log can be
+               exercised with no hardware on the desk. `window.mockTransport`
+               stays the RAW mock deliberately: its `writes`, `sdCard` and
+               `eeprom` are what a developer (and the test harness) reaches
+               for, and reading them through the tap would prove nothing. */
+            transport: tapTransport(transport),
           });
+          window.mockClient = mockClient;
           btn.disabled = true;
           try {
             mockClient.onStatus = (m) => log.log(m);
@@ -2763,6 +3775,21 @@
         "click",
         reported(refreshDeviceState),
       );
+
+      /* The panel still owns the measurement — its result belongs in the card
+         stats and the download ETAs — but the button that starts it belongs
+         with the link it measures. */
+      $("btnLinkTest").addEventListener("click", () => {
+        $("linkSpeedPill").textContent = "measuring…";
+        linkTesting = true;
+        regate();
+        sd.measureLinkSpeed()
+          .catch(() => {})
+          .finally(() => {
+            linkTesting = false;
+            regate();
+          });
+      });
       $("btnSetClock").addEventListener("click", reported(setDeviceClock));
 
       $("btnRead").addEventListener("click", reported(readConfiguration));
@@ -2863,30 +3890,8 @@
         );
       });
 
-      $("btnCalRead").addEventListener("click", reported(readCalibration));
-      $("btnCalSave").addEventListener("click", () => {
-        if (!calibBytes) return;
-        downloadBlob(
-          `calibration_${macTail()}_${stampNow()}.bin`,
-          new Blob([calibBytes], { type: "application/octet-stream" }),
-        );
-        log.log("calibration dump saved");
-      });
-      $("btnCalLoad").addEventListener("click", () => $("calFile").click());
-      $("calFile").addEventListener("change", async (event) => {
-        const file = event.target.files?.[0];
-        event.target.value = "";
-        if (!file) return;
-        calibBytes = new Uint8Array(await file.arrayBuffer());
-        $("calPill").textContent = `${calibBytes.length} bytes loaded`;
-        try {
-          renderCalibDump(sdk.parseCalibDump(calibBytes));
-        } catch (err) {
-          banner("calBanner", "err", `Not a calibration dump: ${err.message}`);
-        }
-        regate();
-      });
-      $("btnCalWrite").addEventListener("click", reported(writeCalibration));
+      /* Nothing here for calibration: `common/calibration-editor.js` owns its
+         own buttons, exactly as the SD and device-naming panels do. */
 
       $("btnStreamStart").addEventListener(
         "click",
@@ -2954,6 +3959,7 @@
       renderHex();
       clearIdentity();
       setUpMock();
+      updateTapNote();
       regate();
       log.log(
         "ready — connect over BLE or classic Bluetooth to configure, stream, record, download from the SD card and change the sensor's names, or over USB-C to configure and rename only",

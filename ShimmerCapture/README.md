@@ -80,14 +80,30 @@ sensor what it now says rather than trusting what was written. **The firmware
 refuses configuration commands while the sensor is sensing**, so Apply is
 greyed out with that reason while a stream or a recording is running.
 
-## Device and clock
+## Device identity, on every tab
 
-A refresh reads the battery voltage and charge, and over a Bluetooth link the
-decoded device status flags — docked, sensing, streaming, logging, SD card
-present, SD file error, clock set, USB plugged in — and the real-world clock.
-Those flags are the only way to learn that the sensor was started from its own
-button, or that its firmware could not open its SD file; the page says so in
-the log when it sees them.
+The panel beside the Sensor link card carries what is true of the sensor
+whatever tab you are on: its name, MAC, hardware and firmware, the battery
+voltage, charge and charger state, which link it is on, and — over a Bluetooth
+link — the decoded device status flags: docked, sensing, streaming, logging,
+SD card present, SD file error, clock set, USB plugged in.
+
+It sits there rather than on the Configure tab because two of those facts gate
+work everywhere else. Whether the sensor is sensing decides both an SD download
+and a name write, and the battery is the thing to check before starting a long
+download. The flags are also the only way to learn that the sensor was started
+from its own button, or that its firmware could not open its SD file; the page
+says so in the log when it sees them.
+
+**Measure link speed** is next to the connect buttons, because it measures the
+link and not the card: it free-runs the firmware's data-rate test, which
+reports the pipe itself — connection interval and MTU on BLE, buffering on
+classic Bluetooth — rather than the file-transfer protocol on top of it. It is
+Bluetooth-only (the dock command set has no data-rate test) and refused while
+the sensor is sensing or a transfer is running, because it saturates the link
+on purpose. The figure it produces also drives the download ETAs on the SD tab.
+
+## The clock
 
 The sensor keeps its clock in **local civil time**, which is what the offline
 file parser expects, so setting it from the host applies the host's time-zone
@@ -96,13 +112,37 @@ read back, because the dock protocol has a write for it and no read.
 
 ## Calibration
 
-The calibration dump is the sensor's own record of every per-sensor calibration
-it holds: which sensor, at which range, calibrated when. The page reads it into
-a table, saves it to a file and writes one back, over a Bluetooth link — the
-dock protocol has no calibration-dump command, so these controls are greyed out
-over USB. Note the ordering the firmware imposes: writing a configuration image
-regenerates the dump from the configuration bytes, so a dump must be written
-**after** a configuration, never before.
+Its own tab, because calibration is per-sensor and per-range rather than a
+device setting, and because reading nine numbers off a hex dump is not a way to
+check whether a sensor is calibrated.
+
+Each sensor gets a card: an offset per axis, a sensitivity per axis in that
+sensor's own units, and a 3x3 alignment matrix, with the range the values apply
+to and the date they were written. Sensitivity is three numbers rather than a
+matrix because that is what the 21-byte block holds — a 3x3 grid would offer
+six cells that cannot be saved. Alignment entries are signed bytes scaled by a
+hundredth, so they are bounded, and a value the format cannot hold is refused
+rather than quietly clamped on the way out.
+
+A sensor the hardware does not have is not offered: a Shimmer3 has neither the
+high-g accelerometer nor the second magnetometer a Shimmer3R carries. Where the
+sensor never said what hardware it is, the panel takes the hardware identity
+from the dump's own version header rather than from the page's default, so it
+cannot invite edits to sensors that may not exist.
+
+Three states are worth telling apart, and the panel does: values written for
+this particular device, values that are still the factory seed, and no record
+at all. The last is not zero — an unwritten block reads back as all ones or all
+zeros, and showing that as a calibration of zero would be a lie about a sensor
+that has never been calibrated. A per-sensor restore puts the factory seed back
+for the selected range.
+
+Reads, writes and the raw dump's save and load all work over a Bluetooth link.
+The dock protocol has no calibration-dump command, so the controls are greyed
+out over USB. One ordering the firmware imposes and the tab says out loud:
+writing a configuration image regenerates the dump from the configuration
+bytes, so a calibration must be written **after** a configuration, never
+before.
 
 ## Streaming, plotting and recording
 
@@ -121,9 +161,28 @@ stream straight to the file you pick instead of being held in memory — a long
 session is not lost if the tab closes. If the link drops mid-recording the file
 is closed properly and what was captured is kept.
 
-An event log below the tabs carries every command, reply and status message,
-filterable by text and severity, and downloadable — which is the first thing to
-attach to a support request.
+## The event log
+
+A drawer docked to the bottom of the viewport carries every command, reply and
+status message, filterable by text and severity, and downloadable — which is
+the first thing to attach to a support request.
+
+Collapsed it is a single bar showing the newest line, with a badge counting the
+errors and warnings you have not seen — anything that arrived while the drawer
+was closed, or while it was open but scrolled back through history. Opening it,
+or scrolling back to the newest line, clears the badge.
+Expanded it keeps the full page width, and whether it is open is remembered per
+browser. The page reserves the space it occupies in either state, so it never
+covers what is underneath it.
+
+**Log raw TX/RX bytes** adds the bytes themselves, in both directions, on any
+of the three links — the diagnostic to reach for when a sensor answers
+something unexpected, or answers nothing. It is off until asked, and it leaves
+out the streaming data packets unless you tick the second box, because a sensor
+at 1024 Hz sends one every millisecond. Either way it is capped at 100 lines a
+second, with one line saying what was held back. The severity filter's
+**TX / RX** option shows exactly these lines; if the two controls are set so
+that nothing can appear, the drawer says which one to change.
 
 ## The SD card
 

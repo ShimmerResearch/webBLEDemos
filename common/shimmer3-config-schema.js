@@ -60,8 +60,8 @@
  * @param {"ble"|"rfcomm"|"usb"|string} [mode] the link the client is on
  * @returns {{
  *   stream: boolean, sdbt: boolean, infomem: boolean, sdlog: boolean,
- *   calib: boolean, rtc: boolean, ranges: boolean, exg: boolean,
- *   sensors: boolean, battery: boolean, status: boolean,
+ *   calib: boolean, calibration: boolean, rtc: boolean, ranges: boolean,
+ *   exg: boolean, sensors: boolean, battery: boolean, status: boolean,
  *   sdTransfer: boolean, branding: boolean,
  * }}
  */
@@ -86,6 +86,21 @@ export function describeShimmer3Caps(client, mode) {
     // to ask the firmware to regenerate the card's configuration file.
     sdlog: has("updateSdLogConfig"),
     calib: has("readCalibration"),
+    /* The whole-dump calibration path: the store that keeps a record per
+       sensor AND range, each with the date it was taken, which is what
+       `common/calibration-editor.js` edits. Both commands are required, not
+       just the read — a page that could read the dump but not write it would
+       offer an editor with nowhere to send the result. UPD_CALIB_DUMP (0x9B)
+       is deliberately NOT part of the gate: `writeCalibDump` issues it itself
+       unless asked not to, so the panel never calls it directly, and naming
+       it here would disable the editor on a bundle that applies the dump
+       without exposing the step as its own method.
+       Deliberately NOT link-gated. It is method detection that decides this
+       one: the dock/USB client and the classic `Shimmer3Client` genuinely do
+       not carry these commands, so the panel falls back to showing the
+       InfoMem calibration blocks read-only there — and naming a link would
+       claim the reason is the protocol when it is the client. */
+    calibration: has("readCalibDump") && has("writeCalibDump"),
     rtc: has("setRtcTime") && has("getRtcTime"),
     ranges: has("setWrAccelRange") && has("setGyroRange"),
     exg: has("enableEMG16Bit") && has("enableECG16Bit"),
