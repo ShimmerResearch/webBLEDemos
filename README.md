@@ -39,7 +39,7 @@ The full Verisense control console now lives in a dedicated repository:
 
 ### Shimmer3R
 
-**Requirements:** Shimmer3R device, firmware ≥ v1.0.22, Chrome/Edge (Web Bluetooth required)
+**Requirements:** Shimmer3R device, firmware ≥ v1.0.22, Chrome/Edge (Web Bluetooth for BLE; Web Serial for classic Bluetooth/USB)
 
 | Demo                                                                     | Link                                                                                  |
 | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
