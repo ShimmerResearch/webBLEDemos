@@ -34,8 +34,12 @@ Three rules the whole library follows, so a page can rely on them:
 | `stream-stats.js`           | `createStreamStats` — rate, expected rate, loss, throughput, frames and duration, over the SDK's `StreamStatsTracker`.                                                                                                                                                                                                                                                 |
 | `csv-recorder.js`           | `createCsvRecorder` — streams rows to a file the user picks, or buffers and downloads.                                                                                                                                                                                                                                                                                 |
 | `sd-browser.js`             | `createSdBrowser` — the on-card tree, a destination folder remembered across sessions, the Consensys-Backup layout, progress with a rolling rate and an ETA, delete-after-verified and abort. Its `measureLinkSpeed` runs the firmware data-rate test, but the button for it belongs to the mounting page, since it measures the link and not the card. Also `fmtEta`. |
+| `brand-editor.js`           | `createBrandEditor` — reads and writes the expansion-board EEPROM record holding the classic-Bluetooth, BLE and USB names, with per-field limits that follow the hardware, stock-versus-custom detection, write-and-verify, restore-to-factory and the restart a new name needs.                                                                                       |
+| `factory-test-panel.js`     | `createFactoryTestPanel` — runs the firmware's own factory self-test and shows the report as it prints, with the verdict words coloured, a parsed summary, and text/CSV export. Owns the cancel-and-drain behaviour the firmware's missing abort command forces on a host.                                                                                             |
+| `rtc-drift-panel.js`        | `createRtcDriftPanel` — samples the sensor's real-world clock against this host's, least-squares fits the drift in ppm, plots it, holds a screen wake lock, detects a stepped host clock and a sensor set on a different time convention, and exports CSV with its metadata.                                                                                           |
 | `vendor/chart.umd.min.js`   | Chart.js 4.5.1, pinned. See `vendor/README.md`.                                                                                                                                                                                                                                                                                                                        |
 | `dev/mock-shimmer3r.js`     | `createMockShimmer3RTransport`, `mockEnabledFromUrl` — a scripted Shimmer3R for developing without hardware.                                                                                                                                                                                                                                                           |
+| `dev/verify.mjs`            | The browser verification pass — see below.                                                                                                                                                                                                                                                                                                                             |
 
 ## Using it from a page
 
@@ -123,6 +127,31 @@ power or most error paths, and its timing is plausible rather than real.
 It is opt-in from the URL only, deliberately — a page that reached for
 the mock on its own would quietly show fake data to someone debugging
 real hardware.
+
+## Verifying without hardware
+
+`dev/verify.mjs` drives the whole of Shimmer Capture against the mock over the
+Chrome DevTools Protocol and checks what came back. It has no dependencies —
+Node's own WebSocket and `fetch` are all it uses — and it writes nothing into
+the repository.
+
+```bash
+npx http-server . -p 8129 -c-1
+chrome --headless=new --remote-debugging-port=9333 --user-data-dir=/tmp/verify-chrome
+node common/dev/verify.mjs 9333
+```
+
+Some of what it asserts is not observable in a browser at all: it reads the
+page's own source to check that every panel's "why can't I do this" sentence
+can name every OTHER panel's busy flag. All the panels compete for one link, so
+each new panel silently ages the refusal text of every panel written before it
+— a control greys out with nothing on screen to say why. Adding a panel means
+adding its flag to that matrix.
+
+**Do not run Prettier across the whole repository from here.** This checkout
+has CRLF line endings, so `--list-different "**/*.html"` flags every HTML file
+on line endings alone; CI checks out LF and sees none of it. Format the file
+you actually touched.
 
 ## Formatting
 
