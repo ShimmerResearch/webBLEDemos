@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-declare const SDK_VERSION = "0.1.24";
+declare const SDK_VERSION = "0.1.25";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
@@ -2578,6 +2578,152 @@ interface Shimmer3DeviceStatus {
 declare function parseShimmer3StatusBytes(bytes: Uint8Array): Shimmer3DeviceStatus;
 
 /**
+ * Transport-agnostic capture state machine for a Shimmer factory self-test.
+ *
+ * The firmware answers `SET_FACTORY_TEST` with a generic ACK first
+ * (log-and-stream-common `Comms/shimmer_bt_uart.c:1618` — TASK_BT_RESPOND
+ * outranks TASK_FACTORY_TEST) and only then runs the suite
+ * (`shimmer_taskList.c:164`), printing the report as **raw ASCII on the same
+ * link, with no framing and no CRC** — one write per line via
+ * `ShimBt_writeToTxBufAndSend(str, len, SHIMMER_CMD)`
+ * (`Test/shimmer_test.c:22-61` builds the envelope). There is no abort command:
+ * once the suite starts, the firmware's main loop is blocked until it prints its
+ * `TEST END` banner, so a host that gives up must keep swallowing bytes rather
+ * than hand them to a framer that would resync through them one at a time.
+ *
+ * That is what this class is: the byte-level half of the runner, with no
+ * knowledge of BLE, serial or the dock UART. A client supplies an
+ * {@link AckClassifier} for its own link's ACK/NACK encoding and then simply
+ * feeds it every inbound chunk; what comes back is whatever was NOT report
+ * traffic, which the client routes as usual.
+ *
+ * Phases are `ack → text → done`:
+ *  - **ack** — the classifier runs on the head of each chunk until it reaches a
+ *    verdict. It runs on the head of the SAME chunk that carries text, because
+ *    over BLE the ACK and the report's first bytes arrive in ONE notification.
+ *  - **text** — printable bytes are kept (TAB/CR/LF and 0x20–0x7E), everything
+ *    else is counted as noise and dropped. `TEST START` arms an idle timer that
+ *    RESOLVES: an incomplete report is a short report, not an error. The
+ *    `TEST END` line resolves synchronously and hands back the bytes after it —
+ *    a deferred status push or a late ACK glued to the banner belongs to the
+ *    client, not to the report.
+ *  - **draining** — entered on timeout or abort, never on success. The result
+ *    promise has already rejected; bytes keep being swallowed until the report
+ *    ends, the link falls silent, or the hard cap expires.
+ *
+ * HARDWARE-VERIFY: that the ACK and the report's first bytes really do share one
+ * BLE notification, and that a `[0x8A][0x71]` status push can arrive glued to
+ * the `TEST END` banner, are the two shapes this class is built around; both are
+ * reasoned from the firmware's single-buffer TX path and have not yet been
+ * observed on a real Shimmer3/3R.
+ */
+/** What the capture is doing right now. */
+type FactoryTestState = 'idle' | 'running' | 'draining';
+/** Why a factory-test run failed. */
+type FactoryTestFailureReason = 
+/** The firmware refused the command (it is sensing, or SD sync is enabled). */
+'nack'
+/** Nothing at all came back within {@link FACTORY_TEST_ACK_TIMEOUT_MS}. */
+ | 'no-response'
+/** No `TEST END` within the overall timeout. */
+ | 'timeout'
+/** Another factory test is running, or its report is still draining. */
+ | 'busy'
+/** The link dropped mid-test. */
+ | 'disconnected';
+/** An error raised by the factory-test runner, tagged with a machine-readable reason. */
+declare class FactoryTestError extends Error {
+    readonly reason: FactoryTestFailureReason;
+    constructor(reason: FactoryTestFailureReason, message: string);
+}
+/**
+ * What an {@link AckClassifier} makes of the head of the buffer it was given.
+ *
+ * `consumed` is how many bytes the verdict accounts for; the rest of the buffer
+ * is report text (after `ack`) or the caller's traffic (after `nack`).
+ */
+type AckVerdict = 
+/** Not enough bytes yet to tell — keep accumulating. */
+{
+    kind: 'need-more';
+}
+/** The command was accepted; the report follows. */
+ | {
+    kind: 'ack';
+    consumed: number;
+    detail?: string;
+}
+/** The command was refused. */
+ | {
+    kind: 'nack';
+    consumed: number;
+    detail?: string;
+}
+/** Link noise to step over (a CRC-failed packet, a resync byte). */
+ | {
+    kind: 'ignore';
+    consumed: number;
+    detail?: string;
+}
+/** No ACK is coming — this is already report text. */
+ | {
+    kind: 'text';
+};
+/**
+ * The refusal message the runner raises when the firmware NACKs the command.
+ *
+ * `ShimBt_isCmdBlockedWhileSensing` (`Comms/shimmer_bt_uart.c:2985`) refuses
+ * `SET_FACTORY_TEST` outright while the device is sensing — streaming, or
+ * logging to the SD card from its own button — and the same NACK comes back
+ * when SD sync is enabled.
+ */
+declare const FACTORY_TEST_NACK_MESSAGE: string;
+/**
+ * How long the runner waits for the firmware's generic ACK — or for the first
+ * report byte, since over one link those can arrive together — before deciding
+ * the command never landed.
+ */
+declare const FACTORY_TEST_ACK_TIMEOUT_MS = 2000;
+/**
+ * Floor for the post-`TEST START` idle timer. A slow section of the suite (the
+ * LED walk-through steps every 5 s) must not look like a finished report, so a
+ * caller cannot ask for a shorter completion idle than this.
+ */
+declare const FACTORY_TEST_IDLE_FLOOR_MS = 10000;
+/** Default silence, while draining, after which the report is assumed over. */
+declare const FACTORY_TEST_DRAIN_IDLE_MS = 10000;
+/** Options shared by every client's `runFactoryTest`. */
+interface FactoryTestRunOptions {
+    /**
+     * Overall budget from the write to the `TEST END` line. Defaults to the
+     * per-type value in `SHIMMER3_FACTORY_TEST_TYPES`. On expiry the result
+     * rejects with reason `timeout` and the capture starts draining.
+     */
+    timeoutMs?: number;
+    /**
+     * Silence after `TEST START` that ends the report successfully. Floored at
+     * {@link FACTORY_TEST_IDLE_FLOOR_MS}.
+     */
+    completionIdleMs?: number;
+    /** Silence that ends the post-failure drain. Defaults to {@link FACTORY_TEST_DRAIN_IDLE_MS}. */
+    drainIdleMs?: number;
+    /**
+     * Ask the sensor what it is doing before writing the command, so a refusal is
+     * reported as "it is sensing" rather than as a bare NACK. Default `true`. A
+     * status read that itself fails never aborts the run.
+     */
+    preflight?: boolean;
+    /** Abort the wait (the sensor keeps printing — see the class docblock). */
+    signal?: AbortSignal | null;
+    /** Called once per fed chunk with that chunk's text and the aggregate so far. */
+    onChunk?: (chunk: string, aggregate: string) => void;
+    /** Called per completed line, with the trailing CR/LF stripped. */
+    onLine?: (line: string) => void;
+    /** Called when non-printable bytes were dropped from a chunk. */
+    onNoise?: (droppedBytes: number) => void;
+}
+
+/**
  * Constants for the Shimmer wired/dock UART protocol.
  *
  * Ported from the Java driver's wiredProtocol package:
@@ -2655,8 +2801,8 @@ interface UartComponentProperty {
 /**
  * The component/property table (`UART_COMPONENT_AND_PROPERTY`,
  * UartPacketDetails.java:98-160). Only the groups relevant to a docked
- * Shimmer3/3R identify + status + config path are surfaced; the GQ-only
- * 802.15.4 radio and device-self-test entries are omitted from D1 (see README).
+ * Shimmer3/3R identify + status + config path are surfaced, plus the factory
+ * self-test; the GQ-only 802.15.4 radio entries are omitted (see README).
  */
 declare const UART_PROP: Readonly<{
     MAIN_PROCESSOR: Readonly<{
@@ -2670,6 +2816,24 @@ declare const UART_PROP: Readonly<{
         LED0_STATE: UartComponentProperty;
         DEVICE_BOOT: UartComponentProperty;
         ENTER_BOOTLOADER: UartComponentProperty;
+    }>;
+    /**
+     * The factory self-test, addressed as a component whose PROPERTY byte is the
+     * test type — there is no payload
+     * (log-and-stream-common `Comms/shimmer_dock_usart.c:473-486`, which checks
+     * the property against `FACTORY_TEST_COUNT` and answers BAD_CMD above it).
+     * The same `factory_test_t` values the Bluetooth command takes
+     * (`Test/shimmer_test.h:21-27`).
+     *
+     * Write-only, and unlike every other entry here the ACK is not the end of it:
+     * the firmware then prints its report as raw text on this link. See
+     * `WiredShimmerClient.runFactoryTest`.
+     */
+    TEST: Readonly<{
+        MAIN: UartComponentProperty;
+        LEDS: UartComponentProperty;
+        ICS: UartComponentProperty;
+        LED_STATES: UartComponentProperty;
     }>;
     BAT: Readonly<{
         ENABLE: UartComponentProperty;
@@ -2951,6 +3115,21 @@ interface ExpansionBoardInfo {
  * null when the board is absent (an unwritten card memory reads back all 0xFF).
  */
 declare function parseExpansionBoard(payload: Uint8Array): ExpansionBoardInfo | null;
+
+/**
+ * Classify the head of a dock-UART RX buffer for a factory-test capture.
+ *
+ * The firmware answers the test command with an ordinary ACK packet and then
+ * prints its report as raw text on the same link (`shimmer_dock_usart.c:473-486`
+ * for the command, `hal_FactoryTest.c` for the printing) — so this has to tell
+ * "a framed packet" from "the report has started", on a stream that may deliver
+ * either a byte at a time.
+ *
+ * A CRC-bad packet is skipped one byte rather than treated as text: the report
+ * has not started yet, and a single corrupt byte must not turn the rest of a
+ * legitimate packet into report content.
+ */
+declare function classifyFactoryTestAckPacket(buf: Uint8Array): AckVerdict;
 
 /**
  * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
@@ -4840,6 +5019,15 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _statusReadsInFlight;
     /**
+     * The in-flight factory-test capture, or null when none is running.
+     *
+     * Non-null for the whole time the link is unusable — from the write until the
+     * report ends, INCLUDING the drain after a cancelled or timed-out run, because
+     * the firmware has no abort command and keeps printing regardless. Every
+     * command write is refused while it is set; see {@link runFactoryTest}.
+     */
+    private _factoryTest;
+    /**
      * How many status payload bytes a STATUS_RESPONSE must carry before it is
      * worth parsing.
      *
@@ -4896,6 +5084,13 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * notice that a recording stopped mid-stream; poll {@link getStatus} instead.
      */
     onDeviceStatus: ((status: Shimmer3DeviceStatus) => void) | null;
+    /**
+     * Invoked whenever {@link factoryTestState} changes, synchronously. A host uses
+     * it to hold its own "the link is busy" gate through the whole run — including
+     * the `draining` phase after a cancel, when the sensor is still printing and no
+     * other command will be accepted.
+     */
+    onFactoryTestStateChange: ((state: FactoryTestState) => void) | null;
     constructor(opts?: Shimmer3RClientOptions);
     /** Best-effort label for `ObjectCluster`s and status messages. */
     private _deviceLabel;
@@ -4913,10 +5108,24 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /** Handle an unexpected transport disconnect (the link dropped under us). */
     private _handleTransportDisconnect;
     /**
+     * Abandon an in-flight factory-test capture because the link has gone. No
+     * drain: draining exists only to keep a still-arriving report out of the
+     * framer, and nothing is arriving on a link that is closed.
+     */
+    private _failFactoryTest;
+    /**
      * Transport entry point. A framed transport (BLE) delivers one firmware
      * message per call and goes straight to {@link _handleFramedChunk}; an
      * unframed one (Web Serial over USB or over a classic-Bluetooth COM port)
      * is re-framed first, then funnelled through the very same handler.
+     *
+     * A running factory test is served FIRST, before either path. Its report is
+     * bare ASCII with no opcode, no length and no CRC, so the framer would treat
+     * every line as garbage and resync through it one byte at a time — and the
+     * temp handlers, which only ever see whole framed messages, would never see it
+     * at all. What the capture hands back is what was NOT report traffic (a status
+     * push glued after `TEST END`, a late ACK), and that continues down the normal
+     * path.
      */
     private _handleNotify;
     private _handleFramedChunk;
@@ -4939,16 +5148,29 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _handleUnframedChunk;
     /**
-     * The framer, told which platform is answering. Only STATUS_RESPONSE's length
-     * depends on that, and only this client knows it.
+     * Merge a bare ACK with the message that follows it, emulating BLE: the module
+     * packs an ACK and the response the firmware wrote straight after it into ONE
+     * notification, and the waiters rely on that — `_waitForAck` hands the
+     * remainder over synchronously via `_lastAckRemainder`. Emitted as two
+     * separate messages, the response would arrive before the caller's `await`
+     * continuation had registered its response handler, and be dropped.
+     *
+     * Two ACKs are never merged: the second would masquerade as the first's
+     * response body.
+     */
+    /**
+     * The framer, told how wide this platform's status response is.
+     *
+     * Only STATUS_RESPONSE's length depends on that — one byte on a Shimmer3, two
+     * on a Shimmer3R — and only this client knows which is answering. Both the
+     * drain and the coalescing check go through here rather than calling the
+     * framer directly, because supplying the option in one place and forgetting
+     * it in the other is not a hypothetical: it made a complete Shimmer3 status
+     * look perpetually one byte short, so the ACK and its response were never
+     * coalesced and the waiter timed out.
      */
     private _controlMessageLength;
-    /**
-     * Pull every complete message out of {@link _ctrlBuf}, leaving the incomplete
-     * tail behind. Extraction is finished before anything is dispatched so a
-     * handler can never observe a half-updated buffer.
-     */
-    private _extractUnframedMessages;
+    private _coalesceAckWithResponse;
     /** Run the schema parser if one has been built, swallowing parse errors. */
     private _parseStreamIfPossible;
     /**
@@ -5181,8 +5403,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * time and only then the InfoMem — the order desktop
      * `CallableWriteConfig.call()` uses (BasicDock.java:1556-1587). An RTC failure
      * ABORTS the config write rather than being tolerated: the InfoMem write is
-     * not attempted, matching the Java rethrow. Note (DEV-900) that the device
-     * treats the RWC as LOCAL civil time; {@link setRtcTime} carries the detail.
+     * not attempted, matching the Java rethrow. The clock is written as a plain
+     * Unix epoch; {@link setRtcTime} carries the detail.
      *
      * `opts.verify` (default `true`) re-reads the image afterwards and byte-
      * compares it against what was sent, EXCLUDING the ranges a device write
@@ -5309,9 +5531,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * same {@link msToRtcBytesLE} helper as the dock path (truncating, matching
      * the Java driver's `(long)(ms * 32.768)`). Call with `Date.now()` to sync
      * the device clock to the host before a drift run.
-     * NOTE (DEV-900): the device treats RWC as LOCAL civil time — pass a
-     * local-adjusted value if that distinction matters for the use case; for
-     * drift measurement only the rate matters, not the epoch.
+     * The value is a plain Unix epoch: desktop Consensys and the Java dock
+     * driver both write `System.currentTimeMillis() * 32.768`, and hardware set
+     * by either reads back as UTC. (The Verisense console's local-civil
+     * convention is that product's, not this one's — do not carry it across.)
+     * For drift measurement only the rate matters, not the epoch.
      */
     setRtcTime(unixMs: number): Promise<void>;
     /**
@@ -5491,10 +5715,38 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _readCalibDumpChunk;
     startStreaming(): Promise<void>;
+    /**
+     * Stop streaming (STOP_STREAMING_COMMAND 0x20), best-effort: the command goes
+     * out and the state is cleared without waiting for the ACK the firmware sends
+     * back.
+     *
+     * Not waiting is deliberate. Stream packets keep arriving for hundreds of ms
+     * after the stop, and the framed path routes a notification to its ACK branch
+     * on the first byte alone — so with an ACK outstanding a residual frame that
+     * happened to begin 0xFF would be taken for the ACK and its tail forwarded to
+     * the control plane, which is how a stray 0xFE fabricates a NACK and a stray
+     * 0x02 frames a bogus inquiry. A notification is not frame-aligned, which is
+     * why the stream parser resyncs on a double preamble, so that first byte can
+     * be anything. `Shimmer3Client.stopStreaming` answers the same problem the
+     * long way, draining to quiescence before it re-enables the control plane;
+     * over BLE, where a notification is already one whole message, simply not
+     * waiting is enough — and it costs nothing against firmware that does not
+     * ACK a stop mid-stream at all.
+     *
+     * The price is that the ACK is still in flight when the next command goes
+     * out, and `_expectingAck` counts rather than queues, so it is spent on that
+     * command. {@link withoutLeadingAck} is what keeps that from costing the
+     * command its own reply — read it before making this wait for the ACK after
+     * all.
+     */
     stopStreaming(): Promise<void>;
     /** Start streaming AND SD card logging simultaneously. */
     startStreamingAndLogging(): Promise<void>;
-    /** Stop streaming AND SD card logging. */
+    /**
+     * Stop streaming AND SD card logging (STOP_SDBT_COMMAND 0x97), best-effort
+     * and without waiting for its ACK, for the reasons {@link stopStreaming}
+     * gives.
+     */
     stopStreamingAndLogging(): Promise<void>;
     private _interpretInquiryResponseShimmer3R;
     /**
@@ -5622,6 +5874,96 @@ declare class Shimmer3RClient extends BaseShimmerClient {
         durationMs: number;
         kBps: number;
     }>;
+    /**
+     * What the factory-test runner is doing: `idle` when the link is free,
+     * `running` while the report is being captured, `draining` while a cancelled
+     * or timed-out report is still being swallowed.
+     */
+    get factoryTestState(): FactoryTestState;
+    /**
+     * Resolve when the link is free again. Never rejects — a failed run still
+     * releases the link, and this is the wait a host needs after cancelling one.
+     */
+    whenFactoryTestIdle(): Promise<void>;
+    /**
+     * Run the sensor's built-in factory self-test and return its report.
+     *
+     * `SET_FACTORY_TEST` (0xA8) with one type byte
+     * (`Comms/shimmer_bt_uart.c:1285-1293`) makes the firmware ACK and then print
+     * the same report it prints on the production line — as raw ASCII on this very
+     * link, with no framing and no CRC (`Test/shimmer_test.c:22-61`). The
+     * {@link FactoryTestCapture} owns those bytes for the duration; see its
+     * docblock for the phases and the tail handoff.
+     *
+     * Three things about this command are unlike every other one here:
+     * - **It cannot be stopped.** The firmware has no abort; its main loop is
+     *   blocked for the whole suite (`shimmer_taskList.c:164`). `opts.signal`
+     *   stops this client *listening*, and the link stays busy until the report
+     *   ends — {@link whenFactoryTestIdle} is how a host waits that out.
+     * - **Nothing else may be written meanwhile.** Every other command rejects
+     *   with a {@link FactoryTestError} of reason `busy` until the capture is idle.
+     * - **It is refused while sensing.** `ShimBt_isCmdBlockedWhileSensing`
+     *   (`Comms/shimmer_bt_uart.c:2985`) NACKs it while streaming or logging, and
+     *   also when SD sync is enabled.
+     *
+     * @param type 0 MAIN, 1 LEDS, 2 ICS, 3 LED_STATES (`Test/shimmer_test.h:21-27`).
+     * @param opts see {@link FactoryTestRunOptions}; `timeoutMs` defaults to the
+     *   type's own entry in `SHIMMER3_FACTORY_TEST_TYPES`.
+     * @returns the report text, CRLF line endings intact.
+     * @throws RangeError for a type the firmware would ACK and then print nothing
+     *   for; {@link FactoryTestError} with reason `nack` (sensing), `busy`
+     *   (another run), `no-response`, `timeout` or `disconnected`; or a
+     *   `DOMException` named `AbortError` when `opts.signal` fires.
+     *
+     * HARDWARE-VERIFY: no real Shimmer3 or Shimmer3R has run this path yet.
+     */
+    runFactoryTest(type: number, opts?: FactoryTestRunOptions): Promise<string>;
+    /**
+     * Let go of the link at the end of a run: clear the capture, then drop
+     * anything the report left in the accumulators. Called from the capture's own
+     * `idle` transition, so it happens before the tail bytes it hands back are
+     * routed through the framer.
+     */
+    private _releaseFactoryTest;
+    /**
+     * Flip the firmware's red-LED override (`TOGGLE_LED_COMMAND` 0x06,
+     * `Comms/shimmer_bt_uart.c:603, :910-914`).
+     *
+     * The command toggles `shimmerStatus.toggleLedRedCmd`, and while it is set the
+     * LED manager holds the LOWER LED solid red (`LEDs/shimmer_leds.c:425-428`) —
+     * above the SD-error and battery indications, below a button press. That makes
+     * it the "which sensor is this one" aid.
+     *
+     * Two things to know: the flag is **never cleared by the firmware**, so it
+     * survives a disconnect and stays lit until it is toggled again or the sensor
+     * loses power; and it is readable back as status bit 7
+     * (`ShimBt_assembleStatusBytes`, `:2920-2932`) — {@link Shimmer3DeviceStatus}
+     * `redLedOn` — which is what {@link setRedLed} uses to make "on"/"off" mean
+     * something.
+     *
+     * While streaming this writes without waiting for the ACK: every inbound byte
+     * belongs to the data plane then, so the ACK would be consumed by the schema
+     * parser and the wait would time out on a command the firmware did in fact run.
+     *
+     * HARDWARE-VERIFY: that the lower LED visibly lights, and that the flag really
+     * does survive a disconnect, want confirming on a sensor.
+     */
+    toggleLed(): Promise<void>;
+    /**
+     * Drive the red-LED override to a definite state rather than flipping it.
+     *
+     * The firmware offers only a toggle, so this is a read-modify-verify:
+     * {@link getStatus} for the current bit, {@link toggleLed} only if it differs,
+     * then a second read to confirm. Calling it twice with the same argument
+     * writes nothing the second time.
+     *
+     * @returns the LED state read back from the sensor.
+     * @throws when the sensor is streaming (the status reads are unavailable), or
+     *   when the read-back does not match — which means something else moved the
+     *   flag between the two reads, and silently reporting success would be worse
+     *   than saying so.
+     */
+    setRedLed(on: boolean): Promise<boolean>;
     private _sdRx;
     private _sdUsers;
     private _sdHandlerAttached;
@@ -5686,16 +6028,25 @@ declare class Shimmer3RClient extends BaseShimmerClient {
 }
 
 /**
- * Sentinels shared by the byte-stream (unframed transport) message framers.
+ * Reading a protocol off an unframed pipe: the sentinels every framer returns,
+ * and the drain loop that turns a framer into message boundaries.
  *
- * A framer is a pure function `(buf) => number` that reports how many bytes the
- * message at the head of `buf` occupies, so a client reading from an unframed
- * pipe (Web Serial, RFCOMM/SPP, a dock UART) can rebuild the message boundaries
- * that BLE notifications hand it for free.
+ * A **framer** is a pure function `(buf) => number` reporting how many bytes the
+ * message at the head of `buf` occupies — the length knowledge the Java driver
+ * encodes in its blocking `readBytes(n)` calls, expressed as a function. Each
+ * device family owns its own (`shimmer3ControlMessageLength`,
+ * `shimmer3rControlMessageLength`, the dock's `wiredPacketLength`), because that
+ * part genuinely differs per protocol.
+ *
+ * The **drain** ({@link drainByteStream}) is the part that does not differ, so it
+ * lives here once: accumulate, extract every complete message, resynchronise
+ * past what cannot be framed, hand back the tail. `Shimmer3Client` and
+ * `Shimmer3RClient` both run on it, differing only in their framer and in two
+ * small hooks ({@link DrainOptions.inspect}, {@link DrainOptions.coalesce}).
  *
  * `src/devices/shimmer3/protocol.ts` and `src/devices/dock/protocol.ts` each
- * predate this module and export their own identically-valued copies; they are
- * public API and are left alone. New framers should import from here.
+ * predate this module and export their own identically-valued sentinel copies;
+ * they are public API and are left alone. New framers should import from here.
  */
 /** Not enough bytes buffered yet to determine the message length. */
 declare const NEED_MORE = -1;
@@ -5704,6 +6055,125 @@ declare const NEED_MORE = -1;
  * should drop one byte and retry (resynchronise) rather than guess a length.
  */
 declare const RESYNC = 0;
+/** A framer: total length of the message at the head of `buf`, or a sentinel. */
+type MessageLengthFn = (buf: Uint8Array) => number;
+/**
+ * What {@link drainByteStream} should do with the byte at the head of the
+ * buffer, before any framing is attempted.
+ *
+ * - `frame` — the normal path: consult the framer.
+ * - `drop` — consume this one byte and carry on. For an opcode that is only
+ *   valid in a context the caller tracks (an INQUIRY_RESPONSE with no inquiry
+ *   outstanding is a stray stream byte, and framing it would swallow real
+ *   control traffic).
+ * - `stop` — end the drain, leaving this byte and everything after it in
+ *   {@link DrainResult.rest}. For bytes that belong to another plane entirely,
+ *   such as stream data whose length only the schema knows.
+ */
+type DrainVerdict = 'frame' | 'drop' | 'stop';
+/**
+ * Why a byte was consumed without becoming a message (for logging).
+ *
+ * - `resync` — the framer could not size a message here.
+ * - `gated` — {@link DrainOptions.inspect} rejected the byte as out of context.
+ * - `rejected` — the framer sized a message but {@link DrainOptions.decode}
+ *   refused it (a failed CRC, a malformed body).
+ */
+type DropReason = 'resync' | 'gated' | 'rejected';
+interface DrainOptions<T = Uint8Array> {
+    /** Framer for the protocol being drained. */
+    messageLength: MessageLengthFn;
+    /**
+     * Turn a framed message into whatever the caller's handlers consume, or return
+     * `null` to refuse it. Omit to receive the raw bytes.
+     *
+     * Refusal deliberately resynchronises by **one byte**, not by the whole span:
+     * a packet that framed but failed its CRC is evidence that the framing itself
+     * was wrong — the real packet header may be a byte or two further on, and
+     * skipping the whole supposed length would step over it. This mirrors the Java
+     * driver's `parseSinglePacket` CRC-fail path.
+     */
+    decode?: (msg: Uint8Array) => T | null;
+    /**
+     * Per-head-byte gate, evaluated before framing. Defaults to always `frame`.
+     * Called with the whole remaining buffer so a gate can look past byte 0.
+     */
+    inspect?: (buf: Uint8Array) => DrainVerdict;
+    /**
+     * Chance to merge the message that follows `msg` into it, returning how many
+     * extra bytes to consume (0 = leave them for the next iteration). `rest`
+     * starts immediately after `msg`.
+     *
+     * This exists because BLE coalesces an ACK with the response written straight
+     * after it into a single notification, and clients built against BLE depend on
+     * that. A drain that emitted them separately would deliver the response before
+     * the awaiting caller had registered its handler.
+     */
+    coalesce?: (msg: Uint8Array, rest: Uint8Array) => number;
+    /**
+     * Dispatch each message the moment it is extracted, before the next head byte
+     * is inspected. When omitted, messages are collected into
+     * {@link DrainResult.messages} and the caller dispatches them afterwards.
+     *
+     * **Use this whenever `inspect` or `coalesce` read state that a handler
+     * mutates synchronously.** Both Shimmer clients do: delivering a response
+     * decrements the gate counters (`_awaitInq`/`_awaitCmd`) or the expected-ACK
+     * count inside the handler, not on a later microtask. Collecting first would
+     * evaluate every hook against the state as it was before *any* message was
+     * delivered — so a stray 0x02 following a genuine INQUIRY_RESPONSE in the same
+     * read would still look "awaited" and get framed, swallowing the bytes behind
+     * it instead of being dropped.
+     *
+     * **Must not throw.** An exception here escapes `drainByteStream`, so the
+     * caller never receives {@link DrainResult.rest} and never advances its
+     * accumulator — every message in that read would be delivered again on the
+     * next one. All three in-tree callers dispatch through an emit helper that
+     * swallows handler exceptions, which is what makes this safe today.
+     */
+    onMessage?: (msg: T) => void;
+    /** Notified for every byte dropped, so callers can log without duplicating the loop. */
+    onDrop?: (byte: number, reason: DropReason) => void;
+}
+interface DrainResult<T = Uint8Array> {
+    /** Complete messages, in wire order — decoded when a `decode` was supplied. */
+    messages: T[];
+    /** Bytes not consumed — the caller stores this back as its accumulator. */
+    rest: Uint8Array;
+    /** True when {@link DrainOptions.inspect} returned `stop`. */
+    stopped: boolean;
+}
+/**
+ * Rebuild message boundaries from an unframed byte stream.
+ *
+ * The shared half of what a client reading from Web Serial, RFCOMM/SPP or a dock
+ * UART has to do: accumulate, extract every complete message the framer can
+ * size, drop what cannot be framed one byte at a time (never guessing a length),
+ * and hand back the incomplete tail. Pure — no client state is touched — so the
+ * awkward cases are unit-testable without a transport.
+ *
+ * Byte-at-a-time resynchronisation is the deliberate choice over flushing the
+ * buffer on garbage: a corrupt byte then costs one byte, not every valid message
+ * queued behind it.
+ *
+ * Pass {@link DrainOptions.onMessage} to have each message dispatched as it is
+ * extracted. That ordering matters whenever `inspect` or `coalesce` consult state
+ * a handler mutates synchronously — see that option's note.
+ */
+declare function drainByteStream(buf: Uint8Array, opts: DrainOptions<Uint8Array> & {
+    decode?: undefined;
+}): DrainResult<Uint8Array>;
+/**
+ * Drain into decoded values of type `T`.
+ *
+ * `decode` is REQUIRED in this form, and that is the whole point of splitting
+ * the signature: `T` is only ever inhabited by what `decode` returns, so
+ * `drainByteStream<MyPacket>(buf, { messageLength, onMessage })` — no `decode` —
+ * must not compile. It used to, and the implementation's cast then handed
+ * `onMessage` a raw `Uint8Array` that the compiler believed was a `MyPacket`.
+ */
+declare function drainByteStream<T>(buf: Uint8Array, opts: DrainOptions<T> & {
+    decode: (msg: Uint8Array) => T | null;
+}): DrainResult<T>;
 
 /**
  * Message framing for a Shimmer3R reached over an **unframed** byte stream.
@@ -5823,6 +6293,93 @@ declare function nudgeGsrResistance(gsrResistanceKOhms: number, gsrRangeSetting:
  * @returns Oversampling ratio index 0–6.
  */
 declare function getOversamplingRatioADS1292R(samplingRate: number): number;
+
+/**
+ * The Shimmer3/Shimmer3R factory self-test: the type table and the two
+ * LiteProtocol helpers a Bluetooth client needs to drive it.
+ *
+ * `SET_FACTORY_TEST` (0xA8, `Comms/shimmer_bt_uart.h:210`, one argument byte per
+ * the command's entry in the argument table at `:695`, handler at
+ * `Comms/shimmer_bt_uart.c:1285-1293`) selects one of the four suites the
+ * firmware runs at the factory. Everything in this module is pure — the runner
+ * itself lives in `../factoryTest/capture.ts` and the clients.
+ *
+ * The suites are shared between the two families: `log-and-stream-common` is
+ * built into both the Shimmer3 (MSP430) and Shimmer3R (STM32) firmware, so the
+ * type numbering, the ACK-then-report sequence and the report envelope are the
+ * same on either. The bodies differ — only the Shimmer3R prints test IDs.
+ */
+
+/**
+ * The factory-test types, exactly as the firmware enumerates them
+ * (`Test/shimmer_test.h:21-27`). A type of 4 or more is silently ACKed and
+ * produces NO report, which is why {@link requireShimmer3FactoryTestType}
+ * refuses it rather than letting a caller wait out a timeout for a report the
+ * firmware was never going to print.
+ */
+declare const SHIMMER3_FACTORY_TEST_TYPE: Readonly<{
+    /** Everything: the IC suite, the LED walk-through and an overall verdict. */
+    readonly MAIN: 0;
+    /** The LEDs only — nothing to pass or fail, so no overall verdict. */
+    readonly LEDS: 1;
+    /** The ICs only, with an overall verdict. */
+    readonly ICS: 2;
+    /** The operational LED-state walk-through — again no overall verdict. */
+    readonly LED_STATES: 3;
+}>;
+/** A factory-test type value (0–3). */
+type Shimmer3FactoryTestType = (typeof SHIMMER3_FACTORY_TEST_TYPE)[keyof typeof SHIMMER3_FACTORY_TEST_TYPE];
+/** Everything a host needs to offer one factory-test type in a UI. */
+interface Shimmer3FactoryTestTypeInfo {
+    /** The argument byte for `SET_FACTORY_TEST`. */
+    readonly value: number;
+    /** The firmware's own enumerator name. */
+    readonly name: 'MAIN' | 'LEDS' | 'ICS' | 'LED_STATES';
+    /** Short human label for a picker. */
+    readonly label: string;
+    /** One sentence explaining what the sensor will do. */
+    readonly description: string;
+    /**
+     * Roughly how long the suite takes. The firmware's main loop is blocked for
+     * the whole of it, so this is also how long the link is unusable.
+     */
+    readonly expectedDurationMs: number;
+    /** Default overall budget for a run of this type — comfortably past the expected duration. */
+    readonly defaultTimeoutMs: number;
+    /** Whether the report ends with an `Overall Result =` line. */
+    readonly hasOverall: boolean;
+}
+/**
+ * The four types in firmware order.
+ *
+ * The durations are the firmware's own step counts, not measurements: the LED
+ * suite is 9 steps of 2 s and the operational-state walk-through 14 of 5 s
+ * (`Test/shimmer_test_leds_states.c`), and the IC suite's chip probes dominate
+ * MAIN. HARDWARE-VERIFY: they have not been timed on a real Shimmer3 or
+ * Shimmer3R, so the default timeouts carry generous headroom over them.
+ */
+declare const SHIMMER3_FACTORY_TEST_TYPES: readonly Shimmer3FactoryTestTypeInfo[];
+/** Look up a type's table entry, or `null` when the value is not one of the four. */
+declare function shimmer3FactoryTestTypeInfo(value: number): Shimmer3FactoryTestTypeInfo | null;
+/**
+ * Look up a type's table entry, or throw.
+ *
+ * @throws RangeError when `value` is not 0–3. The firmware ACKs a larger type
+ *   and then prints nothing at all (`Test/shimmer_test.h:21-27`), so a run with
+ *   one would hang until its timeout with no way to tell it from a dead link.
+ */
+declare function requireShimmer3FactoryTestType(value: number): Shimmer3FactoryTestTypeInfo;
+/** Build the two-byte `SET_FACTORY_TEST` command for a type. */
+declare function buildSetFactoryTestCommand(type: number): Uint8Array;
+/**
+ * Classify the head of a LiteProtocol chunk during a factory-test run.
+ *
+ * The firmware answers the command with the generic one-byte ACK (0xFF) or NACK
+ * (0xFE) and then prints the report as bare ASCII on the same link, so anything
+ * that is not one of those two bytes is already report text. Both answers are
+ * one byte, so this never needs more.
+ */
+declare function classifyLiteProtocolAck(buf: Uint8Array): AckVerdict;
 
 /**
  * EEPROM brand (advertising name) record.
@@ -6292,6 +6849,24 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * ACK/response machinery below.
      */
     private _drainControl;
+    /**
+     * Gate the head byte before framing is attempted.
+     *
+     * Three bytes are only control traffic in the right context, and framing one
+     * out of context would swallow the real control bytes behind it:
+     *
+     * - DATA_PACKET (0x00) while a stream is (about to be) live belongs to the
+     *   stream parser — stop and leave it buffered.
+     * - INQUIRY_RESPONSE (0x02) with no inquiry outstanding is a stray/stream
+     *   byte; framing it would consume `9 + numChannels` bytes of garbage.
+     * - NACK (0xFE) with no command outstanding is likewise dropped. This diverges
+     *   from the Java driver (ShimmerObject processes every 0xFE unconditionally)
+     *   but strictly reduces the risk of a leaked stream byte being read as a NACK.
+     *   Defence-in-depth: `_onTemp` handlers are only added while `_awaitCmd > 0`,
+     *   so an ungated stray 0xFE would emit to no listener anyway — this keeps that
+     *   invariant explicit and survives refactors that add a longer-lived listener.
+     */
+    private _inspectControlHead;
     getEnabledSensors(): number;
     getInternalExpPower(): number;
     /**
@@ -6560,6 +7135,19 @@ declare class WiredShimmerClient extends BaseShimmerClient {
      * write. See {@link _serialize}.
      */
     private _queue;
+    /**
+     * The in-flight factory-test capture, or null when none is running. Non-null
+     * for the whole time the report owns the link — including the drain after a
+     * cancelled or timed-out run, because the firmware has no abort command and
+     * keeps printing regardless.
+     */
+    private _factoryTest;
+    /**
+     * Invoked whenever {@link factoryTestState} changes, synchronously. A host
+     * uses it to hold its own "the link is busy" gate through the whole run,
+     * including the `draining` phase when the sensor is still printing.
+     */
+    onFactoryTestStateChange: ((state: FactoryTestState) => void) | null;
     identity: WiredIdentity | null;
     constructor(opts?: WiredShimmerClientOptions);
     protected _log(...args: unknown[]): void;
@@ -6584,6 +7172,63 @@ declare class WiredShimmerClient extends BaseShimmerClient {
      * belt-and-braces rather than strictly required.)
      */
     resyncStream(): void;
+    /**
+     * What the factory-test runner is doing: `idle` when the link is free,
+     * `running` while a report is being captured, `draining` while a cancelled or
+     * timed-out report is still being swallowed.
+     */
+    get factoryTestState(): FactoryTestState;
+    /**
+     * Resolve when the link is free again. Never rejects — a failed run still
+     * releases the link, and this is the wait a host needs after cancelling one.
+     */
+    whenFactoryTestIdle(): Promise<void>;
+    /**
+     * Run the docked sensor's factory self-test and return its report.
+     *
+     * The dock protocol addresses the test as a WRITE to `UART_COMPONENT.TEST`
+     * whose PROPERTY byte is the test type, with no payload
+     * (`Comms/shimmer_dock_usart.c:473-486`). The firmware ACKs it and then prints
+     * the same report the Bluetooth command produces — as raw text on this link,
+     * with no packet framing and no CRC. A type the firmware does not know is
+     * answered BAD_CMD, which surfaces here as a `nack`.
+     *
+     * On a Shimmer3R the report goes to the USB CDC port when the sensor is
+     * plugged in by USB and to the dock UART otherwise (`hal_FactoryTest.c`), so
+     * this one method serves a docked sensor and a USB-C-connected one alike.
+     *
+     * Two caveats worth passing on to whoever reads the report:
+     * - The whole run holds this client's command queue. Nothing else reaches the
+     *   sensor until the report ends — which is the truth about the firmware, not
+     *   a limitation here: its main loop is blocked for the duration.
+     * - **The ExG chip test cannot pass from the dock.** Shimmer3 firmware prints
+     *   `- FAIL: ADS1292R test will not work from dock` because the dock UART and
+     *   that chip share pins. A FAIL on that line from this transport says nothing
+     *   about the board; run the test over Bluetooth to judge it.
+     *
+     * @param type 0 MAIN, 1 LEDS, 2 ICS, 3 LED_STATES (`Test/shimmer_test.h:21-27`).
+     * @param opts see {@link FactoryTestRunOptions}; `timeoutMs` defaults to the
+     *   type's own entry in `SHIMMER3_FACTORY_TEST_TYPES`. `preflight` is ignored:
+     *   the dock protocol has no equivalent status read.
+     * @returns the report text, CRLF line endings intact.
+     *
+     * HARDWARE-VERIFY: no docked Shimmer3 or USB-C Shimmer3R has run this path.
+     */
+    runFactoryTest(type: number, opts?: FactoryTestRunOptions): Promise<string>;
+    private _runFactoryTestImpl;
+    /**
+     * Let go of the link at the end of a run: clear the capture, then drop
+     * anything the report left in the accumulator. Called from the capture's own
+     * `idle` transition, so it happens before the tail bytes it hands back are
+     * routed through the packet parser.
+     */
+    private _releaseFactoryTest;
+    /**
+     * Abandon an in-flight capture because the link has gone. No drain: draining
+     * exists to keep a still-arriving report out of the packet parser, and nothing
+     * is arriving on a link that is closed.
+     */
+    private _failFactoryTest;
     /** Streaming is not part of the dock UART protocol. */
     startStreaming(): Promise<void>;
     stopStreaming(): Promise<void>;
@@ -6755,9 +7400,14 @@ declare class WiredShimmerClient extends BaseShimmerClient {
     private _handleNotify;
     /**
      * Extract every complete packet currently buffered and dispatch each to the
-     * temp handlers, keeping the incomplete tail for the next chunk. A packet
-     * whose CRC fails is dropped one byte at a time to resync (matching the Java
-     * `parseSinglePacket` CRC-fail path).
+     * temp handlers, keeping the incomplete tail for the next chunk.
+     *
+     * Runs on the shared {@link drainByteStream} loop, decoding straight to
+     * {@link UartRxPacket} so the temp handlers receive parsed packets. A packet
+     * that frames but fails its CRC (or will not parse) is refused, and the drain
+     * resyncs by ONE byte rather than skipping the whole supposed length —
+     * matching the Java `parseSinglePacket` CRC-fail path, on the reasoning that a
+     * bad CRC means the framing itself was probably wrong.
      */
     private _drain;
     private _onTemp;
@@ -10722,11 +11372,208 @@ type VerisenseCalibrationAvailability = 'enabled' | 'disabled' | 'hidden';
 declare function getVerisenseCalibrationSensorAvailability(support: VerisenseHardwareSensorSupport | null | undefined): Record<number, VerisenseCalibrationAvailability>;
 
 /**
- * Parser for the plain-text factory test report streamed by the Verisense
- * firmware (`Includes/ASM_common_source/Test/hal_factoryTest.c`), turning it
- * into a flat map of named metrics suitable for a spreadsheet row.
+ * Shared core for the plain-text factory test reports printed by every Shimmer
+ * firmware family — Verisense (`Includes/ASM_common_source/Test/hal_factoryTest.c`)
+ * and Shimmer3/Shimmer3R (`log-and-stream-common/Test/shimmer_test.c` plus each
+ * board's `hal_FactoryTest.c`).
  *
- * Two properties drive the whole design:
+ * The envelope is identical across families (a `TEST START` banner, a
+ * `Firmware version:` line, a body of ` - <verdict>: <detail>` lines, an
+ * optional `Overall Result = FAIL (0x…)` bitmask, a `TEST END` banner), so the
+ * line loop, the truncation repair, the verdict tiers, the bitmask decode and
+ * the CSV writer live here once. Everything a family prints differently is a
+ * field of the `FactoryTestGrammar` it passes in.
+ *
+ * Two properties drive the whole design, and both came from Verisense:
+ *
+ * 1. **Tests are identified by line content, never by the printed test
+ *    number.** Verisense renumbered its ids at firmware v2.00.010, so the same
+ *    number means different tests across builds while the descriptive text
+ *    stayed stable. Printed ids are still recorded per test and collected into
+ *    an observed id-to-name map, which is what decodes the fail mask — so the
+ *    mask is read correctly under either numbering.
+ *
+ * 2. **The report format is unversioned and still changing.** Nothing here
+ *    throws: unrecognized test lines become generic entries, unrecognized text
+ *    is preserved verbatim in `unparsedLines`, and the caller keeps the raw
+ *    report alongside the parse.
+ */
+/** Verdict carried by a single report line. */
+type FactoryTestVerdict = 'PASS' | 'FAIL' | 'WARNING' | 'NOT_APPLICABLE' | 'INFO' | 'UNKNOWN';
+/** A value extracted from the report, as it should land in a spreadsheet cell. */
+type FactoryTestMetricValue = number | string | boolean;
+/** One test as it appeared in the report. */
+interface FactoryTestResult {
+    /** The test number printed in *this* report, or null if the line carried
+     * none (Shimmer3 prints no numbers at all). Not stable across firmware
+     * versions — see `name`. */
+    id: number | null;
+    /** Canonical snake_case key derived from the line's content. Stable across
+     * firmware versions; this is what column names are built from. */
+    name: string;
+    /** Human-readable test name, e.g. `'VD6283TX Light sensor'`. */
+    label: string;
+    verdict: FactoryTestVerdict;
+    /** The report text for this test, sub-lines joined with `' | '`. */
+    detail: string;
+    metrics: Record<string, FactoryTestMetricValue>;
+}
+/** Overall verdict block printed just before the TEST END banner. */
+interface FactoryTestOverall {
+    /** null when the report never reached its footer (e.g. a blank board aborts
+     * the run at the Shimmer model test), and for the suites that print no
+     * overall verdict at all (the LED walks). */
+    result: 'PASS' | 'FAIL' | null;
+    failMaskHex: string | null;
+    failMask: number | null;
+    /** Canonical names of the tests whose bits are set, resolved through the ids
+     * actually observed in this report. */
+    failedTestNames: string[];
+}
+/** The fields every family's parse result carries. */
+interface FactoryTestReportParsedBase {
+    /** The TEST START banner was found. */
+    ok: boolean;
+    /** The TEST END banner was found — a report can be valid but truncated. */
+    complete: boolean;
+    /** Dotted firmware version from the `Firmware version:` line, e.g. `'2.00.024'`. */
+    firmwareVersion: string | null;
+    overall: FactoryTestOverall;
+    /** Tests in the order they were printed. */
+    tests: FactoryTestResult[];
+    /** Every metric merged into one flat map — one spreadsheet column per key. */
+    metrics: Record<string, FactoryTestMetricValue>;
+    /** Lines no rule recognized. Never dropped, so nothing is silently lost. */
+    unparsedLines: string[];
+    /** Anomalies worth surfacing (repaired truncation, stripped progress dots…). */
+    parserWarnings: string[];
+}
+/** One content rule: the first whose `match` hits the line body wins. */
+interface FactoryTestClassifier {
+    name: string;
+    label: string;
+    match: RegExp;
+    /** Column holding this test's verdict. Defaults to `<name>_result`. */
+    resultKey?: string;
+    extract?: (body: string, out: Record<string, FactoryTestMetricValue>) => void;
+}
+/** What a grammar hook is handed for the line it is being offered. */
+interface FactoryTestLineContext<R extends FactoryTestReportParsedBase> {
+    /** The result being built. */
+    result: R;
+    /** The flat, report-wide metrics map. */
+    metrics: Record<string, FactoryTestMetricValue>;
+    /** The test this line would attach to, or null between tests. */
+    current: FactoryTestResult | null;
+    /** Append a test to the report; returns the entry that ended up holding it
+     * (a different object when `mergeRepeatedNames` folded it into an earlier
+     * test of the same name). */
+    pushTest: (test: FactoryTestResult) => FactoryTestResult;
+    /** Append this line's text to the open test's `detail`. */
+    addDetail: (line: string) => void;
+    /** Record a parser warning. */
+    warn: (message: string) => void;
+}
+/** A hook offered one trimmed line; returns true when it consumed it. */
+type FactoryTestLineRule<R extends FactoryTestReportParsedBase> = (trimmed: string, ctx: FactoryTestLineContext<R>) => boolean;
+/**
+ * Everything one firmware family prints differently.
+ *
+ * Flags default to off, which is the Verisense behaviour the shared core was
+ * extracted from: a grammar that sets none of them parses exactly as the
+ * standalone Verisense parser did.
+ */
+interface FactoryTestGrammar<R extends FactoryTestReportParsedBase> {
+    /** Test-number prefix, e.g. `'WS_TEST'` or `'S3R_TEST'`. Also seeds the
+     * fallback name for a test no classifier recognized (`ws_test_0027`). */
+    idToken: string;
+    /** Content rules, matched in order against the text after the id prefix. */
+    classifiers: FactoryTestClassifier[];
+    /** Section headers that carry no data but end the open test's sub-line run. */
+    sectionHeadings: RegExp;
+    /** Line starts that may appear glued onto the end of a previous line, because
+     * the firmware assembles each line in a fixed-size buffer and drops the CRLF
+     * of anything that overruns it. */
+    repairAnchors: RegExp[];
+    /** `Firmware version:` line; capture group 1 is the dotted version. */
+    firmwareVersion?: RegExp;
+    /** LED test heading; capture group 1 is the printed id, if the family prints
+     * one inside the heading. */
+    ledHeading?: RegExp;
+    /** Classifier name that means "this line is the LED test", so an id line for
+     * it is routed through `ledTest` as the heading would have been. */
+    ledClassifierName?: string;
+    /** Name/label for the `index`-th LED test block in the report. */
+    ledTest?: (index: number, id: number | null) => {
+        name: string;
+        label: string;
+    };
+    /** Operator-visual narration lines belonging to the open LED test. */
+    ledNarration?: RegExp;
+    /** Second chance to name a test whose line content no classifier recognized,
+     * from the number the firmware printed. Content still wins, because the
+     * numbering is the part that has moved between firmware releases; this is
+     * for the lines that carry a bare verdict and no describing words at all
+     * (Shimmer3R prints ` - S3R_TEST_0026 - PASS` for the microphone). A name
+     * found here is looked up among the classifiers for its label and extractor. */
+    testNameById?: (id: number) => string | undefined;
+    /** Name used for a fail-mask bit whose id was never seen in this report.
+     * Defaults to `<idToken lowercased>_00NN`. */
+    maskTestName?: (id: number) => string;
+    /** Accept ` - PASS: …` lines that carry no test number, as Shimmer3 prints
+     * them. Off for families that always print a number. */
+    idlessVerdictLines?: boolean;
+    /** Attach an unrecognized *indented* line to the open test as detail rather
+     * than filing it under `unparsedLines`. */
+    attachIndentedSubLines?: boolean;
+    /** Fold a second test of the same canonical name into the first,
+     * worst-verdict-wins (Shimmer3/3R print one line per ADS1292R chip, and one
+     * line per LED, for what is a single test). */
+    mergeRepeatedNames?: boolean;
+    /** Fold transport-mangled characters before parsing. Defaults to the degree
+     * sign normalizer. */
+    normalizeText?: (text: string) => string;
+    /** Identification lines printed above the first test. */
+    headerLine?: FactoryTestLineRule<R>;
+    /** Indented continuation lines belonging to a test. */
+    subLine?: FactoryTestLineRule<R>;
+    /** Last chance before a line is filed as unparsed. */
+    extraLine?: FactoryTestLineRule<R>;
+}
+/** Which firmware family printed a report. */
+type FactoryTestReportFamily = 'verisense' | 'shimmer3r' | 'shimmer3' | 'unknown';
+/**
+ * Guess which firmware family printed a report.
+ *
+ * The test-number prefix is decisive when one is printed. Shimmer3 (MSP430)
+ * prints none, so it is recognized by its section headings instead — which
+ * also means an LED-states walk, printed by identical shared code on both
+ * Shimmer boards and carrying no numbers, reports as `'shimmer3'` whichever
+ * board ran it. That is the right parse either way: with no ids to resolve,
+ * the two Shimmer grammars differ only in names this report does not contain.
+ */
+declare function detectFactoryTestReportFamily(text: string): FactoryTestReportFamily;
+/**
+ * Render a parsed report as two CSV rows (header, values): the caller's `meta`
+ * columns first, then the parsed metrics sorted by name. A metric whose name
+ * collides with a meta column is dropped in favour of the meta value — the
+ * caller's identity columns are authoritative, and a duplicated header name
+ * breaks most CSV consumers.
+ */
+declare function factoryTestReportToCsvRows(parsed: FactoryTestReportParsedBase, meta?: Record<string, string | number | boolean | null>): string[];
+
+/**
+ * Verisense grammar for the shared factory-test report parser.
+ *
+ * The report is printed by `Includes/ASM_common_source/Test/hal_factoryTest.c`.
+ * Everything generic about it — the banners, the verdict tiers, the truncation
+ * repair, the `Overall Result` bitmask decode and the CSV writer — now lives in
+ * `../factoryTest/report.ts`, shared with the Shimmer3/3R families. What is
+ * left here is what only Verisense prints: the `WS_TEST_` numbering, the
+ * twenty content rules, the MCU header block and the indented production-config
+ * and NAND blocks.
+ *
+ * Two properties drive the design, and both are Verisense's:
  *
  * 1. **Tests are identified by line content, never by the printed
  *    `WS_TEST_00NN` number.** The IDs were renumbered at firmware v2.00.010
@@ -10743,24 +11590,13 @@ declare function getVerisenseCalibrationSensorAvailability(support: VerisenseHar
  *    report alongside the parse.
  */
 /** Verdict carried by a single report line. */
-type VerisenseFactoryTestVerdict = 'PASS' | 'FAIL' | 'WARNING' | 'NOT_APPLICABLE' | 'INFO' | 'UNKNOWN';
+type VerisenseFactoryTestVerdict = FactoryTestVerdict;
 /** A value extracted from the report, as it should land in a spreadsheet cell. */
-type VerisenseFactoryTestMetricValue = number | string | boolean;
+type VerisenseFactoryTestMetricValue = FactoryTestMetricValue;
 /** One test as it appeared in the report. */
-interface VerisenseFactoryTestResult {
-    /** The `WS_TEST_00NN` number printed in *this* report, or null if the line
-     * carried none. Not stable across firmware versions — see `name`. */
-    id: number | null;
-    /** Canonical snake_case key derived from the line's content. Stable across
-     * firmware versions; this is what column names are built from. */
-    name: string;
-    /** Human-readable test name, e.g. `'VD6283TX Light sensor'`. */
-    label: string;
-    verdict: VerisenseFactoryTestVerdict;
-    /** The report text for this test, sub-lines joined with `' | '`. */
-    detail: string;
-    metrics: Record<string, VerisenseFactoryTestMetricValue>;
-}
+type VerisenseFactoryTestResult = FactoryTestResult;
+/** Overall verdict block printed just before the TEST END banner. */
+type VerisenseFactoryTestOverall = FactoryTestOverall;
 /** MCU header block printed above the first test. */
 interface VerisenseFactoryTestMcuInfo {
     macId: string | null;
@@ -10781,42 +11617,16 @@ interface VerisenseFactoryTestModelInfo {
     passkeyId: string | null;
     passkeyKind: string | null;
 }
-/** Overall verdict block printed just before the TEST END banner. */
-interface VerisenseFactoryTestOverall {
-    /** null when the report never reached its footer (e.g. a blank board aborts
-     * the run at the Shimmer model test). */
-    result: 'PASS' | 'FAIL' | null;
-    failMaskHex: string | null;
-    failMask: number | null;
-    /** Canonical names of the tests whose bits are set, resolved through the ids
-     * actually observed in this report. */
-    failedTestNames: string[];
-}
 /** Everything a single report yields. */
-interface VerisenseFactoryTestReportParsed {
-    /** The TEST START banner was found. */
-    ok: boolean;
-    /** The TEST END banner was found — a report can be valid but truncated. */
-    complete: boolean;
-    /** Dotted firmware version from the `Firmware version:` line, e.g. `'2.00.024'`. */
-    firmwareVersion: string | null;
+interface VerisenseFactoryTestReportParsed extends FactoryTestReportParsedBase {
     /** Which `WS_TEST_00NN` numbering this report uses, derived from the firmware
      * version. Informational: parsing never depends on it. */
     idScheme: 'legacy' | 'v2_00_010' | 'unknown';
-    overall: VerisenseFactoryTestOverall;
     mcu: VerisenseFactoryTestMcuInfo;
     model: VerisenseFactoryTestModelInfo | null;
-    /** Tests in the order they were printed. */
-    tests: VerisenseFactoryTestResult[];
-    /** Every metric merged into one flat map — one spreadsheet column per key. */
-    metrics: Record<string, VerisenseFactoryTestMetricValue>;
-    /** Lines no rule recognized. Never dropped, so nothing is silently lost. */
-    unparsedLines: string[];
-    /** Anomalies worth surfacing (repaired truncation, stripped progress dots…). */
-    parserWarnings: string[];
 }
 /**
- * Parse a full factory test report into structured metrics.
+ * Parse a full Verisense factory test report into structured metrics.
  *
  * Never throws: malformed or unrecognized input comes back with `ok: false`
  * and/or its lines preserved in `unparsedLines`.
@@ -10829,7 +11639,110 @@ declare function parseVerisenseFactoryTestReport(text: string): VerisenseFactory
  * caller's identity columns are authoritative, and a duplicated header name
  * breaks most CSV consumers.
  */
-declare function verisenseFactoryTestReportToCsvRows(parsed: VerisenseFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
+declare const verisenseFactoryTestReportToCsvRows: typeof factoryTestReportToCsvRows;
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FW_ID$1 as FW_ID, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, classifyBaseResponse, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, detectExgPreset, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, EvaluateParsedSplitInput, ExgApplyInput, ExgApplyResult, ExgBanks, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerGeneration, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+/**
+ * Shimmer3 and Shimmer3R grammar for the shared factory-test report parser.
+ *
+ * The report envelope is printed by the shared LogAndStream code
+ * (`log-and-stream-common/Test/shimmer_test.c:22-61`) and is byte-identical to
+ * the Verisense one; the body comes from each board's own file:
+ *
+ * - Shimmer3R: `Shimmer_Driver/hal_FactoryTest.c`, which numbers every test
+ *   `S3R_TEST_00NN` and sets bit n-1 of the `Overall Result = FAIL (0x…)` mask
+ *   (`Shimmer_Driver/hal_FactoryTest.h:96-124`). The numbers are sparse — 0003,
+ *   0007-0026 and 0028 — and 0027 appears only in the LED heading, never in the
+ *   mask, because the LED walk is an operator-visual check with no verdict.
+ * - Shimmer3 (MSP430): `Shimmer_Driver/5xx_HAL/hal_FactoryTest.c:65-420`, which
+ *   prints no numbers at all and never sets the mask, so its report always ends
+ *   `Overall Result = PASS` and its tests are identified purely by content.
+ * - The operational-LED-state walk, `log-and-stream-common/Test/
+ *   shimmer_test_leds_states.c`, is shared by both boards and prints neither
+ *   numbers nor an overall verdict.
+ *
+ * Because the numbering is the volatile part, content rules resolve a test
+ * first and the id table only answers for the lines that carry a bare verdict
+ * and no describing words (the microphone prints ` - S3R_TEST_0026 - PASS`).
+ *
+ * Nothing here throws: empty, truncated and unrecognized input all come back as
+ * a result with `ok: false` and the lines preserved.
+ *
+ * HARDWARE-VERIFY: every line shape below is transcribed from firmware source,
+ * not from a report captured off a bench unit. The Shimmer3R BT module version
+ * string and the SD card CID line in particular are reconstructed from their
+ * `sprintf` formats.
+ */
+/** Which of the two Shimmer boards printed a report. */
+type ShimmerFactoryTestReportFamily = 'shimmer3r' | 'shimmer3' | 'unknown';
+/** The `- I/O status:` block, printed by both boards. */
+interface ShimmerFactoryTestIoStatus {
+    docked: boolean | null;
+    btConnected: boolean | null;
+    buttonPressed: boolean | null;
+    usbConnected: boolean | null;
+}
+/** MCU identification block printed under the `MCU:` heading. */
+interface ShimmerFactoryTestMcuInfo {
+    /** The Bluetooth module's MAC, printed under `BT Module:`. */
+    macId: string | null;
+    deviceId: string | null;
+    revisionId: string | null;
+    uniqueId: string | null;
+    /** Shimmer3 only; the MSP430 decodes its reset cause to words. */
+    lastResetReason: string | null;
+    /** Shimmer3R only: the LSE drive level the boot bring-up settled on. */
+    lseDrive: string | null;
+    io: ShimmerFactoryTestIoStatus;
+}
+/** The daughter-card identity printed by the Shimmer model test. */
+interface ShimmerFactoryTestModelInfo {
+    name: string | null;
+    srRevision: string | null;
+}
+/** Everything a single Shimmer3/3R report yields. */
+interface ShimmerFactoryTestReportParsed extends FactoryTestReportParsedBase {
+    family: ShimmerFactoryTestReportFamily;
+    /** `Date (yyyy-mm-dd):` from the report header, Shimmer3R only. */
+    reportDate: string | null;
+    /** `Time (hh:mm:ss):` from the report header, always UTC, Shimmer3R only. */
+    reportTimeUtc: string | null;
+    mcu: ShimmerFactoryTestMcuInfo;
+    model: ShimmerFactoryTestModelInfo | null;
+}
+/**
+ * Shimmer3R test numbers, from the bitmask enum in
+ * `Shimmer_Driver/hal_FactoryTest.h:96-124`. Bit n-1 of the `Overall Result`
+ * mask is test n.
+ *
+ * 0027 is deliberately absent: the shipped reports already print
+ * `LED test (S3R_TEST_0027)`, so the number is spoken for, but the LED walk has
+ * no pass/fail bit and can never appear in the mask.
+ */
+declare const SHIMMER3R_FACTORY_TEST_ID_NAMES: Readonly<Record<number, string>>;
+/**
+ * Matched in order against the text following the test number (or, on
+ * Shimmer3, following the bare `- `); first hit wins. Every pattern keys on
+ * wording rather than on a number, so one list serves both boards and survives
+ * a renumbering.
+ */
+declare const SHIMMER_FACTORY_TEST_CLASSIFIERS: FactoryTestClassifier[];
+/**
+ * Parse a Shimmer3 or Shimmer3R factory test report into structured metrics.
+ *
+ * The family is detected from the report itself, so the caller does not have to
+ * know which board it is talking to — useful because the same page drives both.
+ * A report from neither board still parses under the id-less grammar and comes
+ * back with `family: 'unknown'` and a parser warning saying so.
+ *
+ * Never throws: empty, truncated and garbage input all return a result.
+ */
+declare function parseShimmerFactoryTestReport(text: string): ShimmerFactoryTestReportParsed;
+/**
+ * Render a parsed report as two CSV rows (header, values): the caller's `meta`
+ * columns first, then the parsed metrics sorted by name. A metric whose name
+ * collides with a meta column is dropped in favour of the meta value.
+ */
+declare function shimmerFactoryTestReportToCsvRows(parsed: ShimmerFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
+
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AckVerdict, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, DrainOptions, DrainResult, DrainVerdict, DropReason, EvaluateParsedSplitInput, ExgApplyInput, ExgApplyResult, ExgBanks, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FactoryTestClassifier, FactoryTestFailureReason, FactoryTestGrammar, FactoryTestLineContext, FactoryTestLineRule, FactoryTestMetricValue, FactoryTestOverall, FactoryTestReportFamily, FactoryTestReportParsedBase, FactoryTestResult, FactoryTestRunOptions, FactoryTestState, FactoryTestVerdict, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, MessageLengthFn, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FactoryTestType, Shimmer3FactoryTestTypeInfo, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerFactoryTestIoStatus, ShimmerFactoryTestMcuInfo, ShimmerFactoryTestModelInfo, ShimmerFactoryTestReportFamily, ShimmerFactoryTestReportParsed, ShimmerGeneration, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };

@@ -11,7 +11,7 @@
      *
      * Kept in sync with package.json by tests/core/version.test.ts.
      */
-    const SDK_VERSION = '0.1.24';
+    const SDK_VERSION = '0.1.25';
 
     /**
      * Container for a single decoded sensor frame.
@@ -3766,8 +3766,8 @@
     /**
      * The component/property table (`UART_COMPONENT_AND_PROPERTY`,
      * UartPacketDetails.java:98-160). Only the groups relevant to a docked
-     * Shimmer3/3R identify + status + config path are surfaced; the GQ-only
-     * 802.15.4 radio and device-self-test entries are omitted from D1 (see README).
+     * Shimmer3/3R identify + status + config path are surfaced, plus the factory
+     * self-test; the GQ-only 802.15.4 radio entries are omitted (see README).
      */
     const UART_PROP = Object.freeze({
         MAIN_PROCESSOR: Object.freeze({
@@ -3788,6 +3788,24 @@
             LED0_STATE: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x07, 'READ_WRITE', 'LED_TOGGLE'),
             DEVICE_BOOT: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x08, 'READ_ONLY', 'DEVICE_BOOT'),
             ENTER_BOOTLOADER: cp(UART_COMPONENT.MAIN_PROCESSOR, 0x09, 'WRITE_ONLY', 'ENTER_BOOTLOADER'),
+        }),
+        /**
+         * The factory self-test, addressed as a component whose PROPERTY byte is the
+         * test type — there is no payload
+         * (log-and-stream-common `Comms/shimmer_dock_usart.c:473-486`, which checks
+         * the property against `FACTORY_TEST_COUNT` and answers BAD_CMD above it).
+         * The same `factory_test_t` values the Bluetooth command takes
+         * (`Test/shimmer_test.h:21-27`).
+         *
+         * Write-only, and unlike every other entry here the ACK is not the end of it:
+         * the firmware then prints its report as raw text on this link. See
+         * `WiredShimmerClient.runFactoryTest`.
+         */
+        TEST: Object.freeze({
+            MAIN: cp(UART_COMPONENT.TEST, 0x00, 'WRITE_ONLY', 'FACTORY_TEST_MAIN'),
+            LEDS: cp(UART_COMPONENT.TEST, 0x01, 'WRITE_ONLY', 'FACTORY_TEST_LEDS'),
+            ICS: cp(UART_COMPONENT.TEST, 0x02, 'WRITE_ONLY', 'FACTORY_TEST_ICS'),
+            LED_STATES: cp(UART_COMPONENT.TEST, 0x03, 'WRITE_ONLY', 'FACTORY_TEST_LED_STATES'),
         }),
         BAT: Object.freeze({
             ENABLE: cp(UART_COMPONENT.BAT, 0x00, 'READ_WRITE', 'ENABLE'),
@@ -4283,6 +4301,625 @@
         if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
             return null;
         return { boardId, boardRev, specialRev };
+    }
+    /**
+     * Classify the head of a dock-UART RX buffer for a factory-test capture.
+     *
+     * The firmware answers the test command with an ordinary ACK packet and then
+     * prints its report as raw text on the same link (`shimmer_dock_usart.c:473-486`
+     * for the command, `hal_FactoryTest.c` for the printing) — so this has to tell
+     * "a framed packet" from "the report has started", on a stream that may deliver
+     * either a byte at a time.
+     *
+     * A CRC-bad packet is skipped one byte rather than treated as text: the report
+     * has not started yet, and a single corrupt byte must not turn the rest of a
+     * legitimate packet into report content.
+     */
+    function classifyFactoryTestAckPacket(buf) {
+        if (buf.length === 0)
+            return { kind: 'need-more' };
+        // Anything that is not a packet header is the report: it starts with "/".
+        if (buf[0] !== UART_PACKET_HEADER)
+            return { kind: 'text' };
+        const total = wiredPacketLength(buf);
+        if (total === NEED_MORE$2)
+            return { kind: 'need-more' };
+        if (total === RESYNC$2)
+            return { kind: 'text' };
+        if (buf.length < total)
+            return { kind: 'need-more' };
+        let packet;
+        try {
+            packet = parseUartPacket(buf);
+        }
+        catch {
+            return { kind: 'ignore', consumed: 1 };
+        }
+        if (!packet.crcOk)
+            return { kind: 'ignore', consumed: 1 };
+        if (packet.command === UART_PACKET_CMD.ACK_RESPONSE)
+            return { kind: 'ack', consumed: total };
+        if (isBadResponse(packet.command))
+            return {
+                kind: 'nack',
+                consumed: total,
+                detail: badResponseReason(packet.command),
+            };
+        // A packet for somebody else (a late DATA_RESPONSE): drop it and keep waiting.
+        return { kind: 'ignore', consumed: total };
+    }
+
+    /**
+     * Transport-agnostic capture state machine for a Shimmer factory self-test.
+     *
+     * The firmware answers `SET_FACTORY_TEST` with a generic ACK first
+     * (log-and-stream-common `Comms/shimmer_bt_uart.c:1618` — TASK_BT_RESPOND
+     * outranks TASK_FACTORY_TEST) and only then runs the suite
+     * (`shimmer_taskList.c:164`), printing the report as **raw ASCII on the same
+     * link, with no framing and no CRC** — one write per line via
+     * `ShimBt_writeToTxBufAndSend(str, len, SHIMMER_CMD)`
+     * (`Test/shimmer_test.c:22-61` builds the envelope). There is no abort command:
+     * once the suite starts, the firmware's main loop is blocked until it prints its
+     * `TEST END` banner, so a host that gives up must keep swallowing bytes rather
+     * than hand them to a framer that would resync through them one at a time.
+     *
+     * That is what this class is: the byte-level half of the runner, with no
+     * knowledge of BLE, serial or the dock UART. A client supplies an
+     * {@link AckClassifier} for its own link's ACK/NACK encoding and then simply
+     * feeds it every inbound chunk; what comes back is whatever was NOT report
+     * traffic, which the client routes as usual.
+     *
+     * Phases are `ack → text → done`:
+     *  - **ack** — the classifier runs on the head of each chunk until it reaches a
+     *    verdict. It runs on the head of the SAME chunk that carries text, because
+     *    over BLE the ACK and the report's first bytes arrive in ONE notification.
+     *  - **text** — printable bytes are kept (TAB/CR/LF and 0x20–0x7E), everything
+     *    else is counted as noise and dropped. `TEST START` arms an idle timer that
+     *    RESOLVES: an incomplete report is a short report, not an error. The
+     *    `TEST END` line resolves synchronously and hands back the bytes after it —
+     *    a deferred status push or a late ACK glued to the banner belongs to the
+     *    client, not to the report.
+     *  - **draining** — entered on timeout or abort, never on success. The result
+     *    promise has already rejected; bytes keep being swallowed until the report
+     *    ends, the link falls silent, or the hard cap expires.
+     *
+     * HARDWARE-VERIFY: that the ACK and the report's first bytes really do share one
+     * BLE notification, and that a `[0x8A][0x71]` status push can arrive glued to
+     * the `TEST END` banner, are the two shapes this class is built around; both are
+     * reasoned from the firmware's single-buffer TX path and have not yet been
+     * observed on a real Shimmer3/3R.
+     */
+    /** An error raised by the factory-test runner, tagged with a machine-readable reason. */
+    class FactoryTestError extends Error {
+        constructor(reason, message) {
+            super(message);
+            this.name = 'FactoryTestError';
+            this.reason = reason;
+        }
+    }
+    /**
+     * The refusal message the runner raises when the firmware NACKs the command.
+     *
+     * `ShimBt_isCmdBlockedWhileSensing` (`Comms/shimmer_bt_uart.c:2985`) refuses
+     * `SET_FACTORY_TEST` outright while the device is sensing — streaming, or
+     * logging to the SD card from its own button — and the same NACK comes back
+     * when SD sync is enabled.
+     */
+    const FACTORY_TEST_NACK_MESSAGE = 'The sensor refused the factory self-test because it is sensing. ' +
+        'Stop streaming or SD logging first, or disable SD sync.';
+    /**
+     * How long the runner waits for the firmware's generic ACK — or for the first
+     * report byte, since over one link those can arrive together — before deciding
+     * the command never landed.
+     */
+    const FACTORY_TEST_ACK_TIMEOUT_MS = 2000;
+    /**
+     * Floor for the post-`TEST START` idle timer. A slow section of the suite (the
+     * LED walk-through steps every 5 s) must not look like a finished report, so a
+     * caller cannot ask for a shorter completion idle than this.
+     */
+    const FACTORY_TEST_IDLE_FLOOR_MS = 10000;
+    /** Default silence, while draining, after which the report is assumed over. */
+    const FACTORY_TEST_DRAIN_IDLE_MS = 10000;
+    /** Sentinels from the report envelope (`Test/shimmer_test.c:22-61`). */
+    const TEST_START_SENTINEL = 'TEST START';
+    const TEST_END_SENTINEL = 'TEST END';
+    /** Bytes the report grammar allows: TAB, LF, CR and printable ASCII. */
+    function isReportByte(b) {
+        return b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e);
+    }
+    /**
+     * The capture state machine. One instance per run: it resolves or rejects
+     * exactly once, then reaches `idle` and is finished with.
+     */
+    class FactoryTestCapture {
+        constructor(classify, opts = {}) {
+            this._state = 'idle';
+            this._started = false;
+            this._settled = false;
+            this._idleDone = false;
+            this._phase = 'ack';
+            /** Bytes the classifier has not reached a verdict on yet. */
+            this._ackBuf = new Uint8Array(0);
+            this._aggregate = '';
+            this._line = '';
+            this._sawStart = false;
+            this._ackTimer = null;
+            this._timeoutTimer = null;
+            this._idleTimer = null;
+            this._drainTimer = null;
+            this._drainCapTimer = null;
+            this._signal = null;
+            this._onAbort = null;
+            this._classify = classify;
+            this._opts = opts;
+            this._timeoutMs = Math.max(1000, Math.trunc(opts.timeoutMs ?? 120000));
+            this._idleMs = Math.max(FACTORY_TEST_IDLE_FLOOR_MS, Math.trunc(opts.completionIdleMs ?? 0));
+            this._drainIdleMs = Math.max(1000, Math.trunc(opts.drainIdleMs ?? FACTORY_TEST_DRAIN_IDLE_MS));
+            this.result = new Promise((resolve, reject) => {
+                this._resolve = resolve;
+                this._reject = reject;
+            });
+            /* A run that fails before anyone awaits `result` — a NACK raised inside the
+             * client's own `runFactoryTest`, say — would otherwise surface as an
+             * unhandled rejection and, in a browser, as a console error the application
+             * never asked for. The no-op marks it handled; the caller's own `await`
+             * still sees the rejection. */
+            void this.result.catch(() => { });
+            this.idle = new Promise((resolve) => {
+                this._resolveIdle = resolve;
+            });
+        }
+        /** What the capture is doing right now. */
+        get state() {
+            return this._state;
+        }
+        /** The report text captured so far. */
+        get aggregate() {
+            return this._aggregate;
+        }
+        /**
+         * Arm the capture: start the ACK and overall timers and wire the abort signal.
+         * Call this BEFORE writing the command, so an implausibly fast reply cannot
+         * arrive before there is anything to receive it.
+         */
+        start() {
+            if (this._started)
+                return;
+            this._started = true;
+            this._setState('running');
+            this._ackTimer = setTimeout(() => {
+                this._failNow(new FactoryTestError('no-response', `The sensor did not answer the factory-test command within ${FACTORY_TEST_ACK_TIMEOUT_MS} ms.`));
+            }, FACTORY_TEST_ACK_TIMEOUT_MS);
+            this._timeoutTimer = setTimeout(() => {
+                this._failThenDrain(new FactoryTestError('timeout', `No TEST END line within ${this._timeoutMs} ms. The sensor may still be printing its report.`));
+            }, this._timeoutMs);
+            const signal = this._opts.signal ?? null;
+            if (signal) {
+                if (signal.aborted) {
+                    this._failThenDrain(this._abortError());
+                    return;
+                }
+                this._signal = signal;
+                this._onAbort = () => this._failThenDrain(this._abortError());
+                try {
+                    signal.addEventListener('abort', this._onAbort, { once: true });
+                }
+                catch {
+                    this._onAbort = null;
+                    this._signal = null;
+                }
+            }
+        }
+        /**
+         * Hand the capture one inbound chunk.
+         *
+         * @returns the bytes that are NOT report traffic — everything after a NACK
+         *   packet, everything after the `TEST END` line, or the whole chunk once the
+         *   capture is idle — or `null` when the chunk was consumed entirely. Never
+         *   throws: an inbound chunk must never be able to break the client's notify
+         *   handler.
+         */
+        feed(bytes) {
+            try {
+                if (!bytes || bytes.length === 0)
+                    return null;
+                if (this._state === 'idle')
+                    return bytes;
+                if (this._state === 'draining')
+                    return this._feedDraining(bytes);
+                return this._phase === 'ack' ? this._feedAck(bytes) : this._feedText(bytes);
+            }
+            catch {
+                /* An internal fault must not propagate into the transport's notify
+                 * callback, where it would take the whole RX path down with it. */
+                return null;
+            }
+        }
+        /**
+         * Abandon the capture immediately with `err`, with NO drain — for a link that
+         * has gone away, where there is nothing left to swallow.
+         */
+        fail(err) {
+            this._failNow(err);
+        }
+        // -------------------------------------------------------------------------
+        // Phases
+        // -------------------------------------------------------------------------
+        _feedAck(bytes) {
+            let buf = this._ackBuf.length ? concat(this._ackBuf, bytes) : bytes;
+            this._ackBuf = new Uint8Array(0);
+            for (;;) {
+                if (buf.length === 0)
+                    return null;
+                const verdict = this._classify(buf);
+                if (verdict.kind === 'need-more') {
+                    // Deliberately NOT clearing the ACK timer: a dribbled packet that never
+                    // completes is indistinguishable from silence.
+                    this._ackBuf = new Uint8Array(buf);
+                    return null;
+                }
+                if (verdict.kind === 'ignore') {
+                    buf = buf.subarray(Math.max(1, verdict.consumed));
+                    continue;
+                }
+                this._clearAckTimer();
+                if (verdict.kind === 'nack') {
+                    const rest = buf.subarray(Math.max(0, verdict.consumed));
+                    const detail = verdict.detail ? ` (${verdict.detail})` : '';
+                    this._failNow(new FactoryTestError('nack', `${FACTORY_TEST_NACK_MESSAGE}${detail}`));
+                    return rest.length ? new Uint8Array(rest) : null;
+                }
+                if (verdict.kind === 'ack') {
+                    this._phase = 'text';
+                    return this._feedText(buf.subarray(Math.max(0, verdict.consumed)));
+                }
+                // 'text' — the firmware is already printing; there is no ACK to wait for.
+                this._phase = 'text';
+                return this._feedText(buf);
+            }
+        }
+        _feedText(bytes) {
+            let buf = bytes;
+            /* A second ACK after the first is a stale one — the firmware's ACK for an
+             * earlier command that crossed this one on the link — and must not be
+             * transcribed into the report as noise. */
+            for (;;) {
+                if (buf.length === 0)
+                    break;
+                const verdict = this._classify(buf);
+                if (verdict.kind !== 'ack' || verdict.consumed <= 0)
+                    break;
+                buf = buf.subarray(verdict.consumed);
+            }
+            if (buf.length === 0) {
+                this._armIdleTimer();
+                return null;
+            }
+            const scan = this._scan(buf, true);
+            if (scan.noise > 0)
+                this._safe(() => this._opts.onNoise?.(scan.noise));
+            if (scan.text)
+                this._safe(() => this._opts.onChunk?.(scan.text, this._aggregate));
+            for (const line of scan.lines)
+                this._safe(() => this._opts.onLine?.(line));
+            if (scan.endIndex >= 0) {
+                const tail = buf.subarray(scan.endIndex);
+                this._finish();
+                return tail.length ? new Uint8Array(tail) : null;
+            }
+            this._armIdleTimer();
+            return null;
+        }
+        /**
+         * Post-failure drain: the result promise has already settled, so nothing here
+         * is reported. The bytes are swallowed only to keep them out of the client's
+         * framer until the firmware's report is over.
+         */
+        _feedDraining(bytes) {
+            const scan = this._scan(bytes, false);
+            if (scan.endIndex >= 0) {
+                const tail = bytes.subarray(scan.endIndex);
+                this._goIdle();
+                return tail.length ? new Uint8Array(tail) : null;
+            }
+            this._armDrainTimer();
+            return null;
+        }
+        /**
+         * Walk `bytes`, keeping the report grammar's characters and counting the rest.
+         *
+         * `endIndex` is the offset ONE PAST the newline that ends the `TEST END` line,
+         * expressed in the RAW input's own indices — that exactness is the whole point
+         * of scanning byte by byte, because the tail handed back to the client may
+         * contain the very bytes the filter would otherwise have dropped.
+         */
+        _scan(bytes, accumulate) {
+            let text = '';
+            const lines = [];
+            let noise = 0;
+            for (let i = 0; i < bytes.length; i++) {
+                const b = bytes[i];
+                if (!isReportByte(b)) {
+                    noise++;
+                    continue;
+                }
+                const ch = String.fromCharCode(b);
+                text += ch;
+                this._line += ch;
+                if (b !== 0x0a)
+                    continue;
+                const line = this._line.replace(/\r?\n$/, '');
+                this._line = '';
+                if (accumulate)
+                    lines.push(line);
+                if (!this._sawStart && line.includes(TEST_START_SENTINEL))
+                    this._sawStart = true;
+                if (line.includes(TEST_END_SENTINEL)) {
+                    if (accumulate)
+                        this._aggregate += text;
+                    return { text, lines, noise, endIndex: i + 1 };
+                }
+            }
+            if (accumulate) {
+                this._aggregate += text;
+                if (!this._sawStart && this._aggregate.includes(TEST_START_SENTINEL))
+                    this._sawStart = true;
+            }
+            return { text, lines, noise, endIndex: -1 };
+        }
+        // -------------------------------------------------------------------------
+        // Settlement
+        // -------------------------------------------------------------------------
+        /** The report ended cleanly (TEST END, or a post-TEST START silence). */
+        _finish() {
+            if (this._settled)
+                return;
+            this._settled = true;
+            const text = this._aggregate;
+            this._goIdle();
+            this._resolve(text);
+        }
+        /** Reject and release the link at once — no drain. */
+        _failNow(err) {
+            if (this._settled)
+                return;
+            this._settled = true;
+            this._goIdle();
+            this._reject(err);
+        }
+        /**
+         * Reject, then keep swallowing: the firmware has no abort command, so after a
+         * timeout or a user cancel the report is still coming and the link is not free
+         * until it ends (`Test/shimmer_test.c:22-61`; the main loop is blocked for the
+         * whole suite).
+         */
+        _failThenDrain(err) {
+            if (this._settled)
+                return;
+            this._settled = true;
+            this._clearAckTimer();
+            this._clearTimer('_timeoutTimer');
+            this._clearTimer('_idleTimer');
+            this._detachAbort();
+            this._setState('draining');
+            this._armDrainTimer();
+            this._drainCapTimer = setTimeout(() => this._goIdle(), this._timeoutMs);
+            this._reject(err);
+        }
+        _goIdle() {
+            this._clearAckTimer();
+            this._clearTimer('_timeoutTimer');
+            this._clearTimer('_idleTimer');
+            this._clearTimer('_drainTimer');
+            this._clearTimer('_drainCapTimer');
+            this._detachAbort();
+            /* Guarded by its own flag rather than by the state, because a capture that
+             * fails before `start()` never left `idle` and must still settle its
+             * `idle` promise — a caller awaiting `whenFactoryTestIdle()` would
+             * otherwise wait forever. */
+            if (this._idleDone)
+                return;
+            this._idleDone = true;
+            this._setState('idle');
+            this._safe(() => this._opts.onIdle?.());
+            this._resolveIdle();
+        }
+        _setState(next) {
+            if (this._state === next)
+                return;
+            this._state = next;
+            this._safe(() => this._opts.onStateChange?.(next));
+        }
+        // -------------------------------------------------------------------------
+        // Timers
+        // -------------------------------------------------------------------------
+        /**
+         * Re-arm the completion timer. Only `TEST START` arms it: before the banner
+         * the sensor may simply be slow, and resolving then would return a report that
+         * never began.
+         */
+        _armIdleTimer() {
+            if (!this._sawStart || this._settled)
+                return;
+            this._clearTimer('_idleTimer');
+            this._idleTimer = setTimeout(() => this._finish(), this._idleMs);
+        }
+        _armDrainTimer() {
+            this._clearTimer('_drainTimer');
+            this._drainTimer = setTimeout(() => this._goIdle(), this._drainIdleMs);
+        }
+        _clearAckTimer() {
+            this._clearTimer('_ackTimer');
+        }
+        _clearTimer(key) {
+            const t = this[key];
+            if (t !== null) {
+                clearTimeout(t);
+                this[key] = null;
+            }
+        }
+        _detachAbort() {
+            if (this._signal && this._onAbort) {
+                try {
+                    this._signal.removeEventListener('abort', this._onAbort);
+                }
+                catch {
+                    /* ignore */
+                }
+            }
+            this._signal = null;
+            this._onAbort = null;
+        }
+        _abortError() {
+            /* A DOMException named AbortError, so `err.name === 'AbortError'` works the
+             * same way it does for fetch and every other abortable web API. */
+            if (typeof DOMException === 'function') {
+                return new DOMException('Factory test aborted', 'AbortError');
+            }
+            const err = new Error('Factory test aborted');
+            err.name = 'AbortError';
+            return err;
+        }
+        /** Run a user callback; a throw from one must never derail the capture. */
+        _safe(fn) {
+            try {
+                fn();
+            }
+            catch {
+                /* ignore callback errors */
+            }
+        }
+    }
+    function concat(a, b) {
+        const out = new Uint8Array(a.length + b.length);
+        out.set(a, 0);
+        out.set(b, a.length);
+        return out;
+    }
+
+    /**
+     * The Shimmer3/Shimmer3R factory self-test: the type table and the two
+     * LiteProtocol helpers a Bluetooth client needs to drive it.
+     *
+     * `SET_FACTORY_TEST` (0xA8, `Comms/shimmer_bt_uart.h:210`, one argument byte per
+     * the command's entry in the argument table at `:695`, handler at
+     * `Comms/shimmer_bt_uart.c:1285-1293`) selects one of the four suites the
+     * firmware runs at the factory. Everything in this module is pure — the runner
+     * itself lives in `../factoryTest/capture.ts` and the clients.
+     *
+     * The suites are shared between the two families: `log-and-stream-common` is
+     * built into both the Shimmer3 (MSP430) and Shimmer3R (STM32) firmware, so the
+     * type numbering, the ACK-then-report sequence and the report envelope are the
+     * same on either. The bodies differ — only the Shimmer3R prints test IDs.
+     */
+    /**
+     * The factory-test types, exactly as the firmware enumerates them
+     * (`Test/shimmer_test.h:21-27`). A type of 4 or more is silently ACKed and
+     * produces NO report, which is why {@link requireShimmer3FactoryTestType}
+     * refuses it rather than letting a caller wait out a timeout for a report the
+     * firmware was never going to print.
+     */
+    const SHIMMER3_FACTORY_TEST_TYPE = Object.freeze({
+        /** Everything: the IC suite, the LED walk-through and an overall verdict. */
+        MAIN: 0,
+        /** The LEDs only — nothing to pass or fail, so no overall verdict. */
+        LEDS: 1,
+        /** The ICs only, with an overall verdict. */
+        ICS: 2,
+        /** The operational LED-state walk-through — again no overall verdict. */
+        LED_STATES: 3,
+    });
+    /**
+     * The four types in firmware order.
+     *
+     * The durations are the firmware's own step counts, not measurements: the LED
+     * suite is 9 steps of 2 s and the operational-state walk-through 14 of 5 s
+     * (`Test/shimmer_test_leds_states.c`), and the IC suite's chip probes dominate
+     * MAIN. HARDWARE-VERIFY: they have not been timed on a real Shimmer3 or
+     * Shimmer3R, so the default timeouts carry generous headroom over them.
+     */
+    const SHIMMER3_FACTORY_TEST_TYPES = Object.freeze([
+        Object.freeze({
+            value: SHIMMER3_FACTORY_TEST_TYPE.MAIN,
+            name: 'MAIN',
+            label: 'Everything (MAIN)',
+            description: 'Probes every chip, walks the LEDs and ends with an overall pass/fail verdict.',
+            expectedDurationMs: 35000,
+            defaultTimeoutMs: 90000,
+            hasOverall: true,
+        }),
+        Object.freeze({
+            value: SHIMMER3_FACTORY_TEST_TYPE.LEDS,
+            name: 'LEDS',
+            label: 'LEDs only',
+            description: 'Lights each LED in turn for two seconds. Meant to be watched — there is no overall verdict.',
+            expectedDurationMs: 18000,
+            defaultTimeoutMs: 45000,
+            hasOverall: false,
+        }),
+        Object.freeze({
+            value: SHIMMER3_FACTORY_TEST_TYPE.ICS,
+            name: 'ICS',
+            label: 'Chips only (ICs)',
+            description: 'Probes the sensor, memory and radio chips and ends with an overall pass/fail verdict.',
+            expectedDurationMs: 15000,
+            defaultTimeoutMs: 60000,
+            hasOverall: true,
+        }),
+        Object.freeze({
+            value: SHIMMER3_FACTORY_TEST_TYPE.LED_STATES,
+            name: 'LED_STATES',
+            label: 'LED operating states',
+            description: 'Holds each operational LED state for five seconds so it can be compared against the sensor. ' +
+                'No overall verdict, and the longest of the four.',
+            expectedDurationMs: 70000,
+            defaultTimeoutMs: 120000,
+            hasOverall: false,
+        }),
+    ]);
+    /** Look up a type's table entry, or `null` when the value is not one of the four. */
+    function shimmer3FactoryTestTypeInfo(value) {
+        return SHIMMER3_FACTORY_TEST_TYPES.find((t) => t.value === value) ?? null;
+    }
+    /**
+     * Look up a type's table entry, or throw.
+     *
+     * @throws RangeError when `value` is not 0–3. The firmware ACKs a larger type
+     *   and then prints nothing at all (`Test/shimmer_test.h:21-27`), so a run with
+     *   one would hang until its timeout with no way to tell it from a dead link.
+     */
+    function requireShimmer3FactoryTestType(value) {
+        const info = shimmer3FactoryTestTypeInfo(value);
+        if (!info) {
+            const known = SHIMMER3_FACTORY_TEST_TYPES.map((t) => `${t.value} ${t.name}`).join(', ');
+            throw new RangeError(`Unknown factory-test type ${value}. The firmware defines ${known}; ` +
+                'anything else is acknowledged and then prints no report.');
+        }
+        return info;
+    }
+    /** Build the two-byte `SET_FACTORY_TEST` command for a type. */
+    function buildSetFactoryTestCommand(type) {
+        const info = requireShimmer3FactoryTestType(type);
+        return new Uint8Array([OPCODES.SET_FACTORY_TEST, info.value]);
+    }
+    /**
+     * Classify the head of a LiteProtocol chunk during a factory-test run.
+     *
+     * The firmware answers the command with the generic one-byte ACK (0xFF) or NACK
+     * (0xFE) and then prints the report as bare ASCII on the same link, so anything
+     * that is not one of those two bytes is already report text. Both answers are
+     * one byte, so this never needs more.
+     */
+    function classifyLiteProtocolAck(buf) {
+        if (buf.length === 0)
+            return { kind: 'need-more' };
+        if (buf[0] === OPCODES.ACK_COMMAND_PROCESSED)
+            return { kind: 'ack', consumed: 1 };
+        if (buf[0] === OPCODES.NACK_COMMAND_PROCESSED) {
+            return { kind: 'nack', consumed: 1, detail: 'NACK 0xFE' };
+        }
+        return { kind: 'text' };
     }
 
     /**
@@ -5100,16 +5737,25 @@
     }
 
     /**
-     * Sentinels shared by the byte-stream (unframed transport) message framers.
+     * Reading a protocol off an unframed pipe: the sentinels every framer returns,
+     * and the drain loop that turns a framer into message boundaries.
      *
-     * A framer is a pure function `(buf) => number` that reports how many bytes the
-     * message at the head of `buf` occupies, so a client reading from an unframed
-     * pipe (Web Serial, RFCOMM/SPP, a dock UART) can rebuild the message boundaries
-     * that BLE notifications hand it for free.
+     * A **framer** is a pure function `(buf) => number` reporting how many bytes the
+     * message at the head of `buf` occupies — the length knowledge the Java driver
+     * encodes in its blocking `readBytes(n)` calls, expressed as a function. Each
+     * device family owns its own (`shimmer3ControlMessageLength`,
+     * `shimmer3rControlMessageLength`, the dock's `wiredPacketLength`), because that
+     * part genuinely differs per protocol.
+     *
+     * The **drain** ({@link drainByteStream}) is the part that does not differ, so it
+     * lives here once: accumulate, extract every complete message, resynchronise
+     * past what cannot be framed, hand back the tail. `Shimmer3Client` and
+     * `Shimmer3RClient` both run on it, differing only in their framer and in two
+     * small hooks ({@link DrainOptions.inspect}, {@link DrainOptions.coalesce}).
      *
      * `src/devices/shimmer3/protocol.ts` and `src/devices/dock/protocol.ts` each
-     * predate this module and export their own identically-valued copies; they are
-     * public API and are left alone. New framers should import from here.
+     * predate this module and export their own identically-valued sentinel copies;
+     * they are public API and are left alone. New framers should import from here.
      */
     /** Not enough bytes buffered yet to determine the message length. */
     const NEED_MORE = -1;
@@ -5118,6 +5764,79 @@
      * should drop one byte and retry (resynchronise) rather than guess a length.
      */
     const RESYNC = 0;
+    function drainByteStream(buf, opts) {
+        const { messageLength, decode, inspect, coalesce, onMessage, onDrop } = opts;
+        const messages = [];
+        const deliver = (m) => {
+            if (onMessage)
+                onMessage(m);
+            else
+                messages.push(m);
+        };
+        let rest = buf;
+        let stopped = false;
+        for (;;) {
+            if (rest.length === 0)
+                break;
+            if (inspect) {
+                const verdict = inspect(rest);
+                if (verdict === 'stop') {
+                    stopped = true;
+                    break;
+                }
+                if (verdict === 'drop') {
+                    onDrop?.(rest[0], 'gated');
+                    rest = rest.subarray(1);
+                    continue;
+                }
+            }
+            const len = messageLength(rest);
+            if (len === NEED_MORE)
+                break;
+            if (len === RESYNC) {
+                onDrop?.(rest[0], 'resync');
+                rest = rest.subarray(1);
+                continue;
+            }
+            // Defensive: a framer should report NEED_MORE rather than a length it cannot
+            // yet cover, but never slice past the end of the buffer if one does.
+            if (rest.length < len)
+                break;
+            // Nothing is consumed until the disposition is known, so a message `decode`
+            // refuses can still resync by one byte from where it started.
+            let payload = new Uint8Array(rest.subarray(0, len));
+            let consumed = len;
+            const extra = coalesce ? coalesce(payload, rest.subarray(len)) : 0;
+            if (extra > 0 && extra <= rest.length - len) {
+                const merged = new Uint8Array(len + extra);
+                merged.set(payload, 0);
+                merged.set(rest.subarray(len, len + extra), len);
+                payload = merged;
+                consumed = len + extra;
+            }
+            if (decode) {
+                const decoded = decode(payload);
+                if (decoded === null) {
+                    onDrop?.(rest[0], 'rejected');
+                    rest = rest.subarray(1);
+                    continue;
+                }
+                deliver(decoded);
+            }
+            else {
+                // No decode: T is Uint8Array, guaranteed by the overloads above — the
+                // decoded form cannot be reached without a `decode`. The cast is confined
+                // to this implementation signature and is unobservable to callers.
+                deliver(payload);
+            }
+            rest = rest.subarray(consumed);
+        }
+        return {
+            messages,
+            rest: rest.length ? new Uint8Array(rest) : new Uint8Array(0),
+            stopped,
+        };
+    }
 
     /**
      * Wire protocol for Shimmer3R SD-card file transfer over BLE.
@@ -8468,6 +9187,15 @@
              * two callers may be awaiting at once.
              */
             this._statusReadsInFlight = 0;
+            /**
+             * The in-flight factory-test capture, or null when none is running.
+             *
+             * Non-null for the whole time the link is unusable — from the write until the
+             * report ends, INCLUDING the drain after a cancelled or timed-out run, because
+             * the firmware has no abort command and keeps printing regardless. Every
+             * command write is refused while it is set; see {@link runFactoryTest}.
+             */
+            this._factoryTest = null;
             // Cached device configuration
             this.enabledSensors = 0x000000;
             this.samplingRateHz = 0;
@@ -8518,10 +9246,18 @@
              * notice that a recording stopped mid-stream; poll {@link getStatus} instead.
              */
             this.onDeviceStatus = null;
+            /**
+             * Invoked whenever {@link factoryTestState} changes, synchronously. A host uses
+             * it to hold its own "the link is busy" gate through the whole run — including
+             * the `draining` phase after a cancel, when the sensor is still printing and no
+             * other command will be accepted.
+             */
+            this.onFactoryTestStateChange = null;
             /** Handle an unexpected transport disconnect (the link dropped under us). */
             this._handleTransportDisconnect = (reason) => {
                 this._streaming = false;
                 this._sdKnownSession = null;
+                this._failFactoryTest('The link dropped during the factory self-test.');
                 this._emitStatus('Device disconnected');
                 this._emitDisconnect(reason);
             };
@@ -8533,13 +9269,28 @@
              * message per call and goes straight to {@link _handleFramedChunk}; an
              * unframed one (Web Serial over USB or over a classic-Bluetooth COM port)
              * is re-framed first, then funnelled through the very same handler.
+             *
+             * A running factory test is served FIRST, before either path. Its report is
+             * bare ASCII with no opcode, no length and no CRC, so the framer would treat
+             * every line as garbage and resync through it one byte at a time — and the
+             * temp handlers, which only ever see whole framed messages, would never see it
+             * at all. What the capture hands back is what was NOT report traffic (a status
+             * push glued after `TEST END`, a late ACK), and that continues down the normal
+             * path.
              */
             this._handleNotify = (chunk) => {
+                let bytes = chunk;
+                if (this._factoryTest) {
+                    const rest = this._factoryTest.feed(bytes);
+                    if (!rest || rest.length === 0)
+                        return;
+                    bytes = rest;
+                }
                 if (this._unframed) {
-                    this._handleUnframedChunk(chunk);
+                    this._handleUnframedChunk(bytes);
                     return;
                 }
-                this._handleFramedChunk(chunk);
+                this._handleFramedChunk(bytes);
             };
             this._handleFramedChunk = (chunk) => {
                 this._log('Notify len=', chunk.length, 'data=', chunk);
@@ -8586,6 +9337,41 @@
                         this._log('parseBySchema error:', e);
                     }
                 }
+            };
+            /**
+             * Merge a bare ACK with the message that follows it, emulating BLE: the module
+             * packs an ACK and the response the firmware wrote straight after it into ONE
+             * notification, and the waiters rely on that — `_waitForAck` hands the
+             * remainder over synchronously via `_lastAckRemainder`. Emitted as two
+             * separate messages, the response would arrive before the caller's `await`
+             * continuation had registered its response handler, and be dropped.
+             *
+             * Two ACKs are never merged: the second would masquerade as the first's
+             * response body.
+             */
+            /**
+             * The framer, told how wide this platform's status response is.
+             *
+             * Only STATUS_RESPONSE's length depends on that — one byte on a Shimmer3, two
+             * on a Shimmer3R — and only this client knows which is answering. Both the
+             * drain and the coalescing check go through here rather than calling the
+             * framer directly, because supplying the option in one place and forgetting
+             * it in the other is not a hypothetical: it made a complete Shimmer3 status
+             * look perpetually one byte short, so the ACK and its response were never
+             * coalesced and the waiter timed out.
+             */
+            this._controlMessageLength = (buf) => shimmer3rControlMessageLength(buf, { statusPayloadBytes: this._statusPayloadBytes });
+            this._coalesceAckWithResponse = (msg, rest) => {
+                if (msg.length !== 1 || msg[0] !== OPCODES.ACK_COMMAND_PROCESSED)
+                    return 0;
+                if (this._expectingAck <= 0)
+                    return 0;
+                if (rest.length === 0 || rest[0] === OPCODES.ACK_COMMAND_PROCESSED)
+                    return 0;
+                const nextLen = this._controlMessageLength(rest);
+                if (nextLen === NEED_MORE || nextLen === RESYNC || rest.length < nextLen)
+                    return 0;
+                return nextLen;
             };
             // ---------------------------------------------------------------------------
             // Firmware version (feature gating)
@@ -8740,6 +9526,10 @@
             // Application-initiated teardown is not a fault, so `onDisconnect` stays
             // silent — including when this call is the cleanup that follows a drop.
             this._suppressDisconnectNotification();
+            // Fail an in-flight capture BEFORE the transport goes: no further bytes are
+            // coming, so there is nothing left to drain, and a caller awaiting the
+            // report must be told rather than left on a timer for the whole budget.
+            this._failFactoryTest('Disconnected while the factory self-test was running.');
             try {
                 this._notifyUnsub?.();
                 this._disconnectUnsub?.();
@@ -8762,6 +9552,14 @@
                 this._sdKnownSession = null;
                 this._emitStatus('Disconnected');
             }
+        }
+        /**
+         * Abandon an in-flight factory-test capture because the link has gone. No
+         * drain: draining exists only to keep a still-arriving report out of the
+         * framer, and nothing is arriving on a link that is closed.
+         */
+        _failFactoryTest(message) {
+            this._factoryTest?.fail(new FactoryTestError('disconnected', message));
         }
         /**
          * Surface a STATUS_RESPONSE nobody asked for on {@link onDeviceStatus}.
@@ -8829,70 +9627,28 @@
                 return;
             }
             this._ctrlBuf = concatU8(this._ctrlBuf, chunk);
-            for (const msg of this._extractUnframedMessages())
-                this._handleFramedChunk(msg);
-        }
-        /**
-         * The framer, told which platform is answering. Only STATUS_RESPONSE's length
-         * depends on that, and only this client knows it.
-         */
-        _controlMessageLength(buf) {
-            return shimmer3rControlMessageLength(buf, { statusPayloadBytes: this._statusPayloadBytes });
-        }
-        /**
-         * Pull every complete message out of {@link _ctrlBuf}, leaving the incomplete
-         * tail behind. Extraction is finished before anything is dispatched so a
-         * handler can never observe a half-updated buffer.
-         */
-        _extractUnframedMessages() {
-            const out = [];
-            let buf = this._ctrlBuf;
-            for (;;) {
-                if (buf.length === 0)
-                    break;
+            /* Dispatch as extracted, not in a batch afterwards: _coalesceAckWithResponse
+             * reads `_expectingAck`, which _handleFramedChunk decrements synchronously
+             * when it consumes an ACK. Batching would evaluate the coalescing decision
+             * for a second ACK+response pair in the same read against a stale count. */
+            const { rest, stopped } = drainByteStream(this._ctrlBuf, {
+                messageLength: this._controlMessageLength,
+                onMessage: (msg) => this._handleFramedChunk(msg),
                 // DATA_PACKET belongs to the stream plane even before `_streaming` is set
                 // (the window between START_STREAMING and its ACK). Its length comes from
                 // the schema, so stop framing and let the stream parser own the rest.
-                if (buf[0] === OPCODES.DATA_PACKET) {
-                    this._rxBuf = concatU8(this._rxBuf, buf);
-                    buf = new Uint8Array(0);
-                    this._parseStreamIfPossible();
-                    break;
-                }
-                const len = this._controlMessageLength(buf);
-                if (len === NEED_MORE)
-                    break;
-                if (len === RESYNC) {
-                    this._log(`serial resync: dropping unframeable byte 0x${buf[0].toString(16)}`);
-                    buf = buf.subarray(1);
-                    continue;
-                }
-                if (buf.length < len)
-                    break; // defensive: framer should have said NEED_MORE
-                const msg = new Uint8Array(buf.subarray(0, len));
-                buf = buf.subarray(len);
-                // Emulate BLE's coalescing: the module packs an ACK and the response the
-                // firmware wrote straight after it into ONE notification, and the waiters
-                // rely on that — `_waitForAck` hands the remainder over synchronously via
-                // `_lastAckRemainder`. Emitted as two separate messages, the response
-                // would arrive before the caller's `await` continuation had registered its
-                // response handler, and be dropped. Two ACKs are never merged: the second
-                // would masquerade as the first's response body.
-                if (msg.length === 1 && msg[0] === OPCODES.ACK_COMMAND_PROCESSED && this._expectingAck > 0) {
-                    const nextLen = this._controlMessageLength(buf);
-                    if (nextLen !== NEED_MORE &&
-                        nextLen !== RESYNC &&
-                        buf.length >= nextLen &&
-                        buf[0] !== OPCODES.ACK_COMMAND_PROCESSED) {
-                        out.push(concatU8(msg, buf.subarray(0, nextLen)));
-                        buf = buf.subarray(nextLen);
-                        continue;
-                    }
-                }
-                out.push(msg);
+                inspect: (buf) => (buf[0] === OPCODES.DATA_PACKET ? 'stop' : 'frame'),
+                coalesce: this._coalesceAckWithResponse,
+                onDrop: (byte) => this._log(`serial resync: dropping unframeable byte 0x${byte.toString(16)}`),
+            });
+            if (stopped) {
+                this._ctrlBuf = new Uint8Array(0);
+                this._rxBuf = concatU8(this._rxBuf, rest);
+                this._parseStreamIfPossible();
             }
-            this._ctrlBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
-            return out;
+            else {
+                this._ctrlBuf = rest;
+            }
         }
         /** Run the schema parser if one has been built, swallowing parse errors. */
         _parseStreamIfPossible() {
@@ -9393,8 +10149,8 @@
          * time and only then the InfoMem — the order desktop
          * `CallableWriteConfig.call()` uses (BasicDock.java:1556-1587). An RTC failure
          * ABORTS the config write rather than being tolerated: the InfoMem write is
-         * not attempted, matching the Java rethrow. Note (DEV-900) that the device
-         * treats the RWC as LOCAL civil time; {@link setRtcTime} carries the detail.
+         * not attempted, matching the Java rethrow. The clock is written as a plain
+         * Unix epoch; {@link setRtcTime} carries the detail.
          *
          * `opts.verify` (default `true`) re-reads the image afterwards and byte-
          * compares it against what was sent, EXCLUDING the ranges a device write
@@ -9612,9 +10368,11 @@
          * same {@link msToRtcBytesLE} helper as the dock path (truncating, matching
          * the Java driver's `(long)(ms * 32.768)`). Call with `Date.now()` to sync
          * the device clock to the host before a drift run.
-         * NOTE (DEV-900): the device treats RWC as LOCAL civil time — pass a
-         * local-adjusted value if that distinction matters for the use case; for
-         * drift measurement only the rate matters, not the epoch.
+         * The value is a plain Unix epoch: desktop Consensys and the Java dock
+         * driver both write `System.currentTimeMillis() * 32.768`, and hardware set
+         * by either reads back as UTC. (The Verisense console's local-civil
+         * convention is that product's, not this one's — do not carry it across.)
+         * For drift measurement only the rate matters, not the epoch.
          */
         async setRtcTime(unixMs) {
             if (!this._transport)
@@ -10022,6 +10780,30 @@
             }
             this._emitStatus('START_STREAM ACK received; frames should follow');
         }
+        /**
+         * Stop streaming (STOP_STREAMING_COMMAND 0x20), best-effort: the command goes
+         * out and the state is cleared without waiting for the ACK the firmware sends
+         * back.
+         *
+         * Not waiting is deliberate. Stream packets keep arriving for hundreds of ms
+         * after the stop, and the framed path routes a notification to its ACK branch
+         * on the first byte alone — so with an ACK outstanding a residual frame that
+         * happened to begin 0xFF would be taken for the ACK and its tail forwarded to
+         * the control plane, which is how a stray 0xFE fabricates a NACK and a stray
+         * 0x02 frames a bogus inquiry. A notification is not frame-aligned, which is
+         * why the stream parser resyncs on a double preamble, so that first byte can
+         * be anything. `Shimmer3Client.stopStreaming` answers the same problem the
+         * long way, draining to quiescence before it re-enables the control plane;
+         * over BLE, where a notification is already one whole message, simply not
+         * waiting is enough — and it costs nothing against firmware that does not
+         * ACK a stop mid-stream at all.
+         *
+         * The price is that the ACK is still in flight when the next command goes
+         * out, and `_expectingAck` counts rather than queues, so it is spent on that
+         * command. {@link withoutLeadingAck} is what keeps that from costing the
+         * command its own reply — read it before making this wait for the ACK after
+         * all.
+         */
         async stopStreaming() {
             this._emitStatus('STOP_STREAM → sending (no ACK wait)…');
             try {
@@ -10052,7 +10834,11 @@
             }
             this._emitStatus('START_BT_STREAM_SD_LOGGING ACK received; frames should follow');
         }
-        /** Stop streaming AND SD card logging. */
+        /**
+         * Stop streaming AND SD card logging (STOP_SDBT_COMMAND 0x97), best-effort
+         * and without waiting for its ACK, for the reasons {@link stopStreaming}
+         * gives.
+         */
         async stopStreamingAndLogging() {
             this._emitStatus('STOP_BT_STREAM_SD_LOGGING → sending…');
             try {
@@ -10306,6 +11092,20 @@
         async _write(u8) {
             if (!this._transport)
                 throw new Error('Not connected (RX missing)');
+            /*
+             * Nothing may be written while a factory test holds the link. The firmware's
+             * main loop is blocked for the whole suite (`shimmer_taskList.c:164`), so a
+             * command sent now is not merely unanswered — it sits in the RX buffer and is
+             * acted on minutes later, and its ACK lands in the middle of somebody's
+             * report. Refusing here is what makes the report trustworthy.
+             *
+             * {@link runFactoryTest} writes its own command through the transport
+             * directly, so this guard cannot lock out the very command that arms it.
+             */
+            if (this._factoryTest) {
+                throw new FactoryTestError('busy', 'A factory test is running, or its report is still draining — ' +
+                    'await whenFactoryTestIdle() before sending another command.');
+            }
             this._log('Write', u8);
             await this._transport.write(u8);
         }
@@ -10649,6 +11449,213 @@
                 this._rxBuf = new Uint8Array(0);
                 this._ctrlBuf = new Uint8Array(0);
             }
+        }
+        // ---------------------------------------------------------------------------
+        // Factory self-test (SET_FACTORY_TEST 0xA8) and the red-LED override
+        // ---------------------------------------------------------------------------
+        /**
+         * What the factory-test runner is doing: `idle` when the link is free,
+         * `running` while the report is being captured, `draining` while a cancelled
+         * or timed-out report is still being swallowed.
+         */
+        get factoryTestState() {
+            return this._factoryTest?.state ?? 'idle';
+        }
+        /**
+         * Resolve when the link is free again. Never rejects — a failed run still
+         * releases the link, and this is the wait a host needs after cancelling one.
+         */
+        whenFactoryTestIdle() {
+            return this._factoryTest?.idle ?? Promise.resolve();
+        }
+        /**
+         * Run the sensor's built-in factory self-test and return its report.
+         *
+         * `SET_FACTORY_TEST` (0xA8) with one type byte
+         * (`Comms/shimmer_bt_uart.c:1285-1293`) makes the firmware ACK and then print
+         * the same report it prints on the production line — as raw ASCII on this very
+         * link, with no framing and no CRC (`Test/shimmer_test.c:22-61`). The
+         * {@link FactoryTestCapture} owns those bytes for the duration; see its
+         * docblock for the phases and the tail handoff.
+         *
+         * Three things about this command are unlike every other one here:
+         * - **It cannot be stopped.** The firmware has no abort; its main loop is
+         *   blocked for the whole suite (`shimmer_taskList.c:164`). `opts.signal`
+         *   stops this client *listening*, and the link stays busy until the report
+         *   ends — {@link whenFactoryTestIdle} is how a host waits that out.
+         * - **Nothing else may be written meanwhile.** Every other command rejects
+         *   with a {@link FactoryTestError} of reason `busy` until the capture is idle.
+         * - **It is refused while sensing.** `ShimBt_isCmdBlockedWhileSensing`
+         *   (`Comms/shimmer_bt_uart.c:2985`) NACKs it while streaming or logging, and
+         *   also when SD sync is enabled.
+         *
+         * @param type 0 MAIN, 1 LEDS, 2 ICS, 3 LED_STATES (`Test/shimmer_test.h:21-27`).
+         * @param opts see {@link FactoryTestRunOptions}; `timeoutMs` defaults to the
+         *   type's own entry in `SHIMMER3_FACTORY_TEST_TYPES`.
+         * @returns the report text, CRLF line endings intact.
+         * @throws RangeError for a type the firmware would ACK and then print nothing
+         *   for; {@link FactoryTestError} with reason `nack` (sensing), `busy`
+         *   (another run), `no-response`, `timeout` or `disconnected`; or a
+         *   `DOMException` named `AbortError` when `opts.signal` fires.
+         *
+         * HARDWARE-VERIFY: no real Shimmer3 or Shimmer3R has run this path yet.
+         */
+        async runFactoryTest(type, opts = {}) {
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            // Validated before anything is written, so an out-of-range type costs the
+            // caller an exception rather than a minute of silence.
+            const info = requireShimmer3FactoryTestType(type);
+            if (this._factoryTest) {
+                throw new FactoryTestError('busy', 'A factory test is already running, or its report is still draining — ' +
+                    'await whenFactoryTestIdle() first.');
+            }
+            if (this._streaming) {
+                throw new FactoryTestError('nack', 'The sensor is streaming, and the firmware refuses a factory self-test while it is. ' +
+                    'Stop the stream first.');
+            }
+            if (opts.signal?.aborted) {
+                throw new DOMException('Factory test aborted', 'AbortError');
+            }
+            /*
+             * Preflight: ask what the sensor is doing so a refusal can say "it is
+             * sensing" instead of arriving as a bare 0xFE two seconds later — the button
+             * on the sensor can have started an SD recording this host knows nothing
+             * about. Deliberately NOT fatal when the status read itself fails: an old or
+             * busy firmware that will happily run the test must not be blocked by a
+             * diagnostic.
+             */
+            if (opts.preflight ?? true) {
+                try {
+                    const status = await this.getStatus();
+                    if (status.sensing) {
+                        throw new FactoryTestError('nack', 'The sensor is sensing — streaming, or recording to its SD card — and the firmware ' +
+                            'refuses a factory self-test while it is. Stop the stream or the SD recording first.');
+                    }
+                }
+                catch (err) {
+                    if (err instanceof FactoryTestError)
+                        throw err;
+                    this._emitStatus(`Factory-test preflight status read failed (${err.message}); running anyway.`);
+                }
+            }
+            const transport = this._transport;
+            if (!transport)
+                throw new Error('Not connected (RX missing)');
+            // Nothing left over from before may be mistaken for the first report line.
+            this._rxBuf = new Uint8Array(0);
+            this._ctrlBuf = new Uint8Array(0);
+            const capture = new FactoryTestCapture(classifyLiteProtocolAck, {
+                ...opts,
+                timeoutMs: opts.timeoutMs ?? info.defaultTimeoutMs,
+                onStateChange: (state) => {
+                    /* The release runs BEFORE the host is told, so a host that issues its
+                     * next command straight out of this callback is not refused by the busy
+                     * guard the run it was just told had ended. */
+                    if (state === 'idle')
+                        this._releaseFactoryTest();
+                    try {
+                        this.onFactoryTestStateChange?.(state);
+                    }
+                    catch (e) {
+                        this._log('onFactoryTestStateChange handler error', e);
+                    }
+                },
+            });
+            this._factoryTest = capture;
+            capture.start();
+            this._emitStatus(`SET_FACTORY_TEST ${info.name} → the sensor will print its report…`);
+            try {
+                // Straight to the transport: `_write` refuses everything while a capture
+                // exists, and that guard must not lock out the command that arms it.
+                await transport.write(buildSetFactoryTestCommand(info.value));
+            }
+            catch (err) {
+                capture.fail(new FactoryTestError('disconnected', `Could not send the factory-test command: ${err.message}`));
+            }
+            return capture.result;
+        }
+        /**
+         * Let go of the link at the end of a run: clear the capture, then drop
+         * anything the report left in the accumulators. Called from the capture's own
+         * `idle` transition, so it happens before the tail bytes it hands back are
+         * routed through the framer.
+         */
+        _releaseFactoryTest() {
+            this._factoryTest = null;
+            this._rxBuf = new Uint8Array(0);
+            this._ctrlBuf = new Uint8Array(0);
+            this._emitStatus('Factory test finished — the link is free again');
+        }
+        /**
+         * Flip the firmware's red-LED override (`TOGGLE_LED_COMMAND` 0x06,
+         * `Comms/shimmer_bt_uart.c:603, :910-914`).
+         *
+         * The command toggles `shimmerStatus.toggleLedRedCmd`, and while it is set the
+         * LED manager holds the LOWER LED solid red (`LEDs/shimmer_leds.c:425-428`) —
+         * above the SD-error and battery indications, below a button press. That makes
+         * it the "which sensor is this one" aid.
+         *
+         * Two things to know: the flag is **never cleared by the firmware**, so it
+         * survives a disconnect and stays lit until it is toggled again or the sensor
+         * loses power; and it is readable back as status bit 7
+         * (`ShimBt_assembleStatusBytes`, `:2920-2932`) — {@link Shimmer3DeviceStatus}
+         * `redLedOn` — which is what {@link setRedLed} uses to make "on"/"off" mean
+         * something.
+         *
+         * While streaming this writes without waiting for the ACK: every inbound byte
+         * belongs to the data plane then, so the ACK would be consumed by the schema
+         * parser and the wait would time out on a command the firmware did in fact run.
+         *
+         * HARDWARE-VERIFY: that the lower LED visibly lights, and that the flag really
+         * does survive a disconnect, want confirming on a sensor.
+         */
+        async toggleLed() {
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            const cmd = new Uint8Array([OPCODES.TOGGLE_LED_COMMAND]);
+            if (this._streaming) {
+                await this._write(cmd);
+                this._emitStatus('TOGGLE_LED written (no ACK wait — streaming)');
+                return;
+            }
+            await this._writeExpectingAck(cmd, 1500);
+            this._emitStatus('TOGGLE_LED ACKed');
+        }
+        /**
+         * Drive the red-LED override to a definite state rather than flipping it.
+         *
+         * The firmware offers only a toggle, so this is a read-modify-verify:
+         * {@link getStatus} for the current bit, {@link toggleLed} only if it differs,
+         * then a second read to confirm. Calling it twice with the same argument
+         * writes nothing the second time.
+         *
+         * @returns the LED state read back from the sensor.
+         * @throws when the sensor is streaming (the status reads are unavailable), or
+         *   when the read-back does not match — which means something else moved the
+         *   flag between the two reads, and silently reporting success would be worse
+         *   than saying so.
+         */
+        async setRedLed(on) {
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            if (this._streaming) {
+                throw new Error('The red LED cannot be set while streaming: the state read it needs is lost in the ' +
+                    'stream data. Use toggleLed() if a blind flip will do.');
+            }
+            const before = await this.getStatus();
+            if (before.redLedOn === on) {
+                this._emitStatus(`Red LED already ${on ? 'on' : 'off'}`);
+                return on;
+            }
+            await this.toggleLed();
+            const after = await this.getStatus();
+            if (after.redLedOn !== on) {
+                throw new Error(`Red LED did not follow: asked for ${on ? 'on' : 'off'}, the sensor reports ` +
+                    `${after.redLedOn ? 'on' : 'off'}.`);
+            }
+            this._emitStatus(`Red LED ${on ? 'on' : 'off'}`);
+            return after.redLedOn;
         }
         _sdAcquire() {
             this._sdUsers++;
@@ -13089,51 +14096,49 @@
          * ACK/response machinery below.
          */
         _drainControl() {
-            let buf = this._rxBuf;
-            for (;;) {
-                if (buf.length === 0)
-                    break;
-                // While a stream is (about to be) live, DATA_PACKET (0x00) bytes belong to
-                // the stream parser, not the control plane — leave them buffered.
-                if ((this._streaming || this._streamStarting) && buf[0] === OPCODES.DATA_PACKET)
-                    break;
-                // Only frame 0x02 as an INQUIRY_RESPONSE when an inquiry is actually
-                // awaited; an unexpected 0x02 is a stray/stream byte and framing it would
-                // swallow real control bytes. Drop it instead.
-                if (buf[0] === OPCODES.INQUIRY_RESPONSE && this._awaitInq <= 0) {
-                    this._log('drainControl: dropping 0x02 — no INQUIRY awaited');
-                    buf = buf.subarray(1);
-                    continue;
-                }
-                // Same guard for NACK (0xFE): only frame it as a control message while a
-                // command is genuinely awaiting a response (_awaitCmd > 0). A stray 0xFE —
-                // e.g. a late residual byte arriving after the stop-drain returned early —
-                // is dropped instead of framed. This diverges from the Java driver
-                // (ShimmerObject processes every 0xFE unconditionally) but strictly reduces
-                // the risk of a leaked stream byte being mistaken for a NACK, mirroring the
-                // 0x02 gate above. Defence-in-depth: today _onTemp handlers are added only
-                // while _awaitCmd > 0, so an ungated stray 0xFE would emit to no listener;
-                // this guard keeps that invariant explicit and survives refactors that add
-                // a longer-lived control listener.
-                if (buf[0] === NACK && this._awaitCmd <= 0) {
-                    this._log('drainControl: dropping 0xFE — no command awaited');
-                    buf = buf.subarray(1);
-                    continue;
-                }
-                const len = shimmer3ControlMessageLength(buf);
-                if (len === NEED_MORE$1)
-                    break;
-                if (len === RESYNC$1) {
-                    this._log(`resync: dropping unexpected control byte 0x${buf[0].toString(16)}`);
-                    buf = buf.subarray(1);
-                    continue;
-                }
-                if (buf.length < len)
-                    break; // full message not here yet
-                this._emitTemp(new Uint8Array(buf.subarray(0, len)));
-                buf = buf.subarray(len);
-            }
-            this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
+            /* Dispatch each message as it is extracted, NOT in a batch afterwards: the
+             * `_awaitInq`/`_awaitCmd` gates in _inspectControlHead are decremented
+             * synchronously inside the waiter handlers that _emitTemp invokes. Draining
+             * first and emitting later would inspect every head byte against the gate
+             * state as it was before any response was delivered, so a stray 0x02 sharing
+             * a read with a genuine INQUIRY_RESPONSE would still look awaited and get
+             * framed - swallowing the ACK behind it. */
+            const { rest } = drainByteStream(this._rxBuf, {
+                messageLength: shimmer3ControlMessageLength,
+                inspect: (buf) => this._inspectControlHead(buf),
+                onMessage: (msg) => this._emitTemp(msg),
+                onDrop: (byte, reason) => this._log(reason === 'resync'
+                    ? `resync: dropping unexpected control byte 0x${byte.toString(16)}`
+                    : `drainControl: dropping gated byte 0x${byte.toString(16)}`),
+            });
+            this._rxBuf = rest;
+        }
+        /**
+         * Gate the head byte before framing is attempted.
+         *
+         * Three bytes are only control traffic in the right context, and framing one
+         * out of context would swallow the real control bytes behind it:
+         *
+         * - DATA_PACKET (0x00) while a stream is (about to be) live belongs to the
+         *   stream parser — stop and leave it buffered.
+         * - INQUIRY_RESPONSE (0x02) with no inquiry outstanding is a stray/stream
+         *   byte; framing it would consume `9 + numChannels` bytes of garbage.
+         * - NACK (0xFE) with no command outstanding is likewise dropped. This diverges
+         *   from the Java driver (ShimmerObject processes every 0xFE unconditionally)
+         *   but strictly reduces the risk of a leaked stream byte being read as a NACK.
+         *   Defence-in-depth: `_onTemp` handlers are only added while `_awaitCmd > 0`,
+         *   so an ungated stray 0xFE would emit to no listener anyway — this keeps that
+         *   invariant explicit and survives refactors that add a longer-lived listener.
+         */
+        _inspectControlHead(buf) {
+            const head = buf[0];
+            if ((this._streaming || this._streamStarting) && head === OPCODES.DATA_PACKET)
+                return 'stop';
+            if (head === OPCODES.INQUIRY_RESPONSE && this._awaitInq <= 0)
+                return 'drop';
+            if (head === NACK && this._awaitCmd <= 0)
+                return 'drop';
+            return 'frame';
         }
         // ---------------------------------------------------------------------------
         // Configuration commands
@@ -14019,10 +15024,24 @@
              * write. See {@link _serialize}.
              */
             this._queue = Promise.resolve();
+            /**
+             * The in-flight factory-test capture, or null when none is running. Non-null
+             * for the whole time the report owns the link — including the drain after a
+             * cancelled or timed-out run, because the firmware has no abort command and
+             * keeps printing regardless.
+             */
+            this._factoryTest = null;
+            /**
+             * Invoked whenever {@link factoryTestState} changes, synchronously. A host
+             * uses it to hold its own "the link is busy" gate through the whole run,
+             * including the `draining` phase when the sensor is still printing.
+             */
+            this.onFactoryTestStateChange = null;
             // Cached device info
             this.identity = null;
             /** Handle an unexpected transport disconnect (the dock UART went away). */
             this._handleTransportDisconnect = (reason) => {
+                this._failFactoryTest('The link dropped during the factory self-test.');
                 this._emitStatus('Dock disconnected');
                 this._emitDisconnect(reason);
             };
@@ -14033,7 +15052,17 @@
                 if (!chunk || chunk.length === 0)
                     return;
                 this._log('Notify len=', chunk.length);
-                this._rxBuf = concatU8(this._rxBuf, chunk);
+                /* A running factory test is served FIRST. Its report is bare text with no
+                   packet header, so the parser below would drop it a byte at a time; what
+                   the capture hands back is whatever was NOT report traffic. */
+                let bytes = chunk;
+                if (this._factoryTest) {
+                    const rest = this._factoryTest.feed(bytes);
+                    if (!rest || rest.length === 0)
+                        return;
+                    bytes = rest;
+                }
+                this._rxBuf = concatU8(this._rxBuf, bytes);
                 this._drain();
             };
             this._injectedTransport = opts.transport ?? null;
@@ -14072,6 +15101,10 @@
             this._emitStatus(`Connected: ${this._deviceLabel()}`);
         }
         async disconnect() {
+            // Fail an in-flight capture BEFORE the transport goes: no further bytes are
+            // coming, so there is nothing to drain, and a caller awaiting the report
+            // must be told rather than left waiting out the whole budget.
+            this._failFactoryTest('Disconnected while the factory self-test was running.');
             // Application-initiated teardown is not a fault, so `onDisconnect` stays
             // silent — including when this call is the cleanup that follows a drop.
             this._suppressDisconnectNotification();
@@ -14101,6 +15134,118 @@
          */
         resyncStream() {
             this._rxBuf = new Uint8Array(0);
+        }
+        // ---------------------------------------------------------------------------
+        // Factory self-test (component UART_COMPONENT.TEST)
+        // ---------------------------------------------------------------------------
+        /**
+         * What the factory-test runner is doing: `idle` when the link is free,
+         * `running` while a report is being captured, `draining` while a cancelled or
+         * timed-out report is still being swallowed.
+         */
+        get factoryTestState() {
+            return this._factoryTest?.state ?? 'idle';
+        }
+        /**
+         * Resolve when the link is free again. Never rejects — a failed run still
+         * releases the link, and this is the wait a host needs after cancelling one.
+         */
+        whenFactoryTestIdle() {
+            return this._factoryTest?.idle ?? Promise.resolve();
+        }
+        /**
+         * Run the docked sensor's factory self-test and return its report.
+         *
+         * The dock protocol addresses the test as a WRITE to `UART_COMPONENT.TEST`
+         * whose PROPERTY byte is the test type, with no payload
+         * (`Comms/shimmer_dock_usart.c:473-486`). The firmware ACKs it and then prints
+         * the same report the Bluetooth command produces — as raw text on this link,
+         * with no packet framing and no CRC. A type the firmware does not know is
+         * answered BAD_CMD, which surfaces here as a `nack`.
+         *
+         * On a Shimmer3R the report goes to the USB CDC port when the sensor is
+         * plugged in by USB and to the dock UART otherwise (`hal_FactoryTest.c`), so
+         * this one method serves a docked sensor and a USB-C-connected one alike.
+         *
+         * Two caveats worth passing on to whoever reads the report:
+         * - The whole run holds this client's command queue. Nothing else reaches the
+         *   sensor until the report ends — which is the truth about the firmware, not
+         *   a limitation here: its main loop is blocked for the duration.
+         * - **The ExG chip test cannot pass from the dock.** Shimmer3 firmware prints
+         *   `- FAIL: ADS1292R test will not work from dock` because the dock UART and
+         *   that chip share pins. A FAIL on that line from this transport says nothing
+         *   about the board; run the test over Bluetooth to judge it.
+         *
+         * @param type 0 MAIN, 1 LEDS, 2 ICS, 3 LED_STATES (`Test/shimmer_test.h:21-27`).
+         * @param opts see {@link FactoryTestRunOptions}; `timeoutMs` defaults to the
+         *   type's own entry in `SHIMMER3_FACTORY_TEST_TYPES`. `preflight` is ignored:
+         *   the dock protocol has no equivalent status read.
+         * @returns the report text, CRLF line endings intact.
+         *
+         * HARDWARE-VERIFY: no docked Shimmer3 or USB-C Shimmer3R has run this path.
+         */
+        async runFactoryTest(type, opts = {}) {
+            const info = requireShimmer3FactoryTestType(type);
+            if (this._factoryTest) {
+                throw new FactoryTestError('busy', 'A factory test is already running, or its report is still draining — ' +
+                    'await whenFactoryTestIdle() first.');
+            }
+            return this._serialize(() => this._runFactoryTestImpl(info, opts));
+        }
+        async _runFactoryTestImpl(info, opts) {
+            const transport = this._transport;
+            if (!transport)
+                throw new Error('Not connected');
+            if (opts.signal?.aborted)
+                throw new DOMException('Factory test aborted', 'AbortError');
+            // Nothing left over from before may be mistaken for the first report line.
+            this._rxBuf = new Uint8Array(0);
+            const capture = new FactoryTestCapture(classifyFactoryTestAckPacket, {
+                ...opts,
+                timeoutMs: opts.timeoutMs ?? info.defaultTimeoutMs,
+                onStateChange: (state) => {
+                    /* Release before telling the host, so a host that issues its next
+                       command straight out of this callback is not refused by the run it
+                       was just told had ended. */
+                    if (state === 'idle')
+                        this._releaseFactoryTest();
+                    try {
+                        this.onFactoryTestStateChange?.(state);
+                    }
+                    catch (e) {
+                        this._log('onFactoryTestStateChange handler error', e);
+                    }
+                },
+            });
+            this._factoryTest = capture;
+            capture.start();
+            this._emitStatus(`Factory test ${info.name} requested — the sensor will print its report…`);
+            try {
+                await transport.write(buildWritePacket(UART_PROP.TEST[info.name], new Uint8Array(0)));
+            }
+            catch (err) {
+                capture.fail(new FactoryTestError('disconnected', `Could not send the factory-test command: ${err.message}`));
+            }
+            return capture.result;
+        }
+        /**
+         * Let go of the link at the end of a run: clear the capture, then drop
+         * anything the report left in the accumulator. Called from the capture's own
+         * `idle` transition, so it happens before the tail bytes it hands back are
+         * routed through the packet parser.
+         */
+        _releaseFactoryTest() {
+            this._factoryTest = null;
+            this._rxBuf = new Uint8Array(0);
+            this._emitStatus('Factory test finished — the link is free again');
+        }
+        /**
+         * Abandon an in-flight capture because the link has gone. No drain: draining
+         * exists to keep a still-arriving report out of the packet parser, and nothing
+         * is arriving on a link that is closed.
+         */
+        _failFactoryTest(message) {
+            this._factoryTest?.fail(new FactoryTestError('disconnected', message));
         }
         /** Streaming is not part of the dock UART protocol. */
         async startStreaming() {
@@ -14536,42 +15681,35 @@
         }
         /**
          * Extract every complete packet currently buffered and dispatch each to the
-         * temp handlers, keeping the incomplete tail for the next chunk. A packet
-         * whose CRC fails is dropped one byte at a time to resync (matching the Java
-         * `parseSinglePacket` CRC-fail path).
+         * temp handlers, keeping the incomplete tail for the next chunk.
+         *
+         * Runs on the shared {@link drainByteStream} loop, decoding straight to
+         * {@link UartRxPacket} so the temp handlers receive parsed packets. A packet
+         * that frames but fails its CRC (or will not parse) is refused, and the drain
+         * resyncs by ONE byte rather than skipping the whole supposed length —
+         * matching the Java `parseSinglePacket` CRC-fail path, on the reasoning that a
+         * bad CRC means the framing itself was probably wrong.
          */
         _drain() {
-            let buf = this._rxBuf;
-            for (;;) {
-                if (buf.length === 0)
-                    break;
-                const len = wiredPacketLength(buf);
-                if (len === NEED_MORE$2)
-                    break;
-                if (len === RESYNC$2) {
-                    this._log(`resync: dropping byte 0x${buf[0].toString(16)}`);
-                    buf = buf.subarray(1);
-                    continue;
-                }
-                if (buf.length < len)
-                    break; // full packet not here yet
-                let pkt;
-                try {
-                    pkt = parseUartPacket(buf);
-                }
-                catch {
-                    buf = buf.subarray(1); // malformed — resync
-                    continue;
-                }
-                if (!pkt.crcOk) {
-                    this._log('bad CRC → dropping 1 byte to resync');
-                    buf = buf.subarray(1);
-                    continue;
-                }
+            const { messages, rest } = drainByteStream(this._rxBuf, {
+                messageLength: wiredPacketLength,
+                decode: (msg) => {
+                    let pkt;
+                    try {
+                        pkt = parseUartPacket(msg);
+                    }
+                    catch {
+                        return null; // malformed
+                    }
+                    return pkt.crcOk ? pkt : null;
+                },
+                onDrop: (byte, reason) => this._log(reason === 'rejected'
+                    ? 'bad CRC or malformed packet → dropping 1 byte to resync'
+                    : `resync: dropping byte 0x${byte.toString(16)}`),
+            });
+            this._rxBuf = rest;
+            for (const pkt of messages)
                 this._emitTemp(pkt);
-                buf = buf.subarray(pkt.length);
-            }
-            this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
         }
         _onTemp(fn) {
             this._temps.add(fn);
@@ -23740,6 +24878,426 @@
         };
     }
 
+    /**
+     * Temperature in parentheses at the end of a chip self-test line.
+     *
+     * The only regex deliberately widened when the Verisense parser became shared:
+     * Verisense prints whole degrees with a degree sign (`(25° C)`, or `(25Â° C)`
+     * when the byte reached us through a latin1 decode), Shimmer3R prints two
+     * decimal places with the sign spelled out (`(24.37 degC)`, `(-3.50 degC)`).
+     * Firmware: `Shimmer_Driver/hal_FactoryTest.c:1266`.
+     */
+    const TEMPERATURE_IN_PARENS = /\(\s*(-?\d+(?:\.\d+)?)\s*(?:°\s*C|deg\s*C)\s*\)/i;
+    /** Shared shape of the IMU-class self-test lines: optional temperature in
+     * parentheses plus an optional failure-reason suffix. */
+    function chipDetail(body, out, prefix) {
+        setNum(out, `${prefix}_temp_c`, TEMPERATURE_IN_PARENS.exec(body)?.[1]);
+        const reason = /-\s*(Chip not detected|Signal issue|Temperature issue|DRDY\/INT issue|Unknown)/i.exec(body)?.[1];
+        if (reason)
+            out[`${prefix}_fail_reason`] = reason.trim();
+    }
+    function num(value) {
+        if (value == null || value === '')
+            return undefined;
+        const n = Number(value);
+        return Number.isFinite(n) ? n : undefined;
+    }
+    /** Record `value` under `key` when it parses as a finite number. */
+    function setNum(out, key, value) {
+        const n = num(value);
+        if (n !== undefined)
+            out[key] = n;
+    }
+    /** Record `value` under `key` when it is a non-empty string. */
+    function setStr(out, key, value) {
+        const s = value?.trim();
+        if (s)
+            out[key] = s;
+    }
+    /**
+     * Fold the several ways a degree sign can reach us into a single `°`.
+     *
+     * The firmware emits a bare `0xB0` on some builds and UTF-8 `0xC2 0xB0` on
+     * others; depending on how the transport decoded the bytes we see the degree
+     * sign itself, the mojibake a latin1 decode of the UTF-8 pair produces, or the
+     * Unicode replacement character. This file is UTF-8; the three source literals
+     * below are those exact three encodings and must not be "tidied".
+     */
+    function normalizeReportText(text) {
+        return String(text ?? '')
+            .replace(/Â°/g, '°')
+            .replace(/�/g, '°');
+    }
+    /** Split into lines, dropping progress dots and re-splitting lines that the
+     * firmware's fixed-size buffer glued together. */
+    function toLines(text, anchors, warnings) {
+        const out = [];
+        let stripped = 0;
+        for (const raw of text.split(/\r\n|\r|\n/)) {
+            // The NAND health test streams bare dots to keep the host's idle timer
+            // alive; they arrive with no newline of their own.
+            if (/^[.\s]*$/.test(raw) && /\./.test(raw)) {
+                stripped += 1;
+                continue;
+            }
+            const line = raw.replace(/\.{3,}\s*$/, '');
+            for (const piece of repairLine(line, anchors, warnings)) {
+                if (piece.trim())
+                    out.push(piece);
+            }
+        }
+        if (stripped)
+            warnings.push(`stripped ${stripped} progress-dot line(s)`);
+        return out;
+    }
+    /** Re-split one physical line wherever a known line start appears mid-line. */
+    function repairLine(line, anchors, warnings) {
+        let earliest = -1;
+        for (const anchor of anchors) {
+            anchor.lastIndex = 0;
+            let m;
+            while ((m = anchor.exec(line)) !== null) {
+                if (m.index > 0 && (earliest < 0 || m.index < earliest))
+                    earliest = m.index;
+                // A non-global anchor would loop forever on the same match.
+                if (!anchor.global)
+                    break;
+            }
+        }
+        if (earliest <= 0)
+            return [line];
+        warnings.push(`repaired a line truncated by the firmware buffer near column ${earliest}`);
+        const head = line.slice(0, earliest);
+        return [head, ...repairLine(line.slice(earliest), anchors, warnings)];
+    }
+    /** Read the verdict keyword, if any, off the text following the test id. */
+    function readVerdict(body) {
+        const m = /^\s*(PASS|FAIL|WARNING)\b/i.exec(body);
+        if (m)
+            return m[1].toUpperCase();
+        if (/not applicable/i.test(body))
+            return 'NOT_APPLICABLE';
+        if (body.trim())
+            return 'INFO';
+        return 'UNKNOWN';
+    }
+    /** How loudly a verdict should shout when two lines of one test disagree. */
+    const VERDICT_SEVERITY = {
+        FAIL: 5,
+        WARNING: 4,
+        PASS: 3,
+        NOT_APPLICABLE: 2,
+        INFO: 1,
+        UNKNOWN: 0,
+    };
+    function worstVerdict(a, b) {
+        return VERDICT_SEVERITY[b] > VERDICT_SEVERITY[a] ? b : a;
+    }
+    /**
+     * Fallback for a test this build of the SDK has never seen: keep any
+     * `Key = value` pairs so a firmware change still lands data in the sheet.
+     */
+    function scrapeGenericMetrics(body, name, out) {
+        const re = /([A-Za-z][A-Za-z0-9 _-]{0,40}?)\s*=\s*([-+]?\d+(?:\.\d+)?)/g;
+        let m;
+        while ((m = re.exec(body)) !== null) {
+            const key = `${name}_${m[1]
+            .trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '_')}`;
+            setNum(out, key, m[2]);
+        }
+    }
+    /** The empty overall block, so callers building an empty result agree on it. */
+    function emptyFactoryTestOverall() {
+        return { result: null, failMaskHex: null, failMask: null, failedTestNames: [] };
+    }
+    /**
+     * Parse a full factory test report into structured metrics under `grammar`.
+     *
+     * Never throws: malformed or unrecognized input comes back with `ok: false`
+     * and/or its lines preserved in `unparsedLines`.
+     */
+    function parseFactoryTestReport(text, grammar, empty) {
+        const result = empty();
+        try {
+            const normalize = grammar.normalizeText ?? normalizeReportText;
+            parseInto(normalize(text), grammar, result);
+        }
+        catch (err) {
+            result.parserWarnings.push(`parser error: ${String(err?.message ?? err)}`);
+        }
+        return result;
+    }
+    function parseInto(text, grammar, result) {
+        const warnings = result.parserWarnings;
+        const lines = toLines(text, grammar.repairAnchors, warnings);
+        const metrics = result.metrics;
+        /** Canonical name of the test each printed id was seen against, so the fail
+         * mask can be decoded under whichever numbering this report used. */
+        const nameById = new Map();
+        /** Tests printed without a number, in print order, so a mask can still be
+         * decoded positionally when the family prints no ids at all. */
+        const idlessTests = [];
+        const byName = new Map();
+        let ledSeen = 0;
+        /** Held in an object so the assignment inside `pushTest` stays visible to
+         * the type checker at every use site. */
+        const open = { test: null };
+        const idPattern = new RegExp(`^-?\\s*${grammar.idToken}_(\\d{4})\\s*-\\s*(.*)$`, 'i');
+        const firmwarePattern = grammar.firmwareVersion ?? /^Firmware version\s*:\s*v?([\d.]+)/i;
+        const maskTestName = grammar.maskTestName ??
+            ((id) => `${grammar.idToken.toLowerCase()}_${String(id).padStart(4, '0')}`);
+        const pushTest = (test) => {
+            if (grammar.mergeRepeatedNames) {
+                const existing = byName.get(test.name);
+                if (existing) {
+                    existing.verdict = worstVerdict(existing.verdict, test.verdict);
+                    existing.detail = existing.detail ? `${existing.detail} | ${test.detail}` : test.detail;
+                    Object.assign(existing.metrics, test.metrics);
+                    if (existing.id == null && test.id != null)
+                        existing.id = test.id;
+                    if (test.id != null)
+                        nameById.set(test.id, existing.name);
+                    open.test = existing;
+                    return existing;
+                }
+                byName.set(test.name, test);
+            }
+            result.tests.push(test);
+            if (test.id != null)
+                nameById.set(test.id, test.name);
+            else
+                idlessTests.push(test);
+            open.test = test;
+            return test;
+        };
+        const addDetail = (line) => {
+            const test = open.test;
+            if (!test)
+                return;
+            test.detail = test.detail ? `${test.detail} | ${line.trim()}` : line.trim();
+        };
+        const warn = (message) => {
+            warnings.push(message);
+        };
+        const ctx = () => ({
+            result,
+            metrics,
+            current: open.test,
+            pushTest,
+            addDetail,
+            warn,
+        });
+        /** Route a classified test line through the LED naming rule when the family
+         * has one, so a not-applicable LED line lands on the same entry the LED
+         * heading would have created. */
+        const resolveNames = (classifierName, fallbackName, fallbackLabel, id) => {
+            if (grammar.ledTest &&
+                grammar.ledClassifierName &&
+                classifierName === grammar.ledClassifierName) {
+                const named = grammar.ledTest(ledSeen, id);
+                ledSeen += 1;
+                return named;
+            }
+            return { name: fallbackName, label: fallbackLabel };
+        };
+        /** The classifier a printed test number points at, when the line's own words
+         * said nothing. Gives the id-named test its label and extractor. */
+        const classifierForId = (id) => {
+            const named = grammar.testNameById?.(id);
+            if (!named)
+                return undefined;
+            return (grammar.classifiers.find((c) => c.name === named) ?? {
+                name: named,
+                label: named,
+                match: /(?!)/,
+            });
+        };
+        /** Build, classify and file one test line, merging into an earlier test of
+         * the same name when the grammar asks for it. */
+        const recordTest = (body, id, name, label, classifier) => {
+            const verdict = readVerdict(body);
+            const testMetrics = {};
+            classifier?.extract?.(body, testMetrics);
+            if (!classifier)
+                scrapeGenericMetrics(body, name, testMetrics);
+            // A verdict column is only worth a spreadsheet cell when it can vary:
+            // PASS/FAIL/WARNING record an outcome and NOT_APPLICABLE records a
+            // model gate, but INFO just means "an informational line printed" — its
+            // substance is already in that line's own metrics (usb_power_good,
+            // charger_status, ...), so emitting it would waste a column per test.
+            const resultKey = classifier?.resultKey ?? `${name}_result`;
+            if (verdict !== 'INFO')
+                testMetrics[resultKey] = verdict;
+            const test = pushTest({ id, name, label, verdict, detail: body.trim(), metrics: testMetrics });
+            // After a merge the surviving verdict may be worse than this line's.
+            if (test.verdict !== 'INFO')
+                test.metrics[resultKey] = test.verdict;
+            Object.assign(metrics, test.metrics);
+        };
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (/TEST START/.test(trimmed)) {
+                result.ok = true;
+                continue;
+            }
+            if (/TEST END/.test(trimmed)) {
+                result.complete = true;
+                continue;
+            }
+            const fw = firmwarePattern.exec(trimmed);
+            if (fw) {
+                result.firmwareVersion = fw[1];
+                metrics.fw_version = fw[1];
+                continue;
+            }
+            const range = /Temperature pass range set to\s*(-?\d+)\s*-\s*(-?\d+)/i.exec(trimmed);
+            if (range) {
+                setNum(metrics, 'temp_range_low_c', range[1]);
+                setNum(metrics, 'temp_range_high_c', range[2]);
+                continue;
+            }
+            const overall = /^Overall Result\s*=\s*(PASS|FAIL)(?:\s*\(\s*(0x[0-9A-Fa-f]+)\s*\))?/i.exec(trimmed);
+            if (overall) {
+                result.overall.result = overall[1].toUpperCase();
+                metrics.overall_result = result.overall.result;
+                if (overall[2]) {
+                    result.overall.failMaskHex = overall[2].toUpperCase().replace('0X', '0x');
+                    result.overall.failMask = Number.parseInt(overall[2], 16);
+                    metrics.fail_mask_hex = result.overall.failMaskHex;
+                }
+                continue;
+            }
+            // Section headers (`MCU:`, `SPIM3:` …) carry no data but end the previous
+            // test's sub-line run.
+            if (grammar.sectionHeadings.test(trimmed)) {
+                open.test = null;
+                continue;
+            }
+            if (grammar.headerLine?.(trimmed, ctx()))
+                continue;
+            // `LED test (WS_TEST_0019):` — the family decides what the n-th such block
+            // is called; ordering survives renumbering.
+            const ledHeader = grammar.ledHeading?.exec(trimmed);
+            if (ledHeader) {
+                const id = ledHeader[1] ? Number(ledHeader[1]) : null;
+                const named = grammar.ledTest?.(ledSeen, id) ?? { name: 'led', label: 'LED test' };
+                ledSeen += 1;
+                pushTest({ id, ...named, verdict: 'INFO', detail: '', metrics: {} });
+                // Deliberately no `<name>_result` metric: an INFO verdict carries no
+                // data (the LED test is operator-visual narration), and which suite ran
+                // is already recorded by the caller's factory-test-type column. The
+                // verdict is still on the tests[] entry for anyone who wants it.
+                continue;
+            }
+            const idLine = idPattern.exec(trimmed.replace(/^-\s*/, '- '));
+            if (idLine) {
+                const id = Number(idLine[1]);
+                const body = idLine[2] ?? '';
+                const classifier = grammar.classifiers.find((c) => c.match.test(body)) ?? classifierForId(id);
+                const fallbackName = `${grammar.idToken.toLowerCase()}_${idLine[1]}`;
+                const fallbackLabel = `${grammar.idToken}_${idLine[1]}`;
+                const { name, label } = resolveNames(classifier?.name, classifier?.name ?? fallbackName, classifier?.label ?? fallbackLabel, id);
+                recordTest(body, id, name, label, classifier);
+                continue;
+            }
+            if (grammar.subLine?.(trimmed, ctx()))
+                continue;
+            // LED narration (`- All LEDs off`, `- Left Red LED on`) belongs to the LED
+            // test currently open.
+            if (open.test && grammar.ledNarration?.test(trimmed)) {
+                addDetail(trimmed.replace(/^-\s*/, ''));
+                continue;
+            }
+            // Shimmer3 (MSP430) prints verdict lines with no test number at all. A test
+            // line sits at the report's left margin (` - PASS: …`, or no space at all);
+            // anything indented further is a continuation of the test above it.
+            if (grammar.idlessVerdictLines && !/^[ \t]{2,}/.test(line)) {
+                const bare = /^-\s*(.+)$/.exec(trimmed);
+                const body = bare?.[1] ?? '';
+                const classifier = body ? grammar.classifiers.find((c) => c.match.test(body)) : undefined;
+                const hasVerdict = /^(PASS|FAIL|WARNING)\b/i.test(body) || /not applicable/i.test(body);
+                if (classifier || (body && hasVerdict)) {
+                    const ordinal = idlessTests.length + 1;
+                    const { name, label } = resolveNames(classifier?.name, classifier?.name ?? `test_${String(ordinal).padStart(4, '0')}`, classifier?.label ?? `Test ${ordinal}`, null);
+                    recordTest(body, null, name, label, classifier);
+                    continue;
+                }
+            }
+            if (grammar.extraLine?.(trimmed, ctx()))
+                continue;
+            // An indented line the family did not claim still belongs to the test above
+            // it (GSR rig rows, SD geometry) rather than to the unparsed pile.
+            if (grammar.attachIndentedSubLines && open.test && /^[ \t]/.test(line)) {
+                addDetail(trimmed.replace(/^-\s*/, ''));
+                continue;
+            }
+            result.unparsedLines.push(line);
+        }
+        // Decode the fail mask through the ids this report actually used.
+        if (result.overall.failMask != null) {
+            const positional = nameById.size === 0 && idlessTests.length > 0;
+            const names = [];
+            for (let bit = 0; bit < 32; bit += 1) {
+                if (!(result.overall.failMask & (1 << bit)))
+                    continue;
+                const id = bit + 1;
+                const byId = nameById.get(id);
+                names.push(byId ?? (positional ? idlessTests[bit]?.name : undefined) ?? maskTestName(id));
+            }
+            result.overall.failedTestNames = names;
+            if (positional) {
+                warnings.push('this report prints no test numbers, so fail-mask bits were matched to tests by print order');
+            }
+        }
+    }
+    /**
+     * Guess which firmware family printed a report.
+     *
+     * The test-number prefix is decisive when one is printed. Shimmer3 (MSP430)
+     * prints none, so it is recognized by its section headings instead — which
+     * also means an LED-states walk, printed by identical shared code on both
+     * Shimmer boards and carrying no numbers, reports as `'shimmer3'` whichever
+     * board ran it. That is the right parse either way: with no ids to resolve,
+     * the two Shimmer grammars differ only in names this report does not contain.
+     */
+    function detectFactoryTestReportFamily(text) {
+        const s = String(text ?? '');
+        if (/\bWS_TEST_\d{4}\b/i.test(s))
+            return 'verisense';
+        if (/\bS3R_TEST_\d{4}\b/i.test(s))
+            return 'shimmer3r';
+        if (/^\s*Testing Operational LED states\b/im.test(s))
+            return 'shimmer3';
+        const shimmerHeadings = /^\s*(?:Shimmer model|BT Module|SD Card|LED test|I2C|SPI)\s*:\s*$/im.test(s);
+        if (shimmerHeadings && /TEST START/.test(s))
+            return 'shimmer3';
+        return 'unknown';
+    }
+    /**
+     * Render a parsed report as two CSV rows (header, values): the caller's `meta`
+     * columns first, then the parsed metrics sorted by name. A metric whose name
+     * collides with a meta column is dropped in favour of the meta value — the
+     * caller's identity columns are authoritative, and a duplicated header name
+     * breaks most CSV consumers.
+     */
+    function factoryTestReportToCsvRows(parsed, meta = {}) {
+        // Normalized once and used for both key discovery and value lookup, so a
+        // null/undefined `parsed` from a plain-JS caller cannot throw here.
+        const metrics = parsed?.metrics ?? {};
+        const metaKeys = Object.keys(meta);
+        const metaKeySet = new Set(metaKeys);
+        const metricKeys = Object.keys(metrics)
+            .filter((k) => !metaKeySet.has(k))
+            .sort();
+        const header = [...metaKeys, ...metricKeys].map(csvCell).join(',');
+        const values = [...metaKeys.map((k) => meta[k]), ...metricKeys.map((k) => metrics[k])]
+            .map(csvCell)
+            .join(',');
+        return [header, values];
+    }
+
     /** The firmware release that renumbered the tests. */
     const RENUMBER_VERSION = { major: 2, minor: 0, internal: 10 };
     /**
@@ -23750,7 +25308,7 @@
      * the trailing CRLF is lost, so whatever is written next runs straight on. We
      * re-split on these anchors and note the repair.
      */
-    const REPAIR_ANCHORS = [
+    const REPAIR_ANCHORS$1 = [
         / - WS_TEST_\d{4} - /g,
         /LED test \(WS_TEST_\d{4}\):/g,
         /(?:MCU|I\/O status|Battery|Shimmer model|TWIM0|TWIM1 \(part ?\d\)|SPIM2|SPIM3):/g,
@@ -23925,287 +25483,9 @@
         { name: 'stf2', label: 'STF2 Flash test', match: /STF2/i },
         { name: 'led', label: 'LED test', match: /LED test/i },
     ];
-    /** Shared shape of the IMU-class self-test lines: optional temperature in
-     * parentheses plus an optional failure-reason suffix. */
-    function chipDetail(body, out, prefix) {
-        setNum(out, `${prefix}_temp_c`, /\(\s*(-?\d+)\s*°?\s*C\s*\)/i.exec(body)?.[1]);
-        const reason = /-\s*(Chip not detected|Signal issue|Temperature issue|DRDY\/INT issue|Unknown)/i.exec(body)?.[1];
-        if (reason)
-            out[`${prefix}_fail_reason`] = reason.trim();
-    }
-    function num(value) {
-        if (value == null || value === '')
-            return undefined;
-        const n = Number(value);
-        return Number.isFinite(n) ? n : undefined;
-    }
-    function setNum(out, key, value) {
-        const n = num(value);
-        if (n !== undefined)
-            out[key] = n;
-    }
-    function setStr(out, key, value) {
-        const s = value?.trim();
-        if (s)
-            out[key] = s;
-    }
-    /**
-     * Fold the several ways a degree sign can reach us into a single `°`.
-     *
-     * The firmware emits a bare `0xB0` on some builds and UTF-8 `0xC2 0xB0` on
-     * others; depending on how the transport decoded the bytes we see `°`, the
-     * mojibake `Â°`, or the Unicode replacement character.
-     */
-    function normalizeReportText(text) {
-        return String(text ?? '')
-            .replace(/Â°/g, '°')
-            .replace(/�/g, '°');
-    }
-    /** Split into lines, dropping the NAND health progress dots and re-splitting
-     * lines that the firmware's 128-byte buffer glued together. */
-    function toLines(text, warnings) {
-        const out = [];
-        let stripped = 0;
-        for (const raw of text.split(/\r\n|\r|\n/)) {
-            // The NAND health test streams bare dots to keep the host's idle timer
-            // alive; they arrive with no newline of their own.
-            if (/^[.\s]*$/.test(raw) && /\./.test(raw)) {
-                stripped += 1;
-                continue;
-            }
-            const line = raw.replace(/\.{3,}\s*$/, '');
-            for (const piece of repairLine(line, warnings)) {
-                if (piece.trim())
-                    out.push(piece);
-            }
-        }
-        if (stripped)
-            warnings.push(`stripped ${stripped} progress-dot line(s)`);
-        return out;
-    }
-    /** Re-split one physical line wherever a known line start appears mid-line. */
-    function repairLine(line, warnings) {
-        let earliest = -1;
-        for (const anchor of REPAIR_ANCHORS) {
-            anchor.lastIndex = 0;
-            let m;
-            while ((m = anchor.exec(line)) !== null) {
-                if (m.index > 0 && (earliest < 0 || m.index < earliest))
-                    earliest = m.index;
-            }
-        }
-        if (earliest <= 0)
-            return [line];
-        warnings.push(`repaired a line truncated by the firmware buffer near column ${earliest}`);
-        const head = line.slice(0, earliest);
-        return [head, ...repairLine(line.slice(earliest), warnings)];
-    }
-    /** Read the verdict keyword, if any, off the text following the test id. */
-    function readVerdict(body) {
-        const m = /^\s*(PASS|FAIL|WARNING)\b/i.exec(body);
-        if (m)
-            return m[1].toUpperCase();
-        if (/not applicable/i.test(body))
-            return 'NOT_APPLICABLE';
-        if (body.trim())
-            return 'INFO';
-        return 'UNKNOWN';
-    }
-    /** Derive the numbering scheme from the reported firmware version. */
-    function readIdScheme(version) {
-        if (!version)
-            return 'unknown';
-        const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
-        if (!m)
-            return 'unknown';
-        const triple = {
-            major: Number(m[1]),
-            minor: Number(m[2]),
-            internal: Number(m[3]),
-        };
-        return compareVerisenseFirmwareVersion(triple, RENUMBER_VERSION) >= 0 ? 'v2_00_010' : 'legacy';
-    }
-    function emptyResult() {
-        return {
-            ok: false,
-            complete: false,
-            firmwareVersion: null,
-            idScheme: 'unknown',
-            overall: { result: null, failMaskHex: null, failMask: null, failedTestNames: [] },
-            mcu: {
-                macId: null,
-                deviceId: null,
-                part: null,
-                variant: null,
-                lastResetHex: null,
-                lastResetReasons: null,
-                bootCount: null,
-            },
-            model: null,
-            tests: [],
-            metrics: {},
-            unparsedLines: [],
-            parserWarnings: [],
-        };
-    }
-    /**
-     * Parse a full factory test report into structured metrics.
-     *
-     * Never throws: malformed or unrecognized input comes back with `ok: false`
-     * and/or its lines preserved in `unparsedLines`.
-     */
-    function parseVerisenseFactoryTestReport(text) {
-        const result = emptyResult();
-        try {
-            parseInto(normalizeReportText(text), result);
-        }
-        catch (err) {
-            result.parserWarnings.push(`parser error: ${String(err?.message ?? err)}`);
-        }
-        return result;
-    }
-    function parseInto(text, result) {
-        const warnings = result.parserWarnings;
-        const lines = toLines(text, warnings);
-        const metrics = result.metrics;
-        /** Canonical name of the test each printed id was seen against, so the fail
-         * mask can be decoded under whichever numbering this report used. */
-        const nameById = new Map();
-        let ledSeen = 0;
-        /** Held in an object so the assignment inside `pushTest` stays visible to
-         * the type checker at every use site. */
-        const open = { test: null };
-        const pushTest = (test) => {
-            result.tests.push(test);
-            if (test.id != null)
-                nameById.set(test.id, test.name);
-            open.test = test;
-        };
-        const addDetail = (line) => {
-            const test = open.test;
-            if (!test)
-                return;
-            test.detail = test.detail ? `${test.detail} | ${line.trim()}` : line.trim();
-        };
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (/TEST START/.test(trimmed)) {
-                result.ok = true;
-                continue;
-            }
-            if (/TEST END/.test(trimmed)) {
-                result.complete = true;
-                continue;
-            }
-            const fw = /^Firmware version\s*:\s*v?([\d.]+)/i.exec(trimmed);
-            if (fw) {
-                result.firmwareVersion = fw[1];
-                result.idScheme = readIdScheme(fw[1]);
-                metrics.fw_version = fw[1];
-                continue;
-            }
-            const range = /Temperature pass range set to\s*(-?\d+)\s*-\s*(-?\d+)/i.exec(trimmed);
-            if (range) {
-                setNum(metrics, 'temp_range_low_c', range[1]);
-                setNum(metrics, 'temp_range_high_c', range[2]);
-                continue;
-            }
-            const overall = /^Overall Result\s*=\s*(PASS|FAIL)(?:\s*\(\s*(0x[0-9A-Fa-f]+)\s*\))?/i.exec(trimmed);
-            if (overall) {
-                result.overall.result = overall[1].toUpperCase();
-                metrics.overall_result = result.overall.result;
-                if (overall[2]) {
-                    result.overall.failMaskHex = overall[2].toUpperCase().replace('0X', '0x');
-                    result.overall.failMask = Number.parseInt(overall[2], 16);
-                    metrics.fail_mask_hex = result.overall.failMaskHex;
-                }
-                continue;
-            }
-            // Section headers (`MCU:`, `SPIM3:` …) carry no data but end the previous
-            // test's sub-line run.
-            if (/^(?:MCU|I\/O status|Battery|Shimmer model|TWIM0|TWIM1 \(part ?\d\)|SPIM2|SPIM3)\s*:$/i.test(trimmed)) {
-                open.test = null;
-                continue;
-            }
-            if (readMcuHeaderLine(trimmed, result, metrics))
-                continue;
-            // `LED test (WS_TEST_0019):` — the first such block is the operational
-            // status LED, the second the battery LED. Ordering survives renumbering.
-            const ledHeader = /^LED test\s*\(\s*WS_TEST_(\d{4})\s*\)\s*:/i.exec(trimmed);
-            if (ledHeader) {
-                const name = ledSeen === 0 ? 'led_status' : 'led_batt';
-                ledSeen += 1;
-                pushTest({
-                    id: Number(ledHeader[1]),
-                    name,
-                    label: name === 'led_status' ? 'LED test - operational status' : 'LED test - battery status',
-                    verdict: 'INFO',
-                    detail: '',
-                    metrics: {},
-                });
-                // Deliberately no `<name>_result` metric: an INFO verdict carries no
-                // data (the LED test is operator-visual narration), and which suite ran
-                // is already recorded by the caller's factory-test-type column. The
-                // verdict is still on the tests[] entry for anyone who wants it.
-                continue;
-            }
-            const idLine = /^-?\s*WS_TEST_(\d{4})\s*-\s*(.*)$/i.exec(trimmed.replace(/^-\s*/, '- '));
-            if (idLine) {
-                const id = Number(idLine[1]);
-                const body = idLine[2] ?? '';
-                const verdict = readVerdict(body);
-                const classifier = CLASSIFIERS.find((c) => c.match.test(body));
-                let name = classifier?.name ?? `ws_test_${idLine[1]}`;
-                let label = classifier?.label ?? `WS_TEST_${idLine[1]}`;
-                if (name === 'led') {
-                    // Not-applicable LED lines come through the id path rather than as a
-                    // `LED test (…):` header.
-                    name = ledSeen === 0 ? 'led_status' : 'led_batt';
-                    label =
-                        name === 'led_status' ? 'LED test - operational status' : 'LED test - battery status';
-                    ledSeen += 1;
-                }
-                const testMetrics = {};
-                classifier?.extract?.(body, testMetrics);
-                if (!classifier)
-                    scrapeGenericMetrics(body, name, testMetrics);
-                // A verdict column is only worth a spreadsheet cell when it can vary:
-                // PASS/FAIL/WARNING record an outcome and NOT_APPLICABLE records a
-                // model gate, but INFO just means "an informational line printed" — its
-                // substance is already in that line's own metrics (usb_power_good,
-                // charger_status, ...), so emitting it would waste a column per test.
-                if (verdict !== 'INFO') {
-                    const resultKey = classifier?.resultKey ?? `${name}_result`;
-                    testMetrics[resultKey] = verdict;
-                }
-                pushTest({ id, name, label, verdict, detail: body.trim(), metrics: testMetrics });
-                Object.assign(metrics, testMetrics);
-                continue;
-            }
-            if (readSubLine(trimmed, result, metrics, open.test, addDetail))
-                continue;
-            // LED narration (`- All LEDs off`, `- Left Red LED on`) belongs to the LED
-            // test currently open.
-            if (open.test && /^-\s*(All|Left|Right)\b.*LED/i.test(trimmed)) {
-                addDetail(trimmed.replace(/^-\s*/, ''));
-                continue;
-            }
-            result.unparsedLines.push(line);
-        }
-        // Decode the fail mask through the ids this report actually used.
-        if (result.overall.failMask != null) {
-            const names = [];
-            for (let bit = 0; bit < 32; bit += 1) {
-                if (!(result.overall.failMask & (1 << bit)))
-                    continue;
-                const id = bit + 1;
-                names.push(nameById.get(id) ?? `ws_test_${String(id).padStart(4, '0')}`);
-            }
-            result.overall.failedTestNames = names;
-        }
-    }
     /** MCU identification lines printed above the first test. */
-    function readMcuHeaderLine(trimmed, result, metrics) {
+    function readMcuHeaderLine(trimmed, ctx) {
+        const { result, metrics } = ctx;
         const mac = /^-?\s*MAC ID\s*:\s*([0-9A-Fa-f]+)/.exec(trimmed);
         if (mac) {
             result.mcu.macId = mac[1].toUpperCase();
@@ -24251,7 +25531,8 @@
      * test's `metrics`/`detail` (the tests[] attachment is best-effort context,
      * not the source of truth).
      */
-    function readSubLine(trimmed, result, metrics, current, addDetail) {
+    function readSubLine(trimmed, ctx) {
+        const { result, metrics, current, addDetail } = ctx;
         const put = (key, value) => {
             metrics[key] = value;
             if (current)
@@ -24355,6 +25636,30 @@
             return true;
         return false;
     }
+    /**
+     * The Verisense grammar.
+     *
+     * Every flag the shared core offers is left off: this grammar is the behaviour
+     * the shared core was extracted from, so a report parsed through it comes out
+     * byte-for-byte as the standalone Verisense parser produced it (pinned by
+     * `tests/verisense/factory-test-report-snapshot.test.ts`).
+     */
+    const VERISENSE_FACTORY_TEST_GRAMMAR = {
+        idToken: 'WS_TEST',
+        classifiers: CLASSIFIERS,
+        sectionHeadings: /^(?:MCU|I\/O status|Battery|Shimmer model|TWIM0|TWIM1 \(part ?\d\)|SPIM2|SPIM3)\s*:$/i,
+        repairAnchors: REPAIR_ANCHORS$1,
+        ledHeading: /^LED test\s*\(\s*WS_TEST_(\d{4})\s*\)\s*:/i,
+        ledClassifierName: 'led',
+        // The first LED block is the operational status LED, the second the battery
+        // LED. Ordering survives the renumbering; the printed id does not.
+        ledTest: (index) => index === 0
+            ? { name: 'led_status', label: 'LED test - operational status' }
+            : { name: 'led_batt', label: 'LED test - battery status' },
+        ledNarration: /^-\s*(All|Left|Right)\b.*LED/i,
+        headerLine: readMcuHeaderLine,
+        subLine: readSubLine,
+    };
     function emptyModel() {
         return {
             name: null,
@@ -24366,20 +25671,53 @@
             passkeyKind: null,
         };
     }
+    /** Derive the numbering scheme from the reported firmware version. */
+    function readIdScheme(version) {
+        if (!version)
+            return 'unknown';
+        const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+        if (!m)
+            return 'unknown';
+        const triple = {
+            major: Number(m[1]),
+            minor: Number(m[2]),
+            internal: Number(m[3]),
+        };
+        return compareVerisenseFirmwareVersion(triple, RENUMBER_VERSION) >= 0 ? 'v2_00_010' : 'legacy';
+    }
+    function emptyResult$1() {
+        return {
+            ok: false,
+            complete: false,
+            firmwareVersion: null,
+            idScheme: 'unknown',
+            overall: emptyFactoryTestOverall(),
+            mcu: {
+                macId: null,
+                deviceId: null,
+                part: null,
+                variant: null,
+                lastResetHex: null,
+                lastResetReasons: null,
+                bootCount: null,
+            },
+            model: null,
+            tests: [],
+            metrics: {},
+            unparsedLines: [],
+            parserWarnings: [],
+        };
+    }
     /**
-     * Fallback for a test this build of the SDK has never seen: keep any
-     * `Key = value` pairs so a firmware change still lands data in the sheet.
+     * Parse a full Verisense factory test report into structured metrics.
+     *
+     * Never throws: malformed or unrecognized input comes back with `ok: false`
+     * and/or its lines preserved in `unparsedLines`.
      */
-    function scrapeGenericMetrics(body, name, out) {
-        const re = /([A-Za-z][A-Za-z0-9 _-]{0,40}?)\s*=\s*([-+]?\d+(?:\.\d+)?)/g;
-        let m;
-        while ((m = re.exec(body)) !== null) {
-            const key = `${name}_${m[1]
-            .trim()
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '_')}`;
-            setNum(out, key, m[2]);
-        }
+    function parseVerisenseFactoryTestReport(text) {
+        const result = parseFactoryTestReport(text, VERISENSE_FACTORY_TEST_GRAMMAR, emptyResult$1);
+        result.idScheme = readIdScheme(result.firmwareVersion);
+        return result;
     }
     /**
      * Render a parsed report as two CSV rows (header, values): the caller's `meta`
@@ -24388,20 +25726,410 @@
      * caller's identity columns are authoritative, and a duplicated header name
      * breaks most CSV consumers.
      */
-    function verisenseFactoryTestReportToCsvRows(parsed, meta = {}) {
-        // Normalized once and used for both key discovery and value lookup, so a
-        // null/undefined `parsed` from a plain-JS caller cannot throw here.
-        const metrics = parsed?.metrics ?? {};
-        const metaKeys = Object.keys(meta);
-        const metaKeySet = new Set(metaKeys);
-        const metricKeys = Object.keys(metrics)
-            .filter((k) => !metaKeySet.has(k))
-            .sort();
-        const header = [...metaKeys, ...metricKeys].map(csvCell).join(',');
-        const values = [...metaKeys.map((k) => meta[k]), ...metricKeys.map((k) => metrics[k])]
-            .map(csvCell)
-            .join(',');
-        return [header, values];
+    const verisenseFactoryTestReportToCsvRows = factoryTestReportToCsvRows;
+
+    /**
+     * Shimmer3R test numbers, from the bitmask enum in
+     * `Shimmer_Driver/hal_FactoryTest.h:96-124`. Bit n-1 of the `Overall Result`
+     * mask is test n.
+     *
+     * 0027 is deliberately absent: the shipped reports already print
+     * `LED test (S3R_TEST_0027)`, so the number is spoken for, but the LED walk has
+     * no pass/fail bit and can never appear in the mask.
+     */
+    const SHIMMER3R_FACTORY_TEST_ID_NAMES = Object.freeze({
+        3: 'model',
+        7: 'vref',
+        8: 'vcore',
+        9: 'vbatt_pin',
+        10: 'mcu_temp',
+        11: 'batt_voltage',
+        12: 'charger',
+        13: 'sd',
+        14: 'bt',
+        15: 'ads7028',
+        16: 'lsm6dsv',
+        17: 'bmp390',
+        18: 'adxl371',
+        19: 'lis3mdl',
+        20: 'lis2dw12',
+        21: 'ads1292r',
+        22: 'lis2mdl',
+        23: 'eeprom_i2c1',
+        24: 'eeprom_i2c4_gsr_rig',
+        25: 'gsr_signal',
+        26: 'microphone',
+        28: 'lse_crystal',
+    });
+    /** `<something> = 3742mV (3000-4200mV)` — the shape of every rail measurement. */
+    function millivoltRange(prefix) {
+        return (body, out) => {
+            const m = /=\s*(-?\d+)\s*mV(?:\s*\(\s*(-?\d+)\s*-\s*(-?\d+)\s*mV\s*\))?/i.exec(body);
+            if (!m)
+                return;
+            setNum(out, `${prefix}_mv`, m[1]);
+            setNum(out, `${prefix}_limit_low_mv`, m[2]);
+            setNum(out, `${prefix}_limit_high_mv`, m[3]);
+        };
+    }
+    /** A chip self-test line: `<chip><reason suffix> (24.37 degC)`. */
+    function chipTest(name, label, match) {
+        return { name, label, match, extract: (body, out) => chipDetail(body, out, name) };
+    }
+    /**
+     * Matched in order against the text following the test number (or, on
+     * Shimmer3, following the bare `- `); first hit wins. Every pattern keys on
+     * wording rather than on a number, so one list serves both boards and survives
+     * a renumbering.
+     */
+    const SHIMMER_FACTORY_TEST_CLASSIFIERS = [
+        {
+            name: 'lse_crystal',
+            label: 'LSE crystal (32.768 kHz)',
+            match: /\bLSE\b/i,
+            extract: (body, out) => {
+                setNum(out, 'lse_ppm', /error\s*=\s*([+-]?\d+(?:\.\d+)?)\s*ppm/i.exec(body)?.[1]);
+                setNum(out, 'lse_limit_ppm', /limit\s*\+\/-\s*(\d+(?:\.\d+)?)\s*ppm/i.exec(body)?.[1]);
+                setStr(out, 'lse_caps', /,\s*(HSE-fixed|pre-fix)\s*caps/i.exec(body)?.[1]);
+                setStr(out, 'lse_fail_reason', /not measurable\s*\(([^,)]+)/i.exec(body)?.[1]);
+            },
+        },
+        { name: 'vref', label: 'MCU VRef', match: /VRef/i, extract: millivoltRange('vref') },
+        { name: 'vcore', label: 'MCU VCore', match: /VCore/i, extract: millivoltRange('vcore') },
+        {
+            name: 'vbatt_pin',
+            label: 'MCU VBatt pin',
+            match: /VBatt pin/i,
+            extract: millivoltRange('vbatt_pin'),
+        },
+        {
+            name: 'batt_voltage',
+            label: 'Battery voltage',
+            match: /VBatt\s*=/i,
+            resultKey: 'vbatt_result',
+            extract: millivoltRange('vbatt'),
+        },
+        {
+            name: 'mcu_temp',
+            label: 'MCU temperature',
+            match: /Temperature\s*=\s*-?\d/i,
+            extract: (body, out) => {
+                setNum(out, 'mcu_temp_c', /Temperature\s*=\s*(-?\d+(?:\.\d+)?)/i.exec(body)?.[1]);
+            },
+        },
+        {
+            name: 'charger',
+            label: 'Battery charger chip',
+            match: /Charger chip status/i,
+            extract: (body, out) => {
+                setStr(out, 'charger_chip_status', /Charger chip status\s*=\s*'?(.+?)'?\s*$/i.exec(body)?.[1]);
+            },
+        },
+        // `FAIL: not detected` carries no words of its own; the id table names it.
+        { name: 'sd', label: 'SD card', match: /SD [Cc]ard|read\/write test/i },
+        {
+            name: 'bt',
+            label: 'BT module',
+            // Shimmer3R reports a missing module as `FAIL - BT hasn't initialised`,
+            // with a dash where every other line has a colon.
+            match: /BT firmware version|BT hasn't initialised/i,
+        },
+        chipTest('ads7028', 'ADS7028 ADC', /ADS7028/i),
+        chipTest('lsm6dsv', 'LSM6DSV IMU', /LSM6DSV/i),
+        chipTest('bmp390', 'BMP390/BMP581 pressure sensor', /BMP390|BMP581/i),
+        chipTest('adxl371', 'ADXL371 high-g accelerometer', /ADXL371/i),
+        chipTest('lis3mdl', 'LIS3MDL magnetometer', /LIS3MDL/i),
+        chipTest('lis2dw12', 'LIS2DW12 accelerometer', /LIS2DW12/i),
+        { name: 'ads1292r', label: 'ADS1292R ExG', match: /ADS1292R/i },
+        chipTest('lis2mdl', 'LIS2MDL magnetometer', /LIS2MDL/i),
+        // Shimmer3 has no self-test for these three; it only reports what answered
+        // on the bus, so the lines are informational unless the chip is missing.
+        { name: 'lsm303', label: 'LSM303 accelerometer/magnetometer', match: /LSM303/i },
+        { name: 'mpu9x50', label: 'MPU9x50 / ICM20948 gyroscope', match: /MPU9x50|ICM20948|Gyro chip/i },
+        { name: 'bmpx80', label: 'BMPx80 pressure sensor', match: /BMP180|BMP280|BMPx80/i },
+        { name: 'eeprom_i2c1', label: 'CAT24C16 EEPROM', match: /CAT24C16/i },
+        { name: 'eeprom_i2c4_gsr_rig', label: 'I2C4 EEPROM / GSR test rig', match: /I2C4/i },
+        { name: 'gsr_signal', label: 'GSR signal test', match: /GSR/i },
+        { name: 'microphone', label: 'Microphone', match: /Microphone/i },
+        {
+            name: 'model',
+            label: 'Shimmer model',
+            match: /\(\s*SR\d+-\d+-\d+\s*\)|:\s*not set\s*$/i,
+            extract: (body, out) => {
+                // Only a PASS names a board: the failure prints `FAIL: not set`, which
+                // is the absence of a name rather than a name.
+                setStr(out, 'model_name', /^PASS\s*:\s*(.+?)(?:\s*\(\s*SR[\d-]+\s*\))?\s*$/i.exec(body)?.[1]);
+                setStr(out, 'model_sr_revision', /\(\s*(SR\d+-\d+-\d+)\s*\)/i.exec(body)?.[1]);
+            },
+        },
+        { name: 'led', label: 'LED test', match: /LED test|LEDs?\b/i },
+    ];
+    /** Headings that carry no data but close the open test's continuation run. */
+    const SECTION_HEADINGS = /^-?\s*(?:Shimmer model|MCU|Battery|SD Card|BT Module|Microphone|I2C1|I2C4|I2C|SPI1|SPI2|SPI3|SPI|I\/O status|Counts|BT Disabled|BT Enabled|SD Sync Enabled|Other)\s*:$/i;
+    /**
+     * Line starts that may appear glued onto the end of a previous line.
+     *
+     * `ShimFactoryTest_sendReport` truncates anything longer than
+     * `MAX_TEST_REPORT_LENGTH` (128 bytes including the CRLF), so a long line loses
+     * its terminator and the next write runs straight on. We re-split on these
+     * anchors and note the repair. The Shimmer3R "LSE not measurable" line is the
+     * one that overruns in practice.
+     */
+    const REPAIR_ANCHORS = [
+        / - S3R_TEST_\d{4} - /g,
+        /LED test(?:\s*\(S3R_TEST_\d{4}\))?:/g,
+        /(?:Shimmer model|MCU|Battery|SD Card|BT Module|Microphone|I2C1|I2C4|I2C|SPI1|SPI2|SPI3|SPI):/g,
+        // What follows the one Shimmer3R line long enough to lose its terminator.
+        / - LSE drive applied at boot:/g,
+        /Date \(yyyy-mm-dd\):/g,
+        /Time \(hh:mm:ss\):/g,
+        /INFO: Temperature pass range/g,
+        /Testing Operational LED states/g,
+        /Overall Result\s*=/g,
+        /\/\/\*+/g,
+    ];
+    function yesNo(value) {
+        return /^yes$/i.test(value.trim());
+    }
+    /** Report header and MCU/BT identification lines. */
+    function readShimmerHeaderLine(trimmed, ctx) {
+        const { result, metrics } = ctx;
+        const date = /^Date\s*\(yyyy-mm-dd\)\s*:\s*(\d{4}-\d{2}-\d{2})/i.exec(trimmed);
+        if (date) {
+            result.reportDate = date[1];
+            metrics.report_date = date[1];
+            return true;
+        }
+        const time = /^Time\s*\(hh:mm:ss\)\s*:\s*(\d{1,2}:\d{2}:\d{2})/i.exec(trimmed);
+        if (time) {
+            result.reportTimeUtc = time[1];
+            metrics.report_time_utc = time[1];
+            return true;
+        }
+        const mac = /^-?\s*MAC ID\s*:\s*([0-9A-Fa-f]{12})\s*$/.exec(trimmed);
+        if (mac) {
+            result.mcu.macId = mac[1].toUpperCase();
+            metrics.bt_mac = result.mcu.macId;
+            return true;
+        }
+        const dev = /^-?\s*Device ID\s*=\s*(\S+)/i.exec(trimmed);
+        if (dev) {
+            result.mcu.deviceId = dev[1];
+            metrics.mcu_device_id = dev[1];
+            return true;
+        }
+        const rev = /^-?\s*Revision ID\s*=\s*(\S+)/i.exec(trimmed);
+        if (rev) {
+            result.mcu.revisionId = rev[1];
+            metrics.mcu_revision_id = rev[1];
+            return true;
+        }
+        const uid = /^-?\s*Unique ID\s*=\s*(\S+)/i.exec(trimmed);
+        if (uid) {
+            result.mcu.uniqueId = uid[1];
+            metrics.mcu_unique_id = uid[1];
+            return true;
+        }
+        const reset = /^-?\s*Last reset reason\s*=\s*(.+?)\s*$/i.exec(trimmed);
+        if (reset) {
+            result.mcu.lastResetReason = reset[1];
+            metrics.last_reset_reason = reset[1];
+            return true;
+        }
+        const lse = /^-?\s*LSE drive applied at boot\s*:\s*(\S+)/i.exec(trimmed);
+        if (lse) {
+            result.mcu.lseDrive = lse[1];
+            metrics.lse_drive = lse[1];
+            return true;
+        }
+        const charging = /^-?\s*Determined charging status\s*=\s*(.+?)\s*$/i.exec(trimmed);
+        if (charging) {
+            metrics.charging_status = charging[1];
+            return true;
+        }
+        return false;
+    }
+    /** Indented continuation lines belonging to the test or section above them. */
+    function readShimmerSubLine(trimmed, ctx) {
+        const { result, metrics, current, addDetail } = ctx;
+        const put = (key, value) => {
+            metrics[key] = value;
+            if (current)
+                current.metrics[key] = value;
+        };
+        const io = /^-?\s*(Docked|BT connected|Button pressed|USB connected)\s*:\s*(Yes|No)\s*$/i.exec(trimmed);
+        if (io) {
+            const on = yesNo(io[2]);
+            switch (io[1].toLowerCase()) {
+                case 'docked':
+                    result.mcu.io.docked = on;
+                    metrics.io_docked = on;
+                    break;
+                case 'bt connected':
+                    result.mcu.io.btConnected = on;
+                    metrics.io_bt_connected = on;
+                    break;
+                case 'button pressed':
+                    result.mcu.io.buttonPressed = on;
+                    metrics.io_button_pressed = on;
+                    break;
+                default:
+                    result.mcu.io.usbConnected = on;
+                    metrics.io_usb_connected = on;
+                    break;
+            }
+            return true;
+        }
+        // Shimmer3 keeps lifetime Bluetooth fault counters in EEPROM and prints them
+        // under `- Counts:`.
+        const count = /^-?\s*BT (data-rate test blockages|disconnects while streaming|RTS Lockups|unsolicited reboots)\s*=\s*(\d+)/i.exec(trimmed);
+        if (count) {
+            const key = `bt_${count[1].toLowerCase().replace(/[^a-z0-9]+/g, '_')}`;
+            put(key, Number(count[2]));
+            addDetail(trimmed);
+            return true;
+        }
+        // The SD card's CID, printed as one line above the read/write verdict.
+        const card = /^-?\s*Manufacturer\s*:\s*(.+?)\s*,\s*Manufacture Date\s*=\s*(\S+)\s*$/i.exec(trimmed);
+        if (card) {
+            put('sd_manufacturer', card[1]);
+            put('sd_manufacture_date', card[2]);
+            addDetail(trimmed);
+            return true;
+        }
+        // The Bluetooth module's own version banner, printed verbatim.
+        const btVersion = /^-\s*(RN\d{2,4}\b.*)$/i.exec(trimmed);
+        if (btVersion) {
+            put('bt_module_version', btVersion[1].trim());
+            addDetail(trimmed);
+            return true;
+        }
+        return false;
+    }
+    /**
+     * The operational-LED-state walk. It has no verdicts at all — the firmware
+     * drives the sensor through each state for five seconds so an operator can
+     * watch the LEDs — so it collapses to a single informational test carrying the
+     * states it walked. The state lines are tab-indented under headings that close
+     * the open test, so they are reattached by name rather than by what is open.
+     */
+    function readShimmerExtraLine(trimmed, ctx) {
+        if (/^Testing Operational LED states\s*-\s*Start\b/i.test(trimmed)) {
+            ctx.pushTest({
+                id: null,
+                name: 'led_states',
+                label: 'Operational LED states',
+                verdict: 'INFO',
+                detail: '',
+                metrics: {},
+            });
+            return true;
+        }
+        if (/^Testing Operational LED states\s*-\s*End\b/i.test(trimmed))
+            return true;
+        const state = /^->\s*(.+?)\s*$/.exec(trimmed);
+        if (state) {
+            const test = ctx.result.tests.find((t) => t.name === 'led_states');
+            if (!test)
+                return false;
+            test.detail = test.detail ? `${test.detail} | ${state[1]}` : state[1];
+            const walked = Number(test.metrics.led_states_walked ?? 0) + 1;
+            test.metrics.led_states_walked = walked;
+            ctx.metrics.led_states_walked = walked;
+            return true;
+        }
+        return false;
+    }
+    function shimmerGrammar(family) {
+        const numbered = family === 'shimmer3r';
+        return {
+            idToken: 'S3R_TEST',
+            classifiers: SHIMMER_FACTORY_TEST_CLASSIFIERS,
+            sectionHeadings: SECTION_HEADINGS,
+            repairAnchors: REPAIR_ANCHORS,
+            ledHeading: /^LED test(?:\s*\(\s*S3R_TEST_(\d{4})\s*\))?\s*:/i,
+            ledClassifierName: 'led',
+            // One LED entry however many times the narration mentions a lamp: the walk
+            // is a single operator-visual check, and it has no bit in the fail mask.
+            ledTest: () => ({ name: 'led', label: 'LED test' }),
+            ledNarration: /^-\s*(All|Lower|Upper|Left|Right)\b.*LEDs?\b/i,
+            testNameById: numbered ? (id) => SHIMMER3R_FACTORY_TEST_ID_NAMES[id] : undefined,
+            maskTestName: numbered
+                ? (id) => SHIMMER3R_FACTORY_TEST_ID_NAMES[id] ?? `s3r_test_${String(id).padStart(4, '0')}`
+                : (id) => `test_${String(id).padStart(4, '0')}`,
+            idlessVerdictLines: true,
+            attachIndentedSubLines: true,
+            // Shimmer3/3R print one line per ADS1292R chip, and one per LED colour, for
+            // what the mask treats as a single test.
+            mergeRepeatedNames: true,
+            headerLine: readShimmerHeaderLine,
+            subLine: readShimmerSubLine,
+            extraLine: readShimmerExtraLine,
+        };
+    }
+    const SHIMMER3R_GRAMMAR = shimmerGrammar('shimmer3r');
+    const SHIMMER3_GRAMMAR = shimmerGrammar('shimmer3');
+    function emptyResult(family) {
+        return {
+            ok: false,
+            complete: false,
+            family,
+            firmwareVersion: null,
+            reportDate: null,
+            reportTimeUtc: null,
+            overall: emptyFactoryTestOverall(),
+            mcu: {
+                macId: null,
+                deviceId: null,
+                revisionId: null,
+                uniqueId: null,
+                lastResetReason: null,
+                lseDrive: null,
+                io: { docked: null, btConnected: null, buttonPressed: null, usbConnected: null },
+            },
+            model: null,
+            tests: [],
+            metrics: {},
+            unparsedLines: [],
+            parserWarnings: [],
+        };
+    }
+    /**
+     * Parse a Shimmer3 or Shimmer3R factory test report into structured metrics.
+     *
+     * The family is detected from the report itself, so the caller does not have to
+     * know which board it is talking to — useful because the same page drives both.
+     * A report from neither board still parses under the id-less grammar and comes
+     * back with `family: 'unknown'` and a parser warning saying so.
+     *
+     * Never throws: empty, truncated and garbage input all return a result.
+     */
+    function parseShimmerFactoryTestReport(text) {
+        const detected = detectFactoryTestReportFamily(text);
+        const family = detected === 'shimmer3r' || detected === 'shimmer3' ? detected : 'unknown';
+        const grammar = family === 'shimmer3r' ? SHIMMER3R_GRAMMAR : SHIMMER3_GRAMMAR;
+        const result = parseFactoryTestReport(text, grammar, () => emptyResult(family));
+        if (family === 'unknown') {
+            result.parserWarnings.push(detected === 'verisense'
+                ? 'this is a Verisense factory test report - parse it with parseVerisenseFactoryTestReport'
+                : 'no Shimmer3 or Shimmer3R factory test report was recognized in this text');
+        }
+        const model = result.tests.find((t) => t.name === 'model');
+        if (model) {
+            result.model = {
+                name: model.metrics.model_name ?? null,
+                srRevision: model.metrics.model_sr_revision ?? null,
+            };
+        }
+        return result;
+    }
+    /**
+     * Render a parsed report as two CSV rows (header, values): the caller's `meta`
+     * columns first, then the parsed metrics sorted by name. A metric whose name
+     * collides with a meta column is dropped in favour of the meta value.
+     */
+    function shimmerFactoryTestReportToCsvRows(parsed, meta = {}) {
+        return factoryTestReportToCsvRows(parsed, meta);
     }
 
     exports.ASM_COMMAND = ASM_COMMAND;
@@ -24445,7 +26173,12 @@
     exports.ExgKnobError = ExgKnobError;
     exports.ExgKnobValueError = ExgKnobValueError;
     exports.ExgRespirationLockedError = ExgRespirationLockedError;
+    exports.FACTORY_TEST_ACK_TIMEOUT_MS = FACTORY_TEST_ACK_TIMEOUT_MS;
+    exports.FACTORY_TEST_DRAIN_IDLE_MS = FACTORY_TEST_DRAIN_IDLE_MS;
+    exports.FACTORY_TEST_IDLE_FLOOR_MS = FACTORY_TEST_IDLE_FLOOR_MS;
+    exports.FACTORY_TEST_NACK_MESSAGE = FACTORY_TEST_NACK_MESSAGE;
     exports.FW_ID = FW_ID$1;
+    exports.FactoryTestError = FactoryTestError;
     exports.GAIN_LABELS = GAIN_LABELS;
     exports.GAIN_OPTIONS = GAIN_OPTIONS;
     exports.GAIN_VALUES = GAIN_VALUES;
@@ -24528,6 +26261,7 @@
     exports.SERIAL_DFU_RESULT_NAMES = SERIAL_DFU_RESULT_NAMES;
     exports.SET_EXG_REGS_COMMAND = SET_EXG_REGS_COMMAND;
     exports.SHIMMER3R_DEFAULTS = SHIMMER3R_DEFAULTS;
+    exports.SHIMMER3R_FACTORY_TEST_ID_NAMES = SHIMMER3R_FACTORY_TEST_ID_NAMES;
     exports.SHIMMER3R_INQ_CHANNELS_OFFSET = SHIMMER3R_INQ_CHANNELS_OFFSET;
     exports.SHIMMER3R_INQ_NUM_CHANNELS_OFFSET = SHIMMER3R_INQ_NUM_CHANNELS_OFFSET;
     exports.SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS = SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS;
@@ -24542,6 +26276,8 @@
     exports.SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS = SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS;
     exports.SHIMMER3_BT_BAUD_RATE_OPTIONS = SHIMMER3_BT_BAUD_RATE_OPTIONS;
     exports.SHIMMER3_DEFAULTS = SHIMMER3_DEFAULTS;
+    exports.SHIMMER3_FACTORY_TEST_TYPE = SHIMMER3_FACTORY_TEST_TYPE;
+    exports.SHIMMER3_FACTORY_TEST_TYPES = SHIMMER3_FACTORY_TEST_TYPES;
     exports.SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS = SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS;
     exports.SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS = SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS;
     exports.SHIMMER3_INFOMEM_FIELD_GROUPS = SHIMMER3_INFOMEM_FIELD_GROUPS;
@@ -24582,6 +26318,7 @@
     exports.SHIMMER3_SENSOR_LABELS = SHIMMER3_SENSOR_LABELS;
     exports.SHIMMER3_SPP_SERIAL_OPTIONS = SHIMMER3_SPP_SERIAL_OPTIONS;
     exports.SHIMMER3_SPP_UUID = SHIMMER3_SPP_UUID;
+    exports.SHIMMER_FACTORY_TEST_CLASSIFIERS = SHIMMER_FACTORY_TEST_CLASSIFIERS;
     exports.SHIMMER_UART_CRC_INIT = SHIMMER_UART_CRC_INIT;
     exports.SMARTDOCK_BASE_CMD = SMARTDOCK_BASE_CMD;
     exports.SMARTDOCK_CONNECTION_TYPE = SMARTDOCK_CONNECTION_TYPE;
@@ -24687,6 +26424,7 @@
     exports.buildReadPacket = buildReadPacket;
     exports.buildSelectSlotCommand = buildSelectSlotCommand;
     exports.buildSetExgRegsCommand = buildSetExgRegsCommand;
+    exports.buildSetFactoryTestCommand = buildSetFactoryTestCommand;
     exports.buildShimmer3Schema = buildShimmer3Schema;
     exports.buildStatCmd = buildStatCmd;
     exports.buildStreamSchema = buildStreamSchema;
@@ -24706,6 +26444,8 @@
     exports.channelLayoutDiffersByGeneration = channelLayoutDiffersByGeneration;
     exports.checkConfigBytesValid = checkConfigBytesValid;
     exports.classifyBaseResponse = classifyBaseResponse;
+    exports.classifyFactoryTestAckPacket = classifyFactoryTestAckPacket;
+    exports.classifyLiteProtocolAck = classifyLiteProtocolAck;
     exports.classifyVerisenseDfuError = classifyVerisenseDfuError;
     exports.clearExgResolutionFlags = clearExgResolutionFlags;
     exports.compareInfoMemExcluding = compareInfoMemExcluding;
@@ -24730,9 +26470,11 @@
     exports.describePlatformSupport = describePlatformSupport;
     exports.describeVerisenseChargerStatus = describeVerisenseChargerStatus;
     exports.detectExgPreset = detectExgPreset;
+    exports.detectFactoryTestReportFamily = detectFactoryTestReportFamily;
     exports.deviceWriteDivergentRanges = deviceWriteDivergentRanges;
     exports.divisorToSamplingRate = divisorToSamplingRate;
     exports.downloadSdTree = downloadSdTree;
+    exports.drainByteStream = drainByteStream;
     exports.encodeExgRegisters = encodeExgRegisters;
     exports.encodeSdPath = encodeSdPath;
     exports.enforceVerisenseCommsChannelInterlock = enforceVerisenseCommsChannelInterlock;
@@ -24748,6 +26490,7 @@
     exports.expectedVerisenseStreamSensorIds = expectedVerisenseStreamSensorIds;
     exports.expectedVerisenseStreamSensorIdsFromConfig = expectedVerisenseStreamSensorIdsFromConfig;
     exports.extractBaseLine = extractBaseLine;
+    exports.factoryTestReportToCsvRows = factoryTestReportToCsvRows;
     exports.fatDateTimeToDate = fatDateTimeToDate;
     exports.formatByteArrayAsHex = formatByteArrayAsHex;
     exports.formatByteAsHex = formatByteAsHex;
@@ -24846,6 +26589,7 @@
     exports.parseShimmer3DeviceVersionResponse = parseShimmer3DeviceVersionResponse;
     exports.parseShimmer3FwVersionResponse = parseShimmer3FwVersionResponse;
     exports.parseShimmer3StatusBytes = parseShimmer3StatusBytes;
+    exports.parseShimmerFactoryTestReport = parseShimmerFactoryTestReport;
     exports.parseSlotOccupancy = parseSlotOccupancy;
     exports.parseSmartDockVersion = parseSmartDockVersion;
     exports.parseStatRsp = parseStatRsp;
@@ -24860,6 +26604,7 @@
     exports.readExgKnobs = readExgKnobs;
     exports.readInfoMemFieldValue = readInfoMemFieldValue;
     exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
+    exports.requireShimmer3FactoryTestType = requireShimmer3FactoryTestType;
     exports.resolveChannelFormat = resolveChannelFormat;
     exports.resolveFieldIndex = resolveFieldIndex;
     exports.resolveInfoMemLayout = resolveInfoMemLayout;
@@ -24876,10 +26621,12 @@
     exports.setVerisenseDfuModeWithRetry = setVerisenseDfuModeWithRetry;
     exports.setVerisenseOperationalBitRange = setVerisenseOperationalBitRange;
     exports.shimmer3ControlMessageLength = shimmer3ControlMessageLength;
+    exports.shimmer3FactoryTestTypeInfo = shimmer3FactoryTestTypeInfo;
     exports.shimmer3SensorLabel = shimmer3SensorLabel;
     exports.shimmer3SupportsExg = shimmer3SupportsExg;
     exports.shimmer3UsesThreeByteTimestamp = shimmer3UsesThreeByteTimestamp;
     exports.shimmer3rControlMessageLength = shimmer3rControlMessageLength;
+    exports.shimmerFactoryTestReportToCsvRows = shimmerFactoryTestReportToCsvRows;
     exports.shimmerUartCrcByte = shimmerUartCrcByte;
     exports.shimmerUartCrcCalc = shimmerUartCrcCalc;
     exports.shimmerUartCrcCheck = shimmerUartCrcCheck;
