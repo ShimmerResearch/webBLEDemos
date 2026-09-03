@@ -2480,6 +2480,19 @@
               return true;
 
             case "updateSdLogConfig":
+              /* Feature-detected like every other step here. The plan lists
+                 this one unless the capability is positively denied, so a
+                 caller that has not wired up caps still gets it -- better than
+                 silently dropping the SD-header rebuild and leaving the card's
+                 configuration file stale after the image was written. What is
+                 not acceptable is reporting that as a TypeError, which is what
+                 calling straight through produced. */
+              if (typeof client.updateSdLogConfig !== "function") {
+                log.warn(
+                  "this SDK build has no updateSdLogConfig — the configuration image is written, but the SD header will not be rebuilt until the sensor restarts",
+                );
+                return true;
+              }
               /* Worth attempting and not worth aborting for: the InfoMem is
                  already written, and firmware that does not serve 0x9C has no
                  SD configuration file to rebuild in the first place. */

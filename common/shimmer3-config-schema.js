@@ -359,9 +359,12 @@ const STEP_REREAD = "readInfoMemBytes";
  *     that survives a reboot and that the SD header is built from.
  *  2. `updateSdLogConfig` — 0x9C. `ShimBt_processGeneralCmd` answers it with
  *     `ShimTask_set(TASK_SDLOG_CFG_UPDATE)` (shimmer_bt_uart.c:1099-1103), so
- *     the firmware rewrites the SD header from the bytes just written. Always
- *     run when the client has the method (it is harmless when nothing the
- *     header carries changed), and dropped when it does not.
+ *     the firmware rewrites the SD header from the bytes just written. It is
+ *     harmless when nothing the header carries changed, so the plan lists it
+ *     unless `caps.sdlog` is positively `false`; a caller that has not wired
+ *     up caps gets it rather than silently losing the rebuild. Whether it can
+ *     actually run is settled where the client is, by the executor, which
+ *     feature-detects every step and says so when one is missing.
  *  3. the live setters, in {@link LIVE_ORDER} — sensors, then sampling rate,
  *     then ranges, then expansion power. These overwrite the RUNNING config;
  *     without them the stored image and the streaming behaviour disagree
