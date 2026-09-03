@@ -197,6 +197,27 @@
         gap: 2px 10px;
       }
 
+      /* How fresh the flags are: in the title row, beside Refresh, rather than
+         on a line of its own under the flags. This panel is the taller of the
+         two columns above the tab strip, so a line of its own would push the
+         tabs 18px further down — below where they sat before the panel
+         existed, which is the budget the harness holds it to. The title row
+         has the Refresh button's height to spare. */
+      .device-panel-title .status-fresh {
+        margin-left: auto;
+        font-size: 11px;
+        font-weight: 400;
+        color: var(--faint);
+        white-space: nowrap;
+      }
+
+      /* Not the sensor's word: either a value this page inferred from the
+         command it just sent, or a reading it could not confirm. */
+      .device-panel-title .status-fresh.unread,
+      .flag.inferred {
+        color: var(--warn);
+      }
+
       /* Hairline between the two Bluetooth connect buttons and the wired one.
          Both radio links need the sensor paired with this host first and both
          can stream; the dock link does neither, so it reads as the odd one
@@ -476,6 +497,11 @@
         <aside class="card device-panel" id="devicePanel">
           <div class="card-title device-panel-title">
             <span>Device</span>
+            <!-- Where the flags below came from and when. Three sources reach
+                 them now — a read, a push from the sensor, and this page's own
+                 last command — and a reader cannot act on a flag without
+                 knowing which. -->
+            <span class="status-fresh" id="statusFresh" hidden></span>
             <button
               id="btnRefreshDevice"
               type="button"
@@ -1293,6 +1319,14 @@
         );
       }
 
+      /**
+       * Time of day only, from the same formatter as the full stamps — the
+       * device panel has room for a clock but not for a date.
+       */
+      function clockTime(unixMs) {
+        return formatClock(unixMs).slice("YYYY-MM-DD ".length);
+      }
+
       /** True when two decoded field values are the same value. */
       function sameFieldValue(a, b) {
         if (a instanceof Uint8Array && b instanceof Uint8Array) {
@@ -1578,7 +1612,7 @@
           idBatt: "–",
           idLink: "–",
         });
-        $("statusFlags").textContent = "–";
+        resetStatus();
         $("rwcValue").textContent = "–";
       }
 
@@ -1614,45 +1648,196 @@
         return `${batt.voltage.toFixed(2)} V (${pct})${charger}`;
       }
 
-      /** Render the decoded status bits as a row of coloured flags. */
-      function renderStatus(status) {
-        const host = $("statusFlags");
+      /**
+       * The status flags, in the order the panel shows them, keyed by the name
+       * `parseShimmer3StatusBytes` decodes each bit into. The third column is
+       * whether the flag being on is bad news.
+       */
+      const STATUS_FLAGS = [
+        ["docked", "Docked", false],
+        ["sensing", "Sensing", false],
+        ["streaming", "Streaming", false],
+        ["sdLogging", "SD logging", false],
+        ["sdPresent", "SD card present", false],
+        ["sdError", "SD file error", true],
+        ["rtcSet", "Clock set", false],
+        ["redLedOn", "Red LED", false],
+        ["usbPluggedIn", "USB plugged in", false],
+      ];
+
+      /**
+       * What the flags panel is showing, and how much it is worth.
+       *
+       * The values reach it from three places — a `getStatus` read, an
+       * unsolicited push from the firmware, and this page's own belief about
+       * the command it just sent — and they are not worth the same. So where
+       * they came from travels with them, and the panel says which.
+       *
+       * @type {{
+       *   status: object,
+       *   source: "read" | "push" | "inferred",
+       *   at: number,
+       *   inferred: Set<string>,
+       *   unconfirmedAt: number | null,
+       * } | null}
+       */
+      let statusView = null;
+
+      /**
+       * Take a status the sensor actually stated: an answer to `getStatus`
+       * (`"read"`) or one the firmware pushed unasked (`"push"`).
+       *
+       * A falsy `status` means the read did not answer. That does NOT wipe the
+       * panel — the last known values are still the best knowledge the page
+       * has — but it does stop the panel presenting them as current.
+       *
+       * @param {object|null|undefined} status
+       * @param {"read"|"push"} [source]
+       */
+      function renderStatus(status, source = "read") {
         if (!status) {
-          host.textContent = "–";
+          if (statusView) statusView.unconfirmedAt = Date.now();
+          paintStatus();
           return;
         }
-        const flags = [
-          ["Docked", status.docked, false],
-          ["Sensing", status.sensing, false],
-          ["Streaming", status.streaming, false],
-          ["SD logging", status.sdLogging, false],
-          ["SD card present", status.sdPresent, false],
-          ["SD file error", status.sdError, true],
-          ["Clock set", status.rtcSet, false],
-          ["Red LED", status.redLedOn, false],
-        ];
-        // null, not false: a Shimmer3 omits the second status byte entirely
-        // rather than sending a zero, so "unknown" stays distinguishable.
-        if (status.usbPluggedIn !== null) {
-          flags.push(["USB plugged in", status.usbPluggedIn, false]);
+        /* A value this page inferred and the sensor now contradicts is worth
+           saying out loud before it is quietly replaced: the command was
+           accepted but did not take effect — a full card, a bad file, a trial
+           that had already ended. This is the one moment both are known. */
+        for (const key of statusView?.inferred ?? []) {
+          if (statusView.status[key] !== status[key]) {
+            log.warn(
+              `the sensor reports ${key}=${status[key]} where this page ` +
+                `expected ${statusView.status[key]} from the command it sent — ` +
+                `the command was accepted but did not take effect`,
+            );
+          }
         }
-        host.replaceChildren(
-          ...flags.map(([label, on, badWhenOn]) =>
-            el("span", {
-              class: `flag${on ? (badWhenOn ? " bad" : " on") : ""}`,
-              text: label,
-            }),
-          ),
-        );
+        statusView = {
+          status,
+          source,
+          at: Date.now(),
+          inferred: new Set(),
+          unconfirmedAt: null,
+        };
+        paintStatus();
         /* The sensor is the authority on whether it is sensing: a status read
            is how a host learns its button was pressed while nobody was
            streaming, and every configuration command is NACKed until it
-           stops. */
+           stops. Only worth saying for something the sensor stated — an
+           inferred value can teach nobody anything. */
         if (status.sensing && !streaming) {
           log.warn(
             "the sensor reports it is sensing — it was started from its own button or by another host, and will refuse configuration commands until it stops",
           );
         }
+      }
+
+      /**
+       * Reflect a sensing change this page just made.
+       *
+       * Nothing else will. The firmware deliberately suppresses the
+       * unsolicited status for a sensing change a Bluetooth command caused
+       * (`ShimBt_instreamStatusRespSendIfNotBtCmd`, log-and-stream-common
+       * `Comms/shimmer_bt_uart.c`) rather than echo back what the host just
+       * asked for — so a start or a stop leaves no trace on the panel, which
+       * would sit there showing the flags read at connect.
+       *
+       * These values are this page's belief, not the sensor's word: an ACK
+       * says the command was accepted, not that the sensor is doing it — a
+       * full card or a bad file stops logging without failing anything. So
+       * they are marked `*`, and the next authoritative read — Refresh, a
+       * clock set, the next connect — is what turns them back into a reading,
+       * correcting them if the sensor disagrees ({@link renderStatus}).
+       *
+       * A read fired from here instead, straight after the command, would be
+       * worse than no read at all: `stopStreaming` and
+       * `stopStreamingAndLogging` deliberately do not wait for their own ACK,
+       * so a command written before that ACK lands has it counted as its own
+       * and then waits out its timeout for a reply that was already
+       * discarded. Measured against the mock, and the same race exists on any
+       * link that can put the ACK and the response in one notification.
+       *
+       * @param {Record<string, boolean>} patch flags the command changed
+       */
+      function inferStatus(patch) {
+        /* Patched onto whatever was last known, or onto nothing at all if no
+           read has ever succeeded — `paintStatus` omits a flag that is not a
+           boolean, so the flags this page did not touch stay absent rather
+           than claiming to be off. */
+        statusView = {
+          status: { ...(statusView?.status ?? {}), ...patch },
+          source: "inferred",
+          at: Date.now(),
+          inferred: new Set(Object.keys(patch)),
+          unconfirmedAt: null,
+        };
+        paintStatus();
+      }
+
+      /** Forget the flags: nothing is known about a sensor we have let go. */
+      function resetStatus() {
+        statusView = null;
+        paintStatus();
+      }
+
+      /** Paint {@link statusView}: the flags, then how fresh they are. */
+      function paintStatus() {
+        const host = $("statusFlags");
+        const fresh = $("statusFresh");
+        if (!statusView) {
+          host.textContent = "–";
+          fresh.hidden = true;
+          fresh.textContent = "";
+          fresh.title = "";
+          fresh.classList.remove("unread");
+          return;
+        }
+        const { status, source, at, inferred, unconfirmedAt } = statusView;
+        host.replaceChildren(
+          ...STATUS_FLAGS
+            /* Not a boolean, so not shown: a Shimmer3 omits the second status
+               byte entirely rather than sending a zero, which is why
+               `usbPluggedIn` can be null — and the same rule keeps a flag the
+               page inferred before it ever read one from claiming to be off. */
+            .filter(([key]) => typeof status[key] === "boolean")
+            .map(([key, label, badWhenOn]) => {
+              const on = status[key];
+              const guessed = inferred.has(key);
+              return el("span", {
+                class:
+                  `flag${on ? (badWhenOn ? " bad" : " on") : ""}` +
+                  (guessed ? " inferred" : ""),
+                text: guessed ? `${label} *` : label,
+                title: guessed
+                  ? "Set from the command this page sent, not read back from the sensor."
+                  : null,
+              });
+            }),
+        );
+
+        const clock = clockTime(at);
+        const label =
+          source === "read"
+            ? `read ${clock}`
+            : source === "push"
+              ? `pushed ${clock}`
+              : `inferred ${clock}`;
+        const why =
+          source === "read"
+            ? `Read from the sensor at ${clock}.`
+            : source === "push"
+              ? `The sensor sent these at ${clock} without being asked, which is how it reports a dock, an undock, a button press or a trial ending.`
+              : `The flags marked * were set from the command this page sent at ${clock} and have not been read back. The firmware sends nothing for a change a Bluetooth command caused, so nothing will arrive on its own — press Refresh to confirm them.`;
+        fresh.hidden = false;
+        fresh.textContent = unconfirmedAt ? `${label}, unconfirmed` : label;
+        fresh.title = unconfirmedAt
+          ? `${why} The read-back at ${clockTime(unconfirmedAt)} did not answer, so these are still the last values the page had.`
+          : why;
+        fresh.classList.toggle(
+          "unread",
+          source === "inferred" || !!unconfirmedAt,
+        );
       }
 
       /** Battery, status flags and the real-world clock. */
@@ -2774,6 +2959,15 @@
             ? "streaming to this host and logging to the sensor's SD card"
             : "streaming to this host",
         );
+        /* Only what this command actually changed: START_STREAMING does not
+           touch SD logging, and asserting it off would overwrite a recording
+           the sensor's own button had started. `sensing` follows because the
+           firmware sets it for either kind of recording. */
+        inferStatus(
+          withSd
+            ? { sensing: true, streaming: true, sdLogging: true }
+            : { sensing: true, streaming: true },
+        );
         regate();
       }
 
@@ -2797,6 +2991,13 @@
         // numbers rather than leaving whatever it left behind.
         stats.render();
         if (recorder.active) await stopRecording();
+        // Same reasoning as the start: only what the command changed, and the
+        // page's own belief until something reads it back.
+        inferStatus(
+          withSd
+            ? { sensing: false, streaming: false, sdLogging: false }
+            : { sensing: false, streaming: false },
+        );
         regate();
       }
 
@@ -3031,6 +3232,30 @@
           mode !== "usb" && typeof client.runDataRateTest === "function";
         regate();
 
+        /* The sensor's own news, which nothing on this page used to hear.
+           The firmware pushes an unsolicited STATUS_RESPONSE whenever it is
+           docked or undocked (`LogAndStream_setupDock` / `setupUndock`,
+           log-and-stream-common `log_and_stream_common.c`) and on a sensing
+           change it made itself — the user button, a trial ending, a low
+           battery. A read's own answer is NOT delivered here, so this cannot
+           double-render what Refresh already showed.
+
+           It only fires while idle: once a stream is live the SDK's parser
+           consumes the push, which is why a stream start reflects its own
+           change (`inferStatus`) instead of waiting for one. Guarded by a
+           property check because the dock client has no such callback — and
+           no status bytes to put in it. */
+        if ("onDeviceStatus" in client) {
+          client.onDeviceStatus = (status) => {
+            log.log(
+              `the sensor pushed a status change: docked=${status.docked} ` +
+                `sensing=${status.sensing} streaming=${status.streaming} ` +
+                `sdLogging=${status.sdLogging}`,
+            );
+            renderStatus(status, "push");
+          };
+        }
+
         deviceName = client.device?.name ?? session.transport?.deviceName ?? "";
         setIdentity({ idLink: session.label });
 
@@ -3250,6 +3475,9 @@
            were never sent. */
         tap?.tap.flush();
         tap = null;
+        /* A status pushed by a link the page has already let go would paint a
+           departed sensor's flags into a panel that is about to say "–". */
+        if (client) client.onDeviceStatus = null;
         client = null;
         mode = null;
         caps = {};
@@ -3365,8 +3593,9 @@
           // card file should produce, `mockTransport.eeprom.brandBytes()` is
           // the brand record as the mock now holds it,
           // `mockTransport.calib.bytes()` is the calibration dump as it now
-          // stands, and `sdBrowser` / `brandEditor` / `calibrationEditor` are
-          // the three panels' APIs.
+          // stands, `mockTransport.status.setDocked(true)` pushes the
+          // unsolicited status a dock produces, and `sdBrowser` /
+          // `brandEditor` / `calibrationEditor` are the three panels' APIs.
           window.mockTransport = transport;
           window.sdBrowser = sd;
           window.brandEditor = brand;
