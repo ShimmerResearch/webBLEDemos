@@ -208,13 +208,27 @@ export function createBrandEditor(host, opts = {}) {
   let destroyed = false;
 
   /* A vendored bundle from before the brand record shipped: say so once,
-     here, rather than throwing from the first button press. */
+     here, rather than throwing from the first button press. The constants
+     matter as much as the functions — an undefined offset or length would
+     reach `readDaughterCardMem` and fail there instead, where the message
+     would be about a bad argument rather than about a stale bundle. */
   const missing = [
-    "parseBrandRecord",
-    "buildBrandRecord",
-    "buildBlankBrandRecord",
-    "brandNameProblem",
-  ].filter((name) => typeof sdk[name] !== "function");
+    ...[
+      "parseBrandRecord",
+      "buildBrandRecord",
+      "buildBlankBrandRecord",
+      "brandNameProblem",
+    ].filter((name) => typeof sdk[name] !== "function"),
+    ...[
+      "BRAND_RECORD_HOST_OFFSET",
+      "BRAND_RECORD_SIZE",
+      "BRAND_BT_CLASSIC_MAX_CHARS",
+      "BRAND_BLE_MAX_CHARS",
+      "BRAND_BLE_MAX_CHARS_SHIMMER3",
+      "BRAND_USB_PRODUCT_MAX_CHARS",
+      "BRAND_USB_MANUFACTURER_MAX_CHARS",
+    ].filter((name) => typeof sdk[name] !== "number"),
+  ];
   if (missing.length) {
     host.replaceChildren(
       el(
@@ -328,7 +342,12 @@ export function createBrandEditor(host, opts = {}) {
   );
 
   // The restart banner, hidden until a write or an erase has landed.
-  const restartAuto = el("div", { dataset: { brandRole: "restartAuto" } });
+  const restartAuto = el(
+    "div",
+    { dataset: { brandRole: "restartAuto" } },
+    "Restart now arms a one-shot restart and drops the link — the sensor " +
+      "restarts by itself as the link goes, then advertises the new names.",
+  );
   const restartManual = el(
     "div",
     { dataset: { brandRole: "restartManual" } },
@@ -748,14 +767,18 @@ export function createBrandEditor(host, opts = {}) {
   // The restart banner
   // -------------------------------------------------------------------------
 
+  /**
+   * Show whichever restart route this link actually has.
+   *
+   * Called from `sync`, so the route follows the link rather than being
+   * decided once: a page that reconnects over the dock after arming a restart
+   * over BLE gets the manual walkthrough without the panel being rebuilt.
+   */
   function paintRestartBanner() {
     const auto = canSoftRestart();
     restartAuto.hidden = !auto;
     restartManual.hidden = auto;
     btnRestart.hidden = !auto;
-    restartAuto.textContent =
-      "Restart now arms a one-shot restart and drops the link — the sensor " +
-      "restarts by itself as the link goes, then advertises the new names.";
   }
 
   function showRestartBanner() {
