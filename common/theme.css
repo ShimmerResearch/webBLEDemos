@@ -1,0 +1,1243 @@
+/* =========================================================================
+   Shared design tokens + base components for the webBLEDemos pages.
+
+   Extracted from verisense-device-console/console.css (tokens, cards,
+   buttons, tabs, collapsible groups, dirty fields, log lines, toasts) so
+   every demo in this repo can look like one product without a build step.
+
+   Import from any demo folder:
+       <link rel="stylesheet" href="../common/theme.css" />
+
+   Token layering — three blocks, in this order:
+     :root                                    light values (the baseline)
+     :root[data-theme="dark"]                 explicit dark choice
+     @media (prefers-color-scheme: dark)
+       :root:not([data-theme="light"])        OS dark, unless light was chosen
+
+   Component rules below reference tokens ONLY. Adjust colours here, not in
+   the component section.
+   ========================================================================= */
+
+:root {
+  color-scheme: light;
+
+  /* surfaces */
+  --bg: #f4f6f8;
+  --card: #ffffff;
+  --surface-2: #fafbfc;
+  --surface-3: #f1f5f6;
+  --surface-inset: #eef1f3;
+
+  /* text */
+  --ink: #17232a;
+  --ink-strong: #101c22;
+  --muted: #64747e;
+  --faint: #9aa7ae;
+
+  /* borders */
+  --line: #e2e8eb;
+  --line-soft: #eaeff2;
+  --line-strong: #d3dce0;
+
+  /* Brand accent — Pantone Orange 021C (product colour). Pure #fe5000 is
+     max-chroma: fine for thin/small accents (tab underline, badge dots,
+     meters, focus) but a solid button block of it vibrates on white and
+     white text on it is only 3.3:1. So button surfaces use --accent-fill,
+     an "ember" deepened one step for white ink at 4.8:1, and --accent-text
+     is likewise deepened for AA on light surfaces.
+     NEVER use #fe5000 as a button fill. */
+  --accent: #fe5000;
+  --accent-fill: #cf3f00;
+  --accent-hover: #b83800;
+  --accent-ink: #ffffff;
+  --accent-text: #c13c00;
+  --accent-soft: #ffede3;
+  --accent-soft-border: #ffcdb3;
+  --accent-2: #17506e;
+
+  /* controls */
+  --control-bg: #ffffff;
+  --control-hover: #f2f6f7;
+
+  /* states */
+  --warn: #9a5d06;
+  --warn-bg: #fdf6ea;
+  --warn-border: #eed9b4;
+  --danger: #c0392b;
+  --danger-bg: #fdefed;
+  --danger-border: #f0c4bf;
+  --ok: #1e7a1e;
+  --ok-bg: #eef7ee;
+  --ok-border: #c3e0c3;
+  --info-bg: #eef4f9;
+  --info-border: #c8dbea;
+
+  /* log / terminal surfaces (dark in BOTH themes, as in the console: a
+     terminal that flips to white is unreadable next to a dark plot and
+     breaks the "this is machine output" reading) */
+  --log-bg: #10161d;
+  --log-ink: #cfdae4;
+  --log-line: #273444;
+  --log-ok: #3ddc84;
+  --log-bad: #ff6b6b;
+  /* Bright amber-orange, tuned to pop on --log-bg like --log-ok/--log-bad
+     (the softer #e5b567 was hard to read on the dark log surface). */
+  --log-warn: #ffb454;
+  --log-tx: #79b8ff;
+  --log-rx: #7ee2a8;
+  --log-dim: #7d8b96;
+
+  /* effects */
+  --shadow-card: 0 1px 2px rgba(16, 28, 34, 0.05),
+    0 4px 12px rgba(16, 28, 34, 0.04);
+  --focus-ring: 0 0 0 3px rgba(254, 80, 0, 0.28);
+  --backdrop: rgba(10, 18, 24, 0.5);
+
+  /* Inter is NOT vendored here (no font file in this repo) — the stack
+     falls straight through to the platform UI face. */
+  --font-ui: Inter, "Segoe UI Variable Text", system-ui, "Segoe UI", sans-serif;
+  --font-mono: "Cascadia Code", Consolas, "Courier New", monospace;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0d1117;
+  --card: #151b23;
+  --surface-2: #11161d;
+  --surface-3: #1a212b;
+  --surface-inset: #10151b;
+
+  --ink: #dbe4ec;
+  --ink-strong: #f0f5f9;
+  --muted: #8b98a5;
+  --faint: #5f6d78;
+
+  --line: #232c37;
+  --line-soft: #1d2530;
+  --line-strong: #2d3844;
+
+  /* on dark surfaces the lifted orange doesn't vibrate — fill = accent */
+  --accent: #ff6a2e;
+  --accent-fill: #ff6a2e;
+  --accent-hover: #ff8049;
+  --accent-ink: #2a0f00;
+  --accent-text: #ff8656;
+  --accent-soft: rgba(255, 106, 46, 0.13);
+  --accent-soft-border: rgba(255, 106, 46, 0.32);
+  --accent-2: #5aa7d0;
+
+  --control-bg: #1c242e;
+  --control-hover: #232d39;
+
+  --warn: #e8b04b;
+  --warn-bg: #241d10;
+  --warn-border: #4a3a1c;
+  --danger: #ff6b6b;
+  --danger-bg: #2a1618;
+  --danger-border: #4d2529;
+  --ok: #3ddc84;
+  --ok-bg: #10241a;
+  --ok-border: #1e4630;
+  --info-bg: #121c24;
+  --info-border: #22323f;
+
+  --log-bg: #0a0e13;
+  --log-line: #1d2632;
+
+  --shadow-card: none;
+  --focus-ring: 0 0 0 3px rgba(255, 106, 46, 0.35);
+  --backdrop: rgba(0, 0, 0, 0.6);
+}
+
+/* OS preference, honoured only when the page has NOT pinned light. Values
+   are the same as the [data-theme="dark"] block above; CSS cannot share one
+   declaration block across a media-query boundary, so it is duplicated. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #0d1117;
+    --card: #151b23;
+    --surface-2: #11161d;
+    --surface-3: #1a212b;
+    --surface-inset: #10151b;
+
+    --ink: #dbe4ec;
+    --ink-strong: #f0f5f9;
+    --muted: #8b98a5;
+    --faint: #5f6d78;
+
+    --line: #232c37;
+    --line-soft: #1d2530;
+    --line-strong: #2d3844;
+
+    --accent: #ff6a2e;
+    --accent-fill: #ff6a2e;
+    --accent-hover: #ff8049;
+    --accent-ink: #2a0f00;
+    --accent-text: #ff8656;
+    --accent-soft: rgba(255, 106, 46, 0.13);
+    --accent-soft-border: rgba(255, 106, 46, 0.32);
+    --accent-2: #5aa7d0;
+
+    --control-bg: #1c242e;
+    --control-hover: #232d39;
+
+    --warn: #e8b04b;
+    --warn-bg: #241d10;
+    --warn-border: #4a3a1c;
+    --danger: #ff6b6b;
+    --danger-bg: #2a1618;
+    --danger-border: #4d2529;
+    --ok: #3ddc84;
+    --ok-bg: #10241a;
+    --ok-border: #1e4630;
+    --info-bg: #121c24;
+    --info-border: #22323f;
+
+    --log-bg: #0a0e13;
+    --log-line: #1d2632;
+
+    --shadow-card: none;
+    --focus-ring: 0 0 0 3px rgba(255, 106, 46, 0.35);
+    --backdrop: rgba(0, 0, 0, 0.6);
+  }
+}
+
+/* =========================================================================
+   Base
+   ========================================================================= */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 var(--font-ui);
+  min-height: 100vh;
+}
+
+.page {
+  max-width: 1500px;
+  margin: 14px auto;
+  padding: 0 12px 18px;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 10px;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink-strong);
+}
+
+h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink-strong);
+}
+
+a {
+  color: var(--accent-text);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+code,
+kbd {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+/* =========================================================================
+   Layout
+   ========================================================================= */
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  box-shadow: var(--shadow-card);
+  margin-bottom: 12px;
+}
+
+.card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink-strong);
+  margin: 0 0 10px;
+}
+
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.row:last-child {
+  margin-bottom: 0;
+}
+
+/* min(100%, 300px): columns are 300px wide when there's room, but shrink
+   to fit (never overflow) once the container is narrower than 300px. */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 10px;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 5px 10px;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* =========================================================================
+   Pills and banners
+   ========================================================================= */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.pill.on {
+  border-color: var(--ok-border);
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.pill.err {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+/* Not a fault — something the reader has to know. "Never calibrated" and
+   "edited, not written" are both this, and neither is an error. */
+.pill.warn {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.banner {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--ink);
+  border-radius: 10px;
+  padding: 9px 12px;
+  margin: 8px 0;
+}
+
+/* An empty banner takes no space, so a page can keep one in the markup and
+   only fill in textContent when there is something to say. */
+.banner:empty {
+  display: none;
+}
+
+.banner.ok {
+  border-color: var(--ok-border);
+  border-left-color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.banner.err {
+  border-color: var(--danger-border);
+  border-left-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.banner.warn {
+  border-color: var(--warn-border);
+  border-left-color: var(--warn);
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+.banner.info {
+  border-color: var(--info-border);
+  border-left-color: var(--accent-2);
+  background: var(--info-bg);
+}
+
+/* =========================================================================
+   Controls
+   ========================================================================= */
+
+button,
+input,
+select,
+textarea {
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+  background: var(--control-bg);
+  color: var(--ink);
+  max-width: 100%;
+}
+
+textarea {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  resize: vertical;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible,
+[role="tab"]:focus-visible,
+summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
+}
+
+input[readonly],
+textarea[readonly] {
+  background: var(--surface-inset);
+  color: var(--muted);
+  border-color: var(--line-strong);
+  cursor: not-allowed;
+}
+
+button {
+  padding: 8px 13px;
+  cursor: pointer;
+  font-weight: 600;
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
+}
+
+button:hover:not(:disabled) {
+  background: var(--control-hover);
+}
+
+/* Solid accent block — --accent-fill, never --accent (see the token note). */
+button.primary {
+  color: var(--accent-ink);
+  border-color: transparent;
+  background: var(--accent-fill);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+button.secondary {
+  color: var(--accent-text);
+  border-color: var(--accent-soft-border);
+  background: var(--accent-soft);
+}
+
+button.secondary:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+button.danger {
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+}
+
+button.warn {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
+button.warn:hover:not(:disabled) {
+  background: var(--warn-bg);
+  border-color: var(--warn);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Light/dark switch (initThemeToggle in common/theme.js sets the glyph). */
+.theme-toggle {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--muted);
+}
+
+.theme-toggle:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* =========================================================================
+   Collapsible groups: <details class="group"><summary>…
+   (console .op-group, renamed for reuse outside the op-config editor)
+   ========================================================================= */
+
+details.group {
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--surface-2);
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+details.group > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 8px 10px;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--surface-3);
+  border-bottom: 1px solid var(--line-soft);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+details.group > summary::before {
+  content: "+";
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  color: var(--muted);
+  background: var(--card);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 700;
+  flex: 0 0 16px;
+}
+
+details.group[open] > summary::before {
+  content: "-";
+}
+
+details.group > summary::marker {
+  content: "";
+}
+
+details.group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.group-body {
+  padding: 10px;
+}
+
+/* =========================================================================
+   Config fields
+   ========================================================================= */
+
+.field {
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: var(--card);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.field > label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+}
+
+.field-hint {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+/* Field differs from the device's last-read value. */
+.field.dirty {
+  border-color: var(--warn);
+}
+
+.field.dirty > label::after {
+  content: "\25cf"; /* ● */
+  color: var(--warn);
+  font-size: 9px;
+  margin-left: 6px;
+  vertical-align: 2px;
+}
+
+.dirty-pill {
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* =========================================================================
+   Tabs — WAI-ARIA tablist, wired by initTabs() in common/ui-chrome.js.
+   Markup: .tabs > button[data-tab="panelId"], plus .tab[id] panels.
+   ========================================================================= */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 12px;
+}
+
+.tabs > button,
+.tabs > [role="tab"] {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  padding: 8px 12px 10px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.tabs > button:hover:not(:disabled),
+.tabs > [role="tab"]:hover:not(:disabled) {
+  background: none;
+  color: var(--ink);
+}
+
+/* aria-selected is the single source of truth for the active tab — initTabs
+   sets it, so the underline cannot drift out of step with the ARIA state. */
+.tabs [role="tab"][aria-selected="true"] {
+  color: var(--accent-text);
+  background: none;
+  border-bottom-color: var(--accent);
+}
+
+.tab {
+  display: none;
+}
+
+.tab.active,
+.tab[aria-selected="true"] {
+  display: block;
+}
+
+/* =========================================================================
+   Toasts — bottom-right stack, auto-dismissing.
+   showToast() in common/ui-chrome.js creates .toast-stack#toasts on demand.
+   ========================================================================= */
+
+.toast-stack {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(360px, calc(100vw - 28px));
+}
+
+.toast {
+  background: var(--card);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  animation: toast-in 0.16s ease-out;
+}
+
+.toast.ok {
+  border-left-color: var(--ok);
+}
+
+.toast.err {
+  border-left-color: var(--danger);
+}
+
+.toast.warn {
+  border-left-color: var(--warn);
+}
+
+.toast.info {
+  border-left-color: var(--accent-2);
+}
+
+.toast.leaving {
+  opacity: 0;
+  transition: opacity 0.18s;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+  }
+
+  button {
+    transition: none;
+  }
+}
+
+/* =========================================================================
+   Event log — a terminal surface, so it stays dark in BOTH themes.
+   ========================================================================= */
+
+.log {
+  width: 100%;
+  height: 340px;
+  border-radius: 10px;
+  border: 1px solid var(--log-line);
+  background: var(--log-bg);
+  color: var(--log-ink);
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-line.sev-info {
+  color: var(--log-ink);
+}
+
+.log-line.sev-err {
+  color: var(--log-bad);
+}
+
+.log-line.sev-warn {
+  color: var(--log-warn);
+}
+
+.log-line.sev-tx {
+  color: var(--log-tx);
+}
+
+.log-line.sev-rx {
+  color: var(--log-rx);
+}
+
+.log-line.sev-data {
+  color: var(--log-dim);
+}
+
+.log-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.log-toolbar input[type="search"] {
+  flex: 1;
+  min-width: 120px;
+}
+
+.log-count {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* =========================================================================
+   Hex view — a monospace byte grid (InfoMem is 3 pages of 128 bytes, so the
+   row width is fixed at 16 and the whole 384-byte dump scrolls in place).
+   ========================================================================= */
+
+.hexview {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--surface-inset);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.hexview-row {
+  display: grid;
+  grid-template-columns: 5.5ch repeat(16, 2.5ch);
+  gap: 0 2px;
+  white-space: nowrap;
+}
+
+.hexview-addr {
+  color: var(--faint);
+  user-select: none;
+}
+
+.hexview-byte {
+  text-align: center;
+  color: var(--ink);
+  border-radius: 3px;
+}
+
+/* 0x00 and 0xFF are the two "nothing here" values — dimming them makes the
+   real payload readable at a glance in a 384-byte dump. */
+.hexview-byte.zero,
+.hexview-byte.blank {
+  color: var(--faint);
+}
+
+.hexview-byte.changed {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.hexview-byte.sel {
+  background: var(--accent-fill);
+  color: var(--accent-ink);
+}
+
+/* =========================================================================
+   Stats strip — live Hz / loss / throughput while streaming.
+   ========================================================================= */
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.stats > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 72px;
+}
+
+.stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
+.stat-value {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink-strong);
+}
+
+.stat-value.bad {
+  color: var(--danger);
+}
+
+.stat-value.warn {
+  color: var(--warn);
+}
+
+/* =========================================================================
+   Plots — one canvas panel per sensor group (common/plot.js). The canvas
+   needs a sized block parent because Chart.js runs with
+   maintainAspectRatio:false.
+   ========================================================================= */
+
+.plot-panels {
+  display: grid;
+  gap: 10px;
+}
+
+.plot-panel {
+  position: relative;
+  height: 200px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  padding: 6px;
+}
+
+.plot-panel > canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* =========================================================================
+   SD card browser — the selectable on-card tree and the transfer progress
+   bar (common/sd-browser.js). Monospace, because a card path is a path.
+   ========================================================================= */
+
+.sd-tree {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  padding: 8px 10px;
+}
+
+.sd-tree ul {
+  list-style: none;
+  margin: 0;
+  padding-left: 20px;
+}
+
+/* The outermost list sits flush: the checkbox is the indent. */
+.sd-tree > ul {
+  padding-left: 0;
+}
+
+.sd-tree label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  color: var(--ink-strong);
+  font-weight: 600;
+}
+
+.sd-tree label input {
+  width: auto;
+  flex: 0 0 auto;
+}
+
+.sd-tree .sd-size {
+  color: var(--muted);
+  margin-left: 8px;
+  font-weight: 400;
+}
+
+.sd-tree .sd-file {
+  color: var(--muted);
+}
+
+/* Painted from the tokens rather than left to the UA widget: a <progress>
+   follows the OPERATING SYSTEM colour scheme, not the page's data-theme, so
+   an explicitly-light page on a dark host was drawing a black bar. */
+.sd-progress {
+  width: 100%;
+  height: 14px;
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface-inset);
+  overflow: hidden;
+}
+
+.sd-progress::-webkit-progress-bar {
+  background: var(--surface-inset);
+}
+
+.sd-progress::-webkit-progress-value {
+  background: var(--accent);
+}
+
+.sd-progress::-moz-progress-bar {
+  background: var(--accent);
+}
+
+/* =========================================================================
+   Device naming — the per-field preview and error under each name box
+   (common/brand-editor.js). Both live inside a .field, so they inherit its
+   column and only need their own type and colour.
+   ========================================================================= */
+
+/* The panel puts its input INSIDE its label rather than tying the two
+   together by id, because a panel a page can mount twice must not plant
+   fixed ids. `.field > label` is a flex ROW, though, so a full-width input
+   next to the label text squeezes the text into three lines — block here
+   stacks them, which is what every other field on the page looks like. */
+.field[data-brand-field] > label {
+  display: block;
+}
+
+.field[data-brand-field] > label input {
+  margin-top: 5px;
+}
+
+.brand-preview {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  /* A preview is a name plus a MAC suffix plus, on an unidentified sensor,
+     both platforms' forms — so it wraps rather than widening the column. */
+  overflow-wrap: anywhere;
+}
+
+.brand-error {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+/* Neither takes any space when there is nothing to say, so a field with a
+   valid name is exactly as tall as one with no preview at all. */
+.brand-preview:empty,
+.brand-error:empty {
+  display: none;
+}
+
+/* The box a name cannot be written from. Also on :focus-visible, or the
+   focus ring's border colour hides the very field it is reporting. */
+.field input.bad,
+.field input.bad:focus-visible {
+  border-color: var(--danger);
+}
+
+.brand-steps {
+  margin: 6px 0 0 18px;
+  padding: 0;
+}
+
+.brand-steps li {
+  margin: 2px 0;
+}
+
+/* =========================================================================
+   Calibration editor (common/calibration-editor.js)
+
+   One card per sensor, each holding three labelled number grids: offset
+   (3x1), sensitivity (3x1) and alignment (3x3). The three sit side by side
+   and wrap as a unit, so a narrow window stacks whole grids rather than
+   breaking a matrix across a line — a 3x3 with a row hanging under it is
+   unreadable as a matrix.
+   ========================================================================= */
+
+.cal-grids {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.cal-block {
+  min-width: 0;
+}
+
+.cal-block-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+
+.cal-unit {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.cal-matrix {
+  display: grid;
+  gap: 4px;
+  align-items: center;
+}
+
+/* Leading column is the axis label; the rest are boxes. */
+.cal-matrix.cols-1 {
+  grid-template-columns: 14px 104px;
+}
+
+.cal-matrix.cols-3 {
+  grid-template-columns: 14px repeat(3, 74px);
+}
+
+.cal-axis {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  text-align: right;
+}
+
+/* Numbers, so they line up column-wise and a sign never shifts the digits. */
+input.cal-cell {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: right;
+  padding: 4px 6px;
+  width: 100%;
+}
+
+input.cal-cell:read-only {
+  background: var(--surface-inset);
+  color: var(--muted);
+}
+
+input.cal-cell.bad,
+input.cal-cell.bad:focus-visible {
+  border-color: var(--danger);
+}
+
+.cal-error {
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.cal-chip {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.cal-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* Eats the slack in the row, so Restore defaults sits at the far end. */
+.cal-push {
+  flex: 1 1 auto;
+}
+
+/* A sensor whose stored calibration is not what the boxes now say. Matches
+   the dirty-field treatment on the configuration form, deliberately: it is
+   the same statement — "this differs from the device". */
+.card[data-cal-dirty="true"] {
+  border-color: var(--warn-border);
+}
+
+/* =========================================================================
+   Narrow screens: one column everywhere.
+   ========================================================================= */
+
+@media (max-width: 720px) {
+  .page {
+    margin: 8px auto;
+    padding: 0 8px 14px;
+  }
+
+  .grid,
+  .plot-panels {
+    grid-template-columns: 1fr;
+  }
+
+  .kv {
+    grid-template-columns: 1fr;
+  }
+
+  /* Buttons grow to share the row rather than each claiming a full line —
+     a row of three actions reads better as one band than as three. Icon
+     buttons keep their fixed size; a stretched circle is not a circle. */
+  .row > button:not(.theme-toggle) {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .row > select,
+  .row > input:not([type="checkbox"]):not([type="radio"]) {
+    flex: 1 1 100%;
+  }
+
+  .toast-stack {
+    right: 8px;
+    left: 8px;
+    bottom: 8px;
+    max-width: none;
+  }
+
+  .log {
+    height: 260px;
+  }
+}

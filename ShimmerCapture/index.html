@@ -14,460 +14,3969 @@
       gtag("js", new Date());
       gtag("config", "G-T26GWN0LJW");
     </script>
+
     <meta charset="UTF-8" />
-    <title>ShimmerCapture (Shimmer3R)</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script type="module">
-      import {
-        Shimmer3RClient,
-        SensorBitmapShimmer3,
-      } from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23fe5000'/%3E%3Cpath d='M2 10.5 L5 10.5 L6.5 5.5 L8 12 L9.5 8 L11 10.5 L14 10.5' fill='none' stroke='white' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f6f8" />
+    <title>Shimmer Capture (Shimmer3R)</title>
 
-      const shimmer = new Shimmer3RClient({ debug: true });
-      let isStreaming = false;
-      let isSaving = false;
-      let chart,
-        chartData = {},
-        fileBuffer = [],
-        headerRow = [];
-      let sampleCounter = 0;
-      const ctx = document.getElementById("chart").getContext("2d");
-
-      const exgTestBtn = document.getElementById("exgTestBtn");
-      const emg16Btn = document.getElementById("emg16Btn");
-      const ecg16Btn = document.getElementById("ecg16Btn");
-
-      // keep a small helper to enable/disable as a group
-      function setEXGButtonsEnabled(enabled) {
-        [exgTestBtn, emg16Btn, ecg16Btn].forEach(
-          (b) => (b.disabled = !enabled),
-        );
-      }
-      // disabled until connected
-      setEXGButtonsEnabled(false);
-
-      // Build Sensor Dropdown Menu
-      const sensorMenu = document.getElementById("sensorMenu");
-      for (const [key, value] of Object.entries(SensorBitmapShimmer3)) {
-        const option = document.createElement("option");
-        option.value = value;
-        option.textContent = key;
-        sensorMenu.appendChild(option);
-      }
-
-      async function refreshEnabledSensors() {
-        const enabled = shimmer.getEnabledSensors();
-        for (const opt of sensorMenu.options) {
-          const bit = parseInt(opt.value);
-          opt.selected = (enabled & bit) !== 0;
-        }
-        document.getElementById("status").textContent =
-          `Enabled sensors: 0x${enabled.toString(16).toUpperCase()}`;
-      }
-
-      exgTestBtn.onclick = async () => {
-        if (!shimmer.device) return alert("Connect first.");
+    <!-- Inline, and deliberately NOT type="module": this has to run before the
+         first paint or the page flashes the wrong theme while the module graph
+         loads. Body copied from THEME_BOOTSTRAP_SNIPPET in common/theme.js. -->
+    <script>
+      (function () {
+        var theme = "light";
         try {
-          setEXGButtonsEnabled(false);
-          document.getElementById("status").textContent =
-            "Enabling EXG test signal (16‑bit)…";
-          await shimmer.enableEXGTestSignal16Bit(); // will power expansion, program EXG pages, set sensors, and re-inquiry
-          document.getElementById("status").textContent =
-            "EXG test signal enabled.";
-        } catch (e) {
-          console.error(e);
-          alert("Failed to enable EXG test signal: " + e.message);
-        } finally {
-          setEXGButtonsEnabled(true);
-        }
-      };
+          var saved = localStorage.getItem("uiTheme");
+          if (saved === "dark" || saved === "light") theme = saved;
+          else if (window.matchMedia("(prefers-color-scheme: dark)").matches)
+            theme = "dark";
+        } catch (e) {}
+        document.documentElement.dataset.theme = theme;
+        // Keep the browser chrome (mobile address bar, installed-app title bar) in
+        // step with the page theme. Values mirror --bg in common/theme.css.
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.content = theme === "dark" ? "#0d1117" : "#f4f6f8";
 
-      emg16Btn.onclick = async () => {
-        if (!shimmer.device) return alert("Connect first.");
+        // The event log drawer, for the same reason and with the same key the
+        // module below uses (LOG_DRAWER_KEY): applied before the first paint
+        // so a remembered-open drawer does not shove the page up a frame
+        // after it settles.
+        var open = "false";
         try {
-          setEXGButtonsEnabled(false);
-          document.getElementById("status").textContent =
-            "Enabling EMG (16‑bit) on EXG1 & EXG2…";
-          await shimmer.enableEMG16Bit(); // programs EXG pages, sets EXG1/2 16‑bit sensors, triggers inquiry
-          document.getElementById("status").textContent = "EMG 16‑bit enabled.";
-        } catch (e) {
-          console.error(e);
-          alert("Failed to enable EMG 16‑bit: " + e.message);
-        } finally {
-          setEXGButtonsEnabled(true);
-        }
-      };
-
-      ecg16Btn.onclick = async () => {
-        if (!shimmer.device) return alert("Connect first.");
-        try {
-          setEXGButtonsEnabled(false);
-          document.getElementById("status").textContent =
-            "Enabling ECG (16‑bit) on EXG1 & EXG2…";
-          await shimmer.enableECG16Bit(); // powers expansion, programs EXG pages, sets sensors, triggers inquiry
-          document.getElementById("status").textContent = "ECG 16‑bit enabled.";
-        } catch (e) {
-          console.error(e);
-          alert("Failed to enable ECG 16‑bit: " + e.message);
-        } finally {
-          setEXGButtonsEnabled(true);
-        }
-      };
-
-      // ---- Expansion power UI handling ----
-      const expChk = document.getElementById("expPowerChk");
-      expChk.disabled = true; // disabled until connected
-      expChk.onchange = async (e) => {
-        if (!shimmer || !shimmer.device) {
-          expChk.checked = false;
-          return alert("Connect to device first.");
-        }
-
-        const desired = expChk.checked ? 1 : 0;
-        // disable while toggling to avoid double requests
-        expChk.disabled = true;
-        try {
-          document.getElementById("status").textContent =
-            `Setting expansion power to ${desired ? "ON" : "OFF"}…`;
-          await shimmer.setInternalExpPower(desired);
-          // setInternalExpPower updates shimmer.ExpPower and emits onExpPowerChanged
-          expChk.checked = shimmer.getInternalExpPower() === 1;
-          document.getElementById("status").textContent =
-            `Expansion power ${desired ? "enabled" : "disabled"}.`;
-        } catch (err) {
-          console.error("Failed to set expansion power", err);
-          alert("Failed to set expansion power: " + err.message);
-          // revert visual state to cached value
-          expChk.checked = shimmer.getInternalExpPower() === 1;
-          document.getElementById("status").textContent =
-            "Error setting expansion power.";
-        } finally {
-          expChk.disabled = false;
-        }
-      };
-
-      // Keep checkbox in sync if client emits changes (e.g., enableEMG16Bit triggers setInternalExpPower)
-      shimmer.onExpPowerChanged = (val) => {
-        expChk.checked = val === 1;
-        expChk.disabled = false;
-      };
-
-      // -------- Buttons --------
-      document.getElementById("applySensorsBtn").onclick = async () => {
-        try {
-          const selectedOptions = [...sensorMenu.selectedOptions];
-          if (selectedOptions.length === 0)
-            return alert("Select at least one sensor");
-          let bitmask = 0;
-          selectedOptions.forEach((opt) => (bitmask |= parseInt(opt.value)));
-          const result = await shimmer.setSensors(bitmask);
-          await refreshEnabledSensors();
-          document.getElementById("status").textContent =
-            `Sensors applied (0x${bitmask.toString(16).toUpperCase()})`;
-        } catch (e) {
-          alert(e);
-        }
-      };
-
-      document.getElementById("connectBtn").onclick = async () => {
-        try {
-          await shimmer.connect();
-          document.getElementById("status").textContent =
-            "Connected. Running Inquiry...";
-          const info = await shimmer.inquiry();
-          await refreshEnabledSensors();
-
-          // After connect, reflect cached expansion power state in the checkbox
-          expChk.checked = shimmer.getInternalExpPower() === 1;
-          expChk.disabled = false;
-          setEXGButtonsEnabled(true);
-        } catch (e) {
-          alert(e);
-        }
-      };
-
-      document.getElementById("disconnectBtn").onclick = async () => {
-        await shimmer.disconnect();
-        document.getElementById("status").textContent = "Disconnected.";
-        // disable expansion power checkbox while disconnected
-        expChk.checked = false;
-        expChk.disabled = true;
-        setEXGButtonsEnabled(false);
-      };
-      let signalListInitialized = false;
-      document.getElementById("startBtn").onclick = async () => {
-        if (!shimmer.device) return alert("Connect first.");
-        isStreaming = true;
-        fileBuffer = [];
-        headerRow = [];
-        sampleCounter = 0;
-        signalListInitialized = false;
-        await shimmer.startStreaming();
-        shimmer.onStreamFrame = onFrame;
-        document.getElementById("status").textContent = "Streaming…";
-      };
-      document.getElementById("stopBtn").onclick = async () => {
-        if (!shimmer.device) return alert("Connect first.");
-        isStreaming = true;
-        fileBuffer = [];
-        headerRow = [];
-        sampleCounter = 0;
-        signalListInitialized = false;
-        await shimmer.stopStreaming();
-        shimmer.onStreamFrame = onFrame;
-        document.getElementById("status").textContent = "Streaming stopped…";
-      };
-      document.getElementById("startSDBTBtn").onclick = async () => {
-        if (!shimmer.device) return alert("Connect first.");
-        isStreaming = true;
-        fileBuffer = [];
-        headerRow = [];
-        sampleCounter = 0;
-        // buildSignalList() is what repopulates headerRow, and onFrame only calls
-        // it while this is false — so without the reset a second BT+SD run saves
-        // a CSV with no header. The BT-only start/stop handlers already do this.
-        signalListInitialized = false;
-        await shimmer.startStreamingAndLogging();
-        shimmer.onStreamFrame = onFrame;
-        document.getElementById("status").textContent =
-          "Streaming and SD Logging…";
-      };
-
-      document.getElementById("stopSDBTBtn").onclick = async () => {
-        isStreaming = false;
-        try {
-          await shimmer.stopStreamingAndLogging();
-          document.getElementById("status").textContent =
-            "Streaming and SD Logging stopped.";
-        } catch (e) {
-          console.error("Error while stopping stream:", e);
-          alert("Error stopping stream: " + e.message);
-        }
-      };
-
-      document.getElementById("saveBtn").onclick = () => {
-        isSaving = !isSaving;
-        const btn = document.getElementById("saveBtn");
-        btn.textContent = isSaving ? "Stop Saving" : "Start Saving";
-
-        if (!isSaving && fileBuffer.length > 0) {
-          const csv = [headerRow.join(",")].concat(fileBuffer).join("\n");
-          const blob = new Blob([csv], { type: "text/csv" });
-          const a = document.createElement("a");
-          a.href = URL.createObjectURL(blob);
-          a.download = "shimmer_data.csv";
-          a.click();
-        }
-      };
-
-      // -------- Build signal list --------
-
-      // -------- Build signal list (name + kind) --------
-
-      function buildSignalList(fields) {
-        const listDiv = document.getElementById("signalList");
-        const signalNote = document.getElementById("signalNote");
-        listDiv.innerHTML = "";
-
-        // Collect unique (name, kind) pairs; ignore TIMESTAMP
-        const pairs = [];
-        const seen = new Set(); // key = `${name}||${kind??''}`
-
-        for (const f of fields || []) {
-          if (f.name === "TIMESTAMP") continue;
-          const kind = f.kind ?? null;
-          const key = `${f.name}||${kind ?? ""}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            pairs.push({ name: f.name, kind });
-          }
-        }
-
-        // Create checkboxes labeled "NAME_KIND" (KIND uppercased; omit suffix if kind is null)
-        pairs.forEach(({ name, kind }) => {
-          const label = document.createElement("label");
-          const cb = document.createElement("input");
-          cb.type = "checkbox";
-
-          // Store both name and kind in the value
-          cb.value = JSON.stringify({ name, kind });
-          cb.onchange = rebuildChart;
-
-          const suffix = kind ? `_${String(kind).toUpperCase()}` : "";
-          label.append(cb, `${name}${suffix}`);
-          listDiv.append(label, document.createElement("br"));
-        });
-      }
-
-      // Stable hash from a string
-      function hashString(s) {
-        let h = 2166136261; // FNV-1a seed
-        for (let i = 0; i < s.length; i++) {
-          h ^= s.charCodeAt(i);
-          h = Math.imul(h, 16777619);
-        }
-        return h >>> 0; // uint32
-      }
-
-      // Map hash -> pretty HSL color
-      function colorFromLabel(label, alpha = 1) {
-        const h = hashString(label) % 360; // hue 0–359
-        const s = 68; // saturation %
-        const l = 52; // lightness %
-        return {
-          border: `hsl(${h} ${s}% ${l}%)`,
-          fill: `hsla(${h} ${s}% ${l}% / ${alpha})`,
-        };
-      }
-
-      function rebuildChart() {
-        const selected = [
-          ...document.querySelectorAll("#signalList input:checked"),
-        ].map((cb) => JSON.parse(cb.value));
-
-        chartData = {};
-
-        const toLabel = ({ name, kind }) =>
-          kind ? `${name}_${String(kind).toUpperCase()}` : name;
-
-        const datasets = selected.map((sel) => {
-          const label = toLabel(sel);
-          chartData[label] = [];
-          const { border, fill } = colorFromLabel(label, 0.15);
-          return {
-            label,
-            _metaSel: sel,
-            data: [],
-            borderColor: border,
-            backgroundColor: fill,
-            borderWidth: 1,
-            pointRadius: 0,
-            fill: false,
-          };
-        });
-
-        if (chart) chart.destroy();
-        chart = new Chart(ctx, {
-          type: "line",
-          data: { datasets },
-          options: {
-            animation: false,
-            parsing: false,
-            scales: {
-              x: {
-                type: "linear",
-                title: { text: "Sample Index", display: true },
-              },
-              y: { title: { text: "Value", display: true } },
-            },
-          },
-        });
-
-        headerRow = ["SampleIndex", ...datasets.map((d) => d.label)];
-      }
-
-      function onFrame(oc) {
-        if (!signalListInitialized) {
-          buildSignalList(oc.fields); // now pairs include RAW/CAL
-          signalListInitialized = true;
-        }
-
-        if (!isStreaming || !chart) return;
-        sampleCounter++;
-        const row = [sampleCounter];
-
-        for (const ds of chart.data.datasets) {
-          const { name, kind } = ds._metaSel || {};
-          const field = oc.get(name, kind ?? null);
-          const val = field?.value ?? null;
-
-          const label = ds.label; // "NAME_KIND"
-          chartData[label].push({ x: sampleCounter, y: val });
-          row.push(val);
-        }
-
-        if (isSaving) fileBuffer.push(row.join(","));
-
-        for (const ds of chart.data.datasets) {
-          const label = ds.label;
-          const arr = chartData[label];
-          if (arr.length > 200) arr.splice(0, arr.length - 200);
-          ds.data = arr;
-        }
-        chart.update();
-      }
-
-      shimmer.onStatus = (msg) =>
-        (document.getElementById("log").textContent = msg);
+          if (localStorage.getItem("shimmerCaptureLogDrawer") === "open")
+            open = "true";
+        } catch (e) {}
+        document.documentElement.dataset.logOpen = open;
+      })();
     </script>
 
+    <link rel="stylesheet" href="../common/theme.css" />
+    <!-- Defines the global `Chart`, which common/plot.js reads. Pinned 4.5.1. -->
+    <script src="../common/vendor/chart.umd.min.js"></script>
+
     <style>
-      body {
-        font-family: sans-serif;
-        margin: 20px;
+      /* Page-local layout only — everything visual comes from theme.css. */
+
+      /* How much of the viewport the docked event log occupies. One variable
+         drives three things — the drawer's own height, the space the page
+         reserves at its foot, and where the sticky action bar and the toast
+         stack stop — so the drawer can never cover content, open or shut.
+         Set on the root element by the drawer's toggle. */
+      :root {
+        --log-drawer-h: 34px;
       }
 
-      #toolbar {
-        margin-bottom: 10px;
+      :root[data-log-open="true"] {
+        --log-drawer-h: min(46vh, 420px);
       }
 
-      #chart {
+      .page-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin: 4px 0 14px;
+      }
+
+      .page-head .spacer {
+        flex: 1 1 auto;
+      }
+
+      .subtitle {
+        color: var(--muted);
+        max-width: 70ch;
+      }
+
+      /* The sensor checkbox grid the page owns, injected into the schema
+         form's "Sensor Enables" group. */
+      .sensor-groups {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+        gap: 10px;
+      }
+
+      .sensor-group {
+        border: 1px solid var(--line-soft);
+        border-radius: 10px;
+        background: var(--card);
+        padding: 8px 10px;
+      }
+
+      .sensor-group > h3 {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--muted);
+        margin: 0 0 6px;
+      }
+
+      .sensor-group label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 2px 0;
+        font-size: 13px;
+      }
+
+      .sensor-group label input {
+        width: auto;
+        flex: 0 0 auto;
+      }
+
+      /* Sensor link on the left, device identity on the right.
+
+         `minmax(0, …)` on both tracks rather than `1fr 340px`: a grid item's
+         default minimum is its content, so a long firmware string or a wide
+         button row would otherwise push the track past the container and give
+         the whole PAGE a horizontal scrollbar. Below 800px the two stack, so
+         a phone gets one readable column instead of two squeezed ones. */
+      .link-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 340px);
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+
+      .link-row > .card {
+        margin-bottom: 0;
+        min-width: 0;
+      }
+
+      @media (max-width: 800px) {
+        .link-row {
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        /* Still a bottom sheet, just a taller one: the toolbar wraps onto
+           three rows at this width, and 46vh would leave almost no log. */
+        :root[data-log-open="true"] {
+          --log-drawer-h: min(62vh, 480px);
+        }
+
+        /* Once the connect buttons wrap onto several lines a vertical rule
+           between two of them reads as a stray mark rather than a divider. */
+        .link-sep {
+          display: none;
+        }
+      }
+
+      /* The identity panel sits above the tab strip, which is the page's
+         primary navigation, so every line in it is a line the tabs move down
+         by. Hence the tighter grid, the smaller flags, the Refresh button on
+         the title line and no clock rows — those went to the Configure tab
+         with the clock button. Measured: this brings the panel back to the
+         height of the identity list it replaced, so the tabs sit where they
+         always did (~425px into a 1366x700 laptop viewport). */
+      .device-panel {
+        padding: 12px;
+      }
+
+      .device-panel-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .device-panel .kv-tight {
+        grid-template-columns: 84px minmax(0, 1fr);
+        gap: 2px 8px;
+        font-size: 12px;
+      }
+
+      .device-panel .flags {
+        margin-top: 7px;
+        padding-top: 7px;
+        border-top: 1px solid var(--line-soft);
+        font-size: 12px;
+        line-height: 1.35;
+        gap: 2px 10px;
+      }
+
+      /* How fresh the flags are: in the title row, beside Refresh, rather than
+         on a line of its own under the flags. This panel is the taller of the
+         two columns above the tab strip, so a line of its own would push the
+         tabs 18px further down — below where they sat before the panel
+         existed, which is the budget the harness holds it to. The title row
+         has the Refresh button's height to spare. */
+      .device-panel-title .status-fresh {
+        margin-left: auto;
+        font-size: 11px;
+        font-weight: 400;
+        color: var(--faint);
+        white-space: nowrap;
+      }
+
+      /* Not the sensor's word: either a value this page inferred from the
+         command it just sent, or a reading it could not confirm. */
+      .device-panel-title .status-fresh.unread,
+      .flag.inferred {
+        color: var(--warn);
+      }
+
+      /* Hairline between the two Bluetooth connect buttons and the wired one.
+         Both radio links need the sensor paired with this host first and both
+         can stream; the dock link does neither, so it reads as the odd one
+         out rather than as a third of a kind. */
+      .link-sep {
+        flex: 0 0 auto;
+        align-self: stretch;
+        width: 1px;
+        min-height: 22px;
+        margin: 0 3px;
+        background: var(--line-strong);
+      }
+
+      /* The two raw-byte checkboxes in the log toolbar. */
+      .tap-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+
+      .tap-toggle input {
+        width: auto;
+        flex: 0 0 auto;
+      }
+
+      /* ---------------------------------------------- the log drawer ---- */
+
+      /* Everything the drawer would otherwise sit on top of is pushed clear
+         of it by the same variable the drawer is sized with. */
+      .page {
+        padding-bottom: calc(var(--log-drawer-h) + 18px);
+      }
+
+      .toast-stack {
+        bottom: calc(var(--log-drawer-h) + 14px);
+      }
+
+      .log-drawer {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 40;
+        height: var(--log-drawer-h);
+        display: flex;
+        flex-direction: column;
+        background: var(--card);
+        /* A border rather than a shadow: every shadow token in theme.css
+           casts downwards, which on a panel docked to the bottom edge lands
+           off-screen. The line does the separating work in both themes. */
+        border-top: 1px solid var(--line-strong);
+      }
+
+      .log-drawer-bar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
         width: 100%;
-        height: 400px;
+        height: 33px;
+        border: 0;
+        border-radius: 0;
+        background: none;
+        padding: 0 14px;
+        text-align: left;
+        font-size: 12px;
+        color: var(--muted);
       }
 
-      button {
-        margin-right: 6px;
+      .log-drawer-bar:hover:not(:disabled) {
+        background: var(--control-hover);
       }
 
-      #signalList {
-        margin-top: 8px;
+      .log-drawer-caret {
+        flex: 0 0 auto;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-bottom: 6px solid var(--muted);
       }
 
-      #log {
-        font-size: 0.9em;
-        color: #555;
-        margin-top: 6px;
+      :root[data-log-open="true"] .log-drawer-caret {
+        transform: rotate(180deg);
       }
 
-      label.exp {
-        margin-left: 12px;
-        margin-right: 8px;
+      .log-drawer-title {
+        flex: 0 0 auto;
+        font-weight: 600;
+        color: var(--ink);
+      }
+
+      /* The count of errors and warnings that have not been seen. Red on
+         purpose: the whole reason the log moved down here is that an error at
+         the foot of a long page went unseen. */
+      .log-drawer-badge {
+        flex: 0 0 auto;
+        min-width: 18px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        border: 1px solid var(--danger-border);
+        background: var(--danger-bg);
+        color: var(--danger);
+        font-size: 11px;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      /* The newest line, whatever it was. Never wraps: the bar is one line
+         high and a raw byte dump would otherwise reflow the whole page. */
+      .log-drawer-last {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--faint);
+      }
+
+      .log-drawer-body {
+        display: none;
+        flex: 1 1 auto;
+        min-height: 0;
+        flex-direction: column;
+        padding: 0 14px 12px;
+      }
+
+      :root[data-log-open="true"] .log-drawer-body {
+        display: flex;
+      }
+
+      /* theme.css fixes the log panel at 340px, which is right for a card in
+         the page flow and wrong inside a drawer of a known height. */
+      .log-drawer .log {
+        flex: 1 1 auto;
+        height: auto;
+        min-height: 0;
+      }
+
+      .action-bar {
+        position: sticky;
+        bottom: calc(var(--log-drawer-h) + 8px);
+        z-index: 20;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 10px 12px;
+        box-shadow: var(--shadow-card);
+        margin-bottom: 12px;
+      }
+
+      /* The records table in the Calibration card. Wrapped in its own
+         overflow-x container so a wide table never scrolls the page. */
+      .table-wrap {
+        overflow-x: auto;
+      }
+
+      table.records {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      table.records th,
+      table.records td {
+        text-align: left;
+        padding: 5px 10px 5px 0;
+        border-bottom: 1px solid var(--line-soft);
+        white-space: nowrap;
+      }
+
+      table.records th {
+        color: var(--faint);
+        font-weight: 600;
+        text-transform: uppercase;
+        font-size: 11px;
+        letter-spacing: 0.04em;
+      }
+
+      .flag {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+      }
+
+      .flag::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--faint);
+      }
+
+      .flag.on::before {
+        background: var(--ok);
+      }
+
+      .flag.bad::before {
+        background: var(--danger);
+      }
+
+      .flags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 16px;
+        font-size: 13px;
       }
     </style>
   </head>
 
   <body>
-    <h2>Shimmer Capture (Shimmer3R BLE)</h2>
-    <div id="toolbar">
-      <button id="connectBtn">Connect</button>
-      <button id="startBtn">Start BT Stream</button>
-      <button id="stopBtn">Stop BT</button>
-      <button id="startSDBTBtn">Start BT+SD</button>
-      <button id="stopSDBTBtn">Stop BT+SD</button>
-      <button id="disconnectBtn">Disconnect</button>
-      <button id="saveBtn">Start Saving</button>
-      <select
-        id="sensorMenu"
-        multiple
-        size="5"
-        style="margin-left: 10px; min-width: 220px"
-      ></select>
-      <button id="applySensorsBtn">Apply Sensors</button>
-      <button id="exgTestBtn" disabled>EXG Test (16‑bit)</button>
-      <button id="emg16Btn" disabled>Enable EMG 16‑bit</button>
-      <button id="ecg16Btn" disabled>Enable ECG 16‑bit</button>
+    <div class="page">
+      <header class="page-head">
+        <div>
+          <h1>Shimmer Capture</h1>
+          <div class="subtitle">
+            Example: configure, stream, plot, record, rename and download the SD
+            card of a single Shimmer3R from the browser
+          </div>
+        </div>
+        <span class="spacer"></span>
+        <span class="pill" id="sdkPill" title="Vendored shimmer-web-sdk build"
+          >SDK …</span
+        >
+        <button id="themeBtn" type="button"></button>
+      </header>
 
-      <!-- Expansion power checkbox -->
-      <label class="exp"
-        ><input id="expPowerChk" type="checkbox" /> Expansion Power</label
-      >
+      <!-- ================================ Connect and device identity ====
+           Two columns above the tab strip, because the right-hand half is
+           read-mostly and true on every tab: whether the sensor is sensing
+           gates an SD transfer AND a name write, and the battery matters most
+           right before a long download. Stacks below 800px. -->
+      <div class="link-row">
+        <div class="card">
+          <div class="card-title">Sensor link</div>
+          <!-- BLE and classic Bluetooth first and adjacent: both are radio
+               links that need the sensor paired with this host first, so they
+               share a story and a failure mode. The wired link is last and
+               separated — it needs no pairing, and it speaks a different
+               protocol with no stream and no card access at all. -->
+          <div class="row">
+            <button id="btnBle" class="primary" type="button">
+              Connect BLE
+            </button>
+            <button id="btnBt" type="button">Connect classic Bluetooth</button>
+            <span class="link-sep" aria-hidden="true"></span>
+            <button id="btnUsb" type="button">Connect USB</button>
+            <button id="btnMock" type="button" hidden>Connect (mock)</button>
+            <button id="btnDisconnect" class="secondary" type="button">
+              Disconnect
+            </button>
+            <span class="pill" id="connPill">disconnected</span>
+          </div>
+          <div class="banner" id="platformBanner"></div>
+          <!-- Measures the LINK, not the card, so it belongs with the connect
+               buttons rather than in the SD panel it used to live in. The
+               result still lands in that panel's stats strip and its download
+               ETAs, which is where it gets used. -->
+          <div class="row">
+            <button
+              id="btnLinkTest"
+              type="button"
+              data-requires="idle"
+              data-cap="linkTest"
+            >
+              Measure link speed (5 s)
+            </button>
+            <span class="pill" id="linkSpeedPill">not measured</span>
+          </div>
+          <div class="field-hint" id="linkTestNote"></div>
+        </div>
+
+        <aside class="card device-panel" id="devicePanel">
+          <div class="card-title device-panel-title">
+            <span>Device</span>
+            <!-- Where the flags below came from and when. Three sources reach
+                 them now — a read, a push from the sensor, and this page's own
+                 last command — and a reader cannot act on a flag without
+                 knowing which. -->
+            <span class="status-fresh" id="statusFresh" hidden></span>
+            <button
+              id="btnRefreshDevice"
+              type="button"
+              data-requires="idle"
+              data-cap="status"
+              title="Re-read the battery, the status flags and the sensor's real-world clock"
+            >
+              Refresh
+            </button>
+          </div>
+          <div class="kv kv-tight" id="identityKv">
+            <div class="muted">Device</div>
+            <div id="idName">–</div>
+            <div class="muted">MAC</div>
+            <div id="idMac" class="mono">–</div>
+            <div class="muted">Hardware</div>
+            <div id="idHw">–</div>
+            <div class="muted">Firmware</div>
+            <div id="idFw">–</div>
+            <div class="muted">Battery</div>
+            <div id="idBatt">–</div>
+            <div class="muted">Link</div>
+            <div id="idLink">–</div>
+          </div>
+          <div class="flags" id="statusFlags">–</div>
+        </aside>
+      </div>
+
+      <!-- ===================================================== Tabs ====== -->
+      <div class="tabs">
+        <button data-tab="tabConfig" class="active" type="button">
+          Configure
+        </button>
+        <button data-tab="tabCal" id="tabBtnCal" type="button">
+          Calibration
+        </button>
+        <button data-tab="tabStream" id="tabBtnStream" type="button">
+          Stream &amp; record
+        </button>
+        <button data-tab="tabSd" id="tabBtnSd" type="button">SD card</button>
+        <button data-tab="tabBrand" id="tabBtnBrand" type="button">
+          Device naming
+        </button>
+      </div>
+
+      <!-- ================================================= Configure ===== -->
+      <section class="tab active" id="tabConfig">
+        <div class="card">
+          <div class="card-title">Configuration</div>
+          <div class="banner info" id="configBanner">
+            Connect a sensor to read its configuration.
+          </div>
+          <div id="configForm"></div>
+        </div>
+
+        <!-- What is left of "Device & clock" once the identity, the battery
+             and the status flags have moved up beside the Sensor link card:
+             the clock, which is a configuration matter and belongs on the
+             configuration tab. -->
+        <div class="card">
+          <div class="card-title">Clock</div>
+          <div class="row">
+            <button
+              id="btnSetClock"
+              type="button"
+              data-requires="idle"
+              data-cap="rtcWrite"
+            >
+              Set device clock from host
+            </button>
+          </div>
+          <div class="kv">
+            <div class="muted">Real-world clock</div>
+            <div id="rwcValue" class="mono">–</div>
+            <div class="muted">Host clock</div>
+            <div id="hostClock" class="mono">–</div>
+          </div>
+          <div class="field-hint" style="margin-top: 8px">
+            The sensor keeps its real-world clock in <em>local civil</em> time,
+            which is what the offline file parser expects, so the host's time
+            zone offset is applied when the clock is set.
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Configuration image (InfoMem, 384 bytes)</div>
+          <div class="row">
+            <button
+              id="btnImRead"
+              type="button"
+              data-requires="idle"
+              data-cap="infomem"
+            >
+              Read
+            </button>
+            <button
+              id="btnImWrite"
+              type="button"
+              class="warn"
+              data-requires="idle"
+              data-cap="infomem"
+            >
+              Write
+            </button>
+            <button id="btnImSave" type="button">Save .bin</button>
+            <button id="btnImLoad" type="button">Load .bin</button>
+            <input
+              type="file"
+              id="imFile"
+              accept=".bin,application/octet-stream"
+              hidden
+            />
+            <span class="pill" id="imPill">not read</span>
+          </div>
+          <div class="banner" id="imBanner"></div>
+          <div class="hexview" id="hexview"></div>
+          <div class="field-hint" style="margin-top: 8px">
+            Highlighted bytes differ from the image last read from the sensor.
+            Every byte no field on this page models — the reserved bits, the MPL
+            regions — is carried through a read, edit and write untouched.
+          </div>
+        </div>
+
+        <div class="action-bar row">
+          <button
+            id="btnRead"
+            type="button"
+            data-requires="idle"
+            data-cap="infomem"
+          >
+            Read from device
+          </button>
+          <button
+            id="btnApply"
+            class="primary"
+            type="button"
+            data-requires="idle"
+            data-cap="infomem"
+          >
+            Apply
+          </button>
+          <span class="dirty-pill" id="dirtyPill" hidden>no changes</span>
+          <button id="btnDiscard" class="secondary" type="button">
+            Discard
+          </button>
+          <span class="spacer"></span>
+          <span class="muted" id="applyNote"></span>
+        </div>
+      </section>
+
+      <!-- =============================================== Calibration ===== -->
+      <section class="tab" id="tabCal">
+        <div class="banner" id="calBanner"></div>
+        <!-- common/calibration-editor.js builds the whole panel in here. -->
+        <div id="calPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            Calibration turns the sensor's raw counts into physical units:
+            <em>C</em> = <em>R</em><sup>−1</sup>·<em>K</em><sup>−1</sup>·(<em
+              >U</em
+            >
+            − <em>B</em>), with <em>B</em> the offset, <em>K</em> the diagonal
+            sensitivity and <em>R</em> the alignment. It is per sensor and per
+            range, so a sensor calibrated at ± 2 g has nothing stored for ± 16 g
+            and falls back to the factory defaults there — which is normal, not
+            a fault. Nothing on this tab changes what the sensor
+            <em>measures</em>; it changes how those measurements are read.
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================================== Stream & record ====== -->
+      <section class="tab" id="tabStream">
+        <div class="banner" id="streamBanner"></div>
+
+        <div class="card">
+          <div class="card-title">Stream</div>
+          <div class="row">
+            <button
+              id="btnStreamStart"
+              class="primary"
+              type="button"
+              data-requires="idle"
+              data-cap="stream"
+            >
+              Start stream
+            </button>
+            <button
+              id="btnStreamStop"
+              type="button"
+              data-requires="streaming"
+              data-cap="btStop"
+            >
+              Stop stream
+            </button>
+            <button
+              id="btnSdStart"
+              type="button"
+              data-requires="idle"
+              data-cap="sdbt"
+            >
+              Start stream + SD logging
+            </button>
+            <button
+              id="btnSdStop"
+              type="button"
+              data-requires="streaming"
+              data-cap="sdStop"
+            >
+              Stop stream + SD logging
+            </button>
+          </div>
+          <div class="row">
+            <label for="selWindow">Window</label>
+            <select id="selWindow">
+              <option value="5">5 s</option>
+              <option value="10" selected>10 s</option>
+              <option value="30">30 s</option>
+            </select>
+            <label for="selKind">Values</label>
+            <select id="selKind">
+              <option value="cal" selected>Calibrated</option>
+              <option value="raw">Raw</option>
+            </select>
+            <button id="btnPause" type="button" data-requires="streaming">
+              Pause plot
+            </button>
+          </div>
+          <div id="stats"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Record to CSV</div>
+          <div class="row">
+            <button
+              id="btnRecStart"
+              class="primary"
+              type="button"
+              data-requires="streaming"
+              data-cap="record"
+            >
+              Start recording
+            </button>
+            <button id="btnRecStop" type="button" data-requires="recording">
+              Stop recording
+            </button>
+            <span class="pill" id="recPill">not recording</span>
+          </div>
+          <div class="kv">
+            <div class="muted">File</div>
+            <div id="recName" class="mono">–</div>
+            <div class="muted">Rows</div>
+            <div id="recRows">0</div>
+            <div class="muted">Written</div>
+            <div id="recBytes">0 B</div>
+          </div>
+          <div class="field-hint" style="margin-top: 8px">
+            Recording starts once the first frame has arrived, so the columns
+            are the ones the sensor is actually sending. Rows stream straight to
+            the file you pick, so a long session is not held in memory.
+          </div>
+        </div>
+
+        <div id="plots"></div>
+      </section>
+
+      <!-- =================================================== SD card ===== -->
+      <section class="tab" id="tabSd">
+        <div class="banner" id="sdBanner"></div>
+        <!-- common/sd-browser.js builds the whole panel in here. -->
+        <div id="sdPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            Files are pulled off the card over the same Bluetooth link that
+            carries the configuration, so a download and a live stream cannot
+            run at once. Each file is verified by size on this host before it is
+            deleted from the card, and an interrupted download resumes from what
+            is already on disk — re-running it is always safe.
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================================= Device naming ===== -->
+      <section class="tab" id="tabBrand">
+        <div class="banner" id="brandBanner"></div>
+        <!-- common/brand-editor.js builds the whole panel in here. -->
+        <div id="brandPanel"></div>
+        <div class="card">
+          <div class="field-hint">
+            These names live in a record in the sensor's expansion-board EEPROM,
+            not in its configuration image, so they survive a configuration
+            write and are not part of a saved
+            <code>.bin</code>. The firmware seeds the record with the factory
+            names at first boot and treats it as the only source of truth
+            afterwards, so what is shown above is what the sensor really
+            announces. Every link reaches the record — BLE, classic Bluetooth
+            and the USB-C/dock connection alike.
+          </div>
+        </div>
+      </section>
     </div>
 
-    <div id="status"></div>
-    <div id="signalList"></div>
-    <small id="signalNote" style="color: #666"></small>
-    <canvas id="chart"></canvas>
-    <div id="log"></div>
+    <!-- ================================================== Event log =====
+         Docked to the bottom of the viewport rather than parked at the end
+         of the page, where an error nobody scrolled to went unnoticed.
+
+         Collapsed it is one bar carrying the newest line and a count of the
+         errors and warnings that have not been seen; the page reserves that
+         bar's height so nothing is ever permanently covered. Expanded it
+         keeps the FULL page width — deliberately not a right-hand rail,
+         because the raw byte lines above are long and a narrow column wraps
+         each of them into a ribbon. -->
+    <section class="log-drawer" id="logDrawer" aria-label="Event log">
+      <button
+        class="log-drawer-bar"
+        id="btnLogDrawer"
+        type="button"
+        aria-expanded="false"
+        aria-controls="logDrawerBody"
+      >
+        <span class="log-drawer-caret" aria-hidden="true"></span>
+        <span class="log-drawer-title">Event log</span>
+        <span class="log-drawer-badge" id="logBadge" hidden></span>
+        <span class="log-drawer-last" id="logLast">no events yet</span>
+      </button>
+      <div class="log-drawer-body" id="logDrawerBody">
+        <div class="log-toolbar row">
+          <input
+            type="search"
+            id="logFilter"
+            placeholder="Filter lines…"
+            autocomplete="off"
+          />
+          <select id="logSeverity">
+            <option value="all">All</option>
+            <option value="warnup">Warnings and errors</option>
+            <option value="err">Errors only</option>
+            <option value="txrx">TX / RX</option>
+          </select>
+          <!-- The select above chooses what is SHOWN; these two choose
+                   what is PRODUCED. Nothing tags a line tx/rx unless the tap
+                   is recording, so the two live side by side and #tapNote
+                   below says so whenever they disagree. -->
+          <label
+            class="tap-toggle"
+            title="Log every byte this page writes to the sensor and every byte it receives. Off by default: it is a diagnostic, not a running commentary."
+          >
+            <input type="checkbox" id="chkRawBytes" />
+            Log raw TX/RX bytes
+          </label>
+          <label
+            class="tap-toggle"
+            title="Streaming frames as well as commands. A sensor at 1024 Hz sends one every millisecond, so this is capped and coalesced."
+          >
+            <input type="checkbox" id="chkRawData" disabled />
+            …including data packets
+          </label>
+          <button id="btnLogClear" type="button">Clear</button>
+          <button id="btnLogDownload" type="button">Download</button>
+          <span class="log-count" id="logCount"></span>
+        </div>
+        <div class="banner" id="tapNote"></div>
+        <div class="log" id="log"></div>
+      </div>
+    </section>
+
+    <script type="module">
+      import { initThemeToggle } from "../common/theme.js";
+      import {
+        $,
+        el,
+        createLog,
+        showToast,
+        createGate,
+        initTabs,
+        downloadBlob,
+        fmtBytes,
+        fmtHz,
+      } from "../common/ui-chrome.js";
+      import { createConnectController } from "../common/connect-ui.js";
+      import { createTransportTap } from "../common/transport-tap.js";
+      import { createConfigForm, displayValue } from "../common/config-form.js";
+      import {
+        describeShimmer3Caps,
+        LIVE_OVERLAYS,
+        buildApplyPlan,
+        EXG_MODES,
+        SENSOR_GROUPS,
+        SENSOR_LABELS,
+        configKeysForDirtyFields,
+      } from "../common/shimmer3-config-schema.js";
+      import { createStreamPlot } from "../common/plot.js";
+      import { createStreamStats } from "../common/stream-stats.js";
+      import { createCsvRecorder } from "../common/csv-recorder.js";
+      import { createSdBrowser } from "../common/sd-browser.js";
+      import { createBrandEditor } from "../common/brand-editor.js";
+      import { createCalibrationEditor } from "../common/calibration-editor.js";
+      import {
+        createMockShimmer3RTransport,
+        mockEnabledFromUrl,
+      } from "../common/dev/mock-shimmer3r.js";
+      /* The whole namespace, not destructured names: a vendored bundle that
+         predates one of these exports then degrades to a warning instead of
+         breaking the page's import. */
+      import * as sdk from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+
+      // =====================================================================
+      // Constants
+      // =====================================================================
+
+      /** InfoMem image length. */
+      const IMAGE_BYTES = sdk.INFOMEM_SIZE ?? 384;
+
+      /** Bytes per hex-view row. Matches the .hexview-row grid in theme.css. */
+      const HEX_COLUMNS = 16;
+
+      /** Device stream clock: the timestamp counts 32.768 kHz ticks. */
+      const TICKS_PER_SECOND = 32768;
+
+      /** The ExG bits the ExG mode control owns, never the checkbox grid. */
+      const EXG_16BIT_MASK =
+        (sdk.SensorBitmapShimmer3?.SENSOR_EXG1_16BIT ?? 0) |
+        (sdk.SensorBitmapShimmer3?.SENSOR_EXG2_16BIT ?? 0);
+      const EXG_24BIT_MASK =
+        (sdk.SensorBitmapShimmer3?.SENSOR_EXG1_24BIT ?? 0) |
+        (sdk.SensorBitmapShimmer3?.SENSOR_EXG2_24BIT ?? 0);
+
+      /** Overlay method name -> {configKey, method, arg, label}. */
+      const OVERLAY_BY_METHOD = new Map(
+        Object.entries(LIVE_OVERLAYS).map(([configKey, overlay]) => [
+          overlay.method,
+          { configKey, ...overlay },
+        ]),
+      );
+
+      /** Hardware and firmware id names, for the identity line. */
+      const HW_NAMES = Object.freeze({ 3: "Shimmer3", 10: "Shimmer3R" });
+      const FW_NAMES = Object.freeze({
+        1: "BtStream",
+        2: "SDLog",
+        3: "LogAndStream",
+        15: "StroKare",
+      });
+
+      // =====================================================================
+      // Page chrome
+      // =====================================================================
+
+      /* ------------------------------------------- the event log drawer --
+         Collapsed the drawer is one bar: the newest line, and a count of the
+         errors and warnings that have not been seen — which is not the same
+         as unopened, because a drawer left open and scrolled back through
+         history is showing the user everything except the thing that just
+         went wrong. That count is the reason the log moved to the bottom of
+         the viewport at all: an error at the foot of a long page is an error
+         nobody scrolled to. */
+
+      /** localStorage key. Also read by the pre-paint script in <head>. */
+      const LOG_DRAWER_KEY = "shimmerCaptureLogDrawer";
+
+      /** Errors and warnings that arrived while the newest line was not on
+          screen. Cleared by opening the drawer, by scrolling back to the tail
+          with it open, and by clearing the log. */
+      let logAlerts = 0;
+      /** The newest line, held until the next frame paints the bar. */
+      let pendingBarLine = null;
+      let barPaintScheduled = false;
+
+      const logDrawerIsOpen = () =>
+        document.documentElement.dataset.logOpen === "true";
+
+      /**
+       * Record one line for the collapsed bar.
+       *
+       * Batched onto an animation frame for the same reason the log's own DOM
+       * writes are: with the byte tap open this runs a hundred times a
+       * second, and one textContent write per line is a hundred layouts a
+       * second nobody can read.
+       */
+      function noteLogLine(text, sev) {
+        /* The date is the same all session and the bar is one line wide, so
+           only the clock time earns its place there. */
+        pendingBarLine = text.replace(/^\d{4}-\d{2}-\d{2} /, "");
+        /* Badge whenever the line would not in fact be seen: the drawer
+           closed, or open but scrolled back through history. Counting only
+           while closed meant that leaving the drawer open switched the alert
+           off altogether, which is the opposite of what it is for. */
+        if (
+          (sev === "err" || sev === "warn") &&
+          (!logDrawerIsOpen() || !log?.atTail?.())
+        ) {
+          logAlerts++;
+        }
+        if (!barPaintScheduled) {
+          barPaintScheduled = true;
+          requestAnimationFrame(paintLogBar);
+        }
+      }
+
+      function paintLogBar() {
+        barPaintScheduled = false;
+        if (pendingBarLine !== null) {
+          $("logLast").textContent = pendingBarLine;
+          pendingBarLine = null;
+        }
+        const badge = $("logBadge");
+        badge.hidden = logAlerts === 0;
+        badge.textContent = String(logAlerts);
+        badge.title = `${logAlerts} error${logAlerts === 1 ? "" : "s"} or warning${logAlerts === 1 ? "" : "s"} you have not seen`;
+      }
+
+      /**
+       * @param {boolean} open
+       * @param {boolean} [remember=true] false at startup, where the state
+       *   came out of storage in the first place
+       */
+      /* Scrolling back to the newest line is as much an acknowledgement as
+         opening the drawer: the lines are on screen either way. */
+      function noteLogScrolledToTail() {
+        if (logDrawerIsOpen() && log?.atTail?.() && logAlerts !== 0) {
+          logAlerts = 0;
+          paintLogBar();
+        }
+      }
+
+      function setLogDrawer(open, remember = true) {
+        document.documentElement.dataset.logOpen = open ? "true" : "false";
+        $("btnLogDrawer").setAttribute(
+          "aria-expanded",
+          open ? "true" : "false",
+        );
+        if (open) {
+          /* Opening IS the acknowledgement, so the count starts again from
+             here. */
+          logAlerts = 0;
+          /* A panel that was display:none has no scroll position, so the
+             log's own stick-to-the-tail never had anything to stick to.
+             Restore it once, as the drawer becomes visible. */
+          const panel = $("log");
+          panel.scrollTop = panel.scrollHeight;
+        }
+        paintLogBar();
+        if (remember) {
+          try {
+            localStorage.setItem(LOG_DRAWER_KEY, open ? "open" : "closed");
+          } catch {
+            /* A private window throws on the first write. The drawer still
+               works; it just opens closed next time. */
+          }
+        }
+      }
+
+      $("btnLogDrawer").addEventListener("click", () =>
+        setLogDrawer(!logDrawerIsOpen()),
+      );
+
+      const log = createLog($("log"), {
+        filterInput: $("logFilter"),
+        severitySelect: $("logSeverity"),
+        clearButton: $("btnLogClear"),
+        downloadButton: $("btnLogDownload"),
+        countEl: $("logCount"),
+        fileName: "shimmer-capture-log.txt",
+        onLine: noteLogLine,
+      });
+
+      $("log").addEventListener("scroll", noteLogScrolledToTail, {
+        passive: true,
+      });
+
+      /* The pre-paint script already applied the remembered state to the root
+         element; this catches the chrome up with it without writing it back. */
+      setLogDrawer(logDrawerIsOpen(), false);
+
+      /* Clearing the log clears what the bar was reporting about it. Added
+         after createLog, which wires its own handler on the same button. */
+      $("btnLogClear").addEventListener("click", () => {
+        logAlerts = 0;
+        pendingBarLine = null;
+        $("logLast").textContent = "no events yet";
+        paintLogBar();
+      });
+
+      initThemeToggle($("themeBtn"));
+
+      const tabs = initTabs(document, {
+        onSelect: (id) => {
+          if (id === "tabStream") refreshRecordName();
+          /* The names are what the naming tab is FOR, so opening it reads
+             them — but only once per link, and only if nothing has been read
+             yet, so switching back and forth is not a round trip each time.
+             Deliberately not on connect: a page that read the brand record
+             every time anything connected would spend a round trip on it for
+             the majority of sessions that never open this tab. */
+          if (id === "tabBrand" && client && caps.branding && !brand.record()) {
+            brand.read().catch(() => {});
+          }
+        },
+      });
+
+      $("sdkPill").textContent = sdk.SDK_VERSION
+        ? `SDK ${sdk.SDK_VERSION}`
+        : "SDK (unknown build)";
+
+      // =====================================================================
+      // Raw byte tap
+      // =====================================================================
+
+      /**
+       * The tap wrapped around the live transport, or null.
+       *
+       * One per link, because a transport is per link. The two checkboxes are
+       * the page's state and outlive it, so `tapTransport` pushes them onto
+       * each new tap as it is built.
+       */
+      let tap = null;
+
+      /**
+       * Wrap a transport so the bytes crossing it can be logged.
+       *
+       * Every link goes through here, BLE included — which is why the page
+       * builds the BLE transport itself rather than letting the client build
+       * one (see `makeClients.ble`).
+       */
+      function tapTransport(transport) {
+        tap = createTransportTap(transport, {
+          log,
+          enabled: $("chkRawBytes").checked,
+          includeDataPackets: $("chkRawData").checked,
+        });
+        return tap;
+      }
+
+      /**
+       * Say so when what is being SHOWN and what is being PRODUCED disagree.
+       *
+       * The severity select filters lines that already exist; the tap decides
+       * whether tx/rx lines exist at all. Two half-controls that quietly
+       * cancel each other out is how a TX / RX filter with no producer shipped
+       * in the first place, so each combination that yields nothing gets a
+       * sentence explaining which control to reach for.
+       */
+      function updateTapNote() {
+        const on = $("chkRawBytes").checked;
+        const sev = $("logSeverity").value;
+        if (sev === "txrx" && !on) {
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX logging is off, so this filter has nothing to show. Tick “Log raw TX/RX bytes” above to start recording them.",
+          );
+        } else if (sev === "txrx" && !client) {
+          /* The other half of the same trap: the tap is on, the filter is
+             right, and the log is still empty — because nothing is connected
+             for bytes to cross. */
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX logging is on. Nothing is connected yet, so there are no bytes to show — the lines start as soon as a sensor is.",
+          );
+        } else if (on && (sev === "err" || sev === "warnup")) {
+          banner(
+            "tapNote",
+            "info",
+            "Raw TX/RX bytes are being recorded, but this filter hides them. Choose “TX / RX” or “All” to see them.",
+          );
+        } else {
+          banner("tapNote", "", "");
+        }
+      }
+
+      $("chkRawBytes").addEventListener("change", (e) => {
+        const on = e.target.checked;
+        /* The data-packet opt-in is meaningless with the tap off, and a
+           checkbox that does nothing is worse than one that is disabled. */
+        $("chkRawData").disabled = !on;
+        tap?.tap.setEnabled(on);
+        /* Deliberately worded without a bare "TX" or "RX": those two words are
+           exactly what routes a line into the TX/RX filter, and a status line
+           about the tap is not a byte the sensor sent. */
+        log.log(
+          on
+            ? "raw byte logging on — every command and every reply crossing the link is now logged as a hex line"
+            : "raw byte logging off",
+        );
+        updateTapNote();
+      });
+
+      $("chkRawData").addEventListener("change", (e) => {
+        tap?.tap.setIncludeDataPackets(e.target.checked);
+        log.log(
+          e.target.checked
+            ? "raw byte logging now includes streaming data packets, capped at 100 lines a second"
+            : "raw byte logging is back to control traffic only",
+        );
+      });
+
+      $("logSeverity").addEventListener("change", updateTapNote);
+
+      // =====================================================================
+      // State
+      // =====================================================================
+
+      /** The live client, or null. */
+      let client = null;
+      /** "ble" | "rfcomm" | "usb" — which link the client is on. */
+      let mode = null;
+      /** Feature detection from describeShimmer3Caps, plus page-local keys. */
+      let caps = {};
+      /** True while a device round trip is in flight. */
+      let busy = false;
+      let streaming = false;
+      let sdLogging = false;
+      /**
+       * True while the SD panel is transferring or measuring the link.
+       *
+       * Held separately from `busy` because the two are used in opposite
+       * directions: it is folded INTO the gate state, so everything that
+       * shares the link is refused during a download — but it must stay OUT
+       * of what the SD panel itself is enabled on, or the first progress
+       * event would tear down the panel that is reporting it.
+       */
+      let sdBusy = false;
+      /**
+       * True while the link-speed test is running.
+       *
+       * The test is run BY the SD panel (its result belongs in the card stats
+       * and the download ETAs), so it raises `sdBusy` like a transfer does —
+       * but it is not a transfer, and three refusal messages name what is
+       * holding the link. This is how they tell the two apart.
+       */
+      let linkTesting = false;
+      /** True while the device-naming panel is reading or writing the record. */
+      let brandBusy = false;
+      /**
+       * Why this sensor cannot transfer SD files, when it cannot. Set from
+       * the firmware version at connect time; null when it can.
+       */
+      let sdFirmwareNote = null;
+
+      /**
+       * The hardware id the sensor ACTUALLY REPORTED, or null when the
+       * identification read failed.
+       *
+       * Held separately from the `hardwareVersion` in `context` on purpose.
+       * That one is defaulted to 10 (Shimmer3R) when the read fails, because
+       * the field schema needs *some* layout to render a form at all; this
+       * one is never defaulted, because the device-naming panel narrows the
+       * BLE prefix length with it and a defaulted Shimmer3R would hand an
+       * unidentified Shimmer3 a name its own firmware truncates on air.
+       */
+      let identifiedHardwareVersion = null;
+
+      /** The configuration form, the schema it was built from, and its layout. */
+      let form = null;
+      let fields = [];
+      let layout = null;
+      let generation = null;
+      /** The InfoMem context the form was built against. */
+      let context = null;
+
+      /**
+       * The image exactly as the sensor last handed it over.
+       *
+       * This — not the form's own baseline — is what "changed" means on this
+       * page: it survives loading a `.bin`, which re-baselines the form, and it
+       * is the reference both the hex view and the apply plan need.
+       */
+      let deviceImage = null;
+      /** Sensor bitmap in `deviceImage`. */
+      let baselineSensors = 0;
+      /** ExG preset the user picked since the last read. */
+      let exgMode = "off";
+
+      /** Set once per stream, from the first frame. */
+      let csvColumns = null;
+      /** True once the plot has a schema carrying real raw/cal kinds. */
+      let schemaFromFrame = false;
+      /** Configured rate and frame size from the last inquiry. */
+      let streamRateHz = null;
+      let streamFrameBytes = 0;
+
+      /** Rows this recording has accepted, counted here because the recorder
+       *  only reports its totals when the file is closed. */
+      let recordedRows = 0;
+      let plotPaused = false;
+
+      /** Identity, for the CSV file name and the header line. */
+      let deviceMac = "";
+      let deviceName = "";
+
+      /** True while the calibration panel is reading or writing. */
+      let calibBusy = false;
+
+      // =====================================================================
+      // Small helpers
+      // =====================================================================
+
+      function hex2(b) {
+        return b.toString(16).toUpperCase().padStart(2, "0");
+      }
+
+      function hexMask(mask) {
+        return `0x${(mask >>> 0).toString(16).toUpperCase().padStart(6, "0")}`;
+      }
+
+      function banner(id, kind, text) {
+        const node = $(id);
+        node.className = kind ? `banner ${kind}` : "banner";
+        node.textContent = text ?? "";
+      }
+
+      /**
+       * A HOST timestamp — a true Unix epoch — as local wall clock.
+       *
+       * Not for anything the sensor reported: see `formatDeviceClock`.
+       */
+      function formatClock(unixMs) {
+        if (!Number.isFinite(unixMs)) return "–";
+        const d = new Date(unixMs);
+        const p2 = (n) => String(n).padStart(2, "0");
+        return (
+          `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ` +
+          `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+        );
+      }
+
+      /**
+       * A DEVICE timestamp as the sensor's own clock reads it.
+       *
+       * The sensor keeps local civil time — the offset is already baked into
+       * the value, which is why `setDeviceClock` shifts the host's UTC into
+       * that domain before writing it. Converting the ticks back gives a
+       * number that is a wall clock wearing a Unix epoch's clothes, so it is
+       * read out with the UTC accessors: they return the digits that went in.
+       * The local accessors would add the browser's offset a second time and
+       * show a correctly-set sensor as hours out from the host clock beside
+       * it — which is exactly the comparison that line is there to support.
+       */
+      function formatDeviceClock(unixMs) {
+        if (!Number.isFinite(unixMs)) return "–";
+        const d = new Date(unixMs);
+        const p2 = (n) => String(n).padStart(2, "0");
+        return (
+          `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ` +
+          `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`
+        );
+      }
+
+      /**
+       * Time of day only, from the same formatter as the full stamps — the
+       * device panel has room for a clock but not for a date.
+       */
+      function clockTime(unixMs) {
+        return formatClock(unixMs).slice("YYYY-MM-DD ".length);
+      }
+
+      /** True when two decoded field values are the same value. */
+      function sameFieldValue(a, b) {
+        if (a instanceof Uint8Array && b instanceof Uint8Array) {
+          if (a.length !== b.length) return false;
+          for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+          return true;
+        }
+        if (Array.isArray(a) && Array.isArray(b)) {
+          return a.length === b.length && a.every((v, i) => v === b[i]);
+        }
+        return a === b;
+      }
+
+      // =====================================================================
+      // Gating
+      // =====================================================================
+
+      const gate = createGate(document);
+
+      /**
+       * Re-apply every `data-requires` / `data-cap` gate, then the handful of
+       * states no attribute can express.
+       */
+      function regate() {
+        // Capability floors the markup gates on but only the page can know.
+        caps.record = !!csvColumns;
+        /* Exactly one stop button is live at a time. STOP_STREAMING (0x20)
+           and STOP_SDBT (0x97) are different commands: the first leaves an SD
+           recording running, so offering both would let one click end a
+           stream and silently leave the card still being written. */
+        caps.btStop = streaming && !sdLogging;
+        caps.sdStop = sdLogging;
+
+        /* An SD download, a name write, a calibration write and everything
+           else on this page compete for one link, so any of them in flight
+           counts as busy for every other control — Apply included. No panel's
+           own controls are gated from here; each owns its own (see the
+           `setEnabled` calls below). */
+        gate.apply({
+          connected: !!client,
+          streaming,
+          recording: recorder.active,
+          busy: busy || sdBusy || brandBusy || calibBusy,
+          caps,
+        });
+
+        /* Each panel is enabled on everything EXCEPT its own busy flag: this
+           is the floor for whether the LINK can do the thing at all, and each
+           panel already refuses a second operation of its own. Folding a
+           panel's own flag back in here would have the first progress event
+           tear down the panel reporting it. The OTHER panels' flags do
+           belong, because all three share one link. */
+        sd.setEnabled(
+          !!client &&
+            !!caps.sdTransfer &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !brandBusy &&
+            !calibBusy,
+        );
+        paintSdGating();
+
+        brand.setEnabled(
+          !!client &&
+            !!caps.branding &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !sdBusy &&
+            !calibBusy,
+        );
+        paintBrandGating();
+
+        /* Not gated on `caps.calibration`: a link without the dump commands
+           still shows the calibration blocks out of the configuration image,
+           read-only, and the panel itself decides which store that is. What
+           it IS gated on is the link being free — the firmware NACKs a
+           calibration command while sensing, exactly as it does a
+           configuration one. */
+        cal.setEnabled(
+          !!client &&
+            (!!caps.calibration || !!caps.infomem) &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !sdBusy &&
+            !brandBusy,
+        );
+        paintCalibGating();
+
+        // Page state, not device state: these must work while disconnected so
+        // an image can be inspected, saved or thrown away.
+        $("btnDiscard").disabled = !form || busy;
+        $("btnImSave").disabled = !form;
+        $("btnImLoad").disabled = !form || busy;
+        const mockBtn = $("btnMock");
+        if (!mockBtn.hidden) mockBtn.disabled = !!client || busy;
+
+        /* Apply is refused while the sensor is sensing — the firmware NACKs
+           every configuration SET while it is. buildApplyPlan reports that as
+           `blocked`, and the reason on screen is worth more than a greyed
+           button with no explanation. */
+        const plan = form && client ? currentPlan() : null;
+        if (plan?.blocked) {
+          $("btnApply").disabled = true;
+          $("applyNote").textContent = plan.blocked;
+        } else if (linkTesting) {
+          $("applyNote").textContent =
+            "Waiting for the link-speed test to finish — it saturates the link on purpose, which is the whole point of it.";
+        } else if (sdBusy) {
+          /* Not the firmware refusing this time — the page is. One link, one
+             conversation: a configuration write in the middle of a file
+             transfer would interleave with the block stream. */
+          $("applyNote").textContent =
+            "Waiting for the SD card transfer to finish — a download and a configuration write cannot share the link.";
+        } else if (brandBusy) {
+          $("applyNote").textContent =
+            "Waiting for the device-naming write to finish — a name write and a configuration write cannot share the link.";
+        } else if (calibBusy) {
+          $("applyNote").textContent =
+            "Waiting for the calibration write to finish — and worth waiting for in this order, because a configuration write rebuilds the calibration dump from the configuration bytes.";
+        } else {
+          $("applyNote").textContent = "";
+        }
+
+        paintLinkTestGating();
+        updateDirtyPill();
+        refreshRecordName();
+        /* The tap note depends on whether anything is connected, so it is
+           re-evaluated wherever the connection state is. */
+        updateTapNote();
+      }
+
+      /**
+       * Why the link cannot be measured right now, in plain language, or null.
+       *
+       * The test free-runs the firmware's data-rate command, which saturates
+       * the link on purpose — so it is refused for the same reasons a
+       * download is, plus one of its own: the dock protocol has no data-rate
+       * command at all, which is a fact about the link and not about the
+       * sensor, and worth saying rather than leaving as a greyed button.
+       *
+       * A plain `busy` — one round trip in flight — returns null: the button
+       * greys for a fraction of a second and a hint that flickers with it is
+       * worse than no hint.
+       */
+      function linkTestUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE or classic Bluetooth to measure the link.";
+        }
+        if (mode === "usb") {
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol — there is no data-rate test in that command set. Connect over BLE or classic Bluetooth to measure a link.";
+        }
+        if (!caps.linkTest) {
+          return "This SDK build has no data-rate test. Re-vendor the SDK bundle.";
+        }
+        if (linkTesting) {
+          return "Measuring — it takes 5 seconds and saturates the link, so everything else on the page waits.";
+        }
+        if (streaming || sdLogging) {
+          return "The test deliberately saturates the link, so it is refused while the sensor is sensing — it would compete with the samples coming the other way. Stop the stream first.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. The test would compete with it for the same pipe — wait for the transfer to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link — wait for it to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link — wait for it to finish.";
+        }
+        return null;
+      }
+
+      function paintLinkTestGating() {
+        const reason = linkTestUnavailableReason();
+        $("linkTestNote").textContent = reason ?? "";
+        $("btnLinkTest").title =
+          reason ??
+          "Free-runs the firmware's data-rate test, which measures the pipe itself — connection interval and MTU on BLE, buffering on classic Bluetooth — rather than the file-transfer protocol on top of it.";
+      }
+
+      // =====================================================================
+      // Device call helper
+      // =====================================================================
+
+      /**
+       * Rephrase an SDK error as something the reader can act on.
+       *
+       * "ACK timeout" is accurate and useless: it reports that a one-second
+       * timer expired, not what to do about it. A NACK is different — the
+       * firmware answered, and the usual reason is that it refuses the command
+       * while it is sensing.
+       */
+      function humanError(what, err) {
+        const raw = String(err?.message ?? err ?? "unknown error");
+        if (/ACK timeout/i.test(raw)) {
+          return (
+            `The sensor did not answer "${what}" in time. It may be out of ` +
+            `range, busy with another host, or the link may have dropped — ` +
+            `try again, or disconnect and reconnect.`
+          );
+        }
+        if (/NACK/i.test(raw)) {
+          /* The firmware answered, so the link is fine. Two things produce a
+             NACK, and the page cannot tell them apart from here: a command
+             refused because the sensor is sensing, and a command this
+             firmware does not implement at all. Say both rather than
+             asserting the wrong one. */
+          return (
+            `The sensor refused "${what}". Configuration commands are ` +
+            `refused while it is streaming or logging — if it is idle, its ` +
+            `firmware may not support this command.`
+          );
+        }
+        if (/not open|disconnect|GATT/i.test(raw)) {
+          return `The link dropped during "${what}" (${raw}).`;
+        }
+        return `${what} failed: ${raw}`;
+      }
+
+      /**
+       * Run one device operation with the busy flag held, logging either way,
+       * toasting a failure, and always re-gating.
+       *
+       * @param {string} what user-facing name of the operation
+       * @param {() => Promise<unknown>} fn
+       * @param {{quiet?: boolean, tolerate?: boolean}} [opts]
+       *   `quiet` skips the success log line; `tolerate` downgrades a failure to
+       *   a warning and resolves with undefined instead of rejecting
+       * @returns {Promise<unknown>}
+       */
+      async function withDevice(what, fn, opts = {}) {
+        if (!client) {
+          showToast("Connect a sensor first", "warn");
+          return undefined;
+        }
+        if (busy) {
+          showToast("The sensor is busy with another request", "warn");
+          return undefined;
+        }
+        busy = true;
+        regate();
+        try {
+          const result = await fn();
+          if (!opts.quiet) log.log(`${what}: done`);
+          return result;
+        } catch (err) {
+          const message = humanError(what, err);
+          if (opts.tolerate) {
+            log.warn(message);
+            return undefined;
+          }
+          log.error(message);
+          showToast(message, "err");
+          throw err;
+        } finally {
+          busy = false;
+          regate();
+        }
+      }
+
+      /** withDevice for a best-effort read: never rejects, never toasts. */
+      function tryDevice(what, fn) {
+        return withDevice(what, fn, { tolerate: true, quiet: true });
+      }
+
+      // =====================================================================
+      // Identity and device state
+      // =====================================================================
+
+      function setIdentity(patch) {
+        for (const [id, value] of Object.entries(patch)) {
+          const node = $(id);
+          if (node) node.textContent = value ?? "–";
+        }
+      }
+
+      function clearIdentity() {
+        setIdentity({
+          idName: "–",
+          idMac: "–",
+          idHw: "–",
+          idFw: "–",
+          idBatt: "–",
+          idLink: "–",
+        });
+        resetStatus();
+        $("rwcValue").textContent = "–";
+      }
+
+      function hardwareLabel(hardwareVersion) {
+        if (hardwareVersion == null) return null;
+        return `${HW_NAMES[hardwareVersion] ?? "unknown"} (hardware id ${hardwareVersion})`;
+      }
+
+      function firmwareLabel(fw) {
+        if (!fw || fw.major == null) return null;
+        const name = FW_NAMES[fw.fwId] ?? `firmware id ${fw.fwId}`;
+        return (
+          `${name} v${fw.major}.${String(fw.minor ?? 0).padStart(2, "0")}.` +
+          `${String(fw.patch ?? 0).padStart(3, "0")}`
+        );
+      }
+
+      /**
+       * Voltage, percentage and — where the link reports one — the charger
+       * state, as one line.
+       *
+       * One line rather than the two the page used to carry (a short one in
+       * the identity list and a longer one in the device card): they were
+       * always the same reading, and the panel they now share is above the
+       * tab strip, where a duplicated row costs the tabs a row of height.
+       */
+      function batteryLabel(batt) {
+        if (!batt || !Number.isFinite(batt.voltage)) return null;
+        const pct = batt.percentage == null ? "–" : `${batt.percentage} %`;
+        const charger = batt.chargingStatus
+          ? ` — charger ${batt.chargingStatus}`
+          : "";
+        return `${batt.voltage.toFixed(2)} V (${pct})${charger}`;
+      }
+
+      /**
+       * The status flags, in the order the panel shows them, keyed by the name
+       * `parseShimmer3StatusBytes` decodes each bit into. The third column is
+       * whether the flag being on is bad news.
+       */
+      const STATUS_FLAGS = [
+        ["docked", "Docked", false],
+        ["sensing", "Sensing", false],
+        ["streaming", "Streaming", false],
+        ["sdLogging", "SD logging", false],
+        ["sdPresent", "SD card present", false],
+        ["sdError", "SD file error", true],
+        ["rtcSet", "Clock set", false],
+        ["redLedOn", "Red LED", false],
+        ["usbPluggedIn", "USB plugged in", false],
+      ];
+
+      /**
+       * What the flags panel is showing, and how much it is worth.
+       *
+       * The values reach it from three places — a `getStatus` read, an
+       * unsolicited push from the firmware, and this page's own belief about
+       * the command it just sent — and they are not worth the same. So where
+       * they came from travels with them, and the panel says which.
+       *
+       * @type {{
+       *   status: object,
+       *   source: "read" | "push" | "inferred",
+       *   at: number,
+       *   inferred: Set<string>,
+       *   unconfirmedAt: number | null,
+       * } | null}
+       */
+      let statusView = null;
+
+      /**
+       * Take a status the sensor actually stated: an answer to `getStatus`
+       * (`"read"`) or one the firmware pushed unasked (`"push"`).
+       *
+       * A falsy `status` means the read did not answer. That does NOT wipe the
+       * panel — the last known values are still the best knowledge the page
+       * has — but it does stop the panel presenting them as current.
+       *
+       * @param {object|null|undefined} status
+       * @param {"read"|"push"} [source]
+       */
+      function renderStatus(status, source = "read") {
+        if (!status) {
+          if (statusView) statusView.unconfirmedAt = Date.now();
+          paintStatus();
+          return;
+        }
+        /* A value this page inferred and the sensor now contradicts is worth
+           saying out loud before it is quietly replaced: the command was
+           accepted but did not take effect — a full card, a bad file, a trial
+           that had already ended. This is the one moment both are known. */
+        for (const key of statusView?.inferred ?? []) {
+          if (statusView.status[key] !== status[key]) {
+            log.warn(
+              `the sensor reports ${key}=${status[key]} where this page ` +
+                `expected ${statusView.status[key]} from the command it sent — ` +
+                `the command was accepted but did not take effect`,
+            );
+          }
+        }
+        statusView = {
+          status,
+          source,
+          at: Date.now(),
+          inferred: new Set(),
+          unconfirmedAt: null,
+        };
+        paintStatus();
+        /* The sensor is the authority on whether it is sensing: a status read
+           is how a host learns its button was pressed while nobody was
+           streaming, and every configuration command is NACKed until it
+           stops. Only worth saying for something the sensor stated — an
+           inferred value can teach nobody anything. */
+        if (status.sensing && !streaming) {
+          log.warn(
+            "the sensor reports it is sensing — it was started from its own button or by another host, and will refuse configuration commands until it stops",
+          );
+        }
+      }
+
+      /**
+       * Reflect a sensing change this page just made.
+       *
+       * Nothing else will. The firmware deliberately suppresses the
+       * unsolicited status for a sensing change a Bluetooth command caused
+       * (`ShimBt_instreamStatusRespSendIfNotBtCmd`, log-and-stream-common
+       * `Comms/shimmer_bt_uart.c`) rather than echo back what the host just
+       * asked for — so a start or a stop leaves no trace on the panel, which
+       * would sit there showing the flags read at connect.
+       *
+       * These values are this page's belief, not the sensor's word: an ACK
+       * says the command was accepted, not that the sensor is doing it — a
+       * full card or a bad file stops logging without failing anything. So
+       * they are marked `*`, and the next authoritative read — Refresh, a
+       * clock set, the next connect — is what turns them back into a reading,
+       * correcting them if the sensor disagrees ({@link renderStatus}).
+       *
+       * A read fired from here instead, straight after the command, would be
+       * worse than no read at all: `stopStreaming` and
+       * `stopStreamingAndLogging` deliberately do not wait for their own ACK,
+       * so a command written before that ACK lands has it counted as its own
+       * and then waits out its timeout for a reply that was already
+       * discarded. Measured against the mock, and the same race exists on any
+       * link that can put the ACK and the response in one notification.
+       *
+       * @param {Record<string, boolean>} patch flags the command changed
+       */
+      function inferStatus(patch) {
+        /* Patched onto whatever was last known, or onto nothing at all if no
+           read has ever succeeded — `paintStatus` omits a flag that is not a
+           boolean, so the flags this page did not touch stay absent rather
+           than claiming to be off. */
+        statusView = {
+          status: { ...(statusView?.status ?? {}), ...patch },
+          source: "inferred",
+          at: Date.now(),
+          inferred: new Set(Object.keys(patch)),
+          unconfirmedAt: null,
+        };
+        paintStatus();
+      }
+
+      /** Forget the flags: nothing is known about a sensor we have let go. */
+      function resetStatus() {
+        statusView = null;
+        paintStatus();
+      }
+
+      /** Paint {@link statusView}: the flags, then how fresh they are. */
+      function paintStatus() {
+        const host = $("statusFlags");
+        const fresh = $("statusFresh");
+        if (!statusView) {
+          host.textContent = "–";
+          fresh.hidden = true;
+          fresh.textContent = "";
+          fresh.title = "";
+          fresh.classList.remove("unread");
+          return;
+        }
+        const { status, source, at, inferred, unconfirmedAt } = statusView;
+        host.replaceChildren(
+          ...STATUS_FLAGS
+            /* Not a boolean, so not shown: a Shimmer3 omits the second status
+               byte entirely rather than sending a zero, which is why
+               `usbPluggedIn` can be null — and the same rule keeps a flag the
+               page inferred before it ever read one from claiming to be off. */
+            .filter(([key]) => typeof status[key] === "boolean")
+            .map(([key, label, badWhenOn]) => {
+              const on = status[key];
+              const guessed = inferred.has(key);
+              return el("span", {
+                class:
+                  `flag${on ? (badWhenOn ? " bad" : " on") : ""}` +
+                  (guessed ? " inferred" : ""),
+                text: guessed ? `${label} *` : label,
+                title: guessed
+                  ? "Set from the command this page sent, not read back from the sensor."
+                  : null,
+              });
+            }),
+        );
+
+        const clock = clockTime(at);
+        const label =
+          source === "read"
+            ? `read ${clock}`
+            : source === "push"
+              ? `pushed ${clock}`
+              : `inferred ${clock}`;
+        const why =
+          source === "read"
+            ? `Read from the sensor at ${clock}.`
+            : source === "push"
+              ? `The sensor sent these at ${clock} without being asked, which is how it reports a dock, an undock, a button press or a trial ending.`
+              : `The flags marked * were set from the command this page sent at ${clock} and have not been read back. The firmware sends nothing for a change a Bluetooth command caused, so nothing will arrive on its own — press Refresh to confirm them.`;
+        fresh.hidden = false;
+        fresh.textContent = unconfirmedAt ? `${label}, unconfirmed` : label;
+        fresh.title = unconfirmedAt
+          ? `${why} The read-back at ${clockTime(unconfirmedAt)} did not answer, so these are still the last values the page had.`
+          : why;
+        fresh.classList.toggle(
+          "unread",
+          source === "inferred" || !!unconfirmedAt,
+        );
+      }
+
+      /** Battery, status flags and the real-world clock. */
+      async function refreshDeviceState() {
+        const batt = await tryDevice("read the battery", () =>
+          typeof client.getBattery === "function"
+            ? client.getBattery()
+            : client.getStatus(),
+        );
+        if (batt) setIdentity({ idBatt: batteryLabel(batt) });
+
+        // getStatus() on the wired client reports the battery, not the status
+        // bits: only the radio protocol carries a STATUS_RESPONSE.
+        if (mode !== "usb" && typeof client.getStatus === "function") {
+          const status = await tryDevice("read the device status", () =>
+            client.getStatus(),
+          );
+          renderStatus(status);
+          if (status) {
+            log.log(
+              `status bytes ${Array.from(status.raw, hex2).join(" ")} — ` +
+                `sensing=${status.sensing} sdLogging=${status.sdLogging} ` +
+                `streaming=${status.streaming} rtcSet=${status.rtcSet}`,
+            );
+          }
+        }
+
+        if (typeof client.getRtcTime === "function") {
+          const rtc = await tryDevice("read the real-world clock", () =>
+            client.getRtcTime(),
+          );
+          $("rwcValue").textContent = rtc
+            ? `${formatDeviceClock(rtc.unixMs)}  (${rtc.ticks} ticks)`
+            : "–";
+        }
+        $("hostClock").textContent = formatClock(Date.now());
+      }
+
+      /**
+       * Set the sensor's real-world clock from this host.
+       *
+       * The sensor treats its clock as LOCAL CIVIL time, and the offline file
+       * parser evaluates midnight boundaries on the raw value, so the host's
+       * UTC time is shifted into that domain first. Writing plain UTC is what
+       * broke midnight CSV splits.
+       */
+      async function setDeviceClock() {
+        const localCivilMs = sdk.utcToLocalCivilMillis
+          ? sdk.utcToLocalCivilMillis(Date.now())
+          : Date.now();
+        const write =
+          typeof client.setRtcTime === "function"
+            ? () => client.setRtcTime(localCivilMs)
+            : typeof client.writeRtcFromHostTime === "function"
+              ? () => client.writeRtcFromHostTime(localCivilMs)
+              : null;
+        if (!write) {
+          showToast("This link cannot set the sensor clock", "warn");
+          return;
+        }
+        try {
+          await withDevice("set the real-world clock", write);
+          showToast("Sensor clock set from this host", "ok");
+          await refreshDeviceState();
+        } catch {
+          /* logged and toasted by withDevice */
+        }
+      }
+
+      // =====================================================================
+      // Sensor bitmap (the page owns this, not the schema)
+      // =====================================================================
+
+      /** The sensor bitmap currently encoded in the working image. */
+      function sensorsFromImage(image = form?.getImage()) {
+        if (!image || !layout) return 0;
+        return (
+          (image[layout.idxSensors0] ?? 0) |
+          ((image[layout.idxSensors1] ?? 0) << 8) |
+          ((image[layout.idxSensors2] ?? 0) << 16)
+        );
+      }
+
+      /**
+       * Write a 24-bit sensor bitmap into the working image.
+       *
+       * LSB-FIRST, and the same order on the wire as in InfoMem: idxSensors0
+       * holds bits 0-7. There is no byte swap here and there must not be one —
+       * getting the two out of step makes the form show a different sensor set
+       * than the inquiry reports.
+       */
+      function sensorsToImage(mask) {
+        const image = form?.getImage();
+        if (!image || !layout) return;
+        image[layout.idxSensors0] = mask & 0xff;
+        image[layout.idxSensors1] = (mask >> 8) & 0xff;
+        image[layout.idxSensors2] = (mask >> 16) & 0xff;
+      }
+
+      function sensorsChanged() {
+        return (
+          !!form && !!deviceImage && sensorsFromImage() !== baselineSensors
+        );
+      }
+
+      /** Build the sensor checkbox grid, ready to inject into the form. */
+      function buildSensorGrid() {
+        const grid = el("div", { class: "sensor-groups" });
+        for (const group of SENSOR_GROUPS) {
+          const bits = group.keys
+            .map((key) => [key, sdk.SensorBitmapShimmer3?.[key] ?? 0])
+            .filter(([, bit]) => bit !== 0);
+          if (!bits.length) continue;
+          grid.appendChild(
+            el(
+              "div",
+              { class: "sensor-group" },
+              el("h3", {}, group.title),
+              bits.map(([key, bit]) =>
+                el(
+                  "label",
+                  { title: `${key} — bitmap ${hexMask(bit)}` },
+                  el("input", {
+                    type: "checkbox",
+                    dataset: { sensorBit: String(bit) },
+                    onchange: onSensorToggle,
+                  }),
+                  SENSOR_LABELS[key] ?? key,
+                ),
+              ),
+            ),
+          );
+        }
+        return grid;
+      }
+
+      function onSensorToggle() {
+        let mask = sensorsFromImage();
+        for (const box of document.querySelectorAll("[data-sensor-bit]")) {
+          const bit = Number(box.dataset.sensorBit);
+          mask = box.checked ? mask | bit : mask & ~bit;
+        }
+        sensorsToImage(mask);
+        log.log(`sensor bitmap now ${hexMask(mask)}`);
+        afterImageEdit();
+      }
+
+      /** Push the image's sensor bits back into the checkboxes. */
+      function syncSensorGrid() {
+        const mask = sensorsFromImage();
+        for (const box of document.querySelectorAll("[data-sensor-bit]")) {
+          box.checked = (mask & Number(box.dataset.sensorBit)) !== 0;
+        }
+      }
+
+      // =====================================================================
+      // ExG preset and the sampling-rate helper
+      // =====================================================================
+
+      /** Build the ExG mode control, ready to inject into the form. */
+      function buildExgControl() {
+        const select = el(
+          "select",
+          { id: "exgMode", onchange: onExgModeChange },
+          EXG_MODES.map((m) => el("option", { value: m.id }, m.label)),
+        );
+        return el(
+          "div",
+          { class: "field" },
+          el("label", { for: "exgMode" }, "ExG mode"),
+          select,
+          el("div", {
+            class: "field-hint",
+            text:
+              "Installs a known-good ADS1292R register bank and takes over the " +
+              "ExG sensor bits. Its oversampling ratio is derived from the " +
+              "sampling rate, so it is always applied last.",
+          }),
+        );
+      }
+
+      function onExgModeChange(event) {
+        exgMode = event.target.value;
+        if (exgMode === "off") {
+          log.log("the ExG registers will be left as stored");
+        } else {
+          // The presets all stream 16-bit ExG, so the stored image should say
+          // so too — otherwise the running and stored configurations disagree
+          // until the sensor next reboots.
+          sensorsToImage(
+            (sensorsFromImage() | EXG_16BIT_MASK) & ~EXG_24BIT_MASK,
+          );
+          // The ExG front end runs off the internal expansion rail, and the SDK
+          // helper switches it on live; record that in the image as well.
+          setFieldValue("expPower", 1);
+          log.log(
+            `ExG mode "${exgMode}" selected — 16-bit ExG bits and the internal expansion rail set in the image`,
+          );
+        }
+        afterImageEdit();
+      }
+
+      /**
+       * Set a schema field through its own control, so the form validates the
+       * value, writes the bytes and recomputes its dirty state exactly as it
+       * would for a typed edit.
+       */
+      function setFieldValue(key, value) {
+        const control = document.querySelector(
+          `#configForm .field[data-field-key="${key}"] select, ` +
+            `#configForm .field[data-field-key="${key}"] input`,
+        );
+        if (!control) return false;
+        if (control.type === "checkbox") control.checked = !!value;
+        else control.value = String(value);
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
+      }
+
+      function fieldValue(key, image = form?.getImage()) {
+        const field = fields.find((f) => f.key === key);
+        if (!field || !image || !layout) return undefined;
+        return sdk.readInfoMemFieldValue(image, field, layout);
+      }
+
+      /**
+       * A "common rates" helper above the raw sampling-rate divider.
+       *
+       * The schema models bytes 0-1 as what they are — a 32768 Hz divider — so
+       * the generated control is a divider spinner. That is correct, and
+       * unreadable, hence this.
+       */
+      function buildRateHelper() {
+        const select = el(
+          "select",
+          {
+            id: "rateHelper",
+            onchange: (e) => {
+              const hz = Number(e.target.value);
+              if (!hz) return;
+              setFieldValue("samplingRate", sdk.samplingRateToDivisor(hz));
+              afterImageEdit();
+            },
+          },
+          el("option", { value: "" }, "Pick a common rate…"),
+          (sdk.SHIMMER3_SAMPLING_RATES_HZ ?? []).map((hz) =>
+            el("option", { value: String(hz) }, fmtHz(hz)),
+          ),
+        );
+        return el(
+          "div",
+          { class: "row" },
+          el("label", { for: "rateHelper" }, "Common rates"),
+          select,
+          el("span", { class: "pill", id: "ratePill" }, "–"),
+        );
+      }
+
+      function syncRateReadout() {
+        const pill = $("ratePill");
+        if (!pill) return;
+        const divider = Number(fieldValue("samplingRate"));
+        pill.textContent =
+          Number.isFinite(divider) && divider > 0
+            ? fmtHz(sdk.divisorToSamplingRate(divider))
+            : "–";
+        const helper = $("rateHelper");
+        if (helper) helper.value = "";
+      }
+
+      // =====================================================================
+      // The configuration form
+      // =====================================================================
+
+      /**
+       * Build (or rebuild) the configuration form for a device generation.
+       *
+       * Everything device-specific comes from the SDK: the field list, the
+       * group list, the resolved byte layout and the three field accessors. The
+       * form itself knows nothing about Shimmer3 — it renders a schema and
+       * edits bytes, so every byte no field models survives a read, an edit and
+       * a write untouched.
+       */
+      function buildForm(ctx) {
+        form?.destroy();
+        context = ctx;
+        layout = sdk.resolveInfoMemLayout(ctx);
+        fields = sdk.infoMemFieldsFor(generation);
+        log.log(
+          `configuration schema: ${fields.length} fields for ${generation}`,
+        );
+
+        form = createConfigForm($("configForm"), {
+          fields,
+          groups: sdk.SHIMMER3_INFOMEM_FIELD_GROUPS,
+          layout,
+          codec: {
+            resolveFieldIndex: sdk.resolveFieldIndex,
+            readInfoMemFieldValue: sdk.readInfoMemFieldValue,
+            writeInfoMemFieldValue: sdk.writeInfoMemFieldValue,
+          },
+          imageSize: IMAGE_BYTES,
+          onChange: (key) => {
+            log.log(`configuration edit: ${key}`);
+            afterImageEdit();
+          },
+          onDirtyChange: () => updateDirtyPill(),
+        });
+
+        injectOwnControls();
+        banner("configBanner", "", "");
+      }
+
+      /**
+       * Add the three controls the page owns rather than the schema: the sensor
+       * checkbox grid, the ExG preset and the sampling-rate helper.
+       */
+      function injectOwnControls() {
+        const host = $("configForm");
+
+        const sensorsBody = host.querySelector('[data-group-body="sensors"]');
+        if (sensorsBody) {
+          sensorsBody.appendChild(buildSensorGrid());
+          /* The schema deliberately declares no fields in this group — the
+             Sensors0-4 bitmaps are per-channel enable maps rather than scalar
+             settings — so the form rendered the group hidden. It has content
+             now. */
+          const details = sensorsBody.closest("details.group");
+          if (details) {
+            details.hidden = false;
+            details.open = true;
+          }
+        }
+
+        const exgBody = host.querySelector('[data-group-body="exg"]');
+        if (exgBody)
+          exgBody.insertBefore(buildExgControl(), exgBody.firstChild);
+
+        const samplingBody = host.querySelector('[data-group-body="sampling"]');
+        if (samplingBody) {
+          samplingBody.insertBefore(buildRateHelper(), samplingBody.firstChild);
+        }
+
+        /* The two ExG register banks are opaque 10-byte runs, and the ExG
+           preset above is what installs a known-good one. They stay editable
+           for anyone who really does have a register bank to paste, but they
+           are worth a word of explanation. */
+        for (const key of ["exg1", "exg2"]) {
+          const wrap = host.querySelector(`.field[data-field-key="${key}"]`);
+          if (!wrap) continue;
+          wrap.appendChild(
+            el("div", {
+              class: "field-hint muted",
+              text:
+                "Raw hex. Choosing an ExG mode above installs a known-good " +
+                "bank on the sensor instead, and these are re-read afterwards.",
+            }),
+          );
+        }
+      }
+
+      /** Called after anything changes the working image. */
+      function afterImageEdit() {
+        syncSensorGrid();
+        syncRateReadout();
+        renderHex();
+        regate();
+      }
+
+      /**
+       * Take an image the sensor just gave us as the new reference: the form's
+       * working document, its baseline, and the page's own `deviceImage`.
+       */
+      function adoptDeviceImage(bytes) {
+        deviceImage = new Uint8Array(bytes);
+        form.setImage(bytes);
+        form.captureBaseline();
+        baselineSensors = sensorsFromImage();
+        exgMode = "off";
+        const select = $("exgMode");
+        if (select) select.value = "off";
+        $("imPill").textContent = `${form.getImage().length} bytes read`;
+        $("imPill").classList.add("on");
+        afterImageEdit();
+      }
+
+      /**
+       * Every schema field whose value differs from `deviceImage`.
+       *
+       * Computed here rather than taken from `form.dirtyFields()` because
+       * loading a `.bin` replaces the form's baseline: after that, only this
+       * comparison still answers "what differs from the sensor?", which is the
+       * question both the apply plan and the confirm dialog are asking.
+       */
+      function changedFields() {
+        if (!form || !deviceImage || !layout) return [];
+        const image = form.getImage();
+        const out = [];
+        for (const field of fields) {
+          const to = sdk.readInfoMemFieldValue(image, field, layout);
+          const from = sdk.readInfoMemFieldValue(deviceImage, field, layout);
+          if (!sameFieldValue(to, from)) out.push({ field, from, to });
+        }
+        return out;
+      }
+
+      function dirtyCount() {
+        return (
+          changedFields().length +
+          (sensorsChanged() ? 1 : 0) +
+          (exgMode !== "off" ? 1 : 0)
+        );
+      }
+
+      function updateDirtyPill() {
+        const pill = $("dirtyPill");
+        const n = form ? dirtyCount() : 0;
+        pill.hidden = n === 0;
+        pill.textContent = n === 1 ? "1 change" : `${n} changes`;
+      }
+
+      /** The plan Apply would run right now. */
+      function currentPlan() {
+        const changedKeys = changedFields().map((c) => c.field.key);
+        const dirtyConfigKeys = configKeysForDirtyFields(changedKeys, fields);
+        return buildApplyPlan(dirtyConfigKeys, {
+          caps,
+          mode,
+          streaming,
+          recording: sdLogging,
+          exgModeChanged: exgMode !== "off",
+          sensorsChanged: sensorsChanged(),
+          /* An ExG preset derives its oversampling ratio from the RUNNING
+             sampling rate, so the rate has to be re-applied even when its own
+             field is untouched. */
+          samplingRateChanged:
+            exgMode !== "off" || dirtyConfigKeys.includes("samplingRateHz"),
+        });
+      }
+
+      /** The confirm text: every change, in the sensor's own vocabulary. */
+      function describeChanges() {
+        const lines = changedFields().map(
+          (c) =>
+            `  • ${c.field.label}: ${displayValue(c.field, c.from)} → ` +
+            `${displayValue(c.field, c.to)}`,
+        );
+        if (sensorsChanged()) {
+          lines.push(
+            `  • Enabled sensors: ${hexMask(baselineSensors)} → ${hexMask(sensorsFromImage())}`,
+          );
+        }
+        if (exgMode !== "off") {
+          const label = EXG_MODES.find((m) => m.id === exgMode)?.label;
+          lines.push(`  • ExG mode: ${label}`);
+        }
+        return lines;
+      }
+
+      // =====================================================================
+      // Hex view
+      // =====================================================================
+
+      function renderHex() {
+        const host = $("hexview");
+        const image = form?.getImage();
+        if (!image) {
+          host.replaceChildren(
+            el("div", { class: "muted", text: "No configuration image yet." }),
+          );
+          return;
+        }
+        const rows = [];
+        for (let offset = 0; offset < image.length; offset += HEX_COLUMNS) {
+          const cells = [
+            el("span", {
+              class: "hexview-addr",
+              text: offset.toString(16).toUpperCase().padStart(4, "0"),
+            }),
+          ];
+          for (let i = 0; i < HEX_COLUMNS; i++) {
+            const at = offset + i;
+            if (at >= image.length) {
+              cells.push(el("span", { class: "hexview-byte blank" }, ""));
+              continue;
+            }
+            const b = image[at];
+            const changed = deviceImage ? deviceImage[at] !== b : false;
+            const classes = ["hexview-byte"];
+            if (changed) classes.push("changed");
+            else if (b === 0x00 || b === 0xff) classes.push("zero");
+            cells.push(
+              el(
+                "span",
+                {
+                  class: classes.join(" "),
+                  title: `byte ${at} (0x${at.toString(16).toUpperCase()})`,
+                },
+                hex2(b),
+              ),
+            );
+          }
+          rows.push(el("div", { class: "hexview-row" }, cells));
+        }
+        host.replaceChildren(...rows);
+      }
+
+      /** How many bytes of the working image differ from the sensor's. */
+      function changedByteCount() {
+        const image = form?.getImage();
+        if (!image || !deviceImage) return 0;
+        let n = 0;
+        for (let i = 0; i < image.length; i++) {
+          if (image[i] !== deviceImage[i]) n++;
+        }
+        return n;
+      }
+
+      // =====================================================================
+      // Read and apply
+      // =====================================================================
+
+      async function readConfiguration() {
+        const bytes = await withDevice("read the configuration image", () =>
+          client.readInfoMemBytes(),
+        );
+        if (!bytes) return;
+        adoptDeviceImage(bytes);
+        if (sdk.checkConfigBytesValid?.(bytes) === false) {
+          banner(
+            "imBanner",
+            "warn",
+            "The sensor's configuration memory is blank — its first six bytes are all 0xFF. Applying a configuration will provision it.",
+          );
+        } else {
+          banner("imBanner", "", "");
+        }
+      }
+
+      /**
+       * Apply the plan `buildApplyPlan` produced, in its order.
+       *
+       * The order is the firmware's, not a preference: the stored image first,
+       * then the SD header rebuild, then the live setters (sensors, then rate,
+       * then ranges, then expansion power) and the ExG preset last, because its
+       * oversampling ratio is derived from the rate that was just set. It
+       * finishes by asking the sensor what it now says rather than trusting
+       * what was written.
+       */
+      async function applyConfiguration() {
+        const plan = currentPlan();
+        if (plan.blocked) {
+          showToast(plan.blocked, "warn");
+          log.warn(`Apply refused: ${plan.blocked}`);
+          return;
+        }
+        const changes = describeChanges();
+        if (!changes.length) {
+          showToast("Nothing has changed since the last read", "info");
+          return;
+        }
+        const confirmed = window.confirm(
+          `Write this configuration to the sensor?\n\n${changes.join("\n")}\n\n` +
+            `Steps:\n${plan.steps.map((s, i) => `  ${i + 1}. ${s.label}`).join("\n")}`,
+        );
+        if (!confirmed) {
+          log.log("Apply cancelled");
+          return;
+        }
+
+        log.log(`Apply: ${plan.steps.length} steps`);
+        for (const [index, step] of plan.steps.entries()) {
+          log.log(
+            `apply step ${index + 1}/${plan.steps.length}: ${step.label}`,
+          );
+          if (!(await runApplyStep(step))) {
+            showToast(
+              `Apply stopped at step ${index + 1}. The sensor's stored and running configuration may now disagree — read the configuration back.`,
+              "err",
+            );
+            return;
+          }
+        }
+        showToast("Configuration applied", "ok");
+      }
+
+      /**
+       * One plan step. Returns false when the run must stop.
+       *
+       * A step name is the SDK client's own method name wherever one exists,
+       * but the two InfoMem steps and the ExG preset are named for the
+       * OPERATION, so they are matched explicitly. Both the current
+       * whole-image names and the earlier paged ones are accepted, so
+       * re-vendoring the schema module in either direction cannot silently
+       * drop the image write out of the plan.
+       */
+      async function runApplyStep(step) {
+        try {
+          switch (step.step) {
+            case "writeInfoMemBytes":
+            case "writeInfoMem":
+              await withDevice("write the configuration image", () =>
+                client.writeInfoMemBytes(form.getImage()),
+              );
+              return true;
+
+            case "updateSdLogConfig":
+              /* Feature-detected like every other step here. The plan lists
+                 this one unless the capability is positively denied, so a
+                 caller that has not wired up caps still gets it -- better than
+                 silently dropping the SD-header rebuild and leaving the card's
+                 configuration file stale after the image was written. What is
+                 not acceptable is reporting that as a TypeError, which is what
+                 calling straight through produced. */
+              if (typeof client.updateSdLogConfig !== "function") {
+                log.warn(
+                  "this SDK build has no updateSdLogConfig — the configuration image is written, but the SD header will not be rebuilt until the sensor restarts",
+                );
+                return true;
+              }
+              /* Worth attempting and not worth aborting for: the InfoMem is
+                 already written, and firmware that does not serve 0x9C has no
+                 SD configuration file to rebuild in the first place. */
+              await withDevice(
+                "rebuild the SD configuration header",
+                () => client.updateSdLogConfig(),
+                { tolerate: true },
+              );
+              return true;
+
+            case "inquiry": {
+              const info = await withDevice("re-inquire the channel list", () =>
+                client.inquiry(),
+              );
+              if (info) noteInquiry(info);
+              return true;
+            }
+
+            case "readInfoMemBytes":
+            case "readInfoMem":
+              await readConfiguration();
+              return true;
+
+            case "exgMode": {
+              const method = EXG_MODES.find((m) => m.id === exgMode)?.method;
+              if (!method || typeof client[method] !== "function") {
+                log.warn(
+                  `this SDK build has no ${method ?? "ExG"} helper — the stored image still carries the setting, so it takes effect on the next reboot`,
+                );
+                return true;
+              }
+              await withDevice(`install the ExG registers (${exgMode})`, () =>
+                client[method](),
+              );
+              return true;
+            }
+
+            default: {
+              const overlay = OVERLAY_BY_METHOD.get(step.step);
+              if (!overlay) {
+                log.warn(`unknown apply step "${step.step}" — skipped`);
+                return true;
+              }
+              if (typeof client[overlay.method] !== "function") {
+                log.warn(
+                  `this SDK build has no ${overlay.method} — the stored image still carries the ${overlay.label}`,
+                );
+                return true;
+              }
+              const stored =
+                overlay.configKey === "enabledSensors"
+                  ? sensorsFromImage()
+                  : Number(storedValueFor(overlay.configKey));
+              if (!Number.isFinite(stored)) {
+                log.warn(
+                  `no stored value for the ${overlay.label} — skipping its live setter`,
+                );
+                return true;
+              }
+              const arg = overlay.arg(stored);
+              await withDevice(
+                `apply the ${overlay.label} (${overlay.method}(${arg}))`,
+                () => client[overlay.method](arg),
+              );
+              return true;
+            }
+          }
+        } catch {
+          // withDevice has already logged and toasted the reason.
+          return false;
+        }
+      }
+
+      /** The working image's value for a live-overlay config key. */
+      function storedValueFor(configKey) {
+        const field = fields.find((f) => f.configKey === configKey);
+        if (!field) return NaN;
+        return sdk.readInfoMemFieldValue(form.getImage(), field, layout);
+      }
+
+      function noteInquiry(info) {
+        streamRateHz = info.samplingRateHz ?? null;
+        streamFrameBytes = info.schema?.frameBytes ?? 0;
+        log.log(
+          `inquiry: ${info.numChannels} channels at ${fmtHz(info.samplingRateHz)}, ` +
+            `${streamFrameBytes} bytes per frame, sensors ${hexMask(info.schema?.enabledSensors ?? 0)}`,
+        );
+      }
+
+      /**
+       * Compare what was written against what came back.
+       *
+       * A read-back after a device write is never byte-identical: the firmware
+       * overwrites the MAC with the address it reads from its own Bluetooth
+       * transceiver, and rewrites the configuration-file-creation flag as it
+       * regenerates its SD configuration. `compareInfoMemExcluding` draws that
+       * line in exactly the place the SDK's own write path draws it.
+       */
+      function verifyImage(written, readback) {
+        let verified = null;
+        try {
+          const ranges = sdk.deviceWriteDivergentRanges(context);
+          verified = sdk.compareInfoMemExcluding(written, readback, ranges);
+        } catch (err) {
+          log.warn(`verification helper unavailable: ${err?.message ?? err}`);
+        }
+        if (verified === true) {
+          banner(
+            "imBanner",
+            "ok",
+            "Verified: the image read back matches what was written, apart from the bytes the firmware legitimately rewrites (the MAC, and the configuration-file flag).",
+          );
+          showToast("Configuration image written and verified", "ok");
+          return;
+        }
+        const diffs = [];
+        for (let i = 0; i < Math.min(written.length, readback.length); i++) {
+          if (written[i] !== readback[i]) diffs.push(i);
+        }
+        banner(
+          "imBanner",
+          verified === false ? "err" : "warn",
+          `${diffs.length} byte${diffs.length === 1 ? "" : "s"} read back differently from what was written` +
+            (diffs.length
+              ? ` (first at offset ${diffs[0]}, 0x${diffs[0].toString(16).toUpperCase()})`
+              : "") +
+            ". Some of those are bytes the firmware rewrites on purpose.",
+        );
+      }
+
+      // =====================================================================
+      // Streaming, plotting and recording
+      // =====================================================================
+
+      const plot = createStreamPlot($("plots"), { windowSec: 10, maxFps: 30 });
+      const stats = createStreamStats($("stats"), { windowMillis: 2000 });
+      const recorder = createCsvRecorder({
+        fileNameFn: () => recordFileName(),
+        log,
+        /* The recorder gave up on the file part way through — it has already
+           stopped itself and written the detail to the log. All that is left
+           is to make sure the page does not go on claiming it is recording,
+           and that the researcher hears about it before they walk away with a
+           file that is short. */
+        onError: (info) => {
+          paintRecordingStopped(info);
+          showToast(
+            `Recording stopped: ${info.fileName} is INCOMPLETE — ` +
+              `${info.rowsDropped.toLocaleString()} rows were lost (${info.error})`,
+            "err",
+            { ttlMs: 30000 },
+          );
+          regate();
+        },
+      });
+
+      // =====================================================================
+      // SD card
+      // =====================================================================
+
+      /* The panel is mounted once and handed a GETTER for the client, so it
+         reads whatever is connected now rather than holding the client the
+         page happened to have at startup (which is none). */
+      const sd = createSdBrowser($("sdPanel"), {
+        client: () => client,
+        log,
+        fmtBytes,
+        onBusyChange: (transferring) => {
+          sdBusy = transferring;
+          regate();
+        },
+        /* The link-speed button lives in the Sensor link card, so the running
+           figure has to come back out of the panel to be shown there. */
+        onLinkSpeed: (kBps, final) => {
+          $("linkSpeedPill").textContent =
+            kBps == null
+              ? "not measured"
+              : `${kBps.toFixed(1)} KB/s${final ? "" : " …"}`;
+        },
+      });
+
+      /**
+       * Why the card cannot be browsed right now, in plain language, or null.
+       *
+       * Same shape as the stream tab's USB refusal: a reason on screen beats
+       * a dead tab, because every one of these has a different fix — connect,
+       * use a different link, update the firmware, or stop the stream.
+       */
+      function sdUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE or classic Bluetooth to browse the sensor's SD card and download from it.";
+        }
+        if (mode === "usb") {
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one — the dock command set has no file-transfer commands at all. Connect over BLE or classic Bluetooth to download from the card.";
+        }
+        if (!caps.sdTransfer) {
+          return (
+            sdFirmwareNote ??
+            "This sensor cannot transfer files from its SD card over Bluetooth. Update it to LogAndStream_Shimmer3R v1.01.011 or later."
+          );
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses every SD command while it is — a download and a live stream would compete for the same link. Stop the stream to download from the card.";
+        }
+        /* The other holders of the one link. This panel is disabled for all
+           three (see its setEnabled call), so leaving them unsaid greyed the
+           card out with no reason on screen. */
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link. A download and a name write cannot share it — wait for it to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link. A download and a calibration write cannot share it — wait for it to finish.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off when the reason is not going
+       * to change by itself.
+       *
+       * A disconnected page keeps the tab open, because reading the reason is
+       * the point. USB and old firmware close it and bounce back to
+       * Configure: nothing on it can ever work over that link. Streaming only
+       * closes it — no bounce, because the state is transient and the reader
+       * is on the stream tab anyway.
+       */
+      function paintSdGating() {
+        const reason = sdUnavailableReason();
+        banner("sdBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const permanent = !!client && (mode === "usb" || !caps.sdTransfer);
+        const btn = $("tabBtnSd");
+        btn.disabled = permanent || streaming || sdLogging;
+        btn.title = reason ?? "";
+        if (permanent && tabs.selected() === "tabSd") tabs.select("tabConfig");
+      }
+
+      // =====================================================================
+      // Calibration
+      // =====================================================================
+
+      /* Mounted once and handed GETTERS, like the other two panels.
+         `generation` is what `inferShimmer3Generation` decided, which is what
+         picks the sensor list and the default calibration tables — a Shimmer3
+         has no high-g accel and no alternate magnetometer, and offering them
+         would say a calibration could be set for a chip that is not there.
+
+         `infoMemBlocks` and `readInfoMem` are the read-only fallback for a
+         link with no calibration-dump commands (the USB-C dock, and the
+         classic `Shimmer3Client`): the panel then shows the six calibration
+         blocks out of the configuration image the page already holds, rather
+         than showing nothing. It does not write them — that image belongs to
+         the form above, unsaved edits and all. */
+      const cal = createCalibrationEditor($("calPanel"), {
+        client: () => client,
+        /* Only when the sensor really said what it is. `generation` is
+           derived from the InfoMem context's hardware version, which is
+           DEFAULTED to a Shimmer3R when the identification read fails —
+           because the field schema needs some layout to render a form at
+           all. Passing that default here would offer a possibly-Shimmer3 two
+           sensors it does not have, which is the exact mistake the
+           device-naming panel's `identifiedHardwareVersion` note is about.
+           With nothing passed, the panel takes the hardware id out of the
+           dump's own version header instead — the device's own statement
+           about what wrote those records. */
+        generation: () =>
+          identifiedHardwareVersion == null ? null : generation,
+        hardwareVersion: () => identifiedHardwareVersion,
+        activeRanges: () => configuredCalibRanges(),
+        infoMemBlocks: () => infoMemCalibrationBlocks(),
+        readInfoMem: () => readConfiguration(),
+        log,
+        toast: showToast,
+        fileNamePrefix: () => `Shimmer3R_${macTail()}`,
+        onBusyChange: (working) => {
+          calibBusy = working;
+          regate();
+        },
+      });
+
+      /**
+       * The ranges the sensor is configured for, so each card opens on the
+       * range that is actually in use rather than on range 0.
+       *
+       * Read from the FORM's image rather than from `deviceImage`, so changing
+       * a range in the configuration form moves the calibration tab with it —
+       * which is the honest reading: the calibration that will end up being
+       * applied is the one for the range the sensor ends up configured at.
+       *
+       * The low-noise accel and the alternate magnetometer are missing from
+       * the list on purpose: the SDK's InfoMem model carries no range field
+       * for either, so there is nothing to say about them and the panel falls
+       * back to whichever range holds a record.
+       */
+      function configuredCalibRanges() {
+        const image = form ? form.getImage() : deviceImage;
+        if (!image || !context) return null;
+        try {
+          const imu = sdk.parseInfoMem(image, context).imu;
+          return {
+            wrAccel: imu.wrAccelRange,
+            gyro: imu.gyroRange,
+            mag: imu.magRange,
+            altAccel: imu.altAccelRange,
+          };
+        } catch {
+          return null;
+        }
+      }
+
+      /** The six 21-byte calibration blocks in the image the page holds. */
+      function infoMemCalibrationBlocks() {
+        if (!deviceImage || !context) return null;
+        try {
+          return sdk.parseInfoMem(deviceImage, context).calibration ?? null;
+        } catch {
+          /* A blank or unreadable image is not an error worth a log line
+             here — the configuration card has already said so. */
+          return null;
+        }
+      }
+
+      /**
+       * Why calibration cannot be changed right now, in plain language, or
+       * null.
+       *
+       * The InfoMem fallback is deliberately NOT a refusal: on that link the
+       * tab still shows what the sensor is calibrated to, which is most of
+       * what anyone opens it for. The panel's own banner says the values are
+       * read-only there and why.
+       */
+      function calibUnavailableReason() {
+        if (!client) {
+          return "Connect a sensor to see what it is calibrated to.";
+        }
+        if (!caps.calibration && !caps.infomem) {
+          return "This link can reach neither the calibration dump nor the configuration image, so there is no calibration to show.";
+        }
+        return calibLinkHeldReason();
+      }
+
+      /**
+       * The subset of the above that closes the tab: something else is using
+       * the one link, and it will stop by itself.
+       *
+       * Split out so the sentence and the disabled state come from the same
+       * condition. They were written separately and had already drifted — the
+       * text called the tab unavailable during a link test or a name write
+       * while the tab stayed open — and any holder added later would have
+       * drifted the same way again.
+       */
+      function calibLinkHeldReason() {
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses every configuration command while it is. Stop the stream before reading or writing calibration.";
+        }
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. A calibration write and a download cannot share it — wait for the transfer to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link. Wait for it to finish.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off while the link is busy.
+       *
+       * Nothing here is permanent the way the SD tab's USB refusal is: every
+       * link this page speaks reaches one calibration store or the other, so
+       * the tab is never bounced back to Configure. It closes only while the
+       * sensor is sensing or the link is held, both of which end by
+       * themselves.
+       */
+      function paintCalibGating() {
+        const reason = calibUnavailableReason();
+        banner("calBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const btn = $("tabBtnCal");
+        btn.disabled = !!client && !!calibLinkHeldReason();
+        btn.title = reason ?? "";
+      }
+
+      // =====================================================================
+      // Device naming
+      // =====================================================================
+
+      /* Mounted once and handed GETTERS for everything that changes with the
+         link, so it reads whatever is connected now.
+
+         `identifiedHardwareVersion` is the raw identification result, NOT the
+         `?? 10` default the InfoMem context uses: the panel narrows the BLE
+         prefix length with it, and a defaulted Shimmer3R would defeat that
+         narrowing in exactly the case it exists for. */
+      const brand = createBrandEditor($("brandPanel"), {
+        client: () => client,
+        identifiedHardwareVersion: () => identifiedHardwareVersion,
+        macSuffix: () => (deviceMac ? macTail() : null),
+        mode: () => mode,
+        log,
+        toast: showToast,
+        onBusyChange: (writing) => {
+          brandBusy = writing;
+          regate();
+        },
+        /* The panel arms the restart and then needs the link dropped for it
+           to fire. Its own default would call `client.disconnect()`, which on
+           this page would leave a recording unclosed and the UI still showing
+           a connected sensor — so it gets the page's own teardown instead. */
+        disconnect: () => disconnectFromSensor(),
+      });
+
+      /**
+       * Why the names cannot be changed right now, in plain language, or null.
+       *
+       * Unlike the SD tab there is no link that cannot do this: every client
+       * carries the two daughter-card calls and every link reaches the same
+       * EEPROM. What is left is a sensor that is not connected, a sensor that
+       * is sensing, and an SD transfer holding the link.
+       */
+      function brandUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE, classic Bluetooth or USB-C to see the names this sensor advertises, and to change them.";
+        }
+        if (!caps.branding) {
+          return "This SDK build cannot reach the expansion-board memory the names are stored in. Re-vendor the SDK bundle.";
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing. New names only take effect when it restarts, and the firmware skips a restart while it is sensing so a recording can never be truncated — stop the stream before changing the names.";
+        }
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. A name write and a download cannot share it — wait for the transfer to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link. A name write and a calibration write cannot share it — wait for it to finish.";
+        }
+        return null;
+      }
+
+      /**
+       * Paint the reason, and close the tab off when the reason is not going
+       * to change by itself.
+       *
+       * A disconnected page keeps the tab open, because reading the reason is
+       * the point. An SDK with no brand-record support closes it and bounces
+       * back to Configure: nothing on it can ever work. Sensing and an SD
+       * transfer only close it — no bounce, because both are transient and
+       * the reader is on another tab anyway.
+       *
+       * The reverse does NOT close the SD tab: a card download runs for
+       * minutes and is worth locking a rename out of, while a name write is
+       * two round trips and closing a tab for it would only flicker. The SD
+       * panel's own controls are disabled for the duration either way, from
+       * `regate`.
+       */
+      function paintBrandGating() {
+        const reason = brandUnavailableReason();
+        banner("brandBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const permanent = !!client && !caps.branding;
+        const btn = $("tabBtnBrand");
+        btn.disabled = permanent || streaming || sdLogging || sdBusy;
+        btn.title = reason ?? "";
+        if (permanent && tabs.selected() === "tabBrand") {
+          tabs.select("tabConfig");
+        }
+      }
+
+      function macTail() {
+        const mac = (deviceMac || "").replace(/[^0-9A-Fa-f]/g, "");
+        return mac ? mac.slice(-4).toUpperCase() : "0000";
+      }
+
+      function stampNow() {
+        const d = new Date();
+        const p2 = (n) => String(n).padStart(2, "0");
+        return (
+          `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_` +
+          `${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`
+        );
+      }
+
+      function recordFileName() {
+        return `Shimmer3R_${macTail()}_${stampNow()}.csv`;
+      }
+
+      /** Keep the file-name preview honest while nothing is recording. */
+      function refreshRecordName() {
+        if (recorder.active) return;
+        $("recName").textContent = recordFileName();
+      }
+
+      /**
+       * Prepare the plot, the stats strip and the frame handler, then start.
+       *
+       * @param {boolean} withSd also log to the sensor's own SD card
+       */
+      async function startStream(withSd) {
+        // Ask the sensor what it is configured for rather than trusting what
+        // the page believes it wrote.
+        const info = await tryDevice("inquire before streaming", () =>
+          client.inquiry(),
+        );
+        if (info) noteInquiry(info);
+
+        /* Seed the panels from the inquiry's channel list so they are on screen
+           before the first sample arrives. Those ChannelFields carry no raw/cal
+           kind, though, and the plot routes traces on name AND kind — so the
+           schema is refined once from the first real frame (see onFrame). */
+        plot.setSchema(info?.schema?.fields ?? [], streamRateHz ?? undefined);
+        plot.clear();
+        plotPaused = false;
+        plot.resume();
+        $("btnPause").textContent = "Pause plot";
+        stats.reset(streamRateHz, streamFrameBytes);
+        csvColumns = null;
+        schemaFromFrame = false;
+
+        client.onStreamFrame = onFrame;
+        try {
+          await withDevice(
+            withSd ? "start streaming and SD logging" : "start streaming",
+            () =>
+              withSd
+                ? client.startStreamingAndLogging()
+                : client.startStreaming(),
+          );
+        } catch {
+          client.onStreamFrame = null;
+          return;
+        }
+        streaming = true;
+        sdLogging = withSd;
+        log.log(
+          withSd
+            ? "streaming to this host and logging to the sensor's SD card"
+            : "streaming to this host",
+        );
+        /* Only what this command actually changed: START_STREAMING does not
+           touch SD logging, and asserting it off would overwrite a recording
+           the sensor's own button had started. `sensing` follows because the
+           firmware sets it for either kind of recording. */
+        inferStatus(
+          withSd
+            ? { sensing: true, streaming: true, sdLogging: true }
+            : { sensing: true, streaming: true },
+        );
+        regate();
+      }
+
+      async function stopStream(withSd) {
+        try {
+          await withDevice(
+            withSd ? "stop streaming and SD logging" : "stop streaming",
+            () =>
+              withSd
+                ? client.stopStreamingAndLogging()
+                : client.stopStreaming(),
+          );
+        } catch {
+          /* Logged and toasted. Fall through anyway: leaving the page stuck in
+             "streaming" would refuse every later command for no good reason. */
+        }
+        streaming = false;
+        sdLogging = false;
+        if (client) client.onStreamFrame = null;
+        // The last throttled render can be 500 ms stale, so paint the final
+        // numbers rather than leaving whatever it left behind.
+        stats.render();
+        if (recorder.active) await stopRecording();
+        // Same reasoning as the start: only what the command changed, and the
+        // page's own belief until something reads it back.
+        inferStatus(
+          withSd
+            ? { sensing: false, streaming: false, sdLogging: false }
+            : { sensing: false, streaming: false },
+        );
+        regate();
+      }
+
+      function onFrame(oc) {
+        const hostMs = Date.now();
+
+        if (!schemaFromFrame) {
+          schemaFromFrame = true;
+          // The raw/cal kinds are known now, so the traces can be routed.
+          plot.setSchema(oc.fields, streamRateHz ?? undefined);
+          plot.setWindow(Number($("selWindow").value));
+          plot.setKind($("selKind").value);
+        }
+        if (!csvColumns) {
+          csvColumns = sdk.objectClusterColumns(oc);
+          log.log(
+            `stream schema: ${oc.fields.length} fields per frame, ` +
+              `${csvColumns.length} CSV data columns`,
+          );
+          regate();
+        }
+
+        const ticks = oc.get?.("TIMESTAMP")?.value;
+        plot.push(
+          oc,
+          Number.isFinite(ticks) ? ticks / TICKS_PER_SECOND : hostMs / 1000,
+        );
+        stats.onFrame(oc, performance.now());
+        if (recorder.active && recorder.push(hostMs, oc)) recordedRows++;
+      }
+
+      async function startRecording() {
+        if (!csvColumns) {
+          showToast(
+            "Waiting for the first frame — try again in a moment",
+            "warn",
+          );
+          return;
+        }
+        /* showSaveFilePicker is gesture-gated, so this runs straight off the
+           click with nothing awaited in front of it. */
+        const started = await recorder.start(csvColumns);
+        if (!started) {
+          log.log("recording cancelled");
+          return;
+        }
+        recordedRows = 0;
+        $("recPill").textContent = "recording";
+        $("recPill").classList.add("on");
+        $("recBytes").textContent = "counted when the file is closed";
+        log.log(
+          `recording ${csvColumns.length} columns: ${csvColumns
+            .map((c) => c.header)
+            .join(", ")}`,
+        );
+        regate();
+      }
+
+      /** Repaint the recording panel from a `stop()`-shaped result. */
+      function paintRecordingStopped(result) {
+        $("recRows").textContent = result.rows.toLocaleString();
+        $("recBytes").textContent = fmtBytes(result.bytes);
+        $("recName").textContent = result.fileName;
+        $("recPill").textContent = "not recording";
+        $("recPill").classList.remove("on");
+      }
+
+      async function stopRecording() {
+        if (!recorder.active) return;
+        const result = await recorder.stop();
+        paintRecordingStopped(result);
+        if (result.complete) {
+          log.log(
+            `recording stopped: ${result.rows} rows, ${fmtBytes(result.bytes)}, ${result.fileName}`,
+          );
+          showToast(
+            `Recorded ${result.rows.toLocaleString()} rows to ${result.fileName}`,
+            "ok",
+          );
+        } else {
+          /* Only reachable when the failure happened during the close; a
+             failure mid-recording has already gone through onError. */
+          showToast(
+            `${result.fileName} is INCOMPLETE — ` +
+              `${result.rowsDropped.toLocaleString()} rows were lost (${result.error})`,
+            "err",
+            { ttlMs: 30000 },
+          );
+        }
+        regate();
+      }
+
+      /* One cheap tick a second: the row counter while recording, and the
+         file-name preview the rest of the time. */
+      setInterval(() => {
+        if (recorder.active) {
+          $("recRows").textContent = recordedRows.toLocaleString();
+          $("recName").textContent = "(streaming to the file you chose)";
+        } else {
+          refreshRecordName();
+        }
+      }, 1000);
+
+      // =====================================================================
+      // Connect
+      // =====================================================================
+
+      /**
+       * The Web Bluetooth transport the Shimmer3R client would otherwise build
+       * for itself, wrapped in the byte tap.
+       *
+       * The three UUIDs, the picker filter and the write mode all come from
+       * the SDK's own exported defaults, so a firmware that moves its GATT
+       * layout moves this page with it. Returns null when the vendored bundle
+       * is too old to export the pieces, which the caller degrades over.
+       */
+      function makeBleTransport() {
+        const defaults = sdk.SHIMMER3R_DEFAULTS;
+        if (typeof sdk.WebBluetoothTransport !== "function" || !defaults) {
+          return null;
+        }
+        return new sdk.WebBluetoothTransport({
+          serviceUUID: defaults.SERVICE_UUID,
+          // RX is the host→device write pipe and TX the device→host notify
+          // pipe — named from the SENSOR's point of view, which is the way
+          // round that trips a reader who assumes the host's.
+          writeCharUUID: defaults.CHAR_RX_UUID,
+          notifyCharUUID: defaults.CHAR_TX_UUID,
+          requestDeviceOptions: {
+            filters: [{ services: [defaults.SERVICE_UUID] }],
+            optionalServices: [defaults.SERVICE_UUID],
+          },
+          defaultWriteWithResponse: true,
+          debug: false,
+          logTag: "[Shimmer3R:ble]",
+        });
+      }
+
+      const connect = createConnectController({
+        els: {
+          ble: $("btnBle"),
+          usb: $("btnUsb"),
+          bt: $("btnBt"),
+          disconnect: $("btnDisconnect"),
+          pill: $("connPill"),
+          banner: $("platformBanner"),
+        },
+        log,
+        sdkNs: sdk,
+        makeClients: {
+          /* The client would happily build its own Web Bluetooth transport,
+             and did until the raw byte tap arrived: a transport the page never
+             sees is a transport the page cannot tap, which left BLE — the link
+             most sessions use — as the one link with no byte-level
+             diagnostics.
+
+             So the page builds it, matching Shimmer3RClient._makeWebTransport
+             option for option: the same three UUIDs (read off the SDK's own
+             SHIMMER3R_DEFAULTS rather than typed out here), the same
+             requestDevice filter and optionalServices, and
+             defaultWriteWithResponse: true, which is the one that would change
+             behaviour rather than just labels if it were wrong — the Shimmer3R
+             protocol is ACK-first and its commands are written with a
+             response. */
+          ble: () => {
+            const raw = makeBleTransport();
+            if (!raw) {
+              /* An older vendored bundle with no WebBluetoothTransport export:
+                 fall back to the client's own, which costs the tap on this
+                 link and nothing else. */
+              log.warn(
+                "this SDK bundle does not export WebBluetoothTransport, so the BLE link cannot be tapped — raw TX/RX logging will be empty over BLE",
+              );
+              return new sdk.Shimmer3RClient({ debug: false });
+            }
+            const transport = tapTransport(raw);
+            return {
+              client: new sdk.Shimmer3RClient({ debug: false, transport }),
+              transport,
+            };
+          },
+          bt: () => {
+            /* A classic-Bluetooth link is a serial port, so the transport is
+               built here and handed back alongside the client — the controller
+               needs it to log which RFCOMM service class the browser's picker
+               actually gave us. 64 KB of buffer because a serial read can
+               arrive in one large gulp. */
+            const transport = tapTransport(
+              new sdk.WebSerialTransport({
+                ...sdk.SHIMMER3_SPP_SERIAL_OPTIONS,
+                bufferSize: 64 * 1024,
+              }),
+            );
+            return {
+              client: new sdk.Shimmer3RClient({ debug: false, transport }),
+              transport,
+            };
+          },
+          usb: () => {
+            const transport = tapTransport(new sdk.WebSerialTransport());
+            return {
+              client: new sdk.WiredShimmerClient({ transport }),
+              transport,
+            };
+          },
+        },
+        afterConnect: (session) => afterConnect(session),
+        onDisconnected: (reason) => onDisconnected(reason),
+      });
+
+      /**
+       * Everything the page needs to know about what it just connected to.
+       *
+       * Order matters on the radio path: the firmware and hardware version
+       * reads are what resolve the InfoMem addressing and the status payload
+       * width, so they come first and everything else builds on them.
+       */
+      async function afterConnect(session) {
+        client = session.client;
+        mode = session.mode;
+        caps = describeShimmer3Caps(client, mode);
+        /* One capability the shared feature detection does not cover: a clock
+           write, which the dock client spells `writeRtcFromHostTime` rather
+           than `setRtcTime`. */
+        caps.rtcWrite =
+          typeof client.setRtcTime === "function" ||
+          typeof client.writeRtcFromHostTime === "function";
+        /* Deliberately gated on the link as well as on the method: the dock
+           command set has no data-rate test, so the reason the button is off
+           over USB is the protocol, not a missing SDK export. */
+        caps.linkTest =
+          mode !== "usb" && typeof client.runDataRateTest === "function";
+        regate();
+
+        /* The sensor's own news, which nothing on this page used to hear.
+           The firmware pushes an unsolicited STATUS_RESPONSE whenever it is
+           docked or undocked (`LogAndStream_setupDock` / `setupUndock`,
+           log-and-stream-common `log_and_stream_common.c`) and on a sensing
+           change it made itself — the user button, a trial ending, a low
+           battery. A read's own answer is NOT delivered here, so this cannot
+           double-render what Refresh already showed.
+
+           It only fires while idle: once a stream is live the SDK's parser
+           consumes the push, which is why a stream start reflects its own
+           change (`inferStatus`) instead of waiting for one. Guarded by a
+           property check because the dock client has no such callback — and
+           no status bytes to put in it. */
+        if ("onDeviceStatus" in client) {
+          client.onDeviceStatus = (status) => {
+            log.log(
+              `the sensor pushed a status change: docked=${status.docked} ` +
+                `sensing=${status.sensing} streaming=${status.streaming} ` +
+                `sdLogging=${status.sdLogging}`,
+            );
+            renderStatus(status, "push");
+          };
+        }
+
+        deviceName = client.device?.name ?? session.transport?.deviceName ?? "";
+        setIdentity({ idLink: session.label });
+
+        if (mode === "usb") await afterConnectWired();
+        else await afterConnectRadio();
+
+        applyModeGating();
+        regate();
+      }
+
+      /** The Bluetooth path: BLE, classic Bluetooth, or the mock. */
+      async function afterConnectRadio() {
+        const fw = await tryDevice("read the firmware version", () =>
+          client.readFwVersion(),
+        );
+        const hw = await tryDevice("read the hardware version", () =>
+          client.readDeviceVersion(),
+        );
+        const mac = await tryDevice("read the MAC address", () =>
+          client.getMacAddress(),
+        );
+        if (mac) deviceMac = mac;
+        /* The raw answer, deliberately NOT defaulted — see the declaration.
+           `hw` is undefined when the read was refused or timed out. */
+        identifiedHardwareVersion = hw?.hardwareVersion ?? null;
+        if (identifiedHardwareVersion === null) {
+          log.warn(
+            "the sensor did not report its hardware version, so this page assumes a Shimmer3R for the configuration layout — the device-naming tab stays on the shorter Shimmer3 BLE name limit, which is safe on either platform",
+          );
+        }
+
+        /* The firmware gate on top of the method-and-link check
+           `describeShimmer3Caps` did: v1.01.009 and v1.01.010 serve the
+           SD-transfer protocol and ship every 512-byte block shifted three
+           bytes, so the corruption arrives as valid frames nothing on the
+           host can detect. The version is the only reliable probe, and
+           `supportsSdTransfer` owns the threshold — it reuses the version
+           just read, so this costs no extra round trip. */
+        if (caps.sdTransfer) {
+          const ok = await client.supportsSdTransfer().catch(() => false);
+          caps.sdTransfer = ok === true;
+          sdFirmwareNote = ok
+            ? null
+            : `${firmwareLabel(fw) ?? "This firmware"} cannot transfer SD files intact. It needs LogAndStream_Shimmer3R v1.01.011 or later — v1.01.009 and v1.01.010 corrupt every block they send.`;
+          log.log(
+            caps.sdTransfer
+              ? "SD file transfer supported by this firmware"
+              : `SD file transfer unavailable: ${sdFirmwareNote}`,
+          );
+        }
+
+        setIdentity({
+          idName: deviceName || "(name not reported)",
+          idMac: mac ?? "(unavailable)",
+          idHw: hardwareLabel(hw?.hardwareVersion),
+          idFw: firmwareLabel(fw),
+        });
+
+        const info = await tryDevice("inquire the channel list", () =>
+          client.inquiry(),
+        );
+        if (info) noteInquiry(info);
+
+        await refreshDeviceState();
+
+        const bytes = await tryDevice("read the configuration image", () =>
+          client.readInfoMemBytes(),
+        );
+
+        const ctx = {
+          hardwareVersion: hw?.hardwareVersion ?? 10,
+          firmwareId: fw?.fwId ?? 3,
+          firmwareVersion: {
+            major: fw?.major ?? 0,
+            minor: fw?.minor ?? 0,
+            internal: fw?.patch ?? 0,
+          },
+        };
+        /* An expansion board's revision is what separates a new-IMU Shimmer3
+           from an old-IMU one, and therefore which option tables the schema
+           offers. A Shimmer3R does not need it (hardware id 10 decides), so
+           this stays best-effort. */
+        const board = await tryDevice(
+          "read the expansion board id",
+          async () =>
+            typeof client.readDaughterCardMem === "function"
+              ? sdk.parseExpansionBoard(await client.readDaughterCardMem(0, 16))
+              : null,
+        );
+        generation = sdk.inferShimmer3Generation(
+          ctx,
+          board
+            ? { boardId: board.boardId, boardRev: board.boardRev }
+            : undefined,
+        );
+        buildForm(ctx);
+        if (bytes) adoptDeviceImage(bytes);
+        else {
+          banner(
+            "configBanner",
+            "err",
+            "The configuration image could not be read, so the form below shows a blank image. Press “Read from device” to try again.",
+          );
+        }
+      }
+
+      /**
+       * The USB-C path.
+       *
+       * The Shimmer3R's USB-C port speaks the DOCK protocol, not the Bluetooth
+       * one — the firmware routes CDC bytes to the dock parser — so this is a
+       * different client with a different command set, and there is no sample
+       * stream on it at all.
+       */
+      async function afterConnectWired() {
+        const id = await tryDevice("identify the docked sensor", () =>
+          client.identify(),
+        );
+        if (id?.mac) deviceMac = id.mac;
+        // The raw answer, deliberately NOT defaulted — see the declaration.
+        identifiedHardwareVersion = id?.hardwareVersion ?? null;
+        const batt = await tryDevice("read the battery", () =>
+          client.getStatus(),
+        );
+        const version = id?.firmwareVersion;
+
+        setIdentity({
+          idName: deviceName || "(over USB / dock serial)",
+          idMac: id?.mac ?? "(unavailable)",
+          idHw: hardwareLabel(id?.hardwareVersion),
+          idFw: firmwareLabel(
+            version
+              ? {
+                  fwId: version.firmwareIdentifier,
+                  major: version.firmwareVersionMajor,
+                  minor: version.firmwareVersionMinor,
+                  patch: version.firmwareVersionInternal,
+                }
+              : null,
+          ),
+          idBatt: batteryLabel(batt),
+        });
+        $("hostClock").textContent = formatClock(Date.now());
+
+        const ctx = {
+          hardwareVersion: id?.hardwareVersion ?? 10,
+          firmwareId: version?.firmwareIdentifier ?? 3,
+          firmwareVersion: {
+            major: version?.firmwareVersionMajor ?? 0,
+            minor: version?.firmwareVersionMinor ?? 0,
+            internal: version?.firmwareVersionInternal ?? 0,
+          },
+        };
+        generation = sdk.inferShimmer3Generation(
+          ctx,
+          id?.expansionBoard
+            ? {
+                boardId: id.expansionBoard.boardId,
+                boardRev: id.expansionBoard.boardRev,
+              }
+            : undefined,
+        );
+        buildForm(ctx);
+
+        const bytes = await tryDevice("read the configuration image", () =>
+          client.readInfoMemBytes(),
+        );
+        if (bytes) adoptDeviceImage(bytes);
+        else {
+          banner(
+            "configBanner",
+            "err",
+            "The configuration image could not be read over the dock link. Press “Read from device” to try again.",
+          );
+        }
+      }
+
+      /**
+       * What each link can and cannot do.
+       *
+       * The USB-C port configures a sensor perfectly well and cannot carry a
+       * single sample or a single card block, so the stream and SD tabs are
+       * both closed off with a reason rather than left to fail on the first
+       * button press. The SD half of that lives in `paintSdGating`, which
+       * `regate` calls — its reason depends on the firmware too.
+       */
+      function applyModeGating() {
+        const wired = mode === "usb";
+        $("tabBtnStream").disabled = wired;
+        $("tabBtnStream").title = wired
+          ? "Streaming needs a Bluetooth link"
+          : "";
+        if (wired) {
+          if (tabs.selected() === "tabStream") tabs.select("tabConfig");
+          banner(
+            "streamBanner",
+            "warn",
+            "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one. Configuration, the clock, the configuration image, calibration and the device's names all work over USB; live data does not. Connect over BLE or classic Bluetooth to stream and record.",
+          );
+        } else {
+          banner("streamBanner", "", "");
+        }
+      }
+
+      /** Common teardown for both a user disconnect and a dropped link. */
+      function resetAfterDisconnect() {
+        streaming = false;
+        sdLogging = false;
+        csvColumns = null;
+        schemaFromFrame = false;
+        /* A transfer that outlived its link would keep writing zero-length
+           windows into the destination folder. Abort first, then drop the
+           client the panel reads through. */
+        sd.abort();
+        /* Report whatever the tap was still holding back before the transport
+           it wrapped goes away — a count that never lands reads as bytes that
+           were never sent. */
+        tap?.tap.flush();
+        tap = null;
+        /* A status pushed by a link the page has already let go would paint a
+           departed sensor's flags into a panel that is about to say "–". */
+        if (client) client.onDeviceStatus = null;
+        client = null;
+        mode = null;
+        caps = {};
+        sdFirmwareNote = null;
+        identifiedHardwareVersion = null;
+        form?.setEnabled(false);
+        /* A KB/s figure belongs to the link that produced it, so it goes with
+           the link rather than lingering beside the next one. */
+        $("linkSpeedPill").textContent = "not measured";
+        clearIdentity();
+        $("tabBtnStream").disabled = false;
+        $("tabBtnStream").title = "";
+        banner("streamBanner", "", "");
+        regate();
+      }
+
+      /**
+       * The link went away without the page asking.
+       *
+       * Finishing the recording first is the point of this handler: whatever
+       * was captured before the drop is data the user still wants, and a file
+       * whose writable stream was never closed is a file they cannot read.
+       */
+      async function onDisconnected(reason) {
+        streaming = false;
+        sdLogging = false;
+        if (recorder.active) {
+          log.warn("the link dropped while recording — closing the CSV");
+          await stopRecording();
+        }
+        plot.pause();
+        stats.render();
+        resetAfterDisconnect();
+        connect.setConnected(false);
+        showToast(
+          `The sensor disconnected (${reason?.message ?? reason ?? "link lost"})`,
+          "err",
+        );
+      }
+
+      // =====================================================================
+      // Mock link (?mock=1)
+      // =====================================================================
+
+      /**
+       * A scripted Shimmer3R, for developing and demonstrating this page with
+       * no hardware on the desk. Opt-in from the URL only — a page that reached
+       * for the mock on its own would quietly show fake data to somebody
+       * debugging a real sensor.
+       *
+       *   ?mock=1              framed, like BLE
+       *   ?mock=1&framed=0     an unframed byte stream, like classic Bluetooth
+       *   ?mock=1&rate=204.8   pick the sampling rate
+       *   ?mock=1&fw=1.01.010  report a firmware version (gates the SD tab)
+       *   ?mock=1&hw=3         report a hardware id; `none` refuses to
+       *                        report one at all, which is how the
+       *                        unidentified-sensor path gets exercised
+       *   ?mock=1&sdKBps=400   pace the synthetic card's file blocks
+       *   ?mock=1&debug=1      log every command and reply to the console
+       */
+      function setUpMock() {
+        if (!mockEnabledFromUrl()) return;
+        const params = new URLSearchParams(location.search);
+        const framed = params.get("framed") !== "0";
+        const rateHz = Number(params.get("rate")) || 51.2;
+        /* `1.01.010` — major.minor.patch, the way the firmware releases are
+           named, so the value pasted into the URL is the one from the
+           release notes. */
+        const fwParts = (params.get("fw") ?? "").split(".").map(Number);
+        const firmware =
+          fwParts.length === 3 && fwParts.every(Number.isFinite)
+            ? { major: fwParts[0], minor: fwParts[1], patch: fwParts[2] }
+            : undefined;
+        const sdKBps = Number(params.get("sdKBps")) || undefined;
+        /* `hw=none` (or `hw=0`) NACKs GET_DEVICE_VERSION, so the page cannot
+           identify the sensor. Anything else is a hardware id. */
+        const hwParam = params.get("hw");
+        /* A hw= that is not a number is a typo, not a hardware id. Passing the
+           NaN on gave GET_DEVICE_VERSION a masked 0 -- a fourth answer that is
+           neither a real id, nor the default, nor the unidentified sensor the
+           author was probably reaching for. Treated as absent instead. */
+        const hwNumber = hwParam == null ? NaN : Number(hwParam);
+        const hardwareVersion =
+          hwParam == null
+            ? undefined
+            : /^(none|null|0)$/i.test(hwParam)
+              ? null
+              : Number.isFinite(hwNumber)
+                ? hwNumber
+                : undefined;
+        if (hwParam != null && hardwareVersion === undefined) {
+          log.warn(
+            `mock mode: ignoring hw="${hwParam}" — not a hardware id. Use a number, or "none" for a sensor that will not identify itself.`,
+          );
+        }
+        const btn = $("btnMock");
+        btn.hidden = false;
+        btn.textContent = `Connect (mock, ${framed ? "framed" : "unframed"})`;
+        /* The BLE transport builder, so its options can be read off on a host
+           with no sensor and no Web Bluetooth — constructing one does not go
+           near the radio, only `connect()` does. Side-effect free: the tap is
+           applied by the connect factory, not here. */
+        window.makeBleTransport = makeBleTransport;
+        log.warn(
+          `mock mode: no real sensor is involved. The transport is ${
+            framed
+              ? "framed, like BLE"
+              : "an unframed byte stream, like classic Bluetooth or the dock"
+          }, at ${fmtHz(rateHz)}.`,
+        );
+
+        btn.addEventListener("click", async () => {
+          const transport = createMockShimmer3RTransport({
+            framed,
+            rateHz,
+            firmware,
+            hardwareVersion,
+            sdKBps,
+            debug: params.get("debug") === "1",
+          });
+          // Hooks for driving the page from the console while developing:
+          // `mockTransport.writes` is every command the page sent,
+          // `mockTransport.emitDisconnect()` simulates a dropped link,
+          // `mockTransport.sdCard.bytes(path)` is what a download of that
+          // card file should produce, `mockTransport.eeprom.brandBytes()` is
+          // the brand record as the mock now holds it,
+          // `mockTransport.calib.bytes()` is the calibration dump as it now
+          // stands, `mockTransport.status.setDocked(true)` pushes the
+          // unsolicited status a dock produces, and `sdBrowser` /
+          // `brandEditor` / `calibrationEditor` are the three panels' APIs.
+          window.mockTransport = transport;
+          window.sdBrowser = sd;
+          window.brandEditor = brand;
+          window.calibrationEditor = cal;
+          /* Also the client itself, so a link's feature set can be taken
+             apart from the console: shadowing a method on it is how the
+             "this link cannot do X" paths get exercised without owning the
+             hardware that cannot do X. */
+          const mockClient = new sdk.Shimmer3RClient({
+            debug: false,
+            /* Tapped like every real link, so the raw byte log can be
+               exercised with no hardware on the desk. `window.mockTransport`
+               stays the RAW mock deliberately: its `writes`, `sdCard` and
+               `eeprom` are what a developer (and the test harness) reaches
+               for, and reading them through the tap would prove nothing. */
+            transport: tapTransport(transport),
+          });
+          window.mockClient = mockClient;
+          btn.disabled = true;
+          try {
+            mockClient.onStatus = (m) => log.log(m);
+            mockClient.onDisconnect = (r) => onDisconnected(r);
+            await mockClient.connect();
+            connect.setConnected(true, "mock");
+            await afterConnect({
+              client: mockClient,
+              mode: framed ? "ble" : "rfcomm",
+              transport,
+              label: framed ? "mock (framed)" : "mock (unframed)",
+            });
+            log.log("mock sensor connected");
+          } catch (err) {
+            log.error(`mock connect failed: ${err?.message ?? err}`);
+            connect.setConnected(false);
+          } finally {
+            regate();
+          }
+        });
+      }
+
+      // =====================================================================
+      // Wiring
+      // =====================================================================
+
+      /**
+       * Run a device action from a click and swallow its rejection.
+       *
+       * `withDevice` rethrows so a multi-step run can abort, but a click has
+       * nothing to abort: the failure has already been logged and toasted.
+       * Swallowing it HERE rather than making those functions quiet keeps the
+       * apply plan able to stop — and keeps a refused command out of the
+       * console as an unhandled promise rejection, where it reads like a page
+       * fault rather than like a sensor that said no.
+       */
+      const reported = (fn) => () => {
+        fn().catch(() => {});
+      };
+
+      $("btnBle").addEventListener("click", () => connect.connectVia("ble"));
+      $("btnBt").addEventListener("click", () => connect.connectVia("rfcomm"));
+      $("btnUsb").addEventListener("click", () => connect.connectVia("usb"));
+
+      /**
+       * Put the sensor down properly: abort a transfer, stop a stream, close
+       * the CSV, then drop the link.
+       *
+       * A named function rather than an inline click handler because the
+       * device-naming panel needs exactly this after arming a restart — the
+       * restart only fires when the link goes, and a bare
+       * `client.disconnect()` there would leave a recording unclosed and the
+       * page still believing it was connected.
+       */
+      async function disconnectFromSensor() {
+        sd.abort();
+        if (streaming) await stopStream(sdLogging);
+        if (recorder.active) await stopRecording();
+        if (connect.session) {
+          await connect.disconnect();
+        } else if (client) {
+          // The mock path connects its own client, so the controller has no
+          // session to close.
+          try {
+            await client.disconnect();
+          } catch (err) {
+            log.warn(`disconnect reported an error: ${err?.message ?? err}`);
+          }
+          connect.setConnected(false);
+          log.log("disconnected");
+        }
+        resetAfterDisconnect();
+      }
+
+      /* NOT wrapped in `reported`: an error escaping the teardown is a bug
+         worth seeing, and the page's unhandledrejection handler puts it in
+         the downloadable log. */
+      $("btnDisconnect").addEventListener("click", () => {
+        void disconnectFromSensor();
+      });
+
+      $("btnRefreshDevice").addEventListener(
+        "click",
+        reported(refreshDeviceState),
+      );
+
+      /* The panel still owns the measurement — its result belongs in the card
+         stats and the download ETAs — but the button that starts it belongs
+         with the link it measures. */
+      $("btnLinkTest").addEventListener("click", () => {
+        $("linkSpeedPill").textContent = "measuring…";
+        linkTesting = true;
+        regate();
+        sd.measureLinkSpeed()
+          .catch(() => {})
+          .finally(() => {
+            linkTesting = false;
+            regate();
+          });
+      });
+      $("btnSetClock").addEventListener("click", reported(setDeviceClock));
+
+      $("btnRead").addEventListener("click", reported(readConfiguration));
+      $("btnImRead").addEventListener("click", reported(readConfiguration));
+      $("btnApply").addEventListener("click", reported(applyConfiguration));
+
+      $("btnDiscard").addEventListener("click", () => {
+        form?.revert();
+        if (deviceImage) form?.getImage().set(deviceImage);
+        exgMode = "off";
+        const select = $("exgMode");
+        if (select) select.value = "off";
+        form?.setImage(form.getImage());
+        form?.captureBaseline();
+        afterImageEdit();
+        log.log(
+          "edits discarded — back to the image last read from the sensor",
+        );
+        banner("imBanner", "", "");
+      });
+
+      $("btnImWrite").addEventListener("click", async () => {
+        const changes = describeChanges();
+        const byteCount = changedByteCount();
+        if (
+          !window.confirm(
+            `Write the ${IMAGE_BYTES}-byte configuration image to the sensor?\n\n` +
+              (changes.length
+                ? changes.join("\n")
+                : "  • no field on this page differs from the image last read") +
+              `\n\n${byteCount} of ${IMAGE_BYTES} bytes differ. The whole image ` +
+              `is written, including the bytes no field models, then read back ` +
+              `and compared.`,
+          )
+        ) {
+          log.log("image write cancelled");
+          return;
+        }
+        const written = new Uint8Array(form.getImage());
+        try {
+          await withDevice("write the configuration image", () =>
+            client.writeInfoMemBytes(written),
+          );
+        } catch {
+          return;
+        }
+        const readback = await tryDevice("read the image back", () =>
+          client.readInfoMemBytes(),
+        );
+        if (!readback) {
+          banner(
+            "imBanner",
+            "warn",
+            "The image was written but could not be read back, so the write is unverified.",
+          );
+          return;
+        }
+        adoptDeviceImage(readback);
+        verifyImage(written, readback);
+      });
+
+      $("btnImSave").addEventListener("click", () => {
+        const image = form?.getImage();
+        if (!image) return;
+        downloadBlob(
+          `infomem_${macTail()}_${stampNow()}.bin`,
+          new Blob([image], { type: "application/octet-stream" }),
+        );
+        log.log("configuration image saved");
+      });
+
+      $("btnImLoad").addEventListener("click", () => $("imFile").click());
+      $("imFile").addEventListener("change", async (event) => {
+        const file = event.target.files?.[0];
+        event.target.value = "";
+        if (!file) return;
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (bytes.length !== IMAGE_BYTES) {
+          showToast(
+            `That file is ${bytes.length} bytes; a configuration image is ${IMAGE_BYTES}`,
+            "err",
+          );
+          return;
+        }
+        /* Loaded as an EDIT, not as a new reference: `deviceImage` still holds
+           what the sensor gave us, so the hex view highlights every byte that
+           differs and Apply still knows which live setters to replay. */
+        form.setImage(bytes);
+        afterImageEdit();
+        const n = dirtyCount();
+        log.log(
+          `loaded ${file.name} — ${changedByteCount()} bytes and ${n} field${n === 1 ? "" : "s"} differ from the sensor`,
+        );
+        banner(
+          "imBanner",
+          "info",
+          `Loaded ${file.name}: ${changedByteCount()} of ${IMAGE_BYTES} bytes differ from the sensor's own image. Press Apply to write it, or Discard to go back.`,
+        );
+      });
+
+      /* Nothing here for calibration: `common/calibration-editor.js` owns its
+         own buttons, exactly as the SD and device-naming panels do. */
+
+      $("btnStreamStart").addEventListener(
+        "click",
+        reported(() => startStream(false)),
+      );
+      $("btnStreamStop").addEventListener(
+        "click",
+        reported(() => stopStream(false)),
+      );
+      $("btnSdStart").addEventListener(
+        "click",
+        reported(() => startStream(true)),
+      );
+      $("btnSdStop").addEventListener(
+        "click",
+        reported(() => stopStream(true)),
+      );
+
+      $("selWindow").addEventListener("change", (e) => {
+        const wanted = Number(e.target.value);
+        const applied = plot.setWindow(wanted);
+        if (applied !== wanted) {
+          log.warn(
+            `window capped at ${applied} s — above 512 Hz a longer window is more points than a plot can usefully redraw`,
+          );
+          e.target.value = String(applied);
+        }
+      });
+
+      $("selKind").addEventListener("change", (e) => {
+        plot.setKind(e.target.value);
+        log.log(
+          `plotting ${e.target.value === "raw" ? "raw" : "calibrated"} values`,
+        );
+      });
+
+      $("btnPause").addEventListener("click", () => {
+        plotPaused = !plotPaused;
+        if (plotPaused) plot.pause();
+        else plot.resume();
+        $("btnPause").textContent = plotPaused ? "Resume plot" : "Pause plot";
+      });
+
+      /* NOT wrapped: showSaveFilePicker is gesture-gated, so `startRecording`
+         must be reached straight off the click. It reports its own failures. */
+      $("btnRecStart").addEventListener("click", () => {
+        startRecording().catch(() => {});
+      });
+      $("btnRecStop").addEventListener("click", reported(stopRecording));
+
+      // =====================================================================
+      // Startup
+      // =====================================================================
+
+      /* Anything that still escapes belongs in the log the user can download,
+         not only in a console they will never open. Deliberately NOT
+         `preventDefault()`ed: it stays a console error too, because a
+         rejection nobody handled is a bug worth seeing. */
+      window.addEventListener("unhandledrejection", (event) => {
+        log.error(
+          `unhandled error: ${event.reason?.message ?? event.reason ?? "unknown"}`,
+        );
+      });
+
+      renderHex();
+      clearIdentity();
+      setUpMock();
+      updateTapNote();
+      regate();
+      log.log(
+        "ready — connect over BLE or classic Bluetooth to configure, stream, record, download from the SD card and change the sensor's names, or over USB-C to configure and rename only",
+      );
+    </script>
   </body>
 </html>
