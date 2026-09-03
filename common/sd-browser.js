@@ -207,6 +207,11 @@ export function createSdBrowser(host, opts = {}) {
   let destRoot = null;
   /** Non-null only while a download is running. */
   let abortCtl = null;
+  /**
+   * The Consensys import folder an aborted or partly-failed run left behind,
+   * so the next run continues into it. Cleared by a run that completes.
+   */
+  let pendingStamp = null;
   /** A transfer or a link test is in flight. */
   let busy = false;
   /** The floor the host page sets: is the link able to do this at all? */
@@ -241,52 +246,99 @@ export function createSdBrowser(host, opts = {}) {
     if (node) node.textContent = text;
   };
 
-  const btnRefresh = el("button", { type: "button" }, "Refresh card contents");
+  /* `data-sd-role` on every control the panel owns. Not decoration: it is
+     how a mounting application (or a test) addresses one of these without
+     the panel having to plant ids that would collide if it were mounted
+     twice on one page. */
+  const btnRefresh = el(
+    "button",
+    { type: "button", dataset: { sdRole: "refresh" } },
+    "Refresh card contents",
+  );
   const btnLinkTest = el(
     "button",
     {
       type: "button",
+      dataset: { sdRole: "linkTest" },
       title:
         "Free-runs the firmware's data-rate test, which measures the link " +
         "itself rather than the file-transfer protocol",
     },
     `Measure link speed (${LINK_TEST_MS / 1000} s)`,
   );
-  const treeState = el("span", { class: "muted" });
-  const treeHost = el("div", { class: "sd-tree" });
+  const treeState = el("span", {
+    class: "muted",
+    dataset: { sdRole: "state" },
+  });
+  const treeHost = el("div", { class: "sd-tree", dataset: { sdRole: "tree" } });
 
   const layoutSelect = el(
     "select",
     {
       "aria-label": "Folder layout",
+      dataset: { sdRole: "layout" },
       onchange: (e) => setLayout(e.target.value),
     },
     LAYOUTS.map((l) => el("option", { value: l.id }, l.label)),
   );
-  const pathHint = el("div", { class: "banner info" });
+  const pathHint = el("div", {
+    class: "banner info",
+    dataset: { sdRole: "hint" },
+  });
   const btnPickDest = el(
     "button",
-    { type: "button" },
+    { type: "button", dataset: { sdRole: "pickDest" } },
     "Choose destination folder…",
   );
-  const destLabel = el("span", { class: "muted" }, "No folder selected");
-  const destPreview = el("div", { class: "row muted" });
-  const chkDelete = el("input", { type: "checkbox", checked: true });
+  const destLabel = el(
+    "span",
+    { class: "muted", dataset: { sdRole: "dest" } },
+    "No folder selected",
+  );
+  const destPreview = el("div", {
+    class: "row muted",
+    dataset: { sdRole: "preview" },
+  });
+  const chkDelete = el("input", {
+    type: "checkbox",
+    checked: true,
+    dataset: { sdRole: "delete" },
+  });
 
   const btnDownloadSel = el(
     "button",
-    { type: "button", class: "primary" },
+    {
+      type: "button",
+      class: "primary",
+      dataset: { sdRole: "downloadSelected" },
+    },
     "Download selected",
   );
-  const btnDownloadAll = el("button", { type: "button" }, "Download all");
-  const btnAbort = el("button", { type: "button", class: "danger" }, "Abort");
+  const btnDownloadAll = el(
+    "button",
+    { type: "button", dataset: { sdRole: "downloadAll" } },
+    "Download all",
+  );
+  const btnAbort = el(
+    "button",
+    { type: "button", class: "danger", dataset: { sdRole: "abort" } },
+    "Abort",
+  );
   const progress = el("progress", {
     class: "sd-progress",
+    dataset: { sdRole: "bar" },
     max: "100",
     value: "0",
   });
-  const progLabel = el("div", { class: "row muted" }, "Idle");
-  const fileLabel = el("div", { class: "row muted" });
+  const progLabel = el(
+    "div",
+    { class: "row muted", dataset: { sdRole: "progress" } },
+    "Idle",
+  );
+  const fileLabel = el("div", {
+    class: "row muted",
+    dataset: { sdRole: "file" },
+  });
 
   host.replaceChildren(
     el(
@@ -517,7 +569,9 @@ export function createSdBrowser(host, opts = {}) {
       destPreview.textContent = "";
       return;
     }
-    const stamp = sdk.formatSdImportStamp();
+    // The folder a download would go into RIGHT NOW, which after an aborted
+    // run is the one it left unfinished rather than a fresh one.
+    const stamp = pendingStamp ?? sdk.formatSdImportStamp();
     destPreview.textContent =
       layout === "consensysBackup"
         ? `Files will be written to ${destRoot.name}/${stamp}/<ShimmerName>/${rootPath}/…`
@@ -651,11 +705,20 @@ export function createSdBrowser(host, opts = {}) {
       return;
     }
 
-    // One import folder for the whole run, so selecting several sessions
-    // still produces a single Consensys import rather than one per session.
-    const importStamp = sdk.formatSdImportStamp();
+    /* One import folder for the whole run, so selecting several sessions
+       still produces a single Consensys import rather than one per session.
+       An unfinished run keeps its folder for the NEXT run: the stamp is what
+       decides the destination path, so minting a fresh one after an abort
+       would file the rest of the transfer in a second folder beside the
+       first — resuming nothing and leaving two half-imports for Consensys to
+       find. `pendingStamp` is cleared only by a run that completes. */
+    const importStamp = pendingStamp ?? sdk.formatSdImportStamp();
     if (layout === "consensysBackup") {
-      log.log(`writing Consensys import folder ${importStamp}/`);
+      log.log(
+        pendingStamp
+          ? `resuming into the Consensys import folder ${importStamp}/ that the last run left unfinished`
+          : `writing Consensys import folder ${importStamp}/`,
+      );
     }
 
     abortCtl = new AbortController();
@@ -671,6 +734,10 @@ export function createSdBrowser(host, opts = {}) {
     let skipped = 0;
     let failed = 0;
     let bytes = 0;
+    /* Assume the worst until the run says otherwise, so every path out of the
+       try — including one added later — keeps the import folder for a
+       re-run rather than orphaning it. */
+    let unfinished = true;
 
     try {
       for (const root of rootPaths) {
@@ -683,6 +750,12 @@ export function createSdBrowser(host, opts = {}) {
           importStamp,
           signal: abortCtl.signal,
           onProgress: (p) => {
+            /* The enumerate event fires before anything is known — every
+               count in it is zero — and it stands until the first read
+               window completes, which on a slow link is a whole second.
+               "enumerate: 0/0 files, 0 B / 0 B" is a worse thing to leave on
+               screen for that second than the sentence already there. */
+            if (p.phase === "enumerate") return;
             if (p.bytesTotal > 0) {
               progress.max = p.bytesTotal;
               progress.value = p.bytesDone;
@@ -724,9 +797,12 @@ export function createSdBrowser(host, opts = {}) {
       );
       progLabel.textContent = "Done";
       fileLabel.textContent = "";
+      // Nothing left over, so the next run starts its own import folder.
+      unfinished = failed > 0;
     } catch (err) {
       /* An abort is not a failure: the firmware is stateless per read window,
-         so the next run resumes from the size already on disk. */
+         so the next run resumes from the size already on disk — into this
+         same import folder, which is what `pendingStamp` preserves. */
       if (err?.name === "AbortError") {
         log.log("download aborted — re-run to resume from where it stopped.");
         progLabel.textContent = "Aborted (resumable)";
@@ -735,8 +811,10 @@ export function createSdBrowser(host, opts = {}) {
         progLabel.textContent = `Failed: ${err?.message ?? err}`;
       }
     } finally {
+      pendingStamp = unfinished ? importStamp : null;
       abortCtl = null;
       setBusy(false);
+      refreshDestPreview();
       syncControls();
     }
 
