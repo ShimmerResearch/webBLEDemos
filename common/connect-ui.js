@@ -278,7 +278,18 @@ export function createConnectController(cfg) {
       typeof client.onStatus === "function" ? client.onStatus : null;
 
     let hasHook = false;
-    if (typeof client.onDisconnect === "function") {
+    /* Two shapes to tell apart, and `typeof === "function"` does not tell them
+       apart: a callback slot that someone has already filled looks exactly
+       like a subscribe method. Own-property is the honest test -- the SDK
+       clients declare `onDisconnect` as an instance field (null until set),
+       while a subscribe API would live on the prototype. Getting it backwards
+       calls the existing handler with a callback as its `reason` and wires
+       nothing, so a dropped link would go unnoticed. */
+    const ownCallbackSlot = Object.prototype.hasOwnProperty.call(
+      client,
+      "onDisconnect",
+    );
+    if (!ownCallbackSlot && typeof client.onDisconnect === "function") {
       // Subscribe-method shape: onDisconnect(cb) -> unsubscribe.
       try {
         const off = client.onDisconnect((reason) => handleDropped(reason));
@@ -288,10 +299,23 @@ export function createConnectController(cfg) {
         hasHook = false;
       }
     } else if ("onDisconnect" in client) {
-      // Callback-property shape, like onStatus.
-      client.onDisconnect = (reason) => handleDropped(reason);
+      /* Callback-property shape, like onStatus. Anything already in the slot
+         is kept and called first: it belongs to whoever built the client, and
+         swallowing it would be a silent regression for them. */
+      const existing =
+        typeof client.onDisconnect === "function" ? client.onDisconnect : null;
+      client.onDisconnect = (reason) => {
+        if (existing) {
+          try {
+            existing.call(client, reason);
+          } catch {
+            /* their handler, their problem -- but not at the cost of ours */
+          }
+        }
+        handleDropped(reason);
+      };
       detachDisconnect = () => {
-        client.onDisconnect = null;
+        client.onDisconnect = existing;
       };
       hasHook = true;
     }
