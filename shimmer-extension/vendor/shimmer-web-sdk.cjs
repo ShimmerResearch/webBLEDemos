@@ -4320,8 +4320,14 @@ function classifyFactoryTestAckPacket(buf) {
     const total = wiredPacketLength(buf);
     if (total === NEED_MORE$2)
         return { kind: 'need-more' };
+    /* A header byte followed by something that is not a command byte: line
+       noise, or the tail of a packet that was corrupted mid-flight. Drop one
+       byte and look again, which is what RESYNC means everywhere else in this
+       file — and the same treatment the CRC-bad packet below gets. Calling it
+       text instead would end the search for the ACK and fold whatever follows,
+       the real ACK packet included, into the report. */
     if (total === RESYNC$2)
-        return { kind: 'text' };
+        return { kind: 'ignore', consumed: 1 };
     if (buf.length < total)
         return { kind: 'need-more' };
     let packet;
@@ -4535,8 +4541,19 @@ class FactoryTestCapture {
     /**
      * Abandon the capture immediately with `err`, with NO drain — for a link that
      * has gone away, where there is nothing left to swallow.
+     *
+     * Forces the link free even from `draining`. Draining exists only to keep a
+     * still-arriving report away from the framer; on a closed transport nothing
+     * more can arrive, so waiting out the drain timers would hold a caller in
+     * "busy" for up to the whole timeout budget after the sensor stopped being
+     * reachable — a minute or more for the LED-state suite. The result promise
+     * has already rejected by then, so `err` is only used when it has not.
      */
     fail(err) {
+        if (this._settled) {
+            this._goIdle();
+            return;
+        }
         this._failNow(err);
     }
     // -------------------------------------------------------------------------
@@ -11510,6 +11527,20 @@ class Shimmer3RClient extends BaseShimmerClient {
             throw new FactoryTestError('nack', 'The sensor is streaming, and the firmware refuses a factory self-test while it is. ' +
                 'Stop the stream first.');
         }
+        /*
+         * Nothing else may be mid-conversation. Once the capture is armed it owns
+         * every inbound byte, so another command's response would be swallowed as
+         * report text and its waiter would sit there until it timed out — and the
+         * buffer flush below would take that command's partial response with it.
+         * Both signals are needed: `_expectingAck` covers a command whose ACK has
+         * not landed, and `_temps` covers one that has been acknowledged and is
+         * still waiting for its payload (or an SD transfer, whose handler stays
+         * attached for the whole transfer).
+         */
+        if (this._expectingAck > 0 || this._temps.size > 0) {
+            throw new FactoryTestError('busy', 'Another command is still waiting for its response. A factory test takes over the whole ' +
+                'link, so it cannot start until that one has finished.');
+        }
         if (opts.signal?.aborted) {
             throw new DOMException('Factory test aborted', 'AbortError');
         }
@@ -15186,9 +15217,39 @@ class WiredShimmerClient extends BaseShimmerClient {
             throw new FactoryTestError('busy', 'A factory test is already running, or its report is still draining — ' +
                 'await whenFactoryTestIdle() first.');
         }
-        return this._serialize(() => this._runFactoryTestImpl(info, opts));
+        /*
+         * The queue is held until the capture is IDLE, not until the caller has
+         * its answer. Those are different moments: an aborted or timed-out run
+         * rejects at once while the sensor goes on printing, and a command that
+         * started in that window would have its response swallowed as report text
+         * and then hang until its own timeout. Holding the queue through the drain
+         * says the true thing — the link is not free yet — and makes the next
+         * command wait rather than fail.
+         *
+         * So the caller is handed the capture's own promise, while the serialized
+         * unit runs on to the drain's end.
+         */
+        let settle;
+        let fail;
+        const started = new Promise((resolve, reject) => {
+            settle = resolve;
+            fail = reject;
+        });
+        const queued = this._serialize(async () => {
+            try {
+                await this._runFactoryTestImpl(info, opts, settle);
+            }
+            catch (err) {
+                fail(err);
+                throw err;
+            }
+        });
+        // The queue's own promise is bookkeeping; the caller never sees it, and a
+        // rejection it carried would otherwise surface as unhandled.
+        void queued.catch(() => { });
+        return started.then((result) => result);
     }
-    async _runFactoryTestImpl(info, opts) {
+    async _runFactoryTestImpl(info, opts, settle) {
         const transport = this._transport;
         if (!transport)
             throw new Error('Not connected');
@@ -15222,7 +15283,12 @@ class WiredShimmerClient extends BaseShimmerClient {
         catch (err) {
             capture.fail(new FactoryTestError('disconnected', `Could not send the factory-test command: ${err.message}`));
         }
-        return capture.result;
+        /* The caller's answer is the capture's own promise, so a cancelled run
+           rejects for them at once… */
+        settle(capture.result);
+        /* …while this serialized unit — and with it the command queue — runs on
+           until the sensor has really stopped printing. */
+        await capture.idle;
     }
     /**
      * Let go of the link at the end of a run: clear the capture, then drop
