@@ -1022,6 +1022,50 @@ details.group > summary::-webkit-details-marker {
 }
 
 /* =========================================================================
+   Device naming — the per-field preview and error under each name box
+   (common/brand-editor.js). Both live inside a .field, so they inherit its
+   column and only need their own type and colour.
+   ========================================================================= */
+
+.brand-preview {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  /* A preview is a name plus a MAC suffix plus, on an unidentified sensor,
+     both platforms' forms — so it wraps rather than widening the column. */
+  overflow-wrap: anywhere;
+}
+
+.brand-error {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+/* Neither takes any space when there is nothing to say, so a field with a
+   valid name is exactly as tall as one with no preview at all. */
+.brand-preview:empty,
+.brand-error:empty {
+  display: none;
+}
+
+/* The box a name cannot be written from. Also on :focus-visible, or the
+   focus ring's border colour hides the very field it is reporting. */
+.field input.bad,
+.field input.bad:focus-visible {
+  border-color: var(--danger);
+}
+
+.brand-steps {
+  margin: 6px 0 0 18px;
+  padding: 0;
+}
+
+.brand-steps li {
+  margin: 2px 0;
+}
+
+/* =========================================================================
    Narrow screens: one column everywhere.
    ========================================================================= */
 

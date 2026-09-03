@@ -24,11 +24,16 @@
  */
 
 import {
+  BRAND_PLATFORM,
+  BRAND_RECORD_HOST_OFFSET,
+  BRAND_RECORD_SIZE,
   LoopbackTransport,
   SD_ATTR_DIR,
   SD_STATUS,
   SD_TRANSFER_OPCODES,
   SD_XFER,
+  buildBrandRecord,
+  parseBrandRecord,
   sdCrc16,
 } from "../../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
 
@@ -59,6 +64,9 @@ const CMD = Object.freeze({
   SET_GYRO_RANGE: 0x49,
   SET_ALT_ACCEL_RANGE: 0x4f,
   SET_INTERNAL_EXP_POWER_ENABLE: 0x5e,
+  SET_DAUGHTER_CARD_MEM: 0x67,
+  DAUGHTER_CARD_MEM_RESPONSE: 0x68,
+  GET_DAUGHTER_CARD_MEM: 0x69,
   START_SDBT: 0x70,
   STATUS_RESPONSE: 0x71,
   GET_STATUS: 0x72,
@@ -74,6 +82,13 @@ const CMD = Object.freeze({
   VBATT_RESPONSE: 0x94,
   GET_VBATT: 0x95,
   STOP_SDBT: 0x97,
+  SET_FEATURE: 0xb7,
+});
+
+/** Feature ids for SET_FEATURE, mirroring the SDK's `BT_FEATURE`. */
+const FEATURE = Object.freeze({
+  RN4678_ERROR_LEDS: 1,
+  REBOOT_ON_DISCONNECT: 2,
 });
 
 /** SET_* commands that are accepted, remembered and otherwise inert. */
@@ -168,6 +183,18 @@ const IM = Object.freeze({
  * what real flash does.
  */
 const INFOMEM_STORE_BYTES = 512;
+
+/**
+ * Backing store for GET/SET_DAUGHTER_CARD_MEM: the expansion-board EEPROM as
+ * the HOST sees it. Firmware maps host offset 0 past the first (hardware
+ * details) EEPROM page, so host offsets 0..2031 are absolute bytes 16..2047 —
+ * which is why this is 2032 and not 2048, and why an offset past the end is
+ * refused rather than wrapped.
+ */
+const EEPROM_HOST_BYTES = 2032;
+
+/** Firmware's ceiling on one daughter-card read or write. */
+const EEPROM_MAX_PER_CALL = 128;
 
 /** How long the mock waits before answering, in ms. */
 const REPLY_DELAY_MS = 0;
@@ -277,6 +304,33 @@ function syntheticByte(seed, at) {
 }
 
 /**
+ * The factory brand record for a platform, as firmware seeds it at first
+ * boot: the names in BRAND_DEFAULT_* in log-and-stream-common
+ * `EEPROM/shimmer_eeprom.h`.
+ *
+ * Serialised by the SDK's own `buildBrandRecord` rather than by a byte table
+ * here, so the mock cannot drift from the parser it is feeding — the magic,
+ * the layout version, the length bytes and the CRC all come from one place,
+ * and a change to the record layout breaks both sides at once instead of
+ * leaving them agreeing with each other and with nothing else.
+ *
+ * @param {number|null} hardwareVersion
+ * @returns {Uint8Array} BRAND_RECORD_SIZE bytes
+ */
+function buildStockBrandRecord(hardwareVersion) {
+  const isShimmer3 = hardwareVersion === 3;
+  return buildBrandRecord({
+    btClassic: isShimmer3 ? "Shimmer3" : "Shimmer3R",
+    ble: isShimmer3 ? "S3BLE" : "Shimmer3R",
+    usbProduct: "Shimmer",
+    usbManufacturer: "Shimmer Research Ltd.",
+    seededPlatform: isShimmer3
+      ? BRAND_PLATFORM.SHIMMER3
+      : BRAND_PLATFORM.SHIMMER3R,
+  });
+}
+
+/**
  * True when the page URL asks for the mock (`?mock=1`).
  *
  * Deliberately opt-in and query-string-only: a demo page that reached for the
@@ -309,6 +363,10 @@ export function mockEnabledFromUrl() {
  * @param {{major: number, minor: number, patch: number}} [opts.firmware]
  *   version reported by GET_FW_VERSION. Defaults to v1.01.012, which is above
  *   the SD-transfer gate; pass v1.01.010 to exercise a page's refusal path.
+ * @param {number|null} [opts.hardwareVersion=10] what GET_DEVICE_VERSION
+ *   reports. Pass `null` to NACK it instead, which is how a page's
+ *   "hardware not positively identified" path gets exercised — the one a
+ *   defaulted hardware version silently defeats.
  * @param {number} [opts.sdKBps=120] throughput of streamed SD file blocks
  * @param {number} [opts.linkKBps=180] throughput reported by the firmware
  *   data-rate test (SET_DATA_RATE_TEST)
@@ -317,7 +375,8 @@ export function mockEnabledFromUrl() {
  *   `transport.emitDisconnect()` simulates a dropped link;
  *   `transport.writes` is every command the page sent; `transport.sdCard`
  *   is the synthetic card, with a `bytes(path)` that returns exactly what a
- *   download of that file should produce.
+ *   download of that file should produce; and `transport.eeprom` is the
+ *   expansion-board EEPROM, with the brand record and the restart bookkeeping.
  */
 export function createMockShimmer3RTransport(opts = {}) {
   const framed = opts.framed !== false;
@@ -325,6 +384,8 @@ export function createMockShimmer3RTransport(opts = {}) {
   const debug = !!opts.debug;
   const mac = (opts.mac ?? "000666668091").replace(/[^0-9a-fA-F]/g, "");
   const fw = { major: 1, minor: 1, patch: 12, ...(opts.firmware ?? {}) };
+  const hardwareVersion =
+    opts.hardwareVersion === undefined ? 10 : opts.hardwareVersion;
   const sdKBps = Math.max(1, opts.sdKBps ?? SD_DEFAULT_KBPS);
   const linkKBps = Math.max(1, opts.linkKBps ?? LINK_DEFAULT_KBPS);
 
@@ -341,10 +402,23 @@ export function createMockShimmer3RTransport(opts = {}) {
     configSetupBytes: new Uint8Array(7),
     /** 64-bit RTC ticks, LSB first on the wire. */
     rwcTicks: 0n,
+    /** A soft restart has been armed for the next disconnect. */
+    rebootArmed: false,
+    /** How many times the armed restart has actually fired. */
+    reboots: 0,
   };
 
   const infoMem = new Uint8Array(INFOMEM_STORE_BYTES);
   seedInfoMem();
+
+  /* An erased EEPROM with one record written into it, which is what a
+     provisioned board actually holds — everything the firmware has not
+     claimed reads 0xFF. Leaving bytes 0..15 erased also keeps
+     `parseExpansionBoard` returning null, i.e. "no expansion board", which is
+     the truth about a bare Shimmer3R. */
+  const eeprom = new Uint8Array(EEPROM_HOST_BYTES).fill(0xff);
+  const stockBrand = buildStockBrandRecord(hardwareVersion);
+  eeprom.set(stockBrand, BRAND_RECORD_HOST_OFFSET);
 
   const transport = new LoopbackTransport({
     capabilities: { framed },
@@ -413,6 +487,76 @@ export function createMockShimmer3RTransport(opts = {}) {
   function pageOffset(addr) {
     return addr >= 0x1800 ? addr - 0x1800 : addr;
   }
+
+  // -------------------------------------------------------------------------
+  // Expansion-board EEPROM and the soft restart
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fire an armed soft restart, if one is armed.
+   *
+   * Firmware skips the restart while sensing, so an armed request can never
+   * truncate an active SD recording, and clears the request either way — it
+   * is strictly one-shot and never carries into a later disconnect.
+   *
+   * The restart is where an erased brand record becomes the factory one
+   * again: firmware validates the record at boot and re-seeds the platform
+   * defaults when it does not check out. Modelling that here is what makes a
+   * page's "restore factory names" path provable end to end, rather than only
+   * up to the erase.
+   */
+  function applyPendingReboot() {
+    if (!state.rebootArmed) return;
+    state.rebootArmed = false;
+    if (state.streaming) {
+      if (debug) console.warn("[mock] restart skipped: still sensing");
+      return;
+    }
+    state.reboots++;
+    const record = eeprom.subarray(
+      BRAND_RECORD_HOST_OFFSET,
+      BRAND_RECORD_HOST_OFFSET + BRAND_RECORD_SIZE,
+    );
+    /* Judged by the SDK's own parser, for the same anti-drift reason the
+       record is built with the SDK's builder: the firmware and this mock then
+       agree on what "does not check out" means. */
+    if (!parseBrandRecord(record).valid) {
+      eeprom.set(stockBrand, BRAND_RECORD_HOST_OFFSET);
+      if (debug) console.log("[mock] brand record re-seeded at boot");
+    }
+  }
+
+  /**
+   * The EEPROM, exposed for development and for tests: `brandBytes()` is what
+   * a page's write actually left behind, `stockBrandBytes()` is what the
+   * factory record should look like, and `reboots` counts the armed restarts
+   * that fired.
+   */
+  transport.eeprom = {
+    read: (offset, length) => eeprom.slice(offset, offset + length),
+    brandBytes: () =>
+      eeprom.slice(
+        BRAND_RECORD_HOST_OFFSET,
+        BRAND_RECORD_HOST_OFFSET + BRAND_RECORD_SIZE,
+      ),
+    stockBrandBytes: () => stockBrand.slice(),
+    get rebootArmed() {
+      return state.rebootArmed;
+    },
+    get reboots() {
+      return state.reboots;
+    },
+  };
+
+  /* A normal disconnect does NOT fire LoopbackTransport's onDisconnect
+     callbacks — only `emitDisconnect` does — so the restart is hooked on both
+     paths. `applyPendingReboot` is one-shot, so being reached twice is
+     harmless. */
+  const transportDisconnect = transport.disconnect.bind(transport);
+  transport.disconnect = async () => {
+    applyPendingReboot();
+    await transportDisconnect();
+  };
 
   // -------------------------------------------------------------------------
   // Reply plumbing
@@ -982,6 +1126,10 @@ export function createMockShimmer3RTransport(opts = {}) {
   // Stop the timers when the link goes away, or a "disconnected" mock keeps
   // pushing frames at a client that is no longer listening.
   transport.onDisconnect(() => {
+    /* Before `state.streaming` is cleared below: firmware skips an armed
+       restart while sensing, and a restart that read the flag afterwards
+       would always think the sensor was idle. */
+    applyPendingReboot();
     stopStreaming();
     stopRateTest();
     if (sdRead) {
@@ -1033,8 +1181,14 @@ export function createMockShimmer3RTransport(opts = {}) {
         return;
 
       case CMD.GET_DEVICE_VERSION:
-        // 10 = Shimmer3R
-        reply([ACK, CMD.DEVICE_VERSION_RESPONSE, 10]);
+        /* 10 = Shimmer3R. A null `hardwareVersion` NACKs instead, which is
+           what a page sees from a sensor it cannot identify — and the state
+           every "assume a Shimmer3R" default quietly papers over. */
+        if (hardwareVersion == null) {
+          reply([NACK]);
+          return;
+        }
+        reply([ACK, CMD.DEVICE_VERSION_RESPONSE, hardwareVersion & 0xff]);
         return;
 
       case CMD.GET_STATUS:
@@ -1099,6 +1253,61 @@ export function createMockShimmer3RTransport(opts = {}) {
             (infoMem[IM.sensors2] << 16);
         }
         reply([ACK]);
+        return;
+      }
+
+      case CMD.GET_DAUGHTER_CARD_MEM: {
+        // [0x69][len][offsetLo][offsetHi] → [0x68][len][data…]
+        const len = cmd[1] ?? 0;
+        const off = (cmd[2] ?? 0) | ((cmd[3] ?? 0) << 8);
+        if (len < 1 || len > EEPROM_MAX_PER_CALL || off + len > eeprom.length) {
+          reply([NACK]);
+          return;
+        }
+        const out = new Uint8Array(2 + len);
+        out[0] = CMD.DAUGHTER_CARD_MEM_RESPONSE;
+        out[1] = len;
+        out.set(eeprom.subarray(off, off + len), 2);
+        reply(concat([ACK], out));
+        return;
+      }
+
+      case CMD.SET_DAUGHTER_CARD_MEM: {
+        // [0x67][len][offsetLo][offsetHi][data…]
+        const len = cmd[1] ?? 0;
+        const off = (cmd[2] ?? 0) | ((cmd[3] ?? 0) << 8);
+        /* The 128-byte ceiling is the firmware's, not an arbitrary limit: the
+           command has to fit one receive buffer. A page that asked for more
+           gets the NACK a real sensor would send, rather than a mock that
+           silently accepts a write no device would. */
+        if (
+          len < 1 ||
+          len > EEPROM_MAX_PER_CALL ||
+          off + len > eeprom.length ||
+          cmd.length < 4 + len
+        ) {
+          reply([NACK]);
+          return;
+        }
+        eeprom.set(cmd.subarray(4, 4 + len), off);
+        reply([ACK]);
+        return;
+      }
+
+      case CMD.SET_FEATURE: {
+        // [0xB7][featureId][value]
+        if (cmd[1] === FEATURE.REBOOT_ON_DISCONNECT) {
+          state.rebootArmed = !!cmd[2];
+          reply([ACK]);
+          return;
+        }
+        /* Every other feature id is NACKed, which is also how firmware built
+           before a feature existed answers — the path a page's fallback to
+           "power-cycle it by hand" depends on. */
+        if (debug) {
+          console.warn(`[mock] unknown SET_FEATURE id ${cmd[1]}`);
+        }
+        reply([NACK]);
         return;
       }
 

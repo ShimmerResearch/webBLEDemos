@@ -62,7 +62,7 @@
  *   stream: boolean, sdbt: boolean, infomem: boolean, sdlog: boolean,
  *   calib: boolean, rtc: boolean, ranges: boolean, exg: boolean,
  *   sensors: boolean, battery: boolean, status: boolean,
- *   sdTransfer: boolean,
+ *   sdTransfer: boolean, branding: boolean,
  * }}
  */
 export function describeShimmer3Caps(client, mode) {
@@ -98,6 +98,15 @@ export function describeShimmer3Caps(client, mode) {
        carry these methods either, but naming the link keeps the reason
        visible rather than making it an accident of feature detection. */
     sdTransfer: has("sdListDir") && has("sdReadFileWindow") && mode !== "usb",
+    /* The expansion-board EEPROM, which is where the brand record lives — the
+       names a sensor advertises over classic Bluetooth and BLE, and presents
+       over USB. Deliberately NOT link-gated, unlike `sdTransfer` and
+       `stream`: every client carries these two calls and every link reaches
+       the same EEPROM, because the dock protocol has a daughter-card memory
+       property of its own (`UART_PROP.DAUGHTER_CARD.CARD_MEM`) that takes the
+       same host offsets. A docked sensor is in fact the easiest one to
+       rebrand — no pairing needed. */
+    branding: has("readDaughterCardMem") && has("writeDaughterCardMem"),
   };
 }
 
