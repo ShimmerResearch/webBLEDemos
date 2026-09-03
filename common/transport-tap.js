@@ -114,7 +114,11 @@ export function createTransportTap(transport, opts = {}) {
      line reports when the window closes. */
   let windowStart = 0;
   let printed = 0;
-  let cappedInWindow = 0;
+  /* Per direction, because the budget below is shared but the summary must
+     not be: a run of chunked writes exhausts the same allowance a burst of
+     notifications does, and reporting either as RX sends the reader looking
+     down the wrong half of the link. */
+  const cappedInWindow = { TX: 0, RX: 0 };
   let dataInWindow = 0;
   /** Totals since the tap was created, for `stats()`. */
   const totals = { printed: 0, capped: 0, data: 0 };
@@ -146,12 +150,15 @@ export function createTransportTap(transport, opts = {}) {
       );
       dataInWindow = 0;
     }
-    if (cappedInWindow) {
+    for (const dir of ["TX", "RX"]) {
+      const n = cappedInWindow[dir];
+      if (!n) continue;
       emit(
-        `RX — raw byte logging capped: ${cappedInWindow} more chunk` +
-          `${cappedInWindow === 1 ? "" : "s"} in the last second are not shown`,
+        `${dir} — raw byte logging capped: ${n} more chunk` +
+          `${n === 1 ? " in" : "s in"} the last second ` +
+          `${n === 1 ? "is" : "are"} not shown`,
       );
-      cappedInWindow = 0;
+      cappedInWindow[dir] = 0;
     }
     printed = 0;
   }
@@ -189,7 +196,7 @@ export function createTransportTap(transport, opts = {}) {
     }
 
     if (printed >= maxLines) {
-      cappedInWindow++;
+      cappedInWindow[dir]++;
       totals.capped++;
       return;
     }
