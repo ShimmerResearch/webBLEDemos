@@ -342,6 +342,14 @@ kbd {
   color: var(--danger);
 }
 
+/* Not a fault — something the reader has to know. "Never calibrated" and
+   "edited, not written" are both this, and neither is an error. */
+.pill.warn {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+
 .banner {
   border: 1px solid var(--line);
   border-left: 3px solid var(--line-strong);
@@ -1076,6 +1084,118 @@ details.group > summary::-webkit-details-marker {
 
 .brand-steps li {
   margin: 2px 0;
+}
+
+/* =========================================================================
+   Calibration editor (common/calibration-editor.js)
+
+   One card per sensor, each holding three labelled number grids: offset
+   (3x1), sensitivity (3x1) and alignment (3x3). The three sit side by side
+   and wrap as a unit, so a narrow window stacks whole grids rather than
+   breaking a matrix across a line — a 3x3 with a row hanging under it is
+   unreadable as a matrix.
+   ========================================================================= */
+
+.cal-grids {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+.cal-block {
+  min-width: 0;
+}
+
+.cal-block-title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+
+.cal-unit {
+  font-weight: 400;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.cal-matrix {
+  display: grid;
+  gap: 4px;
+  align-items: center;
+}
+
+/* Leading column is the axis label; the rest are boxes. */
+.cal-matrix.cols-1 {
+  grid-template-columns: 14px 104px;
+}
+
+.cal-matrix.cols-3 {
+  grid-template-columns: 14px repeat(3, 74px);
+}
+
+.cal-axis {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--faint);
+  text-align: right;
+}
+
+/* Numbers, so they line up column-wise and a sign never shifts the digits. */
+input.cal-cell {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: right;
+  padding: 4px 6px;
+  width: 100%;
+}
+
+input.cal-cell:read-only {
+  background: var(--surface-inset);
+  color: var(--muted);
+}
+
+input.cal-cell.bad,
+input.cal-cell.bad:focus-visible {
+  border-color: var(--danger);
+}
+
+.cal-error {
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--danger);
+}
+
+.cal-chip {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.cal-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* Eats the slack in the row, so Restore defaults sits at the far end. */
+.cal-push {
+  flex: 1 1 auto;
+}
+
+/* A sensor whose stored calibration is not what the boxes now say. Matches
+   the dirty-field treatment on the configuration form, deliberately: it is
+   the same statement — "this differs from the device". */
+.card[data-cal-dirty="true"] {
+  border-color: var(--warn-border);
 }
 
 /* =========================================================================
