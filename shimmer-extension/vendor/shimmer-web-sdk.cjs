@@ -7,7 +7,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.1.23';
+const SDK_VERSION = '0.1.24';
 
 /**
  * Container for a single decoded sensor frame.
@@ -1650,129 +1650,9 @@ const SHIMMER3_GSR_RESISTANCE_MIN_MAX_KOHMS = [
     [680.0, 4700.0],
 ];
 
-/**
- * Sensor enable bitmasks for Shimmer3 / Shimmer3R.
- *
- * Values are 24-bit integers sent as the payload of SET_SENSORS_CMD.
- * Multiple sensors are ORed together.
- *
- * @example
- * ```ts
- * const mask = SensorBitmapShimmer3.SENSOR_GYRO | SensorBitmapShimmer3.SENSOR_A_ACCEL;
- * await client.setSensors(mask);
- * ```
- */
-const SensorBitmapShimmer3 = Object.freeze({
-    SENSOR_A_ACCEL: 0x000080,
-    SENSOR_GYRO: 0x000040,
-    SENSOR_MAG: 0x000020,
-    SENSOR_GSR: 0x000004,
-    SENSOR_VBATT: 0x002000,
-    SENSOR_D_ACCEL: 0x001000,
-    SENSOR_PRESSURE: 0x040000,
-    SENSOR_EXG1_24BIT: 0x000010,
-    SENSOR_EXG2_24BIT: 0x000008,
-    SENSOR_EXG1_16BIT: 0x100000,
-    SENSOR_EXG2_16BIT: 0x080000,
-    SENSOR_BRIDGE_AMP: 0x008000,
-    SENSOR_ACCEL_ALT: 0x400000,
-    SENSOR_MAG_ALT: 0x200000,
-    SENSOR_EXT_A0: 0x000002,
-    SENSOR_EXT_A1: 0x000001,
-    SENSOR_EXT_A2: 0x000800,
-    SENSOR_INT_A3: 0x000400,
-    SENSOR_INT_A0: 0x000200,
-    SENSOR_INT_A1: 0x000100,
-    SENSOR_INT_A2: 0x800000,
-});
-/**
- * Map a channel/signal ID from an inquiry response onto the
- * {@link SensorBitmapShimmer3} bit that enables it, or 0 when the ID has no
- * enable bit of its own.
- *
- * ORing these over a channel list reconstructs the enabled-sensor mask the
- * device is actually running, which is what `SET_SENSORS_CMD` would have to
- * send to reproduce it. Ported from
- * `ShimmerObject#interpretDataPacketFormat`, whose Shimmer3 and Shimmer3R
- * branches map the two generations' names for the shared ADC IDs onto the same
- * bits (`ShimmerObject.java:4081-4126`) — e.g. 0x0D is `ExtAdc7` on a Shimmer3
- * and `ExtAdc9` on a Shimmer3R, and both set `SENSOR_EXT_A0`. So this mapping
- * needs no generation of its own, unlike the channel *format* table.
- */
-function channelIdToSensorBit(id) {
-    switch (id) {
-        case 0x00:
-        case 0x01:
-        case 0x02:
-            return SensorBitmapShimmer3.SENSOR_A_ACCEL;
-        case 0x03:
-            return SensorBitmapShimmer3.SENSOR_VBATT;
-        case 0x04:
-        case 0x05:
-        case 0x06:
-            return SensorBitmapShimmer3.SENSOR_D_ACCEL;
-        case 0x07:
-        case 0x08:
-        case 0x09:
-            return SensorBitmapShimmer3.SENSOR_MAG;
-        case 0x0a:
-        case 0x0b:
-        case 0x0c:
-            return SensorBitmapShimmer3.SENSOR_GYRO;
-        case 0x0d:
-            return SensorBitmapShimmer3.SENSOR_EXT_A0;
-        case 0x0e:
-            return SensorBitmapShimmer3.SENSOR_EXT_A1;
-        case 0x0f:
-            return SensorBitmapShimmer3.SENSOR_EXT_A2;
-        case 0x10:
-            return SensorBitmapShimmer3.SENSOR_INT_A3;
-        case 0x11:
-            return SensorBitmapShimmer3.SENSOR_INT_A0;
-        case 0x12:
-            return SensorBitmapShimmer3.SENSOR_INT_A1;
-        case 0x13:
-            return SensorBitmapShimmer3.SENSOR_INT_A2;
-        case 0x14:
-        case 0x15:
-        case 0x16:
-            return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
-        case 0x17:
-        case 0x18:
-        case 0x19:
-            return SensorBitmapShimmer3.SENSOR_MAG_ALT;
-        // Pressure and temperature are enabled together by one bit — the firmware
-        // packs the pair or neither (`chEnPressureAndTemperature`).
-        case 0x1a:
-        case 0x1b:
-            return SensorBitmapShimmer3.SENSOR_PRESSURE;
-        case 0x1c:
-            return SensorBitmapShimmer3.SENSOR_GSR;
-        case 0x1e:
-        case 0x1f:
-            return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
-        case 0x21:
-        case 0x22:
-            return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
-        case 0x23:
-        case 0x24:
-            return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
-        case 0x25:
-        case 0x26:
-            return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
-        case 0x27:
-        case 0x28:
-            return SensorBitmapShimmer3.SENSOR_BRIDGE_AMP;
-        // 0x1D / 0x20 are the ExG status bytes: they ride along with whichever ExG
-        // block is enabled and have no bit of their own.
-        default:
-            return 0;
-    }
-}
-
 /** `ShimmerVerDetails.HW_ID` values that map onto a {@link ShimmerGeneration}. */
 const HW_ID_SHIMMER_3 = 3;
-const HW_ID_SHIMMER_3R = 10;
+const HW_ID_SHIMMER_3R$1 = 10;
 /**
  * Map a DEVICE_VERSION_RESPONSE hardware id onto a generation, or `null` when
  * the id is unknown/absent (the caller then has to pick a default and say so —
@@ -1781,7 +1661,7 @@ const HW_ID_SHIMMER_3R = 10;
 function generationFromHardwareVersion(hardwareVersion) {
     if (hardwareVersion === HW_ID_SHIMMER_3)
         return 'shimmer3';
-    if (hardwareVersion === HW_ID_SHIMMER_3R)
+    if (hardwareVersion === HW_ID_SHIMMER_3R$1)
         return 'shimmer3r';
     return null;
 }
@@ -1960,16 +1840,47 @@ function resolveChannelFormat(id, generation) {
     return RESOLVED[generation][id];
 }
 /**
- * True when this channel ID means a different signal, or occupies a different
- * number of bytes, depending on the hardware generation — i.e. when getting the
- * generation wrong would mislabel or misdecode it.
+ * True when this channel ID is described differently on the two generations, by
+ * label, by layout, or by existing on only one of them.
  *
- * A schema built without knowing the generation is only trustworthy if none of
- * its channels answers true here.
+ * This is the broad question, and a true answer is **not** on its own a reason
+ * to distrust a frame: across most of the ADC block the difference is the
+ * channel's *name* only. Use {@link channelLayoutDiffersByGeneration} for the
+ * narrower question of whether the bytes would actually be misread.
  */
 function isGenerationSensitiveChannel(id) {
     return (CHANNEL_FORMAT_OVERRIDES.shimmer3[id] !== undefined ||
         CHANNEL_FORMAT_OVERRIDES.shimmer3r[id] !== undefined);
+}
+/**
+ * True when assuming the wrong generation for this channel ID would **misread**
+ * the bytes rather than merely mislabel them: the width, the byte order, or
+ * whether the channel exists at all differs between the two generations.
+ *
+ * This is the predicate that gates `StreamSchema.trusted`, and it is
+ * deliberately narrower than {@link isGenerationSensitiveChannel}:
+ *
+ * - `0x1A`/`0x1B` qualify — 2 big-endian bytes then 3 on a Shimmer3 versus 3
+ *   little-endian bytes each on a Shimmer3R, emitted in the opposite order.
+ * - The Shimmer3-only `0x27`/`0x28` qualify, because they resolve to nothing at
+ *   all on a Shimmer3R, so assuming the wrong way either invents a width or
+ *   loses one.
+ * - The ADC block `0x0D`-`0x13` does **not** qualify: `u16`, little-endian, 2
+ *   bytes on both generations, so guessing wrong costs a column heading rather
+ *   than a number.
+ *
+ * Compares the *resolved* formats, not the override layers, so a channel that
+ * one generation overrides back to the same layout as the shared
+ * {@link CHANNEL_FORMATS} entry is correctly reported as layout-identical.
+ */
+function channelLayoutDiffersByGeneration(id) {
+    const s3 = resolveChannelFormat(id, 'shimmer3');
+    const s3r = resolveChannelFormat(id, 'shimmer3r');
+    if (s3 === undefined && s3r === undefined)
+        return false;
+    if (s3 === undefined || s3r === undefined)
+        return true;
+    return s3.fmt !== s3r.fmt || s3.endian !== s3r.endian || s3.sizeBytes !== s3r.sizeBytes;
 }
 /**
  * The width assumed for a channel ID this SDK cannot describe.
@@ -1983,6 +1894,1349 @@ function isGenerationSensitiveChannel(id) {
  * unusable and update the SDK, not publish the numbers.
  */
 const UNKNOWN_CHANNEL_ASSUMED_BYTES = 2;
+
+/**
+ * ADS1292R (EXG) register-bank codec — decode a 10-byte per-chip register
+ * bank into structured, human-readable settings and encode it back, enforcing
+ * the hardware "must-be" bits.
+ *
+ * Pure port of the Java oracle:
+ *   - decode           : ShimmerObject.exgBytesGetConfigFrom
+ *                        (ShimmerObject.java:6894-6940)
+ *   - field bit-layout : ExGConfigBytesDetails.mMapOfExGSettingsChip1
+ *                        (ExGConfigBytesDetails.java:369-451) — every field's
+ *                        byteIndex / bitShift / mask
+ *   - encode           : ExGConfigBytesDetails.generateExgByteArray
+ *                        (ExGConfigBytesDetails.java:487-502)
+ *   - must-be bits     : ExGConfigBytesDetails.setExgByteArrayConstants
+ *                        (ExGConfigBytesDetails.java:507-525)
+ *   - option labels    : SensorEXG.java:116-149 (GUI value lists) and the
+ *                        EXG_SETTING_OPTIONS enums (ExGConfigBytesDetails.java:116-360)
+ *   - gain value map   : SensorEXG.convertEXGGainSettingToValue
+ *                        (SensorEXG.java:2637)
+ *
+ * Resolution (16- vs 24-bit) is NOT a register field — it lives in the sensor
+ * bitmap. See {@link exgResolutionFromSensors} in ./presets.ts
+ * (ShimmerObject.checkExgResolutionFromEnabledSensorsVar, :7255-7279).
+ */
+/** Number of register bytes in one ADS1292R chip bank (InfoMem EXG_BANK_LENGTH). */
+const EXG_BANK_LENGTH$1 = 10;
+// --------------------------------------------------------------------------
+// Option label lists (verbatim from the Java oracle; the array index is the
+// register field's config value).
+// --------------------------------------------------------------------------
+/** REG1 conversion mode (ExGConfigBytesDetails.java:119-120). */
+const CONVERSION_MODE_LABELS = ['Continuous Conversion Mode', 'Single-shot mode'];
+/** REG1 data rate 0-6 (SensorEXG.java:148 ListOfExGRate). */
+const DATA_RATE_LABELS = [
+    '125 Hz',
+    '250 Hz',
+    '500 Hz',
+    '1 kHz',
+    '2 kHz',
+    '4 kHz',
+    '8 kHz',
+];
+/** REG2 voltage reference (ExGConfigBytesDetails.java:142-143). */
+const VOLTAGE_REFERENCE_LABELS = ['2.42 V', '4.033 V'];
+/** REG2 test-signal frequency (ExGConfigBytesDetails.java:154-155). */
+const TEST_SIGNAL_FREQUENCY_LABELS = ['DC', '1 kHz Square Wave'];
+/** REG3 lead-off comparator threshold 0-7 (SensorEXG.java:136). */
+const COMPARATOR_THRESHOLD_LABELS = [
+    'Pos:95%-Neg:5%',
+    'Pos:92.5%-Neg:7.5%',
+    'Pos:90%-Neg:10%',
+    'Pos:87.5%-Neg:12.5%',
+    'Pos:85%-Neg:15%',
+    'Pos:80%-Neg:20%',
+    'Pos:75%-Neg:25%',
+    'Pos:70%-Neg:30%',
+];
+/** REG3 lead-off current 0-3 (SensorEXG.java:134). */
+const LEAD_OFF_CURRENT_LABELS = ['6 nA', '22 nA', '6 uA', '22 uA'];
+/** REG3 lead-off frequency (ExGConfigBytesDetails.java:177-178). */
+const LEAD_OFF_FREQUENCY_LABELS = [
+    'DC lead-off detect',
+    'AC lead-off detect (fs / 4)',
+];
+/** REG4/REG5 PGA gain setting 0-6 → GUI label (SensorEXG.java:116 ListOfExGGain). */
+const GAIN_LABELS = ['6', '1', '2', '3', '4', '8', '12'];
+/** REG4/REG5 PGA gain setting 0-6 → numeric gain (SensorEXG.convertEXGGainSettingToValue, :2637). */
+const GAIN_VALUES = [6, 1, 2, 3, 4, 8, 12];
+/** REG4/REG5 channel power-down (ExGConfigBytesDetails.java:184-185). */
+const POWER_DOWN_LABELS = ['Normal operation', 'Power-down'];
+/** REG4/REG5 input selection 0-9 (ExGConfigBytesDetails.java:196-234). */
+const INPUT_SELECTION_LABELS = [
+    'Normal electrode input',
+    'Input shorted',
+    'RLD_MEASURE',
+    'Supply measurement',
+    'Temperature sensor',
+    'Test signal',
+    'RLD_DRP (positive side connected to RLDIN)',
+    'RLD_DRM (negative side connected to RLDIN)',
+    'RLD_DRPM (both connected to RLDIN)',
+    'Route IN3P/IN3N to channel 1 inputs',
+];
+/** REG6 PGA chop frequency (ExGConfigBytesDetails.java:240-242; value 1 is reserved). */
+const CHOP_FREQUENCY_LABELS = ['fMOD / 16', 'reserved', 'fMOD / 2', 'fMOD / 4'];
+/** REG9 respiration phase at 32 kHz, 0-15 (SensorEXG.java:143). */
+const RESPIRATION_PHASE_32KHZ_LABELS = [
+    '0°',
+    '11.25°',
+    '22.5°',
+    '33.75°',
+    '45°',
+    '56.25°',
+    '67.5°',
+    '78.75°',
+    '90°',
+    '101.25°',
+    '112.5°',
+    '123.75°',
+    '135°',
+    '146.25°',
+    '157.5°',
+    '168.75°',
+];
+/** REG9 respiration phase at 64 kHz, 0-7 (SensorEXG.java:145). */
+const RESPIRATION_PHASE_64KHZ_LABELS = [
+    '0°',
+    '22.5°',
+    '45°',
+    '67.5°',
+    '90°',
+    '112.5°',
+    '135°',
+    '157.5°',
+];
+/** REG10 respiration control frequency (SensorEXG.java:140). */
+const RESPIRATION_FREQUENCY_LABELS = ['32 kHz', '64 kHz'];
+/** REG10 RLD reference signal (ExGConfigBytesDetails.java:357-358). */
+const RLD_REFERENCE_SIGNAL_LABELS = ['Fed externally', '(AVDD - AVSS) / 2'];
+/** REG9 respiration control clock (ExGConfigBytesDetails.java:342-343). */
+const RESPIRATION_CONTROL_LABELS = ['Internal clock', 'External Clock'];
+/**
+ * Lead-off detection mode (the "Lead-Off Detection" GUI knob). The GUI exposes
+ * only Off / DC Current (SensorEXG.ListOfExGLeadOffDetection, SensorEXG.java:132);
+ * the setter also supports an AC-current mode (value 2) which the GUI does not
+ * offer (see the knob helpers in ./knobs.ts).
+ */
+const LEAD_OFF_DETECTION_LABELS = ['Off', 'DC Current'];
+const ON_OFF$1 = ['Off', 'On'];
+/**
+ * Reference-electrode config value → label (byte5 & 0x0F). The four
+ * meaningful values come from ListOfExGReferenceElectrodeConfigValuesAll
+ * {0,3,13,7} (SensorEXG.java:123-124); any other value is reported as custom.
+ */
+const REFERENCE_ELECTRODE_LABELS = {
+    0: 'Fixed Potential',
+    3: 'Inverse of Ch1',
+    13: 'Inverse Wilson CT',
+    7: '3-Ch Single-ended',
+};
+/**
+ * Reference-electrode options as `{ value, label }`, verbatim from the Java
+ * "All" list ListOfExGReferenceElectrodeAll / …ConfigValuesAll
+ * (SensorEXG.java:123-124): Fixed Potential (0), Inverse of Ch1 (3), Inverse
+ * Wilson CT (13), 3-Ch Single-ended (7). The value is the REG6 low-nibble RLD
+ * input-routing code, NOT an index — see setEXGReferenceElectrode
+ * (SensorEXG.java:2483-2489). The 3-Ch single-ended entry is kept for data
+ * fidelity but EX4 builds no special UI for it (docs/handoff/13 EX4 descope).
+ */
+const REFERENCE_ELECTRODE_OPTIONS = Object.freeze([
+    { value: 0, label: 'Fixed Potential' },
+    { value: 3, label: 'Inverse of Ch1' },
+    { value: 13, label: 'Inverse Wilson CT' },
+    { value: 7, label: '3-Ch Single-ended' },
+]);
+/** Every ADS1292R register field, keyed by a stable name. */
+const FIELDS = {
+    conversionMode: { byteIndex: 0, bitShift: 7, mask: 0x01 },
+    dataRate: { byteIndex: 0, bitShift: 0, mask: 0x07 },
+    leadOffComparators: { byteIndex: 1, bitShift: 6, mask: 0x01 },
+    referenceBuffer: { byteIndex: 1, bitShift: 5, mask: 0x01 },
+    voltageReference: { byteIndex: 1, bitShift: 4, mask: 0x01 },
+    oscillatorClockConnection: { byteIndex: 1, bitShift: 3, mask: 0x01 },
+    testSignalSelection: { byteIndex: 1, bitShift: 1, mask: 0x01 },
+    testSignalFrequency: { byteIndex: 1, bitShift: 0, mask: 0x01 },
+    comparatorThreshold: { byteIndex: 2, bitShift: 5, mask: 0x07 },
+    leadOffCurrent: { byteIndex: 2, bitShift: 2, mask: 0x03 },
+    leadOffFrequency: { byteIndex: 2, bitShift: 0, mask: 0x01 },
+    ch1PowerDown: { byteIndex: 3, bitShift: 7, mask: 0x01 },
+    ch1Gain: { byteIndex: 3, bitShift: 4, mask: 0x07 },
+    ch1InputSelection: { byteIndex: 3, bitShift: 0, mask: 0x0f },
+    ch2PowerDown: { byteIndex: 4, bitShift: 7, mask: 0x01 },
+    ch2Gain: { byteIndex: 4, bitShift: 4, mask: 0x07 },
+    ch2InputSelection: { byteIndex: 4, bitShift: 0, mask: 0x0f },
+    chopFrequency: { byteIndex: 5, bitShift: 6, mask: 0x03 },
+    rldBufferPower: { byteIndex: 5, bitShift: 5, mask: 0x01 },
+    rldLeadOffSenseFunction: { byteIndex: 5, bitShift: 4, mask: 0x01 },
+    ch2RldNegInputs: { byteIndex: 5, bitShift: 3, mask: 0x01 },
+    ch2RldPosInputs: { byteIndex: 5, bitShift: 2, mask: 0x01 },
+    ch1RldNegInputs: { byteIndex: 5, bitShift: 1, mask: 0x01 },
+    ch1RldPosInputs: { byteIndex: 5, bitShift: 0, mask: 0x01 },
+    ch2FlipCurrent: { byteIndex: 6, bitShift: 5, mask: 0x01 },
+    ch1FlipCurrent: { byteIndex: 6, bitShift: 4, mask: 0x01 },
+    ch2LeadOffDetectNegInputs: { byteIndex: 6, bitShift: 3, mask: 0x01 },
+    ch2LeadOffDetectPosInputs: { byteIndex: 6, bitShift: 2, mask: 0x01 },
+    ch1LeadOffDetectNegInputs: { byteIndex: 6, bitShift: 1, mask: 0x01 },
+    ch1LeadOffDetectPosInputs: { byteIndex: 6, bitShift: 0, mask: 0x01 },
+    clockDividerSelection: { byteIndex: 7, bitShift: 6, mask: 0x01 },
+    rldLeadOffStatus: { byteIndex: 7, bitShift: 4, mask: 0x01 },
+    ch2NegElectrodeStatus: { byteIndex: 7, bitShift: 3, mask: 0x01 },
+    ch2PosElectrodeStatus: { byteIndex: 7, bitShift: 2, mask: 0x01 },
+    ch1NegElectrodeStatus: { byteIndex: 7, bitShift: 1, mask: 0x01 },
+    ch1PosElectrodeStatus: { byteIndex: 7, bitShift: 0, mask: 0x01 },
+    respirationDemodCircuitry: { byteIndex: 8, bitShift: 7, mask: 0x01 },
+    respirationModCircuitry: { byteIndex: 8, bitShift: 6, mask: 0x01 },
+    respirationPhase: { byteIndex: 8, bitShift: 2, mask: 0x0f },
+    respirationControl: { byteIndex: 8, bitShift: 0, mask: 0x01 },
+    respirationCalibration: { byteIndex: 9, bitShift: 7, mask: 0x01 },
+    respirationControlFrequency: { byteIndex: 9, bitShift: 2, mask: 0x01 },
+    rldReferenceSignal: { byteIndex: 9, bitShift: 1, mask: 0x01 },
+};
+/**
+ * Read one register field's raw config value out of a 10-byte bank. Companion
+ * to {@link setExgFieldPreserving}; both consult the internal bit-layout table.
+ */
+function readExgField(bank, name) {
+    return readField$1(bank, name);
+}
+/**
+ * Write one register field's value into a 10-byte bank IN PLACE, clearing that
+ * field's bits first so every OTHER bit in the byte is preserved (unlike the
+ * encode-time {@link writeField}, which assumes a freshly zeroed bank and only
+ * ORs bits in). This is the primitive the per-knob edit layer builds on: it lets
+ * a single knob change exactly its field and leave the rest of the populated
+ * bank untouched. Does NOT re-apply the must-be bits — callers do that once
+ * after all field writes (see ./knobs.ts).
+ */
+function setExgFieldPreserving(bank, name, value) {
+    const f = FIELDS[name];
+    const fieldMask = (f.mask << f.bitShift) & 0xff;
+    bank[f.byteIndex] = ((bank[f.byteIndex] & ~fieldMask) | ((value & f.mask) << f.bitShift)) & 0xff;
+}
+// --------------------------------------------------------------------------
+// Decode
+// --------------------------------------------------------------------------
+function readField$1(bank, name) {
+    const f = FIELDS[name];
+    return (bank[f.byteIndex] >> f.bitShift) & f.mask;
+}
+function labelled(value, labels) {
+    return { value, label: labels[value] ?? `Unknown (${value})` };
+}
+function onOff(value) {
+    return { value, label: ON_OFF$1[value] ?? `Unknown (${value})` };
+}
+function gainField(value) {
+    return {
+        value,
+        label: GAIN_LABELS[value] ?? `Unknown (${value})`,
+        gain: GAIN_VALUES[value] ?? -1,
+    };
+}
+function channelSettings(bank, chan) {
+    const pd = chan === 1 ? 'ch1PowerDown' : 'ch2PowerDown';
+    const gn = chan === 1 ? 'ch1Gain' : 'ch2Gain';
+    const inp = chan === 1 ? 'ch1InputSelection' : 'ch2InputSelection';
+    return {
+        powerDown: labelled(readField$1(bank, pd), POWER_DOWN_LABELS),
+        gain: gainField(readField$1(bank, gn)),
+        inputSelection: labelled(readField$1(bank, inp), INPUT_SELECTION_LABELS),
+    };
+}
+/**
+ * Decode a single 10-byte ADS1292R register bank into structured settings.
+ * Mirrors ShimmerObject.exgBytesGetConfigFrom (ShimmerObject.java:6894-6940)
+ * combined with ExGConfigBytesDetails.updateFromRegisterArray (:528-539).
+ *
+ * @throws RangeError when the bank is not exactly 10 bytes.
+ */
+function decodeExgRegisters(bank) {
+    if (bank.length !== EXG_BANK_LENGTH$1) {
+        throw new RangeError(`EXG register bank must be exactly ${EXG_BANK_LENGTH$1} bytes, got ${bank.length}.`);
+    }
+    const respFreqValue = readField$1(bank, 'respirationControlFrequency');
+    const phaseValue = readField$1(bank, 'respirationPhase');
+    // Phase label depends on the detection frequency (16 options @32 kHz, 8 @64 kHz)
+    // — SensorEXG.java:143-146, PanelAdvancedExG.java:555-556.
+    const phaseLabels = respFreqValue === 0 ? RESPIRATION_PHASE_32KHZ_LABELS : RESPIRATION_PHASE_64KHZ_LABELS;
+    const comparators = onOff(readField$1(bank, 'leadOffComparators'));
+    const refElectrodeValue = bank[5] & 0x0f;
+    return {
+        conversionMode: labelled(readField$1(bank, 'conversionMode'), CONVERSION_MODE_LABELS),
+        dataRate: labelled(readField$1(bank, 'dataRate'), DATA_RATE_LABELS),
+        referenceBuffer: onOff(readField$1(bank, 'referenceBuffer')),
+        voltageReference: labelled(readField$1(bank, 'voltageReference'), VOLTAGE_REFERENCE_LABELS),
+        oscillatorClockConnection: onOff(readField$1(bank, 'oscillatorClockConnection')),
+        testSignal: {
+            enabled: onOff(readField$1(bank, 'testSignalSelection')),
+            frequency: labelled(readField$1(bank, 'testSignalFrequency'), TEST_SIGNAL_FREQUENCY_LABELS),
+        },
+        ch1: channelSettings(bank, 1),
+        ch2: channelSettings(bank, 2),
+        referenceElectrode: {
+            value: refElectrodeValue,
+            label: REFERENCE_ELECTRODE_LABELS[refElectrodeValue] ??
+                `Custom (0x${refElectrodeValue.toString(16)})`,
+        },
+        leadOff: {
+            detectionEnabled: comparators.value === 1,
+            comparators,
+            current: labelled(readField$1(bank, 'leadOffCurrent'), LEAD_OFF_CURRENT_LABELS),
+            comparatorThreshold: labelled(readField$1(bank, 'comparatorThreshold'), COMPARATOR_THRESHOLD_LABELS),
+            frequency: labelled(readField$1(bank, 'leadOffFrequency'), LEAD_OFF_FREQUENCY_LABELS),
+            ch1: {
+                posInput: onOff(readField$1(bank, 'ch1LeadOffDetectPosInputs')),
+                negInput: onOff(readField$1(bank, 'ch1LeadOffDetectNegInputs')),
+                flipCurrent: onOff(readField$1(bank, 'ch1FlipCurrent')),
+            },
+            ch2: {
+                posInput: onOff(readField$1(bank, 'ch2LeadOffDetectPosInputs')),
+                negInput: onOff(readField$1(bank, 'ch2LeadOffDetectNegInputs')),
+                flipCurrent: onOff(readField$1(bank, 'ch2FlipCurrent')),
+            },
+        },
+        rld: {
+            bufferPower: onOff(readField$1(bank, 'rldBufferPower')),
+            leadOffSenseFunction: onOff(readField$1(bank, 'rldLeadOffSenseFunction')),
+            chopFrequency: labelled(readField$1(bank, 'chopFrequency'), CHOP_FREQUENCY_LABELS),
+            referenceSignal: labelled(readField$1(bank, 'rldReferenceSignal'), RLD_REFERENCE_SIGNAL_LABELS),
+            ch1: {
+                posInput: onOff(readField$1(bank, 'ch1RldPosInputs')),
+                negInput: onOff(readField$1(bank, 'ch1RldNegInputs')),
+            },
+            ch2: {
+                posInput: onOff(readField$1(bank, 'ch2RldPosInputs')),
+                negInput: onOff(readField$1(bank, 'ch2RldNegInputs')),
+            },
+        },
+        respiration: {
+            enabled: readField$1(bank, 'respirationDemodCircuitry') === 1 &&
+                readField$1(bank, 'respirationModCircuitry') === 1,
+            demod: onOff(readField$1(bank, 'respirationDemodCircuitry')),
+            mod: onOff(readField$1(bank, 'respirationModCircuitry')),
+            phase: labelled(phaseValue, phaseLabels),
+            control: labelled(readField$1(bank, 'respirationControl'), RESPIRATION_CONTROL_LABELS),
+            calibration: onOff(readField$1(bank, 'respirationCalibration')),
+            frequency: labelled(respFreqValue, RESPIRATION_FREQUENCY_LABELS),
+        },
+        status: {
+            clockDivider: {
+                value: readField$1(bank, 'clockDividerSelection'),
+                label: readField$1(bank, 'clockDividerSelection') === 0 ? 'fMOD = fCLK / 4' : 'fMOD = fCLK / 16',
+            },
+            rldLeadOff: onOff(readField$1(bank, 'rldLeadOffStatus')),
+            ch1PosElectrode: onOff(readField$1(bank, 'ch1PosElectrodeStatus')),
+            ch1NegElectrode: onOff(readField$1(bank, 'ch1NegElectrodeStatus')),
+            ch2PosElectrode: onOff(readField$1(bank, 'ch2PosElectrodeStatus')),
+            ch2NegElectrode: onOff(readField$1(bank, 'ch2NegElectrodeStatus')),
+        },
+        raw: Array.from(bank),
+    };
+}
+// --------------------------------------------------------------------------
+// Encode
+// --------------------------------------------------------------------------
+const BIT = (n) => 1 << n;
+/**
+ * Force the ADS1292R "must-be" bits listed in the datasheet, exactly as
+ * ExGConfigBytesDetails.setExgByteArrayConstants (ExGConfigBytesDetails.java:507-525).
+ * Mutates and returns the array.
+ */
+function applyExgMustBeBits(bank) {
+    // CONFIG1 (0x00): reserved bits 3-6 cleared.
+    bank[0] &= ~(BIT(6) | BIT(5) | BIT(4) | BIT(3)) & 0xff;
+    // CONFIG2 (0x80): bit7 must be 1, bit2 must be 0.
+    bank[1] |= BIT(7);
+    bank[1] &= ~BIT(2) & 0xff;
+    // LOFF (0x10): bit4 must be 1, bit1 must be 0.
+    bank[2] |= BIT(4);
+    bank[2] &= ~BIT(1) & 0xff;
+    // LOFF_SENS (0x00): bits 6-7 cleared.
+    bank[6] &= ~(BIT(7) | BIT(6)) & 0xff;
+    // LOFF_STAT (0x00): read-only status bits cleared (only bit6 clock-div kept).
+    bank[7] &= ~(BIT(7) | BIT(5) | BIT(4) | BIT(3) | BIT(2) | BIT(1) | BIT(0)) & 0xff;
+    // RESP1 (0x02): bit1 must be 1.
+    bank[8] |= BIT(1);
+    // RESP2 (0x01): reserved bits 3-6 cleared, bit0 must be 1.
+    bank[9] &= ~(BIT(6) | BIT(5) | BIT(4) | BIT(3)) & 0xff;
+    bank[9] |= BIT(0);
+    return bank;
+}
+function writeField(bank, name, value) {
+    const f = FIELDS[name];
+    bank[f.byteIndex] |= (value & f.mask) << f.bitShift;
+}
+/**
+ * Encode structured settings back into a 10-byte register bank, applying the
+ * mandatory must-be bits. Inverse of {@link decodeExgRegisters}; mirrors
+ * ExGConfigBytesDetails.generateExgByteArray (ExGConfigBytesDetails.java:487-502).
+ *
+ * A round-trip `encodeExgRegisters(decodeExgRegisters(bank))` reproduces
+ * `bank` for any bank already satisfying the must-be bits (all Java presets do).
+ */
+function encodeExgRegisters(settings) {
+    const bank = new Uint8Array(EXG_BANK_LENGTH$1);
+    writeField(bank, 'conversionMode', settings.conversionMode.value);
+    writeField(bank, 'dataRate', settings.dataRate.value);
+    writeField(bank, 'leadOffComparators', settings.leadOff.comparators.value);
+    writeField(bank, 'referenceBuffer', settings.referenceBuffer.value);
+    writeField(bank, 'voltageReference', settings.voltageReference.value);
+    writeField(bank, 'oscillatorClockConnection', settings.oscillatorClockConnection.value);
+    writeField(bank, 'testSignalSelection', settings.testSignal.enabled.value);
+    writeField(bank, 'testSignalFrequency', settings.testSignal.frequency.value);
+    writeField(bank, 'comparatorThreshold', settings.leadOff.comparatorThreshold.value);
+    writeField(bank, 'leadOffCurrent', settings.leadOff.current.value);
+    writeField(bank, 'leadOffFrequency', settings.leadOff.frequency.value);
+    writeField(bank, 'ch1PowerDown', settings.ch1.powerDown.value);
+    writeField(bank, 'ch1Gain', settings.ch1.gain.value);
+    writeField(bank, 'ch1InputSelection', settings.ch1.inputSelection.value);
+    writeField(bank, 'ch2PowerDown', settings.ch2.powerDown.value);
+    writeField(bank, 'ch2Gain', settings.ch2.gain.value);
+    writeField(bank, 'ch2InputSelection', settings.ch2.inputSelection.value);
+    writeField(bank, 'chopFrequency', settings.rld.chopFrequency.value);
+    writeField(bank, 'rldBufferPower', settings.rld.bufferPower.value);
+    writeField(bank, 'rldLeadOffSenseFunction', settings.rld.leadOffSenseFunction.value);
+    writeField(bank, 'ch2RldNegInputs', settings.rld.ch2.negInput.value);
+    writeField(bank, 'ch2RldPosInputs', settings.rld.ch2.posInput.value);
+    writeField(bank, 'ch1RldNegInputs', settings.rld.ch1.negInput.value);
+    writeField(bank, 'ch1RldPosInputs', settings.rld.ch1.posInput.value);
+    writeField(bank, 'ch2FlipCurrent', settings.leadOff.ch2.flipCurrent.value);
+    writeField(bank, 'ch1FlipCurrent', settings.leadOff.ch1.flipCurrent.value);
+    writeField(bank, 'ch2LeadOffDetectNegInputs', settings.leadOff.ch2.negInput.value);
+    writeField(bank, 'ch2LeadOffDetectPosInputs', settings.leadOff.ch2.posInput.value);
+    writeField(bank, 'ch1LeadOffDetectNegInputs', settings.leadOff.ch1.negInput.value);
+    writeField(bank, 'ch1LeadOffDetectPosInputs', settings.leadOff.ch1.posInput.value);
+    // REG8 status bits are read-only — cleared by must-be (except clock divider).
+    writeField(bank, 'clockDividerSelection', settings.status.clockDivider.value);
+    writeField(bank, 'respirationDemodCircuitry', settings.respiration.demod.value);
+    writeField(bank, 'respirationModCircuitry', settings.respiration.mod.value);
+    writeField(bank, 'respirationPhase', settings.respiration.phase.value);
+    writeField(bank, 'respirationControl', settings.respiration.control.value);
+    writeField(bank, 'respirationCalibration', settings.respiration.calibration.value);
+    writeField(bank, 'respirationControlFrequency', settings.respiration.frequency.value);
+    writeField(bank, 'rldReferenceSignal', settings.rld.referenceSignal.value);
+    return applyExgMustBeBits(bank);
+}
+
+/**
+ * ADS1292R (EXG) preset detection and resolution derivation.
+ *
+ * Pure port of the Java oracle:
+ *   - preset register arrays : SensorEXG.setDefault... / setEXG... (the commented
+ *     reference byte arrays in SensorEXG.java:1782-1783 ECG, 1813-1814 EMG,
+ *     1845-1846 test, 1872-1873 respiration, 1921-1922 custom)
+ *   - preset detection       : SensorEXG.isEXGUsingDefault*
+ *     (SensorEXG.java:2680-2763), invoked in the order
+ *     Respiration → ECG → EMG → TestSignal → Custom
+ *     (ShimmerObject.java:1791-1820)
+ *   - resolution ↔ bitmap    : ShimmerObject.checkExgResolutionFromEnabledSensorsVar
+ *     (ShimmerObject.java:7255-7279), using the ConfigByteLayoutShimmer3
+ *     sensor-bitmap masks (ConfigByteLayoutShimmer3.java:300-303).
+ */
+/**
+ * Canonical per-chip register arrays for each preset, verbatim from the Java
+ * oracle's reference byte arrays (SensorEXG.java, decimal values). The register
+ * bytes are identical for the 16-bit and 24-bit variants of a preset — only the
+ * sensor bitmap differs (see {@link exgResolutionFromSensors}).
+ */
+const EXG_PRESET_ARRAYS = Object.freeze({
+    /** SensorEXG.java:1782-1783 */
+    ecg: {
+        exg1: Object.freeze([2, 160, 16, 64, 64, 45, 0, 0, 2, 3]),
+        exg2: Object.freeze([2, 160, 16, 64, 71, 0, 0, 0, 2, 1]),
+    },
+    /** SensorEXG.java:1813-1814 */
+    emg: {
+        exg1: Object.freeze([2, 160, 16, 105, 96, 32, 0, 0, 2, 3]),
+        exg2: Object.freeze([2, 160, 16, 129, 129, 0, 0, 0, 2, 1]),
+    },
+    /** SensorEXG.java:1845 */
+    'test-signal': {
+        exg1: Object.freeze([2, 163, 16, 5, 5, 0, 0, 0, 2, 1]),
+        exg2: Object.freeze([2, 163, 16, 5, 5, 0, 0, 0, 2, 1]),
+    },
+    /** SensorEXG.java:1872-1873 */
+    respiration: {
+        exg1: Object.freeze([2, 160, 16, 64, 64, 32, 0, 0, 2, 3]),
+        exg2: Object.freeze([2, 160, 16, 64, 71, 0, 0, 0, 234, 1]),
+    },
+    /** SensorEXG.java:1921-1922 */
+    custom: {
+        exg1: Object.freeze([2, 163, 16, 7, 7, 0, 0, 0, 2, 1]),
+        exg2: Object.freeze([2, 163, 16, 7, 7, 0, 0, 0, 2, 1]),
+    },
+});
+// Sensor-bitmap masks (ConfigByteLayoutShimmer3.java:300-303 == SensorBitmapShimmer3).
+const MASK_EXG1_24BIT$1 = 0x000010;
+const MASK_EXG2_24BIT$1 = 0x000008;
+const MASK_EXG1_16BIT$1 = 0x100000;
+const MASK_EXG2_16BIT$1 = 0x080000;
+function resolutionFlags(enabledSensors) {
+    const es = enabledSensors >>> 0;
+    return {
+        exg1_24: (es & MASK_EXG1_24BIT$1) !== 0,
+        exg2_24: (es & MASK_EXG2_24BIT$1) !== 0,
+        exg1_16: (es & MASK_EXG1_16BIT$1) !== 0,
+        exg2_16: (es & MASK_EXG2_16BIT$1) !== 0,
+    };
+}
+/**
+ * Derive EXG resolution from the enabled-sensors bitmap. Resolution is not a
+ * register field — it lives entirely in the sensor bitmap. Mirrors
+ * ShimmerObject.checkExgResolutionFromEnabledSensorsVar (:7255-7279): the
+ * 16-bit flags take precedence over the 24-bit flags.
+ *
+ * @returns '16bit' | '24bit', or null when no EXG chip is enabled.
+ */
+function exgResolutionFromSensors(enabledSensors) {
+    const f = resolutionFlags(enabledSensors);
+    if (f.exg1_16 || f.exg2_16)
+        return '16bit';
+    if (f.exg1_24 || f.exg2_24)
+        return '24bit';
+    return null;
+}
+function allZero(bank) {
+    for (const b of bank)
+        if (b !== 0)
+            return false;
+    return true;
+}
+/**
+ * Detect which preset a pair of register banks represents.
+ *
+ * Detection is TOLERANT, exactly as the Java oracle's isEXGUsingDefault*
+ * checks (SensorEXG.java:2680-2763): it keys only off the CH1/CH2
+ * input-selection nibbles (byte3/byte4 low nibble) plus the chip-2 respiration
+ * modulation/demodulation bits, and — when {@link enabledSensors} is supplied
+ * — the resolution flags. (Respiration is the exception: it keys off the
+ * respiration bits and the resolution flags only, never the nibbles — see
+ * below.) It does NOT compare the full byte arrays, so the
+ * fields the firmware rewrites (the data-rate/oversampling bits in byte0, the
+ * oscillator-clock bit in byte1, PGA gain, etc.) do not affect the result.
+ * This is why the 16-bit-only hardcoded 3R preset arrays — which differ from
+ * the Java reference arrays in byte1 (oscillator-clock bit) and the rate bits —
+ * still detect correctly.
+ *
+ * The resolution gate mirrors Java: ECG/TestSignal/Respiration require both
+ * chips at the same resolution; EMG requires chip 1 only. When
+ * {@link enabledSensors} is omitted the resolution gate is relaxed (detection
+ * proceeds purely on the input-selection/respiration fields), and empty banks
+ * report 'off'.
+ *
+ * Evaluation order is Respiration → ECG → EMG → TestSignal → Custom
+ * (ShimmerObject.java:1791-1820): respiration shares the ECG input selections
+ * and is distinguished only by its modulation/demodulation bits, so it must be
+ * tested first.
+ *
+ * **Respiration is detected on those two bits alone**, without looking at the
+ * input-selection nibbles — so a bank that enables the respiration circuitry
+ * over some other input selection is reported as 'respiration' rather than
+ * 'custom'. That is deliberate, and it is what the oracle does: the driver's
+ * `isEXGUsingDefaultRespirationConfiguration` (SensorEXG.java:1871-1884) tests
+ * both chips' resolution flags and the chip-2 modulation and demodulation bits,
+ * and the line that would also have required the ECG input selections is
+ * commented out in its source. Tightening it here would be worse than the
+ * looseness: a sensor that Consensys calls a respiration configuration would
+ * then be called 'custom' by this SDK, and the point of this codec is that the
+ * two agree about the same device.
+ *
+ * @throws RangeError when either bank is not exactly 10 bytes.
+ */
+function detectExgPreset(exg1, exg2, enabledSensors) {
+    if (exg1.length !== EXG_BANK_LENGTH$1 || exg2.length !== EXG_BANK_LENGTH$1) {
+        throw new RangeError(`EXG register banks must be exactly ${EXG_BANK_LENGTH$1} bytes each, got ${exg1.length}/${exg2.length}.`);
+    }
+    const flags = enabledSensors != null ? resolutionFlags(enabledSensors) : null;
+    const bothChips = flags
+        ? (flags.exg1_16 && flags.exg2_16) || (flags.exg1_24 && flags.exg2_24)
+        : true;
+    const chip1Only = flags
+        ? (flags.exg1_16 && !flags.exg2_16) || (flags.exg1_24 && !flags.exg2_24)
+        : true;
+    const anyExg = flags
+        ? flags.exg1_16 || flags.exg2_16 || flags.exg1_24 || flags.exg2_24
+        : !(allZero(exg1) && allZero(exg2));
+    if (!anyExg)
+        return 'off';
+    const c1ch1 = exg1[3] & 0x0f;
+    const c1ch2 = exg1[4] & 0x0f;
+    const c2ch1 = exg2[3] & 0x0f;
+    const c2ch2 = exg2[4] & 0x0f;
+    // Chip-2 REG9: demod (bit7) and mod (bit6) circuitry on (SensorEXG.java:2733-2734).
+    const respirationOn = ((exg2[8] >> 7) & 1) === 1 && ((exg2[8] >> 6) & 1) === 1;
+    // NORMAL=0, SHORTED=1, TEST_SIGNAL=5, RLDIN_TO_NEG=7, ROUTE_CH3_TO_CH1=9
+    // (ExGConfigBytesDetails.java:196-234).
+    if (bothChips && respirationOn)
+        return 'respiration';
+    if (bothChips && c1ch1 === 0 && c1ch2 === 0 && c2ch1 === 0 && c2ch2 === 7)
+        return 'ecg';
+    if (chip1Only && c1ch1 === 9 && c1ch2 === 0 && c2ch1 === 1 && c2ch2 === 1)
+        return 'emg';
+    if (bothChips && c1ch1 === 5 && c1ch2 === 5 && c2ch1 === 5 && c2ch2 === 5)
+        return 'test-signal';
+    return 'custom';
+}
+/** Human-readable label for a detected preset (for read-only display). */
+function exgPresetLabel(preset) {
+    switch (preset) {
+        case 'ecg':
+            return 'ECG';
+        case 'emg':
+            return 'EMG';
+        case 'test-signal':
+            return 'ExG Test Signal';
+        case 'respiration':
+            return 'Respiration';
+        case 'custom':
+            return 'Custom';
+        case 'off':
+            return 'Off';
+    }
+}
+
+/**
+ * ADS1292R (EXG) per-knob EDITING — change a single named setting on a pair of
+ * register banks, enforcing the hardware "must-be" bits and preserving every
+ * other bit, with typed validation and the desktop's respiration coupling rules.
+ *
+ * Where EX2's `apply.ts` writes a WHOLE preset, this module (EX4) is the
+ * per-knob layer the docked config editor stages individual edits through. It is
+ * pure and transport-free.
+ *
+ * Java oracle:
+ *   - knob set + GUI labels : SensorEXG.GuiLabelConfig (SensorEXG.java:157-168),
+ *     value lists SensorEXG.java:116-149.
+ *   - which chip(s) each knob writes: the SensorEXG setters behind
+ *     setConfigValueUsingConfigLabel (SensorEXG.java:2948-2998):
+ *       · Gain  — setExGGainSetting(chipID, channel, v) per chip+channel
+ *                 (SensorEXG.java:2314-2331); the GUI's single "Gain" knob sets
+ *                 all four via setExGGainSetting(v) (:2333-2338).
+ *       · Rate  — setEXGRateSetting(v) writes REG1 on BOTH chips (:2468-2471).
+ *       · Reference electrode — setEXGReferenceElectrode(v) writes the four REG6
+ *                 RLD-input bits on CHIP1 only (:2483-2489).
+ *       · Lead-off detection — setEXGLeadOffCurrentMode(mode) flips comparators /
+ *                 RLD sense / per-lead detect bits across BOTH chips
+ *                 (:2495-2575); Off=0 / DC=1 ported (AC=2 descoped, GUI omits it).
+ *       · Lead-off current — setEXGLeadOffDetectionCurrent(v) REG3 both chips
+ *                 (:2600-2604).
+ *       · Lead-off comparator threshold — setEXGLeadOffComparatorTreshold(v) REG3
+ *                 both chips (:2610-2614).
+ *       · Respiration freq — setEXG2RespirationDetectFreq(v) CHIP2 only, and
+ *                 FORCES the phase to the frequency's canonical default
+ *                 (:2618-2628, see the freq-flip note below).
+ *       · Respiration phase — setEXG2RespirationDetectPhase(v) CHIP2 only
+ *                 (:2634-2635).
+ *   - phase-by-frequency lists : ListOfExGRespirationDetectPhase32khz (16 steps,
+ *     values 0-15) / …64khz (8 steps, values 0-7), SensorEXG.java:143-146.
+ *   - freq-flip behaviour : setEXG2RespirationDetectFreq re-validates the phase
+ *     against the new list (checkWhichExgRespPhaseValuesToUse, :2883-2907,
+ *     resets to configvalues[0] if the current phase is now illegal) and THEN
+ *     sets a canonical phase: 112.5° (reg value 10) at 32 kHz, 157.5° (reg value
+ *     7) at 64 kHz (:2622-2627). We port that net effect: flipping the frequency
+ *     auto-remaps the phase to that frequency's default.
+ *   - respiration-locked-unless-enabled : the desktop only opens the freq/phase
+ *     popups when the respiration sensor is enabled (PanelAdvancedExG.java:340,
+ *     357-361, 416-420). We reject freq/phase/control edits when chip-2
+ *     respiration (demod+mod) is off — see the contract note on the knob table.
+ */
+// --------------------------------------------------------------------------
+// Typed errors
+// --------------------------------------------------------------------------
+/** Base class for all knob-edit errors (so callers can `instanceof` one type). */
+class ExgKnobError extends Error {
+}
+/** Thrown when a knob field name is not recognised. */
+class UnknownExgKnobError extends ExgKnobError {
+    constructor(field) {
+        super(`Unknown EXG knob field: "${field}".`);
+        this.field = field;
+        this.name = 'UnknownExgKnobError';
+    }
+}
+/** Thrown when a value is not one of the knob's legal options. */
+class ExgKnobValueError extends ExgKnobError {
+    constructor(field, value, allowed) {
+        super(`Value ${value} is not valid for EXG knob "${field}"; allowed: [${allowed.join(', ')}].`);
+        this.field = field;
+        this.value = value;
+        this.allowed = allowed;
+        this.name = 'ExgKnobValueError';
+    }
+}
+/**
+ * Thrown when a respiration-only knob (frequency / phase) is edited while
+ * chip-2 respiration is disabled (the desktop locks these — see the module
+ * header). Enable respiration first (the `respirationEnable` knob, or the EX2
+ * Respiration preset).
+ */
+class ExgRespirationLockedError extends ExgKnobError {
+    constructor(field) {
+        super(`EXG knob "${field}" is locked until respiration is enabled ` +
+            `(set "respirationEnable" to 1 or apply the Respiration preset first).`);
+        this.field = field;
+        this.name = 'ExgRespirationLockedError';
+    }
+}
+function assertBanks(banks) {
+    if (banks.exg1.length !== EXG_BANK_LENGTH$1 || banks.exg2.length !== EXG_BANK_LENGTH$1) {
+        throw new RangeError(`EXG register banks must be exactly ${EXG_BANK_LENGTH$1} bytes each, got ` +
+            `${banks.exg1.length}/${banks.exg2.length}.`);
+    }
+}
+// --------------------------------------------------------------------------
+// Option lists
+// --------------------------------------------------------------------------
+const indexOptions = (labels) => labels.map((label, value) => ({ value, label }));
+/** Per-channel PGA gain options (label = GUI gain, value = REG4/5 setting 0-6). */
+const GAIN_OPTIONS = Object.freeze(indexOptions(GAIN_LABELS));
+/** REG1 data-rate options (values 0-6). */
+const DATA_RATE_OPTIONS = Object.freeze(indexOptions(DATA_RATE_LABELS));
+/** REG3 lead-off current options (values 0-3). */
+const LEAD_OFF_CURRENT_OPTIONS = Object.freeze(indexOptions(LEAD_OFF_CURRENT_LABELS));
+/** REG3 lead-off comparator-threshold options (values 0-7). */
+const LEAD_OFF_COMPARATOR_OPTIONS = Object.freeze(indexOptions(COMPARATOR_THRESHOLD_LABELS));
+/** Lead-off detection mode options — Off (0) / DC Current (1). */
+const LEAD_OFF_DETECTION_OPTIONS = Object.freeze(indexOptions(LEAD_OFF_DETECTION_LABELS));
+/** Respiration detection-frequency options — 32 kHz (0) / 64 kHz (1). */
+const RESPIRATION_FREQUENCY_OPTIONS = Object.freeze(indexOptions(RESPIRATION_FREQUENCY_LABELS));
+/** On/Off options for the respiration-enable toggle. */
+const ON_OFF_OPTIONS = Object.freeze([
+    { value: 0, label: 'Off' },
+    { value: 1, label: 'On' },
+]);
+/**
+ * Legal respiration-phase options for a given detection frequency. At 32 kHz
+ * (freq value 0) there are 16 phase steps (values 0-15); at 64 kHz (value 1)
+ * there are 8 (values 0-7). Verbatim from SensorEXG.java:143-146.
+ */
+function respirationPhaseOptions(freq) {
+    return indexOptions(freq === 0 ? RESPIRATION_PHASE_32KHZ_LABELS : RESPIRATION_PHASE_64KHZ_LABELS);
+}
+/** Canonical phase the desktop forces when the detection frequency changes. */
+// SensorEXG.setEXG2RespirationDetectFreq (:2622-2627): 32 kHz → PHASE_112_5
+// (REG9 value 10), 64 kHz → PHASE_157_5 (REG9 value 7).
+const RESP_PHASE_DEFAULT_32KHZ = 10;
+const RESP_PHASE_DEFAULT_64KHZ = 7;
+/** Set the same field on both chip banks. */
+function setBoth(banks, field, value) {
+    setExgFieldPreserving(banks.exg1, field, value);
+    setExgFieldPreserving(banks.exg2, field, value);
+}
+/**
+ * Port of SensorEXG.setEXGLeadOffCurrentMode for the two GUI-exposed modes
+ * (Off=0, DC Current=1). AC current (mode 2) and the three-unipolar branch are
+ * descoped (docs/handoff/13 EX4); the bipolar branch is used for DC.
+ */
+function applyLeadOffDetection(banks, mode) {
+    const isEmg = detectExgPreset(banks.exg1, banks.exg2) === 'emg';
+    if (mode === 0) {
+        // OFF — SensorEXG.java:2496-2507.
+        setBoth(banks, 'leadOffFrequency', 0); // DC
+        setBoth(banks, 'leadOffComparators', 0); // OFF
+        setExgFieldPreserving(banks.exg1, 'rldLeadOffSenseFunction', 0);
+        setBoth(banks, 'ch2LeadOffDetectNegInputs', 0);
+        setBoth(banks, 'ch2LeadOffDetectPosInputs', 0);
+        setBoth(banks, 'ch1LeadOffDetectNegInputs', 0);
+        setBoth(banks, 'ch1LeadOffDetectPosInputs', 0);
+        // EMG: power down chip-2 CH2 again (only powered up for lead-off).
+        if (isEmg)
+            setExgFieldPreserving(banks.exg2, 'ch2PowerDown', 1);
+        return;
+    }
+    // DC Current — SensorEXG.java:2508-2545 (bipolar / non-unipolar branch).
+    // Chip 1.
+    setExgFieldPreserving(banks.exg1, 'leadOffFrequency', 0); // DC
+    setExgFieldPreserving(banks.exg1, 'leadOffComparators', 1); // ON
+    setExgFieldPreserving(banks.exg1, 'rldLeadOffSenseFunction', 1); // ON
+    setExgFieldPreserving(banks.exg1, 'ch2LeadOffDetectNegInputs', 0);
+    setExgFieldPreserving(banks.exg1, 'ch2LeadOffDetectPosInputs', 1);
+    setExgFieldPreserving(banks.exg1, 'ch1LeadOffDetectNegInputs', 1);
+    setExgFieldPreserving(banks.exg1, 'ch1LeadOffDetectPosInputs', 1);
+    setExgFieldPreserving(banks.exg1, 'leadOffCurrent', 1); // 22 nA
+    setExgFieldPreserving(banks.exg1, 'comparatorThreshold', 2); // Pos90/Neg10
+    // Chip 2 (always present in the docked two-bank model — isTwoChipExg true).
+    setExgFieldPreserving(banks.exg2, 'leadOffFrequency', 0);
+    setExgFieldPreserving(banks.exg2, 'leadOffComparators', 1);
+    setExgFieldPreserving(banks.exg2, 'ch2LeadOffDetectNegInputs', 0);
+    setExgFieldPreserving(banks.exg2, 'ch2LeadOffDetectPosInputs', 1);
+    setExgFieldPreserving(banks.exg2, 'ch1LeadOffDetectNegInputs', 0);
+    setExgFieldPreserving(banks.exg2, 'ch1LeadOffDetectPosInputs', 0);
+    setExgFieldPreserving(banks.exg2, 'leadOffCurrent', 1);
+    setExgFieldPreserving(banks.exg2, 'comparatorThreshold', 2);
+    // EMG: power up chip-2 CH2 so it can carry the lead-off measurement.
+    if (isEmg)
+        setExgFieldPreserving(banks.exg2, 'ch2PowerDown', 0);
+}
+/** The complete editable-knob registry. */
+const EXG_KNOBS = Object.freeze({
+    exg1Ch1Gain: {
+        label: 'Gain (EXG1 CH1)',
+        banks: ['exg1'],
+        options: GAIN_OPTIONS,
+        requiresRespiration: false,
+        apply: (b, v) => setExgFieldPreserving(b.exg1, 'ch1Gain', v),
+    },
+    exg1Ch2Gain: {
+        label: 'Gain (EXG1 CH2)',
+        banks: ['exg1'],
+        options: GAIN_OPTIONS,
+        requiresRespiration: false,
+        apply: (b, v) => setExgFieldPreserving(b.exg1, 'ch2Gain', v),
+    },
+    exg2Ch1Gain: {
+        label: 'Gain (EXG2 CH1)',
+        banks: ['exg2'],
+        options: GAIN_OPTIONS,
+        requiresRespiration: false,
+        apply: (b, v) => setExgFieldPreserving(b.exg2, 'ch1Gain', v),
+    },
+    exg2Ch2Gain: {
+        label: 'Gain (EXG2 CH2)',
+        banks: ['exg2'],
+        options: GAIN_OPTIONS,
+        requiresRespiration: false,
+        apply: (b, v) => setExgFieldPreserving(b.exg2, 'ch2Gain', v),
+    },
+    dataRate: {
+        label: 'ExG Rate',
+        banks: ['exg1', 'exg2'],
+        options: DATA_RATE_OPTIONS,
+        requiresRespiration: false,
+        apply: (b, v) => setBoth(b, 'dataRate', v),
+    },
+    referenceElectrode: {
+        label: 'Reference Electrode',
+        banks: ['exg1'],
+        options: REFERENCE_ELECTRODE_OPTIONS,
+        requiresRespiration: false,
+        // setEXGReferenceElectrode (SensorEXG.java:2483-2489): the value is a REG6
+        // low-nibble routing code; spread its bits over the four CHIP1 RLD-input
+        // fields (bit3→CH2 neg, bit2→CH2 pos, bit1→CH1 neg, bit0→CH1 pos).
+        apply: (b, v) => {
+            setExgFieldPreserving(b.exg1, 'ch2RldNegInputs', (v & 0x08) === 0x08 ? 1 : 0);
+            setExgFieldPreserving(b.exg1, 'ch2RldPosInputs', (v & 0x04) === 0x04 ? 1 : 0);
+            setExgFieldPreserving(b.exg1, 'ch1RldNegInputs', (v & 0x02) === 0x02 ? 1 : 0);
+            setExgFieldPreserving(b.exg1, 'ch1RldPosInputs', (v & 0x01) === 0x01 ? 1 : 0);
+        },
+    },
+    leadOffDetection: {
+        label: 'Lead-Off Detection',
+        banks: ['exg1', 'exg2'],
+        options: LEAD_OFF_DETECTION_OPTIONS,
+        requiresRespiration: false,
+        apply: applyLeadOffDetection,
+    },
+    leadOffCurrent: {
+        label: 'Lead-Off Current',
+        banks: ['exg1', 'exg2'],
+        options: LEAD_OFF_CURRENT_OPTIONS,
+        requiresRespiration: false,
+        apply: (b, v) => setBoth(b, 'leadOffCurrent', v),
+    },
+    leadOffComparatorThreshold: {
+        label: 'Lead-Off Comparator Threshold',
+        banks: ['exg1', 'exg2'],
+        options: LEAD_OFF_COMPARATOR_OPTIONS,
+        requiresRespiration: false,
+        apply: (b, v) => setBoth(b, 'comparatorThreshold', v),
+    },
+    respirationEnable: {
+        label: 'Respiration',
+        banks: ['exg2'],
+        options: ON_OFF_OPTIONS,
+        // This IS the gate toggle — never gated on itself.
+        requiresRespiration: false,
+        apply: (b, v) => {
+            setExgFieldPreserving(b.exg2, 'respirationDemodCircuitry', v);
+            setExgFieldPreserving(b.exg2, 'respirationModCircuitry', v);
+        },
+    },
+    respirationFrequency: {
+        label: 'Respiration Detection Freq',
+        banks: ['exg2'],
+        options: RESPIRATION_FREQUENCY_OPTIONS,
+        requiresRespiration: true,
+        // setEXG2RespirationDetectFreq (SensorEXG.java:2618-2628): set the frequency,
+        // then FORCE the phase to that frequency's canonical default.
+        apply: (b, v) => {
+            setExgFieldPreserving(b.exg2, 'respirationControlFrequency', v);
+            setExgFieldPreserving(b.exg2, 'respirationPhase', v === 0 ? RESP_PHASE_DEFAULT_32KHZ : RESP_PHASE_DEFAULT_64KHZ);
+        },
+    },
+    respirationPhase: {
+        label: 'Respiration Detection Phase',
+        banks: ['exg2'],
+        dynamicOptions: (b) => respirationPhaseOptions(readExgField(b.exg2, 'respirationControlFrequency')),
+        requiresRespiration: true,
+        apply: (b, v) => setExgFieldPreserving(b.exg2, 'respirationPhase', v),
+    },
+});
+// --------------------------------------------------------------------------
+// Public API
+// --------------------------------------------------------------------------
+/**
+ * The current legal option list for a knob, given the banks (needed for the
+ * respiration phase list, which follows the current detection frequency).
+ *
+ * @throws UnknownExgKnobError for an unrecognised field.
+ */
+function exgKnobOptions(field, banks) {
+    const spec = EXG_KNOBS[field];
+    if (!spec)
+        throw new UnknownExgKnobError(field);
+    if (spec.dynamicOptions)
+        return spec.dynamicOptions(banks);
+    return [...(spec.options ?? [])];
+}
+/** True when chip-2 respiration (both demod + mod circuits) is enabled. */
+function isExgRespirationEnabled(banks) {
+    return (readExgField(banks.exg2, 'respirationDemodCircuitry') === 1 &&
+        readExgField(banks.exg2, 'respirationModCircuitry') === 1);
+}
+/**
+ * Set ONE knob to `value`, returning NEW banks with the field changed, the
+ * must-be bits re-enforced, and every other bit preserved. Pure — the inputs
+ * are not mutated.
+ *
+ * Respiration contract: `respirationFrequency` and `respirationPhase` are
+ * REJECTED (throw {@link ExgRespirationLockedError}) unless chip-2 respiration
+ * is enabled — matching the desktop, which greys these knobs out until the
+ * respiration sensor is on (PanelAdvancedExG.java:340,357-361,416-420). The
+ * app disables the corresponding controls, so this throw is a backstop rather
+ * than a normal path. `respirationEnable` is the toggle itself and is never
+ * gated.
+ *
+ * Phase/frequency coupling: setting `respirationFrequency` also auto-remaps the
+ * phase to that frequency's canonical default (112.5° at 32 kHz, 157.5° at
+ * 64 kHz), so the stored phase is never left illegal for the new frequency
+ * (matches SensorEXG.setEXG2RespirationDetectFreq). Setting `respirationPhase`
+ * directly to a value that is illegal for the CURRENT frequency throws
+ * {@link ExgKnobValueError}.
+ *
+ * @throws RangeError when a bank is not 10 bytes.
+ * @throws UnknownExgKnobError for an unrecognised field.
+ * @throws ExgKnobValueError when the value is not a legal option.
+ * @throws ExgRespirationLockedError for a locked respiration edit.
+ */
+function updateExgSetting(banks, field, value) {
+    assertBanks(banks);
+    const spec = EXG_KNOBS[field];
+    if (!spec)
+        throw new UnknownExgKnobError(field);
+    if (spec.requiresRespiration && !isExgRespirationEnabled(banks)) {
+        throw new ExgRespirationLockedError(field);
+    }
+    const options = spec.dynamicOptions ? spec.dynamicOptions(banks) : (spec.options ?? []);
+    if (!options.some((o) => o.value === value)) {
+        throw new ExgKnobValueError(field, value, options.map((o) => o.value));
+    }
+    const next = {
+        exg1: Uint8Array.from(banks.exg1),
+        exg2: Uint8Array.from(banks.exg2),
+    };
+    spec.apply(next, value);
+    // Re-enforce must-be bits on every bank this knob touched.
+    if (spec.banks.includes('exg1'))
+        applyExgMustBeBits(next.exg1);
+    if (spec.banks.includes('exg2'))
+        applyExgMustBeBits(next.exg2);
+    return next;
+}
+/**
+ * Apply a batch of knob edits in order, threading each edit's result into the
+ * next. Later edits win over earlier ones, and each edit sees the banks as left
+ * by the previous (so e.g. a `respirationEnable: 1` edit can precede — and
+ * unlock — a `respirationPhase` edit in the same batch). Pure.
+ *
+ * @throws the same typed errors as {@link updateExgSetting}, on the first
+ * offending edit.
+ */
+function applyExgKnobEdits(banks, edits) {
+    assertBanks(banks);
+    let acc = {
+        exg1: Uint8Array.from(banks.exg1),
+        exg2: Uint8Array.from(banks.exg2),
+    };
+    for (const edit of edits) {
+        acc = updateExgSetting(acc, edit.field, edit.value);
+    }
+    return acc;
+}
+/**
+ * Read the current value of every knob out of a pair of banks — the inverse of
+ * a full set. Handy for seeding an editor from the device's current config and
+ * for round-trip tests. The respiration-enable and lead-off-detection knobs are
+ * derived (they are macros over several bits), everything else reads its field.
+ */
+function readExgKnobs(banks) {
+    assertBanks(banks);
+    const d1 = decodeExgRegisters(banks.exg1);
+    const d2 = decodeExgRegisters(banks.exg2);
+    return {
+        exg1Ch1Gain: d1.ch1.gain.value,
+        exg1Ch2Gain: d1.ch2.gain.value,
+        exg2Ch1Gain: d2.ch1.gain.value,
+        exg2Ch2Gain: d2.ch2.gain.value,
+        dataRate: d1.dataRate.value,
+        referenceElectrode: banks.exg1[5] & 0x0f,
+        // Detection is "on" (DC=1) when the CHIP1 comparators + RLD sense are on.
+        leadOffDetection: d1.leadOff.detectionEnabled ? 1 : 0,
+        leadOffCurrent: d1.leadOff.current.value,
+        leadOffComparatorThreshold: d1.leadOff.comparatorThreshold.value,
+        respirationEnable: isExgRespirationEnabled(banks) ? 1 : 0,
+        respirationFrequency: d2.respiration.frequency.value,
+        respirationPhase: d2.respiration.phase.value,
+    };
+}
+
+/**
+ * ADS1292R (EXG) preset APPLICATION — turn a chosen preset + resolution into the
+ * two register banks and the enabled-sensors bitmap to write.
+ *
+ * Pure, transport-free port of the Java oracle's preset setters. Where EX1
+ * (`presets.ts`) ships the reference register arrays and preset *detection*,
+ * this module ships the *write* side: the resolution↔bitmap coupling, the
+ * sampling-rate→data-rate coupling, and the sensor-conflict clearing that
+ * desktop performs when a preset tile is clicked.
+ *
+ * Java oracle:
+ *   - preset setters        : SensorEXG.setDefaultECGConfiguration (:1781),
+ *     setDefaultEMGConfiguration (:1812), setEXGTestSignal (:1844),
+ *     setDefaultRespirationConfiguration (:1871). Each calls clearExgConfig()
+ *     then setExgChannelBitsPerMode(sensorId) then a series of named field
+ *     writes then setDefaultExgCommon(samplingRate).
+ *   - resolution↔bitmap     : SensorEXG.setExgChannelBitsPerMode (:2150-2183) +
+ *     updateEnabledSensorsFromExgResolution (:2108-2148). Resolution is NOT a
+ *     register field — it lives only in the sensor bitmap.
+ *   - rate coupling         : SensorEXG.setDefaultExgCommon (:1999-2005) calls
+ *     setExGRateFromFreq (:2784-2806), which rewrites REG1 data-rate on BOTH
+ *     chips (setEXGRateSetting, :2468-2471) from the device sampling rate.
+ *   - oscillator clock      : setDefaultExgCommon sets CHIP1 REG2 oscillator-
+ *     clock-connection ON when the chip clocks are joined
+ *     (ShimmerVerObject.isSupportedExgChipClocksJoined, :712-723).
+ *   - conflict clearing     : ShimmerDevice.sensorMapConflictCheckandCorrect
+ *     (:2497-2512) disables every sensor in a sensor's conflict list; EXG's
+ *     conflict list is SensorEXG.sDRefEcg etc. (:332-344).
+ */
+/** HW_ID codes (ShimmerVerDetails.HW_ID) — matches infomem/layout.ts HW_ID. */
+const HW_ID_SHIMMER_3R = 10;
+// Sensor-bitmap resolution masks (ConfigByteLayoutShimmer3, == SensorBitmapShimmer3).
+const MASK_EXG1_24BIT = 0x000010;
+const MASK_EXG2_24BIT = 0x000008;
+const MASK_EXG1_16BIT = 0x100000;
+const MASK_EXG2_16BIT = 0x080000;
+/**
+ * Sensors that conflict with any EXG preset, as the Shimmer3 streaming
+ * enabled-sensors bitmap masks (Configuration.Shimmer3.SensorBitmap). Ported
+ * from the EXG SensorDetailsRef conflict lists (SensorEXG.java:332-344 ECG,
+ * identical set for EMG/Test/Respiration): the internal ADC channels, GSR, the
+ * resistance amp, and the bridge amp. The resistance amp shares the bridge-amp
+ * bit on Shimmer3 (Configuration.java:643), so clearing SENSOR_BRIDGE_AMP
+ * covers both.
+ *
+ * NAMING: the internal-ADC labels below are the Java driver's Shimmer3-era
+ * names (A1/A12/A13/A14, the MSP430 ADC input numbers). This SDK's own
+ * `SensorBitmapShimmer3` names the SAME four bits A3/A0/A1/A2, following the
+ * Shimmer3R firmware — so 0x000400 is `SENSOR_INT_A1` in Java but
+ * `SENSOR_INT_A3` here, and 0x000100 is `SENSOR_INT_A13` there and
+ * `SENSOR_INT_A1` here. The masks are what matter and they agree; only the
+ * display names differ by generation.
+ */
+const EXG_CONFLICTING_SENSORS = Object.freeze([
+    { mask: 0x000004, label: 'GSR' }, // SENSOR_GSR (Configuration.java:630)
+    { mask: 0x000400, label: 'Internal ADC A1' }, // SENSOR_INT_A1 (:636)
+    { mask: 0x000200, label: 'Internal ADC A12' }, // SENSOR_INT_A12 (:637)
+    { mask: 0x000100, label: 'Internal ADC A13' }, // SENSOR_INT_A13 (:638)
+    { mask: 0x800000, label: 'Internal ADC A14' }, // SENSOR_INT_A14 (:639)
+    { mask: 0x008000, label: 'Bridge/Resistance Amp' }, // SENSOR_BRIDGE_AMP (:643)
+]);
+/**
+ * Report which currently-enabled sensors conflict with turning on EXG. Ported
+ * from ShimmerDevice.sensorMapConflictCheckandCorrect (ShimmerDevice.java:2497)
+ * reading the EXG conflict list — desktop *disables* these when an EXG tile is
+ * clicked, so {@link applyExgPreset} clears them from the returned bitmap and
+ * the UI can warn "disables: …" ahead of the write.
+ */
+function exgConflictingSensors(enabledSensors) {
+    const es = enabledSensors >>> 0;
+    return EXG_CONFLICTING_SENSORS.filter((c) => (es & c.mask) !== 0);
+}
+/**
+ * Map a device sampling rate (Hz) to the ADS1292R REG1 data-rate setting (0-6).
+ * Byte-for-byte port of SensorEXG.setExGRateFromFreq (SensorEXG.java:2784-2806),
+ * including the >8 kHz → 500 Hz fallback. NB the thresholds are `<=` here,
+ * distinct from the Shimmer3R live-BT oversampling helper
+ * `getOversamplingRatioADS1292R` (calibration.ts:89) which uses strict `<` and
+ * so differs at the exact boundary rates — that helper is the live-BT streaming
+ * path and is deliberately NOT used for the docked InfoMem write, which mirrors
+ * the desktop config-generation path (this function).
+ */
+function exgRateSettingFromFreq(freq) {
+    if (freq <= 125)
+        return 0; // 125 Hz
+    if (freq <= 250)
+        return 1; // 250 Hz
+    if (freq <= 500)
+        return 2; // 500 Hz
+    if (freq <= 1000)
+        return 3; // 1000 Hz
+    if (freq <= 2000)
+        return 4; // 2000 Hz
+    if (freq <= 4000)
+        return 5; // 4000 Hz
+    if (freq <= 8000)
+        return 6; // 8000 Hz
+    return 2; // > 8 kHz → 500 Hz (SensorEXG.java:2801-2802)
+}
+/** Whether the two ADS1292R chip clocks are joined for this hardware. */
+function isExgChipClocksJoined(hardwareVersion) {
+    // ShimmerVerObject.isSupportedExgChipClocksJoined (:712-723): true for
+    // Shimmer3R with the EXG-unified board (the only EXG board on 3R), and for
+    // Shimmer4-SDK / Shimmer3 EXG-unified rev>=4. Only the 3R case is determinable
+    // from the hardware version alone (no expansion-board rev in the docked
+    // context), so classic Shimmer3 preserves whatever bit the device already had
+    // (see applyExgPreset) rather than forcing it off.
+    return hardwareVersion === HW_ID_SHIMMER_3R;
+}
+/** Byte1 REG2 oscillator-clock-connection is bit 3. */
+const REG2_OSC_CLOCK_BIT = 0x08;
+/**
+ * Clear the four EXG resolution flags (the bits that enable the ADS1292R chips
+ * in the Shimmer3 streaming bitmap) from an enabled-sensors mask, leaving every
+ * non-EXG sensor untouched. This is how the Java driver DISABLES EXG live: it
+ * never pushes zeroed register banks to the chip — the ADS1292R forces the
+ * must-be bits (CONFIG2 bit7=1 etc., ExGConfigBytesDetails.java:507-525) so an
+ * all-zero write would fail read-back — it simply drops the EXG bits from the
+ * enabled-sensors bitmap and re-writes that (writeEnabledSensors is "always the
+ * last command", ShimmerBluetooth.java:2732,2735; readEXGConfigurations /
+ * writeEXGConfiguration only run while EXG stays enabled, :2670,4014-4018). The
+ * live `applyExgPresetLive('off')` path uses this instead of {@link applyExgPreset}
+ * so it never writes — nor read-back-verifies — a zeroed bank. See the docked-vs-
+ * live asymmetry note on {@link applyExgPreset} step (2).
+ */
+function clearExgResolutionFlags(enabledSensors) {
+    return ((enabledSensors >>> 0) & -1572889) >>> 0;
+}
+/**
+ * Apply an EXG preset + resolution to a device configuration, returning the two
+ * register banks and the updated enabled-sensors bitmap to write. Pure — does
+ * not mutate the input.
+ *
+ * Ports the Java preset setters (SensorEXG.setDefault*) as a whole:
+ *  1. Clears the four EXG resolution flags (clearExgConfig →
+ *     setExgChannelBitsPerMode(-1) resets them, :2150-2154).
+ *  2. For 'off', returns zeroed banks with no EXG flags set.
+ *  3. Clears conflicting sensors from the bitmap
+ *     (sensorMapConflictCheckandCorrect, ShimmerDevice.java:2497-2512).
+ *  4. Sets the resolution flags for the chips this preset uses — EMG is chip-1
+ *     only, every other preset is both chips (setExgChannelBitsPerMode,
+ *     :2162-2182). Respiration is NOT forced to 24-bit: it honours the chosen
+ *     resolution on both chips, exactly like ECG.
+ *  5. Takes the preset register arrays (identical for 16- and 24-bit — the
+ *     resolution lives only in the bitmap, see step 4).
+ *  6. Rewrites REG1 data-rate on both chips from {@link ExgApplyInput.samplingRateHz}
+ *     (setDefaultExgCommon → setExGRateFromFreq, :2003 / :2784).
+ *  7. Sets the CHIP1 oscillator-clock-connection bit when the hardware joins the
+ *     chip clocks (:2000-2002); otherwise preserves the device's existing bit.
+ *  8. Re-applies the mandatory must-be bits.
+ *
+ * @throws RangeError when either input bank is not exactly 10 bytes.
+ */
+function applyExgPreset(input, preset, resolution) {
+    if (input.exg1.length !== EXG_BANK_LENGTH$1 || input.exg2.length !== EXG_BANK_LENGTH$1) {
+        throw new RangeError(`EXG register banks must be exactly ${EXG_BANK_LENGTH$1} bytes each, got ${input.exg1.length}/${input.exg2.length}.`);
+    }
+    // (1) Clear all four resolution flags — clean slate for the new preset.
+    let enabledSensors = (input.enabledSensors >>> 0) & -1572889;
+    // (2) 'off' — no EXG chips enabled; zero the banks so the read-back summary
+    // reads 'off' rather than a stale preset.
+    //
+    // DOCKED vs LIVE ASYMMETRY. This function is the DOCKED (InfoMem) path: InfoMem
+    // is passive storage with no chip enforcement, so zeroed banks are fine and are
+    // in fact what EX1's detectExgPreset keys 'off' off (all-zero banks + no
+    // resolution flags → 'off', presets.ts). Keeping the zeroed banks here preserves
+    // that detection contract on the docked read-back.
+    //
+    // The LIVE (over-the-radio) path must NOT reuse this: the ADS1292R forces its
+    // must-be bits on write (CONFIG2 bit7=1 etc., ExGConfigBytesDetails.java:507-525),
+    // so a zeroed SET would read back non-zero and the read-back-verify would throw.
+    // Java disables EXG live by clearing only the sensor bitmap, never by writing
+    // zeroed registers (writeEnabledSensors is the disable path,
+    // ShimmerBluetooth.java:2732,2735) — so `applyExgPresetLive('off')` calls
+    // {@link clearExgResolutionFlags} and skips the register write entirely.
+    if (preset === 'off') {
+        return {
+            exg1: new Uint8Array(EXG_BANK_LENGTH$1),
+            exg2: new Uint8Array(EXG_BANK_LENGTH$1),
+            enabledSensors: enabledSensors >>> 0,
+        };
+    }
+    // (3) Clear conflicting sensors (desktop disables them on tile click).
+    for (const c of EXG_CONFLICTING_SENSORS)
+        enabledSensors &= ~c.mask;
+    // (4) Resolution flags: EMG = chip 1 only; all others = both chips.
+    const bothChips = preset !== 'emg';
+    if (resolution === '24bit') {
+        enabledSensors |= MASK_EXG1_24BIT;
+        if (bothChips)
+            enabledSensors |= MASK_EXG2_24BIT;
+    }
+    else {
+        enabledSensors |= MASK_EXG1_16BIT;
+        if (bothChips)
+            enabledSensors |= MASK_EXG2_16BIT;
+    }
+    enabledSensors >>>= 0;
+    // (5) Preset register arrays (same bytes for both resolutions).
+    const ref = EXG_PRESET_ARRAYS[preset];
+    const exg1 = Uint8Array.from(ref.exg1);
+    const exg2 = Uint8Array.from(ref.exg2);
+    // (6) Rewrite REG1 data-rate on both chips from the sampling rate.
+    const rate = exgRateSettingFromFreq(input.samplingRateHz);
+    exg1[0] = (exg1[0] & -8) | rate;
+    exg2[0] = (exg2[0] & -8) | rate;
+    // (7) Oscillator-clock-connection bit (CHIP1 only).
+    if (isExgChipClocksJoined(input.hardwareVersion)) {
+        exg1[1] |= REG2_OSC_CLOCK_BIT;
+    }
+    else {
+        // Preserve whatever the device already had (correct for a Shimmer3 whose
+        // EXG-unified board rev>=4 joins clocks — undetectable from HW id alone).
+        exg1[1] = (exg1[1] & ~REG2_OSC_CLOCK_BIT) | (input.exg1[1] & REG2_OSC_CLOCK_BIT);
+    }
+    // (8) Mandatory must-be bits.
+    applyExgMustBeBits(exg1);
+    applyExgMustBeBits(exg2);
+    return { exg1, exg2, enabledSensors: enabledSensors >>> 0 };
+}
+
+/**
+ * ADS1292R (EXG) LIVE Bluetooth/BLE framing — the GET/SET register commands and
+ * the read-back response decode used by the over-the-air (not docked) path.
+ *
+ * Pure, transport-free port of the Java oracle's EXG BT command flow
+ * (com.shimmerresearch.bluetooth.ShimmerBluetooth). Where EX1 (`registers.ts`)
+ * and EX2 (`apply.ts`) build the 10-byte-per-chip register banks, this module
+ * turns a bank into the exact LiteProtocol instruction bytes and decodes the
+ * response — so both `Shimmer3RClient` and `Shimmer3Client` share one framing
+ * definition rather than each hand-rolling the byte layout.
+ *
+ * LiteProtocol opcodes (ShimmerLiteProtocolInstructionSet.java):
+ *   SET_EXG_REGS_COMMAND = 97 (0x61) @:479, EXG_REGS_RESPONSE = 98 (0x62) @:1604,
+ *   GET_EXG_REGS_COMMAND = 99 (0x63) @:1058.
+ *
+ * @packageDocumentation
+ */
+/** SET_EXG_REGS_COMMAND opcode (ShimmerLiteProtocolInstructionSet.java:479, value 97). */
+const SET_EXG_REGS_COMMAND = 0x61;
+/** EXG_REGS_RESPONSE opcode (ShimmerLiteProtocolInstructionSet.java:1604, value 98). */
+const EXG_REGS_RESPONSE = 0x62;
+/** GET_EXG_REGS_COMMAND opcode (ShimmerLiteProtocolInstructionSet.java:1058, value 99). */
+const GET_EXG_REGS_COMMAND = 0x63;
+/**
+ * Number of payload bytes AFTER the {@link EXG_REGS_RESPONSE} opcode for a
+ * full-bank read. The Java driver declares this response length as 11
+ * (ShimmerBluetooth.java:468) and reads exactly 11 bytes (`readBytes(11, …)`,
+ * ShimmerBluetooth.java:1642).
+ *
+ * The 11 bytes are `[count][reg0..reg9]`. Payload byte 0 is the number of
+ * registers the firmware is returning, echoed back from the request — the
+ * firmware writes the opcode then `exgLength`
+ * (`log-and-stream-common/Comms/shimmer_bt_uart.c:2223-2229`, both the Shimmer3
+ * and Shimmer3R trees) — which makes the response length-prefixed and, since
+ * this SDK only ever asks for a whole 10-register bank, always 11 here. The
+ * driver ignores that byte and copies the registers from offset 1
+ * (`System.arraycopy(bufferAns, 1, …, 0, 10)`, ShimmerBluetooth.java:1646-1651),
+ * because the chip identity is tracked host-side from the preceding GET
+ * instruction rather than read back from the response
+ * (`mTempChipID = insBytes[1]`, ShimmerBluetooth.java:1087-1089).
+ */
+const EXG_REGS_RESPONSE_PAYLOAD_LENGTH = 11;
+/** EXG chip index — the `EXG_CHIP_INDEX` ordinal used in the instruction header. */
+const EXG_CHIP1 = 0;
+/** EXG chip index — chip 2. */
+const EXG_CHIP2 = 1;
+/**
+ * Build the GET_EXG_REGS instruction for one chip:
+ * `{0x63, chipID, 0, 10}` — read 10 registers starting at offset 0.
+ * Byte-for-byte port of ShimmerBluetooth.readEXGConfigurations
+ * (`writeInstruction(new byte[]{GET_EXG_REGS_COMMAND,(byte)(chipID.ordinal()),0,10})`,
+ * ShimmerBluetooth.java:4027).
+ */
+function buildGetExgRegsCommand(chip) {
+    return new Uint8Array([GET_EXG_REGS_COMMAND, chip, 0, EXG_BANK_LENGTH$1]);
+}
+/**
+ * Build the SET_EXG_REGS instruction for one chip:
+ * `{0x61, chipID, 0, 10, reg0..reg9}` — a single 14-byte write (the 10 register
+ * bytes fit one instruction, never chunked). Byte-for-byte port of
+ * ShimmerBluetooth.writeEXGConfiguration
+ * (`writeInstruction(new byte[]{SET_EXG_REGS_COMMAND,(byte)(chipID.ordinal()),0,10,reg[0]..reg[9]})`,
+ * ShimmerBluetooth.java:4224).
+ *
+ * @throws RangeError when `bank` is not exactly 10 bytes.
+ */
+function buildSetExgRegsCommand(chip, bank) {
+    if (bank.length !== EXG_BANK_LENGTH$1) {
+        throw new RangeError(`EXG register bank must be exactly ${EXG_BANK_LENGTH$1} bytes, got ${bank.length}.`);
+    }
+    const out = new Uint8Array(4 + EXG_BANK_LENGTH$1);
+    out[0] = SET_EXG_REGS_COMMAND;
+    out[1] = chip;
+    out[2] = 0;
+    out[3] = EXG_BANK_LENGTH$1;
+    out.set(bank, 4);
+    return out;
+}
+/**
+ * Extract the 10-byte register bank from an EXG_REGS_RESPONSE frame.
+ *
+ * The frame is `[0x62][count][reg0..reg9]` (opcode + {@link EXG_REGS_RESPONSE_PAYLOAD_LENGTH}
+ * payload bytes). Mirrors the Java `System.arraycopy(bufferAns, 1, …, 0, 10)`
+ * (ShimmerBluetooth.java:1646): the byte immediately after the opcode is the
+ * register count, which the driver ignores, and the 10 register bytes follow.
+ *
+ * @param frame the complete response including the leading 0x62 opcode.
+ * @throws RangeError when the frame is too short or does not start with 0x62.
+ */
+function decodeExgRegsResponse(frame) {
+    if (frame.length < 1 + EXG_REGS_RESPONSE_PAYLOAD_LENGTH) {
+        throw new RangeError(`EXG_REGS_RESPONSE must be ${1 + EXG_REGS_RESPONSE_PAYLOAD_LENGTH} bytes (opcode + ${EXG_REGS_RESPONSE_PAYLOAD_LENGTH} payload), got ${frame.length}.`);
+    }
+    if (frame[0] !== EXG_REGS_RESPONSE) {
+        throw new RangeError(`EXG_REGS_RESPONSE must start with 0x${EXG_REGS_RESPONSE.toString(16)}, got 0x${frame[0].toString(16)}.`);
+    }
+    // opcode at [0], echo byte at [1], 10 register bytes at [2..11].
+    return frame.slice(2, 2 + EXG_BANK_LENGTH$1);
+}
+/**
+ * Register index of REG8 (LOFF_STAT) within the 10-byte bank — the read-only
+ * lead-off status register (ExGConfigBytesDetails REG8). Its bits reflect the
+ * chip's live lead-off state, so the device never echoes back what was written;
+ * {@link exgBanksEqualIgnoringStatus} excludes it from read-back comparison.
+ */
+const EXG_REG8_STATUS_INDEX = 7;
+/**
+ * Compare two 10-byte register banks for read-back verification, ignoring the
+ * read-only REG8 (LOFF_STAT) status byte at index {@link EXG_REG8_STATUS_INDEX}.
+ * Every other register is host-writable and must echo back exactly.
+ */
+function exgBanksEqualIgnoringStatus(a, b) {
+    if (a.length !== EXG_BANK_LENGTH$1 || b.length !== EXG_BANK_LENGTH$1)
+        return false;
+    for (let i = 0; i < EXG_BANK_LENGTH$1; i++) {
+        if (i === EXG_REG8_STATUS_INDEX)
+            continue;
+        if (a[i] !== b[i])
+            return false;
+    }
+    return true;
+}
 
 /**
  * Low-level byte-manipulation utilities used by the Shimmer3R protocol decoder.
@@ -2061,6 +3315,126 @@ function parseShimmer3StatusBytes(bytes) {
 }
 
 /**
+ * Sensor enable bitmasks for Shimmer3 / Shimmer3R.
+ *
+ * Values are 24-bit integers sent as the payload of SET_SENSORS_CMD.
+ * Multiple sensors are ORed together.
+ *
+ * @example
+ * ```ts
+ * const mask = SensorBitmapShimmer3.SENSOR_GYRO | SensorBitmapShimmer3.SENSOR_A_ACCEL;
+ * await client.setSensors(mask);
+ * ```
+ */
+const SensorBitmapShimmer3 = Object.freeze({
+    SENSOR_A_ACCEL: 0x000080,
+    SENSOR_GYRO: 0x000040,
+    SENSOR_MAG: 0x000020,
+    SENSOR_GSR: 0x000004,
+    SENSOR_VBATT: 0x002000,
+    SENSOR_D_ACCEL: 0x001000,
+    SENSOR_PRESSURE: 0x040000,
+    SENSOR_EXG1_24BIT: 0x000010,
+    SENSOR_EXG2_24BIT: 0x000008,
+    SENSOR_EXG1_16BIT: 0x100000,
+    SENSOR_EXG2_16BIT: 0x080000,
+    SENSOR_BRIDGE_AMP: 0x008000,
+    SENSOR_ACCEL_ALT: 0x400000,
+    SENSOR_MAG_ALT: 0x200000,
+    SENSOR_EXT_A0: 0x000002,
+    SENSOR_EXT_A1: 0x000001,
+    SENSOR_EXT_A2: 0x000800,
+    SENSOR_INT_A3: 0x000400,
+    SENSOR_INT_A0: 0x000200,
+    SENSOR_INT_A1: 0x000100,
+    SENSOR_INT_A2: 0x800000,
+});
+/**
+ * Map a channel/signal ID from an inquiry response onto the
+ * {@link SensorBitmapShimmer3} bit that enables it, or 0 when the ID has no
+ * enable bit of its own.
+ *
+ * ORing these over a channel list reconstructs the enabled-sensor mask the
+ * device is actually running, which is what `SET_SENSORS_CMD` would have to
+ * send to reproduce it. Ported from
+ * `ShimmerObject#interpretDataPacketFormat`, whose Shimmer3 and Shimmer3R
+ * branches map the two generations' names for the shared ADC IDs onto the same
+ * bits (`ShimmerObject.java:4081-4126`) — e.g. 0x0D is `ExtAdc7` on a Shimmer3
+ * and `ExtAdc9` on a Shimmer3R, and both set `SENSOR_EXT_A0`. So this mapping
+ * needs no generation of its own, unlike the channel *format* table.
+ */
+function channelIdToSensorBit(id) {
+    switch (id) {
+        case 0x00:
+        case 0x01:
+        case 0x02:
+            return SensorBitmapShimmer3.SENSOR_A_ACCEL;
+        case 0x03:
+            return SensorBitmapShimmer3.SENSOR_VBATT;
+        case 0x04:
+        case 0x05:
+        case 0x06:
+            return SensorBitmapShimmer3.SENSOR_D_ACCEL;
+        case 0x07:
+        case 0x08:
+        case 0x09:
+            return SensorBitmapShimmer3.SENSOR_MAG;
+        case 0x0a:
+        case 0x0b:
+        case 0x0c:
+            return SensorBitmapShimmer3.SENSOR_GYRO;
+        case 0x0d:
+            return SensorBitmapShimmer3.SENSOR_EXT_A0;
+        case 0x0e:
+            return SensorBitmapShimmer3.SENSOR_EXT_A1;
+        case 0x0f:
+            return SensorBitmapShimmer3.SENSOR_EXT_A2;
+        case 0x10:
+            return SensorBitmapShimmer3.SENSOR_INT_A3;
+        case 0x11:
+            return SensorBitmapShimmer3.SENSOR_INT_A0;
+        case 0x12:
+            return SensorBitmapShimmer3.SENSOR_INT_A1;
+        case 0x13:
+            return SensorBitmapShimmer3.SENSOR_INT_A2;
+        case 0x14:
+        case 0x15:
+        case 0x16:
+            return SensorBitmapShimmer3.SENSOR_ACCEL_ALT;
+        case 0x17:
+        case 0x18:
+        case 0x19:
+            return SensorBitmapShimmer3.SENSOR_MAG_ALT;
+        // Pressure and temperature are enabled together by one bit — the firmware
+        // packs the pair or neither (`chEnPressureAndTemperature`).
+        case 0x1a:
+        case 0x1b:
+            return SensorBitmapShimmer3.SENSOR_PRESSURE;
+        case 0x1c:
+            return SensorBitmapShimmer3.SENSOR_GSR;
+        case 0x1e:
+        case 0x1f:
+            return SensorBitmapShimmer3.SENSOR_EXG1_24BIT;
+        case 0x21:
+        case 0x22:
+            return SensorBitmapShimmer3.SENSOR_EXG2_24BIT;
+        case 0x23:
+        case 0x24:
+            return SensorBitmapShimmer3.SENSOR_EXG1_16BIT;
+        case 0x25:
+        case 0x26:
+            return SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
+        case 0x27:
+        case 0x28:
+            return SensorBitmapShimmer3.SENSOR_BRIDGE_AMP;
+        // 0x1D / 0x20 are the ExG status bytes: they ride along with whichever ExG
+        // block is enabled and have no bit of their own.
+        default:
+            return 0;
+    }
+}
+
+/**
  * Building the streaming packet schema from an inquiry response's channel list.
  *
  * Shared by both families: `Shimmer3RClient` (framed BLE) and
@@ -2124,13 +3498,28 @@ function buildStreamSchema(channelIds, timestampFmt, opts) {
         enabledSensors |= channelIdToSensorBit(id);
     }
     // An assumed generation only matters if something in the list actually
-    // depends on it — a gyro-only packet decodes identically either way.
+    // depends on it — a gyro-only packet decodes identically either way. Of the
+    // channels that do differ, only those whose *layout* differs can misread the
+    // frame: across the ADC block the two generations disagree about the channel's
+    // name while `u16`/little-endian/2 bytes holds on both, so guessing wrong
+    // there mislabels a column without moving a single offset. Reporting that as
+    // untrustworthy would cry wolf on the commonest expansion-board setup, so it
+    // is said out loud and the schema stays trusted.
     const sensitive = [...new Set(Array.from(channelIds).filter(isGenerationSensitiveChannel))];
-    const generationMatters = generationAssumed && sensitive.length > 0;
+    const misdecoded = sensitive.filter(channelLayoutDiffersByGeneration);
+    const mislabelled = sensitive.filter((id) => !channelLayoutDiffersByGeneration(id));
+    const generationMatters = generationAssumed && misdecoded.length > 0;
     if (generationMatters) {
-        onProblem?.(`Channel(s) ${sensitive.map((id) => `0x${hex2$1(id)}`).join(', ')} are decoded differently on ` +
+        onProblem?.(`Channel(s) ${misdecoded.map((id) => `0x${hex2$1(id)}`).join(', ')} are decoded differently on ` +
             `a Shimmer3 and a Shimmer3R, and this schema assumed ${generation} because the device ` +
             `version has not been read. Call readDeviceVersion() before inquiry() to settle it.`);
+    }
+    if (generationAssumed && mislabelled.length > 0) {
+        onProblem?.(`Channel(s) ${mislabelled.map((id) => `0x${hex2$1(id)}`).join(', ')} carry a different name on ` +
+            `a Shimmer3 and a Shimmer3R, and this schema assumed ${generation} because the device ` +
+            `version has not been read. The bytes are laid out identically on both, so the frame ` +
+            `decodes correctly and stays trusted — only these channel names may be wrong. Call ` +
+            `readDeviceVersion() before inquiry() to settle them.`);
     }
     return {
         timestampFmt,
@@ -3076,6 +4465,89 @@ function shimmer3UsesThreeByteTimestamp(v) {
             return true; // unknown/newer firmware type — default to modern u24
     }
 }
+/**
+ * Hardware-version codes the firmware-version-code ladder below keys off
+ * (`ShimmerVerDetails.HW_ID`).
+ */
+const HW_ID$1 = Object.freeze({
+    SHIMMER_2R: 2,
+    SHIMMER_3: 3,
+    SHIMMER_3R: 10,
+});
+/**
+ * Derive the `ShimmerVerObject` "firmware version code" from a parsed FW version
+ * plus a hardware id — a port of the ladder at ShimmerVerObject.java:266-311.
+ *
+ * The code is a single monotonically-increasing capability number derived from
+ * the (HW id, FW id, major.minor.internal) tuple; the Java driver gates several
+ * protocol features on it rather than on the raw version. Returns `-1` when no
+ * rung matches (firmware older than every known threshold), exactly as Java
+ * initialises it.
+ *
+ * Only the rungs reachable by the hardware this SDK talks to are ported.
+ * Java also awards code 7 on a bare hardware-id match for Shimmer4-SDK and
+ * Arduino, code 6 for the two ShimmerGQ 802.15.4 boards and code 5 for SWEATCH,
+ * none of which these clients connect to; and code 7 on `mFirmwareIdentifier ==
+ * FW_ID.STROKARE`, a bespoke firmware build this SDK has no FW_ID for. A device
+ * running one of those would land one rung lower here than in Java — still
+ * above the ExG gate below in every case, so the difference is inert.
+ *
+ * `compareVersions` semantics (UtilShimmer.java:620-629, via :536-543): same HW
+ * id AND same FW id AND `this` version >= the target, comparing major, then
+ * minor, then internal with `>=`.
+ */
+function deriveShimmer3FirmwareVersionCode(fw, hardwareVersion) {
+    const { firmwareIdentifier: id, major, minor, internal } = fw;
+    const ge = (tHw, tId, tMaj, tMin, tInt) => {
+        if (hardwareVersion !== tHw || id !== tId)
+            return false;
+        return (major > tMaj || (major === tMaj && (minor > tMin || (minor === tMin && internal >= tInt))));
+    };
+    const L = FW_ID$1.LOGANDSTREAM;
+    const B = FW_ID$1.BTSTREAM;
+    const S = FW_ID$1.SDLOG;
+    if (ge(HW_ID$1.SHIMMER_3, L, 0, 16, 6))
+        return 9;
+    if (ge(HW_ID$1.SHIMMER_3R, L, 0, 0, 1) ||
+        ge(HW_ID$1.SHIMMER_3, L, 0, 13, 7) ||
+        ge(HW_ID$1.SHIMMER_3, S, 0, 20, 1)) {
+        return 8;
+    }
+    if (ge(HW_ID$1.SHIMMER_3, L, 0, 6, 5))
+        return 7;
+    if (ge(HW_ID$1.SHIMMER_3, B, 0, 7, 3) ||
+        ge(HW_ID$1.SHIMMER_3, L, 0, 5, 4) ||
+        ge(HW_ID$1.SHIMMER_3, S, 0, 11, 5)) {
+        return 6;
+    }
+    if (ge(HW_ID$1.SHIMMER_3, B, 0, 5, 0) || ge(HW_ID$1.SHIMMER_3, L, 0, 3, 0))
+        return 5;
+    if (ge(HW_ID$1.SHIMMER_3, B, 0, 4, 0) || ge(HW_ID$1.SHIMMER_3, L, 0, 2, 0))
+        return 4;
+    if (ge(HW_ID$1.SHIMMER_3, B, 0, 3, 0) || ge(HW_ID$1.SHIMMER_3, L, 0, 1, 0))
+        return 3;
+    if (ge(HW_ID$1.SHIMMER_3, B, 0, 2, 0))
+        return 2;
+    if (ge(HW_ID$1.SHIMMER_2R, B, 1, 2, 0) || ge(HW_ID$1.SHIMMER_3, B, 0, 1, 0))
+        return 1;
+    return -1;
+}
+/**
+ * Whether this firmware carries the live ExG GET/SET register commands — the
+ * gate the Java driver applies before every ExG read and write:
+ * `(getFirmwareVersionInternal() >= 8 && getFirmwareVersionCode() == 2) ||
+ * getFirmwareVersionCode() > 2` (ShimmerBluetooth.java:4015,4026,4205,4223).
+ *
+ * `firmwareVersionCode == 2` is exactly classic-Shimmer3 BtStream in
+ * [0.2.0, 0.3.0), which only gained the ExG commands at internal 8 — hence the
+ * extra `internal >= 8` leg. Everything newer (code > 2: all LogAndStream,
+ * BtStream >= 0.3.0, SDLog, and every Shimmer3R) has them unconditionally.
+ * BtStream 0.1.x (code 1) and anything below every rung (code -1) are rejected.
+ */
+function shimmer3SupportsExg(fw, hardwareVersion) {
+    const code = deriveShimmer3FirmwareVersionCode(fw, hardwareVersion);
+    return (fw.internal >= 8 && code === 2) || code > 2;
+}
 // ---------------------------------------------------------------------------
 // Unframed-stream control-message framing
 // ---------------------------------------------------------------------------
@@ -3136,6 +4608,20 @@ function shimmer3ControlMessageLength(buf) {
         if (numChannels > 32)
             return RESYNC$1;
         return SHIMMER3_INQ_CHANNELS_OFFSET + numChannels; // 9 + numChannels
+    }
+    if (opcode === OPCODES.EXG_REGS_RESPONSE) {
+        // Variable length: [opcode][count][reg0..reg(count-1)]. The count byte is
+        // the number of registers the firmware is returning, echoed from the request
+        // (`*(resPacket + packet_length++) = exgLength`,
+        // `log-and-stream-common/Comms/shimmer_bt_uart.c:2223-2225`). One ADS1292R
+        // bank is `EXG_BANK_LENGTH` registers and the SDK never asks for more, so a
+        // larger "count" is garbage — resync rather than swallow up to 257 bytes of
+        // real control traffic, the same policy as the memory reads below.
+        if (buf.length < 2)
+            return NEED_MORE$1;
+        if (buf[1] > EXG_BANK_LENGTH$1)
+            return RESYNC$1;
+        return 2 + buf[1];
     }
     if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE || opcode === OPCODES.INFOMEM_RESPONSE) {
         // Variable length: [opcode][length][data...]. Firmware caps both a
@@ -5241,19 +6727,31 @@ function writeCalibration(out, config, layout) {
  * read-change-write cycle cannot silently destroy a stored node list just
  * because sync happens to be off; a caller that wants the Java behaviour sets
  * `syncNodes: []`.
+ *
+ * The list is TERMINATED by the first all-0xFF slot — that is where
+ * `parseSyncNodes` stops, and the firmware reads it the same way. So the first
+ * missing, malformed or literally all-0xFF entry ends the list here too, and
+ * every slot after it is padded. Writing a real MAC behind a terminator would
+ * put bytes in the image that no reader can reach, and the list would come
+ * back shorter than it went in.
  */
 function writeSyncNodes(out, config, layout) {
     if (!layout.supportsSdLogSync)
         return;
+    let terminated = false;
     for (let i = 0; i < MAX_SYNC_NODES; i++) {
         const offset = layout.idxNode0 + i * MAC_LENGTH;
-        const mac = config.syncNodes[i];
-        if (mac === undefined) {
+        const mac = terminated ? undefined : config.syncNodes[i];
+        // macFromHex already yields all-0xFF for unparseable input, so this one
+        // test covers a bad string and a real FFFFFFFFFFFF alike.
+        const bytes = mac === undefined ? undefined : macFromHex(mac);
+        if (bytes === undefined || bytes.every((b) => b === 0xff)) {
+            terminated = true;
             for (let b = 0; b < MAC_LENGTH; b++)
                 out[offset + b] = 0xff;
         }
         else {
-            setBytes(out, offset, macFromHex(mac));
+            setBytes(out, offset, bytes);
         }
     }
 }
@@ -6746,17 +8244,26 @@ function writeInfoMemFieldValue(bytes, field, layout, value) {
         }
         case 'mac6[]': {
             const macs = value;
+            // The list is terminated by the first all-0xFF slot, which is where
+            // readInfoMemFieldValue stops. So a missing, malformed or all-0xFF entry
+            // ends the list and every later slot is padded: a MAC written behind a
+            // terminator is unreachable on the next read and would leave the image
+            // holding bytes that contradict the list it parses as.
+            let terminated = false;
             for (let n = 0; n < MAX_NODES; n++) {
                 const at = idx + n * MAC_LEN;
-                const mac = macs[n];
-                if (mac === undefined || !/^[0-9a-fA-F]{12}$/.test(mac)) {
+                const mac = terminated ? undefined : macs[n];
+                const parsed = mac !== undefined && /^[0-9a-fA-F]{12}$/.test(mac)
+                    ? Array.from({ length: MAC_LEN }, (_unused, b) => Number.parseInt(mac.slice(b * 2, b * 2 + 2), 16))
+                    : null;
+                if (parsed === null || parsed.every((b) => b === 0xff)) {
+                    terminated = true;
                     for (let b = 0; b < MAC_LEN; b++)
                         bytes[at + b] = 0xff;
                 }
                 else {
-                    for (let b = 0; b < MAC_LEN; b++) {
-                        bytes[at + b] = Number.parseInt(mac.slice(b * 2, b * 2 + 2), 16);
-                    }
+                    for (let b = 0; b < MAC_LEN; b++)
+                        bytes[at + b] = parsed[b];
                 }
             }
             return;
@@ -6841,6 +8348,40 @@ const SHIMMER3R_INFOMEM_BLE_CHUNK_BYTES = 64;
  * (`Calibration/shimmer_calibration.c:372-380`).
  */
 const CALIB_DUMP_CHUNK_BYTES = 128;
+// ---------------------------------------------------------------------------
+// Stray-ACK tolerance
+// ---------------------------------------------------------------------------
+/**
+ * A control message with a leading ACK byte stepped over, so a waiter matches
+ * on the opcode the firmware composed rather than on framing sitting in front
+ * of it.
+ *
+ * Needed because `_expectingAck` is a COUNT, not a queue: any ACK satisfies any
+ * outstanding expectation. The two stop commands write without registering one
+ * ({@link Shimmer3RClient.stopStreaming},
+ * {@link Shimmer3RClient.stopStreamingAndLogging}) and yet the firmware ACKs
+ * them, so a host that asks for something straight after a stop has that stray
+ * ACK counted as its own command's — and its command's REAL reply then arrives
+ * with the count already back at zero, unconsumed by the ACK branch of
+ * {@link Shimmer3RClient._handleFramedChunk}. Over BLE the module packs that
+ * reply in behind its own ACK, so what reaches the waiters is
+ * `[0xFF][0x8A][0x71]…` with the ACK still on the front. A waiter that matches
+ * at offset 0 alone misses it and times out on a reply that did arrive.
+ *
+ * Stepping over the byte here, rather than balancing the count by waiting for
+ * the stop's ACK at the stop, is what keeps that deliberate no-ACK-wait intact
+ * — see {@link Shimmer3RClient.stopStreaming} for why waiting there is the
+ * worse trade. It costs nothing when the count was right all along: no message
+ * the firmware composes begins with an ACK of its own, and a lone ACK is left
+ * alone so the waiters go on ignoring it.
+ *
+ * A byte stream does not strictly need this — `_extractUnframedMessages` has
+ * already split the ACK into its own message — but it is applied on both paths
+ * so the two transports agree on what a waiter accepts.
+ */
+function withoutLeadingAck(msg) {
+    return msg.length > 1 && msg[0] === OPCODES.ACK_COMMAND_PROCESSED ? msg.subarray(1) : msg;
+}
 // ---------------------------------------------------------------------------
 // Shimmer3RClient
 // ---------------------------------------------------------------------------
@@ -7230,33 +8771,32 @@ class Shimmer3RClient extends BaseShimmerClient {
             return;
         // A push carries the ACK prefix when the firmware's
         // `useAckPrefixForInstreamResponses` flag is on
-        // (SET_INSTREAM_RESPONSE_ACK_PREFIX_STATE, 0xA3), so step over one if it is
-        // there. On a byte stream the drain has already split the ACK off, but over
-        // BLE it shares the notification.
-        const at = chunk[0] === OPCODES.ACK_COMMAND_PROCESSED ? 1 : 0;
-        if (chunk[at] !== OPCODES.INSTREAM_CMD_RESPONSE)
+        // (SET_INSTREAM_RESPONSE_ACK_PREFIX_STATE, 0xA3), and a stray ACK can be
+        // sitting in front of it besides; `withoutLeadingAck` covers both.
+        const msg = withoutLeadingAck(chunk);
+        if (msg[0] !== OPCODES.INSTREAM_CMD_RESPONSE)
             return;
-        if (chunk[at + 1] !== OPCODES.STATUS_RESPONSE)
+        if (msg[1] !== OPCODES.STATUS_RESPONSE)
             return;
         // Somebody's answer, not news: `getStatus` reports it to its own caller.
         if (this._statusReadsInFlight > 0)
             return;
-        // The payload must be ALL there, not merely started. A guard of `at + 3`
-        // let a push with one status byte through on a two-byte platform, and the
-        // parser then reported `usbPluggedIn: null` — indistinguishable, to the
+        // The payload must be ALL there, not merely started. A guard of three
+        // bytes let a push with one status byte through on a two-byte platform, and
+        // the parser then reported `usbPluggedIn: null` — indistinguishable, to the
         // caller, from a Shimmer3 that has no such field.
         const need = this._minStatusPayloadBytes;
-        if (chunk.length < at + 2 + need) {
+        if (msg.length < 2 + need) {
             // Dropped rather than surfaced: nobody asked for this message, so there
             // is no caller waiting to be failed, and inventing a status is worse than
             // missing one the firmware will push again on the next change. Logged
             // because a short push means the framing is wrong, which is exactly the
             // kind of thing whoever turned `debug` on is looking for.
-            this._log('Dropping truncated STATUS push:', chunk.length - at - 2, 'payload byte(s), need', need);
+            this._log('Dropping truncated STATUS push:', msg.length - 2, 'payload byte(s), need', need);
             return;
         }
         try {
-            this.onDeviceStatus(parseShimmer3StatusBytes(chunk.subarray(at + 2, at + 2 + this._statusPayloadBytes)));
+            this.onDeviceStatus(parseShimmer3StatusBytes(msg.subarray(2, 2 + this._statusPayloadBytes)));
         }
         catch (e) {
             this._log('onDeviceStatus handler error', e);
@@ -7967,11 +9507,33 @@ class Shimmer3RClient extends BaseShimmerClient {
      * arriving partway through a chunked write leaves a half-written image on the
      * device. A named refusal also reads far better than the ACK timeout the same
      * situation used to produce.
+     *
+     * The guard is **only** as good as `_streaming`, which tracks the streams
+     * this client started. The firmware blocks configuration writes for anything
+     * it considers sensing, SD logging included, and this client holds no local
+     * SD-logging flag — `readStatus()` is the only way to learn about a log
+     * started before it connected or by another host. So a write can still be
+     * refused by the device after passing this check; that refusal arrives as a
+     * NACK and is reported as one. The message says as much rather than implying
+     * the check covers both.
+     */
+    /**
+     * Refuse a configuration write the firmware would reject anyway.
+     *
+     * Covers what this client started, streaming or streaming-plus-SD-logging,
+     * since both set the same flag. It cannot cover a recording the client did
+     * not start — one begun with the sensor's own button, or by a scheduled
+     * trial — because no local flag is set for those; there the device NACKs the
+     * write, which surfaces as a failure rather than as this refusal.
+     * {@link getStatus} reports the sensor's actual sensing and SD-logging state
+     * for a caller that wants to know before trying.
      */
     _assertNotSensingForConfigWrite(what) {
         if (this._streaming) {
-            throw new Error(`${what} is unavailable while streaming — the firmware refuses every ` +
-                'configuration write while sensing. Stop streaming or SD logging first.');
+            throw new Error(`${what} is unavailable while this client is streaming — the firmware ` +
+                'refuses every configuration write while the sensor is sensing. Call ' +
+                'stopStreaming(), or stopStreamingAndLogging() if the recording was ' +
+                'started with startStreamingAndLogging(), which sets the same flag.');
         }
     }
     /** Paged InfoMem read (D → C → B) against an already-resolved context. */
@@ -8063,54 +9625,175 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._emitStatus('RWC set');
     }
     // ---------------------------------------------------------------------------
-    // ExG configuration helpers
+    // ExG (ADS1292R) live configuration — GET / SET / preset apply
+    //
+    // Codec-driven port of the Java ExG BT command flow
+    // (ShimmerBluetooth.readEXGConfigurations / writeEXGConfiguration, :4014-4226),
+    // replacing the hardcoded 16-bit-only preset instruction arrays this section
+    // used to carry. The register banks now come from the shared, transport-free
+    // codec in `../exg/` and the GET/SET framing from `../exg/live.ts`, so
+    // Shimmer3R and classic Shimmer3 share one definition of both.
     // ---------------------------------------------------------------------------
-    /** Enable EMG (ADS1292R) in 16-bit mode on EXG1 & EXG2. */
+    /**
+     * Read both ExG chips' 10-byte register banks over the radio
+     * (GET_EXG_REGS ×2 → EXG_REGS_RESPONSE decode). Ported from
+     * ShimmerBluetooth.readEXGConfigurations, which issues one GET for CHIP1 then
+     * one for CHIP2 (ShimmerBluetooth.java:4014-4018).
+     *
+     * @throws Error when not connected, or while streaming — the read-back needs
+     *   the control plane, which the data plane owns for the duration of a stream.
+     */
+    async readExgConfig(timeoutMs = 2000) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming)
+            throw new Error('Cannot read ExG registers while streaming');
+        const exg1 = await this._readExgChip(EXG_CHIP1, timeoutMs);
+        const exg2 = await this._readExgChip(EXG_CHIP2, timeoutMs);
+        return { exg1, exg2 };
+    }
+    /**
+     * Read one chip's bank. EXG_REGS_RESPONSE is `[0x62][count][reg0..reg9]` — the
+     * byte after the opcode is the register COUNT the firmware is returning, which
+     * it echoes from the request (`*(resPacket + packet_length++) = exgLength`,
+     * `log-and-stream-common/Comms/shimmer_bt_uart.c:2227-2229`). That is the same
+     * length-prefixed shape as an InfoMem or daughter-card read, so this reuses
+     * {@link _readLengthPrefixedResponse} and inherits its ACK-piggyback handling,
+     * notification reassembly, and tolerance of firmware that omits the prefix.
+     */
+    async _readExgChip(chip, timeoutMs) {
+        return this._readLengthPrefixedResponse(buildGetExgRegsCommand(chip), OPCODES.EXG_REGS_RESPONSE, EXG_BANK_LENGTH$1, `ExG chip ${chip + 1} register read`, 1, 1500, timeoutMs);
+    }
+    /**
+     * Write both ExG chips' 10-byte register banks over the radio
+     * (SET_EXG_REGS ×2), then read them back and verify.
+     *
+     * Ports ShimmerBluetooth.writeEXGConfiguration (:4222-4226) — one 14-byte
+     * instruction per chip — with the Shimmer3R-specific oversampling-ratio
+     * injection into REG1 (see {@link _injectOversamplingRatio}).
+     *
+     * WRITE-SAFETY DEVIATION FROM JAVA: the Java driver fires SET_EXG_REGS and does
+     * not verify, relying on a timeout→disconnect failsafe if the write silently
+     * fails (ShimmerBluetooth.java:4212-4216; the register array is cached
+     * driver-side on the bare ACK, :2132). The safer flow is ported instead:
+     * SET → await ACK → GET read-back → compare, ignoring only the read-only REG8
+     * status byte → throw on mismatch. A bad or no-op write therefore surfaces here
+     * rather than as a puzzling disconnect later.
+     *
+     * @throws Error when not connected, while streaming, or on a read-back mismatch.
+     * @throws RangeError when either bank is not exactly 10 bytes.
+     */
+    async writeExgConfig(exg1, exg2) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming)
+            throw new Error('Cannot write ExG registers while streaming');
+        if (exg1.length !== EXG_BANK_LENGTH$1 || exg2.length !== EXG_BANK_LENGTH$1) {
+            throw new RangeError(`ExG register banks must be exactly ${EXG_BANK_LENGTH$1} bytes each, got ${exg1.length}/${exg2.length}.`);
+        }
+        const b1 = this._injectOversamplingRatio(exg1);
+        const b2 = this._injectOversamplingRatio(exg2);
+        await this._writeExpectingAck(buildSetExgRegsCommand(EXG_CHIP1, b1), 1500);
+        await this._writeExpectingAck(buildSetExgRegsCommand(EXG_CHIP2, b2), 1500);
+        const readBack = await this.readExgConfig();
+        if (!exgBanksEqualIgnoringStatus(b1, readBack.exg1) ||
+            !exgBanksEqualIgnoringStatus(b2, readBack.exg2)) {
+            throw new Error('ExG write read-back mismatch: device registers do not match what was written');
+        }
+        this._emitStatus('ExG registers written and verified.');
+    }
+    /**
+     * Shimmer3R-only: overwrite REG1's (bank byte 0) low 3 bits with the ADS1292R
+     * oversampling ratio for the current sampling rate. This reproduces exactly
+     * what the previous `_writeExgPages` did — `exg[4] = ((exg[4] >> 3) << 3) |
+     * ratio`, where byte 4 of the old 14-byte instruction was register byte 0 — and
+     * keeps using {@link getOversamplingRatioADS1292R} rather than the codec's
+     * `exgRateSettingFromFreq`. The two disagree on purpose: this one uses strict
+     * `<` thresholds (calibration.ts:89, the live-BT path) where the docked
+     * InfoMem/config-generation path uses `<=` (SensorEXG.setExGRateFromFreq), so
+     * they differ at exactly the boundary rates. Classic Shimmer3 does neither —
+     * ShimmerBluetooth.writeEXGConfiguration writes reg[0] verbatim (:4224).
+     */
+    _injectOversamplingRatio(bank) {
+        const ratio = getOversamplingRatioADS1292R(this.samplingRateHz);
+        const out = new Uint8Array(bank);
+        out[0] = (((out[0] >> 3) << 3) | ratio) & 0xff;
+        return out;
+    }
+    /**
+     * Apply an ExG preset live: derive the register banks and the enabled-sensors
+     * bitmap from the client's current inquiry state (sampling rate, enabled
+     * sensors) via the codec's `applyExgPreset`, write the registers, then update
+     * the bitmap.
+     *
+     * ORDER: ExG registers first, enabled sensors LAST. The desktop write flow
+     * marks `writeEnabledSensors(...)` "this should always be the last command"
+     * (ShimmerBluetooth.java:2732,2735) and runs `writeEXGConfiguration()` earlier
+     * in the same flow (:2670). {@link setSensors} re-inquires, so the streaming
+     * schema and `enabledSensors` end up reflecting the new preset.
+     */
+    async applyExgPresetLive(preset, resolution) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (this._streaming)
+            throw new Error('Cannot configure ExG while streaming');
+        // 'off' — LIVE disable. Java never pushes zeroed register banks at the chip:
+        // the ADS1292R forces its must-be bits on write (CONFIG2 bit7 = 1 etc.,
+        // ExGConfigBytesDetails.java:507-525), so a zeroed SET would read back
+        // non-zero and fail the verify in writeExgConfig. The disable is done purely
+        // by dropping the ExG bits from the enabled-sensors bitmap
+        // (writeEnabledSensors, ShimmerBluetooth.java:2732,2735; the ExG register
+        // read/write only run while ExG stays enabled, :2670,4014-4018). The DOCKED
+        // path (`applyExgPreset('off')`) does zero the InfoMem banks — InfoMem is
+        // passive storage, and that is what detectExgPreset keys 'off' off.
+        if (preset === 'off') {
+            await this.setSensors(clearExgResolutionFlags(this.enabledSensors));
+            this._emitStatus("ExG preset 'off' applied (ExG chips disabled). Schema updated.");
+            return;
+        }
+        // Seeded from the device's current banks so that the oscillator-clock
+        // PRESERVE path is honoured on hardware whose joined-clock state cannot be
+        // inferred from the hardware id (a classic Shimmer3 with a rev >= 4 unified
+        // ExG board). On a Shimmer3R the banks are fully determined by the preset.
+        const current = await this.readExgConfig();
+        const result = applyExgPreset({
+            exg1: current.exg1,
+            exg2: current.exg2,
+            enabledSensors: this.enabledSensors,
+            samplingRateHz: this.samplingRateHz,
+            hardwareVersion: HW_ID.SHIMMER_3R,
+        }, preset, resolution);
+        await this.writeExgConfig(result.exg1, result.exg2);
+        // Enabled sensors last; setSensors re-inquires and refreshes the schema.
+        await this.setSensors(result.enabledSensors);
+        this._emitStatus(`ExG preset '${preset}' (${resolution}) applied. Schema updated.`);
+    }
+    /**
+     * Enable EMG (ADS1292R) in 16-bit mode.
+     *
+     * Thin wrapper over {@link applyExgPresetLive} so the preset bytes have exactly
+     * one source (`EXG_PRESET_ARRAYS` in `../exg/presets.ts`). NOTE that, following
+     * the Java driver, the EMG preset powers chip 2 down and so enables the chip-1
+     * resolution flag ONLY (SensorEXG.setExgChannelBitsPerMode, :2162-2182); the
+     * hardcoded version of this helper enabled both chips' 16-bit flags and
+     * streamed two channels of powered-down noise.
+     */
     async enableEMG16Bit() {
-        if (!this._transport)
-            throw new Error('Not connected (RX missing)');
-        await this._writeExgPages(new Uint8Array([
-            0x61, 0x00, 0x00, 0x0a, 0x02, 0xa8, 0x10, 0x69, 0x60, 0x20, 0x00, 0x00, 0x02, 0x03,
-        ]), new Uint8Array([
-            0x61, 0x01, 0x00, 0x0a, 0x02, 0xa0, 0x10, 0xe1, 0xe1, 0x00, 0x00, 0x00, 0x02, 0x01,
-        ]));
-        this._emitStatus('EMG 16-bit enabled on EXG1 & EXG2. Schema updated.');
+        await this.applyExgPresetLive('emg', '16bit');
     }
-    /** Enable EXG test signal in 16-bit mode (useful for verifying ExG hardware). */
+    /**
+     * Enable the ExG test signal in 16-bit mode (useful for verifying ExG hardware).
+     * Thin wrapper over {@link applyExgPresetLive} — see {@link enableEMG16Bit}.
+     */
     async enableEXGTestSignal16Bit() {
-        if (!this._transport)
-            throw new Error('Not connected (RX missing)');
-        await this._writeExgPages(new Uint8Array([
-            0x61, 0x00, 0x00, 0x0a, 0x02, 0xab, 0x10, 0x15, 0x15, 0x00, 0x00, 0x00, 0x02, 0x01,
-        ]), new Uint8Array([
-            0x61, 0x01, 0x00, 0x0a, 0x02, 0xa3, 0x10, 0x15, 0x15, 0x00, 0x00, 0x00, 0x02, 0x01,
-        ]));
-        this._emitStatus('EXG test signal 16-bit enabled. Schema updated.');
+        await this.applyExgPresetLive('test-signal', '16bit');
     }
-    /** Enable ECG in 16-bit mode on EXG1 & EXG2. */
+    /**
+     * Enable ECG in 16-bit mode on EXG1 & EXG2.
+     * Thin wrapper over {@link applyExgPresetLive} — see {@link enableEMG16Bit}.
+     */
     async enableECG16Bit() {
-        if (!this._transport)
-            throw new Error('Not connected (RX missing)');
-        await this._writeExgPages(new Uint8Array([
-            0x61, 0x00, 0x00, 0x0a, 0x02, 0xa8, 0x10, 0x40, 0x40, 0x2d, 0x00, 0x00, 0x02, 0x03,
-        ]), new Uint8Array([
-            0x61, 0x01, 0x00, 0x0a, 0x02, 0xa0, 0x10, 0x40, 0x47, 0x00, 0x00, 0x00, 0x02, 0x01,
-        ]));
-        this._emitStatus('ECG 16-bit enabled on EXG1 & EXG2. Schema updated.');
-    }
-    async _writeExgPages(exg1, exg2) {
-        const oversamplingRatio = getOversamplingRatioADS1292R(this.samplingRateHz);
-        exg1 = new Uint8Array(exg1);
-        exg2 = new Uint8Array(exg2);
-        exg1[4] = (((exg1[4] >> 3) << 3) | oversamplingRatio) & 0xff;
-        exg2[4] = (((exg2[4] >> 3) << 3) | oversamplingRatio) & 0xff;
-        await this._write(exg1);
-        await new Promise((r) => setTimeout(r, 200));
-        await this._write(exg2);
-        await new Promise((r) => setTimeout(r, 50));
-        const targetBits = (SensorBitmapShimmer3.SENSOR_EXG1_16BIT | SensorBitmapShimmer3.SENSOR_EXG2_16BIT) >>> 0;
-        const newMask = ((this.enabledSensors >>> 0) | targetBits) & 0xffffff;
-        await this.setSensors(newMask);
+        await this.applyExgPresetLive('ecg', '16bit');
     }
     // ---------------------------------------------------------------------------
     // Calibration fetch (opt-in)
@@ -8686,12 +10369,15 @@ class Shimmer3RClient extends BaseShimmerClient {
             const handler = (chunk) => {
                 if (!chunk || chunk.length === 0)
                     return;
-                if (chunk.length === 1 && chunk[0] === OPCODES.ACK_COMMAND_PROCESSED)
-                    return;
-                if (chunk[0] === expectedOpcode) {
+                // The expected opcode first, so a reply is never mistaken for framing;
+                // then the same message with a stray ACK stepped over. Resolving with
+                // the stripped buffer is what lets every caller keep reading its reply
+                // from offset 0.
+                const msg = chunk[0] === expectedOpcode ? chunk : withoutLeadingAck(chunk);
+                if (msg[0] === expectedOpcode) {
                     clearTimeout(t);
                     this._offTemp(handler);
-                    resolve(chunk);
+                    resolve(msg);
                 }
             };
             this._onTemp(handler);
@@ -8711,6 +10397,8 @@ class Shimmer3RClient extends BaseShimmerClient {
      */
     _waitForInstreamResponse(subOpcode, payloadLen, timeoutMs = 1500) {
         const matches = (c) => c.length >= 2 + payloadLen && c[0] === OPCODES.INSTREAM_CMD_RESPONSE && c[1] === subOpcode;
+        /** The instream message a chunk carries, past any stray ACK in front. */
+        const message = (c) => c[0] === OPCODES.INSTREAM_CMD_RESPONSE ? c : withoutLeadingAck(c);
         // BLE packs [0xFF][0x8A][0x71]… into a single notification, so the reply may
         // already be sitting in the ACK's remainder — the same synchronous hand-over
         // `_waitForResponse` performs for a plain opcode. Without this the message
@@ -8726,11 +10414,14 @@ class Shimmer3RClient extends BaseShimmerClient {
                 reject(new Error(`Instream response 0x${hex2$1(subOpcode)} timeout`));
             }, timeoutMs);
             const handler = (chunk) => {
-                if (!chunk || !matches(chunk))
+                if (!chunk)
+                    return;
+                const msg = message(chunk);
+                if (!matches(msg))
                     return;
                 clearTimeout(t);
                 this._offTemp(handler);
-                resolve(chunk);
+                resolve(msg);
             };
             this._onTemp(handler);
         });
@@ -11541,6 +13232,152 @@ class Shimmer3Client extends BaseShimmerClient {
         return { expPower };
     }
     // ---------------------------------------------------------------------------
+    // ExG (ADS1292R) live configuration — GET / SET / preset apply
+    //
+    // The same LiteProtocol ExG command flow as Shimmer3R, ported from
+    // ShimmerBluetooth.readEXGConfigurations / writeEXGConfiguration (:4014-4226)
+    // and sharing the register codec and GET/SET framing in `../exg/`. Classic
+    // Shimmer3 differs from the 3R in two respects: it writes the register banks
+    // VERBATIM — the oversampling-ratio injection into REG1 is 3R-only, Java writes
+    // reg[0] unchanged (:4224) — and its firmware range is wide enough that the
+    // ExG command set has to be gated on the firmware version.
+    // ---------------------------------------------------------------------------
+    /**
+     * Assert this device's firmware has the live ExG GET/SET commands, so an ExG
+     * call on firmware without them fails immediately instead of hanging until the
+     * response timeout. Applies the Java gate via {@link shimmer3SupportsExg}
+     * (ShimmerBluetooth.java:4015,4026,4205,4223), which derives the firmware
+     * version code from the parsed FW version plus the hardware id exactly as
+     * ShimmerVerObject does. Old BtStream (code 1, or code 2 below internal 8) is
+     * rejected up front.
+     *
+     * @throws Error when not connected, before the connect handshake has learned
+     *   the versions, or on firmware without the ExG command set.
+     */
+    _assertExgSupported() {
+        if (!this._transport)
+            throw new Error('Not connected');
+        if (this.firmwareVersion == null || this.deviceVersion == null) {
+            throw new Error('ExG requires a completed connect handshake (firmware version unknown)');
+        }
+        if (!shimmer3SupportsExg(this.firmwareVersion, this.deviceVersion.hardwareVersion)) {
+            const { major, minor, internal } = this.firmwareVersion;
+            const code = deriveShimmer3FirmwareVersionCode(this.firmwareVersion, this.deviceVersion.hardwareVersion);
+            throw new Error(`ExG register commands are not supported by this firmware ` +
+                `(v${major}.${minor}.${internal}, firmware code ${code}). ` +
+                `They need a firmware code of 3 or more — which every LogAndStream ` +
+                `build, every Shimmer3R, BtStream 0.3.0 and later, and SDLog reach — ` +
+                `or code 2 with an internal version of 8 or more (BtStream 0.2.8 to ` +
+                `0.2.x).` +
+                (code === -1
+                    ? ' A code of -1 means the reported version matched no known ' +
+                        'release, so it is refused whatever the firmware calls itself.'
+                    : ''));
+        }
+    }
+    /**
+     * Read both ExG chips' 10-byte register banks (GET_EXG_REGS ×2 →
+     * EXG_REGS_RESPONSE decode). Ported from
+     * ShimmerBluetooth.readEXGConfigurations (:4014-4018): CHIP1 then CHIP2.
+     *
+     * @throws Error when the firmware lacks ExG support, when not connected, or
+     *   while streaming (the control plane belongs to the stream parser then).
+     */
+    async readExgConfig(timeoutMs = SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+        this._assertExgSupported();
+        if (this._streaming)
+            throw new Error('Cannot read ExG registers while streaming');
+        const exg1 = await this._readExgChip(EXG_CHIP1, timeoutMs);
+        const exg2 = await this._readExgChip(EXG_CHIP2, timeoutMs);
+        return { exg1, exg2 };
+    }
+    async _readExgChip(chip, timeoutMs) {
+        // GET is ACK-then-response, and _waitForResponse already tolerates the
+        // optional ACK prefix (as inquiry() relies on), so register for the response
+        // directly instead of awaiting the ACK first — no race if the device
+        // coalesces the two into one RFCOMM chunk.
+        await this._write(buildGetExgRegsCommand(chip));
+        const frame = await this._waitForResponse(OPCODES.EXG_REGS_RESPONSE, timeoutMs);
+        return decodeExgRegsResponse(frame);
+    }
+    /**
+     * Write both ExG chips' 10-byte register banks (SET_EXG_REGS ×2), then read
+     * them back and verify. The banks go out verbatim — the oversampling-ratio
+     * injection is Shimmer3R-only.
+     *
+     * WRITE-SAFETY DEVIATION FROM JAVA: Java applies SET_EXG_REGS immediately and
+     * does not verify, relying on a timeout→disconnect failsafe
+     * (ShimmerBluetooth.java:4212-4216). The safer flow is ported instead: SET →
+     * await ACK → GET read-back → compare, ignoring only the read-only REG8 status
+     * byte → throw on mismatch.
+     *
+     * @throws Error when unsupported, not connected, streaming, or on a mismatch.
+     * @throws RangeError when either bank is not exactly 10 bytes.
+     */
+    async writeExgConfig(exg1, exg2) {
+        this._assertExgSupported();
+        if (this._streaming)
+            throw new Error('Cannot write ExG registers while streaming');
+        if (exg1.length !== EXG_BANK_LENGTH$1 || exg2.length !== EXG_BANK_LENGTH$1) {
+            throw new RangeError(`ExG register banks must be exactly ${EXG_BANK_LENGTH$1} bytes each, got ${exg1.length}/${exg2.length}.`);
+        }
+        const b1 = new Uint8Array(exg1);
+        const b2 = new Uint8Array(exg2);
+        await this._writeExpectingAck(buildSetExgRegsCommand(EXG_CHIP1, b1), SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        await this._writeExpectingAck(buildSetExgRegsCommand(EXG_CHIP2, b2), SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+        const readBack = await this.readExgConfig();
+        if (!exgBanksEqualIgnoringStatus(b1, readBack.exg1) ||
+            !exgBanksEqualIgnoringStatus(b2, readBack.exg2)) {
+            throw new Error('ExG write read-back mismatch: device registers do not match what was written');
+        }
+        this._emitStatus('ExG registers written and verified.');
+    }
+    /**
+     * Apply an ExG preset live: derive the register banks and the enabled-sensors
+     * bitmap from the current inquiry state via the codec's `applyExgPreset`, write
+     * the registers, then set the enabled sensors LAST — the desktop flow marks
+     * `writeEnabledSensors(...)` "this should always be the last command"
+     * (ShimmerBluetooth.java:2732,2735) and runs `writeEXGConfiguration()` earlier
+     * (:2670).
+     *
+     * The device's own hardware version is passed through, so the joined-clock bit
+     * follows `ShimmerVerObject.isSupportedExgChipClocksJoined` (:712-723) rather
+     * than being forced on: a classic Shimmer3 keeps whatever bit it already had
+     * (its unified-ExG board revision is not knowable from the hardware id), while
+     * a Shimmer3R always gets it set.
+     */
+    async applyExgPresetLive(preset, resolution) {
+        this._assertExgSupported();
+        if (this._streaming)
+            throw new Error('Cannot configure ExG while streaming');
+        // 'off' — LIVE disable. Java never pushes zeroed register banks at the chip:
+        // the ADS1292R forces its must-be bits on write (CONFIG2 bit7 = 1 etc.,
+        // ExGConfigBytesDetails.java:507-525), so a zeroed SET would read back
+        // non-zero and fail the verify in writeExgConfig. The disable is done purely
+        // by dropping the ExG bits from the enabled-sensors bitmap
+        // (writeEnabledSensors, ShimmerBluetooth.java:2732,2735; the ExG register
+        // read/write only run while ExG stays enabled, :2670,4014-4018). The DOCKED
+        // path (`applyExgPreset('off')`) does zero the InfoMem banks — InfoMem is
+        // passive storage, and that is what detectExgPreset keys 'off' off.
+        if (preset === 'off') {
+            await this.setSensors(clearExgResolutionFlags(this.enabledSensors));
+            this._emitStatus("ExG preset 'off' applied (ExG chips disabled). Schema updated.");
+            return;
+        }
+        const current = await this.readExgConfig();
+        const result = applyExgPreset({
+            exg1: current.exg1,
+            exg2: current.exg2,
+            enabledSensors: this.enabledSensors,
+            samplingRateHz: this.samplingRateHz,
+            hardwareVersion: this.deviceVersion?.hardwareVersion,
+        }, preset, resolution);
+        await this.writeExgConfig(result.exg1, result.exg2);
+        // Enabled sensors last; setSensors re-inquires and refreshes the schema.
+        await this.setSensors(result.enabledSensors);
+        this._emitStatus(`ExG preset '${preset}' (${resolution}) applied. Schema updated.`);
+    }
+    // ---------------------------------------------------------------------------
     // Inquiry
     // ---------------------------------------------------------------------------
     /**
@@ -14070,6 +15907,13 @@ function parseSdLog(bytes) {
     // Byte 11 bits 1-3: GSR range (0-3 fixed, 4 = auto) — same offset on both
     // the Shimmer3 and Shimmer3R header layouts.
     const gsrRange = (bytes[11] >> 1) & 0x07;
+    // Bytes 56-65 / 66-75: the two ADS1292R (ExG) register banks, at the same
+    // offsets on both the Shimmer3 and Shimmer3R modern-header branches —
+    // ShimmerSDLog#processSDLogHeader copies from 56 then 66 in each
+    // (ShimmerSDLog.java:253-254 Shimmer3R, :323-324 Shimmer3). All-zero on a
+    // non-ExG device; decode with `decodeExgRegisters` from the ExG codec.
+    const exg1 = bytes.slice(56, 66);
+    const exg2 = bytes.slice(66, 76);
     // Bytes 44-51: RTC difference, signed 64-bit MSB-first.
     let rtc = 0n;
     for (let i = 44; i <= 51; i++)
@@ -14166,6 +16010,8 @@ function parseSdLog(bytes) {
         expansionBoard,
         imuRanges: parseImuRanges(bytes, hardwareVersion),
         calibration: [],
+        exg1,
+        exg2,
     };
     return { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz };
 }
@@ -22574,11 +24420,32 @@ exports.CALIB_READ_SOURCE = CALIB_READ_SOURCE;
 exports.CHANNEL_FORMATS = CHANNEL_FORMATS;
 exports.CHANNEL_FORMAT_OVERRIDES = CHANNEL_FORMAT_OVERRIDES;
 exports.CHARGING_STATUS_BYTE = CHARGING_STATUS_BYTE;
+exports.CHOP_FREQUENCY_LABELS = CHOP_FREQUENCY_LABELS;
+exports.COMPARATOR_THRESHOLD_LABELS = COMPARATOR_THRESHOLD_LABELS;
 exports.CONSENSYS_UNKNOWN_DEVICE = CONSENSYS_UNKNOWN_DEVICE;
+exports.CONVERSION_MODE_LABELS = CONVERSION_MODE_LABELS;
 exports.CalibQuality = CalibQuality;
 exports.CalibSensorId = CalibSensorId;
+exports.DATA_RATE_LABELS = DATA_RATE_LABELS;
+exports.DATA_RATE_OPTIONS = DATA_RATE_OPTIONS;
 exports.DEBUG_COMMAND_ID = DEBUG_COMMAND_ID;
+exports.EXG_BANK_LENGTH = EXG_BANK_LENGTH$1;
+exports.EXG_CHIP1 = EXG_CHIP1;
+exports.EXG_CHIP2 = EXG_CHIP2;
+exports.EXG_CONFLICTING_SENSORS = EXG_CONFLICTING_SENSORS;
+exports.EXG_KNOBS = EXG_KNOBS;
+exports.EXG_PRESET_ARRAYS = EXG_PRESET_ARRAYS;
+exports.EXG_REG8_STATUS_INDEX = EXG_REG8_STATUS_INDEX;
+exports.EXG_REGS_RESPONSE = EXG_REGS_RESPONSE;
+exports.EXG_REGS_RESPONSE_PAYLOAD_LENGTH = EXG_REGS_RESPONSE_PAYLOAD_LENGTH;
+exports.ExgKnobError = ExgKnobError;
+exports.ExgKnobValueError = ExgKnobValueError;
+exports.ExgRespirationLockedError = ExgRespirationLockedError;
 exports.FW_ID = FW_ID$1;
+exports.GAIN_LABELS = GAIN_LABELS;
+exports.GAIN_OPTIONS = GAIN_OPTIONS;
+exports.GAIN_VALUES = GAIN_VALUES;
+exports.GET_EXG_REGS_COMMAND = GET_EXG_REGS_COMMAND;
 exports.GSR_NAME = GSR_NAME;
 exports.INERTIAL_UNITS = INERTIAL_UNITS;
 exports.INFOMEM_ADDR_FLAT = INFOMEM_ADDR_FLAT;
@@ -22594,6 +24461,13 @@ exports.INFOMEM_PAGE_SIZE = INFOMEM_PAGE_SIZE;
 exports.INFOMEM_SAMPLING_CLOCK_FREQ = INFOMEM_SAMPLING_CLOCK_FREQ;
 exports.INFOMEM_SIZE = INFOMEM_SIZE;
 exports.INFOMEM_VALIDITY_BYTES = INFOMEM_VALIDITY_BYTES;
+exports.INPUT_SELECTION_LABELS = INPUT_SELECTION_LABELS;
+exports.LEAD_OFF_COMPARATOR_OPTIONS = LEAD_OFF_COMPARATOR_OPTIONS;
+exports.LEAD_OFF_CURRENT_LABELS = LEAD_OFF_CURRENT_LABELS;
+exports.LEAD_OFF_CURRENT_OPTIONS = LEAD_OFF_CURRENT_OPTIONS;
+exports.LEAD_OFF_DETECTION_LABELS = LEAD_OFF_DETECTION_LABELS;
+exports.LEAD_OFF_DETECTION_OPTIONS = LEAD_OFF_DETECTION_OPTIONS;
+exports.LEAD_OFF_FREQUENCY_LABELS = LEAD_OFF_FREQUENCY_LABELS;
 exports.LoopbackTransport = LoopbackTransport;
 exports.MAX_CALIB_DUMP_BYTES = MAX_CALIB_DUMP_BYTES;
 exports.NEED_MORE = NEED_MORE;
@@ -22610,7 +24484,15 @@ exports.OP_IDX = OP_IDX;
 exports.ObjectCluster = ObjectCluster;
 exports.PACKET_OVERHEAD_RESPONSE_DATA = PACKET_OVERHEAD_RESPONSE_DATA;
 exports.PACKET_OVERHEAD_RESPONSE_OTHER = PACKET_OVERHEAD_RESPONSE_OTHER;
+exports.POWER_DOWN_LABELS = POWER_DOWN_LABELS;
+exports.REFERENCE_ELECTRODE_OPTIONS = REFERENCE_ELECTRODE_OPTIONS;
+exports.RESPIRATION_CONTROL_LABELS = RESPIRATION_CONTROL_LABELS;
+exports.RESPIRATION_FREQUENCY_LABELS = RESPIRATION_FREQUENCY_LABELS;
+exports.RESPIRATION_FREQUENCY_OPTIONS = RESPIRATION_FREQUENCY_OPTIONS;
+exports.RESPIRATION_PHASE_32KHZ_LABELS = RESPIRATION_PHASE_32KHZ_LABELS;
+exports.RESPIRATION_PHASE_64KHZ_LABELS = RESPIRATION_PHASE_64KHZ_LABELS;
 exports.RESYNC = RESYNC;
+exports.RLD_REFERENCE_SIGNAL_LABELS = RLD_REFERENCE_SIGNAL_LABELS;
 exports.RtcDriftMonitor = RtcDriftMonitor;
 exports.SC_CALIB_FORMAT_VERSION = SC_CALIB_FORMAT_VERSION;
 exports.SC_CAL_QUALITY_MASK = SC_CAL_QUALITY_MASK;
@@ -22640,6 +24522,7 @@ exports.SERIAL_DFU_EXTENDED_ERROR_NAMES = SERIAL_DFU_EXTENDED_ERROR_NAMES;
 exports.SERIAL_DFU_OBJECT_TYPE = SERIAL_DFU_OBJECT_TYPE;
 exports.SERIAL_DFU_OP = SERIAL_DFU_OP;
 exports.SERIAL_DFU_RESULT_NAMES = SERIAL_DFU_RESULT_NAMES;
+exports.SET_EXG_REGS_COMMAND = SET_EXG_REGS_COMMAND;
 exports.SHIMMER3R_DEFAULTS = SHIMMER3R_DEFAULTS;
 exports.SHIMMER3R_INQ_CHANNELS_OFFSET = SHIMMER3R_INQ_CHANNELS_OFFSET;
 exports.SHIMMER3R_INQ_NUM_CHANNELS_OFFSET = SHIMMER3R_INQ_NUM_CHANNELS_OFFSET;
@@ -22719,6 +24602,7 @@ exports.SlipDecoder = SlipDecoder;
 exports.SmartDockClient = SmartDockClient;
 exports.StreamStatsTracker = StreamStatsTracker;
 exports.TEST_MODE_ID = TEST_MODE_ID;
+exports.TEST_SIGNAL_FREQUENCY_LABELS = TEST_SIGNAL_FREQUENCY_LABELS;
 exports.TIMESTAMP_FIELD = TIMESTAMP_FIELD;
 exports.UART_COMPONENT = UART_COMPONENT;
 exports.UART_CONFIG_COMMANDS = UART_CONFIG_COMMANDS;
@@ -22727,6 +24611,7 @@ exports.UART_PACKET_CMD = UART_PACKET_CMD;
 exports.UART_PACKET_HEADER = UART_PACKET_HEADER;
 exports.UART_PROP = UART_PROP;
 exports.UNKNOWN_CHANNEL_ASSUMED_BYTES = UNKNOWN_CHANNEL_ASSUMED_BYTES;
+exports.UnknownExgKnobError = UnknownExgKnobError;
 exports.VERISENSE_BLE_SCHEDULE_DEFAULTS = VERISENSE_BLE_SCHEDULE_DEFAULTS;
 exports.VERISENSE_BLE_SCHEDULE_RANGES = VERISENSE_BLE_SCHEDULE_RANGES;
 exports.VERISENSE_BLE_SYNC_SCHEDULES = VERISENSE_BLE_SYNC_SCHEDULES;
@@ -22758,6 +24643,7 @@ exports.VERISENSE_USB_DFU_PID = VERISENSE_USB_DFU_PID;
 exports.VERISENSE_USB_DFU_PORT_FILTERS = VERISENSE_USB_DFU_PORT_FILTERS;
 exports.VERISENSE_USB_DFU_REENUMERATION_DELAY_MS = VERISENSE_USB_DFU_REENUMERATION_DELAY_MS;
 exports.VERISENSE_USB_DFU_VID = VERISENSE_USB_DFU_VID;
+exports.VOLTAGE_REFERENCE_LABELS = VOLTAGE_REFERENCE_LABELS;
 exports.VerisenseBleDevice = VerisenseBleDevice;
 exports.VerisenseSerialDfu = VerisenseSerialDfu;
 exports.WIRED_DEFAULTS = WIRED_DEFAULTS;
@@ -22767,6 +24653,9 @@ exports.WebBluetoothTransport = WebBluetoothTransport;
 exports.WebSerialTransport = WebSerialTransport;
 exports.WiredShimmerClient = WiredShimmerClient;
 exports.applyDuplicateSuffix = applyDuplicateSuffix;
+exports.applyExgKnobEdits = applyExgKnobEdits;
+exports.applyExgMustBeBits = applyExgMustBeBits;
+exports.applyExgPreset = applyExgPreset;
 exports.applyImuCalibration = applyImuCalibration;
 exports.asmRtcBytesToUnixSeconds = asmRtcBytesToUnixSeconds;
 exports.asmRtcMinutesBytesToUnixSeconds = asmRtcMinutesBytesToUnixSeconds;
@@ -22782,6 +24671,7 @@ exports.buildBrandRecord = buildBrandRecord;
 exports.buildDefaultVerisenseCalibrationSet = buildDefaultVerisenseCalibrationSet;
 exports.buildDeleteCmd = buildDeleteCmd;
 exports.buildFreeSpaceCmd = buildFreeSpaceCmd;
+exports.buildGetExgRegsCommand = buildGetExgRegsCommand;
 exports.buildHeader = buildHeader;
 exports.buildListDirCmd = buildListDirCmd;
 exports.buildMemReadPayload = buildMemReadPayload;
@@ -22792,6 +24682,7 @@ exports.buildProductionConfigPayload = buildProductionConfigPayload;
 exports.buildReadCmd = buildReadCmd;
 exports.buildReadPacket = buildReadPacket;
 exports.buildSelectSlotCommand = buildSelectSlotCommand;
+exports.buildSetExgRegsCommand = buildSetExgRegsCommand;
 exports.buildShimmer3Schema = buildShimmer3Schema;
 exports.buildStatCmd = buildStatCmd;
 exports.buildStreamSchema = buildStreamSchema;
@@ -22808,9 +24699,11 @@ exports.calibrateVector3 = calibrateVector3;
 exports.calibrationBlobCrc = calibrationBlobCrc;
 exports.channelFormatsFor = channelFormatsFor;
 exports.channelIdToSensorBit = channelIdToSensorBit;
+exports.channelLayoutDiffersByGeneration = channelLayoutDiffersByGeneration;
 exports.checkConfigBytesValid = checkConfigBytesValid;
 exports.classifyBaseResponse = classifyBaseResponse;
 exports.classifyVerisenseDfuError = classifyVerisenseDfuError;
+exports.clearExgResolutionFlags = clearExgResolutionFlags;
 exports.compareInfoMemExcluding = compareInfoMemExcluding;
 exports.compareVerisenseFirmwareVersion = compareVerisenseFirmwareVersion;
 exports.computeVerisensePairingPin = computeVerisensePairingPin;
@@ -22820,23 +24713,34 @@ exports.crc32 = crc32;
 exports.createBlankVerisenseOperationalConfig = createBlankVerisenseOperationalConfig;
 exports.csvCell = csvCell;
 exports.csvRow = csvRow;
+exports.decodeExgRegisters = decodeExgRegisters;
+exports.decodeExgRegsResponse = decodeExgRegsResponse;
 exports.decodeSdLogFile = decodeSdLogFile;
 exports.decodeSdLogValue = decodeSdLogValue;
 exports.decodeSdSession = decodeSdSession;
 exports.decodeVerisenseBleOptimizationResult = decodeVerisenseBleOptimizationResult;
 exports.defaultVerisensePasskeyForId = defaultVerisensePasskeyForId;
 exports.deleteDownloadedFromCard = deleteDownloadedFromCard;
+exports.deriveShimmer3FirmwareVersionCode = deriveShimmer3FirmwareVersionCode;
 exports.deriveVerisenseMacIdFromName = deriveVerisenseMacIdFromName;
 exports.describePlatformSupport = describePlatformSupport;
 exports.describeVerisenseChargerStatus = describeVerisenseChargerStatus;
+exports.detectExgPreset = detectExgPreset;
 exports.deviceWriteDivergentRanges = deviceWriteDivergentRanges;
 exports.divisorToSamplingRate = divisorToSamplingRate;
 exports.downloadSdTree = downloadSdTree;
+exports.encodeExgRegisters = encodeExgRegisters;
 exports.encodeSdPath = encodeSdPath;
 exports.enforceVerisenseCommsChannelInterlock = enforceVerisenseCommsChannelInterlock;
 exports.ensureDirectoryPath = ensureDirectoryPath;
 exports.enumerateSdTree = enumerateSdTree;
 exports.evaluateParsedFileSplit = evaluateParsedFileSplit;
+exports.exgBanksEqualIgnoringStatus = exgBanksEqualIgnoringStatus;
+exports.exgConflictingSensors = exgConflictingSensors;
+exports.exgKnobOptions = exgKnobOptions;
+exports.exgPresetLabel = exgPresetLabel;
+exports.exgRateSettingFromFreq = exgRateSettingFromFreq;
+exports.exgResolutionFromSensors = exgResolutionFromSensors;
 exports.expectedVerisenseStreamSensorIds = expectedVerisenseStreamSensorIds;
 exports.expectedVerisenseStreamSensorIdsFromConfig = expectedVerisenseStreamSensorIdsFromConfig;
 exports.extractBaseLine = extractBaseLine;
@@ -22878,6 +24782,7 @@ exports.infoMemFieldsFor = infoMemFieldsFor;
 exports.interpretShimmer3InquiryResponse = interpretShimmer3InquiryResponse;
 exports.isAckCommand = isAckCommand;
 exports.isBadResponse = isBadResponse;
+exports.isExgRespirationEnabled = isExgRespirationEnabled;
 exports.isGenerationSensitiveChannel = isGenerationSensitiveChannel;
 exports.isNackCommand = isNackCommand;
 exports.isNewImuSensors = isNewImuSensors;
@@ -22947,12 +24852,15 @@ exports.parseVerisenseFactoryTestReport = parseVerisenseFactoryTestReport;
 exports.parseVersionInfo = parseVersionInfo;
 exports.patchSecureDfuSendOperation = patchSecureDfuSendOperation;
 exports.promiseWithTimeout = promiseWithTimeout;
+exports.readExgField = readExgField;
+exports.readExgKnobs = readExgKnobs;
 exports.readInfoMemFieldValue = readInfoMemFieldValue;
 exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
 exports.resolveChannelFormat = resolveChannelFormat;
 exports.resolveFieldIndex = resolveFieldIndex;
 exports.resolveInfoMemLayout = resolveInfoMemLayout;
 exports.resolveVerisenseSensorRateFieldKey = resolveVerisenseSensorRateFieldKey;
+exports.respirationPhaseOptions = respirationPhaseOptions;
 exports.runVerisenseDfuUpdate = runVerisenseDfuUpdate;
 exports.samplingRateToDivisor = samplingRateToDivisor;
 exports.sdCrc16 = sdCrc16;
@@ -22960,10 +24868,12 @@ exports.sdMessageSpan = sdMessageSpan;
 exports.sdStatusToString = sdStatusToString;
 exports.sdXferStatusToString = sdXferStatusToString;
 exports.serializeCalibrationBlob = serializeCalibrationBlob;
+exports.setExgFieldPreserving = setExgFieldPreserving;
 exports.setVerisenseDfuModeWithRetry = setVerisenseDfuModeWithRetry;
 exports.setVerisenseOperationalBitRange = setVerisenseOperationalBitRange;
 exports.shimmer3ControlMessageLength = shimmer3ControlMessageLength;
 exports.shimmer3SensorLabel = shimmer3SensorLabel;
+exports.shimmer3SupportsExg = shimmer3SupportsExg;
 exports.shimmer3UsesThreeByteTimestamp = shimmer3UsesThreeByteTimestamp;
 exports.shimmer3rControlMessageLength = shimmer3rControlMessageLength;
 exports.shimmerUartCrcByte = shimmerUartCrcByte;
@@ -22978,6 +24888,7 @@ exports.transportAvailability = transportAvailability;
 exports.tryExtractSdMessage = tryExtractSdMessage;
 exports.unixSecondsToAsmRtcBytes = unixSecondsToAsmRtcBytes;
 exports.unixSecondsToCalibTsBytes = unixSecondsToCalibTsBytes;
+exports.updateExgSetting = updateExgSetting;
 exports.updateVerisenseDfuImageWithRetry = updateVerisenseDfuImageWithRetry;
 exports.utcToLocalCivilMillis = utcToLocalCivilMillis;
 exports.verisenseDeviceFileTag = verisenseDeviceFileTag;
