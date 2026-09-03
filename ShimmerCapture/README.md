@@ -168,7 +168,9 @@ status message, filterable by text and severity, and downloadable — which is
 the first thing to attach to a support request.
 
 Collapsed it is a single bar showing the newest line, with a badge counting the
-errors and warnings since it was last opened; opening it clears the badge.
+errors and warnings you have not seen — anything that arrived while the drawer
+was closed, or while it was open but scrolled back through history. Opening it,
+or scrolling back to the newest line, clears the badge.
 Expanded it keeps the full page width, and whether it is open is remembered per
 browser. The page reserves the space it occupies in either state, so it never
 covers what is underneath it.

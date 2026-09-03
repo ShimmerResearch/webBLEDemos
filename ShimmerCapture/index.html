@@ -311,9 +311,9 @@
         color: var(--ink);
       }
 
-      /* The count of errors and warnings since the drawer was last opened.
-         Red on purpose: the whole reason the log moved down here is that an
-         error at the foot of a long page went unseen. */
+      /* The count of errors and warnings that have not been seen. Red on
+         purpose: the whole reason the log moved down here is that an error at
+         the foot of a long page went unseen. */
       .log-drawer-badge {
         flex: 0 0 auto;
         min-width: 18px;
@@ -809,7 +809,7 @@
          of the page, where an error nobody scrolled to went unnoticed.
 
          Collapsed it is one bar carrying the newest line and a count of the
-         errors and warnings since it was last opened; the page reserves that
+         errors and warnings that have not been seen; the page reserves that
          bar's height so nothing is ever permanently covered. Expanded it
          keeps the FULL page width — deliberately not a right-hand rail,
          because the raw byte lines above are long and a narrow column wraps
@@ -952,14 +952,19 @@
 
       /* ------------------------------------------- the event log drawer --
          Collapsed the drawer is one bar: the newest line, and a count of the
-         errors and warnings since it was last opened. That count is the
-         reason the log moved to the bottom of the viewport at all — an error
-         at the foot of a long page is an error nobody scrolled to. */
+         errors and warnings that have not been seen — which is not the same
+         as unopened, because a drawer left open and scrolled back through
+         history is showing the user everything except the thing that just
+         went wrong. That count is the reason the log moved to the bottom of
+         the viewport at all: an error at the foot of a long page is an error
+         nobody scrolled to. */
 
       /** localStorage key. Also read by the pre-paint script in <head>. */
       const LOG_DRAWER_KEY = "shimmerCaptureLogDrawer";
 
-      /** Errors and warnings since the drawer was last opened. */
+      /** Errors and warnings that arrived while the newest line was not on
+          screen. Cleared by opening the drawer, by scrolling back to the tail
+          with it open, and by clearing the log. */
       let logAlerts = 0;
       /** The newest line, held until the next frame paints the bar. */
       let pendingBarLine = null;
@@ -1005,7 +1010,7 @@
         const badge = $("logBadge");
         badge.hidden = logAlerts === 0;
         badge.textContent = String(logAlerts);
-        badge.title = `${logAlerts} error${logAlerts === 1 ? "" : "s"} or warning${logAlerts === 1 ? "" : "s"} since the log was last opened`;
+        badge.title = `${logAlerts} error${logAlerts === 1 ? "" : "s"} or warning${logAlerts === 1 ? "" : "s"} you have not seen`;
       }
 
       /**
