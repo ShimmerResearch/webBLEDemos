@@ -41,6 +41,17 @@
         // step with the page theme. Values mirror --bg in common/theme.css.
         var meta = document.querySelector('meta[name="theme-color"]');
         if (meta) meta.content = theme === "dark" ? "#0d1117" : "#f4f6f8";
+
+        // The event log drawer, for the same reason and with the same key the
+        // module below uses (LOG_DRAWER_KEY): applied before the first paint
+        // so a remembered-open drawer does not shove the page up a frame
+        // after it settles.
+        var open = "false";
+        try {
+          if (localStorage.getItem("shimmerCaptureLogDrawer") === "open")
+            open = "true";
+        } catch (e) {}
+        document.documentElement.dataset.logOpen = open;
       })();
     </script>
 
@@ -50,6 +61,20 @@
 
     <style>
       /* Page-local layout only — everything visual comes from theme.css. */
+
+      /* How much of the viewport the docked event log occupies. One variable
+         drives three things — the drawer's own height, the space the page
+         reserves at its foot, and where the sticky action bar and the toast
+         stack stop — so the drawer can never cover content, open or shut.
+         Set on the root element by the drawer's toggle. */
+      :root {
+        --log-drawer-h: 34px;
+      }
+
+      :root[data-log-open="true"] {
+        --log-drawer-h: min(46vh, 420px);
+      }
+
       .page-head {
         display: flex;
         align-items: flex-start;
@@ -126,6 +151,12 @@
           grid-template-columns: minmax(0, 1fr);
         }
 
+        /* Still a bottom sheet, just a taller one: the toolbar wraps onto
+           three rows at this width, and 46vh would leave almost no log. */
+        :root[data-log-open="true"] {
+          --log-drawer-h: min(62vh, 480px);
+        }
+
         /* Once the connect buttons wrap onto several lines a vertical rule
            between two of them reads as a stray mark rather than a divider. */
         .link-sep {
@@ -194,9 +225,123 @@
         flex: 0 0 auto;
       }
 
+      /* ---------------------------------------------- the log drawer ---- */
+
+      /* Everything the drawer would otherwise sit on top of is pushed clear
+         of it by the same variable the drawer is sized with. */
+      .page {
+        padding-bottom: calc(var(--log-drawer-h) + 18px);
+      }
+
+      .toast-stack {
+        bottom: calc(var(--log-drawer-h) + 14px);
+      }
+
+      .log-drawer {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 40;
+        height: var(--log-drawer-h);
+        display: flex;
+        flex-direction: column;
+        background: var(--card);
+        /* A border rather than a shadow: every shadow token in theme.css
+           casts downwards, which on a panel docked to the bottom edge lands
+           off-screen. The line does the separating work in both themes. */
+        border-top: 1px solid var(--line-strong);
+      }
+
+      .log-drawer-bar {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        height: 33px;
+        border: 0;
+        border-radius: 0;
+        background: none;
+        padding: 0 14px;
+        text-align: left;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .log-drawer-bar:hover:not(:disabled) {
+        background: var(--control-hover);
+      }
+
+      .log-drawer-caret {
+        flex: 0 0 auto;
+        border-left: 5px solid transparent;
+        border-right: 5px solid transparent;
+        border-bottom: 6px solid var(--muted);
+      }
+
+      :root[data-log-open="true"] .log-drawer-caret {
+        transform: rotate(180deg);
+      }
+
+      .log-drawer-title {
+        flex: 0 0 auto;
+        font-weight: 600;
+        color: var(--ink);
+      }
+
+      /* The count of errors and warnings since the drawer was last opened.
+         Red on purpose: the whole reason the log moved down here is that an
+         error at the foot of a long page went unseen. */
+      .log-drawer-badge {
+        flex: 0 0 auto;
+        min-width: 18px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        border: 1px solid var(--danger-border);
+        background: var(--danger-bg);
+        color: var(--danger);
+        font-size: 11px;
+        font-weight: 700;
+        text-align: center;
+      }
+
+      /* The newest line, whatever it was. Never wraps: the bar is one line
+         high and a raw byte dump would otherwise reflow the whole page. */
+      .log-drawer-last {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+        font-family: var(--font-mono);
+        font-size: 11px;
+        color: var(--faint);
+      }
+
+      .log-drawer-body {
+        display: none;
+        flex: 1 1 auto;
+        min-height: 0;
+        flex-direction: column;
+        padding: 0 14px 12px;
+      }
+
+      :root[data-log-open="true"] .log-drawer-body {
+        display: flex;
+      }
+
+      /* theme.css fixes the log panel at 340px, which is right for a card in
+         the page flow and wrong inside a drawer of a known height. */
+      .log-drawer .log {
+        flex: 1 1 auto;
+        height: auto;
+        min-height: 0;
+      }
+
       .action-bar {
         position: sticky;
-        bottom: 0;
+        bottom: calc(var(--log-drawer-h) + 8px);
         z-index: 20;
         background: var(--card);
         border: 1px solid var(--line);
@@ -659,53 +804,71 @@
           </div>
         </div>
       </section>
+    </div>
 
-      <!-- ================================================= Event log ===== -->
-      <div class="card">
-        <details class="group" open>
-          <summary>Event log</summary>
-          <div class="group-body">
-            <div class="log-toolbar row">
-              <input
-                type="search"
-                id="logFilter"
-                placeholder="Filter lines…"
-                autocomplete="off"
-              />
-              <select id="logSeverity">
-                <option value="all">All</option>
-                <option value="warnup">Warnings and errors</option>
-                <option value="err">Errors only</option>
-                <option value="txrx">TX / RX</option>
-              </select>
-              <!-- The select above chooses what is SHOWN; these two choose
+    <!-- ================================================== Event log =====
+         Docked to the bottom of the viewport rather than parked at the end
+         of the page, where an error nobody scrolled to went unnoticed.
+
+         Collapsed it is one bar carrying the newest line and a count of the
+         errors and warnings since it was last opened; the page reserves that
+         bar's height so nothing is ever permanently covered. Expanded it
+         keeps the FULL page width — deliberately not a right-hand rail,
+         because the raw byte lines above are long and a narrow column wraps
+         each of them into a ribbon. -->
+    <section class="log-drawer" id="logDrawer" aria-label="Event log">
+      <button
+        class="log-drawer-bar"
+        id="btnLogDrawer"
+        type="button"
+        aria-expanded="false"
+        aria-controls="logDrawerBody"
+      >
+        <span class="log-drawer-caret" aria-hidden="true"></span>
+        <span class="log-drawer-title">Event log</span>
+        <span class="log-drawer-badge" id="logBadge" hidden></span>
+        <span class="log-drawer-last" id="logLast">no events yet</span>
+      </button>
+      <div class="log-drawer-body" id="logDrawerBody">
+        <div class="log-toolbar row">
+          <input
+            type="search"
+            id="logFilter"
+            placeholder="Filter lines…"
+            autocomplete="off"
+          />
+          <select id="logSeverity">
+            <option value="all">All</option>
+            <option value="warnup">Warnings and errors</option>
+            <option value="err">Errors only</option>
+            <option value="txrx">TX / RX</option>
+          </select>
+          <!-- The select above chooses what is SHOWN; these two choose
                    what is PRODUCED. Nothing tags a line tx/rx unless the tap
                    is recording, so the two live side by side and #tapNote
                    below says so whenever they disagree. -->
-              <label
-                class="tap-toggle"
-                title="Log every byte this page writes to the sensor and every byte it receives. Off by default: it is a diagnostic, not a running commentary."
-              >
-                <input type="checkbox" id="chkRawBytes" />
-                Log raw TX/RX bytes
-              </label>
-              <label
-                class="tap-toggle"
-                title="Streaming frames as well as commands. A sensor at 1024 Hz sends one every millisecond, so this is capped and coalesced."
-              >
-                <input type="checkbox" id="chkRawData" disabled />
-                …including data packets
-              </label>
-              <button id="btnLogClear" type="button">Clear</button>
-              <button id="btnLogDownload" type="button">Download</button>
-              <span class="log-count" id="logCount"></span>
-            </div>
-            <div class="banner" id="tapNote"></div>
-            <div class="log" id="log"></div>
-          </div>
-        </details>
+          <label
+            class="tap-toggle"
+            title="Log every byte this page writes to the sensor and every byte it receives. Off by default: it is a diagnostic, not a running commentary."
+          >
+            <input type="checkbox" id="chkRawBytes" />
+            Log raw TX/RX bytes
+          </label>
+          <label
+            class="tap-toggle"
+            title="Streaming frames as well as commands. A sensor at 1024 Hz sends one every millisecond, so this is capped and coalesced."
+          >
+            <input type="checkbox" id="chkRawData" disabled />
+            …including data packets
+          </label>
+          <button id="btnLogClear" type="button">Clear</button>
+          <button id="btnLogDownload" type="button">Download</button>
+          <span class="log-count" id="logCount"></span>
+        </div>
+        <div class="banner" id="tapNote"></div>
+        <div class="log" id="log"></div>
       </div>
-    </div>
+    </section>
 
     <script type="module">
       import { initThemeToggle } from "../common/theme.js";
@@ -798,6 +961,93 @@
       // Page chrome
       // =====================================================================
 
+      /* ------------------------------------------- the event log drawer --
+         Collapsed the drawer is one bar: the newest line, and a count of the
+         errors and warnings since it was last opened. That count is the
+         reason the log moved to the bottom of the viewport at all — an error
+         at the foot of a long page is an error nobody scrolled to. */
+
+      /** localStorage key. Also read by the pre-paint script in <head>. */
+      const LOG_DRAWER_KEY = "shimmerCaptureLogDrawer";
+
+      /** Errors and warnings since the drawer was last opened. */
+      let logAlerts = 0;
+      /** The newest line, held until the next frame paints the bar. */
+      let pendingBarLine = null;
+      let barPaintScheduled = false;
+
+      const logDrawerIsOpen = () =>
+        document.documentElement.dataset.logOpen === "true";
+
+      /**
+       * Record one line for the collapsed bar.
+       *
+       * Batched onto an animation frame for the same reason the log's own DOM
+       * writes are: with the byte tap open this runs a hundred times a
+       * second, and one textContent write per line is a hundred layouts a
+       * second nobody can read.
+       */
+      function noteLogLine(text, sev) {
+        /* The date is the same all session and the bar is one line wide, so
+           only the clock time earns its place there. */
+        pendingBarLine = text.replace(/^\d{4}-\d{2}-\d{2} /, "");
+        if (!logDrawerIsOpen() && (sev === "err" || sev === "warn")) {
+          logAlerts++;
+        }
+        if (!barPaintScheduled) {
+          barPaintScheduled = true;
+          requestAnimationFrame(paintLogBar);
+        }
+      }
+
+      function paintLogBar() {
+        barPaintScheduled = false;
+        if (pendingBarLine !== null) {
+          $("logLast").textContent = pendingBarLine;
+          pendingBarLine = null;
+        }
+        const badge = $("logBadge");
+        badge.hidden = logAlerts === 0;
+        badge.textContent = String(logAlerts);
+        badge.title = `${logAlerts} error${logAlerts === 1 ? "" : "s"} or warning${logAlerts === 1 ? "" : "s"} since the log was last opened`;
+      }
+
+      /**
+       * @param {boolean} open
+       * @param {boolean} [remember=true] false at startup, where the state
+       *   came out of storage in the first place
+       */
+      function setLogDrawer(open, remember = true) {
+        document.documentElement.dataset.logOpen = open ? "true" : "false";
+        $("btnLogDrawer").setAttribute(
+          "aria-expanded",
+          open ? "true" : "false",
+        );
+        if (open) {
+          /* Opening IS the acknowledgement, so the count starts again from
+             here. */
+          logAlerts = 0;
+          /* A panel that was display:none has no scroll position, so the
+             log's own stick-to-the-tail never had anything to stick to.
+             Restore it once, as the drawer becomes visible. */
+          const panel = $("log");
+          panel.scrollTop = panel.scrollHeight;
+        }
+        paintLogBar();
+        if (remember) {
+          try {
+            localStorage.setItem(LOG_DRAWER_KEY, open ? "open" : "closed");
+          } catch {
+            /* A private window throws on the first write. The drawer still
+               works; it just opens closed next time. */
+          }
+        }
+      }
+
+      $("btnLogDrawer").addEventListener("click", () =>
+        setLogDrawer(!logDrawerIsOpen()),
+      );
+
       const log = createLog($("log"), {
         filterInput: $("logFilter"),
         severitySelect: $("logSeverity"),
@@ -805,6 +1055,20 @@
         downloadButton: $("btnLogDownload"),
         countEl: $("logCount"),
         fileName: "shimmer-capture-log.txt",
+        onLine: noteLogLine,
+      });
+
+      /* The pre-paint script already applied the remembered state to the root
+         element; this catches the chrome up with it without writing it back. */
+      setLogDrawer(logDrawerIsOpen(), false);
+
+      /* Clearing the log clears what the bar was reporting about it. Added
+         after createLog, which wires its own handler on the same button. */
+      $("btnLogClear").addEventListener("click", () => {
+        logAlerts = 0;
+        pendingBarLine = null;
+        $("logLast").textContent = "no events yet";
+        paintLogBar();
       });
 
       initThemeToggle($("themeBtn"));

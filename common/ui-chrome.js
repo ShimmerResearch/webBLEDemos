@@ -139,6 +139,12 @@ export function formatLogTime(d = new Date()) {
  * @param {HTMLElement} [opts.countEl] shows "shown / total lines" when filtering
  * @param {string} [opts.fileName="event-log.txt"]
  * @param {boolean} [opts.timestamps=true] prefix each line with the host time
+ * @param {(text: string, sev: string) => void} [opts.onLine] called once per
+ *   line as it is stored — before the filter, so a page that summarises the
+ *   log somewhere else (a collapsed drawer's newest line, an unread-error
+ *   badge) sees every line whether or not this panel is showing it. Called
+ *   synchronously from the emit, so keep it to bookkeeping: the DOM work
+ *   belongs on a frame, exactly as the flush below does it.
  * @returns {{
  *   log: (...args: unknown[]) => void,
  *   warn: (...args: unknown[]) => void,
@@ -212,6 +218,14 @@ export function createLog(container, opts = {}) {
     lines.push(line);
     if (lines.length > maxLines) lines.splice(0, lines.length - maxLines);
     pending.push(line);
+    if (opts.onLine) {
+      try {
+        opts.onLine(line.text, line.sev);
+      } catch {
+        /* A summariser that throws must not cost the log the line it was
+           summarising, and must not become a second error to report. */
+      }
+    }
     if (!flushScheduled) {
       flushScheduled = true;
       requestAnimationFrame(flush);
