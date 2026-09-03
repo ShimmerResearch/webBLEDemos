@@ -64,7 +64,7 @@ import { el, downloadBlob } from "./ui-chrome.js";
 /* The whole namespace rather than destructured names: a vendored bundle that
    predates one of the calibration exports then degrades to a message from
    `mount()` instead of breaking the importing page. */
-import * as sdk from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
 // Constants

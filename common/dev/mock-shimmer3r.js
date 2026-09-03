@@ -38,7 +38,7 @@ import {
   getDefaultCalibration,
   parseBrandRecord,
   sdCrc16,
-} from "../../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+} from "../../vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
 // Protocol constants (LiteProtocol). Repeated here rather than imported so

@@ -10,4 +10,4 @@ common/vendor/chart.umd.min.js
 shimmer-extension/chart.min.js
 shimmer-extension/jszip.min.js
 shimmer-extension/vendor/
-Verisense/vendor/
+vendor/

@@ -35,7 +35,7 @@ import { el, fmtBytes as defaultFmtBytes } from "./ui-chrome.js";
    predates one of the SD-transfer exports then degrades to a message from
    `createSdBrowser()` instead of breaking the importing page. Destructuring
    would throw at import time and take the whole page with it. */
-import * as sdk from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
 // Constants

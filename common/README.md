@@ -10,7 +10,7 @@ Three rules the whole library follows, so a page can rely on them:
 1. **Import convention.** Every module is reachable from any demo folder as
    `../common/<file>.js`. Modules import each other by bare relative path
    (`./ui-chrome.js`), and reach the SDK at
-   `../shimmer-extension/vendor/shimmer-web-sdk.esm.js`.
+   `../vendor/shimmer-web-sdk.esm.js`.
 2. **No DOM at import time.** No module touches `document` or `window` while
    it is being imported — every one of them does its DOM work inside an
    exported function. A page can therefore import in `<head>`, in any order,
@@ -57,7 +57,7 @@ Three rules the whole library follows, so a page can rely on them:
 import { initThemeToggle } from "../common/theme.js";
 import { $, createLog, showToast } from "../common/ui-chrome.js";
 import { createConnectController } from "../common/connect-ui.js";
-import * as sdkNs from "../shimmer-extension/vendor/shimmer-web-sdk.esm.js";
+import * as sdkNs from "../vendor/shimmer-web-sdk.esm.js";
 ```
 
 Pass the SDK to `createConnectController` as a **namespace object**, not as
