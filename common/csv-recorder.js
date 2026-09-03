@@ -107,6 +107,12 @@ export function createCsvRecorder(opts = {}) {
   /** @type {FileSystemWritableFileStream|null} */
   let writable = null;
   /**
+   * Set while a failure is committing or discarding the picked file's stream in
+   * the background, so `stop()` can wait for the handle to be released.
+   * @type {Promise<void>|null}
+   */
+  let dying = null;
+  /**
    * Serialises writes. `push()` is synchronous, so a flush is kicked off and
    * chained rather than awaited; `stop()` awaits the tail.
    */
@@ -157,10 +163,27 @@ export function createCsvRecorder(opts = {}) {
     if (failure) return; // the first failure is the interesting one
     failure = String(e?.message ?? e);
     active = false;
+    // Hand the stream to the cleanup below before clearing the reference, so
+    // nothing else can write to it in the meantime.
+    const orphan = writable;
     writable = null;
     pending = [];
     memory = [];
     const r = result();
+    // Release the picked file. Dropping the reference alone left the handle
+    // locked and the file EMPTY: a FileSystemWritableFileStream writes to a
+    // swap file that only reaches the real file on close(), so with neither a
+    // close() nor an abort() the user was left 0 bytes while the message below
+    // promised a short one. So commit what already landed, and fall back to
+    // abort() when even that fails - or go straight there when close() is
+    // what failed, since there is nothing left to commit through.
+    if (orphan) {
+      const discard = () => Promise.resolve(orphan.abort?.()).catch(() => {});
+      dying =
+        what === "close"
+          ? discard()
+          : Promise.resolve(orphan.close()).catch(discard);
+    }
     err(
       `CSV ${what} failed: ${failure} — recording stopped. ${fileName} is ` +
         `INCOMPLETE: ${r.rows} rows written, ${r.rowsDropped} lost.`,
@@ -251,6 +274,7 @@ export function createCsvRecorder(opts = {}) {
     pending = [];
     memory = [];
     writable = null;
+    dying = null;
     writeChain = Promise.resolve();
     expectedFieldCount = null;
     widthWarned = false;
@@ -356,7 +380,16 @@ export function createCsvRecorder(opts = {}) {
    * @returns {Promise<{rows: number, rowsDropped: number, bytes: number, fileName: string, complete: boolean, error: string|null}>}
    */
   async function stop() {
-    if (!active) return result();
+    // A failure mid-session already cleared `active`, so this is the path a
+    // caller reaches after one. Still wait for the stream: the cleanup runs in
+    // the background from fail(), and the file is not on disk until it lands.
+    if (!active) {
+      if (dying) {
+        await dying;
+        dying = null;
+      }
+      return result();
+    }
     active = false;
     stopping = true;
     await flush();
@@ -372,6 +405,13 @@ export function createCsvRecorder(opts = {}) {
         fileName,
         new Blob(memory, { type: "text/csv;charset=utf-8" }),
       );
+    }
+    // A failure left the stream being committed or discarded in the background.
+    // Wait for it, so the result is not reported before the file is written and
+    // a caller that starts recording again immediately does not meet a lock.
+    if (dying) {
+      await dying;
+      dying = null;
     }
     memory = [];
     stopping = false;
