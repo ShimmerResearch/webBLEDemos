@@ -3,7 +3,7 @@
  * a sensor advertises over classic Bluetooth, the name it advertises over BLE,
  * and the product and manufacturer strings it presents over USB.
  *
- * Extracted from `eeprom-branding/index.html`: the current-record readout and
+ * Extracted from the retired `eeprom-branding` demo: the current-record readout and
  * its stock/custom/invalid pill (L305-344, L705-756), the four provisioning
  * fields with their per-field validation and live preview (L346-426,
  * L592-685), the record I/O with its read-back byte compare (L691-702,

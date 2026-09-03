@@ -13,11 +13,11 @@ is reachable from a page you can read in an afternoon.
 
 ## The three ways to connect
 
-| Link                  | Configure | Read / write the configuration image | Set the clock | Status flags | Calibration dump | Stream to the host | Log to the SD card |
-| --------------------- | :-------: | :----------------------------------: | :-----------: | :----------: | :--------------: | :----------------: | :----------------: |
-| **BLE**               |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |
-| **Classic Bluetooth** |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |
-| **USB-C**             |    yes    |                 yes                  |      yes      | battery only |        no        |      **no**\*      |      **no**\*      |
+| Link                  | Configure | Read / write the configuration image | Set the clock | Status flags | Calibration dump | Stream to the host | Log to the SD card | Browse / download the card | Set device names |
+| --------------------- | :-------: | :----------------------------------: | :-----------: | :----------: | :--------------: | :----------------: | :----------------: | :------------------------: | :--------------: |
+| **BLE**               |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |
+| **Classic Bluetooth** |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |
+| **USB-C**             |    yes    |                 yes                  |      yes      | battery only |        no        |      **no**\*      |      **no**\*      |          **no**\*          |       yes        |
 
 \* **The Shimmer3R's USB-C port speaks the dock protocol, not the Bluetooth
 one** — the firmware routes the bytes arriving on the USB serial port to the
@@ -121,9 +121,56 @@ stream straight to the file you pick instead of being held in memory — a long
 session is not lost if the tab closes. If the link drops mid-recording the file
 is closed properly and what was captured is kept.
 
-An event log below both tabs carries every command, reply and status message,
+An event log below the tabs carries every command, reply and status message,
 filterable by text and severity, and downloadable — which is the first thing to
 attach to a support request.
+
+## The SD card
+
+Browses the sensor's card and pulls logged sessions off it. Sizes and free
+space come from the card itself; pick whole sessions or individual files.
+
+Files can be written either as the card lays them out or into the folder
+structure Consensys imports, which is the default — the layout matters, because
+Consensys will not find a session filed the other way. The destination folder is
+remembered between visits, so a long download does not start with a file dialog
+every time. A browser can never preselect an absolute path, so the first
+download of a session asks once.
+
+A transfer shows its throughput and an estimate of the time left, and can be
+aborted. Aborting keeps what has already been written and the folder it went
+into, so pressing Download again resumes rather than starting a second copy
+alongside the first. A file can optionally be deleted from the card once its
+download has been verified — only verified files, and it says how many before
+it does it.
+
+This needs a Bluetooth link and **firmware v1.01.011 or later**. Earlier
+firmware either has no SD file-transfer commands at all or, on v1.01.009 and
+v1.01.010, has them and corrupts every 512-byte block in transit, so the tab
+refuses to start rather than hand back a file that looks fine and is not.
+
+## Device names
+
+Reads and writes the record in the sensor's EEPROM that decides the names it
+advertises over classic Bluetooth and BLE, and presents over USB, so a sensor
+can carry a customer's branding instead of the Shimmer defaults.
+
+Type one classic-Bluetooth name and the BLE and USB product names follow it
+unless you set them yourself; the USB manufacturer string is used verbatim by
+the descriptor and is never derived. The name lengths a sensor can carry differ
+by hardware and by field, and the editor holds you to them rather than letting
+the firmware truncate a name on air — where a sensor will not say what hardware
+it is, it applies the shorter limit rather than assuming the roomier one.
+
+A write is CRC-protected, read back and compared, and shows what is changing
+before it goes. **A new name only takes effect after the sensor restarts.** Over
+a Bluetooth link the tab can arm the restart and trigger it by disconnecting;
+over the dock it walks you through a power-cycle, because the dock protocol has
+no restart command. "Restore stock defaults" returns the sensor to its factory
+names.
+
+Works over all three links: the record lives in the same place and is reached
+the same way whether the sensor is on a radio or in a dock.
 
 ## Requirements
 
@@ -144,7 +191,7 @@ Append `?mock=1` to the URL and a **Connect (mock)** button appears, which
 connects the page to a scripted Shimmer3R that answers on a loopback link. It
 is a development aid, not a firmware simulator: it answers the commands this
 page sends with plausible values and correct framing, and emits synthetic sine
-data at the configured rate. It does not model timing, power, the SD card or
+data at the configured rate. It models a small synthetic card, but not timing, power or
 error paths, and it deliberately does not implement every command — a refused
 one is a useful thing to be able to see.
 
@@ -153,6 +200,9 @@ one is a useful thing to be able to see.
 | `?mock=1`    | Framed replies, one per notification — how BLE behaves.                                                                  |
 | `&framed=0`  | Replies dribbled three bytes at a time — how a classic-Bluetooth or USB byte stream behaves, and what re-framing is for. |
 | `&rate=<Hz>` | Sampling rate, default 51.2.                                                                                             |
+| `&sdKBps=`   | Throttle the synthetic card's transfer rate, so progress and abort have something to act on.                             |
+| `&fw=`       | Report a different firmware version, to see the SD tab refuse an unsupported one.                                        |
+| `&hw=none`   | Refuse to say what hardware it is, to see the conservative name limits apply.                                            |
 | `&debug=1`   | Log every command and reply to the browser console.                                                                      |
 
 While the mock is connected, `mockTransport.writes` in the console is every

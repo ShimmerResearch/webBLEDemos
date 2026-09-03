@@ -3,7 +3,7 @@
  * this host, and pull sessions off the card with progress, a rolling
  * throughput readout, an ETA and a resumable abort.
  *
- * Extracted from `sd-download/index.html`: the card readouts and the
+ * Extracted from the retired `sd-download` demo: the card readouts and the
  * link-speed test (L182-211, L433-463), the selectable tree (L655-715), the
  * destination folder remembered in IndexedDB (L304-369, L717-740), the layout
  * choice and its path preview (L401-424), and the download run with its
