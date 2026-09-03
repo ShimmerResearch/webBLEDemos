@@ -50,6 +50,9 @@ const CMD = Object.freeze({
   SET_GYRO_RANGE: 0x49,
   SET_ALT_ACCEL_RANGE: 0x4f,
   SET_INTERNAL_EXP_POWER_ENABLE: 0x5e,
+  SET_EXG_REGS: 0x61,
+  EXG_REGS_RESPONSE: 0x62,
+  GET_EXG_REGS: 0x63,
   START_SDBT: 0x70,
   STATUS_RESPONSE: 0x71,
   GET_STATUS: 0x72,
@@ -142,6 +145,9 @@ const IM = Object.freeze({
   sensors2: 5,
   configSetupByte0: 6,
   configSetupByte3: 9,
+  exg1: 10,
+  exg2: 20,
+  exgBankLength: 10,
   btCommBaudRate: 30,
   shimmerName: 187,
   expIdName: 199,
@@ -504,6 +510,48 @@ export function createMockShimmer3RTransport(opts = {}) {
           (adc >> 8) & 0xff,
           0xc0, // charger status byte
         ]);
+        return;
+      }
+
+      /* The two ADS1292R register banks. They live in the configuration image
+         (bytes 10-19 and 20-29), and the live commands are a window onto the
+         same ten bytes -- which is the point: a host that writes them live and
+         then re-reads the image must see one answer, not two.
+
+         Worth serving even though the page only ever wrote them: as of SDK
+         0.1.24 the ExG helpers READ the current banks before writing, so a
+         mock that only tolerated the write stopped serving the flow. */
+      case CMD.GET_EXG_REGS: {
+        // [0x63][chip][startAddr][len] -> ACK + [0x62][len][regs...]
+        const chip = cmd[1] ?? 0;
+        const start = cmd[2] ?? 0;
+        const len = cmd[3] ?? 0;
+        const base = chip === 0 ? IM.exg1 : IM.exg2;
+        if (chip > 1 || start + len > IM.exgBankLength) {
+          reply([NACK]);
+          return;
+        }
+        reply(
+          concat(
+            [ACK, CMD.EXG_REGS_RESPONSE, len],
+            infoMem.slice(base + start, base + start + len),
+          ),
+        );
+        return;
+      }
+
+      case CMD.SET_EXG_REGS: {
+        // [0x61][chip][startAddr][len][regs...]
+        const chip = cmd[1] ?? 0;
+        const start = cmd[2] ?? 0;
+        const len = cmd[3] ?? 0;
+        const base = chip === 0 ? IM.exg1 : IM.exg2;
+        if (chip > 1 || start + len > IM.exgBankLength || cmd.length < 4 + len) {
+          reply([NACK]);
+          return;
+        }
+        for (let i = 0; i < len; i++) infoMem[base + start + i] = cmd[4 + i];
+        reply([ACK]);
         return;
       }
 
