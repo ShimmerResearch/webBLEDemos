@@ -885,12 +885,20 @@ export function createSdBrowser(host, opts = {}) {
    */
   async function measureLinkSpeed(durationMs = LINK_TEST_MS) {
     const client = getClient();
+    /* Every path that returns null tells the owner of the button, not just
+       the one that throws. The mounting page puts the pill into "measuring…"
+       before calling and has nothing else that clears it, so a refusal that
+       stayed quiet left the pill running for the rest of the session. Both
+       refusals are unreachable through the button as it is gated today —
+       which is exactly why they would not have been noticed. */
     if (typeof client?.runDataRateTest !== "function") {
       log.warn("This SDK build has no data-rate test.");
+      reportLinkSpeed(null, true);
       return null;
     }
     if (busy) {
       log.warn("A card operation is already running.");
+      reportLinkSpeed(null, true);
       return null;
     }
     setBusy(true);
