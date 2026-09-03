@@ -62,7 +62,8 @@
  *   stream: boolean, sdbt: boolean, infomem: boolean, sdlog: boolean,
  *   calib: boolean, calibration: boolean, rtc: boolean, ranges: boolean,
  *   exg: boolean, sensors: boolean, battery: boolean, status: boolean,
- *   sdTransfer: boolean, branding: boolean,
+ *   sdTransfer: boolean, branding: boolean, factoryTest: boolean,
+ *   ledToggle: boolean, rtcRead: boolean,
  * }}
  */
 export function describeShimmer3Caps(client, mode) {
@@ -122,6 +123,20 @@ export function describeShimmer3Caps(client, mode) {
        same host offsets. A docked sensor is in fact the easiest one to
        rebrand — no pairing needed. */
     branding: has("readDaughterCardMem") && has("writeDaughterCardMem"),
+    /* The firmware's own factory self-test. Deliberately NOT link-gated: the
+       dock protocol addresses the same suite through its TEST component, so a
+       docked or USB-C sensor runs it too — the only difference is that the
+       ExG chip test cannot pass from the dock, which the report says itself. */
+    factoryTest: has("runFactoryTest"),
+    /* The red-LED override, and this one IS link-gated: the dock protocol has
+       no LED command at all (the property exists in the header but only under
+       the GQ build), so it is Bluetooth-only however capable the client is. */
+    ledToggle: has("toggleLed") && mode !== "usb",
+    /* Reading the real-world clock, which is all a drift measurement needs.
+       Broader than `rtc` above, which also requires the setter: the wired
+       client reads the clock through a config property rather than a method
+       of its own, and can measure drift without being able to set it. */
+    rtcRead: has("getRtcTime") || (mode === "usb" && has("getConfig")),
   };
 }
 

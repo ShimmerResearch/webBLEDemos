@@ -545,6 +545,7 @@
         <button data-tab="tabBrand" id="tabBtnBrand" type="button">
           Device naming
         </button>
+        <button data-tab="tabTest" id="tabBtnTest" type="button">Test</button>
       </div>
 
       <!-- ================================================= Configure ===== -->
@@ -580,9 +581,11 @@
             <div id="hostClock" class="mono">–</div>
           </div>
           <div class="field-hint" style="margin-top: 8px">
-            The sensor keeps its real-world clock in <em>local civil</em> time,
-            which is what the offline file parser expects, so the host's time
-            zone offset is applied when the clock is set.
+            The sensor keeps its real-world clock in <em>UTC</em>, as desktop
+            Consensys and the dock software set it, so both lines above are
+            shown in this host's local time and should read the same. The
+            <strong>Test</strong> tab measures how far the sensor's clock drifts
+            from this host's over time.
           </div>
         </div>
 
@@ -802,6 +805,89 @@
           </div>
         </div>
       </section>
+
+      <!-- ====================================================== Test ===== -->
+      <section class="tab" id="tabTest">
+        <div class="banner" id="testBanner"></div>
+
+        <div class="card">
+          <div class="card-title">Factory self-test</div>
+          <div class="field-hint" id="selfTestNote"></div>
+          <!-- common/factory-test-panel.js builds the whole panel in here. -->
+          <div id="selfTestPanel"></div>
+          <div class="field-hint" style="margin-top: 8px">
+            This is the same self-test the firmware runs on the production line.
+            The sensor prints its report over this link as it goes, and stops
+            everything else for the duration — up to about a minute for the
+            LED-state walk-through. Nothing can interrupt it: Cancel stops this
+            page listening, and the sensor keeps printing until its TEST END
+            line. The LED tests are meant to be watched, because each line names
+            the LED that should be lit as it is lit.
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Real-time clock drift</div>
+          <div class="field-hint" id="driftNote"></div>
+          <!-- common/rtc-drift-panel.js builds the whole panel in here. -->
+          <div id="driftPanel"></div>
+          <div class="field-hint" style="margin-top: 8px">
+            The sensor's real-world clock is driven by its 32 kHz crystal, so
+            the crystal's error shows up here directly — the absolute figure the
+            self-test's own crystal check cannot give, because that one measures
+            the 32 kHz crystal against the 16 MHz one and reports the
+            difference. A wired link is the better one for this: its round trips
+            jitter less than Bluetooth. Expect a usable figure within an hour or
+            two, and leave it longer for a tighter one; keep this tab open and
+            stop the host from sleeping. First measurements on hardware, docked:
+            a stock Shimmer3R read about −9 ppm, and a unit reworked to 22 pF
+            crystal load capacitors about −98 ppm. Docked sensors read a few ppm
+            low from charge self-heating, so a battery run at room temperature
+            gives the comparable figure. The fit rebaselines itself if this
+            host's own clock is stepped.
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">LEDs</div>
+          <div class="row">
+            <button
+              id="btnLedToggle"
+              type="button"
+              data-requires="idle"
+              data-cap="ledToggle"
+            >
+              Toggle red LED
+            </button>
+            <button
+              id="btnLedOn"
+              type="button"
+              data-requires="idle"
+              data-cap="ledToggle"
+            >
+              Red LED on
+            </button>
+            <button
+              id="btnLedOff"
+              type="button"
+              data-requires="idle"
+              data-cap="ledToggle"
+            >
+              Red LED off
+            </button>
+            <span class="pill" id="ledPill">not read</span>
+          </div>
+          <div class="field-hint" id="ledNote"></div>
+          <div class="field-hint" style="margin-top: 8px">
+            The firmware's toggle-LED command holds the lower LED solid red on
+            top of the sensor's own indications, and leaves it that way until it
+            is toggled again or the sensor is power-cycled — a disconnect does
+            not clear it. It is a "which sensor is this one" aid rather than a
+            health check; the sequence that exercises every LED colour is part
+            of the self-test above.
+          </div>
+        </div>
+      </section>
     </div>
 
     <!-- ================================================== Event log =====
@@ -899,6 +985,8 @@
       import { createSdBrowser } from "../common/sd-browser.js";
       import { createBrandEditor } from "../common/brand-editor.js";
       import { createCalibrationEditor } from "../common/calibration-editor.js";
+      import { createFactoryTestPanel } from "../common/factory-test-panel.js";
+      import { createRtcDriftPanel } from "../common/rtc-drift-panel.js";
       import {
         createMockShimmer3RTransport,
         mockEnabledFromUrl,
@@ -1296,6 +1384,13 @@
       /** True while the calibration panel is reading or writing. */
       let calibBusy = false;
 
+      /**
+       * True from the moment a self-test starts until the link is genuinely
+       * free again — which is AFTER a cancel, because the firmware has no
+       * abort and the sensor goes on printing its report to its own end.
+       */
+      let testBusy = false;
+
       // =====================================================================
       // Small helpers
       // =====================================================================
@@ -1330,25 +1425,23 @@
       }
 
       /**
-       * A DEVICE timestamp as the sensor's own clock reads it.
+       * A DEVICE timestamp, shown in this host's local time.
        *
-       * The sensor keeps local civil time — the offset is already baked into
-       * the value, which is why `setDeviceClock` shifts the host's UTC into
-       * that domain before writing it. Converting the ticks back gives a
-       * number that is a wall clock wearing a Unix epoch's clothes, so it is
-       * read out with the UTC accessors: they return the digits that went in.
-       * The local accessors would add the browser's offset a second time and
-       * show a correctly-set sensor as hours out from the host clock beside
-       * it — which is exactly the comparison that line is there to support.
+       * The sensor's real-world clock is a plain Unix epoch: desktop Consensys
+       * and the dock software both write `Date.now()` ticks, and hardware set
+       * by either reads back as UTC. So a device stamp and a host stamp are
+       * the same kind of number and are rendered by the same formatter — which
+       * is what makes the device clock and the host clock beside it comparable
+       * at a glance.
+       *
+       * (This page previously wrote and displayed LOCAL civil time, a
+       * convention belonging to the Verisense console. It made a sensor set by
+       * Consensys read a whole timezone offset adrift, and vice versa. Kept as
+       * a named function rather than folded into `formatClock` so the two
+       * domains stay legible at every call site.)
        */
       function formatDeviceClock(unixMs) {
-        if (!Number.isFinite(unixMs)) return "–";
-        const d = new Date(unixMs);
-        const p2 = (n) => String(n).padStart(2, "0");
-        return (
-          `${d.getUTCFullYear()}-${p2(d.getUTCMonth() + 1)}-${p2(d.getUTCDate())} ` +
-          `${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:${p2(d.getUTCSeconds())}`
-        );
+        return formatClock(unixMs);
       }
 
       /**
@@ -1401,7 +1494,7 @@
           connected: !!client,
           streaming,
           recording: recorder.active,
-          busy: busy || sdBusy || brandBusy || calibBusy,
+          busy: busy || sdBusy || brandBusy || calibBusy || testBusy,
           caps,
         });
 
@@ -1418,7 +1511,8 @@
             !sdLogging &&
             !busy &&
             !brandBusy &&
-            !calibBusy,
+            !calibBusy &&
+            !testBusy,
         );
         paintSdGating();
 
@@ -1429,7 +1523,8 @@
             !sdLogging &&
             !busy &&
             !sdBusy &&
-            !calibBusy,
+            !calibBusy &&
+            !testBusy,
         );
         paintBrandGating();
 
@@ -1446,9 +1541,33 @@
             !sdLogging &&
             !busy &&
             !sdBusy &&
-            !brandBusy,
+            !brandBusy &&
+            !testBusy,
         );
         paintCalibGating();
+
+        /* The self-test's own flag is excluded, as everywhere else: this is
+           the floor for STARTING one, and folding it in would disable Cancel
+           at the moment it is needed. */
+        selfTest.setEnabled(
+          !!client &&
+            !!caps.factoryTest &&
+            !streaming &&
+            !sdLogging &&
+            !busy &&
+            !sdBusy &&
+            !brandBusy &&
+            !calibBusy &&
+            !linkTesting,
+        );
+        /* The drift monitor is not disabled by the other panels: it takes one
+           round trip every N seconds and simply SKIPS a tick while somebody
+           else holds the link (see driftSampleSkipReason), which keeps a long
+           measurement running across an SD download instead of ending it. */
+        drift.setEnabled(
+          !!client && !!caps.rtcRead && !streaming && !sdLogging && !testBusy,
+        );
+        paintTestGating();
 
         // Page state, not device state: these must work while disconnected so
         // an image can be inspected, saved or thrown away.
@@ -1481,6 +1600,9 @@
         } else if (calibBusy) {
           $("applyNote").textContent =
             "Waiting for the calibration write to finish — and worth waiting for in this order, because a configuration write rebuilds the calibration dump from the configuration bytes.";
+        } else if (testBusy) {
+          $("applyNote").textContent =
+            "Waiting for the self-test to finish — the sensor runs it with everything else stopped and answers nothing until its report ends.";
         } else {
           $("applyNote").textContent = "";
         }
@@ -1530,6 +1652,9 @@
         }
         if (calibBusy) {
           return "A calibration write is using the link — wait for it to finish.";
+        }
+        if (testBusy) {
+          return "The self-test is running. The sensor answers nothing else until its report ends — wait for the TEST END line.";
         }
         return null;
       }
@@ -1818,6 +1943,9 @@
 
       /** Paint {@link statusView}: the flags, then how fresh they are. */
       function paintStatus() {
+        // Keeps the Test tab's LED pill in step with a status this page did
+        // not ask for — an unsolicited push, or another host's toggle.
+        paintLed();
         const host = $("statusFlags");
         const fresh = $("statusFresh");
         if (!statusView) {
@@ -1920,14 +2048,15 @@
        * broke midnight CSV splits.
        */
       async function setDeviceClock() {
-        const localCivilMs = sdk.utcToLocalCivilMillis
-          ? sdk.utcToLocalCivilMillis(Date.now())
-          : Date.now();
+        /* A plain Unix epoch, which is what desktop Consensys and the dock
+           software write: a sensor set here and a sensor set there must read
+           the same. */
+        const nowMs = Date.now();
         const write =
           typeof client.setRtcTime === "function"
-            ? () => client.setRtcTime(localCivilMs)
+            ? () => client.setRtcTime(nowMs)
             : typeof client.writeRtcFromHostTime === "function"
-              ? () => client.writeRtcFromHostTime(localCivilMs)
+              ? () => client.writeRtcFromHostTime(nowMs)
               : null;
         if (!write) {
           showToast("This link cannot set the sensor clock", "warn");
@@ -1936,6 +2065,10 @@
         try {
           await withDevice("set the real-world clock", write);
           showToast("Sensor clock set from this host", "ok");
+          /* Any drift measurement in progress spans a discontinuity now, so
+             its baseline goes with the write rather than being fitted across
+             the step. */
+          drift.noteClockWritten();
           await refreshDeviceState();
         } catch {
           /* logged and toasted by withDevice */
@@ -2709,6 +2842,9 @@
         if (calibBusy) {
           return "A calibration write is using the link. A download and a calibration write cannot share it — wait for it to finish.";
         }
+        if (testBusy) {
+          return "The sensor is running its self-test and answers nothing else until the report ends — wait for it to finish (up to about a minute).";
+        }
         return null;
       }
 
@@ -2772,6 +2908,55 @@
         onBusyChange: (working) => {
           calibBusy = working;
           regate();
+        },
+      });
+
+      /* The two Test-tab panels. Both are handed `canRun`/`canSample` rather
+         than being told when they may act: the page owns the reason, and a
+         panel that asked at click time can never be out of step with a gate
+         that was painted a moment earlier. */
+      const selfTest = createFactoryTestPanel($("selfTestPanel"), {
+        client: () => client,
+        mode: () => mode,
+        identifiedHardwareVersion: () => identifiedHardwareVersion,
+        log,
+        toast: showToast,
+        fileNamePrefix: () => `Shimmer3R_${macTail()}`,
+        deviceLabel: () => deviceName || deviceMac || "",
+        canRun: () =>
+          selfTestUnavailableReason() ??
+          (busy
+            ? "Another command is in flight — try again in a moment."
+            : null),
+        onBusyChange: (working) => {
+          testBusy = working;
+          regate();
+        },
+      });
+
+      const drift = createRtcDriftPanel($("driftPanel"), {
+        client: () => client,
+        mode: () => mode,
+        log,
+        toast: showToast,
+        fileNamePrefix: () => `Shimmer3R_${macTail()}`,
+        deviceLabel: () => deviceName || deviceMac || "",
+        canSample: driftSampleSkipReason,
+        /* Each sample goes through the page's own busy flag, so a self-test or
+           an Apply cannot start in the middle of one. `tolerate` keeps a
+           missed read a skipped sample rather than a toast every interval. */
+        withLink: (fn) =>
+          withDevice("read the sensor clock", fn, {
+            quiet: true,
+            tolerate: true,
+          }),
+        /* The sensor's real-world clock is a plain Unix epoch, as Consensys
+           and the dock software write it, so the host time goes across
+           unmodified. One hook, so a convention change is one line. */
+        hostToDeviceMillis: (ms) => ms,
+        onClockWritten: () => {
+          inferStatus({ rtcSet: true });
+          void refreshDeviceState();
         },
       });
 
@@ -2859,6 +3044,9 @@
         if (brandBusy) {
           return "A device-naming write is using the link. Wait for it to finish.";
         }
+        if (testBusy) {
+          return "The sensor is running its self-test and answers nothing else until the report ends — wait for it to finish.";
+        }
         return null;
       }
 
@@ -2877,6 +3065,148 @@
         const btn = $("tabBtnCal");
         btn.disabled = !!client && !!calibLinkHeldReason();
         btn.title = reason ?? "";
+      }
+
+      /**
+       * Why nothing on the Test tab can start right now, or null.
+       *
+       * Plain `busy` is deliberately absent: a single command in flight is
+       * over in milliseconds, and naming it here would flicker the banner on
+       * every refresh.
+       */
+      function testUnavailableReason() {
+        if (!client) {
+          return "Connect over BLE, classic Bluetooth or USB-C to run the sensor's built-in self-test, watch its clock drift against this host, or switch its red LED.";
+        }
+        if (streaming || sdLogging) {
+          return "The sensor is sensing, and the firmware refuses a self-test while it is — the test takes the whole sensor over for up to a minute. Stop the stream first.";
+        }
+        if (linkTesting) {
+          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+        }
+        if (sdBusy) {
+          return "An SD card transfer is using the link. A report printed into the middle of a block stream would interleave with it — wait for the transfer to finish.";
+        }
+        if (brandBusy) {
+          return "A device-naming write is using the link — wait for it to finish.";
+        }
+        if (calibBusy) {
+          return "A calibration write is using the link — wait for it to finish.";
+        }
+        return null;
+      }
+
+      /**
+       * The self-test section specifically. The USB sentence is a NOTE, not a
+       * refusal: the dock protocol runs the same suite through its own test
+       * component, and only one line of the report comes out differently.
+       */
+      function selfTestUnavailableReason() {
+        if (client && !caps.factoryTest) {
+          return "This SDK build cannot run the self-test on this link (no runFactoryTest). Re-vendor the SDK bundle.";
+        }
+        if (client && mode === "usb") {
+          return "Over the USB-C/dock link the self-test runs through the dock protocol's own test command. One line comes out differently: the ExG chip test reports FAIL from the dock, because that connection and the chip share pins. That is the docked test, not the board.";
+        }
+        return testUnavailableReason();
+      }
+
+      /** The LED buttons specifically. */
+      function ledUnavailableReason() {
+        // The tab banner already says "connect"; repeating it here would put
+        // the same sentence on screen twice.
+        if (!client) return null;
+        if (mode === "usb") {
+          return "The dock protocol has no LED command, so the red LED can only be switched over BLE or classic Bluetooth. The self-test's LED sequence still runs over USB-C.";
+        }
+        if (!caps.ledToggle) {
+          return "This SDK build has no toggle-LED call. Re-vendor the SDK bundle.";
+        }
+        if (testBusy) {
+          return "The self-test is running — it drives the LEDs itself until its report ends.";
+        }
+        return testUnavailableReason();
+      }
+
+      /**
+       * Why the drift monitor skips THIS tick, or null.
+       *
+       * A skip is not a failure: the monitor fits a slope through samples
+       * taken at whatever moments the link was free, so missing one costs
+       * nothing but time. That is why the drift panel is not disabled when
+       * another panel takes the link — it just waits.
+       */
+      function driftSampleSkipReason() {
+        if (!client) return "disconnected";
+        if (testBusy) return "the self-test is running";
+        if (streaming || sdLogging) return "the sensor is sensing";
+        if (linkTesting) return "the link-speed test is running";
+        if (sdBusy) return "an SD card transfer is using the link";
+        if (brandBusy) return "a device-naming write is using the link";
+        if (calibBusy) return "a calibration write is using the link";
+        if (busy) return "another command is in flight";
+        return null;
+      }
+
+      function paintTestGating() {
+        const reason = testUnavailableReason();
+        banner("testBanner", reason ? (client ? "warn" : "info") : "", reason);
+        const btn = $("tabBtnTest");
+        /* Transient reasons only, and no bounce to another tab: everything
+           here works on every link, so the tab is never permanently
+           impossible — and while another panel merely holds the link, the
+           drift plot is still worth watching. Only the firmware-level refusal
+           closes it. */
+        btn.disabled = !!client && (streaming || sdLogging);
+        btn.title = reason ?? "";
+        $("selfTestNote").textContent = client
+          ? (selfTestUnavailableReason() ?? "")
+          : "";
+        $("driftNote").textContent =
+          client && !caps.rtcRead
+            ? "This link cannot read the sensor's clock, so there is nothing to measure here."
+            : "";
+        paintLed();
+      }
+
+      /**
+       * The red-LED pill, painted from the SENSOR's status bit rather than
+       * from what this page last asked for: the firmware's flag survives a
+       * disconnect, so another host — or this one, last session — may have
+       * left it on.
+       */
+      function paintLed() {
+        const on = statusView?.status?.redLedOn;
+        const pill = $("ledPill");
+        pill.textContent =
+          typeof on === "boolean"
+            ? on
+              ? "red LED on"
+              : "red LED off"
+            : "not read";
+        pill.className = "pill" + (on === true ? " on" : "");
+        $("ledNote").textContent = ledUnavailableReason() ?? "";
+      }
+
+      /**
+       * Drive the red LED, then read the status back so the pill shows what
+       * the sensor says rather than what was asked for.
+       *
+       * @param {boolean|null} want true, false, or null to toggle
+       */
+      async function setRedLed(want) {
+        const label =
+          want == null
+            ? "toggle the red LED"
+            : `switch the red LED ${want ? "on" : "off"}`;
+        await withDevice(label, () =>
+          want == null ? client.toggleLed() : client.setRedLed(want),
+        );
+        /* Read the flag back rather than assuming it followed: `setRedLed`
+           verifies, but `toggleLed` is fire-and-acknowledge, and the pill is
+           supposed to be the sensor's word. */
+        if (client) await refreshDeviceState();
+        paintLed();
       }
 
       // =====================================================================
@@ -2934,6 +3264,9 @@
         }
         if (calibBusy) {
           return "A calibration write is using the link. A name write and a calibration write cannot share it — wait for it to finish.";
+        }
+        if (testBusy) {
+          return "The sensor is running its self-test — wait for its report to end before changing the names.";
         }
         return null;
       }
@@ -3547,6 +3880,12 @@
            windows into the destination folder. Abort first, then drop the
            client the panel reads through. */
         sd.abort();
+        /* Nothing is coming from a link that has gone, so the capture is
+           abandoned rather than drained, and the busy flag it set is released
+           here in case the drop happened mid-report. */
+        selfTest.cancel("disconnect");
+        drift.stop();
+        testBusy = false;
         /* Report whatever the tap was still holding back before the transport
            it wrapped goes away — a count that never lands reads as bytes that
            were never sent. */
@@ -3613,6 +3952,15 @@
        *                        report one at all, which is how the
        *                        unidentified-sensor path gets exercised
        *   ?mock=1&sdKBps=400   pace the synthetic card's file blocks
+       *   ?mock=1&testMs=40    shorten the self-test's per-LED dwell (2000 ms
+       *                        on real hardware, so a full LED test is 18 s)
+       *   ?mock=1&testFail=1   a failing self-test: a FAIL line, an over-long
+       *                        line the firmware would truncate, a fail mask
+       *   ?mock=1&ppm=20000    run the sensor's clock at this error, so the
+       *                        drift monitor has a slope to find
+       *   ?mock=1&clockBase=local  start the sensor's clock on this host's
+       *                        civil time instead of UTC, as a sensor set by
+       *                        a tool using the other convention reads
        *   ?mock=1&debug=1      log every command and reply to the console
        */
       function setUpMock() {
@@ -3629,6 +3977,14 @@
             ? { major: fwParts[0], minor: fwParts[1], patch: fwParts[2] }
             : undefined;
         const sdKBps = Number(params.get("sdKBps")) || undefined;
+        const factoryTest = {
+          stepMs: Number(params.get("testMs")) || undefined,
+          fail: params.get("testFail") === "1",
+        };
+        const rtc = {
+          ppm: Number(params.get("ppm")) || 0,
+          clockBase: params.get("clockBase") === "local" ? "local" : "utc",
+        };
         /* `hw=none` (or `hw=0`) NACKs GET_DEVICE_VERSION, so the page cannot
            identify the sensor. Anything else is a hardware id. */
         const hwParam = params.get("hw");
@@ -3673,6 +4029,8 @@
             firmware,
             hardwareVersion,
             sdKBps,
+            factoryTest,
+            rtc,
             debug: params.get("debug") === "1",
           });
           // Hooks for driving the page from the console while developing:
@@ -3689,6 +4047,8 @@
           window.sdBrowser = sd;
           window.brandEditor = brand;
           window.calibrationEditor = cal;
+          window.factoryTestPanel = selfTest;
+          window.rtcDriftPanel = drift;
           /* Also the client itself, so a link's feature set can be taken
              apart from the console: shadowing a method on it is how the
              "this link cannot do X" paths get exercised without owning the
@@ -3759,6 +4119,10 @@
        */
       async function disconnectFromSensor() {
         sd.abort();
+        /* Disconnecting is the ONLY escape from a running self-test — the
+           firmware has no abort — so it must not wait for one to finish. */
+        selfTest.cancel("disconnect");
+        drift.stop();
         if (streaming) await stopStream(sdLogging);
         if (recorder.active) await stopRecording();
         if (connect.session) {
@@ -3804,6 +4168,19 @@
           });
       });
       $("btnSetClock").addEventListener("click", reported(setDeviceClock));
+
+      $("btnLedToggle").addEventListener(
+        "click",
+        reported(() => setRedLed(null)),
+      );
+      $("btnLedOn").addEventListener(
+        "click",
+        reported(() => setRedLed(true)),
+      );
+      $("btnLedOff").addEventListener(
+        "click",
+        reported(() => setRedLed(false)),
+      );
 
       $("btnRead").addEventListener("click", reported(readConfiguration));
       $("btnImRead").addEventListener("click", reported(readConfiguration));
@@ -3975,8 +4352,13 @@
       updateTapNote();
       regate();
       log.log(
-        "ready — connect over BLE or classic Bluetooth to configure, stream, record, download from the SD card and change the sensor's names, or over USB-C to configure and rename only",
+        "ready — connect over BLE or classic Bluetooth to configure, stream, record, download from the SD card, change the sensor's names, run its self-test and watch its clock drift, or over USB-C for everything but streaming and the LED",
       );
+      /* The page has finished building itself. A test harness waits on this
+         rather than on some particular panel having rendered — the module
+         graph grows, and a probe tied to one panel ages the moment another
+         one is added after it. */
+      document.documentElement.dataset.booted = "true";
     </script>
   </body>
 </html>
