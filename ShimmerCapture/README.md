@@ -48,6 +48,34 @@ port rather than the device. A Shimmer3R pairs as two separate entries — one
 classic, one BLE — and only the classic one answers on this path; the page says
 so if you pick the wrong one.
 
+## General
+
+The first tab, as in the Verisense device console, and for the same reason: the
+one-shot commands somebody reaches for straight after connecting come before
+the tabs that are a task in themselves.
+
+The **clock** is here rather than with the configuration because it is a device
+command and not a stored setting — the real-world clock is not part of the
+configuration image. Set it from this host, or read it back on its own; reading
+it alone is deliberately not the Device panel's **Refresh**, which also reads
+the battery and the status bytes, because three round trips to answer one
+question is three chances for one of the others to put an error on screen about
+something nobody asked about.
+
+The **LEDs** are here rather than on the Test tab because nothing about them is
+a test: holding the lower LED solid red is how you tell two sensors on a bench
+apart. The sequence that exercises every LED colour is part of the factory
+self-test, which is on **Test**.
+
+**Device commands** is the general place for the rest. **Re-inquire channel
+list** asks the firmware what it is set to send and at what rate — the page
+does this on connect and after an Apply, so this is for the case where
+something else reconfigured the sensor meanwhile. **Reboot on next disconnect**
+arms the firmware's one-shot soft reboot: it cannot reboot while the link is
+up, and it skips the reboot entirely while the sensor is recording so that it
+can never truncate a trial. Reach for it after writing advertising names, which
+the Bluetooth module only re-reads at boot.
+
 ## Configuring
 
 The configuration editor is generated from the SDK's description of the
@@ -58,6 +86,22 @@ pressure sensor's oversampling, the Bluetooth baud rate, the SD-logging
 start-up and duration settings, the trial and experiment identifiers, the
 multi-sensor sync settings and the stored calibration blocks. Every control
 carries the byte and bit it lives in, on hover.
+
+The **Calibration** group in that form is the six 21-byte kinematic blocks the
+image holds, and they are laid out the way the Calibration tab lays out the
+dump: an offset vector, a sensitivity vector and a 3x3 alignment matrix, each
+labelled with its unit, and a chip naming the range the image is configured for
+— which is what makes the numbers mean anything, since the image holds one
+block per sensor rather than one per range. Forty-two hex characters in a text
+box was what the bytes are and unreadable with it.
+
+They are editable here, and read-only on the Calibration tab when that tab
+falls back to showing the image: the configuration image belongs to this form,
+and two panels writing one image would silently drop whichever change lost. A
+value the 21-byte format cannot hold is refused with the box named, never
+clamped, and a block holding no calibration at all — every byte 0x00 or 0xFF —
+shows the factory defaults the firmware would fall back to, greyed, so nobody
+reads them as measurements.
 
 Two things the page owns rather than the schema:
 
@@ -111,11 +155,12 @@ on purpose. The figure it produces also drives the download ETAs on the SD tab.
 
 ## The clock
 
-The sensor keeps its clock in **UTC**, which is what desktop Consensys and the
-dock software write, so setting it from this host writes a plain epoch and both
-the sensor's clock and the host's are shown in this host's local time — they
-should read the same. Over USB the clock can be set but not read back, because
-the dock protocol has a write for it and no read.
+On the **General** tab. The sensor keeps its clock in **UTC**, which is what
+desktop Consensys and the dock software write, so setting it from this host
+writes a plain epoch and both the sensor's clock and the host's are shown in
+this host's local time — they should read the same. Over USB the clock can be
+set but not read back, because the dock protocol has a write for it and no
+read.
 
 (An earlier version of this page wrote and displayed the clock as local civil
 time, a convention belonging to the Verisense console. It made a sensor set by
@@ -149,6 +194,21 @@ at all. The last is not zero — an unwritten block reads back as all ones or al
 zeros, and showing that as a calibration of zero would be a lie about a sensor
 that has never been calibrated. A per-sensor restore puts the factory seed back
 for the selected range.
+
+The calibration is read **as part of the connect handshake**, along with the
+configuration image, so the tab is populated before anybody opens it — a page
+that showed a sensor's settings without showing what it is calibrated to had
+told half the story, and the tab otherwise sat empty until somebody thought to
+press Read. It goes last in the handshake, because it needs the generation and
+the configured ranges the earlier reads establish, and it is tolerated rather
+than required: an older firmware NACKs the command, and a tab that could not
+be filled is not a connection that failed.
+
+Every card carries its date line whenever anything has been read, saying "no
+date" where there is none. A line that appeared on three sensors and not on the
+others read as those three being the only ones with a calibration date, when
+what it meant was that the rest have no calibration at all — a different fact,
+and one the pill beside each title already makes.
 
 Reads, writes and the raw dump's save and load all work over a Bluetooth link.
 The dock protocol has no calibration-dump command, so the controls are greyed
@@ -188,6 +248,13 @@ Expanded it keeps the full page width, and whether it is open is remembered per
 browser. The page reserves the space it occupies in either state, so it never
 covers what is underneath it.
 
+**Copy** puts the whole log on the clipboard — every line, not just the ones
+the filter is showing, which is the same text **Download** saves. It reports
+what happened either way: the clipboard API is refused outside a secure context
+and on an unfocused document, and a log is exactly what somebody wants to copy
+when something has gone wrong, so a copy that silently did nothing would be the
+worst possible failure.
+
 **Log raw TX/RX bytes** adds the bytes themselves, in both directions, on any
 of the three links — the diagnostic to reach for when a sensor answers
 something unexpected, or answers nothing. It is off until asked, and it leaves
@@ -204,10 +271,19 @@ space come from the card itself; pick whole sessions or individual files.
 
 Files can be written either as the card lays them out or into the folder
 structure Consensys imports, which is the default — the layout matters, because
-Consensys will not find a session filed the other way. The destination folder is
-remembered between visits, so a long download does not start with a file dialog
-every time. A browser can never preselect an absolute path, so the first
-download of a session asks once.
+Consensys will not find a session filed the other way. That structure is
+
+    <destination>/<import date and time>/<MAC id>/data/<trial>/<session>/<file>
+
+and the second level is the sensor's **MAC address**, twelve lowercase hex
+digits, not its name: a name folder produces a tree the Consensys importer
+walks straight past, so the download looks complete and cannot be imported.
+The panel shows the path it is about to write before it writes anything, with
+the real MAC in it, and says so plainly if the address could not be read.
+
+The destination folder is remembered between visits, so a long download does
+not start with a file dialog every time. A browser can never preselect an
+absolute path, so the first download of a session asks once.
 
 A transfer shows its throughput and an estimate of the time left, and can be
 aborted. Aborting keeps what has already been written and the folder it went

@@ -115,7 +115,7 @@ export function describeShimmer3Caps(client, mode) {
        visible rather than making it an accident of feature detection. */
     sdTransfer: has("sdListDir") && has("sdReadFileWindow") && mode !== "usb",
     /* The expansion-board EEPROM, which is where the brand record lives — the
-       names a sensor advertises over classic Bluetooth and BLE, and presents
+       names a sensor advertises over Classic Bluetooth and BLE, and presents
        over USB. Deliberately NOT link-gated, unlike `sdTransfer` and
        `stream`: every client carries these two calls and every link reaches
        the same EEPROM, because the dock protocol has a daughter-card memory

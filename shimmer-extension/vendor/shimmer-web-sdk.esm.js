@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.1.25';
+const SDK_VERSION = '0.2.1';
 
 /**
  * Container for a single decoded sensor frame.
@@ -1424,6 +1424,68 @@ class StreamStatsTracker {
             lossPct: totalExpected > 0 ? (totalLost / totalExpected) * 100 : 0,
             perSensor,
         };
+    }
+}
+
+/**
+ * A set of listeners: one that throws neither stops the others nor reaches the
+ * emitter — as long as the `onError` reporter does not itself throw, which is
+ * the single way an exception can still escape {@link HandlerSet.emit}. See the
+ * constructor.
+ *
+ * Every client keeps one of these for its "temp" handlers — the short-lived
+ * callbacks a request registers to catch its own reply — and all four had
+ * grown an identical copy of it, differing only in what they hand the
+ * listeners (`Uint8Array`, `string`, `UartRxPacket`).
+ *
+ * Swallowing handler exceptions is not incidental tidiness, which is the
+ * reason this is worth naming once rather than repeating. `drainByteStream`'s
+ * `onMessage` hook documents that it **must not throw**: an exception there
+ * escapes the drain, so the caller never receives the remaining tail, never
+ * advances its accumulator, and re-delivers every message in that read on the
+ * next one. What makes that safe is that all in-tree callers dispatch through
+ * this emitter. Four hand-rolled copies could drift apart silently; one can be
+ * tested, and is.
+ */
+class HandlerSet {
+    /**
+     * @param onError Called with whatever a listener threw. Intended for a log
+     *   line — it is invoked inside the emit loop, so if it throws, the
+     *   remaining listeners are skipped and the exception escapes after all.
+     */
+    constructor(onError) {
+        this.onError = onError;
+        this._fns = new Set();
+    }
+    /** Number of registered listeners. */
+    get size() {
+        return this._fns.size;
+    }
+    /** Register `fn`. Adding the same function twice registers it once. */
+    add(fn) {
+        this._fns.add(fn);
+    }
+    /** Unregister `fn`. Safe to call for a function that was never added. */
+    delete(fn) {
+        this._fns.delete(fn);
+    }
+    /** Drop every listener. */
+    clear() {
+        this._fns.clear();
+    }
+    /**
+     * Hand `value` to every listener in registration order, reporting anything
+     * thrown to `onError` and carrying on with the rest.
+     */
+    emit(value) {
+        this._fns.forEach((fn) => {
+            try {
+                fn(value);
+            }
+            catch (e) {
+                this.onError(e);
+            }
+        });
     }
 }
 
@@ -4424,6 +4486,19 @@ const FACTORY_TEST_DRAIN_IDLE_MS = 10000;
 /** Sentinels from the report envelope (`Test/shimmer_test.c:22-61`). */
 const TEST_START_SENTINEL = 'TEST START';
 const TEST_END_SENTINEL = 'TEST END';
+/**
+ * Cap on the in-progress line, in characters.
+ *
+ * `_line` exists only to spot a sentinel, and it is emptied at every newline —
+ * so on any report it stays around the firmware's own 128-character write, or
+ * twice that where a truncated write glued two lines together. A device that
+ * sent no newline at all would otherwise grow it without limit, and the drain
+ * is exactly the state a misbehaving device is left in. Four times the
+ * firmware's buffer is far past any real line and still bounded; the head is
+ * what gets dropped, because a sentinel sits at the END of the line that
+ * carries it.
+ */
+const MAX_LINE_CHARS = 512;
 /** Bytes the report grammar allows: TAB, LF, CR and printable ASCII. */
 function isReportByte(b) {
     return b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e);
@@ -4664,6 +4739,9 @@ class FactoryTestCapture {
             if (accumulate)
                 text += ch;
             this._line += ch;
+            if (this._line.length > MAX_LINE_CHARS) {
+                this._line = this._line.slice(-MAX_LINE_CHARS);
+            }
             if (b !== 0x0a)
                 continue;
             const line = this._line.replace(/\r?\n$/, '');
@@ -7065,11 +7143,11 @@ function u16be(bytes, msbIdx, lsbIdx) {
  */
 function parseSd(bytes, layout) {
     if (!layout.supportsSdLogSync) {
-        return { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 };
+        return { btInterval: 0, estimatedExpLengthSec: 0, maxExpLengthMin: 0 };
     }
     return {
         btInterval: bytes[layout.idxSDBTInterval] & 0xff,
-        estimatedExpLengthMin: u16be(bytes, layout.idxEstimatedExpLengthMsb, layout.idxEstimatedExpLengthLsb),
+        estimatedExpLengthSec: u16be(bytes, layout.idxEstimatedExpLengthMsb, layout.idxEstimatedExpLengthLsb),
         maxExpLengthMin: u16be(bytes, layout.idxMaxExpLengthMsb, layout.idxMaxExpLengthLsb),
     };
 }
@@ -7189,7 +7267,7 @@ function emptyConfig(raw) {
             altMagRate: 0,
             altAccelRate: 0,
         },
-        sd: { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 },
+        sd: { btInterval: 0, estimatedExpLengthSec: 0, maxExpLengthMin: 0 },
         calibration: {
             lnAccel: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
             gyro: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
@@ -7437,8 +7515,8 @@ function writeSd(out, config, layout) {
         return;
     const sd = config.sd;
     out[layout.idxSDBTInterval] = sd.btInterval & 0xff;
-    out[layout.idxEstimatedExpLengthMsb] = (sd.estimatedExpLengthMin >> 8) & 0xff;
-    out[layout.idxEstimatedExpLengthLsb] = sd.estimatedExpLengthMin & 0xff;
+    out[layout.idxEstimatedExpLengthMsb] = (sd.estimatedExpLengthSec >> 8) & 0xff;
+    out[layout.idxEstimatedExpLengthLsb] = sd.estimatedExpLengthSec & 0xff;
     out[layout.idxMaxExpLengthMsb] = (sd.maxExpLengthMin >> 8) & 0xff;
     out[layout.idxMaxExpLengthLsb] = sd.maxExpLengthMin & 0xff;
 }
@@ -8626,20 +8704,20 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     },
     {
         key: 'estimatedExpLength',
-        label: 'Estimated Experiment Length',
-        desc: 'Big-endian u16 at idxEstimatedExpLengthMsb/Lsb (ShimmerObject.java:5316-5317; FW experimentLengthEstimatedInSec*).',
+        label: 'Estimated Experiment Length (seconds)',
+        desc: 'Big-endian u16 at idxEstimatedExpLengthMsb/Lsb. SECONDS, per the firmware struct field experimentLengthEstimatedInSec* (shimmer_config.h:403-404) — note the sibling field below is in minutes. ShimmerObject.java:5316-5317.',
         kind: 'u16be',
         layoutKey: 'idxEstimatedExpLengthMsb',
         min: 0,
         max: 0xffff,
         group: 'sdLogging',
         appliesTo: ALL,
-        configKey: 'sd.estimatedExpLengthMin',
+        configKey: 'sd.estimatedExpLengthSec',
     },
     {
         key: 'maxExpLength',
-        label: 'Maximum Experiment Length (auto-stop)',
-        desc: 'Big-endian u16 at idxMaxExpLengthMsb/Lsb (ShimmerObject.java:5318-5319; FW experimentLengthMaxInMinutes*).',
+        label: 'Maximum Experiment Length, auto-stop (minutes)',
+        desc: 'Big-endian u16 at idxMaxExpLengthMsb/Lsb. MINUTES, per the firmware struct field experimentLengthMaxInMinutes* (shimmer_config.h:405-406) — the field above is in seconds. ShimmerObject.java:5318-5319.',
         kind: 'u16be',
         layoutKey: 'idxMaxExpLengthMsb',
         min: 0,
@@ -9182,7 +9260,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._disconnectUnsub = null;
         // Protocol state
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         this.schema = null;
         this._lastAckRemainder = null;
         this._expectingAck = 0;
@@ -10290,7 +10368,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      * The guard is **only** as good as `_streaming`, which tracks the streams
      * this client started. The firmware blocks configuration writes for anything
      * it considers sensing, SD logging included, and this client holds no local
-     * SD-logging flag — `readStatus()` is the only way to learn about a log
+     * SD-logging flag — {@link getStatus} is the only way to learn about a log
      * started before it connected or by another host. So a write can still be
      * refused by the device after passing this check; that refusal arrives as a
      * NACK and is reported as one. The message says as much rather than implying
@@ -11256,14 +11334,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(buf) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(buf);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(buf);
     }
     /**
      * Read (and cache) the hardware version via GET_DEVICE_VERSION_COMMAND
@@ -13573,8 +13644,29 @@ function parseSdTrialFolderName(folder) {
  * down in windows with resume-from-on-disk-size semantics — the same shape as
  * the field-proven Verisense `transferLoggedData` flow.
  */
-/** Device-name folder used when a session folder is not `<Name>-<NNN>`. */
+/**
+ * Device folder used when no MAC id is available and the session folder is not
+ * `<Name>-<NNN>` either.
+ */
 const CONSENSYS_UNKNOWN_DEVICE = 'Unknown_Shimmer';
+/**
+ * Normalise a MAC id to the form Consensys names its device folders with:
+ * twelve LOWERCASE hex digits, no separators (`e8eb1b9767a0`).
+ *
+ * Lowercase because that is what Consensys writes, and what
+ * {@link import('../../sdlog/header.js').parseSdLogHeader} reports for the same
+ * six bytes inside the file - the two have to agree for an import to match a
+ * folder to the sessions in it. Windows is case-insensitive about paths, so
+ * this is cosmetic there and load-bearing on macOS and Linux.
+ *
+ * Returns null for anything that is not six bytes of hex, so a caller can tell
+ * "no MAC" from "a MAC I could not use" and fall back deliberately rather than
+ * creating a folder named after a truncated or unprovisioned address.
+ */
+function consensysMacFolderName(macId) {
+    const hex = String(macId ?? '').replace(/[^0-9a-fA-F]/g, '');
+    return hex.length === 12 ? hex.toLowerCase() : null;
+}
 /**
  * Format an import-time folder name as Consensys does: `yyyy-MM-dd_HH.mm.ss`
  * in local time (e.g. `2025-06-25_15.30.36`).
@@ -13587,12 +13679,34 @@ function formatSdImportStamp(date = new Date()) {
 /**
  * Map a card directory chain to its Consensys Backup destination.
  *
- * The device name is taken from the session folder (`<ShimmerName>-<NNN>`)
- * rather than from the connected device, so sessions recorded under a previous
- * device name - or on a card that has been moved between devices - still file
- * under the name they were recorded with, which is what Consensys shows.
+ * The level between the import stamp and the card tree is the device's **MAC
+ * id**, twelve lowercase hex digits:
+ *
+ *     <import-stamp>/e8eb1b9767a0/data/<TrialName>_<ConfigTime>/<ShimmerName>-<NNN>
+ *
+ * It is the MAC and not the Shimmer name because that is what Consensys itself
+ * writes and what its importer looks for - a name folder produces a tree the
+ * import walks straight past. The MAC is also the identifier that cannot drift:
+ * a device renamed between two trials keeps one folder, where the name would
+ * have split its sessions in two.
+ *
+ * `macId` is the CONNECTED device's MAC, so it is right whenever the card is
+ * being read out of the device that wrote it - which is the only way this
+ * transfer path can be reached at all. A card physically moved from another
+ * device would be filed under the reading device's MAC; the alternative,
+ * reading each session's first file header for the MAC stored in it, costs a
+ * round trip per session to cover a case Bluetooth download cannot produce.
+ *
+ * With no usable MAC (`null`, or anything that is not six bytes of hex) it
+ * falls back to the Shimmer name taken from the session folder, and then to
+ * {@link CONSENSYS_UNKNOWN_DEVICE}. That tree is NOT importable by Consensys -
+ * the fallback exists so a download still lands somewhere sensible and
+ * separates two devices' sessions, not because it is equivalent.
  */
-function consensysBackupSegments(cardDirSegments, importStamp) {
+function consensysBackupSegments(cardDirSegments, importStamp, macId) {
+    const mac = consensysMacFolderName(macId);
+    if (mac)
+        return [importStamp, mac, ...cardDirSegments];
     let shimmerName = CONSENSYS_UNKNOWN_DEVICE;
     const sessionDir = cardDirSegments[cardDirSegments.length - 1];
     if (sessionDir) {
@@ -13650,6 +13764,7 @@ async function downloadSdTree(client, destRoot, opts = {}) {
     const maxRetriesPerFile = opts.maxRetriesPerFile ?? 3;
     const layout = opts.layout ?? 'card';
     const importStamp = opts.importStamp ?? formatSdImportStamp();
+    const macId = opts.macId ?? null;
     const summary = {
         importStamp: layout === 'consensysBackup' ? importStamp : undefined,
         filesDownloaded: 0,
@@ -13684,7 +13799,9 @@ async function downloadSdTree(client, destRoot, opts = {}) {
         const segments = file.path.split('/');
         const name = segments.pop();
         try {
-            const destSegments = layout === 'consensysBackup' ? consensysBackupSegments(segments, importStamp) : segments;
+            const destSegments = layout === 'consensysBackup'
+                ? consensysBackupSegments(segments, importStamp, macId)
+                : segments;
             const dir = await ensureDirectoryPath(destRoot, destSegments);
             const handle = await dir.getFileHandle(name, { create: true });
             const existingSize = (await handle.getFile()).size;
@@ -13942,7 +14059,7 @@ class Shimmer3Client extends BaseShimmerClient {
         this._disconnectUnsub = null;
         // Protocol state
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         this.schema = null;
         this._streaming = false;
         this._streamStarting = false;
@@ -15001,14 +15118,7 @@ class Shimmer3Client extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(buf) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(buf);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(buf);
     }
 }
 
@@ -15056,7 +15166,7 @@ class WiredShimmerClient extends BaseShimmerClient {
         this._notifyUnsub = null;
         this._disconnectUnsub = null;
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         /**
          * Serialization queue. Every public command method chains onto this so that
          * only one request/response exchange is in flight at a time — the docked
@@ -15808,14 +15918,7 @@ class WiredShimmerClient extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(pkt) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(pkt);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(pkt);
     }
 }
 
@@ -16142,7 +16245,7 @@ class SmartDockClient extends BaseShimmerClient {
         this._notifyUnsub = null;
         this._disconnectUnsub = null;
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         /**
          * Serialization queue: all public operations chain onto this so slot
          * select + per-slot reads run as atomic, non-interleaved units. Concurrent
@@ -16490,14 +16593,7 @@ class SmartDockClient extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(line) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(line);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(line);
     }
 }
 
@@ -21921,8 +22017,14 @@ class VerisenseBleDevice extends BaseShimmerClient {
     /** Subscribe to a transport's notify/disconnect streams. */
     _wireTransport(transport) {
         this._transport = transport;
+        /* Arm the base class's `onDisconnect` for this connection as well as this
+           client's own `disconnected` event. Both exist for a reason: the event is
+           what every Verisense consumer here listens to, while `onDisconnect` is
+           part of the shared client contract, and a caller written against that
+           contract was previously handed a callback that could never fire. */
+        this._armDisconnectNotification();
         this._notifyUnsub = transport.onNotify((bytes) => this._feedStreamBytes(bytes));
-        this._disconnectUnsub = transport.onDisconnect(() => this._handleTransportDisconnect());
+        this._disconnectUnsub = transport.onDisconnect((reason) => this._handleTransportDisconnect(reason));
     }
     /** Drop the current transport's notify/disconnect subscriptions. */
     _unwireTransport() {
@@ -21942,13 +22044,20 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._disconnectUnsub = null;
     }
     /** Handle an unexpected / requested transport disconnect (link drop). */
-    _handleTransportDisconnect() {
+    _handleTransportDisconnect(reason) {
         const kind = this._transportKind === 'serial' ? 'serial' : 'ble';
         this._mode = 'idle';
         this._transportKind = null;
-        if (this._suppressDisconnectedEvent)
+        if (this._suppressDisconnectedEvent) {
+            // Application-initiated teardown is not a fault for either channel.
+            this._suppressDisconnectNotification();
             return;
+        }
         this.emit('disconnected', { kind });
+        /* The transport's own error, not a synthesised one: it is the only thing
+           that says WHY the link went, and the other clients forward it. The
+           `disconnected` event keeps its existing shape. */
+        this._emitDisconnect(reason);
     }
     /**
      * Mirror the active WebBluetoothTransport's GATT handles onto the legacy
@@ -26222,5 +26331,5 @@ function shimmerFactoryTestReportToCsvRows(parsed, meta = {}) {
     return factoryTestReportToCsvRows(parsed, meta);
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, EXG_BANK_LENGTH$1 as EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, EXG_BANK_LENGTH$1 as EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

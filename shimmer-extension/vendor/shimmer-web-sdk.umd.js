@@ -11,7 +11,7 @@
      *
      * Kept in sync with package.json by tests/core/version.test.ts.
      */
-    const SDK_VERSION = '0.1.25';
+    const SDK_VERSION = '0.2.1';
 
     /**
      * Container for a single decoded sensor frame.
@@ -1430,6 +1430,68 @@
                 lossPct: totalExpected > 0 ? (totalLost / totalExpected) * 100 : 0,
                 perSensor,
             };
+        }
+    }
+
+    /**
+     * A set of listeners: one that throws neither stops the others nor reaches the
+     * emitter — as long as the `onError` reporter does not itself throw, which is
+     * the single way an exception can still escape {@link HandlerSet.emit}. See the
+     * constructor.
+     *
+     * Every client keeps one of these for its "temp" handlers — the short-lived
+     * callbacks a request registers to catch its own reply — and all four had
+     * grown an identical copy of it, differing only in what they hand the
+     * listeners (`Uint8Array`, `string`, `UartRxPacket`).
+     *
+     * Swallowing handler exceptions is not incidental tidiness, which is the
+     * reason this is worth naming once rather than repeating. `drainByteStream`'s
+     * `onMessage` hook documents that it **must not throw**: an exception there
+     * escapes the drain, so the caller never receives the remaining tail, never
+     * advances its accumulator, and re-delivers every message in that read on the
+     * next one. What makes that safe is that all in-tree callers dispatch through
+     * this emitter. Four hand-rolled copies could drift apart silently; one can be
+     * tested, and is.
+     */
+    class HandlerSet {
+        /**
+         * @param onError Called with whatever a listener threw. Intended for a log
+         *   line — it is invoked inside the emit loop, so if it throws, the
+         *   remaining listeners are skipped and the exception escapes after all.
+         */
+        constructor(onError) {
+            this.onError = onError;
+            this._fns = new Set();
+        }
+        /** Number of registered listeners. */
+        get size() {
+            return this._fns.size;
+        }
+        /** Register `fn`. Adding the same function twice registers it once. */
+        add(fn) {
+            this._fns.add(fn);
+        }
+        /** Unregister `fn`. Safe to call for a function that was never added. */
+        delete(fn) {
+            this._fns.delete(fn);
+        }
+        /** Drop every listener. */
+        clear() {
+            this._fns.clear();
+        }
+        /**
+         * Hand `value` to every listener in registration order, reporting anything
+         * thrown to `onError` and carrying on with the rest.
+         */
+        emit(value) {
+            this._fns.forEach((fn) => {
+                try {
+                    fn(value);
+                }
+                catch (e) {
+                    this.onError(e);
+                }
+            });
         }
     }
 
@@ -4430,6 +4492,19 @@
     /** Sentinels from the report envelope (`Test/shimmer_test.c:22-61`). */
     const TEST_START_SENTINEL = 'TEST START';
     const TEST_END_SENTINEL = 'TEST END';
+    /**
+     * Cap on the in-progress line, in characters.
+     *
+     * `_line` exists only to spot a sentinel, and it is emptied at every newline —
+     * so on any report it stays around the firmware's own 128-character write, or
+     * twice that where a truncated write glued two lines together. A device that
+     * sent no newline at all would otherwise grow it without limit, and the drain
+     * is exactly the state a misbehaving device is left in. Four times the
+     * firmware's buffer is far past any real line and still bounded; the head is
+     * what gets dropped, because a sentinel sits at the END of the line that
+     * carries it.
+     */
+    const MAX_LINE_CHARS = 512;
     /** Bytes the report grammar allows: TAB, LF, CR and printable ASCII. */
     function isReportByte(b) {
         return b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e);
@@ -4670,6 +4745,9 @@
                 if (accumulate)
                     text += ch;
                 this._line += ch;
+                if (this._line.length > MAX_LINE_CHARS) {
+                    this._line = this._line.slice(-MAX_LINE_CHARS);
+                }
                 if (b !== 0x0a)
                     continue;
                 const line = this._line.replace(/\r?\n$/, '');
@@ -7071,11 +7149,11 @@
      */
     function parseSd(bytes, layout) {
         if (!layout.supportsSdLogSync) {
-            return { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 };
+            return { btInterval: 0, estimatedExpLengthSec: 0, maxExpLengthMin: 0 };
         }
         return {
             btInterval: bytes[layout.idxSDBTInterval] & 0xff,
-            estimatedExpLengthMin: u16be(bytes, layout.idxEstimatedExpLengthMsb, layout.idxEstimatedExpLengthLsb),
+            estimatedExpLengthSec: u16be(bytes, layout.idxEstimatedExpLengthMsb, layout.idxEstimatedExpLengthLsb),
             maxExpLengthMin: u16be(bytes, layout.idxMaxExpLengthMsb, layout.idxMaxExpLengthLsb),
         };
     }
@@ -7195,7 +7273,7 @@
                 altMagRate: 0,
                 altAccelRate: 0,
             },
-            sd: { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 },
+            sd: { btInterval: 0, estimatedExpLengthSec: 0, maxExpLengthMin: 0 },
             calibration: {
                 lnAccel: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
                 gyro: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
@@ -7443,8 +7521,8 @@
             return;
         const sd = config.sd;
         out[layout.idxSDBTInterval] = sd.btInterval & 0xff;
-        out[layout.idxEstimatedExpLengthMsb] = (sd.estimatedExpLengthMin >> 8) & 0xff;
-        out[layout.idxEstimatedExpLengthLsb] = sd.estimatedExpLengthMin & 0xff;
+        out[layout.idxEstimatedExpLengthMsb] = (sd.estimatedExpLengthSec >> 8) & 0xff;
+        out[layout.idxEstimatedExpLengthLsb] = sd.estimatedExpLengthSec & 0xff;
         out[layout.idxMaxExpLengthMsb] = (sd.maxExpLengthMin >> 8) & 0xff;
         out[layout.idxMaxExpLengthLsb] = sd.maxExpLengthMin & 0xff;
     }
@@ -8632,20 +8710,20 @@
         },
         {
             key: 'estimatedExpLength',
-            label: 'Estimated Experiment Length',
-            desc: 'Big-endian u16 at idxEstimatedExpLengthMsb/Lsb (ShimmerObject.java:5316-5317; FW experimentLengthEstimatedInSec*).',
+            label: 'Estimated Experiment Length (seconds)',
+            desc: 'Big-endian u16 at idxEstimatedExpLengthMsb/Lsb. SECONDS, per the firmware struct field experimentLengthEstimatedInSec* (shimmer_config.h:403-404) — note the sibling field below is in minutes. ShimmerObject.java:5316-5317.',
             kind: 'u16be',
             layoutKey: 'idxEstimatedExpLengthMsb',
             min: 0,
             max: 0xffff,
             group: 'sdLogging',
             appliesTo: ALL,
-            configKey: 'sd.estimatedExpLengthMin',
+            configKey: 'sd.estimatedExpLengthSec',
         },
         {
             key: 'maxExpLength',
-            label: 'Maximum Experiment Length (auto-stop)',
-            desc: 'Big-endian u16 at idxMaxExpLengthMsb/Lsb (ShimmerObject.java:5318-5319; FW experimentLengthMaxInMinutes*).',
+            label: 'Maximum Experiment Length, auto-stop (minutes)',
+            desc: 'Big-endian u16 at idxMaxExpLengthMsb/Lsb. MINUTES, per the firmware struct field experimentLengthMaxInMinutes* (shimmer_config.h:405-406) — the field above is in seconds. ShimmerObject.java:5318-5319.',
             kind: 'u16be',
             layoutKey: 'idxMaxExpLengthMsb',
             min: 0,
@@ -9188,7 +9266,7 @@
             this._disconnectUnsub = null;
             // Protocol state
             this._rxBuf = new Uint8Array(0);
-            this._temps = new Set();
+            this._temps = new HandlerSet((e) => this._log('temp handler error', e));
             this.schema = null;
             this._lastAckRemainder = null;
             this._expectingAck = 0;
@@ -10296,7 +10374,7 @@
          * The guard is **only** as good as `_streaming`, which tracks the streams
          * this client started. The firmware blocks configuration writes for anything
          * it considers sensing, SD logging included, and this client holds no local
-         * SD-logging flag — `readStatus()` is the only way to learn about a log
+         * SD-logging flag — {@link getStatus} is the only way to learn about a log
          * started before it connected or by another host. So a write can still be
          * refused by the device after passing this check; that refusal arrives as a
          * NACK and is reported as one. The message says as much rather than implying
@@ -11262,14 +11340,7 @@
             this._temps.delete(fn);
         }
         _emitTemp(buf) {
-            this._temps.forEach((fn) => {
-                try {
-                    fn(buf);
-                }
-                catch (e) {
-                    this._log('temp handler error', e);
-                }
-            });
+            this._temps.emit(buf);
         }
         /**
          * Read (and cache) the hardware version via GET_DEVICE_VERSION_COMMAND
@@ -13579,8 +13650,29 @@
      * down in windows with resume-from-on-disk-size semantics — the same shape as
      * the field-proven Verisense `transferLoggedData` flow.
      */
-    /** Device-name folder used when a session folder is not `<Name>-<NNN>`. */
+    /**
+     * Device folder used when no MAC id is available and the session folder is not
+     * `<Name>-<NNN>` either.
+     */
     const CONSENSYS_UNKNOWN_DEVICE = 'Unknown_Shimmer';
+    /**
+     * Normalise a MAC id to the form Consensys names its device folders with:
+     * twelve LOWERCASE hex digits, no separators (`e8eb1b9767a0`).
+     *
+     * Lowercase because that is what Consensys writes, and what
+     * {@link import('../../sdlog/header.js').parseSdLogHeader} reports for the same
+     * six bytes inside the file - the two have to agree for an import to match a
+     * folder to the sessions in it. Windows is case-insensitive about paths, so
+     * this is cosmetic there and load-bearing on macOS and Linux.
+     *
+     * Returns null for anything that is not six bytes of hex, so a caller can tell
+     * "no MAC" from "a MAC I could not use" and fall back deliberately rather than
+     * creating a folder named after a truncated or unprovisioned address.
+     */
+    function consensysMacFolderName(macId) {
+        const hex = String(macId ?? '').replace(/[^0-9a-fA-F]/g, '');
+        return hex.length === 12 ? hex.toLowerCase() : null;
+    }
     /**
      * Format an import-time folder name as Consensys does: `yyyy-MM-dd_HH.mm.ss`
      * in local time (e.g. `2025-06-25_15.30.36`).
@@ -13593,12 +13685,34 @@
     /**
      * Map a card directory chain to its Consensys Backup destination.
      *
-     * The device name is taken from the session folder (`<ShimmerName>-<NNN>`)
-     * rather than from the connected device, so sessions recorded under a previous
-     * device name - or on a card that has been moved between devices - still file
-     * under the name they were recorded with, which is what Consensys shows.
+     * The level between the import stamp and the card tree is the device's **MAC
+     * id**, twelve lowercase hex digits:
+     *
+     *     <import-stamp>/e8eb1b9767a0/data/<TrialName>_<ConfigTime>/<ShimmerName>-<NNN>
+     *
+     * It is the MAC and not the Shimmer name because that is what Consensys itself
+     * writes and what its importer looks for - a name folder produces a tree the
+     * import walks straight past. The MAC is also the identifier that cannot drift:
+     * a device renamed between two trials keeps one folder, where the name would
+     * have split its sessions in two.
+     *
+     * `macId` is the CONNECTED device's MAC, so it is right whenever the card is
+     * being read out of the device that wrote it - which is the only way this
+     * transfer path can be reached at all. A card physically moved from another
+     * device would be filed under the reading device's MAC; the alternative,
+     * reading each session's first file header for the MAC stored in it, costs a
+     * round trip per session to cover a case Bluetooth download cannot produce.
+     *
+     * With no usable MAC (`null`, or anything that is not six bytes of hex) it
+     * falls back to the Shimmer name taken from the session folder, and then to
+     * {@link CONSENSYS_UNKNOWN_DEVICE}. That tree is NOT importable by Consensys -
+     * the fallback exists so a download still lands somewhere sensible and
+     * separates two devices' sessions, not because it is equivalent.
      */
-    function consensysBackupSegments(cardDirSegments, importStamp) {
+    function consensysBackupSegments(cardDirSegments, importStamp, macId) {
+        const mac = consensysMacFolderName(macId);
+        if (mac)
+            return [importStamp, mac, ...cardDirSegments];
         let shimmerName = CONSENSYS_UNKNOWN_DEVICE;
         const sessionDir = cardDirSegments[cardDirSegments.length - 1];
         if (sessionDir) {
@@ -13656,6 +13770,7 @@
         const maxRetriesPerFile = opts.maxRetriesPerFile ?? 3;
         const layout = opts.layout ?? 'card';
         const importStamp = opts.importStamp ?? formatSdImportStamp();
+        const macId = opts.macId ?? null;
         const summary = {
             importStamp: layout === 'consensysBackup' ? importStamp : undefined,
             filesDownloaded: 0,
@@ -13690,7 +13805,9 @@
             const segments = file.path.split('/');
             const name = segments.pop();
             try {
-                const destSegments = layout === 'consensysBackup' ? consensysBackupSegments(segments, importStamp) : segments;
+                const destSegments = layout === 'consensysBackup'
+                    ? consensysBackupSegments(segments, importStamp, macId)
+                    : segments;
                 const dir = await ensureDirectoryPath(destRoot, destSegments);
                 const handle = await dir.getFileHandle(name, { create: true });
                 const existingSize = (await handle.getFile()).size;
@@ -13948,7 +14065,7 @@
             this._disconnectUnsub = null;
             // Protocol state
             this._rxBuf = new Uint8Array(0);
-            this._temps = new Set();
+            this._temps = new HandlerSet((e) => this._log('temp handler error', e));
             this.schema = null;
             this._streaming = false;
             this._streamStarting = false;
@@ -15007,14 +15124,7 @@
             this._temps.delete(fn);
         }
         _emitTemp(buf) {
-            this._temps.forEach((fn) => {
-                try {
-                    fn(buf);
-                }
-                catch (e) {
-                    this._log('temp handler error', e);
-                }
-            });
+            this._temps.emit(buf);
         }
     }
 
@@ -15062,7 +15172,7 @@
             this._notifyUnsub = null;
             this._disconnectUnsub = null;
             this._rxBuf = new Uint8Array(0);
-            this._temps = new Set();
+            this._temps = new HandlerSet((e) => this._log('temp handler error', e));
             /**
              * Serialization queue. Every public command method chains onto this so that
              * only one request/response exchange is in flight at a time — the docked
@@ -15814,14 +15924,7 @@
             this._temps.delete(fn);
         }
         _emitTemp(pkt) {
-            this._temps.forEach((fn) => {
-                try {
-                    fn(pkt);
-                }
-                catch (e) {
-                    this._log('temp handler error', e);
-                }
-            });
+            this._temps.emit(pkt);
         }
     }
 
@@ -16148,7 +16251,7 @@
             this._notifyUnsub = null;
             this._disconnectUnsub = null;
             this._rxBuf = new Uint8Array(0);
-            this._temps = new Set();
+            this._temps = new HandlerSet((e) => this._log('temp handler error', e));
             /**
              * Serialization queue: all public operations chain onto this so slot
              * select + per-slot reads run as atomic, non-interleaved units. Concurrent
@@ -16496,14 +16599,7 @@
             this._temps.delete(fn);
         }
         _emitTemp(line) {
-            this._temps.forEach((fn) => {
-                try {
-                    fn(line);
-                }
-                catch (e) {
-                    this._log('temp handler error', e);
-                }
-            });
+            this._temps.emit(line);
         }
     }
 
@@ -21927,8 +22023,14 @@
         /** Subscribe to a transport's notify/disconnect streams. */
         _wireTransport(transport) {
             this._transport = transport;
+            /* Arm the base class's `onDisconnect` for this connection as well as this
+               client's own `disconnected` event. Both exist for a reason: the event is
+               what every Verisense consumer here listens to, while `onDisconnect` is
+               part of the shared client contract, and a caller written against that
+               contract was previously handed a callback that could never fire. */
+            this._armDisconnectNotification();
             this._notifyUnsub = transport.onNotify((bytes) => this._feedStreamBytes(bytes));
-            this._disconnectUnsub = transport.onDisconnect(() => this._handleTransportDisconnect());
+            this._disconnectUnsub = transport.onDisconnect((reason) => this._handleTransportDisconnect(reason));
         }
         /** Drop the current transport's notify/disconnect subscriptions. */
         _unwireTransport() {
@@ -21948,13 +22050,20 @@
             this._disconnectUnsub = null;
         }
         /** Handle an unexpected / requested transport disconnect (link drop). */
-        _handleTransportDisconnect() {
+        _handleTransportDisconnect(reason) {
             const kind = this._transportKind === 'serial' ? 'serial' : 'ble';
             this._mode = 'idle';
             this._transportKind = null;
-            if (this._suppressDisconnectedEvent)
+            if (this._suppressDisconnectedEvent) {
+                // Application-initiated teardown is not a fault for either channel.
+                this._suppressDisconnectNotification();
                 return;
+            }
             this.emit('disconnected', { kind });
+            /* The transport's own error, not a synthesised one: it is the only thing
+               that says WHY the link went, and the other clients forward it. The
+               `disconnected` event keeps its existing shape. */
+            this._emitDisconnect(reason);
         }
         /**
          * Mirror the active WebBluetoothTransport's GATT handles onto the legacy
@@ -26548,6 +26657,7 @@
     exports.compareVerisenseFirmwareVersion = compareVerisenseFirmwareVersion;
     exports.computeVerisensePairingPin = computeVerisensePairingPin;
     exports.consensysBackupSegments = consensysBackupSegments;
+    exports.consensysMacFolderName = consensysMacFolderName;
     exports.crc16_ccitt_false = crc16_ccitt_false;
     exports.crc32 = crc32;
     exports.createBlankVerisenseOperationalConfig = createBlankVerisenseOperationalConfig;

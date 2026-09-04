@@ -108,11 +108,17 @@ export function initThemeToggle(button) {
   if (!btn) return () => {};
 
   const syncGlyph = () => {
+    const label =
+      getTheme() === "dark" ? "Switch to light theme" : "Switch to dark theme";
     btn.textContent = getTheme() === "dark" ? "☀︎" : "☾︎";
-    btn.setAttribute(
-      "aria-label",
-      getTheme() === "dark" ? "Switch to light theme" : "Switch to dark theme",
-    );
+    btn.setAttribute("aria-label", label);
+    /* And a tooltip, because the button is a bare glyph: a sun or a moon on
+       its own is a guess until you have clicked it once. The console has had
+       one from the start; these pages had only the aria-label, which a mouse
+       user never sees. Dynamic rather than the console's static "Switch
+       between light and dark theme" — it says which way the click goes, which
+       is the thing the glyph is already trying and failing to say. */
+    btn.title = label;
   };
 
   const onClick = () => {

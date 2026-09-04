@@ -446,6 +446,8 @@
         <span class="pill" id="sdkPill" title="Vendored shimmer-web-sdk build"
           >SDK …</span
         >
+        <!-- Glyph, aria-label and tooltip all come from initThemeToggle, so
+             the two apps say the same thing in the same words. -->
         <button id="themeBtn" type="button"></button>
       </header>
 
@@ -457,7 +459,7 @@
       <div class="link-row">
         <div class="card">
           <div class="card-title">Sensor link</div>
-          <!-- BLE and classic Bluetooth first and adjacent: both are radio
+          <!-- BLE and Classic Bluetooth first and adjacent: both are radio
                links that need the sensor paired with this host first, so they
                share a story and a failure mode. The wired link is last and
                separated — it needs no pairing, and it speaks a different
@@ -466,7 +468,7 @@
             <button id="btnBle" class="primary" type="button">
               Connect BLE
             </button>
-            <button id="btnBt" type="button">Connect classic Bluetooth</button>
+            <button id="btnBt" type="button">Connect Classic Bluetooth</button>
             <span class="link-sep" aria-hidden="true"></span>
             <button id="btnUsb" type="button">Connect USB</button>
             <button id="btnMock" type="button" hidden>Connect (mock)</button>
@@ -531,10 +533,15 @@
       </div>
 
       <!-- ===================================================== Tabs ====== -->
+      <!-- General first, as in the Verisense device console: the one-shot
+           commands somebody reaches for straight after connecting (what time
+           does it think it is, which sensor is this one) come before the tabs
+           that are a task in themselves. -->
       <div class="tabs">
-        <button data-tab="tabConfig" class="active" type="button">
-          Configure
+        <button data-tab="tabGeneral" class="active" type="button">
+          General
         </button>
+        <button data-tab="tabConfig" type="button">Configure</button>
         <button data-tab="tabCal" id="tabBtnCal" type="button">
           Calibration
         </button>
@@ -548,20 +555,16 @@
         <button data-tab="tabTest" id="tabBtnTest" type="button">Test</button>
       </div>
 
-      <!-- ================================================= Configure ===== -->
-      <section class="tab active" id="tabConfig">
-        <div class="card">
-          <div class="card-title">Configuration</div>
-          <div class="banner info" id="configBanner">
-            Connect a sensor to read its configuration.
-          </div>
-          <div id="configForm"></div>
-        </div>
+      <!-- =================================================== General ==== -->
+      <!-- The one-shot commands: nothing here is a task with its own state,
+           which is exactly what keeps it off the other tabs. The clock came
+           from Configure (it is a device command, not a stored setting — the
+           real-world clock is not part of the configuration image) and the
+           LEDs from Test (nothing about them is a test; they are how you tell
+           two sensors on a bench apart). -->
+      <section class="tab active" id="tabGeneral">
+        <div class="banner" id="generalBanner"></div>
 
-        <!-- What is left of "Device & clock" once the identity, the battery
-             and the status flags have moved up beside the Sensor link card:
-             the clock, which is a configuration matter and belongs on the
-             configuration tab. -->
         <div class="card">
           <div class="card-title">Clock</div>
           <div class="row">
@@ -572,6 +575,15 @@
               data-cap="rtcWrite"
             >
               Set device clock from host
+            </button>
+            <button
+              id="btnReadClock"
+              type="button"
+              data-requires="idle"
+              data-cap="rtcRead"
+              title="Re-read the sensor's real-world clock without touching anything else"
+            >
+              Read device clock
             </button>
           </div>
           <div class="kv">
@@ -587,6 +599,94 @@
             <strong>Test</strong> tab measures how far the sensor's clock drifts
             from this host's over time.
           </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">LEDs</div>
+          <div class="row">
+            <button
+              id="btnLedToggle"
+              type="button"
+              data-requires="idle"
+              data-cap="ledToggle"
+            >
+              Toggle red LED
+            </button>
+            <button
+              id="btnLedOn"
+              type="button"
+              data-requires="idle"
+              data-cap="ledToggle"
+            >
+              Red LED on
+            </button>
+            <button
+              id="btnLedOff"
+              type="button"
+              data-requires="idle"
+              data-cap="ledToggle"
+            >
+              Red LED off
+            </button>
+            <span class="pill" id="ledPill">not read</span>
+          </div>
+          <div class="field-hint" id="ledNote"></div>
+          <div class="field-hint" style="margin-top: 8px">
+            The firmware's toggle-LED command holds the lower LED solid red on
+            top of the sensor's own indications, and leaves it that way until it
+            is toggled again or the sensor is power-cycled — a disconnect does
+            not clear it. It is a "which sensor is this one" aid rather than a
+            health check; the sequence that exercises every LED colour is on the
+            <strong>Test</strong> tab, as part of the factory self-test.
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Device commands</div>
+          <div class="row">
+            <button
+              id="btnInquiry"
+              type="button"
+              data-requires="idle"
+              data-cap="stream"
+              title="Ask the firmware which channels it is set to send and at what rate"
+            >
+              Re-inquire channel list
+            </button>
+            <button
+              id="btnRebootOnDisconnect"
+              type="button"
+              class="warn"
+              data-requires="idle"
+              data-cap="branding"
+              title="Arm a one-shot soft reboot the sensor performs the moment this host disconnects"
+            >
+              Reboot on next disconnect
+            </button>
+          </div>
+          <div class="field-hint" id="generalNote"></div>
+          <div class="field-hint" style="margin-top: 8px">
+            The channel inquiry is what tells this page the shape of a stream
+            frame, so it runs on connect and after an Apply; it is here for the
+            case where the sensor was reconfigured by something else meanwhile.
+            The reboot is armed rather than immediate — the firmware cannot
+            reboot while the link is up, and skips it altogether while the
+            sensor is recording so that it can never truncate a trial. It is
+            one-shot: it never carries into a later disconnect. Reach for it
+            after writing advertising names, which the Bluetooth module only
+            re-reads at boot.
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================= Configure ===== -->
+      <section class="tab" id="tabConfig">
+        <div class="card">
+          <div class="card-title">Configuration</div>
+          <div class="banner info" id="configBanner">
+            Connect a sensor to read its configuration.
+          </div>
+          <div id="configForm"></div>
         </div>
 
         <div class="card">
@@ -800,7 +900,7 @@
             <code>.bin</code>. The firmware seeds the record with the factory
             names at first boot and treats it as the only source of truth
             afterwards, so what is shown above is what the sensor really
-            announces. Every link reaches the record — BLE, classic Bluetooth
+            announces. Every link reaches the record — BLE, Classic Bluetooth
             and the USB-C/dock connection alike.
           </div>
         </div>
@@ -847,46 +947,6 @@
             host's own clock is stepped.
           </div>
         </div>
-
-        <div class="card">
-          <div class="card-title">LEDs</div>
-          <div class="row">
-            <button
-              id="btnLedToggle"
-              type="button"
-              data-requires="idle"
-              data-cap="ledToggle"
-            >
-              Toggle red LED
-            </button>
-            <button
-              id="btnLedOn"
-              type="button"
-              data-requires="idle"
-              data-cap="ledToggle"
-            >
-              Red LED on
-            </button>
-            <button
-              id="btnLedOff"
-              type="button"
-              data-requires="idle"
-              data-cap="ledToggle"
-            >
-              Red LED off
-            </button>
-            <span class="pill" id="ledPill">not read</span>
-          </div>
-          <div class="field-hint" id="ledNote"></div>
-          <div class="field-hint" style="margin-top: 8px">
-            The firmware's toggle-LED command holds the lower LED solid red on
-            top of the sensor's own indications, and leaves it that way until it
-            is toggled again or the sensor is power-cycled — a disconnect does
-            not clear it. It is a "which sensor is this one" aid rather than a
-            health check; the sequence that exercises every LED colour is part
-            of the self-test above.
-          </div>
-        </div>
       </section>
     </div>
 
@@ -921,11 +981,13 @@
             placeholder="Filter lines…"
             autocomplete="off"
           />
-          <select id="logSeverity">
+          <!-- Wording matched to the Verisense device console's own filter,
+               so the two pages read the same. -->
+          <select id="logSeverity" aria-label="Log severity filter">
             <option value="all">All</option>
-            <option value="warnup">Warnings and errors</option>
-            <option value="err">Errors only</option>
-            <option value="txrx">TX / RX</option>
+            <option value="err">Errors</option>
+            <option value="warnup">Warnings+</option>
+            <option value="txrx">TX/RX</option>
           </select>
           <!-- The select above chooses what is SHOWN; these two choose
                    what is PRODUCED. Nothing tags a line tx/rx unless the tap
@@ -945,8 +1007,21 @@
             <input type="checkbox" id="chkRawData" disabled />
             …including data packets
           </label>
+          <button
+            id="btnLogCopy"
+            type="button"
+            title="Copy the whole log to the clipboard — every line, not just the ones the filter is showing"
+          >
+            Copy
+          </button>
           <button id="btnLogClear" type="button">Clear</button>
-          <button id="btnLogDownload" type="button">Download</button>
+          <button
+            id="btnLogDownload"
+            type="button"
+            title="Save the whole log to a file"
+          >
+            Download
+          </button>
           <span class="log-count" id="logCount"></span>
         </div>
         <div class="banner" id="tapNote"></div>
@@ -970,6 +1045,7 @@
       import { createConnectController } from "../common/connect-ui.js";
       import { createTransportTap } from "../common/transport-tap.js";
       import { createConfigForm, displayValue } from "../common/config-form.js";
+      import { createKinematicBlockEditorFactory } from "../common/kinematic-block-editor.js";
       import {
         describeShimmer3Caps,
         LIVE_OVERLAYS,
@@ -1150,10 +1226,12 @@
         filterInput: $("logFilter"),
         severitySelect: $("logSeverity"),
         clearButton: $("btnLogClear"),
+        copyButton: $("btnLogCopy"),
         downloadButton: $("btnLogDownload"),
         countEl: $("logCount"),
         fileName: "shimmer-capture-log.txt",
         onLine: noteLogLine,
+        toast: showToast,
       });
 
       $("log").addEventListener("scroll", noteLogScrolledToTail, {
@@ -1630,10 +1708,10 @@
        */
       function linkTestUnavailableReason() {
         if (!client) {
-          return "Connect over BLE or classic Bluetooth to measure the link.";
+          return "Connect over BLE or Classic Bluetooth to measure the link.";
         }
         if (mode === "usb") {
-          return "This sensor is connected over its USB-C port, which speaks the dock protocol — there is no data-rate test in that command set. Connect over BLE or classic Bluetooth to measure a link.";
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol — there is no data-rate test in that command set. Connect over BLE or Classic Bluetooth to measure a link.";
         }
         if (!caps.linkTest) {
           return "This SDK build has no data-rate test. Re-vendor the SDK bundle.";
@@ -1664,7 +1742,7 @@
         $("linkTestNote").textContent = reason ?? "";
         $("btnLinkTest").title =
           reason ??
-          "Free-runs the firmware's data-rate test, which measures the pipe itself — connection interval and MTU on BLE, buffering on classic Bluetooth — rather than the file-transfer protocol on top of it.";
+          "Free-runs the firmware's data-rate test, which measures the pipe itself — connection interval and MTU on BLE, buffering on Classic Bluetooth — rather than the file-transfer protocol on top of it.";
       }
 
       // =====================================================================
@@ -2075,6 +2153,84 @@
         }
       }
 
+      /**
+       * Re-read the sensor's real-world clock and nothing else.
+       *
+       * Refresh (in the Device panel) reads the battery, the status bytes and
+       * the clock; this is the clock on its own, which is what somebody
+       * checking whether a clock write took wants — three round trips to
+       * answer one question is three chances for one of the others to fail
+       * and put an error on screen about something nobody asked about.
+       */
+      async function readDeviceClock() {
+        if (typeof client?.getRtcTime !== "function") {
+          showToast("This link cannot read the sensor clock", "warn");
+          return;
+        }
+        const rtc = await tryDevice("read the real-world clock", () =>
+          client.getRtcTime(),
+        );
+        $("rwcValue").textContent = rtc
+          ? `${formatDeviceClock(rtc.unixMs)}  (${rtc.ticks} ticks)`
+          : "–";
+        $("hostClock").textContent = formatClock(Date.now());
+        if (rtc) {
+          const skewMs = rtc.unixMs - Date.now();
+          $("generalNote").textContent =
+            `The sensor's clock reads ${formatDeviceClock(rtc.unixMs)}, ` +
+            `${Math.abs(skewMs) < 1000 ? "within a second of" : `${(skewMs / 1000).toFixed(1)} s from`} ` +
+            "this host's.";
+        }
+      }
+
+      /** Ask the firmware what it is set to send, and re-derive the schema. */
+      async function reInquire() {
+        const info = await tryDevice("re-inquire the channel list", () =>
+          client.inquiry(),
+        );
+        if (!info) return;
+        noteInquiry(info);
+        showToast("Channel list re-read from the sensor", "ok");
+      }
+
+      /**
+       * Arm the firmware's one-shot reboot-on-disconnect.
+       *
+       * Confirmed, because it is not undoable from here: nothing reads the
+       * flag back, and the only way to clear it is the disconnect that spends
+       * it. The firmware skips it while sensing, so this cannot cut a
+       * recording short — but a reader deserves to be told what they are
+       * arming rather than discovering it at disconnect.
+       */
+      async function armRebootOnDisconnect() {
+        if (typeof client?.setRebootOnDisconnect !== "function") {
+          showToast("This SDK build cannot arm a reboot", "warn");
+          return;
+        }
+        if (
+          !window.confirm(
+            "Arm a soft reboot for the moment this host disconnects?\n\n" +
+              "The sensor reboots as the link drops — which is how a new " +
+              "advertising name takes effect. It is skipped while the sensor " +
+              "is recording, and it is one-shot: nothing carries into a later " +
+              "disconnect.",
+          )
+        ) {
+          return;
+        }
+        try {
+          await withDevice("arm the reboot on disconnect", () =>
+            client.setRebootOnDisconnect(true),
+          );
+          $("generalNote").textContent =
+            "A reboot is armed: the sensor will restart the moment this host " +
+            "disconnects, unless it is recording at the time.";
+          showToast("Reboot armed for the next disconnect", "ok");
+        } catch {
+          /* logged and toasted by withDevice */
+        }
+      }
+
       // =====================================================================
       // Sensor bitmap (the page owns this, not the schema)
       // =====================================================================
@@ -2307,6 +2463,16 @@
             readInfoMemFieldValue: sdk.readInfoMemFieldValue,
             writeInfoMemFieldValue: sdk.writeInfoMemFieldValue,
           },
+          /* The Calibration group's six 21-byte blocks render as the same
+             offset / sensitivity / alignment grids the Calibration tab uses,
+             with the range this image is configured for shown beside them,
+             rather than as forty-two hex characters each. Every other field
+             keeps its default control — the factory returns null for anything
+             that is not a calibration block. */
+          editorFor: createKinematicBlockEditorFactory({
+            fields,
+            generation: () => generation,
+          }),
           imageSize: IMAGE_BYTES,
           onChange: (key) => {
             log.log(`configuration edit: ${key}`);
@@ -2793,6 +2959,10 @@
         client: () => client,
         log,
         fmtBytes,
+        /* Names the device level of the Consensys Backup tree. A getter
+           because `deviceMac` is filled in during the connect handshake,
+           after this panel is mounted. */
+        macId: () => deviceMac,
         onBusyChange: (transferring) => {
           sdBusy = transferring;
           regate();
@@ -2816,10 +2986,10 @@
        */
       function sdUnavailableReason() {
         if (!client) {
-          return "Connect over BLE or classic Bluetooth to browse the sensor's SD card and download from it.";
+          return "Connect over BLE or Classic Bluetooth to browse the sensor's SD card and download from it.";
         }
         if (mode === "usb") {
-          return "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one — the dock command set has no file-transfer commands at all. Connect over BLE or classic Bluetooth to download from the card.";
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one — the dock command set has no file-transfer commands at all. Connect over BLE or Classic Bluetooth to download from the card.";
         }
         if (!caps.sdTransfer) {
           return (
@@ -3076,7 +3246,7 @@
        */
       function testUnavailableReason() {
         if (!client) {
-          return "Connect over BLE, classic Bluetooth or USB-C to run the sensor's built-in self-test, watch its clock drift against this host, or switch its red LED.";
+          return "Connect over BLE, Classic Bluetooth or USB-C to run the sensor's built-in self-test, watch its clock drift against this host, or switch its red LED.";
         }
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses a self-test while it is — the test takes the whole sensor over for up to a minute. Stop the stream first.";
@@ -3131,7 +3301,7 @@
         // the same sentence on screen twice.
         if (!client) return null;
         if (mode === "usb") {
-          return "The dock protocol has no LED command, so the red LED can only be switched over BLE or classic Bluetooth. The self-test's LED sequence still runs over USB-C.";
+          return "The dock protocol has no LED command, so the red LED can only be switched over BLE or Classic Bluetooth. The self-test's LED sequence still runs over USB-C.";
         }
         if (!caps.ledToggle) {
           return "This SDK build has no toggle-LED call. Re-vendor the SDK bundle.";
@@ -3265,7 +3435,7 @@
        */
       function brandUnavailableReason() {
         if (!client) {
-          return "Connect over BLE, classic Bluetooth or USB-C to see the names this sensor advertises, and to change them.";
+          return "Connect over BLE, Classic Bluetooth or USB-C to see the names this sensor advertises, and to change them.";
         }
         if (!caps.branding) {
           return "This SDK build cannot reach the expansion-board memory the names are stored in. Re-vendor the SDK bundle.";
@@ -3607,7 +3777,7 @@
             };
           },
           bt: () => {
-            /* A classic-Bluetooth link is a serial port, so the transport is
+            /* A Classic-Bluetooth link is a serial port, so the transport is
                built here and handed back alongside the client — the controller
                needs it to log which RFCOMM service class the browser's picker
                actually gave us. 64 KB of buffer because a serial read can
@@ -3693,7 +3863,7 @@
         regate();
       }
 
-      /** The Bluetooth path: BLE, classic Bluetooth, or the mock. */
+      /** The Bluetooth path: BLE, Classic Bluetooth, or the mock. */
       async function afterConnectRadio() {
         const fw = await tryDevice("read the firmware version", () =>
           client.readFwVersion(),
@@ -3787,6 +3957,28 @@
             "The configuration image could not be read, so the form below shows a blank image. Press “Read from device” to try again.",
           );
         }
+
+        /* And the calibration, for the same reason the configuration image is
+           read here: a page that shows a sensor's settings without showing
+           what it is calibrated to has told half the story, and the tab
+           otherwise sat empty until somebody thought to press Read.
+
+           LAST, deliberately. It needs the generation and the configured
+           ranges the reads above establish — the panel opens each card on the
+           range the image says the sensor is set to — and it is the one read
+           here that is worth a page of traffic (the dump is up to 209 bytes
+           over 128-byte pages), so it goes behind everything the rest of the
+           page needs to render at all.
+
+           `reuseInfoMem` because the image arrived a few lines ago: on a link
+           with no dump commands the panel falls back to showing the InfoMem
+           blocks, and without this it would re-read all 384 bytes to get the
+           ones it has already been handed. Tolerated rather than awaited for
+           success: an older firmware NACKs GET_CALIB_DUMP, and a tab that
+           could not be filled is not a connection that failed. */
+        if (caps.calibration || caps.infomem) {
+          await cal.read({ reuseInfoMem: true }).catch(() => null);
+        }
       }
 
       /**
@@ -3858,6 +4050,14 @@
             "The configuration image could not be read over the dock link. Press “Read from device” to try again.",
           );
         }
+
+        /* The calibration too, as on the radio path. There are no dump
+           commands over the dock, so this is the InfoMem fallback showing the
+           blocks out of the image just read — `reuseInfoMem` is what stops it
+           reading all 384 bytes a second time to see them. */
+        if (caps.infomem) {
+          await cal.read({ reuseInfoMem: true }).catch(() => null);
+        }
       }
 
       /**
@@ -3880,7 +4080,7 @@
           banner(
             "streamBanner",
             "warn",
-            "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one. Configuration, the clock, the configuration image, calibration and the device's names all work over USB; live data does not. Connect over BLE or classic Bluetooth to stream and record.",
+            "This sensor is connected over its USB-C port, which speaks the dock protocol rather than the Bluetooth one. Configuration, the clock, the configuration image, calibration and the device's names all work over USB; live data does not. Connect over BLE or Classic Bluetooth to stream and record.",
           );
         } else {
           banner("streamBanner", "", "");
@@ -3962,7 +4162,7 @@
        * debugging a real sensor.
        *
        *   ?mock=1              framed, like BLE
-       *   ?mock=1&framed=0     an unframed byte stream, like classic Bluetooth
+       *   ?mock=1&framed=0     an unframed byte stream, like Classic Bluetooth
        *   ?mock=1&rate=204.8   pick the sampling rate
        *   ?mock=1&fw=1.01.010  report a firmware version (gates the SD tab)
        *   ?mock=1&hw=3         report a hardware id; `none` refuses to
@@ -4035,7 +4235,7 @@
           `mock mode: no real sensor is involved. The transport is ${
             framed
               ? "framed, like BLE"
-              : "an unframed byte stream, like classic Bluetooth or the dock"
+              : "an unframed byte stream, like Classic Bluetooth or the dock"
           }, at ${fmtHz(rateHz)}.`,
         );
 
@@ -4185,6 +4385,12 @@
           });
       });
       $("btnSetClock").addEventListener("click", reported(setDeviceClock));
+      $("btnReadClock").addEventListener("click", reported(readDeviceClock));
+      $("btnInquiry").addEventListener("click", reported(reInquire));
+      $("btnRebootOnDisconnect").addEventListener(
+        "click",
+        reported(armRebootOnDisconnect),
+      );
 
       $("btnLedToggle").addEventListener(
         "click",
@@ -4369,7 +4575,7 @@
       updateTapNote();
       regate();
       log.log(
-        "ready — connect over BLE or classic Bluetooth to configure, stream, record, download from the SD card, change the sensor's names, run its self-test and watch its clock drift, or over USB-C for everything but streaming and the LED",
+        "ready — connect over BLE or Classic Bluetooth to configure, stream, record, download from the SD card, change the sensor's names, run its self-test and watch its clock drift, or over USB-C for everything but streaming and the LED",
       );
       /* The page has finished building itself. A test harness waits on this
          rather than on some particular panel having rendered — the module

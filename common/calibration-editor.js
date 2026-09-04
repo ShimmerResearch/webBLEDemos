@@ -323,7 +323,7 @@ const I8_MAX = 127;
  *   part of the saved dump's file name; a getter, so a page can name the file
  *   after a sensor that was not connected when the panel was mounted
  * @returns {{
- *   read: () => Promise<object|null>,
+ *   read: (opts?: {reuseInfoMem?: boolean}) => Promise<object|null>,
  *   write: () => Promise<boolean>,
  *   save: () => boolean,
  *   load: (bytes: Uint8Array) => boolean,
@@ -1153,15 +1153,26 @@ export function createCalibrationEditor(host, opts = {}) {
        clears the editor and goes back to what the sensor holds. */
     const dirty = !!typed && !bytesEqual(typed, stored);
 
-    // ---- the "as of" readout
+    /* ---- the "as of" readout
+       Present on EVERY card, always, once something has been read: a line
+       that appears on three sensors and not on the others reads as those
+       three being the only ones with a calibration date, when in fact the
+       rest have no calibration at all — a different fact entirely, and one
+       the pill beside the title is already making. Saying "no date" for a
+       sensor with nothing stored is the honest version of the blank. It only
+       stays empty before the first read, where there is genuinely nothing to
+       report yet. */
     const stamp = rec ? readStamp(rec.timestampTicks) : "none";
     const date = stamp instanceof Date ? stamp : null;
-    if (store() === "infomem") {
+    if (store() === "none") {
+      entry.asOf.textContent = "";
+    } else if (store() === "infomem") {
       entry.asOf.textContent = stored
         ? "no date — the configuration image stores no calibration date"
-        : "";
+        : "no date — nothing is stored for this sensor at this range";
     } else if (!stored) {
-      entry.asOf.textContent = "";
+      entry.asOf.textContent =
+        "no date — nothing is stored for this sensor at this range";
     } else if (date) {
       entry.asOf.textContent = `as of ${formatStamp(date)}`;
     } else if (stamp === "unset") {
@@ -1598,12 +1609,19 @@ export function createCalibrationEditor(host, opts = {}) {
   /**
    * Read the calibration the sensor holds and show it.
    *
+   * @param {{reuseInfoMem?: boolean}} [opts] `reuseInfoMem: true` skips the
+   *   configuration-image re-read the InfoMem fallback normally starts with,
+   *   and shows the image the page already holds. For a caller that has just
+   *   read it — a page reading calibration as part of its connect handshake —
+   *   where the re-read would be a second full 384-byte transfer for bytes
+   *   arriving a moment earlier. The dump path is unaffected: there is
+   *   nothing to reuse there, and a read is a read.
    * @returns {Promise<object|null>} the parsed dump (or the InfoMem blocks) or
    *   null on failure
    */
-  async function read() {
+  async function read(opts = {}) {
     const which = store();
-    if (which === "infomem") return readInfoMemFallback();
+    if (which === "infomem") return readInfoMemFallback(opts);
     const client = clientFor("reading its calibration");
     if (!client) return null;
     setBusy(true);
@@ -1631,12 +1649,12 @@ export function createCalibrationEditor(host, opts = {}) {
   }
 
   /** The read-only path: the six InfoMem blocks the page already holds. */
-  async function readInfoMemFallback() {
+  async function readInfoMemFallback({ reuseInfoMem = false } = {}) {
     const client = clientFor("reading its calibration");
     if (!client) return null;
     setBusy(true);
     try {
-      if (typeof opts.readInfoMem === "function") {
+      if (!reuseInfoMem && typeof opts.readInfoMem === "function") {
         log.log(
           "this link has no calibration-dump commands — reading the calibration blocks out of the configuration image instead…",
         );
