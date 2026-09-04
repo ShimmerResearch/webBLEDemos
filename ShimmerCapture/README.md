@@ -153,7 +153,7 @@ says so in the log when it sees them.
 **Measure link speed** is next to the connect buttons, because it measures the
 link and not the card: it free-runs the firmware's data-rate test, which
 reports the pipe itself — connection interval and MTU on BLE, buffering on
-classic Bluetooth — rather than the file-transfer protocol on top of it. It is
+Classic Bluetooth — rather than the file-transfer protocol on top of it. It is
 Bluetooth-only (the dock command set has no data-rate test) and refused while
 the sensor is sensing or a transfer is running, because it saturates the link
 on purpose. The figure it produces also drives the download ETAs on the SD tab.
@@ -313,10 +313,10 @@ refuses to start rather than hand back a file that looks fine and is not.
 ## Device names
 
 Reads and writes the record in the sensor's EEPROM that decides the names it
-advertises over classic Bluetooth and BLE, and presents over USB, so a sensor
+advertises over Classic Bluetooth and BLE, and presents over USB, so a sensor
 can carry a customer's branding instead of the Shimmer defaults.
 
-Type one classic-Bluetooth name and the BLE and USB product names follow it
+Type one Classic-Bluetooth name and the BLE and USB product names follow it
 unless you set them yourself; the USB manufacturer string is used verbatim by
 the descriptor and is never derived. The name lengths a sensor can carry differ
 by hardware and by field, and the editor holds you to them rather than letting
@@ -405,7 +405,7 @@ one is a useful thing to be able to see.
 | Parameter          | Effect                                                                                                                                  |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `?mock=1`          | Framed replies, one per notification — how BLE behaves.                                                                                 |
-| `&framed=0`        | Replies dribbled three bytes at a time — how a classic-Bluetooth or USB byte stream behaves, and what re-framing is for.                |
+| `&framed=0`        | Replies dribbled three bytes at a time — how a Classic-Bluetooth or USB byte stream behaves, and what re-framing is for.                |
 | `&rate=<Hz>`       | Sampling rate, default 51.2.                                                                                                            |
 | `&sdKBps=`         | Throttle the synthetic card's transfer rate, so progress and abort have something to act on.                                            |
 | `&fw=`             | Report a different firmware version, to see the SD tab refuse an unsupported one.                                                       |

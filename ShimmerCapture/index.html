@@ -2112,7 +2112,7 @@
            answers with the same eight bytes, and `caps.rtcRead` — which gates
            the button — already counts it. Testing the method here left the row
            at "–" over a link that can in fact answer. */
-        if (canReadRwc(client, mode)) {
+        if (canReadRwc(client)) {
           const rtc = await tryDevice("read the real-world clock", () =>
             readDeviceRwc(client, mode),
           );
@@ -2169,7 +2169,7 @@
        * and put an error on screen about something nobody asked about.
        */
       async function readDeviceClock() {
-        if (!canReadRwc(client, mode)) {
+        if (!canReadRwc(client)) {
           showToast("This link cannot read the sensor clock", "warn");
           return;
         }

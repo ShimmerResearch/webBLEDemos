@@ -386,18 +386,20 @@ export function createRtcDriftPanel(host, opts = {}) {
   /**
    * Can this client, on this link, have its clock read at all?
    *
-   * `canReadRwc` is the same predicate `readDeviceSeconds` acts on, from the
+   * `canReadRwc` is the same predicate `readDeviceRwc` refuses on, from the
    * same module — so a panel that says yes here never fails at the first
    * sample with "undefined is not a function". They used to be two copies of
    * the rule side by side, which is survivable; the page's third copy was not
    * (see `common/device-clock.js`).
    *
+   * No mode: whether the clock can be read is a property of the client, and
+   * which of the two reads is used is the mode's business, inside the reader.
+   *
    * @param {object|null} [client]
-   * @param {string|null} [mode]
    * @returns {boolean}
    */
-  function supports(client = getClient(), mode = getMode()) {
-    return canReadRwc(client, mode);
+  function supports(client = getClient()) {
+    return canReadRwc(client);
   }
 
   /** Can the sensor's clock be WRITTEN over this link? Sync needs this. */

@@ -26,6 +26,10 @@
  * Nothing here touches `document`.
  *
  *   import { readDeviceRwc, canReadRwc } from "../common/device-clock.js";
+ *
+ *   if (canReadRwc(client)) {
+ *     const { unixMs } = await readDeviceRwc(client, mode);
+ *   }
  */
 
 import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
@@ -49,24 +53,42 @@ function ticksFromBytes(u8) {
   return ticks;
 }
 
+/** Does this client carry the Bluetooth clock read (GET_RWC)? */
+function hasRadioRead(client) {
+  return typeof client?.getRtcTime === "function";
+}
+
+/** Does this client carry the dock's clock-property read? */
+function hasDockRead(client) {
+  return typeof client?.getConfig === "function" && !!DOCK_TIME_PROP;
+}
+
 /**
- * Whether this client on this link can be asked the time at all.
+ * Whether this client can be asked the time at all.
  *
- * Mirrors `describeShimmer3Caps(...).rtcRead`, deliberately: a control gated
- * on that capability has to be served by {@link readDeviceRwc}, or the button
- * is enabled and the handler refuses — which is the bug this module was
- * written for.
+ * **Takes no mode, on purpose.** The link decides WHICH read is used, not
+ * WHETHER one is available — a client carrying either command can be asked.
+ * An earlier version took a mode and answered "no" for a dock-like client on
+ * an undeclared link, while {@link readDeviceRwc} read it happily: the gate
+ * and the reader disagreed on one shape, which is the same class of bug this
+ * module was written to remove, one layer down. Found by Copilot on
+ * webBLEDemos#76. The reader now refuses exactly when this returns false, so
+ * the two cannot drift apart again.
+ *
+ * The invariant worth stating, because it is the one that broke: a control
+ * gated on `describeShimmer3Caps(...).rtcRead` must be servable here.
+ * `rtcRead` is `getRtcTime || (usb && getConfig)`, and both of those imply
+ * this — so "enabled and always refuses" is unreachable. This is deliberately
+ * the more permissive of the two: it says yes to a `getConfig`-only client on
+ * any link, which is what lets the clock-drift panel keep working for a
+ * dock-like client whose page never declared a mode.
  *
  * @param {object|null|undefined} client
- * @param {string|null|undefined} [mode] the link — `"ble"`, `"rfcomm"`, `"usb"`
  * @returns {boolean}
  */
-export function canReadRwc(client, mode) {
+export function canReadRwc(client) {
   if (!client) return false;
-  if (typeof client.getRtcTime === "function") return true;
-  return (
-    mode === "usb" && typeof client.getConfig === "function" && !!DOCK_TIME_PROP
-  );
+  return hasRadioRead(client) || hasDockRead(client);
 }
 
 /**
@@ -80,26 +102,41 @@ export function canReadRwc(client, mode) {
  * simply shows it).
  *
  * @param {object} client
- * @param {string|null|undefined} [mode] the link — see {@link canReadRwc}
+ * @param {string|null|undefined} [mode] the link — `"ble"`, `"rfcomm"`,
+ *   `"usb"`. Chooses the PATH, never whether there is one: see
+ *   {@link canReadRwc}. On `"usb"` the dock property is used even by a client
+ *   that also carries `getRtcTime`, because on that link the radio command
+ *   does not exist.
  * @returns {Promise<{ticks: bigint, unixMs: number, viaDock: boolean}>}
- * @throws if nothing is connected, the link has no way to read the clock, or
- *   the answer is the wrong length. Never returns a guess.
+ * @throws if nothing is connected, this client has no way to read the clock,
+ *   or the answer is the wrong length. Never returns a guess.
  */
 export async function readDeviceRwc(client, mode) {
   if (!client) throw new Error("no sensor is connected");
+  /* The gate, called rather than restated: an independent condition here is
+     exactly how the page came to have a button that was enabled and always
+     refused. */
+  if (!canReadRwc(client)) {
+    /* `getConfig` and not `hasDockRead` here: the latter already folds in the
+       property check, so testing it would make this branch unreachable. The
+       distinction is worth keeping — a dock client on a bundle too old to
+       export CURR_LOCAL_TIME is a re-vendor away from working, and saying
+       "no way to read the clock" would send someone looking at the sensor. */
+    throw new Error(
+      typeof client.getConfig === "function"
+        ? "this SDK bundle has no CURR_LOCAL_TIME property — re-vendor it to read the clock over a wired link"
+        : "this client has no way to read the sensor clock",
+    );
+  }
 
-  /* The wired path is also the fallback for a client with no radio clock
-     command, so a dock-like client that only implements `getConfig` works
-     without the caller having to declare a mode. */
-  if (mode === "usb" || typeof client.getRtcTime !== "function") {
-    if (typeof client.getConfig !== "function") {
-      throw new Error("this link has no way to read the sensor clock");
-    }
-    if (!DOCK_TIME_PROP) {
-      throw new Error(
-        "this SDK bundle has no CURR_LOCAL_TIME property — re-vendor it to read the clock over a wired link",
-      );
-    }
+  /* Dock first when the link is the dock's, because the radio command does
+     not exist there whatever methods the object happens to carry — and dock
+     also as the fallback for a client with no radio read, so a dock-like
+     client works without the caller having to declare a mode. */
+  const useDock =
+    (mode === "usb" || !hasRadioRead(client)) && hasDockRead(client);
+
+  if (useDock) {
     const raw = await client.getConfig(DOCK_TIME_PROP);
     if (!raw || raw.length < 8) {
       throw new Error(`CURR_LOCAL_TIME returned ${raw?.length ?? 0} bytes`);

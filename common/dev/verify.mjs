@@ -4509,47 +4509,88 @@ console.log("\n--- the clock read agrees with the gate that offers it ---");
 const clockGate = await evaluate(`
   const schema = await import('/common/shimmer3-config-schema.js');
   const clock = await import('/common/device-clock.js');
-  /* The four shapes that matter: a radio client, a dock client (getConfig and
-     no getRtcTime), a dock client on a bundle old enough to lack the property,
-     and nothing connected. */
-  const radio = { getRtcTime(){}, getConfig(){} };
-  const dock = { getConfig(){} };
-  const mute = {};
-  const rows = [
-    ['radio over ble',  radio, 'ble'],
-    ['radio over rfcomm', radio, 'rfcomm'],
-    ['dock over usb',   dock,  'usb'],
-    ['mute over usb',   mute,  'usb'],
-    ['mute over ble',   mute,  'ble'],
-  ].map(([name, client, mode]) => ({
-    name,
-    caps: schema.describeShimmer3Caps(client, mode).rtcRead,
-    reader: clock.canReadRwc(client, mode),
-  }));
+  /* The four client shapes that exist, crossed with every link. "dock" is a
+     getConfig-only client and "both" is the stub shape that carries each
+     read — it cannot arise from the real clients (Shimmer3RClient has no
+     getConfig, WiredShimmerClient no getRtcTime) but it is what pins which
+     path wins on the dock link. */
+  const shapes = {
+    radio: { async getRtcTime(){ return { ticks: 1n, unixMs: 1 }; } },
+    dock:  { async getConfig(){ return new Uint8Array(8); } },
+    both:  { async getRtcTime(){ return { ticks: 1n, unixMs: 1 }; },
+             async getConfig(){ return new Uint8Array(8); } },
+    mute:  {},
+  };
+  const rows = [];
+  for (const [shape, client] of Object.entries(shapes)) {
+    for (const mode of ['ble', 'rfcomm', 'usb']) {
+      let read = 'threw';
+      try { read = (await clock.readDeviceRwc(client, mode)).viaDock ? 'dock' : 'radio'; }
+      catch { /* refused, which is a result */ }
+      rows.push({
+        shape, mode,
+        caps: schema.describeShimmer3Caps(client, mode).rtcRead,
+        gate: clock.canReadRwc(client),
+        read,
+      });
+    }
+  }
   return {
     rows,
-    disagree: rows.filter(r => r.caps !== r.reader).map(r => r.name),
-    nothingConnected: clock.canReadRwc(null, 'ble'),
-    /* The page must go through the shared reader in BOTH clock paths — the
-       button and the Device panel's Refresh. A property test in either is the
-       bug coming back. */
+    /* The bug this module was written for: a control the capability enables
+       that the reader then refuses. */
+    enabledButRefuses: rows.filter(r => r.caps && r.read === 'threw')
+      .map(r => r.shape + '/' + r.mode),
+    /* And its sibling, one layer down: the gate and the reader disagreeing,
+       which is what Copilot found in the first version of this module. */
+    gateDisagrees: rows.filter(r => r.gate !== (r.read !== 'threw'))
+      .map(r => r.shape + '/' + r.mode),
+    /* canReadRwc takes no mode: whether a clock can be read is a property of
+       the CLIENT. Pinned by call, not by reading the source. */
+    modeIgnored: clock.canReadRwc(shapes.dock, 'ble') === clock.canReadRwc(shapes.dock, 'usb'),
+    nothingConnected: clock.canReadRwc(null),
     src: await (await fetch('/ShimmerCapture/index.html')).text(),
   };
 `);
+const dockOnUsb = clockGate.rows.find(
+  (r) => r.shape === "dock" && r.mode === "usb",
+);
+const bothOnUsb = clockGate.rows.find(
+  (r) => r.shape === "both" && r.mode === "usb",
+);
+const bothOnBle = clockGate.rows.find(
+  (r) => r.shape === "both" && r.mode === "ble",
+);
 check(
-  "canReadRwc and describeShimmer3Caps.rtcRead agree on every link/client shape",
-  clockGate.disagree.length === 0 &&
-    // …and they agree on the case that broke, rather than agreeing on "no".
-    clockGate.rows.find((r) => r.name === "dock over usb").caps === true &&
-    clockGate.rows.find((r) => r.name === "mute over usb").caps === false &&
+  "no client/link shape is offered the clock by the capability and refused by the reader",
+  clockGate.enabledButRefuses.length === 0 &&
+    // …and the case that broke really is offered, rather than agreeing on "no".
+    dockOnUsb.caps === true &&
+    dockOnUsb.read === "dock",
+  clockGate.enabledButRefuses.length
+    ? `enabled but refuses: ${clockGate.enabledButRefuses.join(", ")}`
+    : `${clockGate.rows.length} shapes, dock-over-usb reads via ${dockOnUsb.read}`,
+);
+check(
+  "the gate and the reader agree on every one of them, and the gate ignores the link",
+  clockGate.gateDisagrees.length === 0 &&
+    clockGate.modeIgnored &&
     clockGate.nothingConnected === false,
-  clockGate.disagree.length
-    ? `disagree: ${clockGate.disagree.join(", ")}`
-    : clockGate.rows.map((r) => `${r.name}=${r.caps}`).join(", "),
+  clockGate.gateDisagrees.length
+    ? `gate disagrees: ${clockGate.gateDisagrees.join(", ")}`
+    : "gate === reader on all 12",
+);
+check(
+  "the link chooses the path: the dock's own command wins on the dock link",
+  // A client carrying both reads takes the dock property over USB — the radio
+  // command does not exist on that link whatever the object offers — and the
+  // radio command everywhere else.
+  bothOnUsb.read === "dock" && bothOnBle.read === "radio",
+  `both-reads client: usb via ${bothOnUsb.read}, ble via ${bothOnBle.read}`,
 );
 check(
   "both of the page's clock reads go through the shared reader, not a method test",
-  /canReadRwc\(client, mode\)/.test(clockGate.src) &&
+  /canReadRwc\(client\)/.test(clockGate.src) &&
     /readDeviceRwc\(client, mode\)/.test(clockGate.src) &&
     // The two call sites are the button and the Device panel's Refresh.
     (clockGate.src.match(/readDeviceRwc\(client, mode\)/g) ?? []).length ===
