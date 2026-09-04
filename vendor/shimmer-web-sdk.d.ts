@@ -155,7 +155,7 @@ declare abstract class BaseShimmerClient implements IShimmerClient {
     /**
      * Invoked when the link to the device goes away **without the application
      * asking for it**: the sensor was switched off, walked out of BLE range, or
-     * its USB / classic-Bluetooth COM port was unplugged. `reason` carries the
+     * its USB / Classic-Bluetooth COM port was unplugged. `reason` carries the
      * transport's error when it supplied one.
      *
      * Deliberately NOT invoked by {@link disconnect}. A caller that closed the
@@ -233,9 +233,9 @@ declare abstract class BaseShimmerClient implements IShimmerClient {
  *
  * iOS is the opposite shape — a harder "no" than an unimplemented API. Every iOS
  * browser is WebKit, which ships neither API, and iOS exposes no
- * classic-Bluetooth serial access to third-party apps at any layer: Core
+ * Classic-Bluetooth serial access to third-party apps at any layer: Core
  * Bluetooth is BLE-only, and classic profiles such as SPP require MFi licensing.
- * So classic Bluetooth there is impossible rather than merely absent, and no
+ * So Classic Bluetooth there is impossible rather than merely absent, and no
  * future browser release changes that. BLE via a browser that bundles its own
  * stack (Bluefy, WebBLE) is the ceiling.
  */
@@ -553,7 +553,7 @@ interface WebSerialTransportOptions {
     /**
      * Service class IDs the port picker is *permitted* to surface Bluetooth
      * (RFCOMM/SPP) ports for — pass `[SHIMMER3_SPP_UUID]` to reach a Shimmer
-     * paired over classic Bluetooth. Chrome hides Bluetooth serial ports entirely
+     * paired over Classic Bluetooth. Chrome hides Bluetooth serial ports entirely
      * unless the origin names their service class, so `filters` alone is not
      * enough.
      *
@@ -575,7 +575,7 @@ interface WebSerialTransportOptions {
     bufferSize?: number;
     /**
      * Reported {@link ShimmerTransport.kind}. Defaults to `'serial'`; pass
-     * `'rfcomm'` when the port is a classic-Bluetooth virtual COM port so logs
+     * `'rfcomm'` when the port is a Classic-Bluetooth virtual COM port so logs
      * and UI can tell the two apart (no client behaviour depends on it).
      */
     kind?: ShimmerTransportKind;
@@ -645,7 +645,7 @@ declare class WebSerialTransport implements ShimmerTransport {
     /**
      * `port.open()`, bounded by {@link WebSerialTransportOptions.openTimeoutMs}.
      *
-     * Opening a classic-Bluetooth COM port is what brings the RFCOMM link up, so
+     * Opening a Classic-Bluetooth COM port is what brings the RFCOMM link up, so
      * an asleep or out-of-range sensor blocks here rather than failing fast. If
      * the timeout wins we still close the port should the open land later —
      * otherwise the OS keeps an orphaned handle and the next attempt fails with
@@ -2424,7 +2424,7 @@ declare function exgBanksEqualIgnoringStatus(a: Uint8Array, b: Uint8Array): bool
  * Building the streaming packet schema from an inquiry response's channel list.
  *
  * Shared by both families: `Shimmer3RClient` (framed BLE) and
- * `buildShimmer3Schema` (unframed classic Bluetooth) put the same channel-ID
+ * `buildShimmer3Schema` (unframed Classic Bluetooth) put the same channel-ID
  * bytes through the same table, and any difference in how they treat a channel
  * they do not recognise would be a difference in how quietly they corrupt data.
  * So the logic lives here once.
@@ -3132,7 +3132,7 @@ declare function parseExpansionBoard(payload: Uint8Array): ExpansionBoardInfo | 
 declare function classifyFactoryTestAckPacket(buf: Uint8Array): AckVerdict;
 
 /**
- * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
+ * Pure protocol helpers for the Classic Bluetooth (RFCOMM/SPP) Shimmer3.
  *
  * Classic Shimmer3 speaks the same LiteProtocol command set as the Shimmer3R
  * (see `../shimmer3r/constants.ts`), but over an **unframed RFCOMM byte stream**
@@ -3209,7 +3209,7 @@ interface Shimmer3InquiryResult {
  * Build a stream schema from the channel-ID list reported by the inquiry.
  *
  * Mirrors ShimmerObject#interpretDataPacketFormat. The generation is fixed at
- * `'shimmer3'`: this file is the classic-Bluetooth Shimmer3 path, so unlike
+ * `'shimmer3'`: this file is the Classic-Bluetooth Shimmer3 path, so unlike
  * `Shimmer3RClient` — which the same firmware answers on both platforms — there
  * is nothing to determine and nothing to assume. That matters for the BMP
  * channels, which are 2-byte big-endian temperature + 3-byte big-endian
@@ -5124,7 +5124,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /**
      * Transport entry point. A framed transport (BLE) delivers one firmware
      * message per call and goes straight to {@link _handleFramedChunk}; an
-     * unframed one (Web Serial over USB or over a classic-Bluetooth COM port)
+     * unframed one (Web Serial over USB or over a Classic-Bluetooth COM port)
      * is re-framed first, then funnelled through the very same handler.
      *
      * A running factory test is served FIRST, before either path. Its report is
@@ -5367,7 +5367,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      *
      * `opts.chunkBytes` defaults to **64 over a framed (BLE) transport and 128
      * over an unframed one**. 128 is the firmware's ceiling and the page size the
-     * dock path uses, and it is what a byte stream — classic Bluetooth over
+     * dock path uses, and it is what a byte stream — Classic Bluetooth over
      * RFCOMM, or the dock UART — carries happily. Over BLE the proven size is 64:
      * that is what the brand-record write survives on real hardware, where a
      * 128-byte command has to cross four notifications into a firmware receive
@@ -5810,7 +5810,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      *
      * Worth asking even though this client is named for the Shimmer3R: the two
      * platforms share this firmware and this command set, so a Shimmer3 reached
-     * over classic Bluetooth answers here too — and answers some commands with
+     * over Classic Bluetooth answers here too — and answers some commands with
      * fewer bytes than a Shimmer3R does (see {@link getStatus}). Cached, so the
      * gating call sites can ask freely.
      */
@@ -5874,7 +5874,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * `durationMs`. This measures the pipe itself (BLE connection interval and
      * MTU, or RFCOMM/serial buffering) independent of the SD/file-transfer
      * protocol, so it gives an upper bound for transfer rates on a given
-     * host/adapter/OS — and a direct BLE-vs-classic-Bluetooth comparison.
+     * host/adapter/OS — and a direct BLE-vs-Classic-Bluetooth comparison.
      * The device must be idle (the firmware NACKs the test while sensing).
      */
     runDataRateTest(durationMs?: number, onProgress?: (bytesSoFar: number, elapsedMs: number) => void): Promise<{
@@ -6713,7 +6713,7 @@ declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
  */
 
 /**
- * The `WebSerialTransport` options that reach a Shimmer over classic Bluetooth.
+ * The `WebSerialTransport` options that reach a Shimmer over Classic Bluetooth.
  *
  * Both Bluetooth fields are required and they do different jobs, which is the
  * whole reason this is a constant rather than something each caller assembles:
@@ -6800,7 +6800,7 @@ interface Shimmer3ClientOptions extends ShimmerClientOptions {
     emitCalibratedInertial?: boolean;
 }
 /**
- * Client for the **classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
+ * Client for the **Classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
  *
  * Shimmer3 speaks the same LiteProtocol as the Shimmer3R (shared opcodes, sensor
  * bitmap, channel formats — all reused from `../shimmer3r/`), with two
@@ -6883,7 +6883,7 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * A transport is REQUIRED (constructor option or this parameter): Web
      * Bluetooth cannot open an RFCOMM socket, so there is no default. In a browser
      * the working transport is a {@link WebSerialTransport} over the virtual COM
-     * port the OS creates for a Shimmer paired over classic Bluetooth. Calling
+     * port the OS creates for a Shimmer paired over Classic Bluetooth. Calling
      * without one throws.
      *
      * Handshake (ported from ShimmerBluetooth#initialize → readShimmerVersionNew →

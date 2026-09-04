@@ -91,7 +91,7 @@ class BaseShimmerClient {
         /**
          * Invoked when the link to the device goes away **without the application
          * asking for it**: the sensor was switched off, walked out of BLE range, or
-         * its USB / classic-Bluetooth COM port was unplugged. `reason` carries the
+         * its USB / Classic-Bluetooth COM port was unplugged. `reason` carries the
          * transport's error when it supplied one.
          *
          * Deliberately NOT invoked by {@link disconnect}. A caller that closed the
@@ -186,9 +186,9 @@ class BaseShimmerClient {
  *
  * iOS is the opposite shape — a harder "no" than an unimplemented API. Every iOS
  * browser is WebKit, which ships neither API, and iOS exposes no
- * classic-Bluetooth serial access to third-party apps at any layer: Core
+ * Classic-Bluetooth serial access to third-party apps at any layer: Core
  * Bluetooth is BLE-only, and classic profiles such as SPP require MFi licensing.
- * So classic Bluetooth there is impossible rather than merely absent, and no
+ * So Classic Bluetooth there is impossible rather than merely absent, and no
  * future browser release changes that. BLE via a browser that bundles its own
  * stack (Bluefy, WebBLE) is the ceiling.
  */
@@ -285,34 +285,34 @@ function transportAdvice(support, need) {
              * what they are using.
              *
              * Deliberately conditional on the *sensor* too. BLE is not a substitute
-             * for classic Bluetooth in general - a classic-only Shimmer3 (the RN42
+             * for Classic Bluetooth in general - a classic-only Shimmer3 (the RN42
              * fleet has no BLE radio at all) cannot be reached from iOS by any route.
              * Promising "connect over BLE instead" would send exactly the user who
-             * needs classic Bluetooth off after something that cannot work for them.
+             * needs Classic Bluetooth off after something that cannot work for them.
              */
             const route = support.webBluetooth
                 ? 'A sensor that also supports BLE can be reached that way instead.'
                 : 'A sensor that also supports BLE can be reached with Bluefy or WebBLE (App Store), which bundle their own BLE stack.';
             return need === 'classicBluetooth'
-                ? `Classic Bluetooth cannot be reached from iOS at all: iOS gives apps no classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP requires MFi licensing). ${route} A classic-Bluetooth-only sensor cannot be used from iOS.`
+                ? `Classic Bluetooth cannot be reached from iOS at all: iOS gives apps no Classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP requires MFi licensing). ${route} A Classic-Bluetooth-only sensor cannot be used from iOS.`
                 : `Web Serial is not available on iOS — WebKit does not implement it, so a wired dock cannot be opened. ${route}`;
         }
         return need === 'classicBluetooth'
-            ? 'Web Serial is not available in this browser, so classic Bluetooth cannot be used. Use Chrome or Edge on desktop, or Chrome 138+ on Android, over HTTPS or on localhost.'
+            ? 'Web Serial is not available in this browser, so Classic Bluetooth cannot be used. Use Chrome or Edge on desktop, or Chrome 138+ on Android, over HTTPS or on localhost.'
             : 'Web Serial is not available in this browser, so the USB/dock connection cannot be used. Use Chrome or Edge on desktop, over HTTPS or on localhost.';
     }
     if (availability === 'unlikely') {
         /*
          * Only reachable for a wired port on Android — see serialBluetoothOnly.
          *
-         * The classic-Bluetooth alternative is conditional, not prescribed. This
+         * The Classic-Bluetooth alternative is conditional, not prescribed. This
          * advice is device-agnostic (TransportNeed says nothing about the sensor),
          * and a Verisense reaches the host over wired USB serial or BLE and has no
          * RFCOMM at all — so telling every Android caller to "pair over classic
          * Bluetooth instead" sends wired-only users after a connection that cannot
          * exist. Same failure as promising BLE on iOS above.
          */
-        return 'Android Chrome exposes Web Serial for paired Bluetooth devices only, so a wired USB/dock connection will most likely find nothing (wired serial support is still rolling out). A sensor that supports classic Bluetooth can be paired and reached that way instead.';
+        return 'Android Chrome exposes Web Serial for paired Bluetooth devices only, so a wired USB/dock connection will most likely find nothing (wired serial support is still rolling out). A sensor that supports Classic Bluetooth can be paired and reached that way instead.';
     }
     /*
      * Classic Bluetooth works here, but on Android the picker is empty until the
@@ -351,7 +351,7 @@ function transportAdvice(support, need) {
          * have taken an LE bond — for it, "paired but missing" has some other cause,
          * and the BLE-off dance is a dead end.
          */
-        return 'Pair the sensor in Android Settings → Bluetooth first — Android Chrome exposes Web Serial for paired Bluetooth devices only. If a sensor that also has a BLE radio is already paired and still missing, Android has most likely bonded it over BLE rather than classic Bluetooth, which leaves no classic service record for the picker to find. To fix it: disable the sensor’s BLE radio, unpair it on the phone, pair again from Bluetooth settings, then re-enable BLE — the classic bond survives, so this is once per phone.';
+        return 'Pair the sensor in Android Settings → Bluetooth first — Android Chrome exposes Web Serial for paired Bluetooth devices only. If a sensor that also has a BLE radio is already paired and still missing, Android has most likely bonded it over BLE rather than Classic Bluetooth, which leaves no classic service record for the picker to find. To fix it: disable the sensor’s BLE radio, unpair it on the phone, pair again from Bluetooth settings, then re-enable BLE — the classic bond survives, so this is once per phone.';
     }
     return null;
 }
@@ -651,7 +651,7 @@ class WebSerialTransport {
     /**
      * `port.open()`, bounded by {@link WebSerialTransportOptions.openTimeoutMs}.
      *
-     * Opening a classic-Bluetooth COM port is what brings the RFCOMM link up, so
+     * Opening a Classic-Bluetooth COM port is what brings the RFCOMM link up, so
      * an asleep or out-of-range sensor blocks here rather than failing fast. If
      * the timeout wins we still close the port should the open land later —
      * otherwise the OS keeps an orphaned handle and the next attempt fails with
@@ -3500,7 +3500,7 @@ function channelIdToSensorBit(id) {
  * Building the streaming packet schema from an inquiry response's channel list.
  *
  * Shared by both families: `Shimmer3RClient` (framed BLE) and
- * `buildShimmer3Schema` (unframed classic Bluetooth) put the same channel-ID
+ * `buildShimmer3Schema` (unframed Classic Bluetooth) put the same channel-ID
  * bytes through the same table, and any difference in how they treat a channel
  * they do not recognise would be a difference in how quietly they corrupt data.
  * So the logic lives here once.
@@ -5022,7 +5022,7 @@ function classifyLiteProtocolAck(buf) {
 }
 
 /**
- * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
+ * Pure protocol helpers for the Classic Bluetooth (RFCOMM/SPP) Shimmer3.
  *
  * Classic Shimmer3 speaks the same LiteProtocol command set as the Shimmer3R
  * (see `../shimmer3r/constants.ts`), but over an **unframed RFCOMM byte stream**
@@ -5080,7 +5080,7 @@ const SHIMMER3_SAMPLING_CLOCK_FREQ = 32768;
  * Build a stream schema from the channel-ID list reported by the inquiry.
  *
  * Mirrors ShimmerObject#interpretDataPacketFormat. The generation is fixed at
- * `'shimmer3'`: this file is the classic-Bluetooth Shimmer3 path, so unlike
+ * `'shimmer3'`: this file is the Classic-Bluetooth Shimmer3 path, so unlike
  * `Shimmer3RClient` — which the same firmware answers on both platforms — there
  * is nothing to determine and nothing to assume. That matters for the BMP
  * channels, which are 2-byte big-endian temperature + 3-byte big-endian
@@ -9366,7 +9366,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         /**
          * Transport entry point. A framed transport (BLE) delivers one firmware
          * message per call and goes straight to {@link _handleFramedChunk}; an
-         * unframed one (Web Serial over USB or over a classic-Bluetooth COM port)
+         * unframed one (Web Serial over USB or over a Classic-Bluetooth COM port)
          * is re-framed first, then funnelled through the very same handler.
          *
          * A running factory test is served FIRST, before either path. Its report is
@@ -9592,13 +9592,13 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         /*
          * Status text follows the transport rather than assuming BLE. These four
-         * messages used to be emitted unconditionally, so a classic-Bluetooth session
+         * messages used to be emitted unconditionally, so a Classic-Bluetooth session
          * reported "GATT connected", "RX/TX obtained" and "Notifications started" -
          * none of which exist on an RFCOMM link, which has no GATT server, no
          * characteristics and no notifications.
          *
          * That is not cosmetic. Debugging a Shimmer3R that would not appear in
-         * Android's classic-Bluetooth picker, this log read as proof the button had
+         * Android's Classic-Bluetooth picker, this log read as proof the button had
          * silently fallen back to BLE; only port.getInfo() reporting an SPP service
          * class showed the link was in fact correct and the words were wrong. A log
          * that misreports the mechanism costs more than one with less detail.
@@ -10193,7 +10193,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      *
      * `opts.chunkBytes` defaults to **64 over a framed (BLE) transport and 128
      * over an unframed one**. 128 is the firmware's ceiling and the page size the
-     * dock path uses, and it is what a byte stream — classic Bluetooth over
+     * dock path uses, and it is what a byte stream — Classic Bluetooth over
      * RFCOMM, or the dock UART — carries happily. Over BLE the proven size is 64:
      * that is what the brand-record write survives on real hardware, where a
      * 128-byte command has to cross four notifications into a firmware receive
@@ -11344,7 +11344,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      *
      * Worth asking even though this client is named for the Shimmer3R: the two
      * platforms share this firmware and this command set, so a Shimmer3 reached
-     * over classic Bluetooth answers here too — and answers some commands with
+     * over Classic Bluetooth answers here too — and answers some commands with
      * fewer bytes than a Shimmer3R does (see {@link getStatus}). Cached, so the
      * gating call sites can ask freely.
      */
@@ -11495,7 +11495,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      * `durationMs`. This measures the pipe itself (BLE connection interval and
      * MTU, or RFCOMM/serial buffering) independent of the SD/file-transfer
      * protocol, so it gives an upper bound for transfer rates on a given
-     * host/adapter/OS — and a direct BLE-vs-classic-Bluetooth comparison.
+     * host/adapter/OS — and a direct BLE-vs-Classic-Bluetooth comparison.
      * The device must be idle (the firmware NACKs the test while sensing).
      */
     async runDataRateTest(durationMs = 5000, onProgress) {
@@ -13964,7 +13964,7 @@ async function deleteDownloadedFromCard(client, filePaths, dirPaths = [], opts =
 // Re-export the shared LiteProtocol surface so Shimmer3 consumers import from one
 // module (these are identical across the two device families).
 /**
- * The `WebSerialTransport` options that reach a Shimmer over classic Bluetooth.
+ * The `WebSerialTransport` options that reach a Shimmer over Classic Bluetooth.
  *
  * Both Bluetooth fields are required and they do different jobs, which is the
  * whole reason this is a constant rather than something each caller assembles:
@@ -14022,7 +14022,7 @@ const SHIMMER3_DEFAULTS = Object.freeze({
 // Shimmer3Client
 // ---------------------------------------------------------------------------
 /**
- * Client for the **classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
+ * Client for the **Classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
  *
  * Shimmer3 speaks the same LiteProtocol as the Shimmer3R (shared opcodes, sensor
  * bitmap, channel formats — all reused from `../shimmer3r/`), with two
@@ -14158,7 +14158,7 @@ class Shimmer3Client extends BaseShimmerClient {
      * A transport is REQUIRED (constructor option or this parameter): Web
      * Bluetooth cannot open an RFCOMM socket, so there is no default. In a browser
      * the working transport is a {@link WebSerialTransport} over the virtual COM
-     * port the OS creates for a Shimmer paired over classic Bluetooth. Calling
+     * port the OS creates for a Shimmer paired over Classic Bluetooth. Calling
      * without one throws.
      *
      * Handshake (ported from ShimmerBluetooth#initialize → readShimmerVersionNew →
@@ -14173,7 +14173,7 @@ class Shimmer3Client extends BaseShimmerClient {
         const t = transport ?? this._injectedTransport;
         if (!t) {
             throw new Error('Shimmer3Client requires an injected transport: Web Bluetooth cannot open an ' +
-                'RFCOMM/SPP socket. In a browser, pair the sensor over classic Bluetooth and ' +
+                'RFCOMM/SPP socket. In a browser, pair the sensor over Classic Bluetooth and ' +
                 'pass a WebSerialTransport over the COM port the OS creates for it ' +
                 '(allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID]); elsewhere pass any ' +
                 'ShimmerTransport via the constructor ({ transport }) or connect(transport).');
