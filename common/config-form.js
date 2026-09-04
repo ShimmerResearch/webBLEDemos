@@ -370,6 +370,44 @@ function formatForControl(field, value) {
  *   writeInfoMemFieldValue: (bytes: Uint8Array, field: object, layout: object,
  *     value: unknown) => void,
  * }} cfg.codec the SDK's three field accessors, injected
+ * @param {(field: object, api: {
+ *   id: string,
+ *   onEdit: () => void,
+ *   describe: (key: string) => {value: unknown, label: string}|null,
+ * }) => {
+ *   node: HTMLElement,
+ *   get: () => {ok: true, value: unknown}|{ok: false, error: string},
+ *   set: (value: unknown) => void,
+ *   setDisabled?: (disabled: boolean, reason: string) => void,
+ *   setInvalid?: (message: string) => void,
+ *   focus?: () => void,
+ *   refresh?: () => void,
+ * }|null} [cfg.editorFor] a custom editor for a field, in place of the plain
+ *   control this module would build.
+ *
+ *   `refresh()`, if provided, is called on every OTHER editor after any field
+ *   commits — it is how an editor hears that a sibling field it derives
+ *   something from has changed, since a commit otherwise repaints only the
+ *   field that was committed. It must NOT overwrite what the user has typed
+ *   into the editor itself; that is what `set()` is for.
+ *
+ *   Returning null (for every field, or for one) keeps the default control, so
+ *   a page opts in per field and this module keeps working with no `editorFor`
+ *   at all. The editor is handed the same commit path as a plain control: it
+ *   calls `api.onEdit()`, this module asks it for a value through `get()`, and
+ *   a valid one is written into the image exactly as any other field's is —
+ *   which is the point of the hook rather than a second writer. Dirty state,
+ *   Discard, Apply and the hex view therefore need no knowledge of it.
+ *
+ *   `api.describe(key)` reads ANOTHER field's current value and its option
+ *   label out of the same image, for an editor that has to show something
+ *   about a sibling field — the configured range beside a calibration block,
+ *   say. It returns null for a field this form does not hold.
+ *
+ *   The hook exists because this module deliberately has no SDK dependency
+ *   (see the header): an editor that has to decode a field's bytes into
+ *   something structured needs the SDK's codec for that encoding, so it is
+ *   built by the page and passed in.
  * @param {number} [cfg.imageSize=384] working-image length
  * @param {Uint8Array} [cfg.image] initial working image; defaults to a
  *   zero-filled buffer, so the form renders before anything has been read
@@ -395,6 +433,7 @@ export function createConfigForm(host, cfg) {
     groups = [],
     layout,
     codec,
+    editorFor,
     onChange,
     onDirtyChange,
   } = cfg ?? {};
@@ -543,12 +582,39 @@ export function createConfigForm(host, cfg) {
     const noteId = `${id}-note`;
     const tooltip = encodingTooltip(field, index, msbIndex);
 
-    const control = buildControl(field, id);
-    control.dataset.fieldKey = field.key;
-    control.title = tooltip;
-    control.setAttribute("aria-describedby", `${hintId} ${errId} ${noteId}`);
+    /* A page-supplied editor takes the place of the control entirely. It
+       is asked for BEFORE buildControl so a field it claims never gets a
+       default control built for it, and it is asked once per entry, so an
+       editor holds per-field state safely.
 
-    const label = el("label", { for: id, title: tooltip }, field.label);
+       The box is declared first and filled in at the end of this function
+       because the editor is constructed before the entry exists but commits
+       through it: `onEdit` has to reach the finished entry, not the half-built
+       one, and a closure over a `let` that is assigned later would read
+       undefined if an editor ever called back during construction. */
+    const entryRef = { current: null };
+    const editor =
+      typeof editorFor === "function"
+        ? (editorFor(field, {
+            id,
+            onEdit: () => commit(entryRef.current),
+            describe: describeField,
+          }) ?? null)
+        : null;
+
+    const control = editor ? editor.node : buildControl(field, id);
+    control.dataset.fieldKey = field.key;
+    if (!editor) {
+      control.title = tooltip;
+      control.setAttribute("aria-describedby", `${hintId} ${errId} ${noteId}`);
+    }
+
+    /* An editor supplies its own titles for its own boxes; a `label for=` at
+       the top of a nine-box matrix points at nothing in particular. The field
+       name still has to be there, so it becomes a plain heading. */
+    const label = editor
+      ? el("div", { class: "field-editor-label", title: tooltip }, field.label)
+      : el("label", { for: id, title: tooltip }, field.label);
     const hint = el("div", { class: "field-hint", id: hintId }, field.desc);
     // aria-live so a rejected value is announced when it is rejected, not
     // only when the control is next focused.
@@ -582,11 +648,18 @@ export function createConfigForm(host, cfg) {
       tooltip,
       wrap,
       control,
+      editor,
       error,
       note,
       supported: true,
       reason: "",
     };
+    entryRef.current = entry;
+
+    // An editor commits through its own `onEdit`, on whatever event it
+    // decides is a change; wiring `change` here as well would commit twice
+    // for every edit inside it.
+    if (editor) return entry;
 
     // Numeric, text, hex and MAC controls all commit on `change`, never per
     // keystroke: "13" on the way to "130" is out of range for plenty of
@@ -707,8 +780,64 @@ export function createConfigForm(host, cfg) {
     return codec.readInfoMemFieldValue(bytes, field, layout);
   }
 
+  /**
+   * Tell every custom editor that the image changed underneath it.
+   *
+   * `refresh()` is the half of the `editorFor` contract that is about OTHER
+   * fields: an editor is handed its own value through `set()`, but anything it
+   * derives from a sibling — the range a calibration block belongs to — has no
+   * other way to hear about an edit, because a commit only repaints the field
+   * that was committed.
+   *
+   * Optional, and a throwing one must not cost the commit that provoked it:
+   * the bytes are already written by this point, and an editor that fails to
+   * repaint must not make a successful write look like a failed one.
+   *
+   * @param {object|null} [except] the entry that just committed
+   */
+  function notifyEditorsOfChange(except = null) {
+    for (const entry of entries.values()) {
+      if (entry === except || !entry.editor?.refresh) continue;
+      try {
+        entry.editor.refresh();
+      } catch {
+        /* An editor that cannot repaint is a display problem, not a write
+           problem. Deliberately silent: this runs once per editor per commit,
+           so a broken one would otherwise log on every keystroke-commit. */
+      }
+    }
+  }
+
+  /**
+   * One field's current value plus the label its option table gives it, for
+   * an editor that needs to show something about a SIBLING field.
+   *
+   * Reads the working image, not the baseline, so an editor showing "the
+   * configured range" follows an edit to that range immediately rather than
+   * waiting for a write.
+   *
+   * @param {string} key
+   * @returns {{value: unknown, label: string}|null} null when this form has
+   *   no such field — including a field dropped because its layout key does
+   *   not resolve on this firmware, which is exactly the case a caller must
+   *   not mistake for "the value is zero".
+   */
+  function describeField(key) {
+    const entry = entries.get(key);
+    if (!entry) return null;
+    const value = read(entry.field);
+    const option = entry.field.options?.find(
+      ([v]) => String(v) === String(value),
+    );
+    return { value, label: option ? String(option[1]) : String(value) };
+  }
+
   function setControlValue(entry, value) {
     const { field, control } = entry;
+    if (entry.editor) {
+      entry.editor.set(value);
+      return;
+    }
     if (control.type === "checkbox") {
       control.checked = Number(value) !== 0;
       return;
@@ -745,7 +874,9 @@ export function createConfigForm(host, cfg) {
 
   /** Validate without writing; used for live styling while typing. */
   function validateOnly(entry) {
-    const parsed = parseControlValue(entry.field, entry.control.value);
+    const parsed = entry.editor
+      ? entry.editor.get()
+      : parseControlValue(entry.field, entry.control.value);
     if (parsed.ok) clearError(entry);
     else showError(entry, parsed.error);
     return parsed;
@@ -758,13 +889,19 @@ export function createConfigForm(host, cfg) {
    * validating before writing rather than after.
    */
   function commit(entry) {
-    const { field, control } = entry;
+    if (!entry) return;
+    const { field, control, editor } = entry;
     // A read-only control is a display of bytes this module cannot encode.
     // Never write from one, however the change event arrived.
-    if (control.readOnly) return;
-    const raw =
-      control.type === "checkbox" ? (control.checked ? 1 : 0) : control.value;
-    const parsed = parseControlValue(field, raw);
+    if (!editor && control.readOnly) return;
+    let parsed;
+    if (editor) {
+      parsed = editor.get();
+    } else {
+      const raw =
+        control.type === "checkbox" ? (control.checked ? 1 : 0) : control.value;
+      parsed = parseControlValue(field, raw);
+    }
     if (!parsed.ok) {
       showError(entry, parsed.error);
       refreshDirty();
@@ -777,10 +914,25 @@ export function createConfigForm(host, cfg) {
     // control always shows what the bytes now actually say.
     setControlValue(entry, read(field));
     refreshDirty();
+    /* Give every OTHER editor a chance to repaint anything it derives from a
+       sibling field. The kinematic calibration editor shows the range its
+       block belongs to, read out of this same image — edit that range and the
+       chip beside the matrices was left naming the old one, and the greyed
+       factory defaults were the old range's too. Editors only, and never the
+       one that just committed (it has already repainted itself from the
+       bytes), so this costs nothing on a form with no editors in it. */
+    notifyEditorsOfChange(entry);
     onChange?.(field.key, parsed.value, dirtyKeys());
   }
 
   function showError(entry, message) {
+    /* An editor reports its own refusals, in its own words and against its own
+       boxes — a nine-box matrix needs to say WHICH box, which this line
+       cannot. Populating both would print the same refusal twice. */
+    if (entry.editor) {
+      entry.editor.setInvalid?.(message);
+      return;
+    }
     entry.error.textContent = message;
     entry.error.hidden = false;
     entry.control.setAttribute("aria-invalid", "true");
@@ -789,6 +941,10 @@ export function createConfigForm(host, cfg) {
   }
 
   function clearError(entry) {
+    if (entry.editor) {
+      entry.editor.setInvalid?.("");
+      return;
+    }
     entry.error.textContent = "";
     entry.error.hidden = true;
     entry.control.removeAttribute("aria-invalid");
@@ -863,10 +1019,16 @@ export function createConfigForm(host, cfg) {
   }
 
   function applyEnabled(entry) {
-    entry.control.disabled = !enabled || !entry.supported;
+    const disabled = !enabled || !entry.supported;
+    const reason = entry.supported ? "" : entry.reason || UNSUPPORTED_TITLE;
+    if (entry.editor) {
+      entry.editor.setDisabled?.(disabled, reason);
+      return;
+    }
+    entry.control.disabled = disabled;
     entry.control.title = entry.supported
       ? entry.tooltip
-      : `${entry.reason || UNSUPPORTED_TITLE} — ${entry.tooltip}`;
+      : `${reason} — ${entry.tooltip}`;
   }
 
   // ---- Public API -------------------------------------------------------
@@ -936,7 +1098,8 @@ export function createConfigForm(host, cfg) {
         if (n.tagName === "DETAILS") n.open = true;
         if (n === host) break;
       }
-      entry.control.focus({ preventScroll: true });
+      if (entry.editor?.focus) entry.editor.focus();
+      else entry.control.focus?.({ preventScroll: true });
       entry.wrap.scrollIntoView({ block: "nearest" });
     },
 

@@ -173,7 +173,7 @@ const linkOrder = await evaluate(`
   };
 `);
 check(
-  "connect buttons read BLE, classic Bluetooth, then the wired link",
+  "connect buttons read BLE, Classic Bluetooth, then the wired link",
   linkOrder.ids.slice(0, 3).join(",") === "btnBle,btnBt,btnUsb" &&
     linkOrder.ids[3] === "btnMock" &&
     linkOrder.sepAfterBt === "link-sep",
@@ -212,7 +212,7 @@ check(
 check(
   "disconnected it is refused with a reason, and the dock link genuinely cannot run it",
   linkIdle.disabled &&
-    /Connect over BLE or classic Bluetooth/.test(linkIdle.note) &&
+    /Connect over BLE or Classic Bluetooth/.test(linkIdle.note) &&
     linkIdle.dockHasTest === false &&
     linkIdle.radioHasTest === true,
   linkIdle.note,
@@ -591,6 +591,11 @@ const sdDownload = await evaluate(`
   const picked = await window.__useFs('MemDest');
   const dest = window.__sdRole('dest').textContent;
   const preview = window.__sdRole('preview').textContent;
+  /* The element is created "row muted" and repainted per layout, so the class
+     it ends up with is worth pinning: assigning the whole string once dropped
+     the "row" and with it the line's spacing. (No backticks in here -- this
+     comment lives inside the template literal handed to Runtime.evaluate.) */
+  const previewClasses = [...window.__sdRole('preview').classList];
   const session = 'data/DefaultTrial_5f2c1a90/Shimmer_8091-001';
   await window.sdBrowser.download([session], { deleteVerified: false });
   const cmp = [...window.__fs.files.keys()].map(hostPath => {
@@ -604,7 +609,7 @@ const sdDownload = await evaluate(`
       if (want[i] !== got[i]) { mismatchAt = i; break; }
     return { hostPath, cardPath, bytes: got.length, mismatchAt };
   });
-  return { picked, dest, preview, cmp,
+  return { picked, dest, preview, previewClasses, cmp,
     progress: window.__sdRole('progress').textContent,
     readCmds: window.__opCount(0xC4),
     cardIntact: window.mockTransport.sdCard.files.length };
@@ -614,10 +619,17 @@ check(
   "a picked destination is reported with the path the layout will produce",
   sdDownload.picked === true &&
     sdDownload.dest === "Saving into: MemDest" &&
-    /^Files will be written to MemDest\/\d{4}-\d{2}-\d{2}_\d{2}\.\d{2}\.\d{2}\/<ShimmerName>\/data\/…$/.test(
+    /* The device level is the sensor's MAC, lowercase, because that is where
+       Consensys looks — the preview shows the REAL one so that a run about to
+       be filed under a Shimmer name instead is noticed here rather than at
+       import time. */
+    /^Files will be written to MemDest\/\d{4}-\d{2}-\d{2}_\d{2}\.\d{2}\.\d{2}\/000666668091\/data\/…$/.test(
       sdDownload.preview,
-    ),
-  `${sdDownload.dest} — ${sdDownload.preview}`,
+    ) &&
+    // Keeps its layout classes, and is not wearing the missing-MAC warning.
+    sdDownload.previewClasses.includes("row") &&
+    !sdDownload.previewClasses.includes("preview-warn"),
+  `${sdDownload.dest} — ${sdDownload.preview} [${sdDownload.previewClasses.join(" ")}]`,
 );
 check(
   "downloading a session writes every file byte-for-byte, in the Consensys Backup layout",
@@ -626,7 +638,7 @@ check(
     sdDownload.cmp.every(
       (f) =>
         stampRe.test(f.hostPath.split("/")[0]) &&
-        f.hostPath.split("/")[1] === "Shimmer_8091",
+        f.hostPath.split("/")[1] === "000666668091",
     ) &&
     sdDownload.cmp.map((f) => f.bytes).join() === "17622,6145,931" &&
     sdDownload.progress === "Done" &&
@@ -1034,7 +1046,7 @@ check(
 );
 
 // ===========================================================================
-console.log("\n--- unframed (classic-Bluetooth-like, 3-byte dribble) ---");
+console.log("\n--- unframed (Classic-Bluetooth-like, 3-byte dribble) ---");
 await goto(`${BASE}?mock=1&framed=0&rate=102.4`);
 check(
   "connect over the unframed transport",
@@ -1380,7 +1392,7 @@ check(
     brandWrite.parsed.ble === "AcmeWristb" &&
     brandWrite.parsed.usbProduct === "AcmeWristband" &&
     /AcmeWristb-8091-BLE/.test(brandWrite.previews.ble) &&
-    /truncated from the classic Bluetooth prefix/.test(
+    /truncated from the Classic Bluetooth prefix/.test(
       brandWrite.previews.ble,
     ) &&
     /USB product "AcmeWristband 8091"/.test(brandWrite.previews.product),
@@ -1825,10 +1837,12 @@ check(
   "Calibration is a tab of its own, next to Configure, and has left it",
   // The whole strip is pinned, not just Calibration's neighbour, so that a
   // tab appearing in the wrong place is caught as loudly as one going
-  // missing. Test joins the END of the strip: it is the tab you reach for
-  // once the sensor is set up, not part of setting it up.
+  // missing. General leads it — the one-shot commands you reach for straight
+  // after connecting, as in the Verisense device console — and Test ends it:
+  // the tab you reach for once the sensor is set up, not part of setting it
+  // up.
   calTab.order.join(",") ===
-    "tabConfig,tabCal,tabStream,tabSd,tabBrand,tabTest" &&
+    "tabGeneral,tabConfig,tabCal,tabStream,tabSd,tabBrand,tabTest" &&
     calTab.label === "Calibration" &&
     !calTab.goneFromConfig.includes("Calibration") &&
     calTab.noOldIds.length === 0 &&
@@ -1840,9 +1854,15 @@ check(
 const calRead = await evaluate(`
   ${CAL}
   document.querySelector('.tabs [data-tab=tabCal]').click();
+  /* Sliced from HERE, not from the start of the session: the page reads the
+     calibration as part of its connect handshake now, so the writes already
+     hold one complete paged read before this click adds a second. Filtering
+     the whole history would assert on both at once. */
+  const from = window.mockTransport.writes.length;
   role('read').click();
   await new Promise(r => setTimeout(r, 2500));
-  const reads = window.mockTransport.writes.filter(w => w.bytes[0] === 0x9a)
+  const reads = window.mockTransport.writes.slice(from)
+    .filter(w => w.bytes[0] === 0x9a)
     .map(w => ({ len: w.bytes[1], off: w.bytes[2] | (w.bytes[3] << 8) }));
   return {
     pill: role('storePill').textContent,
@@ -1914,8 +1934,13 @@ check(
   byKey.altAccel.state === "never" &&
     byKey.altAccel.pill === "never calibrated" &&
     byKey.altAccel.offset === ",," &&
-    byKey.altAccel.asOf === "",
-  `${byKey.altAccel.pill}, boxes "${byKey.altAccel.offset}"`,
+    /* The date line is on EVERY card once something has been read, saying
+       "no date" where there is none. It used to be blank here, which read as
+       "these three sensors are the only ones with a calibration date" when
+       what it meant was "the others have no calibration at all" — a
+       different fact, and one the pill beside the title already makes. */
+    /^no date — nothing is stored/.test(byKey.altAccel.asOf),
+  `${byKey.altAccel.pill}, boxes "${byKey.altAccel.offset}", date "${byKey.altAccel.asOf}"`,
 );
 check(
   "and so does a record whose block is all 0xFF — not 65535s",
@@ -2326,6 +2351,21 @@ check(
 // ===========================================================================
 console.log("\n--- calibration: an unidentified sensor ---");
 await goto(`${BASE}?mock=1&hw=none`);
+/* Sampled BEFORE connecting, which is now the only state in which nothing
+   has named the hardware: the page reads the calibration as part of its
+   connect handshake, and on this sensor — one that refuses
+   GET_DEVICE_VERSION — the dump's own version header is what names it. That
+   is the point of the fallback, and it is worth pinning that it happens
+   without anybody pressing Read. */
+const calUnknownBefore = await evaluate(`
+  ${CAL}
+  document.querySelector('.tabs [data-tab=tabCal]').click();
+  return {
+    unknownCard: !!P().querySelector('[data-cal-role=unknownHardware]'),
+    text: P().querySelector('[data-cal-role=unknownHardware]')?.textContent ?? '',
+    sensors: P().querySelectorAll('[data-cal-sensor]').length,
+  };
+`);
 check(
   "connect to a sensor that refuses GET_DEVICE_VERSION",
   (await evaluate(CONNECT)) === "mock",
@@ -2333,28 +2373,25 @@ check(
 const calUnknown = await evaluate(`
   ${CAL}
   document.querySelector('.tabs [data-tab=tabCal]').click();
-  const before = {
-    unknownCard: !!P().querySelector('[data-cal-role=unknownHardware]'),
-    text: P().querySelector('[data-cal-role=unknownHardware]')?.textContent ?? '',
-    sensors: P().querySelectorAll('[data-cal-sensor]').length,
-  };
-  role('read').click();
-  await new Promise(r => setTimeout(r, 2500));
-  return { before, after: {
+  return { after: {
     unknownCard: !!P().querySelector('[data-cal-role=unknownHardware]'),
     sensors: [...P().querySelectorAll('[data-cal-sensor]')].map(c => c.dataset.calSensor),
     lnAccel: cells('lnAccel', 'sens'),
+    reads: window.mockTransport.writes.filter(w => w.bytes[0] === 0x9a).length,
   } };
 `);
 check(
-  "an unidentified sensor shows no sensor cards until the dump names its hardware",
-  calUnknown.before.unknownCard &&
-    calUnknown.before.sensors === 0 &&
-    /has not said what hardware it is/.test(calUnknown.before.text) &&
+  "an unidentified sensor gets its sensor cards from the dump the connect read fetched",
+  calUnknownBefore.unknownCard &&
+    calUnknownBefore.sensors === 0 &&
+    /Connect a sensor, or load a saved dump/.test(calUnknownBefore.text) &&
     !calUnknown.after.unknownCard &&
     calUnknown.after.sensors.length === 7 &&
-    calUnknown.after.lnAccel === "1674,1670,1673",
-  `${calUnknown.before.sensors} cards before the read, ${calUnknown.after.sensors.length} after`,
+    calUnknown.after.lnAccel === "1674,1670,1673" &&
+    // Two pages, from the connect handshake alone — nobody pressed Read.
+    calUnknown.after.reads === 2,
+  `${calUnknownBefore.sensors} cards before connecting, ${calUnknown.after.sensors.length} after, ` +
+    `${calUnknown.after.reads} dump page reads`,
 );
 
 // ---- the capability key, and which links actually have the dump commands
@@ -2595,10 +2632,14 @@ const panel = await evaluate(`
       Math.abs(r(dev).top - r(link).top) < 4,
     tabsBottom: r(tabs).bottom,
     viewport: window.innerHeight,
-    // The clock kept its own card on the Configure tab; the battery is now
-    // one reading in one place rather than two of the same number.
-    clockCard: [...document.querySelectorAll('#tabConfig .card-title')]
+    // The clock has its own card on the GENERAL tab — it is a device
+    // command, not a stored setting, so it does not belong with the
+    // configuration image. The battery is one reading in one place rather
+    // than two of the same number.
+    clockCard: [...document.querySelectorAll('#tabGeneral .card-title')]
       .map(t => t.textContent.trim()),
+    clockGoneFromConfig: ![...document.querySelectorAll('#tabConfig .card-title')]
+      .some(t => t.textContent.trim() === 'Clock'),
     battDetailGone: !document.getElementById('battDetail'),
     refreshInPanel: !!dev.querySelector('#btnRefreshDevice'),
   };
@@ -2607,10 +2648,10 @@ const tabIds = Object.keys(panel.perTab);
 check(
   "the identity panel sits beside the Sensor link card and stays put on every tab",
   panel.sideBySide &&
-    // Six since the Test tab joined Configure, Calibration, Stream, SD card
-    // and Naming. Counted rather than named on purpose: a tab that goes
-    // missing is as much a regression as one that paints wrong.
-    tabIds.length === 6 &&
+    // Seven: General, Configure, Calibration, Stream, SD card, Naming,
+    // Test. Counted rather than named on purpose: a tab that goes missing is
+    // as much a regression as one that paints wrong.
+    tabIds.length === 7 &&
     tabIds.every((t) => panel.perTab[t].visible) &&
     tabIds.every((t) => panel.perTab[t].name.includes("Shimmer3R")) &&
     tabIds.every((t) => panel.perTab[t].flags === 9) &&
@@ -2626,7 +2667,8 @@ check(
     panel.tabsBottom <= 430 &&
     panel.refreshInPanel &&
     panel.battDetailGone &&
-    panel.clockCard[1] === "Clock",
+    panel.clockCard[0] === "Clock" &&
+    panel.clockGoneFromConfig,
   `tab strip ends at ${Math.round(panel.tabsBottom)}px of ${panel.viewport}px`,
 );
 
@@ -3274,7 +3316,7 @@ check(
     /corrupt every block/.test(oldFw.banner) &&
     oldFw.bannerKind === "banner warn" &&
     oldFw.title === oldFw.banner &&
-    oldFw.selected === "tabConfig" &&
+    oldFw.selected === "tabGeneral" &&
     oldFw.streamTab &&
     oldFw.logs.length === 1,
   oldFw.banner.slice(0, 90) + "…",
@@ -3331,7 +3373,9 @@ const SDK_CONSUMERS = [
   "common/brand-editor.js",
   "common/calibration-editor.js",
   "common/csv-recorder.js",
+  "common/device-clock.js",
   "common/factory-test-panel.js",
+  "common/kinematic-block-editor.js",
   "common/rtc-drift-panel.js",
   "common/sd-browser.js",
   "common/stream-stats.js",
@@ -3565,7 +3609,7 @@ const tabInfo = await evaluate(`
 `);
 check(
   "the Test tab is last in the strip and is a real ARIA tab",
-  tabInfo.ids.length === 6 &&
+  tabInfo.ids.length === 7 &&
     tabInfo.last === "tabBtnTest" &&
     tabInfo.role === "tab" &&
     tabInfo.controls === "tabTest" &&
@@ -4182,6 +4226,448 @@ check(
   canRunWiring.includes("selfTestUnavailableReason") &&
     !canRunWiring.includes("selfTestLinkNote"),
   canRunWiring.split(String.fromCharCode(10))[1] ?? "",
+);
+
+// ===========================================================================
+// The General tab, the kinematic block editor, and the log's Copy button —
+// the alignment pass against the Verisense device console.
+// ===========================================================================
+console.log("\n--- the General tab ---");
+await goto(`${BASE}?mock=1`);
+
+const generalIdle = await evaluate(`
+  const btn = [...document.querySelectorAll('.tabs [data-tab]')][0];
+  return {
+    first: btn.dataset.tab,
+    label: btn.textContent.trim(),
+    selected: document.querySelector('.tabs [aria-selected="true"]').dataset.tab,
+    cards: [...document.querySelectorAll('#tabGeneral .card-title')]
+      .map(t => t.textContent.trim()),
+    /* Every control on it is a device command, so every one is gated on a
+       link. A button that is live with nothing connected would fail on its
+       first press with a message about the client rather than about the
+       link. */
+    live: [...document.querySelectorAll('#tabGeneral button')]
+      .filter(b => !b.disabled).map(b => b.id),
+  };
+`);
+check(
+  "General leads the strip, is what the page opens on, and holds the three cards",
+  generalIdle.first === "tabGeneral" &&
+    generalIdle.label === "General" &&
+    generalIdle.selected === "tabGeneral" &&
+    generalIdle.cards.join(",") === "Clock,LEDs,Device commands",
+  `${generalIdle.label} first, showing ${generalIdle.cards.join(" / ")}`,
+);
+check(
+  "disconnected, nothing on it is pressable",
+  generalIdle.live.length === 0,
+  generalIdle.live.length ? generalIdle.live.join(", ") : "all gated",
+);
+
+check("connect for the General tab", (await evaluate(CONNECT)) === "mock");
+
+const general = await evaluate(`
+  document.querySelector('.tabs [data-tab=tabGeneral]').click();
+  const from = window.mockTransport.writes.length;
+  document.getElementById('btnReadClock').click();
+  await new Promise(r => setTimeout(r, 900));
+  const clockOps = window.mockTransport.writes.slice(from)
+    .map(w => w.bytes[0]);
+  const afterClock = {
+    rwc: document.getElementById('rwcValue').textContent,
+    host: document.getElementById('hostClock').textContent,
+    note: document.getElementById('generalNote').textContent,
+  };
+  const from2 = window.mockTransport.writes.length;
+  document.getElementById('btnInquiry').click();
+  await new Promise(r => setTimeout(r, 900));
+  return {
+    clockOps, afterClock,
+    inquiryOps: window.mockTransport.writes.slice(from2).map(w => w.bytes[0]),
+    /* The LED and the clock left the tabs they were on, and nothing was left
+       behind on either — a duplicate id would make $() return whichever came
+       first in the document and quietly wire half the page to it. */
+    ledOnGeneral: !!document.querySelector('#tabGeneral #btnLedToggle'),
+    ledGoneFromTest: !document.querySelector('#tabTest #btnLedToggle'),
+    clockGoneFromConfig: !document.querySelector('#tabConfig #btnSetClock'),
+    oneOfEach: ['btnSetClock','btnLedToggle','btnReadClock','btnInquiry']
+      .map(id => document.querySelectorAll('#' + id).length),
+  };
+`);
+check(
+  "Read device clock reads the clock and nothing else, and reports the skew",
+  // GET_RWC_COMMAND (0x91) once: the point of the button is that it is not
+  // Refresh, which also reads the battery and the status bytes.
+  general.clockOps.join(",") === "145" &&
+    /^\d{4}-\d{2}-\d{2} /.test(general.afterClock.rwc) &&
+    /^\d{4}-\d{2}-\d{2} /.test(general.afterClock.host) &&
+    /within a second of|s from/.test(general.afterClock.note),
+  `ops [${general.clockOps.join(",")}] — ${general.afterClock.note}`,
+);
+check(
+  "Re-inquire channel list sends one INQUIRY and nothing else",
+  general.inquiryOps.join(",") === "1",
+  `ops [${general.inquiryOps.join(",")}]`,
+);
+check(
+  "the clock and the LEDs moved to General, leaving nothing behind",
+  general.ledOnGeneral &&
+    general.ledGoneFromTest &&
+    general.clockGoneFromConfig &&
+    general.oneOfEach.every((n) => n === 1),
+  `one of each: ${general.oneOfEach.join(",")}`,
+);
+
+// ===========================================================================
+console.log("\n--- calibration blocks in the configuration form ---");
+
+const kin = await evaluate(`
+  document.querySelector('.tabs [data-tab=tabConfig]').click();
+  const body = document.querySelector('[data-group-body="calibration"]');
+  body.closest('details').open = true;
+  await new Promise(r => requestAnimationFrame(r));
+  const cell = (key, part, i) => document.querySelector(
+    '[data-field-key="' + key + '"] [data-cal-part=' + part + '][data-cal-index="' + i + '"]');
+  const cells = (key, part) => [...document.querySelectorAll(
+    '[data-field-key="' + key + '"] [data-cal-part=' + part + ']')].map(i => i.value);
+  const before = {
+    fields: [...body.querySelectorAll('.field')].length,
+    /* No hex box anywhere in the group: two editors on one 21-byte field
+       would be two writers, and whichever committed last would win. */
+    hexBoxes: [...body.querySelectorAll('input[placeholder$="hex characters"]')].length,
+    ranges: [...body.querySelectorAll('.cal-inline .pill')].map(p => p.textContent),
+    lnSens: cells('calib.lnAccel', 'sens'),
+    lnAlign: cells('calib.lnAccel', 'align'),
+    faint: [...body.querySelectorAll('input.cal-cell.faint')].length,
+    /* The mock's image carries no calibration, so every box holds the greyed
+       factory default — 90 of them across six sensors. */
+    allCells: [...body.querySelectorAll('input.cal-cell')].length,
+    note: document.querySelector('[data-field-key="calib.lnAccel"] .field-hint.muted').textContent,
+  };
+
+  // A value the format cannot hold: alignment is i8/100, so 5 is refused.
+  const bad = cell('calib.lnAccel', 'align', 0);
+  const was = bad.value;
+  bad.value = '5';
+  bad.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  const refused = {
+    error: document.querySelector('[data-field-key="calib.lnAccel"] .cal-error').textContent,
+    flagged: bad.classList.contains('bad'),
+    dirty: document.getElementById('dirtyPill').textContent,
+    dirtyHidden: document.getElementById('dirtyPill').hidden,
+  };
+
+  // …and one it can. Committing turns the greyed defaults into real values.
+  bad.value = was;
+  bad.dispatchEvent(new Event('change', { bubbles: true }));
+  const box = cell('calib.lnAccel', 'offset', 0);
+  box.value = '123';
+  box.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  const accepted = {
+    dirty: document.getElementById('dirtyPill').textContent,
+    error: document.querySelector('[data-field-key="calib.lnAccel"] .cal-error').textContent,
+    faint: document.querySelectorAll('[data-field-key="calib.lnAccel"] input.cal-cell.faint').length,
+    offsets: cells('calib.lnAccel', 'offset'),
+    /* The bytes are what the form actually holds, so the hex view is where
+       the edit has to show up — an editor that painted boxes and wrote
+       nothing would look identical up to here. */
+    highlighted: document.querySelectorAll('#hexview .hex-byte.changed, #hexview .changed').length > 0,
+  };
+
+  document.getElementById('btnDiscard').click();
+  await new Promise(r => requestAnimationFrame(r));
+  return { before, refused, accepted, after: {
+    offsets: cells('calib.lnAccel', 'offset'),
+    faint: document.querySelectorAll('[data-field-key="calib.lnAccel"] input.cal-cell.faint').length,
+    dirtyHidden: document.getElementById('dirtyPill').hidden,
+  } };
+`);
+check(
+  "the six calibration blocks render as matrices, not as hex, one field each",
+  kin.before.fields === 6 &&
+    kin.before.hexBoxes === 0 &&
+    kin.before.allCells === 90 &&
+    kin.before.lnSens.length === 3 &&
+    kin.before.lnAlign.length === 9,
+  `${kin.before.fields} fields, ${kin.before.allCells} boxes, ${kin.before.hexBoxes} hex boxes`,
+);
+check(
+  "each block names the range the image is configured for",
+  kin.before.ranges.length === 6 &&
+    kin.before.ranges.filter((r) => /^configured: /.test(r)).length === 4 &&
+    // The Shimmer3R's LIS2MDL magnetometer has one range, so the schema
+    // declares no range field for it — and that is not a lookup failure.
+    kin.before.ranges.filter((r) => r === "single range").length === 2,
+  kin.before.ranges.join(" · "),
+);
+check(
+  "an empty block shows the factory defaults it falls back to, greyed and labelled",
+  kin.before.faint === 90 &&
+    /every byte is 0x00 or 0xFF/.test(kin.before.note) &&
+    /factory defaults/.test(kin.before.note) &&
+    // LSM6DSV low-noise accel at +/- 2g
+    kin.before.lnSens.join(",") === "1672,1672,1672",
+  `${kin.before.faint} greyed boxes; sensitivity ${kin.before.lnSens.join(",")}`,
+);
+check(
+  "a value the 21-byte format cannot hold is refused, and says which box",
+  /align row 1 column 1/.test(kin.refused.error) &&
+    /1\.28 to 1\.27 in steps of 0\.01/.test(kin.refused.error) &&
+    kin.refused.flagged,
+  kin.refused.error,
+);
+check(
+  "a value it can hold reaches the bytes, and stops being a greyed default",
+  kin.accepted.error === "" &&
+    kin.accepted.faint === 0 &&
+    kin.accepted.offsets.join(",") === "123,0,0" &&
+    /change/.test(kin.accepted.dirty) &&
+    kin.accepted.highlighted,
+  `${kin.accepted.dirty}, offsets ${kin.accepted.offsets.join(",")}`,
+);
+check(
+  "Discard puts the greyed defaults back, exactly as it does any other field",
+  kin.after.offsets.join(",") === "0,0,0" &&
+    kin.after.faint === 15 &&
+    kin.after.dirtyHidden,
+  `offsets ${kin.after.offsets.join(",")}, ${kin.after.faint} greyed`,
+);
+
+// ===========================================================================
+console.log("\n--- the event log's toolbar ---");
+
+const logBar = await evaluate(`
+  const ids = ['logFilter','logSeverity','chkRawBytes','chkRawData',
+               'btnLogCopy','btnLogClear','btnLogDownload'];
+  const order = [...document.querySelectorAll('#logDrawerBody .log-toolbar *')]
+    .filter(n => ids.includes(n.id)).map(n => n.id);
+  /* Copied by clicking, not by calling the API: the button is the thing that
+     has to be wired. The clipboard is unavailable in a headless pass, so what
+     is asserted is that it REPORTS either way — a copy that silently does
+     nothing is the failure mode this replaced. */
+  window.__toasts = [];
+  const realToast = window.showToast;
+  document.getElementById('btnLogCopy').click();
+  await new Promise(r => setTimeout(r, 400));
+  return {
+    order,
+    severities: [...document.querySelectorAll('#logSeverity option')]
+      .map(o => o.textContent),
+    copyTitle: document.getElementById('btnLogCopy').title,
+    toasts: [...document.querySelectorAll('.toast')].map(t => t.textContent),
+    themeTitle: document.getElementById('themeBtn').title,
+    drawerTitle: document.querySelector('.log-drawer-title').textContent,
+  };
+`);
+check(
+  "the toolbar reads filter, severity, the two taps, then Copy / Clear / Download",
+  logBar.order.join(",") ===
+    "logFilter,logSeverity,chkRawBytes,chkRawData,btnLogCopy,btnLogClear,btnLogDownload",
+  logBar.order.join(" → "),
+);
+check(
+  "the drawer title and the severity wording match the console's",
+  logBar.drawerTitle === "Event log" &&
+    logBar.severities.join(",") === "All,Errors,Warnings+,TX/RX",
+  `"${logBar.drawerTitle}": ${logBar.severities.join(" / ")}`,
+);
+check(
+  "Copy reports what happened rather than failing silently",
+  logBar.toasts.some((t) =>
+    /Copied \d+ log lines|clipboard is not available/.test(t),
+  ) &&
+    /every line, not just the ones the filter is showing/.test(
+      logBar.copyTitle,
+    ),
+  logBar.toasts.join(" | ") || "no toast",
+);
+check(
+  "the theme toggle says which way the click goes, as the console's does",
+  /^Switch to (light|dark) theme$/.test(logBar.themeTitle),
+  logBar.themeTitle,
+);
+
+// ===========================================================================
+// The clock read, and the gate that decides whether to offer it.
+//
+// These have to agree. They did not: the button was gated on
+// `describeShimmer3Caps(...).rtcRead`, which counts the dock's `getConfig`
+// property as a way to read the clock, while the handler tested for the
+// Bluetooth `getRtcTime` method and refused. So over USB the control was
+// enabled and always said "This link cannot read the sensor clock" — and the
+// README had been written to match the bug. Found by Copilot on #76.
+//
+// Source-level and stub-level on purpose: the mock transport speaks the radio
+// protocol only, so there is no dock client here to drive the button with.
+// What can be pinned is the agreement, which is what actually broke.
+// ===========================================================================
+console.log("\n--- the clock read agrees with the gate that offers it ---");
+
+const clockGate = await evaluate(`
+  const schema = await import('/common/shimmer3-config-schema.js');
+  const clock = await import('/common/device-clock.js');
+  /* The four client shapes that exist, crossed with every link. "dock" is a
+     getConfig-only client and "both" is the stub shape that carries each
+     read — it cannot arise from the real clients (Shimmer3RClient has no
+     getConfig, WiredShimmerClient no getRtcTime) but it is what pins which
+     path wins on the dock link. */
+  const shapes = {
+    radio: { async getRtcTime(){ return { ticks: 1n, unixMs: 1 }; } },
+    dock:  { async getConfig(){ return new Uint8Array(8); } },
+    both:  { async getRtcTime(){ return { ticks: 1n, unixMs: 1 }; },
+             async getConfig(){ return new Uint8Array(8); } },
+    mute:  {},
+  };
+  const rows = [];
+  for (const [shape, client] of Object.entries(shapes)) {
+    for (const mode of ['ble', 'rfcomm', 'usb']) {
+      let read = 'threw';
+      try { read = (await clock.readDeviceRwc(client, mode)).viaDock ? 'dock' : 'radio'; }
+      catch { /* refused, which is a result */ }
+      rows.push({
+        shape, mode,
+        caps: schema.describeShimmer3Caps(client, mode).rtcRead,
+        gate: clock.canReadRwc(client),
+        read,
+      });
+    }
+  }
+  return {
+    rows,
+    /* The bug this module was written for: a control the capability enables
+       that the reader then refuses. */
+    enabledButRefuses: rows.filter(r => r.caps && r.read === 'threw')
+      .map(r => r.shape + '/' + r.mode),
+    /* And its sibling, one layer down: the gate and the reader disagreeing,
+       which is what Copilot found in the first version of this module. */
+    gateDisagrees: rows.filter(r => r.gate !== (r.read !== 'threw'))
+      .map(r => r.shape + '/' + r.mode),
+    /* canReadRwc takes no mode: whether a clock can be read is a property of
+       the CLIENT. Pinned by call, not by reading the source. */
+    modeIgnored: clock.canReadRwc(shapes.dock, 'ble') === clock.canReadRwc(shapes.dock, 'usb'),
+    nothingConnected: clock.canReadRwc(null),
+    src: await (await fetch('/ShimmerCapture/index.html')).text(),
+  };
+`);
+const dockOnUsb = clockGate.rows.find(
+  (r) => r.shape === "dock" && r.mode === "usb",
+);
+const bothOnUsb = clockGate.rows.find(
+  (r) => r.shape === "both" && r.mode === "usb",
+);
+const bothOnBle = clockGate.rows.find(
+  (r) => r.shape === "both" && r.mode === "ble",
+);
+check(
+  "no client/link shape is offered the clock by the capability and refused by the reader",
+  clockGate.enabledButRefuses.length === 0 &&
+    // …and the case that broke really is offered, rather than agreeing on "no".
+    dockOnUsb.caps === true &&
+    dockOnUsb.read === "dock",
+  clockGate.enabledButRefuses.length
+    ? `enabled but refuses: ${clockGate.enabledButRefuses.join(", ")}`
+    : `${clockGate.rows.length} shapes, dock-over-usb reads via ${dockOnUsb.read}`,
+);
+check(
+  "the gate and the reader agree on every one of them, and the gate ignores the link",
+  clockGate.gateDisagrees.length === 0 &&
+    clockGate.modeIgnored &&
+    clockGate.nothingConnected === false,
+  clockGate.gateDisagrees.length
+    ? `gate disagrees: ${clockGate.gateDisagrees.join(", ")}`
+    : "gate === reader on all 12",
+);
+check(
+  "the link chooses the path: the dock's own command wins on the dock link",
+  // A client carrying both reads takes the dock property over USB — the radio
+  // command does not exist on that link whatever the object offers — and the
+  // radio command everywhere else.
+  bothOnUsb.read === "dock" && bothOnBle.read === "radio",
+  `both-reads client: usb via ${bothOnUsb.read}, ble via ${bothOnBle.read}`,
+);
+check(
+  "both of the page's clock reads go through the shared reader, not a method test",
+  /canReadRwc\(client\)/.test(clockGate.src) &&
+    /readDeviceRwc\(client, mode\)/.test(clockGate.src) &&
+    // The two call sites are the button and the Device panel's Refresh.
+    (clockGate.src.match(/readDeviceRwc\(client, mode\)/g) ?? []).length ===
+      2 &&
+    !/typeof client\.getRtcTime === "function"/.test(clockGate.src) &&
+    !/typeof client\?\.getRtcTime !== "function"/.test(clockGate.src),
+  `${(clockGate.src.match(/readDeviceRwc\(client, mode\)/g) ?? []).length} call sites, no getRtcTime property test`,
+);
+
+// ===========================================================================
+console.log("\n--- a calibration block follows the range field beside it ---");
+await goto(`${BASE}?mock=1`);
+check(
+  "connect for the refresh-hook pass",
+  (await evaluate(CONNECT)) === "mock",
+);
+
+const refreshHook = await evaluate(`
+  document.querySelector('.tabs [data-tab=tabConfig]').click();
+  document.querySelector('[data-group-body="calibration"]').closest('details').open = true;
+  document.querySelector('[data-group-body="gyro"]').closest('details').open = true;
+  await new Promise(r => requestAnimationFrame(r));
+  const cells = (k, part) => [...document.querySelectorAll(
+    '[data-field-key="' + k + '"] [data-cal-part=' + part + ']')].map(i => i.value);
+  const pill = (k) => document.querySelector('[data-field-key="' + k + '"] .pill').textContent;
+  const faint = (k) => document.querySelectorAll(
+    '[data-field-key="' + k + '"] input.cal-cell.faint').length;
+  const sel = document.querySelector('[data-field-key="gyroRange.lsm6dsv"] select');
+
+  const before = { pill: pill('calib.gyro'), sens: cells('calib.gyro', 'sens') };
+
+  // 1. change the range: the pill AND the greyed defaults must follow it
+  sel.value = '4';                                  // +/- 2000 dps
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  const moved = { pill: pill('calib.gyro'), sens: cells('calib.gyro', 'sens'),
+                  faint: faint('calib.gyro'),
+                  otherPill: pill('calib.lnAccel'),
+                  otherSens: cells('calib.lnAccel', 'sens') };
+
+  // 2. type a real value, then change the range again: the boxes must NOT move
+  const box = document.querySelector(
+    '[data-field-key="calib.gyro"] [data-cal-part=offset][data-cal-index="0"]');
+  box.value = '777';
+  box.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  sel.value = '0';
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  const kept = { pill: pill('calib.gyro'), off: cells('calib.gyro', 'offset'),
+                 sens: cells('calib.gyro', 'sens'), faint: faint('calib.gyro') };
+  return { before, moved, kept };
+`);
+check(
+  "changing the range repaints the block's range chip and its greyed defaults",
+  refreshHook.before.pill === "configured: +/- 125dps" &&
+    refreshHook.before.sens.join(",") === "229,229,229" &&
+    refreshHook.moved.pill === "configured: +/- 2000dps" &&
+    // 2000 dps is a far coarser LSB, so the default sensitivity really moves.
+    refreshHook.moved.sens.join(",") === "14,14,14" &&
+    refreshHook.moved.faint === 15,
+  `${refreshHook.before.pill} ${refreshHook.before.sens[0]} → ${refreshHook.moved.pill} ${refreshHook.moved.sens[0]}`,
+);
+check(
+  "and it leaves every OTHER block alone",
+  refreshHook.moved.otherPill === "configured: ± 2g" &&
+    refreshHook.moved.otherSens.join(",") === "1672,1672,1672",
+  `${refreshHook.moved.otherPill}, ${refreshHook.moved.otherSens.join(",")}`,
+);
+check(
+  "a block holding real values keeps them — only its chip follows the range",
+  refreshHook.kept.pill === "configured: +/- 125dps" &&
+    refreshHook.kept.off.join(",") === "777,0,0" &&
+    // Still the 2000 dps figure it was edited alongside, NOT re-defaulted.
+    refreshHook.kept.sens.join(",") === "14,14,14" &&
+    refreshHook.kept.faint === 0,
+  `offset ${refreshHook.kept.off.join(",")}, sensitivity ${refreshHook.kept.sens.join(",")}, ${refreshHook.kept.faint} greyed`,
 );
 
 // ===========================================================================

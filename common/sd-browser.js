@@ -191,6 +191,17 @@ export function fmtEta(seconds) {
  *   that shows it somewhere of its own; null when the test failed. The panel
  *   has no button for that test — see the note on `measureLinkSpeed`.
  * @param {(n: number) => string} [opts.fmtBytes] byte formatter
+ * @param {string|null|(() => string|null)} [opts.macId] the connected
+ *   sensor's MAC id, in any hex format. Names the device level of the
+ *   Consensys Backup tree — see {@link sdk.consensysBackupSegments}. A getter,
+ *   so the panel reads whatever the page has NOW rather than whatever it knew
+ *   when it was mounted, which for a MAC read during the connect handshake is
+ *   the difference between the real address and nothing.
+ *
+ *   Without it a Consensys download still completes, but under a folder named
+ *   after the Shimmer rather than the MAC — a tree Consensys walks straight
+ *   past. So the panel says so, out loud, rather than letting somebody find
+ *   out at import time.
  * @param {string} [opts.rootPath="data"] tree to walk on the card
  * @returns {{
  *   refresh: () => Promise<void>,
@@ -210,7 +221,26 @@ export function createSdBrowser(host, opts = {}) {
     typeof opts.client === "function" ? opts.client : () => opts.client ?? null;
   const log = opts.log ?? { log() {}, warn() {}, error() {} };
   const fmtBytes = opts.fmtBytes ?? defaultFmtBytes;
+  const getMacId =
+    typeof opts.macId === "function" ? opts.macId : () => opts.macId ?? null;
   const rootPath = opts.rootPath ?? CARD_ROOT;
+
+  /**
+   * The MAC as Consensys names its device folders, or null.
+   *
+   * Through the SDK's own normaliser rather than a local regex, so this and
+   * the download agree byte for byte about what counts as a usable MAC — a
+   * preview promising `e8eb1b9767a0` while the transfer files under
+   * `Shimmer_5AA4` would be worse than no preview.
+   */
+  const macFolder = () => {
+    try {
+      return sdk.consensysMacFolderName?.(getMacId()) ?? null;
+    } catch {
+      /* A vendored bundle from before the helper existed. */
+      return null;
+    }
+  };
 
   /* A vendored bundle from before SD-over-Bluetooth shipped: say so here,
      once, rather than throwing from the first Refresh. The sibling brand
@@ -624,10 +654,26 @@ export function createSdBrowser(host, opts = {}) {
     // The folder a download would go into RIGHT NOW, which after an aborted
     // run is the one it left unfinished rather than a fresh one.
     const stamp = pendingStamp ?? sdk.formatSdImportStamp();
-    destPreview.textContent =
-      layout === "consensysBackup"
-        ? `Files will be written to ${destRoot.name}/${stamp}/<ShimmerName>/${rootPath}/…`
-        : `Files will be written to ${destRoot.name}/${rootPath}/…`;
+    /* `classList`, not `className`: the element is created `row muted`, and
+       assigning the whole class string dropped the `row` — which is what gives
+       it its spacing under the destination line. */
+    const warn = (on) => destPreview.classList.toggle("preview-warn", on);
+    if (layout !== "consensysBackup") {
+      destPreview.textContent = `Files will be written to ${destRoot.name}/${rootPath}/…`;
+      warn(false);
+      return;
+    }
+    /* The device level is the MAC, and the preview shows the REAL one rather
+       than a placeholder: this line is the only chance anyone gets to notice
+       that the tree is about to be named after the Shimmer instead — which
+       looks like a successful download and cannot be imported. */
+    const mac = macFolder();
+    destPreview.textContent = mac
+      ? `Files will be written to ${destRoot.name}/${stamp}/${mac}/${rootPath}/…`
+      : `Files will be written to ${destRoot.name}/${stamp}/<ShimmerName>/${rootPath}/… — ` +
+        "the sensor's MAC address could not be read, and Consensys expects it " +
+        "where the name will be, so this tree will not import.";
+    warn(!mac);
   }
 
   function setDestLabel(remembered) {
@@ -765,12 +811,26 @@ export function createSdBrowser(host, opts = {}) {
        first — resuming nothing and leaving two half-imports for Consensys to
        find. `pendingStamp` is cleared only by a run that completes. */
     const importStamp = pendingStamp ?? sdk.formatSdImportStamp();
+    const macId = macFolder();
     if (layout === "consensysBackup") {
       log.log(
         pendingStamp
           ? `resuming into the Consensys import folder ${importStamp}/ that the last run left unfinished`
           : `writing Consensys import folder ${importStamp}/`,
       );
+      /* Warned at the start of the run, not only in the preview: a resumed
+         run reuses a stamp from before the link dropped, and the MAC is read
+         during the connect handshake — so a re-connect that failed to read it
+         would otherwise silently change where the rest of the transfer
+         lands. */
+      if (macId) log.log(`filing under the sensor's MAC ${macId}/`);
+      else
+        log.warn(
+          "the sensor's MAC address is not known, so the device folder will " +
+            "be named after the Shimmer instead. Consensys expects the MAC " +
+            "there and will not import this tree — reconnect and try again " +
+            "if an import is what this download is for.",
+        );
     }
 
     abortCtl = new AbortController();
@@ -800,6 +860,7 @@ export function createSdBrowser(host, opts = {}) {
           deleteAfterVerify,
           layout,
           importStamp,
+          macId,
           signal: abortCtl.signal,
           onProgress: (p) => {
             /* The enumerate event fires before anything is known — every
@@ -895,7 +956,7 @@ export function createSdBrowser(host, opts = {}) {
    * This measures the pipe — BLE connection interval and MTU, or RFCOMM
    * buffering — not the file-transfer protocol, so it is the honest upper
    * bound to quote before a long download, and a direct A/B between BLE and
-   * classic Bluetooth on the same host.
+   * Classic Bluetooth on the same host.
    *
    * NO BUTTON IN THIS PANEL DRIVES THIS. What it measures is the link, not
    * the card: the number is the same whether or not a card is fitted, and it

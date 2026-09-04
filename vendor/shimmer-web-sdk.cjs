@@ -7,7 +7,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.1.25';
+const SDK_VERSION = '0.2.1';
 
 /**
  * Container for a single decoded sensor frame.
@@ -91,7 +91,7 @@ class BaseShimmerClient {
         /**
          * Invoked when the link to the device goes away **without the application
          * asking for it**: the sensor was switched off, walked out of BLE range, or
-         * its USB / classic-Bluetooth COM port was unplugged. `reason` carries the
+         * its USB / Classic-Bluetooth COM port was unplugged. `reason` carries the
          * transport's error when it supplied one.
          *
          * Deliberately NOT invoked by {@link disconnect}. A caller that closed the
@@ -186,9 +186,9 @@ class BaseShimmerClient {
  *
  * iOS is the opposite shape — a harder "no" than an unimplemented API. Every iOS
  * browser is WebKit, which ships neither API, and iOS exposes no
- * classic-Bluetooth serial access to third-party apps at any layer: Core
+ * Classic-Bluetooth serial access to third-party apps at any layer: Core
  * Bluetooth is BLE-only, and classic profiles such as SPP require MFi licensing.
- * So classic Bluetooth there is impossible rather than merely absent, and no
+ * So Classic Bluetooth there is impossible rather than merely absent, and no
  * future browser release changes that. BLE via a browser that bundles its own
  * stack (Bluefy, WebBLE) is the ceiling.
  */
@@ -285,34 +285,34 @@ function transportAdvice(support, need) {
              * what they are using.
              *
              * Deliberately conditional on the *sensor* too. BLE is not a substitute
-             * for classic Bluetooth in general - a classic-only Shimmer3 (the RN42
+             * for Classic Bluetooth in general - a classic-only Shimmer3 (the RN42
              * fleet has no BLE radio at all) cannot be reached from iOS by any route.
              * Promising "connect over BLE instead" would send exactly the user who
-             * needs classic Bluetooth off after something that cannot work for them.
+             * needs Classic Bluetooth off after something that cannot work for them.
              */
             const route = support.webBluetooth
                 ? 'A sensor that also supports BLE can be reached that way instead.'
                 : 'A sensor that also supports BLE can be reached with Bluefy or WebBLE (App Store), which bundle their own BLE stack.';
             return need === 'classicBluetooth'
-                ? `Classic Bluetooth cannot be reached from iOS at all: iOS gives apps no classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP requires MFi licensing). ${route} A classic-Bluetooth-only sensor cannot be used from iOS.`
+                ? `Classic Bluetooth cannot be reached from iOS at all: iOS gives apps no Classic-Bluetooth serial access (Core Bluetooth is BLE-only, and SPP requires MFi licensing). ${route} A Classic-Bluetooth-only sensor cannot be used from iOS.`
                 : `Web Serial is not available on iOS — WebKit does not implement it, so a wired dock cannot be opened. ${route}`;
         }
         return need === 'classicBluetooth'
-            ? 'Web Serial is not available in this browser, so classic Bluetooth cannot be used. Use Chrome or Edge on desktop, or Chrome 138+ on Android, over HTTPS or on localhost.'
+            ? 'Web Serial is not available in this browser, so Classic Bluetooth cannot be used. Use Chrome or Edge on desktop, or Chrome 138+ on Android, over HTTPS or on localhost.'
             : 'Web Serial is not available in this browser, so the USB/dock connection cannot be used. Use Chrome or Edge on desktop, over HTTPS or on localhost.';
     }
     if (availability === 'unlikely') {
         /*
          * Only reachable for a wired port on Android — see serialBluetoothOnly.
          *
-         * The classic-Bluetooth alternative is conditional, not prescribed. This
+         * The Classic-Bluetooth alternative is conditional, not prescribed. This
          * advice is device-agnostic (TransportNeed says nothing about the sensor),
          * and a Verisense reaches the host over wired USB serial or BLE and has no
          * RFCOMM at all — so telling every Android caller to "pair over classic
          * Bluetooth instead" sends wired-only users after a connection that cannot
          * exist. Same failure as promising BLE on iOS above.
          */
-        return 'Android Chrome exposes Web Serial for paired Bluetooth devices only, so a wired USB/dock connection will most likely find nothing (wired serial support is still rolling out). A sensor that supports classic Bluetooth can be paired and reached that way instead.';
+        return 'Android Chrome exposes Web Serial for paired Bluetooth devices only, so a wired USB/dock connection will most likely find nothing (wired serial support is still rolling out). A sensor that supports Classic Bluetooth can be paired and reached that way instead.';
     }
     /*
      * Classic Bluetooth works here, but on Android the picker is empty until the
@@ -351,7 +351,7 @@ function transportAdvice(support, need) {
          * have taken an LE bond — for it, "paired but missing" has some other cause,
          * and the BLE-off dance is a dead end.
          */
-        return 'Pair the sensor in Android Settings → Bluetooth first — Android Chrome exposes Web Serial for paired Bluetooth devices only. If a sensor that also has a BLE radio is already paired and still missing, Android has most likely bonded it over BLE rather than classic Bluetooth, which leaves no classic service record for the picker to find. To fix it: disable the sensor’s BLE radio, unpair it on the phone, pair again from Bluetooth settings, then re-enable BLE — the classic bond survives, so this is once per phone.';
+        return 'Pair the sensor in Android Settings → Bluetooth first — Android Chrome exposes Web Serial for paired Bluetooth devices only. If a sensor that also has a BLE radio is already paired and still missing, Android has most likely bonded it over BLE rather than Classic Bluetooth, which leaves no classic service record for the picker to find. To fix it: disable the sensor’s BLE radio, unpair it on the phone, pair again from Bluetooth settings, then re-enable BLE — the classic bond survives, so this is once per phone.';
     }
     return null;
 }
@@ -651,7 +651,7 @@ class WebSerialTransport {
     /**
      * `port.open()`, bounded by {@link WebSerialTransportOptions.openTimeoutMs}.
      *
-     * Opening a classic-Bluetooth COM port is what brings the RFCOMM link up, so
+     * Opening a Classic-Bluetooth COM port is what brings the RFCOMM link up, so
      * an asleep or out-of-range sensor blocks here rather than failing fast. If
      * the timeout wins we still close the port should the open land later —
      * otherwise the OS keeps an orphaned handle and the next attempt fails with
@@ -1426,6 +1426,68 @@ class StreamStatsTracker {
             lossPct: totalExpected > 0 ? (totalLost / totalExpected) * 100 : 0,
             perSensor,
         };
+    }
+}
+
+/**
+ * A set of listeners: one that throws neither stops the others nor reaches the
+ * emitter — as long as the `onError` reporter does not itself throw, which is
+ * the single way an exception can still escape {@link HandlerSet.emit}. See the
+ * constructor.
+ *
+ * Every client keeps one of these for its "temp" handlers — the short-lived
+ * callbacks a request registers to catch its own reply — and all four had
+ * grown an identical copy of it, differing only in what they hand the
+ * listeners (`Uint8Array`, `string`, `UartRxPacket`).
+ *
+ * Swallowing handler exceptions is not incidental tidiness, which is the
+ * reason this is worth naming once rather than repeating. `drainByteStream`'s
+ * `onMessage` hook documents that it **must not throw**: an exception there
+ * escapes the drain, so the caller never receives the remaining tail, never
+ * advances its accumulator, and re-delivers every message in that read on the
+ * next one. What makes that safe is that all in-tree callers dispatch through
+ * this emitter. Four hand-rolled copies could drift apart silently; one can be
+ * tested, and is.
+ */
+class HandlerSet {
+    /**
+     * @param onError Called with whatever a listener threw. Intended for a log
+     *   line — it is invoked inside the emit loop, so if it throws, the
+     *   remaining listeners are skipped and the exception escapes after all.
+     */
+    constructor(onError) {
+        this.onError = onError;
+        this._fns = new Set();
+    }
+    /** Number of registered listeners. */
+    get size() {
+        return this._fns.size;
+    }
+    /** Register `fn`. Adding the same function twice registers it once. */
+    add(fn) {
+        this._fns.add(fn);
+    }
+    /** Unregister `fn`. Safe to call for a function that was never added. */
+    delete(fn) {
+        this._fns.delete(fn);
+    }
+    /** Drop every listener. */
+    clear() {
+        this._fns.clear();
+    }
+    /**
+     * Hand `value` to every listener in registration order, reporting anything
+     * thrown to `onError` and carrying on with the rest.
+     */
+    emit(value) {
+        this._fns.forEach((fn) => {
+            try {
+                fn(value);
+            }
+            catch (e) {
+                this.onError(e);
+            }
+        });
     }
 }
 
@@ -3438,7 +3500,7 @@ function channelIdToSensorBit(id) {
  * Building the streaming packet schema from an inquiry response's channel list.
  *
  * Shared by both families: `Shimmer3RClient` (framed BLE) and
- * `buildShimmer3Schema` (unframed classic Bluetooth) put the same channel-ID
+ * `buildShimmer3Schema` (unframed Classic Bluetooth) put the same channel-ID
  * bytes through the same table, and any difference in how they treat a channel
  * they do not recognise would be a difference in how quietly they corrupt data.
  * So the logic lives here once.
@@ -4426,6 +4488,19 @@ const FACTORY_TEST_DRAIN_IDLE_MS = 10000;
 /** Sentinels from the report envelope (`Test/shimmer_test.c:22-61`). */
 const TEST_START_SENTINEL = 'TEST START';
 const TEST_END_SENTINEL = 'TEST END';
+/**
+ * Cap on the in-progress line, in characters.
+ *
+ * `_line` exists only to spot a sentinel, and it is emptied at every newline —
+ * so on any report it stays around the firmware's own 128-character write, or
+ * twice that where a truncated write glued two lines together. A device that
+ * sent no newline at all would otherwise grow it without limit, and the drain
+ * is exactly the state a misbehaving device is left in. Four times the
+ * firmware's buffer is far past any real line and still bounded; the head is
+ * what gets dropped, because a sentinel sits at the END of the line that
+ * carries it.
+ */
+const MAX_LINE_CHARS = 512;
 /** Bytes the report grammar allows: TAB, LF, CR and printable ASCII. */
 function isReportByte(b) {
     return b === 0x09 || b === 0x0a || b === 0x0d || (b >= 0x20 && b <= 0x7e);
@@ -4666,6 +4741,9 @@ class FactoryTestCapture {
             if (accumulate)
                 text += ch;
             this._line += ch;
+            if (this._line.length > MAX_LINE_CHARS) {
+                this._line = this._line.slice(-MAX_LINE_CHARS);
+            }
             if (b !== 0x0a)
                 continue;
             const line = this._line.replace(/\r?\n$/, '');
@@ -4944,7 +5022,7 @@ function classifyLiteProtocolAck(buf) {
 }
 
 /**
- * Pure protocol helpers for the classic Bluetooth (RFCOMM/SPP) Shimmer3.
+ * Pure protocol helpers for the Classic Bluetooth (RFCOMM/SPP) Shimmer3.
  *
  * Classic Shimmer3 speaks the same LiteProtocol command set as the Shimmer3R
  * (see `../shimmer3r/constants.ts`), but over an **unframed RFCOMM byte stream**
@@ -5002,7 +5080,7 @@ const SHIMMER3_SAMPLING_CLOCK_FREQ = 32768;
  * Build a stream schema from the channel-ID list reported by the inquiry.
  *
  * Mirrors ShimmerObject#interpretDataPacketFormat. The generation is fixed at
- * `'shimmer3'`: this file is the classic-Bluetooth Shimmer3 path, so unlike
+ * `'shimmer3'`: this file is the Classic-Bluetooth Shimmer3 path, so unlike
  * `Shimmer3RClient` — which the same firmware answers on both platforms — there
  * is nothing to determine and nothing to assume. That matters for the BMP
  * channels, which are 2-byte big-endian temperature + 3-byte big-endian
@@ -7067,11 +7145,11 @@ function u16be(bytes, msbIdx, lsbIdx) {
  */
 function parseSd(bytes, layout) {
     if (!layout.supportsSdLogSync) {
-        return { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 };
+        return { btInterval: 0, estimatedExpLengthSec: 0, maxExpLengthMin: 0 };
     }
     return {
         btInterval: bytes[layout.idxSDBTInterval] & 0xff,
-        estimatedExpLengthMin: u16be(bytes, layout.idxEstimatedExpLengthMsb, layout.idxEstimatedExpLengthLsb),
+        estimatedExpLengthSec: u16be(bytes, layout.idxEstimatedExpLengthMsb, layout.idxEstimatedExpLengthLsb),
         maxExpLengthMin: u16be(bytes, layout.idxMaxExpLengthMsb, layout.idxMaxExpLengthLsb),
     };
 }
@@ -7191,7 +7269,7 @@ function emptyConfig(raw) {
             altMagRate: 0,
             altAccelRate: 0,
         },
-        sd: { btInterval: 0, estimatedExpLengthMin: 0, maxExpLengthMin: 0 },
+        sd: { btInterval: 0, estimatedExpLengthSec: 0, maxExpLengthMin: 0 },
         calibration: {
             lnAccel: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
             gyro: new Uint8Array(GENERAL_CALIBRATION_LENGTH),
@@ -7439,8 +7517,8 @@ function writeSd(out, config, layout) {
         return;
     const sd = config.sd;
     out[layout.idxSDBTInterval] = sd.btInterval & 0xff;
-    out[layout.idxEstimatedExpLengthMsb] = (sd.estimatedExpLengthMin >> 8) & 0xff;
-    out[layout.idxEstimatedExpLengthLsb] = sd.estimatedExpLengthMin & 0xff;
+    out[layout.idxEstimatedExpLengthMsb] = (sd.estimatedExpLengthSec >> 8) & 0xff;
+    out[layout.idxEstimatedExpLengthLsb] = sd.estimatedExpLengthSec & 0xff;
     out[layout.idxMaxExpLengthMsb] = (sd.maxExpLengthMin >> 8) & 0xff;
     out[layout.idxMaxExpLengthLsb] = sd.maxExpLengthMin & 0xff;
 }
@@ -8628,20 +8706,20 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     },
     {
         key: 'estimatedExpLength',
-        label: 'Estimated Experiment Length',
-        desc: 'Big-endian u16 at idxEstimatedExpLengthMsb/Lsb (ShimmerObject.java:5316-5317; FW experimentLengthEstimatedInSec*).',
+        label: 'Estimated Experiment Length (seconds)',
+        desc: 'Big-endian u16 at idxEstimatedExpLengthMsb/Lsb. SECONDS, per the firmware struct field experimentLengthEstimatedInSec* (shimmer_config.h:403-404) — note the sibling field below is in minutes. ShimmerObject.java:5316-5317.',
         kind: 'u16be',
         layoutKey: 'idxEstimatedExpLengthMsb',
         min: 0,
         max: 0xffff,
         group: 'sdLogging',
         appliesTo: ALL,
-        configKey: 'sd.estimatedExpLengthMin',
+        configKey: 'sd.estimatedExpLengthSec',
     },
     {
         key: 'maxExpLength',
-        label: 'Maximum Experiment Length (auto-stop)',
-        desc: 'Big-endian u16 at idxMaxExpLengthMsb/Lsb (ShimmerObject.java:5318-5319; FW experimentLengthMaxInMinutes*).',
+        label: 'Maximum Experiment Length, auto-stop (minutes)',
+        desc: 'Big-endian u16 at idxMaxExpLengthMsb/Lsb. MINUTES, per the firmware struct field experimentLengthMaxInMinutes* (shimmer_config.h:405-406) — the field above is in seconds. ShimmerObject.java:5318-5319.',
         kind: 'u16be',
         layoutKey: 'idxMaxExpLengthMsb',
         min: 0,
@@ -9184,7 +9262,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._disconnectUnsub = null;
         // Protocol state
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         this.schema = null;
         this._lastAckRemainder = null;
         this._expectingAck = 0;
@@ -9288,7 +9366,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         /**
          * Transport entry point. A framed transport (BLE) delivers one firmware
          * message per call and goes straight to {@link _handleFramedChunk}; an
-         * unframed one (Web Serial over USB or over a classic-Bluetooth COM port)
+         * unframed one (Web Serial over USB or over a Classic-Bluetooth COM port)
          * is re-framed first, then funnelled through the very same handler.
          *
          * A running factory test is served FIRST, before either path. Its report is
@@ -9514,13 +9592,13 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         /*
          * Status text follows the transport rather than assuming BLE. These four
-         * messages used to be emitted unconditionally, so a classic-Bluetooth session
+         * messages used to be emitted unconditionally, so a Classic-Bluetooth session
          * reported "GATT connected", "RX/TX obtained" and "Notifications started" -
          * none of which exist on an RFCOMM link, which has no GATT server, no
          * characteristics and no notifications.
          *
          * That is not cosmetic. Debugging a Shimmer3R that would not appear in
-         * Android's classic-Bluetooth picker, this log read as proof the button had
+         * Android's Classic-Bluetooth picker, this log read as proof the button had
          * silently fallen back to BLE; only port.getInfo() reporting an SPP service
          * class showed the link was in fact correct and the words were wrong. A log
          * that misreports the mechanism costs more than one with less detail.
@@ -10115,7 +10193,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      *
      * `opts.chunkBytes` defaults to **64 over a framed (BLE) transport and 128
      * over an unframed one**. 128 is the firmware's ceiling and the page size the
-     * dock path uses, and it is what a byte stream — classic Bluetooth over
+     * dock path uses, and it is what a byte stream — Classic Bluetooth over
      * RFCOMM, or the dock UART — carries happily. Over BLE the proven size is 64:
      * that is what the brand-record write survives on real hardware, where a
      * 128-byte command has to cross four notifications into a firmware receive
@@ -10292,7 +10370,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      * The guard is **only** as good as `_streaming`, which tracks the streams
      * this client started. The firmware blocks configuration writes for anything
      * it considers sensing, SD logging included, and this client holds no local
-     * SD-logging flag — `readStatus()` is the only way to learn about a log
+     * SD-logging flag — {@link getStatus} is the only way to learn about a log
      * started before it connected or by another host. So a write can still be
      * refused by the device after passing this check; that refusal arrives as a
      * NACK and is reported as one. The message says as much rather than implying
@@ -11258,14 +11336,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(buf) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(buf);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(buf);
     }
     /**
      * Read (and cache) the hardware version via GET_DEVICE_VERSION_COMMAND
@@ -11273,7 +11344,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      *
      * Worth asking even though this client is named for the Shimmer3R: the two
      * platforms share this firmware and this command set, so a Shimmer3 reached
-     * over classic Bluetooth answers here too — and answers some commands with
+     * over Classic Bluetooth answers here too — and answers some commands with
      * fewer bytes than a Shimmer3R does (see {@link getStatus}). Cached, so the
      * gating call sites can ask freely.
      */
@@ -11424,7 +11495,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      * `durationMs`. This measures the pipe itself (BLE connection interval and
      * MTU, or RFCOMM/serial buffering) independent of the SD/file-transfer
      * protocol, so it gives an upper bound for transfer rates on a given
-     * host/adapter/OS — and a direct BLE-vs-classic-Bluetooth comparison.
+     * host/adapter/OS — and a direct BLE-vs-Classic-Bluetooth comparison.
      * The device must be idle (the firmware NACKs the test while sensing).
      */
     async runDataRateTest(durationMs = 5000, onProgress) {
@@ -13575,8 +13646,29 @@ function parseSdTrialFolderName(folder) {
  * down in windows with resume-from-on-disk-size semantics — the same shape as
  * the field-proven Verisense `transferLoggedData` flow.
  */
-/** Device-name folder used when a session folder is not `<Name>-<NNN>`. */
+/**
+ * Device folder used when no MAC id is available and the session folder is not
+ * `<Name>-<NNN>` either.
+ */
 const CONSENSYS_UNKNOWN_DEVICE = 'Unknown_Shimmer';
+/**
+ * Normalise a MAC id to the form Consensys names its device folders with:
+ * twelve LOWERCASE hex digits, no separators (`e8eb1b9767a0`).
+ *
+ * Lowercase because that is what Consensys writes, and what
+ * {@link import('../../sdlog/header.js').parseSdLogHeader} reports for the same
+ * six bytes inside the file - the two have to agree for an import to match a
+ * folder to the sessions in it. Windows is case-insensitive about paths, so
+ * this is cosmetic there and load-bearing on macOS and Linux.
+ *
+ * Returns null for anything that is not six bytes of hex, so a caller can tell
+ * "no MAC" from "a MAC I could not use" and fall back deliberately rather than
+ * creating a folder named after a truncated or unprovisioned address.
+ */
+function consensysMacFolderName(macId) {
+    const hex = String(macId ?? '').replace(/[^0-9a-fA-F]/g, '');
+    return hex.length === 12 ? hex.toLowerCase() : null;
+}
 /**
  * Format an import-time folder name as Consensys does: `yyyy-MM-dd_HH.mm.ss`
  * in local time (e.g. `2025-06-25_15.30.36`).
@@ -13589,12 +13681,34 @@ function formatSdImportStamp(date = new Date()) {
 /**
  * Map a card directory chain to its Consensys Backup destination.
  *
- * The device name is taken from the session folder (`<ShimmerName>-<NNN>`)
- * rather than from the connected device, so sessions recorded under a previous
- * device name - or on a card that has been moved between devices - still file
- * under the name they were recorded with, which is what Consensys shows.
+ * The level between the import stamp and the card tree is the device's **MAC
+ * id**, twelve lowercase hex digits:
+ *
+ *     <import-stamp>/e8eb1b9767a0/data/<TrialName>_<ConfigTime>/<ShimmerName>-<NNN>
+ *
+ * It is the MAC and not the Shimmer name because that is what Consensys itself
+ * writes and what its importer looks for - a name folder produces a tree the
+ * import walks straight past. The MAC is also the identifier that cannot drift:
+ * a device renamed between two trials keeps one folder, where the name would
+ * have split its sessions in two.
+ *
+ * `macId` is the CONNECTED device's MAC, so it is right whenever the card is
+ * being read out of the device that wrote it - which is the only way this
+ * transfer path can be reached at all. A card physically moved from another
+ * device would be filed under the reading device's MAC; the alternative,
+ * reading each session's first file header for the MAC stored in it, costs a
+ * round trip per session to cover a case Bluetooth download cannot produce.
+ *
+ * With no usable MAC (`null`, or anything that is not six bytes of hex) it
+ * falls back to the Shimmer name taken from the session folder, and then to
+ * {@link CONSENSYS_UNKNOWN_DEVICE}. That tree is NOT importable by Consensys -
+ * the fallback exists so a download still lands somewhere sensible and
+ * separates two devices' sessions, not because it is equivalent.
  */
-function consensysBackupSegments(cardDirSegments, importStamp) {
+function consensysBackupSegments(cardDirSegments, importStamp, macId) {
+    const mac = consensysMacFolderName(macId);
+    if (mac)
+        return [importStamp, mac, ...cardDirSegments];
     let shimmerName = CONSENSYS_UNKNOWN_DEVICE;
     const sessionDir = cardDirSegments[cardDirSegments.length - 1];
     if (sessionDir) {
@@ -13652,6 +13766,7 @@ async function downloadSdTree(client, destRoot, opts = {}) {
     const maxRetriesPerFile = opts.maxRetriesPerFile ?? 3;
     const layout = opts.layout ?? 'card';
     const importStamp = opts.importStamp ?? formatSdImportStamp();
+    const macId = opts.macId ?? null;
     const summary = {
         importStamp: layout === 'consensysBackup' ? importStamp : undefined,
         filesDownloaded: 0,
@@ -13686,7 +13801,9 @@ async function downloadSdTree(client, destRoot, opts = {}) {
         const segments = file.path.split('/');
         const name = segments.pop();
         try {
-            const destSegments = layout === 'consensysBackup' ? consensysBackupSegments(segments, importStamp) : segments;
+            const destSegments = layout === 'consensysBackup'
+                ? consensysBackupSegments(segments, importStamp, macId)
+                : segments;
             const dir = await ensureDirectoryPath(destRoot, destSegments);
             const handle = await dir.getFileHandle(name, { create: true });
             const existingSize = (await handle.getFile()).size;
@@ -13847,7 +13964,7 @@ async function deleteDownloadedFromCard(client, filePaths, dirPaths = [], opts =
 // Re-export the shared LiteProtocol surface so Shimmer3 consumers import from one
 // module (these are identical across the two device families).
 /**
- * The `WebSerialTransport` options that reach a Shimmer over classic Bluetooth.
+ * The `WebSerialTransport` options that reach a Shimmer over Classic Bluetooth.
  *
  * Both Bluetooth fields are required and they do different jobs, which is the
  * whole reason this is a constant rather than something each caller assembles:
@@ -13905,7 +14022,7 @@ const SHIMMER3_DEFAULTS = Object.freeze({
 // Shimmer3Client
 // ---------------------------------------------------------------------------
 /**
- * Client for the **classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
+ * Client for the **Classic-Bluetooth (RFCOMM/SPP) Shimmer3**.
  *
  * Shimmer3 speaks the same LiteProtocol as the Shimmer3R (shared opcodes, sensor
  * bitmap, channel formats — all reused from `../shimmer3r/`), with two
@@ -13944,7 +14061,7 @@ class Shimmer3Client extends BaseShimmerClient {
         this._disconnectUnsub = null;
         // Protocol state
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         this.schema = null;
         this._streaming = false;
         this._streamStarting = false;
@@ -14041,7 +14158,7 @@ class Shimmer3Client extends BaseShimmerClient {
      * A transport is REQUIRED (constructor option or this parameter): Web
      * Bluetooth cannot open an RFCOMM socket, so there is no default. In a browser
      * the working transport is a {@link WebSerialTransport} over the virtual COM
-     * port the OS creates for a Shimmer paired over classic Bluetooth. Calling
+     * port the OS creates for a Shimmer paired over Classic Bluetooth. Calling
      * without one throws.
      *
      * Handshake (ported from ShimmerBluetooth#initialize → readShimmerVersionNew →
@@ -14056,7 +14173,7 @@ class Shimmer3Client extends BaseShimmerClient {
         const t = transport ?? this._injectedTransport;
         if (!t) {
             throw new Error('Shimmer3Client requires an injected transport: Web Bluetooth cannot open an ' +
-                'RFCOMM/SPP socket. In a browser, pair the sensor over classic Bluetooth and ' +
+                'RFCOMM/SPP socket. In a browser, pair the sensor over Classic Bluetooth and ' +
                 'pass a WebSerialTransport over the COM port the OS creates for it ' +
                 '(allowedBluetoothServiceClassIds: [SHIMMER3_SPP_UUID]); elsewhere pass any ' +
                 'ShimmerTransport via the constructor ({ transport }) or connect(transport).');
@@ -15003,14 +15120,7 @@ class Shimmer3Client extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(buf) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(buf);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(buf);
     }
 }
 
@@ -15058,7 +15168,7 @@ class WiredShimmerClient extends BaseShimmerClient {
         this._notifyUnsub = null;
         this._disconnectUnsub = null;
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         /**
          * Serialization queue. Every public command method chains onto this so that
          * only one request/response exchange is in flight at a time — the docked
@@ -15810,14 +15920,7 @@ class WiredShimmerClient extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(pkt) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(pkt);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(pkt);
     }
 }
 
@@ -16144,7 +16247,7 @@ class SmartDockClient extends BaseShimmerClient {
         this._notifyUnsub = null;
         this._disconnectUnsub = null;
         this._rxBuf = new Uint8Array(0);
-        this._temps = new Set();
+        this._temps = new HandlerSet((e) => this._log('temp handler error', e));
         /**
          * Serialization queue: all public operations chain onto this so slot
          * select + per-slot reads run as atomic, non-interleaved units. Concurrent
@@ -16492,14 +16595,7 @@ class SmartDockClient extends BaseShimmerClient {
         this._temps.delete(fn);
     }
     _emitTemp(line) {
-        this._temps.forEach((fn) => {
-            try {
-                fn(line);
-            }
-            catch (e) {
-                this._log('temp handler error', e);
-            }
-        });
+        this._temps.emit(line);
     }
 }
 
@@ -21923,8 +22019,14 @@ class VerisenseBleDevice extends BaseShimmerClient {
     /** Subscribe to a transport's notify/disconnect streams. */
     _wireTransport(transport) {
         this._transport = transport;
+        /* Arm the base class's `onDisconnect` for this connection as well as this
+           client's own `disconnected` event. Both exist for a reason: the event is
+           what every Verisense consumer here listens to, while `onDisconnect` is
+           part of the shared client contract, and a caller written against that
+           contract was previously handed a callback that could never fire. */
+        this._armDisconnectNotification();
         this._notifyUnsub = transport.onNotify((bytes) => this._feedStreamBytes(bytes));
-        this._disconnectUnsub = transport.onDisconnect(() => this._handleTransportDisconnect());
+        this._disconnectUnsub = transport.onDisconnect((reason) => this._handleTransportDisconnect(reason));
     }
     /** Drop the current transport's notify/disconnect subscriptions. */
     _unwireTransport() {
@@ -21944,13 +22046,20 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._disconnectUnsub = null;
     }
     /** Handle an unexpected / requested transport disconnect (link drop). */
-    _handleTransportDisconnect() {
+    _handleTransportDisconnect(reason) {
         const kind = this._transportKind === 'serial' ? 'serial' : 'ble';
         this._mode = 'idle';
         this._transportKind = null;
-        if (this._suppressDisconnectedEvent)
+        if (this._suppressDisconnectedEvent) {
+            // Application-initiated teardown is not a fault for either channel.
+            this._suppressDisconnectNotification();
             return;
+        }
         this.emit('disconnected', { kind });
+        /* The transport's own error, not a synthesised one: it is the only thing
+           that says WHY the link went, and the other clients forward it. The
+           `disconnected` event keeps its existing shape. */
+        this._emitDisconnect(reason);
     }
     /**
      * Mirror the active WebBluetoothTransport's GATT handles onto the legacy
@@ -26544,6 +26653,7 @@ exports.compareInfoMemExcluding = compareInfoMemExcluding;
 exports.compareVerisenseFirmwareVersion = compareVerisenseFirmwareVersion;
 exports.computeVerisensePairingPin = computeVerisensePairingPin;
 exports.consensysBackupSegments = consensysBackupSegments;
+exports.consensysMacFolderName = consensysMacFolderName;
 exports.crc16_ccitt_false = crc16_ccitt_false;
 exports.crc32 = crc32;
 exports.createBlankVerisenseOperationalConfig = createBlankVerisenseOperationalConfig;

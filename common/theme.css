@@ -1199,6 +1199,65 @@ input.cal-cell.bad:focus-visible {
 }
 
 /* =========================================================================
+   Kinematic block editor inside the configuration form
+   (common/kinematic-block-editor.js)
+
+   The same three grids as the cards above, rendered as one field's control
+   instead of as a card of its own — so the Configure tab's Calibration
+   section reads like the Calibration tab rather than like forty-two hex
+   characters. Everything visual is reused from the block above; only the
+   wrapper and the "these are defaults, not measurements" treatment are new.
+   ========================================================================= */
+
+.cal-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.cal-inline-head {
+  align-items: center;
+  gap: 8px;
+}
+
+/* Three grids side by side need about 520px. The field grid's columns are
+   300px minimum, so a calibration field takes the whole row rather than
+   wrapping its matrices into a column one box wide. */
+.field:has(.cal-inline) {
+  grid-column: 1 / -1;
+}
+
+/* Boxes holding the factory defaults the firmware would fall back to, not
+   values read off the device. Greyed for the same reason the cards grey
+   them: they are what the sensor WOULD use, and mistaking them for a stored
+   calibration is the one misreading that matters here. */
+input.cal-cell.faint {
+  color: var(--faint);
+  font-style: italic;
+}
+
+/* The destination preview when the download is about to produce a tree
+   Consensys cannot import — the MAC could not be read, so the device folder
+   will be named after the Shimmer instead. A colour rather than a `.banner`,
+   because the element is a `.row` and has to keep its spacing: this is the one
+   line that gets to say so before the transfer starts. */
+.preview-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* A custom editor supplies its own labels for its own boxes, so the field
+   name above it is a heading rather than a <label for>. Matched to the
+   weight and colour a real field label has, so a mixed grid of default
+   controls and editors does not look like two forms. */
+.field-editor-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* =========================================================================
    Narrow screens: one column everywhere.
    ========================================================================= */
 

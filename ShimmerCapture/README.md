@@ -48,6 +48,39 @@ port rather than the device. A Shimmer3R pairs as two separate entries — one
 classic, one BLE — and only the classic one answers on this path; the page says
 so if you pick the wrong one.
 
+## General
+
+The first tab, as in the Verisense device console, and for the same reason: the
+one-shot commands somebody reaches for straight after connecting come before
+the tabs that are a task in themselves.
+
+The **clock** is here rather than with the configuration because it is a device
+command and not a stored setting — the real-world clock is not part of the
+configuration image. Set it from this host, or read it back on its own; reading
+it alone is deliberately not the Device panel's **Refresh**, which also reads
+the battery and the status bytes, because three round trips to answer one
+question is three chances for one of the others to put an error on screen about
+something nobody asked about.
+
+The **LEDs** are here rather than on the Test tab because nothing about them is
+a test. They drive the firmware's red-LED override, which holds the lower LED
+solid red on top of the sensor's own indications: a "which sensor is this one"
+aid, not a health check. The firmware never clears the flag, so it stays lit
+across a disconnect until it is toggled again or the sensor is power-cycled,
+and the pill shows what the sensor's own status byte says rather than what this
+page last asked for. Bluetooth only — the dock protocol has no LED command. The
+sequence that exercises every LED _colour_ is part of the factory self-test,
+which is on **Test**.
+
+**Device commands** is the general place for the rest. **Re-inquire channel
+list** asks the firmware what it is set to send and at what rate — the page
+does this on connect and after an Apply, so this is for the case where
+something else reconfigured the sensor meanwhile. **Reboot on next disconnect**
+arms the firmware's one-shot soft reboot: it cannot reboot while the link is
+up, and it skips the reboot entirely while the sensor is recording so that it
+can never truncate a trial. Reach for it after writing advertising names, which
+the Bluetooth module only re-reads at boot.
+
 ## Configuring
 
 The configuration editor is generated from the SDK's description of the
@@ -58,6 +91,22 @@ pressure sensor's oversampling, the Bluetooth baud rate, the SD-logging
 start-up and duration settings, the trial and experiment identifiers, the
 multi-sensor sync settings and the stored calibration blocks. Every control
 carries the byte and bit it lives in, on hover.
+
+The **Calibration** group in that form is the six 21-byte kinematic blocks the
+image holds, and they are laid out the way the Calibration tab lays out the
+dump: an offset vector, a sensitivity vector and a 3x3 alignment matrix, each
+labelled with its unit, and a chip naming the range the image is configured for
+— which is what makes the numbers mean anything, since the image holds one
+block per sensor rather than one per range. Forty-two hex characters in a text
+box was what the bytes are and unreadable with it.
+
+They are editable here, and read-only on the Calibration tab when that tab
+falls back to showing the image: the configuration image belongs to this form,
+and two panels writing one image would silently drop whichever change lost. A
+value the 21-byte format cannot hold is refused with the box named, never
+clamped, and a block holding no calibration at all — every byte 0x00 or 0xFF —
+shows the factory defaults the firmware would fall back to, greyed, so nobody
+reads them as measurements.
 
 Two things the page owns rather than the schema:
 
@@ -104,18 +153,27 @@ says so in the log when it sees them.
 **Measure link speed** is next to the connect buttons, because it measures the
 link and not the card: it free-runs the firmware's data-rate test, which
 reports the pipe itself — connection interval and MTU on BLE, buffering on
-classic Bluetooth — rather than the file-transfer protocol on top of it. It is
+Classic Bluetooth — rather than the file-transfer protocol on top of it. It is
 Bluetooth-only (the dock command set has no data-rate test) and refused while
 the sensor is sensing or a transfer is running, because it saturates the link
 on purpose. The figure it produces also drives the download ETAs on the SD tab.
 
 ## The clock
 
-The sensor keeps its clock in **UTC**, which is what desktop Consensys and the
-dock software write, so setting it from this host writes a plain epoch and both
-the sensor's clock and the host's are shown in this host's local time — they
-should read the same. Over USB the clock can be set but not read back, because
-the dock protocol has a write for it and no read.
+On the **General** tab. The sensor keeps its clock in **UTC**, which is what
+desktop Consensys and the dock software write, so setting it from this host
+writes a plain epoch and both the sensor's clock and the host's are shown in
+this host's local time — they should read the same.
+
+It reads and writes over **every** link, USB-C included. There is no dock
+equivalent of the Bluetooth GET_RWC command, but the dock protocol has a
+read-only `CURR_LOCAL_TIME` property that answers with the same eight bytes in
+the same unit, so the two paths are interchangeable — `common/device-clock.js`
+picks whichever the current link has. (An earlier version of this page said
+the clock could be set but not read back over USB. That was true of the page,
+not of the link: it tested for the Bluetooth method and gave up, while the
+capability it gated the button on already counted the dock property. So the
+button was enabled and always refused.)
 
 (An earlier version of this page wrote and displayed the clock as local civil
 time, a convention belonging to the Verisense console. It made a sensor set by
@@ -149,6 +207,21 @@ at all. The last is not zero — an unwritten block reads back as all ones or al
 zeros, and showing that as a calibration of zero would be a lie about a sensor
 that has never been calibrated. A per-sensor restore puts the factory seed back
 for the selected range.
+
+The calibration is read **as part of the connect handshake**, along with the
+configuration image, so the tab is populated before anybody opens it — a page
+that showed a sensor's settings without showing what it is calibrated to had
+told half the story, and the tab otherwise sat empty until somebody thought to
+press Read. It goes last in the handshake, because it needs the generation and
+the configured ranges the earlier reads establish, and it is tolerated rather
+than required: an older firmware NACKs the command, and a tab that could not
+be filled is not a connection that failed.
+
+Every card carries its date line whenever anything has been read, saying "no
+date" where there is none. A line that appeared on three sensors and not on the
+others read as those three being the only ones with a calibration date, when
+what it meant was that the rest have no calibration at all — a different fact,
+and one the pill beside each title already makes.
 
 Reads, writes and the raw dump's save and load all work over a Bluetooth link.
 The dock protocol has no calibration-dump command, so the controls are greyed
@@ -188,6 +261,13 @@ Expanded it keeps the full page width, and whether it is open is remembered per
 browser. The page reserves the space it occupies in either state, so it never
 covers what is underneath it.
 
+**Copy** puts the whole log on the clipboard — every line, not just the ones
+the filter is showing, which is the same text **Download** saves. It reports
+what happened either way: the clipboard API is refused outside a secure context
+and on an unfocused document, and a log is exactly what somebody wants to copy
+when something has gone wrong, so a copy that silently did nothing would be the
+worst possible failure.
+
 **Log raw TX/RX bytes** adds the bytes themselves, in both directions, on any
 of the three links — the diagnostic to reach for when a sensor answers
 something unexpected, or answers nothing. It is off until asked, and it leaves
@@ -204,10 +284,19 @@ space come from the card itself; pick whole sessions or individual files.
 
 Files can be written either as the card lays them out or into the folder
 structure Consensys imports, which is the default — the layout matters, because
-Consensys will not find a session filed the other way. The destination folder is
-remembered between visits, so a long download does not start with a file dialog
-every time. A browser can never preselect an absolute path, so the first
-download of a session asks once.
+Consensys will not find a session filed the other way. That structure is
+
+    <destination>/<import date and time>/<MAC id>/data/<trial>/<session>/<file>
+
+and the second level is the sensor's **MAC address**, twelve lowercase hex
+digits, not its name: a name folder produces a tree the Consensys importer
+walks straight past, so the download looks complete and cannot be imported.
+The panel shows the path it is about to write before it writes anything, with
+the real MAC in it, and says so plainly if the address could not be read.
+
+The destination folder is remembered between visits, so a long download does
+not start with a file dialog every time. A browser can never preselect an
+absolute path, so the first download of a session asks once.
 
 A transfer shows its throughput and an estimate of the time left, and can be
 aborted. Aborting keeps what has already been written and the folder it went
@@ -224,10 +313,10 @@ refuses to start rather than hand back a file that looks fine and is not.
 ## Device names
 
 Reads and writes the record in the sensor's EEPROM that decides the names it
-advertises over classic Bluetooth and BLE, and presents over USB, so a sensor
+advertises over Classic Bluetooth and BLE, and presents over USB, so a sensor
 can carry a customer's branding instead of the Shimmer defaults.
 
-Type one classic-Bluetooth name and the BLE and USB product names follow it
+Type one Classic-Bluetooth name and the BLE and USB product names follow it
 unless you set them yourself; the USB manufacturer string is used verbatim by
 the descriptor and is never derived. The name lengths a sensor can carry differ
 by hardware and by field, and the editor holds you to them rather than letting
@@ -246,7 +335,8 @@ the same way whether the sensor is on a radio or in a dock.
 
 ## Test
 
-Three things the sensor can be asked about itself.
+Two things the sensor can be asked about itself. (The red LED used to be a
+third; it is on **General** now, because nothing about it is a test.)
 
 **The factory self-test** is the same suite the firmware runs on the
 production line, and it prints the same report: pick one of its four suites
@@ -289,14 +379,6 @@ and a unit reworked to 22 pF crystal load capacitors about −98 ppm. Docked
 sensors read a few ppm low from charge self-heating, so a battery run at room
 temperature gives the comparable figure.
 
-**The LED buttons** drive the firmware's red-LED override, which holds the
-lower LED solid red on top of the sensor's own indications. It is a "which
-sensor is this one" aid rather than a health check. The firmware never clears
-the flag, so it stays lit across a disconnect until it is toggled again or the
-sensor is power-cycled, and the pill shows what the sensor's own status byte
-says rather than what this page last asked for. Bluetooth only: the dock
-protocol has no LED command.
-
 ## Requirements
 
 - A **Shimmer3R**. Firmware v1.0.22 or later for BLE streaming; the
@@ -323,7 +405,7 @@ one is a useful thing to be able to see.
 | Parameter          | Effect                                                                                                                                  |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `?mock=1`          | Framed replies, one per notification — how BLE behaves.                                                                                 |
-| `&framed=0`        | Replies dribbled three bytes at a time — how a classic-Bluetooth or USB byte stream behaves, and what re-framing is for.                |
+| `&framed=0`        | Replies dribbled three bytes at a time — how a Classic-Bluetooth or USB byte stream behaves, and what re-framing is for.                |
 | `&rate=<Hz>`       | Sampling rate, default 51.2.                                                                                                            |
 | `&sdKBps=`         | Throttle the synthetic card's transfer rate, so progress and abort have something to act on.                                            |
 | `&fw=`             | Report a different firmware version, to see the SD tab refuse an unsupported one.                                                       |

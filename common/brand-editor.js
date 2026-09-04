@@ -1,6 +1,6 @@
 /**
  * Device naming: read and write the EEPROM brand record that decides the name
- * a sensor advertises over classic Bluetooth, the name it advertises over BLE,
+ * a sensor advertises over Classic Bluetooth, the name it advertises over BLE,
  * and the product and manufacturer strings it presents over USB.
  *
  * Extracted from the retired `eeprom-branding` demo: the current-record readout and
@@ -80,7 +80,7 @@ const STOCK_DEFAULTS = Object.freeze({
  * Link names that carry the Bluetooth command set, and therefore SET_FEATURE.
  *
  * A soft restart is a Bluetooth command, so it is available over BLE and over
- * classic Bluetooth but NOT over the dock UART, whose protocol has no
+ * Classic Bluetooth but NOT over the dock UART, whose protocol has no
  * equivalent property. Today the method check alone would be enough — the
  * wired client does not carry `setRebootOnDisconnect` at all — but naming the
  * link keeps the reason visible instead of leaving it an accident of feature
@@ -100,16 +100,16 @@ const FIELD_DEFS = Object.freeze([
   Object.freeze({
     key: "ble",
     label: "BLE prefix",
-    placeholder: "derived from the classic Bluetooth prefix",
+    placeholder: "derived from the Classic Bluetooth prefix",
     blankProblem: "enter a name",
-    hint: "Leave blank to reuse the classic Bluetooth prefix.",
+    hint: "Leave blank to reuse the Classic Bluetooth prefix.",
   }),
   Object.freeze({
     key: "usbProduct",
     label: "USB product prefix",
-    placeholder: "derived from the classic Bluetooth prefix",
+    placeholder: "derived from the Classic Bluetooth prefix",
     blankProblem: "enter a name",
-    hint: "Leave blank to reuse the classic Bluetooth prefix.",
+    hint: "Leave blank to reuse the Classic Bluetooth prefix.",
   }),
   Object.freeze({
     key: "usbManufacturer",
@@ -432,7 +432,7 @@ export function createBrandEditor(host, opts = {}) {
         "div",
         { class: "field-hint" },
         "Printable ASCII, no commas. The firmware appends the MAC suffix to " +
-          "the classic Bluetooth, BLE and USB product names; the USB " +
+          "the Classic Bluetooth, BLE and USB product names; the USB " +
           "manufacturer string is used exactly as typed. The record is never " +
           "write-protected — it stays rewritable and erasable from here — and " +
           "every write is CRC-protected, so a garbled record simply reverts " +
@@ -511,7 +511,7 @@ export function createBrandEditor(host, opts = {}) {
    * Can this link ask the sensor to restart itself?
    *
    * SET_FEATURE / FEATURE_REBOOT_ON_DISCONNECT is a Bluetooth command, so a
-   * BLE or classic-Bluetooth link can arm it; the dock UART cannot.
+   * BLE or Classic-Bluetooth link can arm it; the dock UART cannot.
    */
   function canSoftRestart() {
     if (softRestartRefused) return false;
@@ -529,7 +529,7 @@ export function createBrandEditor(host, opts = {}) {
   /**
    * What will actually be written, after the derivation rules.
    *
-   * The BLE and USB *product* prefixes fall back to the classic Bluetooth
+   * The BLE and USB *product* prefixes fall back to the Classic Bluetooth
    * prefix when left blank, so a customer need only type one name. The USB
    * *manufacturer* never derives: the device descriptor uses it verbatim.
    *
@@ -636,7 +636,7 @@ export function createBrandEditor(host, opts = {}) {
       const row = rows.get(key);
       if (!row.input.value.trim() && eff[key] && eff[key] !== eff.btClassic) {
         row.preview.textContent +=
-          "  (truncated from the classic Bluetooth prefix)";
+          "  (truncated from the Classic Bluetooth prefix)";
       }
     }
 
@@ -858,7 +858,7 @@ export function createBrandEditor(host, opts = {}) {
       });
       log.log(
         rec.valid
-          ? `names on the sensor: classic Bluetooth "${rec.btClassic}" · BLE "${rec.ble}" · USB product "${rec.usbProduct}" · USB manufacturer "${rec.usbManufacturer}"`
+          ? `names on the sensor: Classic Bluetooth "${rec.btClassic}" · BLE "${rec.ble}" · USB product "${rec.usbProduct}" · USB manufacturer "${rec.usbManufacturer}"`
           : `the brand record is invalid (${rec.invalidReason}) — the sensor is using its factory names`,
       );
       return rec;
@@ -939,7 +939,7 @@ export function createBrandEditor(host, opts = {}) {
     setBusy(true);
     try {
       log.log(
-        `writing names: classic Bluetooth "${eff.btClassic}" · BLE "${eff.ble}" · USB product "${eff.usbProduct}" · USB manufacturer "${eff.usbManufacturer}"`,
+        `writing names: Classic Bluetooth "${eff.btClassic}" · BLE "${eff.ble}" · USB product "${eff.usbProduct}" · USB manufacturer "${eff.usbManufacturer}"`,
       );
       await client.writeDaughterCardMem(sdk.BRAND_RECORD_HOST_OFFSET, bytes);
       const verify = await readBytes(client);

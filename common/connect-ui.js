@@ -30,7 +30,7 @@
  */
 const MODE_LABELS = Object.freeze({
   ble: "BLE",
-  rfcomm: "classic Bluetooth",
+  rfcomm: "Classic Bluetooth",
   usb: "wired serial",
 });
 
@@ -60,7 +60,7 @@ const MIN_USEFUL_SDK = "0.1.12";
  *   page that offers only BLE just omits `usb`/`bt`
  * @param {HTMLButtonElement} [cfg.els.ble]     "Connect BLE"
  * @param {HTMLButtonElement} [cfg.els.usb]     "Connect USB / dock"
- * @param {HTMLButtonElement} [cfg.els.bt]      "Connect classic Bluetooth"
+ * @param {HTMLButtonElement} [cfg.els.bt]      "Connect Classic Bluetooth"
  * @param {HTMLButtonElement} [cfg.els.disconnect]
  * @param {HTMLElement} [cfg.els.pill]    connection pill (`.pill`, gets `.on`)
  * @param {HTMLElement} [cfg.els.info]    free-text status line

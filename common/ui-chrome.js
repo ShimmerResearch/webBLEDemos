@@ -136,6 +136,15 @@ export function formatLogTime(d = new Date()) {
  *   `all` | `err` | `warnup` (warn and worse) | `txrx`
  * @param {HTMLElement} [opts.downloadButton]
  * @param {HTMLElement} [opts.clearButton]
+ * @param {HTMLElement} [opts.copyButton] copies the FULL text to the
+ *   clipboard, filter or no filter — the same text Download saves. Wired here
+ *   rather than by each page because the clipboard write has two paths and a
+ *   failure mode: `navigator.clipboard` is unavailable outside a secure
+ *   context and can be refused by permission policy, so it falls back to a
+ *   hidden `<textarea>` and `document.execCommand`, and reports either way.
+ * @param {(message: string, kind?: string) => void} [opts.toast] how to report
+ *   a copy; falls back to the button's own label changing for a moment, so the
+ *   copy is never silent on a page with no toasts.
  * @param {HTMLElement} [opts.countEl] shows "shown / total lines" when filtering
  * @param {string} [opts.fileName="event-log.txt"]
  * @param {boolean} [opts.timestamps=true] prefix each line with the host time
@@ -152,6 +161,7 @@ export function formatLogTime(d = new Date()) {
  *   clear: () => void,
  *   text: () => string,
  *   setFilter: (text?: string, severity?: string) => void,
+ *   copy: () => Promise<boolean>,
  *   lineCount: () => number,
  *   atTail: () => boolean,
  * }}
@@ -275,6 +285,7 @@ export function createLog(container, opts = {}) {
       if (severity !== undefined) filterSev = severity || "all";
       rerender();
     },
+    copy: () => copyText(api.text()),
     lineCount: () => lines.length,
     /**
      * True when the view is scrolled to (or within a line or two of) the
@@ -296,8 +307,77 @@ export function createLog(container, opts = {}) {
   opts.downloadButton?.addEventListener("click", () =>
     downloadBlob(fileName, new Blob([api.text()], { type: "text/plain" })),
   );
+  if (opts.copyButton) {
+    const btn = opts.copyButton;
+    btn.addEventListener("click", async () => {
+      const n = lines.length;
+      const ok = await api.copy();
+      const message = ok
+        ? `Copied ${n} log line${n === 1 ? "" : "s"} to the clipboard`
+        : "The clipboard is not available here — use Download instead";
+      if (opts.toast) opts.toast(message, ok ? "ok" : "warn");
+      else flashLabel(btn, ok ? "Copied" : "Blocked");
+    });
+  }
 
   return api;
+}
+
+/**
+ * Put `text` on the clipboard, or report that it could not be done.
+ *
+ * Two paths on purpose. `navigator.clipboard.writeText` is the right one and
+ * is all that works on a page the browser will not give a synchronous
+ * selection to, but it is absent outside a secure context and can be refused
+ * by permissions policy — and a log is exactly what someone wants to copy when
+ * something has gone wrong, which is the worst moment to hand them nothing.
+ * The `execCommand` fallback is deprecated and still works everywhere.
+ *
+ * @param {string} text
+ * @returns {Promise<boolean>} whether the text is now on the clipboard
+ */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* Refused or unavailable — fall through to the selection path. */
+  }
+  const ta = document.createElement("textarea");
+  try {
+    ta.value = text;
+    /* Off-screen rather than hidden: `display:none` and `visibility:hidden`
+       cannot hold a selection, so the copy would silently do nothing. */
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    /* In a `finally`, because any step above can throw — and a copy that
+       failed would otherwise leave its textarea attached to the body for the
+       rest of the session, once per attempt. `remove()` on a node that was
+       never appended is a no-op, so this is safe on every path. */
+    ta.remove();
+  }
+}
+
+/** Say something on a button for a moment, then put its label back. */
+function flashLabel(btn, message, ms = 1200) {
+  if (btn.dataset.flashing === "true") return;
+  const was = btn.textContent;
+  btn.dataset.flashing = "true";
+  btn.textContent = message;
+  setTimeout(() => {
+    btn.textContent = was;
+    delete btn.dataset.flashing;
+  }, ms);
 }
 
 /** JSON.stringify that survives circular objects and BigInt. */
