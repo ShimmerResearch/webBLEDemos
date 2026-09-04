@@ -63,9 +63,14 @@ question is three chances for one of the others to put an error on screen about
 something nobody asked about.
 
 The **LEDs** are here rather than on the Test tab because nothing about them is
-a test: holding the lower LED solid red is how you tell two sensors on a bench
-apart. The sequence that exercises every LED colour is part of the factory
-self-test, which is on **Test**.
+a test. They drive the firmware's red-LED override, which holds the lower LED
+solid red on top of the sensor's own indications: a "which sensor is this one"
+aid, not a health check. The firmware never clears the flag, so it stays lit
+across a disconnect until it is toggled again or the sensor is power-cycled,
+and the pill shows what the sensor's own status byte says rather than what this
+page last asked for. Bluetooth only — the dock protocol has no LED command. The
+sequence that exercises every LED _colour_ is part of the factory self-test,
+which is on **Test**.
 
 **Device commands** is the general place for the rest. **Re-inquire channel
 list** asks the firmware what it is set to send and at what rate — the page
@@ -322,7 +327,8 @@ the same way whether the sensor is on a radio or in a dock.
 
 ## Test
 
-Three things the sensor can be asked about itself.
+Two things the sensor can be asked about itself. (The red LED used to be a
+third; it is on **General** now, because nothing about it is a test.)
 
 **The factory self-test** is the same suite the firmware runs on the
 production line, and it prints the same report: pick one of its four suites
@@ -364,14 +370,6 @@ First measurements on hardware, docked: a stock Shimmer3R read about −9 ppm,
 and a unit reworked to 22 pF crystal load capacitors about −98 ppm. Docked
 sensors read a few ppm low from charge self-heating, so a battery run at room
 temperature gives the comparable figure.
-
-**The LED buttons** drive the firmware's red-LED override, which holds the
-lower LED solid red on top of the sensor's own indications. It is a "which
-sensor is this one" aid rather than a health check. The firmware never clears
-the flag, so it stays lit across a disconnect until it is toggled again or the
-sensor is power-cycled, and the pill shows what the sensor's own status byte
-says rather than what this page last asked for. Bluetooth only: the dock
-protocol has no LED command.
 
 ## Requirements
 
