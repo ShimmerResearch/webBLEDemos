@@ -1237,6 +1237,16 @@ input.cal-cell.faint {
   font-style: italic;
 }
 
+/* The destination preview when the download is about to produce a tree
+   Consensys cannot import — the MAC could not be read, so the device folder
+   will be named after the Shimmer instead. A colour rather than a `.banner`,
+   because the element is a `.row` and has to keep its spacing: this is the one
+   line that gets to say so before the transfer starts. */
+.preview-warn {
+  color: var(--warn);
+  font-weight: 600;
+}
+
 /* A custom editor supplies its own labels for its own boxes, so the field
    name above it is a heading rather than a <label for>. Matched to the
    weight and colour a real field label has, so a mixed grid of default

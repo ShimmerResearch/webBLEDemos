@@ -654,9 +654,13 @@ export function createSdBrowser(host, opts = {}) {
     // The folder a download would go into RIGHT NOW, which after an aborted
     // run is the one it left unfinished rather than a fresh one.
     const stamp = pendingStamp ?? sdk.formatSdImportStamp();
+    /* `classList`, not `className`: the element is created `row muted`, and
+       assigning the whole class string dropped the `row` — which is what gives
+       it its spacing under the destination line. */
+    const warn = (on) => destPreview.classList.toggle("preview-warn", on);
     if (layout !== "consensysBackup") {
       destPreview.textContent = `Files will be written to ${destRoot.name}/${rootPath}/…`;
-      destPreview.className = "muted";
+      warn(false);
       return;
     }
     /* The device level is the MAC, and the preview shows the REAL one rather
@@ -669,7 +673,7 @@ export function createSdBrowser(host, opts = {}) {
       : `Files will be written to ${destRoot.name}/${stamp}/<ShimmerName>/${rootPath}/… — ` +
         "the sensor's MAC address could not be read, and Consensys expects it " +
         "where the name will be, so this tree will not import.";
-    destPreview.className = mac ? "muted" : "banner warn";
+    warn(!mac);
   }
 
   function setDestLabel(remembered) {

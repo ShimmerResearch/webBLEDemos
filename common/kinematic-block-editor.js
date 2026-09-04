@@ -131,23 +131,6 @@ function checkValue(text, part, sensitivityScale) {
 }
 
 /**
- * The range field that governs a calibration group, by key.
- *
- * Found by pattern rather than tabulated, because the schema names these
- * per-part: the wide-range accelerometer's range is `wrAccelRange` on one
- * generation and `wrAccelRange.lsm303ah` on another, and the gyro's is
- * `gyroRange.mpu9x50` or `gyroRange.lsm6dsv`. A table would need an entry per
- * part and would silently stop finding the range for the next one added.
- *
- * Returns null where the part genuinely has no range field — the Shimmer3R's
- * LIS2MDL magnetometer has exactly one range, so the schema declares none, and
- * that is not a lookup failure.
- *
- * @param {readonly object[]} fields the schema fields for THIS generation
- * @param {string} group e.g. `lnAccel`
- * @returns {string|null}
- */
-/**
  * The defaults-table family for a generation string.
  *
  * `inferShimmer3Generation` and `getGroupDefaults` name the same three parts
@@ -166,6 +149,23 @@ export function calibrationFamilyFor(generation) {
   return null;
 }
 
+/**
+ * The range field that governs a calibration group, by key.
+ *
+ * Found by pattern rather than tabulated, because the schema names these
+ * per-part: the wide-range accelerometer's range is `wrAccelRange` on one
+ * generation and `wrAccelRange.lsm303ah` on another, and the gyro's is
+ * `gyroRange.mpu9x50` or `gyroRange.lsm6dsv`. A table would need an entry per
+ * part and would silently stop finding the range for the next one added.
+ *
+ * Returns null where the part genuinely has no range field — the Shimmer3R's
+ * LIS2MDL magnetometer has exactly one range, so the schema declares none, and
+ * that is not a lookup failure.
+ *
+ * @param {readonly object[]} fields the schema fields for THIS generation
+ * @param {string} group e.g. `lnAccel`
+ * @returns {string|null}
+ */
 function rangeFieldKeyFor(fields, group) {
   const re = new RegExp(`^${group}Range(\\.|$)`);
   const hit = (fields ?? []).find((f) => re.test(String(f.key)));

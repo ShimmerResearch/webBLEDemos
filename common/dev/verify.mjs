@@ -591,6 +591,11 @@ const sdDownload = await evaluate(`
   const picked = await window.__useFs('MemDest');
   const dest = window.__sdRole('dest').textContent;
   const preview = window.__sdRole('preview').textContent;
+  /* The element is created "row muted" and repainted per layout, so the class
+     it ends up with is worth pinning: assigning the whole string once dropped
+     the "row" and with it the line's spacing. (No backticks in here -- this
+     comment lives inside the template literal handed to Runtime.evaluate.) */
+  const previewClasses = [...window.__sdRole('preview').classList];
   const session = 'data/DefaultTrial_5f2c1a90/Shimmer_8091-001';
   await window.sdBrowser.download([session], { deleteVerified: false });
   const cmp = [...window.__fs.files.keys()].map(hostPath => {
@@ -604,7 +609,7 @@ const sdDownload = await evaluate(`
       if (want[i] !== got[i]) { mismatchAt = i; break; }
     return { hostPath, cardPath, bytes: got.length, mismatchAt };
   });
-  return { picked, dest, preview, cmp,
+  return { picked, dest, preview, previewClasses, cmp,
     progress: window.__sdRole('progress').textContent,
     readCmds: window.__opCount(0xC4),
     cardIntact: window.mockTransport.sdCard.files.length };
@@ -620,8 +625,11 @@ check(
        import time. */
     /^Files will be written to MemDest\/\d{4}-\d{2}-\d{2}_\d{2}\.\d{2}\.\d{2}\/000666668091\/data\/…$/.test(
       sdDownload.preview,
-    ),
-  `${sdDownload.dest} — ${sdDownload.preview}`,
+    ) &&
+    // Keeps its layout classes, and is not wearing the missing-MAC warning.
+    sdDownload.previewClasses.includes("row") &&
+    !sdDownload.previewClasses.includes("preview-warn"),
+  `${sdDownload.dest} — ${sdDownload.preview} [${sdDownload.previewClasses.join(" ")}]`,
 );
 check(
   "downloading a session writes every file byte-for-byte, in the Consensys Backup layout",

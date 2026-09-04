@@ -345,8 +345,8 @@ async function copyText(text) {
   } catch {
     /* Refused or unavailable — fall through to the selection path. */
   }
+  const ta = document.createElement("textarea");
   try {
-    const ta = document.createElement("textarea");
     ta.value = text;
     /* Off-screen rather than hidden: `display:none` and `visibility:hidden`
        cannot hold a selection, so the copy would silently do nothing. */
@@ -356,11 +356,15 @@ async function copyText(text) {
     ta.style.opacity = "0";
     document.body.appendChild(ta);
     ta.select();
-    const ok = document.execCommand("copy");
-    ta.remove();
-    return ok;
+    return document.execCommand("copy");
   } catch {
     return false;
+  } finally {
+    /* In a `finally`, because any step above can throw — and a copy that
+       failed would otherwise leave its textarea attached to the body for the
+       rest of the session, once per attempt. `remove()` on a node that was
+       never appended is a no-op, so this is safe on every path. */
+    ta.remove();
   }
 }
 
