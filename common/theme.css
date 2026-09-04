@@ -1202,6 +1202,67 @@ input.cal-cell.bad:focus-visible {
    Narrow screens: one column everywhere.
    ========================================================================= */
 
+/* ---------------------------------------------------------------------------
+   Factory self-test report (common/factory-test-panel.js)
+   --------------------------------------------------------------------------- */
+
+/* A terminal surface, dark in both themes exactly like `.log`: this is device
+   output printed line by line, and reading it as a terminal is the point. The
+   height cap keeps a 75-line report from pushing the controls off screen while
+   still showing enough to follow a paced LED test. */
+.test-report {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--log-bg);
+  color: var(--log-ink);
+  border: 1px solid var(--log-line);
+  border-radius: 10px;
+  padding: 10px;
+  max-height: min(46vh, 480px);
+  overflow: auto;
+}
+
+/* No empty box before a test has been run. */
+.test-report:empty {
+  display: none;
+}
+
+/* The three verdict words the firmware prints, on the log palette so they read
+   against the dark surface in either theme. */
+.tr-pass {
+  color: var(--log-ok);
+  font-weight: 700;
+}
+
+.tr-fail {
+  color: var(--log-bad);
+  font-weight: 700;
+}
+
+.tr-warn {
+  color: var(--log-warn);
+  font-weight: 700;
+}
+
+/* ---------------------------------------------------------------------------
+   Real-world-clock drift plot (common/rtc-drift-panel.js)
+   --------------------------------------------------------------------------- */
+
+/* The canvas sizes its backing store from the WRAPPER's width, so this rule
+   owns the layout size. Changing the height means changing PLOT_HEIGHT_PX in
+   the panel to match. */
+.drift-plot {
+  display: block;
+  width: 100%;
+  height: 180px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+
 @media (max-width: 720px) {
   .page {
     margin: 8px auto;
@@ -1239,5 +1300,13 @@ input.cal-cell.bad:focus-visible {
 
   .log {
     height: 260px;
+  }
+
+  .test-report {
+    max-height: 40vh;
+  }
+
+  .drift-plot {
+    height: 150px;
   }
 }

@@ -13,11 +13,11 @@ is reachable from a page you can read in an afternoon.
 
 ## The three ways to connect
 
-| Link                  | Configure | Read / write the configuration image | Set the clock | Status flags | Calibration dump | Stream to the host | Log to the SD card | Browse / download the card | Set device names |
-| --------------------- | :-------: | :----------------------------------: | :-----------: | :----------: | :--------------: | :----------------: | :----------------: | :------------------------: | :--------------: |
-| **BLE**               |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |
-| **Classic Bluetooth** |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |
-| **USB-C**             |    yes    |                 yes                  |      yes      | battery only |        no        |      **no**\*      |      **no**\*      |          **no**\*          |       yes        |
+| Link                  | Configure | Read / write the configuration image | Set the clock | Status flags | Calibration dump | Stream to the host | Log to the SD card | Browse / download the card | Set device names | Factory self-test | Clock drift | Red LED |
+| --------------------- | :-------: | :----------------------------------: | :-----------: | :----------: | :--------------: | :----------------: | :----------------: | :------------------------: | :--------------: | :---------------: | :---------: | :-----: |
+| **BLE**               |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |        yes        |     yes     |   yes   |
+| **Classic Bluetooth** |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |        yes        |     yes     |   yes   |
+| **USB-C**             |    yes    |                 yes                  |      yes      | battery only |        no        |      **no**\*      |      **no**\*      |          **no**\*          |       yes        |      yes\*\*      |     yes     | **no**  |
 
 \* **The Shimmer3R's USB-C port speaks the dock protocol, not the Bluetooth
 one** — the firmware routes the bytes arriving on the USB serial port to the
@@ -32,7 +32,13 @@ The dock protocol is a different command set, not a subset, which is why the
 last few columns differ: it has no `STATUS_RESPONSE` (it reports the battery
 instead of the status bits) and no calibration-dump command, so the page greys
 those controls out rather than guessing. It does have a clock write, so
-setting the clock works over all three links.
+setting the clock works over all three links, and it has a test command, so the
+self-test runs over all three too.
+
+\*\* Over the dock the ExG chip test reports FAIL, because that connection and
+the chip share pins and the firmware says so in the report itself. That is the
+docked test, not the board — run the self-test over Bluetooth to judge an ExG
+expansion board.
 
 The two Bluetooth links reach the same command set by different routes. **BLE**
 uses Web Bluetooth and its own device picker. **Classic Bluetooth** uses Web
@@ -105,10 +111,17 @@ on purpose. The figure it produces also drives the download ETAs on the SD tab.
 
 ## The clock
 
-The sensor keeps its clock in **local civil time**, which is what the offline
-file parser expects, so setting it from the host applies the host's time-zone
-offset rather than writing plain UTC. Over USB the clock can be set but not
-read back, because the dock protocol has a write for it and no read.
+The sensor keeps its clock in **UTC**, which is what desktop Consensys and the
+dock software write, so setting it from this host writes a plain epoch and both
+the sensor's clock and the host's are shown in this host's local time — they
+should read the same. Over USB the clock can be set but not read back, because
+the dock protocol has a write for it and no read.
+
+(An earlier version of this page wrote and displayed the clock as local civil
+time, a convention belonging to the Verisense console. It made a sensor set by
+Consensys read a whole time-zone offset adrift, and a sensor set here read
+adrift in Consensys.) The **Test** tab measures how far the sensor's clock
+drifts from this host's over time.
 
 ## Calibration
 
@@ -231,6 +244,59 @@ names.
 Works over all three links: the record lives in the same place and is reached
 the same way whether the sensor is on a radio or in a dock.
 
+## Test
+
+Three things the sensor can be asked about itself.
+
+**The factory self-test** is the same suite the firmware runs on the
+production line, and it prints the same report: pick one of its four suites
+(everything, LEDs only, chips only, or the LED operating states), press Run,
+and the report appears line by line as the sensor prints it, with PASS, FAIL
+and WARNING picked out. When it finishes, the parsed verdict appears above it
+— including the failing test names decoded from the report's own fail mask —
+and the report can be copied, saved as text, or saved as a CSV row.
+
+Two things are worth knowing before pressing Run. The sensor stops everything
+else while it runs, and answers no other command until the report ends, so the
+rest of the page is refused with that reason meanwhile — up to about a minute
+for the LED-state walk-through. And **the firmware has no way to be
+interrupted**: Cancel stops this page listening, but the sensor keeps printing
+to its own end, so the page stays busy until then and says so. Disconnecting
+is the only way out early. The LED suites are meant to be watched — each line
+names the LED that should be lit at that moment.
+
+Over the USB-C/dock link the test runs through the dock protocol's own test
+command. One line comes out differently there: the ExG chip test reports FAIL
+from the dock, because that connection and the chip share pins. That is the
+docked test, not the board.
+
+**The clock-drift monitor** samples the sensor's real-world clock against this
+host's on an interval and least-squares fits the slope in ppm, with a plot, a
+seconds-per-day readout, and CSV export carrying the fit and its metadata. The
+sensor's clock is driven by its 32 kHz crystal, so the crystal's error shows up
+here directly — the absolute figure the self-test's own crystal check cannot
+give, because that one measures the 32 kHz crystal against the 16 MHz one and
+reports only the difference. A wired link is the better one for this: its round
+trips jitter less than Bluetooth. Expect a usable figure within an hour or two.
+If this host's clock is stepped (by NTP, or by a daylight-saving change) the
+fit rebaselines itself rather than fitting across the discontinuity, and a
+sensor whose clock was set on a whole-quarter-hour offset — by a tool using a
+different convention — is recognised as such and reported, rather than shown
+as an hour of error. A clock that is genuinely wrong still shows as wrong.
+
+First measurements on hardware, docked: a stock Shimmer3R read about −9 ppm,
+and a unit reworked to 22 pF crystal load capacitors about −98 ppm. Docked
+sensors read a few ppm low from charge self-heating, so a battery run at room
+temperature gives the comparable figure.
+
+**The LED buttons** drive the firmware's red-LED override, which holds the
+lower LED solid red on top of the sensor's own indications. It is a "which
+sensor is this one" aid rather than a health check. The firmware never clears
+the flag, so it stays lit across a disconnect until it is toggled again or the
+sensor is power-cycled, and the pill shows what the sensor's own status byte
+says rather than what this page last asked for. Bluetooth only: the dock
+protocol has no LED command.
+
 ## Requirements
 
 - A **Shimmer3R**. Firmware v1.0.22 or later for BLE streaming; the
@@ -254,19 +320,27 @@ data at the configured rate. It models a small synthetic card, but not timing, p
 error paths, and it deliberately does not implement every command — a refused
 one is a useful thing to be able to see.
 
-| Parameter    | Effect                                                                                                                   |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `?mock=1`    | Framed replies, one per notification — how BLE behaves.                                                                  |
-| `&framed=0`  | Replies dribbled three bytes at a time — how a classic-Bluetooth or USB byte stream behaves, and what re-framing is for. |
-| `&rate=<Hz>` | Sampling rate, default 51.2.                                                                                             |
-| `&sdKBps=`   | Throttle the synthetic card's transfer rate, so progress and abort have something to act on.                             |
-| `&fw=`       | Report a different firmware version, to see the SD tab refuse an unsupported one.                                        |
-| `&hw=none`   | Refuse to say what hardware it is, to see the conservative name limits apply.                                            |
-| `&debug=1`   | Log every command and reply to the browser console.                                                                      |
+| Parameter          | Effect                                                                                                                                  |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `?mock=1`          | Framed replies, one per notification — how BLE behaves.                                                                                 |
+| `&framed=0`        | Replies dribbled three bytes at a time — how a classic-Bluetooth or USB byte stream behaves, and what re-framing is for.                |
+| `&rate=<Hz>`       | Sampling rate, default 51.2.                                                                                                            |
+| `&sdKBps=`         | Throttle the synthetic card's transfer rate, so progress and abort have something to act on.                                            |
+| `&fw=`             | Report a different firmware version, to see the SD tab refuse an unsupported one.                                                       |
+| `&hw=none`         | Refuse to say what hardware it is, to see the conservative name limits apply.                                                           |
+| `&testMs=`         | Shorten the self-test's per-LED dwell (2000 ms on real hardware, so a full LED test really is 18 seconds).                              |
+| `&testFail=1`      | A failing self-test: a FAIL line, a line long enough for the firmware to truncate, and the fail mask that goes with it.                 |
+| `&ppm=`            | Run the mock sensor's clock at this error, so the drift monitor has a slope to find.                                                    |
+| `&clockBase=local` | Start the sensor's clock on this host's civil time rather than UTC — what a sensor set by a tool using the other convention looks like. |
+| `&debug=1`         | Log every command and reply to the browser console.                                                                                     |
 
 While the mock is connected, `mockTransport.writes` in the console is every
 command the page has sent, and `mockTransport.emitDisconnect()` simulates a
-dropped link.
+dropped link. `mockTransport.factoryTest` reports how many self-tests have run,
+whether one is still printing and exactly what text it printed;
+`mockTransport.rtc` exposes the sensor's own running clock. The panels
+themselves are `factoryTestPanel` and `rtcDriftPanel`, beside `sdBrowser`,
+`brandEditor` and `calibrationEditor`.
 
 It is opt-in from the URL only, and deliberately so: a page that reached for
 the mock on its own would quietly show fake data to somebody debugging real
@@ -277,5 +351,7 @@ hardware.
 This is an early example. It has been exercised end to end against the mock
 link; the paths that only a real sensor can prove — that a configuration write
 is accepted and applied, that a calibration dump round-trips, that a long
-recording holds up at high rates — want confirming on hardware before anyone
-relies on them for real work. Check a recording before it matters.
+recording holds up at high rates, that the self-test report arrives whole over
+a real link, that the red LED really lights — want confirming on hardware
+before anyone relies on them for real work. Check a recording before it
+matters.
