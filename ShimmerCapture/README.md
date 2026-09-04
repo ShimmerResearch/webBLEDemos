@@ -163,9 +163,17 @@ on purpose. The figure it produces also drives the download ETAs on the SD tab.
 On the **General** tab. The sensor keeps its clock in **UTC**, which is what
 desktop Consensys and the dock software write, so setting it from this host
 writes a plain epoch and both the sensor's clock and the host's are shown in
-this host's local time — they should read the same. Over USB the clock can be
-set but not read back, because the dock protocol has a write for it and no
-read.
+this host's local time — they should read the same.
+
+It reads and writes over **every** link, USB-C included. There is no dock
+equivalent of the Bluetooth GET_RWC command, but the dock protocol has a
+read-only `CURR_LOCAL_TIME` property that answers with the same eight bytes in
+the same unit, so the two paths are interchangeable — `common/device-clock.js`
+picks whichever the current link has. (An earlier version of this page said
+the clock could be set but not read back over USB. That was true of the page,
+not of the link: it tested for the Bluetooth method and gave up, while the
+capability it gated the button on already counted the dock property. So the
+button was enabled and always refused.)
 
 (An earlier version of this page wrote and displayed the clock as local civil
 time, a convention belonging to the Verisense console. It made a sensor set by

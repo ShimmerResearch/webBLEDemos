@@ -3373,6 +3373,7 @@ const SDK_CONSUMERS = [
   "common/brand-editor.js",
   "common/calibration-editor.js",
   "common/csv-recorder.js",
+  "common/device-clock.js",
   "common/factory-test-panel.js",
   "common/kinematic-block-editor.js",
   "common/rtc-drift-panel.js",
@@ -4487,6 +4488,145 @@ check(
   "the theme toggle says which way the click goes, as the console's does",
   /^Switch to (light|dark) theme$/.test(logBar.themeTitle),
   logBar.themeTitle,
+);
+
+// ===========================================================================
+// The clock read, and the gate that decides whether to offer it.
+//
+// These have to agree. They did not: the button was gated on
+// `describeShimmer3Caps(...).rtcRead`, which counts the dock's `getConfig`
+// property as a way to read the clock, while the handler tested for the
+// Bluetooth `getRtcTime` method and refused. So over USB the control was
+// enabled and always said "This link cannot read the sensor clock" — and the
+// README had been written to match the bug. Found by Copilot on #76.
+//
+// Source-level and stub-level on purpose: the mock transport speaks the radio
+// protocol only, so there is no dock client here to drive the button with.
+// What can be pinned is the agreement, which is what actually broke.
+// ===========================================================================
+console.log("\n--- the clock read agrees with the gate that offers it ---");
+
+const clockGate = await evaluate(`
+  const schema = await import('/common/shimmer3-config-schema.js');
+  const clock = await import('/common/device-clock.js');
+  /* The four shapes that matter: a radio client, a dock client (getConfig and
+     no getRtcTime), a dock client on a bundle old enough to lack the property,
+     and nothing connected. */
+  const radio = { getRtcTime(){}, getConfig(){} };
+  const dock = { getConfig(){} };
+  const mute = {};
+  const rows = [
+    ['radio over ble',  radio, 'ble'],
+    ['radio over rfcomm', radio, 'rfcomm'],
+    ['dock over usb',   dock,  'usb'],
+    ['mute over usb',   mute,  'usb'],
+    ['mute over ble',   mute,  'ble'],
+  ].map(([name, client, mode]) => ({
+    name,
+    caps: schema.describeShimmer3Caps(client, mode).rtcRead,
+    reader: clock.canReadRwc(client, mode),
+  }));
+  return {
+    rows,
+    disagree: rows.filter(r => r.caps !== r.reader).map(r => r.name),
+    nothingConnected: clock.canReadRwc(null, 'ble'),
+    /* The page must go through the shared reader in BOTH clock paths — the
+       button and the Device panel's Refresh. A property test in either is the
+       bug coming back. */
+    src: await (await fetch('/ShimmerCapture/index.html')).text(),
+  };
+`);
+check(
+  "canReadRwc and describeShimmer3Caps.rtcRead agree on every link/client shape",
+  clockGate.disagree.length === 0 &&
+    // …and they agree on the case that broke, rather than agreeing on "no".
+    clockGate.rows.find((r) => r.name === "dock over usb").caps === true &&
+    clockGate.rows.find((r) => r.name === "mute over usb").caps === false &&
+    clockGate.nothingConnected === false,
+  clockGate.disagree.length
+    ? `disagree: ${clockGate.disagree.join(", ")}`
+    : clockGate.rows.map((r) => `${r.name}=${r.caps}`).join(", "),
+);
+check(
+  "both of the page's clock reads go through the shared reader, not a method test",
+  /canReadRwc\(client, mode\)/.test(clockGate.src) &&
+    /readDeviceRwc\(client, mode\)/.test(clockGate.src) &&
+    // The two call sites are the button and the Device panel's Refresh.
+    (clockGate.src.match(/readDeviceRwc\(client, mode\)/g) ?? []).length ===
+      2 &&
+    !/typeof client\.getRtcTime === "function"/.test(clockGate.src) &&
+    !/typeof client\?\.getRtcTime !== "function"/.test(clockGate.src),
+  `${(clockGate.src.match(/readDeviceRwc\(client, mode\)/g) ?? []).length} call sites, no getRtcTime property test`,
+);
+
+// ===========================================================================
+console.log("\n--- a calibration block follows the range field beside it ---");
+await goto(`${BASE}?mock=1`);
+check(
+  "connect for the refresh-hook pass",
+  (await evaluate(CONNECT)) === "mock",
+);
+
+const refreshHook = await evaluate(`
+  document.querySelector('.tabs [data-tab=tabConfig]').click();
+  document.querySelector('[data-group-body="calibration"]').closest('details').open = true;
+  document.querySelector('[data-group-body="gyro"]').closest('details').open = true;
+  await new Promise(r => requestAnimationFrame(r));
+  const cells = (k, part) => [...document.querySelectorAll(
+    '[data-field-key="' + k + '"] [data-cal-part=' + part + ']')].map(i => i.value);
+  const pill = (k) => document.querySelector('[data-field-key="' + k + '"] .pill').textContent;
+  const faint = (k) => document.querySelectorAll(
+    '[data-field-key="' + k + '"] input.cal-cell.faint').length;
+  const sel = document.querySelector('[data-field-key="gyroRange.lsm6dsv"] select');
+
+  const before = { pill: pill('calib.gyro'), sens: cells('calib.gyro', 'sens') };
+
+  // 1. change the range: the pill AND the greyed defaults must follow it
+  sel.value = '4';                                  // +/- 2000 dps
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  const moved = { pill: pill('calib.gyro'), sens: cells('calib.gyro', 'sens'),
+                  faint: faint('calib.gyro'),
+                  otherPill: pill('calib.lnAccel'),
+                  otherSens: cells('calib.lnAccel', 'sens') };
+
+  // 2. type a real value, then change the range again: the boxes must NOT move
+  const box = document.querySelector(
+    '[data-field-key="calib.gyro"] [data-cal-part=offset][data-cal-index="0"]');
+  box.value = '777';
+  box.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  sel.value = '0';
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => requestAnimationFrame(r));
+  const kept = { pill: pill('calib.gyro'), off: cells('calib.gyro', 'offset'),
+                 sens: cells('calib.gyro', 'sens'), faint: faint('calib.gyro') };
+  return { before, moved, kept };
+`);
+check(
+  "changing the range repaints the block's range chip and its greyed defaults",
+  refreshHook.before.pill === "configured: +/- 125dps" &&
+    refreshHook.before.sens.join(",") === "229,229,229" &&
+    refreshHook.moved.pill === "configured: +/- 2000dps" &&
+    // 2000 dps is a far coarser LSB, so the default sensitivity really moves.
+    refreshHook.moved.sens.join(",") === "14,14,14" &&
+    refreshHook.moved.faint === 15,
+  `${refreshHook.before.pill} ${refreshHook.before.sens[0]} → ${refreshHook.moved.pill} ${refreshHook.moved.sens[0]}`,
+);
+check(
+  "and it leaves every OTHER block alone",
+  refreshHook.moved.otherPill === "configured: ± 2g" &&
+    refreshHook.moved.otherSens.join(",") === "1672,1672,1672",
+  `${refreshHook.moved.otherPill}, ${refreshHook.moved.otherSens.join(",")}`,
+);
+check(
+  "a block holding real values keeps them — only its chip follows the range",
+  refreshHook.kept.pill === "configured: +/- 125dps" &&
+    refreshHook.kept.off.join(",") === "777,0,0" &&
+    // Still the 2000 dps figure it was edited alongside, NOT re-defaulted.
+    refreshHook.kept.sens.join(",") === "14,14,14" &&
+    refreshHook.kept.faint === 0,
+  `offset ${refreshHook.kept.off.join(",")}, sensitivity ${refreshHook.kept.sens.join(",")}, ${refreshHook.kept.faint} greyed`,
 );
 
 // ===========================================================================

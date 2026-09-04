@@ -36,6 +36,7 @@
 
 import { el, downloadBlob, fmtDuration } from "./ui-chrome.js";
 import { onThemeChange } from "./theme.js";
+import { readDeviceRwc, canReadRwc } from "./device-clock.js";
 /* The whole namespace rather than destructured names: a vendored bundle that
    predates `RtcDriftMonitor` then degrades to a banner from
    `createRtcDriftPanel()` instead of throwing at import time and taking the
@@ -107,13 +108,6 @@ function cssVar(node, name, fallback) {
     /* A detached node has no computed style; the fallback still draws. */
     return fallback;
   }
-}
-
-/** 64-bit little-endian tick count from the dock's 8-byte answer. */
-function ticksFromBytes(u8) {
-  let ticks = 0n;
-  for (let i = 7; i >= 0; i--) ticks = (ticks << 8n) | BigInt(u8[i]);
-  return ticks;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,13 +197,6 @@ export function createRtcDriftPanel(host, opts = {}) {
     );
     return inertDriftPanel();
   }
-
-  /**
-   * The dock's read-only "what time is it now" property. Optional: a bundle
-   * without it simply cannot read the clock over a wired link, which
-   * {@link supports} reports rather than discovering at the first sample.
-   */
-  const DOCK_TIME_PROP = sdk.UART_PROP?.MAIN_PROCESSOR?.CURR_LOCAL_TIME ?? null;
 
   const monitor = new sdk.RtcDriftMonitor();
 
@@ -399,18 +386,18 @@ export function createRtcDriftPanel(host, opts = {}) {
   /**
    * Can this client, on this link, have its clock read at all?
    *
-   * Mirrors {@link readDeviceSeconds} exactly, so a panel that says yes here
-   * never fails at the first sample with "undefined is not a function".
+   * `canReadRwc` is the same predicate `readDeviceSeconds` acts on, from the
+   * same module — so a panel that says yes here never fails at the first
+   * sample with "undefined is not a function". They used to be two copies of
+   * the rule side by side, which is survivable; the page's third copy was not
+   * (see `common/device-clock.js`).
    *
    * @param {object|null} [client]
    * @param {string|null} [mode]
    * @returns {boolean}
    */
   function supports(client = getClient(), mode = getMode()) {
-    if (!client) return false;
-    const wired = mode === "usb" || typeof client.getRtcTime !== "function";
-    if (!wired) return true;
-    return typeof client.getConfig === "function" && !!DOCK_TIME_PROP;
+    return canReadRwc(client, mode);
   }
 
   /** Can the sensor's clock be WRITTEN over this link? Sync needs this. */
@@ -436,23 +423,14 @@ export function createRtcDriftPanel(host, opts = {}) {
    * hands it the reading unmodified.
    */
   async function readDeviceSeconds() {
-    const client = getClient();
-    if (!client) throw new Error("no sensor is connected");
-    /* The wired path is also the fallback for a client with no radio clock
-       command, so a dock-like client that only implements `getConfig` works
-       without the mounting page having to declare a mode. */
-    if (getMode() === "usb" || typeof client.getRtcTime !== "function") {
-      if (!DOCK_TIME_PROP)
-        throw new Error(
-          "this SDK bundle has no CURR_LOCAL_TIME property — re-vendor it to read the clock over a wired link",
-        );
-      const raw = await client.getConfig(DOCK_TIME_PROP);
-      if (!raw || raw.length < 8)
-        throw new Error(`CURR_LOCAL_TIME returned ${raw?.length ?? 0} bytes`);
-      return Number(ticksFromBytes(raw)) / TICKS_PER_SEC;
-    }
-    const { unixMs } = await client.getRtcTime();
-    return unixMs / 1000;
+    /* Which of the two reads works is a property of the LINK, and that
+       knowledge now lives in `common/device-clock.js` — this panel had it
+       first and was the only place that did, which is how the page's own
+       clock readouts came to give up over USB on a link that can in fact
+       answer. Ticks rather than `unixMs` so the seconds keep their full
+       resolution through the division. */
+    const { ticks } = await readDeviceRwc(getClient(), getMode());
+    return Number(ticks) / TICKS_PER_SEC;
   }
 
   /**

@@ -385,6 +385,12 @@ function formatForControl(field, value) {
  * }|null} [cfg.editorFor] a custom editor for a field, in place of the plain
  *   control this module would build.
  *
+ *   `refresh()`, if provided, is called on every OTHER editor after any field
+ *   commits — it is how an editor hears that a sibling field it derives
+ *   something from has changed, since a commit otherwise repaints only the
+ *   field that was committed. It must NOT overwrite what the user has typed
+ *   into the editor itself; that is what `set()` is for.
+ *
  *   Returning null (for every field, or for one) keeps the default control, so
  *   a page opts in per field and this module keeps working with no `editorFor`
  *   at all. The editor is handed the same commit path as a plain control: it
@@ -775,6 +781,34 @@ export function createConfigForm(host, cfg) {
   }
 
   /**
+   * Tell every custom editor that the image changed underneath it.
+   *
+   * `refresh()` is the half of the `editorFor` contract that is about OTHER
+   * fields: an editor is handed its own value through `set()`, but anything it
+   * derives from a sibling — the range a calibration block belongs to — has no
+   * other way to hear about an edit, because a commit only repaints the field
+   * that was committed.
+   *
+   * Optional, and a throwing one must not cost the commit that provoked it:
+   * the bytes are already written by this point, and an editor that fails to
+   * repaint must not make a successful write look like a failed one.
+   *
+   * @param {object|null} [except] the entry that just committed
+   */
+  function notifyEditorsOfChange(except = null) {
+    for (const entry of entries.values()) {
+      if (entry === except || !entry.editor?.refresh) continue;
+      try {
+        entry.editor.refresh();
+      } catch {
+        /* An editor that cannot repaint is a display problem, not a write
+           problem. Deliberately silent: this runs once per editor per commit,
+           so a broken one would otherwise log on every keystroke-commit. */
+      }
+    }
+  }
+
+  /**
    * One field's current value plus the label its option table gives it, for
    * an editor that needs to show something about a SIBLING field.
    *
@@ -880,6 +914,14 @@ export function createConfigForm(host, cfg) {
     // control always shows what the bytes now actually say.
     setControlValue(entry, read(field));
     refreshDirty();
+    /* Give every OTHER editor a chance to repaint anything it derives from a
+       sibling field. The kinematic calibration editor shows the range its
+       block belongs to, read out of this same image — edit that range and the
+       chip beside the matrices was left naming the old one, and the greyed
+       factory defaults were the old range's too. Editors only, and never the
+       one that just committed (it has already repainted itself from the
+       bytes), so this costs nothing on a form with no editors in it. */
+    notifyEditorsOfChange(entry);
     onChange?.(field.key, parsed.value, dirtyKeys());
   }
 

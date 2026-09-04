@@ -1063,6 +1063,7 @@
       import { createCalibrationEditor } from "../common/calibration-editor.js";
       import { createFactoryTestPanel } from "../common/factory-test-panel.js";
       import { createRtcDriftPanel } from "../common/rtc-drift-panel.js";
+      import { readDeviceRwc, canReadRwc } from "../common/device-clock.js";
       import {
         createMockShimmer3RTransport,
         mockEnabledFromUrl,
@@ -2106,9 +2107,14 @@
           }
         }
 
-        if (typeof client.getRtcTime === "function") {
+        /* `canReadRwc`, not a `getRtcTime` property test: the USB-C link has
+           no such command but the dock protocol has a read-only property that
+           answers with the same eight bytes, and `caps.rtcRead` — which gates
+           the button — already counts it. Testing the method here left the row
+           at "–" over a link that can in fact answer. */
+        if (canReadRwc(client, mode)) {
           const rtc = await tryDevice("read the real-world clock", () =>
-            client.getRtcTime(),
+            readDeviceRwc(client, mode),
           );
           $("rwcValue").textContent = rtc
             ? `${formatDeviceClock(rtc.unixMs)}  (${rtc.ticks} ticks)`
@@ -2163,12 +2169,12 @@
        * and put an error on screen about something nobody asked about.
        */
       async function readDeviceClock() {
-        if (typeof client?.getRtcTime !== "function") {
+        if (!canReadRwc(client, mode)) {
           showToast("This link cannot read the sensor clock", "warn");
           return;
         }
         const rtc = await tryDevice("read the real-world clock", () =>
-          client.getRtcTime(),
+          readDeviceRwc(client, mode),
         );
         $("rwcValue").textContent = rtc
           ? `${formatDeviceClock(rtc.unixMs)}  (${rtc.ticks} ticks)`

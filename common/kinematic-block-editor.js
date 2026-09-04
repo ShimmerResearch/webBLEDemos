@@ -397,44 +397,34 @@ export function createKinematicBlockEditorFactory(opts = {}) {
         const parsed = sdk.parseKinematicCalibBlock(bytes, {
           sensitivityScale,
         });
-        showingDefaults = false;
 
         if (parsed) {
+          showingDefaults = false;
           fill(parsed);
           stateNote.textContent = "";
+          paintFaint();
         } else {
-          /* All 0x00 or all 0xFF: the firmware reads that as "nothing stored"
-             and falls back to its own defaults, so those are what the sensor
-             would actually use and what the boxes show — greyed, exactly as
-             the Calibration tab greys them, so nobody mistakes them for
-             measured values. Showing forty-two zeroes instead would be
-             literally true about the bytes and misleading about the sensor. */
-          const cfg = configuredRange();
-          const fallback = defaults
-            ? (defaults.byRange[cfg?.value ?? defaults.fallbackRange] ??
-              defaults.byRange[defaults.fallbackRange])
-            : null;
-          if (fallback) {
-            fill(fallback);
-            showingDefaults = true;
-            stateNote.textContent =
-              "This block holds no calibration — every byte is 0x00 or 0xFF — " +
-              "so the greyed values above are the factory defaults the " +
-              "firmware falls back to for this range. Editing any box writes " +
-              "the whole block, defaults and all.";
-          } else {
-            clear();
-            stateNote.textContent =
-              "This block holds no calibration — every byte is 0x00 or 0xFF. " +
-              "Which factory defaults the firmware falls back to depends on " +
-              "the hardware, and the sensor has not said what it is.";
-          }
-        }
-        for (const part of ["offset", "sens", "align"]) {
-          for (const input of cells[part])
-            input.classList.toggle("faint", showingDefaults);
+          showFallback();
         }
         paintProblems([]);
+      },
+
+      /**
+       * A SIBLING field changed — repaint whatever is derived from one.
+       *
+       * Two things here are: the chip naming the configured range, and, when
+       * the block holds no calibration, the factory defaults shown greyed —
+       * which are per range, so changing the range changed which ones the
+       * firmware would fall back to.
+       *
+       * Deliberately does NOT touch boxes holding real values. `set()` is the
+       * only thing allowed to overwrite those, and it is called with the
+       * bytes; a refresh that helpfully repainted an edit in progress would
+       * throw away work on every keystroke-commit elsewhere in the form.
+       */
+      refresh() {
+        paintRange();
+        if (showingDefaults) showFallback();
       },
 
       get() {
@@ -454,9 +444,7 @@ export function createKinematicBlockEditorFactory(opts = {}) {
         /* The moment anything is committed these are real values, not the
            greyed placeholder — the whole block goes to the bytes. */
         showingDefaults = false;
-        for (const part of ["offset", "sens", "align"]) {
-          for (const input of cells[part]) input.classList.remove("faint");
-        }
+        paintFaint();
         stateNote.textContent = "";
         return {
           ok: true,
@@ -513,6 +501,53 @@ export function createKinematicBlockEditorFactory(opts = {}) {
       for (const part of ["offset", "sens", "align"]) {
         for (const input of cells[part]) input.value = "";
       }
+    }
+
+    /** Grey the boxes, or un-grey them, to match `showingDefaults`. */
+    function paintFaint() {
+      for (const part of ["offset", "sens", "align"]) {
+        for (const input of cells[part])
+          input.classList.toggle("faint", showingDefaults);
+      }
+    }
+
+    /**
+     * Show what the firmware would fall back to for the CONFIGURED range.
+     *
+     * Reached when the block is all 0x00 or all 0xFF — the firmware reads that
+     * as "nothing stored" and uses its own defaults, so those are what the
+     * sensor would actually apply and what the boxes show. Greyed, exactly as
+     * the Calibration tab greys them, so nobody mistakes them for measured
+     * values. Forty-two zeroes instead would be literally true about the bytes
+     * and misleading about the sensor.
+     *
+     * Also the refresh path, which is why it is a function: the fallback is
+     * per range, so an edit to the range field changes it.
+     */
+    function showFallback() {
+      const defaults = groupDefaults();
+      const cfg = configuredRange();
+      const fallback = defaults
+        ? (defaults.byRange[cfg?.value ?? defaults.fallbackRange] ??
+          defaults.byRange[defaults.fallbackRange])
+        : null;
+      if (fallback) {
+        showingDefaults = true;
+        fill(fallback);
+        stateNote.textContent =
+          "This block holds no calibration — every byte is 0x00 or 0xFF — " +
+          "so the greyed values above are the factory defaults the " +
+          "firmware falls back to for this range. Editing any box writes " +
+          "the whole block, defaults and all.";
+      } else {
+        showingDefaults = false;
+        clear();
+        stateNote.textContent =
+          "This block holds no calibration — every byte is 0x00 or 0xFF. " +
+          "Which factory defaults the firmware falls back to depends on " +
+          "the hardware, and the sensor has not said what it is.";
+      }
+      paintFaint();
     }
   };
 }
