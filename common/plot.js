@@ -647,6 +647,13 @@ export function createStreamPlot(host, opts = {}) {
     for (const panel of Object.values(panels)) {
       delete panel.chart.options.scales.y.min;
       delete panel.chart.options.scales.y.max;
+      /* The x range too. `draw` pins it whenever it has more than one point,
+         and dropping only the y range left the axis showing the time window of
+         the samples just discarded — so switching raw/cal, which clears,
+         painted an empty plot against the old window until enough new samples
+         arrived to re-pin it. */
+      delete panel.chart.options.scales.x.min;
+      delete panel.chart.options.scales.x.max;
       panel.chart.update("none");
     }
     dirty = false;
