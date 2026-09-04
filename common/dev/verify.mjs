@@ -4152,6 +4152,38 @@ check(
     .find((l) => l.includes("btn.disabled")) ?? "not found",
 );
 
+/* The run gate and the "worth knowing" note are different things, and the
+   panel cannot tell them apart: it refuses on ANY sentence `canRun` hands
+   back. They were once one function, which read well and silently stopped
+   the USB-C link -- the one link this tab documents with a footnote of its
+   own -- from ever running a self-test. Checked at source level, because
+   reproducing it needs a dock on the bench. */
+const runGate = fnBody(pageSrc, "selfTestUnavailableReason") ?? "";
+const linkNote = fnBody(pageSrc, "selfTestLinkNote") ?? "";
+const USB_TEST = 'mode === "usb"';
+check(
+  "the self-test run gate returns refusals only, never the USB note",
+  runGate.length > 0 && !runGate.includes(USB_TEST),
+  runGate.includes(USB_TEST)
+    ? "selfTestUnavailableReason still returns the USB note"
+    : "clean",
+);
+check(
+  "and that note lives in a function the run gate does not consult",
+  linkNote.includes(USB_TEST),
+  linkNote ? "selfTestLinkNote carries it" : "selfTestLinkNote not found",
+);
+const canRunWiring = pageSrc.slice(
+  pageSrc.indexOf("canRun:"),
+  pageSrc.indexOf("canRun:") + 200,
+);
+check(
+  "the panel is wired to the gate, not to the note",
+  canRunWiring.includes("selfTestUnavailableReason") &&
+    !canRunWiring.includes("selfTestLinkNote"),
+  canRunWiring.split(String.fromCharCode(10))[1] ?? "",
+);
+
 // ===========================================================================
 console.log("\n--- console ---");
 check(

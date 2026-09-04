@@ -3097,18 +3097,32 @@
       }
 
       /**
-       * The self-test section specifically. The USB sentence is a NOTE, not a
-       * refusal: the dock protocol runs the same suite through its own test
-       * component, and only one line of the report comes out differently.
+       * Why the self-test cannot run, or null. This is the RUN GATE, so
+       * everything it returns must be a genuine refusal — the panel treats any
+       * sentence it gets back as a reason not to start.
+       *
+       * The USB caveat deliberately lives in `selfTestLinkNote` instead. It
+       * used to be returned from here, which read well and blocked the USB-C
+       * link from running a self-test at all: the one link whose support this
+       * tab advertises with a footnote of its own.
        */
       function selfTestUnavailableReason() {
         if (client && !caps.factoryTest) {
           return "This SDK build cannot run the self-test on this link (no runFactoryTest). Re-vendor the SDK bundle.";
         }
+        return testUnavailableReason();
+      }
+
+      /**
+       * Something worth knowing before reading the report, or null. NEVER a
+       * refusal — see the note above — and shown beside the panel rather than
+       * in place of it.
+       */
+      function selfTestLinkNote() {
         if (client && mode === "usb") {
           return "Over the USB-C/dock link the self-test runs through the dock protocol's own test command. One line comes out differently: the ExG chip test reports FAIL from the dock, because that connection and the chip share pins. That is the docked test, not the board.";
         }
-        return testUnavailableReason();
+        return null;
       }
 
       /** The LED buttons specifically. */
@@ -3159,8 +3173,11 @@
            closes it. */
         btn.disabled = !!client && (streaming || sdLogging);
         btn.title = reason ?? "";
+        /* The refusal if there is one, otherwise whatever is worth knowing
+           about this link. Both end up in the same place on screen; only one
+           of them may reach the run gate. */
         $("selfTestNote").textContent = client
-          ? (selfTestUnavailableReason() ?? "")
+          ? (selfTestUnavailableReason() ?? selfTestLinkNote() ?? "")
           : "";
         $("driftNote").textContent =
           client && !caps.rtcRead

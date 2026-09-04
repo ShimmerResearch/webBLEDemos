@@ -864,8 +864,13 @@ export function createRtcDriftPanel(host, opts = {}) {
       baseLine.textContent = `Clock base: none — the sensor's clock is ${signed(clockBaseRawSec, 0)} s off this host's, too far off the quarter-hour grid to be a timezone. Sync it before a long run; the drift fit itself is unaffected.`;
       return;
     }
+    /* "None" means no whole-quarter-hour base was detected — NOT that the two
+       clocks agree. Anything inside the slack window lands here, so the sensor
+       can still be a minute or so out, and the offset readout is the thing
+       that says by how much. Claiming they are in step would contradict the
+       stat beside it. */
     baseLine.textContent =
-      "Clock base: none — the sensor's clock is on host UTC.";
+      "Clock base: none — no timezone-shaped offset, so the sensor's clock is compared with this host's directly. See the offset for how far apart they are.";
   }
 
   function paintControls() {
