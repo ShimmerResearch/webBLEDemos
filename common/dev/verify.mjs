@@ -1046,7 +1046,7 @@ check(
 );
 
 // ===========================================================================
-console.log("\n--- unframed (classic-Bluetooth-like, 3-byte dribble) ---");
+console.log("\n--- unframed (Classic-Bluetooth-like, 3-byte dribble) ---");
 await goto(`${BASE}?mock=1&framed=0&rate=102.4`);
 check(
   "connect over the unframed transport",
