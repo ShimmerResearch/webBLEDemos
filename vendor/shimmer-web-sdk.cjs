@@ -4414,6 +4414,219 @@ function classifyFactoryTestAckPacket(buf) {
 }
 
 /**
+ * What a Shimmer says about itself when asked: which Bluetooth module it
+ * carries, and which board it is.
+ *
+ * Both answers are shared across the Shimmer3 Bluetooth client, the Shimmer3R
+ * one and the dock — the same SR codes and the same module strings reach the
+ * host over all three links — so the tables and the formatting live here
+ * rather than in any one client.
+ */
+/** Shimmer platform, from the hardware id the sensor reports. */
+const SHIMMER_PLATFORM_NAMES = Object.freeze({
+    3: 'Shimmer3',
+    10: 'Shimmer3R',
+});
+/**
+ * SR code → board name, from the Java driver's `mMapOfShimmerHardware`
+ * (`ShimmerVerDetails.java:136-169`), whose codes match the firmware's own
+ * `SR_BOARD_CODES` enum (`Boards/shimmer_boards.h:26-43`) exactly.
+ *
+ * These are NOT Shimmer3-only. A Shimmer3R reports the same codes for the
+ * same sensor configurations — the firmware tests for them without regard to
+ * platform, and in one place explicitly pairs `HW_ID_SHIMMER3R` with
+ * `EXP_BRD_EXG_UNIFIED` (`Boards/shimmer_boards.c:136-137`).
+ *
+ * Codes 56-59 and 61-68 (ShimmerGQ, Shimmer4, ECGmd and the Verisense family)
+ * are in the Java map but omitted here: they are other product lines, this SDK
+ * addresses them through their own clients, and a Shimmer3-family sensor
+ * reporting one of them would be a fault worth showing raw rather than naming.
+ */
+const SHIMMER_SR_BOARD_NAMES = Object.freeze({
+    8: 'Bridge Amplifier+',
+    9: 'Span',
+    14: 'GSR+',
+    31: 'IMU',
+    36: 'PROTO3 Mini',
+    37: 'ECG/EMG',
+    38: 'PROTO3 Deluxe',
+    41: 'Base15U',
+    42: 'Base6U',
+    44: '200g Accel',
+    46: 'GPS',
+    47: 'ECG/EMG/Resp',
+    48: 'GSR+',
+    49: 'Bridge Amplifier+',
+    55: 'High-g Accel',
+});
+/**
+ * `SR48-3-0` — the form Shimmer's own product documentation and labels use.
+ *
+ * The Java driver's `getBoardVerString()` (`ExpansionBoardDetails.java:100-102`)
+ * joins the same three numbers with dots instead. Hyphens are used here
+ * because that is what is printed on the boards.
+ */
+function formatShimmerSrCode(board) {
+    return `SR${board.boardId}-${board.boardRev}-${board.specialRev}`;
+}
+/**
+ * True when the daughter-card id page holds a real board rather than one of
+ * the two "nothing here" patterns — all zeroes (never written) or all 0xFF
+ * (erased). Port of `isExpansionBoardValid()`
+ * (`ExpansionBoardDetails.java:104-111`).
+ */
+function isShimmerSrBoardValid(board) {
+    if (!board)
+        return false;
+    const { boardId, boardRev, specialRev } = board;
+    if (boardId === 0 && boardRev === 0 && specialRev === 0)
+        return false;
+    if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
+        return false;
+    return true;
+}
+/**
+ * Describe a sensor's hardware for display: platform, board name and SR code.
+ *
+ * Every part is optional because every part can be missing in practice — an
+ * older firmware that does not answer the hardware-version command, a board
+ * whose id page was never written, an SR code newer than this table.
+ */
+function describeShimmerHardware(hardwareVersion, board) {
+    const platform = hardwareVersion == null ? null : (SHIMMER_PLATFORM_NAMES[hardwareVersion] ?? null);
+    const valid = isShimmerSrBoardValid(board) ? board : null;
+    const boardName = valid ? (SHIMMER_SR_BOARD_NAMES[valid.boardId] ?? null) : null;
+    const srCode = valid ? formatShimmerSrCode(valid) : null;
+    /* A sensor that will not say which platform it is still has a board, and
+     * "unknown hardware GSR+ (SR48-3-0)" reads like a fault rather than a
+     * description. When there is no platform to lead with, the board name leads
+     * instead; a known-but-unnamed hardware id is kept, because the number is
+     * real information. */
+    let head = platform;
+    if (!head && hardwareVersion != null)
+        head = `hardware id ${hardwareVersion}`;
+    let named;
+    if (head)
+        named = boardName ? `${head} ${boardName}` : head;
+    else
+        named = boardName ?? 'unknown hardware';
+    const label = srCode ? `${named} (${srCode})` : named;
+    return { platform, boardName, srCode, label };
+}
+/**
+ * The Bluetooth module replies the Shimmer3 firmware is known to capture,
+ * ported from the Java driver's `BT_MODULE_VERSION` enum
+ * (`BluetoothModuleVersionDetails.java:15-39`) — its middle column is the
+ * substring, its third column the user-facing name.
+ *
+ * Two of the Java names disagree with the reply they are matched against and
+ * are corrected here, because a host that shows a version the module did not
+ * report is worse than one that shows none:
+ *
+ * - `RN4678 V1.13.5` was labelled `v1.15.5`
+ * - `RN4678 V1.22` was labelled `v1.23`, the same as the entry below it
+ *
+ * HARDWARE-VERIFY: transcribed from the Java table, not from modules of each
+ * revision. The substrings are what matter and they come from the modules'
+ * own datasheet-documented replies, but only RN4678 v1.23 and the CYW20820
+ * have been seen by this SDK.
+ */
+const BLUETOOTH_MODULE_VERSIONS = Object.freeze([
+    { match: 'Ver 4.77 RN-42', family: 'rn42', model: 'RN42', version: '4.77' },
+    { match: 'Ver 6.15 04', family: 'rn42', model: 'RN42', version: '6.15' },
+    { match: 'Ver 4.77 05', family: 'rn41', model: 'RN41', version: '4.77' },
+    { match: 'RN4678 V1.00.5', family: 'rn4678', model: 'RN4678', version: '1.00.5' },
+    { match: 'RN4678 V1.11.00', family: 'rn4678', model: 'RN4678', version: '1.11.0' },
+    { match: 'RN4678 V1.13.5', family: 'rn4678', model: 'RN4678', version: '1.13.5' },
+    { match: 'RN4678 V1.22', family: 'rn4678', model: 'RN4678', version: '1.22' },
+    { match: 'RN4678 V1.23', family: 'rn4678', model: 'RN4678', version: '1.23' },
+]);
+/**
+ * The Shimmer3R's reply, built by
+ * `BT_generateCyw20820FirmwareVersionStr()` (`CYW20820.c:1893-1903`):
+ *
+ * ```
+ * CYW20820 app=v01.04.18.18, stack=0x00000000, protocol=0x0000, hardware=0x00
+ * ```
+ *
+ * The four application fields are printed `%02d`, so the leading zeroes are
+ * formatting rather than meaning and are dropped for display — `v1.4.18.18`,
+ * which is how the module's own documentation writes it.
+ */
+const CYW20820_PATTERN = /CYW20820\s+app=v(\d+)\.(\d+)\.(\d+)\.(\d+),\s*stack=(0x[0-9a-f]+),\s*protocol=(0x[0-9a-f]+),\s*hardware=(0x[0-9a-f]+)/i;
+/**
+ * Parse the reply to `GET_BT_VERSION_STR_COMMAND` (0xA1).
+ *
+ * The reply is whatever the Bluetooth module said when the firmware asked it,
+ * passed through unaltered apart from the RN4678's trailing `CMD>` prompt,
+ * which the firmware strips (`Comms/shimmer_bt_uart.c:442-458`). So there is
+ * no single grammar: an RN module answers with a Roving Networks / Microchip
+ * banner, and a Shimmer3R answers with a line the Shimmer firmware composes
+ * itself from the CYW20820's binary version record.
+ *
+ * Never throws. An unrecognised reply is returned with `family: 'unknown'` and
+ * the raw text as its label — the Java equivalent has a bug here that returns
+ * an empty name instead (its `NOT_READ` row carries an empty comparison
+ * string, which `String.contains` matches against every input, so an
+ * unrecognised module is reported as "not read"). What the module actually
+ * said is the most useful thing a host can show.
+ */
+function parseBluetoothModuleVersion(raw) {
+    let text = '';
+    if (typeof raw === 'string') {
+        text = raw;
+    }
+    else if (raw) {
+        /* latin1, byte for byte, matching how the rest of this SDK reads ASCII out
+         * of firmware payloads. A TextDecoder would substitute U+FFFD for the high
+         * bytes a garbled reply can carry, and that substitution would then be
+         * shown to a user as the module's name. */
+        for (const b of raw)
+            text += String.fromCharCode(b);
+    }
+    const trimmed = text.replace(/\0+$/, '').trim();
+    const cyw = CYW20820_PATTERN.exec(trimmed);
+    if (cyw) {
+        const version = [cyw[1], cyw[2], cyw[3], cyw[4]].map((n) => String(Number(n))).join('.');
+        return {
+            raw: text,
+            family: 'cyw20820',
+            model: 'CYW20820',
+            version,
+            label: `CYW20820 v${version}`,
+            details: {
+                stack: cyw[5].toLowerCase(),
+                protocol: cyw[6].toLowerCase(),
+                hardware: cyw[7].toLowerCase(),
+            },
+        };
+    }
+    /* First match wins, and the RN-42 rows are ordered before the RN41 one they
+     * would otherwise be shadowed by: "Ver 4.77 RN-42 01/05/10" also contains
+     * "Ver 4.77 05" from the RN41 row. The Java loop takes the LAST match
+     * instead and gets this right only because of where the rows happen to sit
+     * in its enum. */
+    for (const entry of BLUETOOTH_MODULE_VERSIONS) {
+        if (trimmed.includes(entry.match)) {
+            return {
+                raw: text,
+                family: entry.family,
+                model: entry.model,
+                version: entry.version,
+                label: `${entry.model} v${entry.version}`,
+            };
+        }
+    }
+    return {
+        raw: text,
+        family: 'unknown',
+        model: null,
+        version: null,
+        label: trimmed.length ? trimmed : 'not reported',
+    };
+}
+
+/**
  * Transport-agnostic capture state machine for a Shimmer factory self-test.
  *
  * The firmware answers `SET_FACTORY_TEST` with a generic ACK first
@@ -6393,6 +6606,30 @@ const SD_RESPONSE_OPCODES = new Set([
     SD_TRANSFER_OPCODES.DELETE_RESPONSE,
 ]);
 /**
+ * Responses shaped `[opcode][length][data…]`, and the largest payload length
+ * the firmware will report for each — the value that separates a real response
+ * from a stray byte that happens to equal the opcode.
+ *
+ * - daughter-card memory and InfoMem: the handlers refuse a read above 128
+ *   bytes (`Comms/shimmer_bt_uart.c`, the SET/GET_INFOMEM and
+ *   GET_DAUGHTER_CARD_MEM arg checks)
+ * - the daughter-card id page: 16 bytes, one EEPROM page
+ * - the Bluetooth module version: whatever the module replied, held in the
+ *   firmware's `char btVerStrResponse[100]`
+ *
+ * A response missing from this table cannot be reassembled on a byte stream —
+ * the drain has no way to know where it ends, so it resyncs through it one
+ * byte at a time and the read times out. That is invisible over BLE, where a
+ * notification is already one whole message, and shows up only over classic
+ * Bluetooth or the USB serial link.
+ */
+const DECLARED_LENGTH_RESPONSE_CAPS = Object.freeze({
+    [OPCODES.DAUGHTER_CARD_MEM_RESPONSE]: 128,
+    [OPCODES.INFOMEM_RESPONSE]: 128,
+    [OPCODES.DAUGHTER_CARD_ID_RESPONSE]: 16,
+    [OPCODES.BT_VERSION_STR_RESPONSE]: 100,
+});
+/**
  * Total length (INCLUDING the leading opcode) of the control message at the
  * head of `buf`, or {@link NEED_MORE} when more bytes are required to tell, or
  * {@link RESYNC} when the leading byte starts nothing we recognise.
@@ -6459,10 +6696,11 @@ function shimmer3rControlMessageLength(buf, opts = {}) {
         const total = SHIMMER3R_INQ_CHANNELS_OFFSET + numChannels;
         return buf.length < total ? NEED_MORE : total;
     }
-    if (opcode === OPCODES.DAUGHTER_CARD_MEM_RESPONSE || opcode === OPCODES.INFOMEM_RESPONSE) {
-        // [opcode][length][data…]; the firmware caps both a daughter-card and an
-        // InfoMem read at 128 bytes, so a larger "length" is garbage rather than a
-        // giant response.
+    const declaredCap = DECLARED_LENGTH_RESPONSE_CAPS[opcode];
+    if (declaredCap !== undefined) {
+        // [opcode][length][data…]; each response's cap is the largest payload the
+        // firmware will produce for it, so a larger "length" is a stray byte
+        // rather than a giant response.
         //
         // Framing these means the whole response arrives as ONE message, so
         // `_readLengthPrefixedResponse`'s continuation path — which treats later
@@ -6471,10 +6709,10 @@ function shimmer3rControlMessageLength(buf, opts = {}) {
         // frame them and would resync straight past the tail of the record.
         if (buf.length < 2)
             return NEED_MORE;
-        const memLen = buf[1];
-        if (memLen > 128)
+        const declaredLen = buf[1];
+        if (declaredLen > declaredCap)
             return RESYNC;
-        const total = 2 + memLen;
+        const total = 2 + declaredLen;
         return buf.length < total ? NEED_MORE : total;
     }
     const payload = SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS[opcode];
@@ -9941,7 +10179,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      * MTU the CYW20820 negotiates — and the transport surfaces one notification
      * per chunk, so any response longer than that arrives split. Firmware writes
      * the logical response contiguously, so the fragments simply concatenate in
-     * order: accumulate until `expectedLen` data bytes have arrived instead of
+     * order: accumulate until `want` data bytes have arrived instead of
      * assuming the first chunk holds the whole response.
      *
      * Firmware always emits the length byte after the opcode, but its absence is
@@ -9963,6 +10201,25 @@ class Shimmer3RClient extends BaseShimmerClient {
             : await this._waitForResponse(respOpcode, responseTimeoutMs);
         /* Bytes after the response opcode. */
         let acc = first[0] === respOpcode ? first.subarray(1) : first;
+        /* `'declared'` is for the responses whose length the host cannot know in
+         * advance because the firmware measures it — the Bluetooth module version
+         * string is `strlen()` of whatever the module replied
+         * (`Comms/shimmer_bt_uart.c:2092-2099`). The length byte is consumed here
+         * and the header machinery below is then switched off, since the only
+         * header there was has already been read. */
+        let want;
+        if (expectedLen === 'declared') {
+            if (acc.length < 1) {
+                throw new Error(`${label} response carried no length byte.`);
+            }
+            want = acc[0];
+            acc = acc.subarray(1);
+            headerBytes = 0;
+            expectedOffset = undefined;
+        }
+        else {
+            want = expectedLen;
+        }
         /* Whether a header is present is decided by reading it, because a response
          * without one is a case this client supports (see the loopback test for an
          * InfoMem reply with no length byte). That check is unavoidably a guess for
@@ -9975,7 +10232,7 @@ class Shimmer3RClient extends BaseShimmerClient {
          * one byte into a coincidence on three. Previously only `buf[0]` was
          * examined and the offset bytes were ignored entirely. */
         const hasHeader = (buf) => {
-            if (buf.length < headerBytes || buf[0] !== expectedLen)
+            if (buf.length < headerBytes || buf[0] !== want)
                 return false;
             if (headerBytes >= 3 && expectedOffset !== undefined) {
                 return (buf[1] | (buf[2] << 8)) === expectedOffset;
@@ -9983,15 +10240,15 @@ class Shimmer3RClient extends BaseShimmerClient {
             return true;
         };
         const dataOf = (buf) => hasHeader(buf) ? buf.subarray(headerBytes) : buf;
-        if (dataOf(acc).length >= expectedLen) {
-            return dataOf(acc).slice(0, expectedLen);
+        if (dataOf(acc).length >= want) {
+            return dataOf(acc).slice(0, want);
         }
         /* Response is fragmented — collect the continuation chunks, which carry
          * raw payload bytes with no opcode of their own. */
         return new Promise((resolve, reject) => {
             const t = setTimeout(() => {
                 this._offTemp(handler);
-                reject(new Error(`${label} returned ${dataOf(acc).length} of ${expectedLen} bytes (response truncated).`));
+                reject(new Error(`${label} returned ${dataOf(acc).length} of ${want} bytes (response truncated).`));
             }, responseTimeoutMs);
             const handler = (chunk) => {
                 if (!chunk || chunk.length === 0)
@@ -10004,10 +10261,10 @@ class Shimmer3RClient extends BaseShimmerClient {
                  * mid-response. */
                 acc = concatU8(acc, chunk);
                 const data = dataOf(acc);
-                if (data.length >= expectedLen) {
+                if (data.length >= want) {
                     clearTimeout(t);
                     this._offTemp(handler);
-                    resolve(data.slice(0, expectedLen));
+                    resolve(data.slice(0, want));
                 }
             };
             this._onTemp(handler);
@@ -10058,6 +10315,64 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._emitStatus(`SET_FEATURE reboot-on-disconnect=${enabled ? 1 : 0} → waiting for ACK…`);
         await this._writeExpectingAck(new Uint8Array([OPCODES.SET_FEATURE, BT_FEATURE.REBOOT_ON_DISCONNECT, enabled ? 1 : 0]), 1500);
         this._emitStatus(`Reboot-on-disconnect ${enabled ? 'armed' : 'cleared'}`);
+    }
+    /**
+     * Read the board's SR identity — `{boardId, boardRev, specialRev}`, the
+     * first three bytes of the daughter-card id page
+     * (GET_DAUGHTER_CARD_ID_COMMAND 0x66 → `[0x65][length][bytes…]`,
+     * `Comms/shimmer_bt_uart.c:1308-1317, 2268-2277`).
+     *
+     * This is the page the firmware caches at boot, not a live EEPROM read, so
+     * it answers even on a board whose EEPROM has since gone away. Returns null
+     * when the page holds one of the two "nothing here" patterns — all zeroes,
+     * never written, or all 0xFF, erased — which is what
+     * {@link isShimmerSrBoardValid} tests for.
+     *
+     * Despite the name there is no separate expansion board on a Shimmer3R: the
+     * page carries the SR code of the board itself, drawn from the same table
+     * the Shimmer3 uses. Pair it with {@link describeShimmerHardware} to get a
+     * line like `Shimmer3R GSR+ (SR48-3-0)`.
+     */
+    async readSrBoard() {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        this._emitStatus('GET_DAUGHTER_CARD_ID → waiting for ACK then RSP…');
+        const payload = await this._readLengthPrefixedResponse(new Uint8Array([OPCODES.GET_DAUGHTER_CARD_ID_COMMAND, 3, 0]), OPCODES.DAUGHTER_CARD_ID_RESPONSE, 3, 'Daughter-card id read');
+        const board = parseExpansionBoard(payload);
+        this._emitStatus(board ? `SR board ${formatShimmerSrCode(board)}` : 'SR board id page is blank');
+        return board;
+    }
+    /**
+     * Read what the Bluetooth module says its own version is
+     * (GET_BT_VERSION_STR_COMMAND 0xA1 → `[0xA2][length][ASCII…]`,
+     * `Comms/shimmer_bt_uart.c:2092-2099`).
+     *
+     * The length is the firmware's `strlen()` of the module's reply, so the host
+     * cannot know it in advance — and the Shimmer3R's reply is around seventy
+     * characters, more than one BLE notification carries, so the reassembly in
+     * the read helper is load-bearing here.
+     *
+     * What comes back differs by platform, which is why the result is parsed
+     * rather than returned as a string: a Shimmer3 forwards the RN module's own
+     * banner (minus the `CMD>` prompt the firmware strips), while a Shimmer3R
+     * returns a line the Shimmer firmware composes from the CYW20820's binary
+     * version record. {@link parseBluetoothModuleVersion} covers both and keeps
+     * the raw text either way.
+     *
+     * An empty reply is not an error: `btVerStrResponse` starts zeroed and is
+     * only filled once the module has answered the firmware's own query, so a
+     * sensor asked early enough — or one whose module never replied — reports a
+     * zero length. That arrives as `family: 'unknown'` with the label
+     * `'not reported'`.
+     */
+    async readBtModuleVersion() {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        this._emitStatus('GET_BT_VERSION_STR → waiting for ACK then RSP…');
+        const payload = await this._readLengthPrefixedResponse(new Uint8Array([OPCODES.GET_BT_VERSION_STR_COMMAND]), OPCODES.BT_VERSION_STR_RESPONSE, 'declared', 'Bluetooth module version read');
+        const parsed = parseBluetoothModuleVersion(payload);
+        this._emitStatus(`Bluetooth module: ${parsed.label}`);
+        return parsed;
     }
     /**
      * Read from the daughter-card (expansion board) EEPROM memory. `offset` is a
@@ -15538,6 +15853,28 @@ class WiredShimmerClient extends BaseShimmerClient {
     async _readExpansionBoardImpl() {
         const payload = await this._readMem(UART_PROP.DAUGHTER_CARD.CARD_ID, 0, 16);
         return parseExpansionBoard(payload);
+    }
+    /**
+     * Read what the Bluetooth module says its own version is
+     * (`BLUETOOTH.VER`, the dock protocol's equivalent of the Bluetooth
+     * link's GET_BT_VERSION_STR_COMMAND).
+     *
+     * Same reply, same parser, same caveat: a Shimmer3 forwards the RN module's
+     * banner and a Shimmer3R returns the line the Shimmer firmware composes from
+     * the CYW20820's version record, so the result is parsed rather than handed
+     * back as a string. See {@link parseBluetoothModuleVersion}.
+     *
+     * Worth knowing over this link in particular: the module has to have been
+     * powered and asked for the firmware to have anything cached, and a sensor
+     * sitting in a dock may have had its radio off since boot. An empty reply is
+     * reported as `family: 'unknown'` with the label `'not reported'` rather
+     * than as an error.
+     */
+    async readBtModuleVersion() {
+        const payload = await this.getConfig(UART_PROP.BLUETOOTH.VER);
+        const parsed = parseBluetoothModuleVersion(payload);
+        this._emitStatus(`Bluetooth module: ${parsed.label}`);
+        return parsed;
     }
     /**
      * Read from the daughter-card EEPROM memory (`DAUGHTER_CARD.CARD_MEM`).
@@ -26337,6 +26674,7 @@ exports.ASM_COMMAND = ASM_COMMAND;
 exports.ASM_PROPERTY = ASM_PROPERTY;
 exports.BASE_HARDWARE_IDS = BASE_HARDWARE_IDS;
 exports.BLE_LINK_MIN_FW = BLE_LINK_MIN_FW;
+exports.BLUETOOTH_MODULE_VERSIONS = BLUETOOTH_MODULE_VERSIONS;
 exports.BRAND_BLE_MAX_CHARS = BRAND_BLE_MAX_CHARS;
 exports.BRAND_BLE_MAX_CHARS_SHIMMER3 = BRAND_BLE_MAX_CHARS_SHIMMER3;
 exports.BRAND_BT_CLASSIC_MAX_CHARS = BRAND_BT_CLASSIC_MAX_CHARS;
@@ -26520,6 +26858,8 @@ exports.SHIMMER3_SENSOR_LABELS = SHIMMER3_SENSOR_LABELS;
 exports.SHIMMER3_SPP_SERIAL_OPTIONS = SHIMMER3_SPP_SERIAL_OPTIONS;
 exports.SHIMMER3_SPP_UUID = SHIMMER3_SPP_UUID;
 exports.SHIMMER_FACTORY_TEST_CLASSIFIERS = SHIMMER_FACTORY_TEST_CLASSIFIERS;
+exports.SHIMMER_PLATFORM_NAMES = SHIMMER_PLATFORM_NAMES;
+exports.SHIMMER_SR_BOARD_NAMES = SHIMMER_SR_BOARD_NAMES;
 exports.SHIMMER_UART_CRC_INIT = SHIMMER_UART_CRC_INIT;
 exports.SMARTDOCK_BASE_CMD = SMARTDOCK_BASE_CMD;
 exports.SMARTDOCK_CONNECTION_TYPE = SMARTDOCK_CONNECTION_TYPE;
@@ -26670,6 +27010,7 @@ exports.deleteDownloadedFromCard = deleteDownloadedFromCard;
 exports.deriveShimmer3FirmwareVersionCode = deriveShimmer3FirmwareVersionCode;
 exports.deriveVerisenseMacIdFromName = deriveVerisenseMacIdFromName;
 exports.describePlatformSupport = describePlatformSupport;
+exports.describeShimmerHardware = describeShimmerHardware;
 exports.describeVerisenseChargerStatus = describeVerisenseChargerStatus;
 exports.detectExgPreset = detectExgPreset;
 exports.detectFactoryTestReportFamily = detectFactoryTestReportFamily;
@@ -26699,6 +27040,7 @@ exports.formatByteAsHex = formatByteAsHex;
 exports.formatPendingEventProperties = formatPendingEventProperties;
 exports.formatSchedulerPayloadForLog = formatSchedulerPayloadForLog;
 exports.formatSdImportStamp = formatSdImportStamp;
+exports.formatShimmerSrCode = formatShimmerSrCode;
 exports.formatStatusPayloadForLog = formatStatusPayloadForLog;
 exports.formatVerisenseChargerStatus = formatVerisenseChargerStatus;
 exports.formatVerisenseFirmwareVersion = formatVerisenseFirmwareVersion;
@@ -26738,6 +27080,7 @@ exports.isNewImuSensors = isNewImuSensors;
 exports.isRoutineVerisenseDfuLogMessage = isRoutineVerisenseDfuLogMessage;
 exports.isSafeFirmwareArchiveName = isSafeFirmwareArchiveName;
 exports.isSdLoggingFirmware = isSdLoggingFirmware;
+exports.isShimmerSrBoardValid = isShimmerSrBoardValid;
 exports.isSupportedEightByteDerivedSensors = isSupportedEightByteDerivedSensors;
 exports.isSupportedMpl = isSupportedMpl;
 exports.isSupportedRtcConfigViaUart = isSupportedRtcConfigViaUart;
@@ -26764,6 +27107,7 @@ exports.padVerisenseOperationalConfig = padVerisenseOperationalConfig;
 exports.parseActiveSlot = parseActiveSlot;
 exports.parseBatteryStatus = parseBatteryStatus;
 exports.parseBleLinkDebugPayload = parseBleLinkDebugPayload;
+exports.parseBluetoothModuleVersion = parseBluetoothModuleVersion;
 exports.parseBrandRecord = parseBrandRecord;
 exports.parseCalibDump = parseCalibDump;
 exports.parseCalibrationBlob = parseCalibrationBlob;

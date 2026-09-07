@@ -70,6 +70,9 @@ const CMD = Object.freeze({
   SET_EXG_REGS: 0x61,
   EXG_REGS_RESPONSE: 0x62,
   GET_EXG_REGS: 0x63,
+  SET_DAUGHTER_CARD_ID: 0x64,
+  DAUGHTER_CARD_ID_RESPONSE: 0x65,
+  GET_DAUGHTER_CARD_ID: 0x66,
   SET_DAUGHTER_CARD_MEM: 0x67,
   DAUGHTER_CARD_MEM_RESPONSE: 0x68,
   GET_DAUGHTER_CARD_MEM: 0x69,
@@ -78,6 +81,8 @@ const CMD = Object.freeze({
   GET_STATUS: 0x72,
   SET_DATA_RATE_TEST: 0xa4,
   DATA_RATE_TEST_RESPONSE: 0xa5,
+  GET_BT_VERSION_STR: 0xa1,
+  BT_VERSION_STR_RESPONSE: 0xa2,
   SET_FACTORY_TEST: 0xa8,
   INSTREAM_CMD_RESPONSE: 0x8a,
   SET_INFOMEM: 0x8c,
@@ -702,6 +707,39 @@ export function createMockShimmer3RTransport(opts = {}) {
   const stockBrand = buildStockBrandRecord(hardwareVersion);
   eeprom.set(stockBrand, BRAND_RECORD_HOST_OFFSET);
 
+  /* The daughter-card ID page: the FIRST sixteen EEPROM bytes, which the
+     card-memory store above deliberately does not cover. Firmware answers
+     GET_DAUGHTER_CARD_ID from a copy it caches at boot rather than from the
+     chip, which is why it is a separate array here too.
+
+     Default `[48, 3, 0]` — a GSR+ board, SR48-3-0 — so the page has something
+     to name. `&srBoard=none` empties it to the erased 0xFF pattern a board
+     whose page was never written reports. */
+  const srBoardPage = new Uint8Array(16).fill(0xff);
+  if (opts.srBoard !== "none") {
+    const parts = String(opts.srBoard ?? "48-3-0")
+      .split("-")
+      .map((n) => Number.parseInt(n, 10));
+    srBoardPage[0] = Number.isFinite(parts[0]) ? parts[0] & 0xff : 48;
+    srBoardPage[1] = Number.isFinite(parts[1]) ? parts[1] & 0xff : 3;
+    srBoardPage[2] = Number.isFinite(parts[2]) ? parts[2] & 0xff : 0;
+  }
+
+  /* What the Bluetooth module replied when the firmware asked it, verbatim.
+     The Shimmer3R default is the line `BT_generateCyw20820FirmwareVersionStr`
+     composes (`CYW20820.c:1893-1903`); a Shimmer3 forwards the RN module's
+     own banner instead, so `hardwareVersion === 3` gets one of those.
+
+     `&btVersion=` (empty) models the real zero-length case: the firmware's
+     buffer starts zeroed and is filled only once the module has answered its
+     own query, so a sensor asked early enough reports nothing. */
+  const btVersionString =
+    opts.btVersion !== undefined
+      ? String(opts.btVersion)
+      : hardwareVersion === 3
+        ? "RN4678 V1.23 06/30/2021 (c)Microchip Technology Inc"
+        : "CYW20820 app=v01.04.18.18, stack=0x00000000, protocol=0x0000, hardware=0x00";
+
   /* Calibration RAM with the synthetic dump at the front of it. Everything
      past the dump reads as zeros, which is what a read past a real dump
      returns — and what makes the SDK's "take the total from the first
@@ -915,6 +953,20 @@ export function createMockShimmer3RTransport(opts = {}) {
     },
     /** Exactly the text put on the wire, for a byte-for-byte comparison. */
     text: () => testText,
+  };
+
+  transport.identity = {
+    /** The SR board page's first three bytes, or null when it reads erased. */
+    get srBoard() {
+      const [boardId, boardRev, specialRev] = srBoardPage;
+      if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
+        return null;
+      return { boardId, boardRev, specialRev };
+    },
+    /** What the Bluetooth module replied, exactly as it goes on the wire. */
+    get btVersion() {
+      return btVersionString;
+    },
   };
 
   transport.rtc = {
@@ -2167,6 +2219,35 @@ export function createMockShimmer3RTransport(opts = {}) {
         calibStats.updates++;
         reply([ACK]);
         return;
+
+      case CMD.GET_DAUGHTER_CARD_ID: {
+        // [0x66][len][offset] → [0x65][len][data…], capped at one page
+        const len = cmd[1] ?? 0;
+        const off = cmd[2] ?? 0;
+        if (len < 1 || off + len > srBoardPage.length) {
+          reply([NACK]);
+          return;
+        }
+        const out = new Uint8Array(2 + len);
+        out[0] = CMD.DAUGHTER_CARD_ID_RESPONSE;
+        out[1] = len;
+        out.set(srBoardPage.subarray(off, off + len), 2);
+        reply(concat([ACK], out));
+        return;
+      }
+
+      case CMD.GET_BT_VERSION_STR: {
+        /* [0xa1] → [0xa2][strlen][ASCII…]. No arguments, and the length is
+           the firmware's own `strlen()` of the module's reply — which is why
+           a zero-length answer is a legitimate one and not modelled as a
+           NACK. Sent through `reply()` whole: on a framed link that makes it
+           one notification the SDK has to split by the declared length, and
+           on an unframed one the dribble path exercises reassembly. */
+        const bytes = [];
+        for (const ch of btVersionString) bytes.push(ch.charCodeAt(0) & 0xff);
+        reply(concat([ACK, CMD.BT_VERSION_STR_RESPONSE, bytes.length], bytes));
+        return;
+      }
 
       case CMD.GET_DAUGHTER_CARD_MEM: {
         // [0x69][len][offsetLo][offsetHi] → [0x68][len][data…]
