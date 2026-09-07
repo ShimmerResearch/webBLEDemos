@@ -730,9 +730,18 @@ export function createMockShimmer3RTransport(opts = {}) {
     const parts = String(opts.srBoard ?? "48-3-0")
       .split("-")
       .map((n) => Number.parseInt(n, 10));
-    srBoardPage[0] = Number.isFinite(parts[0]) ? parts[0] & 0xff : 48;
-    srBoardPage[1] = Number.isFinite(parts[1]) ? parts[1] & 0xff : 3;
-    srBoardPage[2] = Number.isFinite(parts[2]) ? parts[2] & 0xff : 0;
+    const triple = [
+      Number.isFinite(parts[0]) ? parts[0] & 0xff : 48,
+      Number.isFinite(parts[1]) ? parts[1] & 0xff : 3,
+      Number.isFinite(parts[2]) ? parts[2] & 0xff : 0,
+    ];
+    /* An all-zero SR code means the page was never written, so the WHOLE page
+       is zero - not three zeroes in front of the 0xFF fill above, which is
+       neither pattern and would misrepresent the state to anything that
+       looked past the first three bytes. A real board's remaining bytes hold
+       other hardware details, so those stay 0xFF. */
+    if (triple.every((v) => v === 0)) srBoardPage.fill(0x00);
+    else srBoardPage.set(triple, 0);
   }
 
   /* What the Bluetooth module replied when the firmware asked it, verbatim.

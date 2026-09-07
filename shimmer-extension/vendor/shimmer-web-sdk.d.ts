@@ -3190,7 +3190,7 @@ declare function formatShimmerSrCode(board: ShimmerSrBoard): string;
  * (erased). Port of `isExpansionBoardValid()`
  * (`ExpansionBoardDetails.java:104-111`).
  */
-declare function isShimmerSrBoardValid(board: ShimmerSrBoard | null | undefined): boolean;
+declare function isShimmerSrBoardValid(board: ShimmerSrBoard | null | undefined): board is ShimmerSrBoard;
 /** A sensor's board identity, ready to render. */
 interface ShimmerHardwareDescription {
     /** `'Shimmer3'` / `'Shimmer3R'`, or null when the hardware id is unknown. */

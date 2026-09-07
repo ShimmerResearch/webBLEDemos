@@ -4879,13 +4879,15 @@ check(
   (await evaluate(CONNECT)) === "mock",
 );
 const identZero = await evaluate(`${IDENT}
-  return { ...rows(), board: JSON.stringify(window.mockTransport.identity.srBoard) };
+  const page = await window.mockClient.readSrBoard();
+  return { ...rows(), board: JSON.stringify(page) };
 `);
 check(
   "an all-zero id page is no board, not the board SR0-0-0",
-  /* All zeroes is as much "never written" as all 0xFF is "erased". */
-  identZero.hw === "Shimmer3R" && !identZero.hw.includes("SR0"),
-  `${identZero.hw}  (mock page ${identZero.board})`,
+  /* All zeroes is as much "never written" as all 0xFF is "erased", and the
+     SDK has to read BOTH as absent. */
+  identZero.hw === "Shimmer3R" && !identZero.hw.includes("SR0") && identZero.board === "null",
+  `${identZero.hw}  (readSrBoard -> ${identZero.board})`,
 );
 
 // ===========================================================================
