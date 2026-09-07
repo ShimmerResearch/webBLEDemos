@@ -138,10 +138,35 @@ greyed out with that reason while a stream or a recording is running.
 ## Device identity, on every tab
 
 The panel beside the Sensor link card carries what is true of the sensor
-whatever tab you are on: its name, MAC, hardware and firmware, the battery
-voltage, charge and charger state, which link it is on, and — over a Bluetooth
-link — the decoded device status flags: docked, sensing, streaming, logging,
-SD card present, SD file error, clock set, USB plugged in.
+whatever tab you are on: its name, MAC, hardware, firmware, Bluetooth module,
+the battery voltage, charge and charger state, which link it is on, and — over
+a Bluetooth link — the decoded device status flags: docked, sensing, streaming,
+logging, SD card present, SD file error, clock set, USB plugged in.
+
+Three of those rows say more than their labels suggest.
+
+**Name** is the sensor's own configured name, out of its configuration image,
+which is the name it answers to everywhere else — in its recordings' file
+names, in Consensys, on the naming tab. When that has not been read yet, or
+was never set, the panel falls back to the name the link reported and says so:
+`(advertising name)`. The two can differ, because a Bluetooth module only
+re-reads its name at boot, so a rename that has not been followed by a
+power-cycle still advertises the old one. A serial link — classic Bluetooth or
+USB-C — reports no device name at all, so there the configured name is the only
+one there is.
+
+**Hardware** is the platform, the board and its SR code: `Shimmer3R GSR+
+(SR48-3-0)`. The SR code comes from the board's own id page, and each part is
+dropped if it is not known — a board newer than this page's name table still
+shows as `Shimmer3R (SR52-1-0)`, and a sensor whose id page was never written
+as `Shimmer3R`.
+
+**Bluetooth** is what the radio module says about _itself_, which is not the
+same thing as the sensor's firmware version on the row above. A Shimmer3
+reports its RN module's own banner (`RN4678 v1.23`); a Shimmer3R reports the
+CYW20820 in the Vela module (`CYW20820 v1.4.18.18`). It reads `not reported`
+when the module has not answered the firmware's version query — which is a
+real state on a sensor asked early enough, not an error.
 
 It sits there rather than on the Configure tab because two of those facts gate
 work everywhere else. Whether the sensor is sensing decides both an SD download
@@ -149,14 +174,6 @@ and a name write, and the battery is the thing to check before starting a long
 download. The flags are also the only way to learn that the sensor was started
 from its own button, or that its firmware could not open its SD file; the page
 says so in the log when it sees them.
-
-**Measure link speed** is next to the connect buttons, because it measures the
-link and not the card: it free-runs the firmware's data-rate test, which
-reports the pipe itself — connection interval and MTU on BLE, buffering on
-Classic Bluetooth — rather than the file-transfer protocol on top of it. It is
-Bluetooth-only (the dock command set has no data-rate test) and refused while
-the sensor is sensing or a transfer is running, because it saturates the link
-on purpose. The figure it produces also drives the download ETAs on the SD tab.
 
 ## The clock
 
@@ -335,8 +352,22 @@ the same way whether the sensor is on a radio or in a dock.
 
 ## Test
 
-Two things the sensor can be asked about itself. (The red LED used to be a
-third; it is on **General** now, because nothing about it is a test.)
+Three things that take the sensor's link exclusively for a while. (The red LED
+used to be here too; it is on **General** now, because nothing about it is a
+test.)
+
+**Link speed** free-runs the firmware's data-rate test for five seconds and
+counts what arrives, which is the only honest way to know a link's throughput:
+BLE negotiates its connection interval with the host's own Bluetooth stack, so
+two hosts and the same sensor can differ severalfold. It is Bluetooth-only —
+the dock command set has no data-rate test — and refused while the sensor is
+sensing or a transfer is running, because it saturates the link on purpose. The
+figure lands in the SD card tab's stats and drives its download estimates, so
+measuring once after connecting makes those estimates worth reading.
+
+It used to sit beside the connect buttons. It is here now because it is a test
+that holds the link, which is what everything else on this tab does, and it
+shares their gating.
 
 **The factory self-test** is the same suite the firmware runs on the
 production line, and it prints the same report: pick one of its four suites
@@ -402,19 +433,21 @@ data at the configured rate. It models a small synthetic card, but not timing, p
 error paths, and it deliberately does not implement every command — a refused
 one is a useful thing to be able to see.
 
-| Parameter          | Effect                                                                                                                                  |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `?mock=1`          | Framed replies, one per notification — how BLE behaves.                                                                                 |
-| `&framed=0`        | Replies dribbled three bytes at a time — how a Classic-Bluetooth or USB byte stream behaves, and what re-framing is for.                |
-| `&rate=<Hz>`       | Sampling rate, default 51.2.                                                                                                            |
-| `&sdKBps=`         | Throttle the synthetic card's transfer rate, so progress and abort have something to act on.                                            |
-| `&fw=`             | Report a different firmware version, to see the SD tab refuse an unsupported one.                                                       |
-| `&hw=none`         | Refuse to say what hardware it is, to see the conservative name limits apply.                                                           |
-| `&testMs=`         | Shorten the self-test's per-LED dwell (2000 ms on real hardware, so a full LED test really is 18 seconds).                              |
-| `&testFail=1`      | A failing self-test: a FAIL line, a line long enough for the firmware to truncate, and the fail mask that goes with it.                 |
-| `&ppm=`            | Run the mock sensor's clock at this error, so the drift monitor has a slope to find.                                                    |
-| `&clockBase=local` | Start the sensor's clock on this host's civil time rather than UTC — what a sensor set by a tool using the other convention looks like. |
-| `&debug=1`         | Log every command and reply to the browser console.                                                                                     |
+| Parameter          | Effect                                                                                                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `?mock=1`          | Framed replies, one per notification — how BLE behaves.                                                                                                                                                 |
+| `&framed=0`        | Replies dribbled three bytes at a time — how a Classic-Bluetooth or USB byte stream behaves, and what re-framing is for.                                                                                |
+| `&rate=<Hz>`       | Sampling rate, default 51.2.                                                                                                                                                                            |
+| `&sdKBps=`         | Throttle the synthetic card's transfer rate, so progress and abort have something to act on.                                                                                                            |
+| `&fw=`             | Report a different firmware version, to see the SD tab refuse an unsupported one.                                                                                                                       |
+| `&hw=none`         | Refuse to say what hardware it is, to see the conservative name limits apply.                                                                                                                           |
+| `&testMs=`         | Shorten the self-test's per-LED dwell (2000 ms on real hardware, so a full LED test really is 18 seconds).                                                                                              |
+| `&testFail=1`      | A failing self-test: a FAIL line, a line long enough for the firmware to truncate, and the fail mask that goes with it.                                                                                 |
+| `&ppm=`            | Run the mock sensor's clock at this error, so the drift monitor has a slope to find.                                                                                                                    |
+| `&clockBase=local` | Start the sensor's clock on this host's civil time rather than UTC — what a sensor set by a tool using the other convention looks like.                                                                 |
+| `&srBoard=`        | The board's SR identity, as `id-rev-special` (default `48-3-0`, a GSR+). `none` fills the id page with 0xFF, an erased chip; `0-0-0` leaves it all zeroes, a page never written. Both read as no board. |
+| `&btVersion=`      | What the Bluetooth module replied. Defaults to a CYW20820 line, or an RN4678 banner with `&hw=3`. Empty models a module that never answered.                                                            |
+| `&debug=1`         | Log every command and reply to the browser console.                                                                                                                                                     |
 
 While the mock is connected, `mockTransport.writes` in the console is every
 command the page has sent, and `mockTransport.emitDisconnect()` simulates a

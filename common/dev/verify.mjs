@@ -187,7 +187,8 @@ const linkIdle = await evaluate(`
   const wired = new sdk.WiredShimmerClient({ transport: new sdk.LoopbackTransport() });
   const radio = new sdk.Shimmer3RClient({ debug: false });
   return {
-    inLinkCard: btn.closest('.card') === document.getElementById('btnBle').closest('.card'),
+    inTestTab: btn.closest('#tabTest') !== null,
+    notInLinkCard: btn.closest('.card') !== document.getElementById('btnBle').closest('.card'),
     notInSdPanel: !document.getElementById('sdPanel').contains(btn) &&
       document.querySelector('#sdPanel [data-sd-role="linkTest"]') === null,
     disabled: btn.disabled,
@@ -201,8 +202,12 @@ const linkIdle = await evaluate(`
   };
 `);
 check(
-  "the link-speed button moved out of the SD panel and into the Sensor link card",
-  linkIdle.inLinkCard &&
+  /* Twice moved: out of the SD panel, then out of the connect column. It is a
+     test that takes the link exclusively, which is what the Test tab is for,
+     and its result is still read by the SD panel's own estimates. */
+  "the link-speed button lives in the Test tab, not the SD panel or the connect column",
+  linkIdle.inTestTab &&
+    linkIdle.notInLinkCard &&
     linkIdle.notInSdPanel &&
     linkIdle.cap === "linkTest" &&
     linkIdle.requires === "idle" &&
@@ -319,6 +324,7 @@ check("connect pill after mock connect", (await evaluate(CONNECT)) === "mock");
 const ident = await evaluate(`
   const t = id => document.getElementById(id).textContent;
   return { name:t('idName'), mac:t('idMac'), hw:t('idHw'), fw:t('idFw'),
+    btModule:t('idBtModule'),
     batt:t('idBatt'), link:t('idLink'), imPill:t('imPill'),
     rate:document.getElementById('ratePill').textContent,
     fields:document.querySelectorAll('#configForm .field').length,
@@ -329,11 +335,31 @@ const ident = await evaluate(`
 `);
 check(
   "identity line populated",
-  ident.name.includes("Shimmer3R") &&
+  /* The name is the sensor's OWN configured name, out of the configuration
+     image, not the advertising name the link reported — that one is the
+     fallback and says so when it is used. The hardware line is platform,
+     board and SR code rather than the raw hardware id, which told a reader
+     nothing that "Shimmer3R" does not. */
+  ident.name === "Shimmer_8091" &&
     ident.mac === "000666668091" &&
-    ident.hw.includes("id 10") &&
+    ident.hw === "Shimmer3R GSR+ (SR48-3-0)" &&
     ident.fw.includes("LogAndStream"),
   JSON.stringify(ident),
+);
+check(
+  "and the Bluetooth module is named from what the module itself replied",
+  /* A Shimmer3R answers with a line the Shimmer firmware composes from the
+     CYW20820's version record; a Shimmer3 forwards its RN module's banner.
+     Both are parsed, and the version shown is the module's own. */
+  ident.btModule === "CYW20820 v1.4.18.18",
+  ident.btModule,
+);
+check(
+  "the battery percentage is rounded, not the estimator's raw float",
+  /* The SDK returns the polynomial's output, as a library should. A reading
+     carrying fifteen decimal places reads as a fault. */
+  /^\d+\.\d\d V \((<1|\d{1,3}) %\)( — charger \w+)?$/.test(ident.batt),
+  ident.batt,
 );
 check(
   "form + sensor grid + hex view built",
@@ -842,12 +868,13 @@ check(
   `${sdLink.link} — ${sdLink.guide[1]?.slice(-72) ?? "no guide line"}`,
 );
 
-// ---- 4. and the button that starts it now lives with the connect buttons
+// ---- 4. and the button that starts it now lives in the Test tab
 const linkBtn = await evaluate(`
   const btn = document.getElementById('btnLinkTest');
   const pill = document.getElementById('linkSpeedPill');
-  const linkCard = document.getElementById('btnBle').closest('.card');
-  const before = { inLinkCard: btn.closest('.card') === linkCard,
+  document.getElementById('tabBtnTest').click();
+  await new Promise(r => setTimeout(r, 200));
+  const before = { inTestTab: btn.closest('#tabTest') !== null,
     disabled: btn.disabled, note: document.getElementById('linkTestNote').textContent,
     title: btn.title };
   btn.click();
@@ -863,8 +890,8 @@ const linkBtn = await evaluate(`
     noteAfter: document.getElementById('linkTestNote').textContent };
 `);
 check(
-  "the link-speed button works from the Sensor link card and reports beside itself",
-  linkBtn.before.inLinkCard &&
+  "the link-speed button works from the Test tab and reports beside itself",
+  linkBtn.before.inTestTab &&
     !linkBtn.before.disabled &&
     linkBtn.before.note === "" &&
     /measures the pipe itself/.test(linkBtn.before.title) &&
@@ -1055,12 +1082,21 @@ check(
 const un = await evaluate(`
   const t = id => document.getElementById(id).textContent;
   return { name:t('idName'), mac:t('idMac'), fw:t('idFw'), link:t('idLink'),
+    hw:t('idHw'), btModule:t('idBtModule'),
     imPill:t('imPill'), rate:document.getElementById('ratePill').textContent,
     fields:document.querySelectorAll('#configForm .field').length };
 `);
 check(
   "unframed link reads identity and the whole image",
-  un.name.endsWith("-BT") &&
+  /* The configured name, not the link's: a serial link reports no device name
+     at all, which is why this row read "(name not reported)" on every
+     classic-Bluetooth and USB connection. The two identity reads added
+     alongside it also have to survive the unframer here — over BLE a
+     notification is already one whole message, which would hide a response
+     the length table does not know how to end. */
+  un.name === "Shimmer_8091" &&
+    un.hw === "Shimmer3R GSR+ (SR48-3-0)" &&
+    un.btModule === "CYW20820 v1.4.18.18" &&
     un.mac === "000666668091" &&
     un.imPill === "384 bytes read" &&
     un.rate === "102.4 Hz" &&
@@ -1656,7 +1692,12 @@ const brandUnknown = await evaluate(
 );
 check(
   "an unidentified sensor keeps the SHORT BLE cap, even though the config form defaulted to a Shimmer3R",
-  brandUnknown.idHw === "–" &&
+  /* The hardware line leads with the BOARD when the sensor will not say which
+     platform it is: "unknown hardware GSR+" reads like a fault, and the SR
+     code is the useful half. That the platform is genuinely still unknown is
+     what the BLE cap assertions below prove — an unidentified sensor keeps the
+     shorter Shimmer3 cap, which is safe on either platform. */
+  brandUnknown.idHw === "GSR+ (SR48-3-0)" &&
     brandUnknown.fields === 40 &&
     brandUnknown.contextHw === 8 &&
     brandUnknown.maxAttr === 8 &&
@@ -2301,7 +2342,13 @@ check(
 // Calibration on a Shimmer3, which has neither of the alternate sensors.
 // ===========================================================================
 console.log("\n--- calibration: a Shimmer3 ---");
-await goto(`${BASE}?mock=1&hw=3`);
+/* SR48-2-0 on purpose: the expansion board's revision is what separates an
+   old-IMU Shimmer3 from a new-IMU one (revision >= 3 on a GSR+ board), and
+   this pass is about the older LSM303DLHC/MPU9150 tables. It used to be left
+   to whatever the mock's id page happened to hold, which was nothing at all --
+   the page was reading the wrong EEPROM page and inferring the generation
+   from unrelated bytes. */
+await goto(`${BASE}?mock=1&hw=3&srBoard=48-2-0`);
 check("connect to a Shimmer3", (await evaluate(CONNECT)) === "mock");
 const calS3 = await evaluate(`
   ${CAL}
@@ -2323,7 +2370,7 @@ const calS3 = await evaluate(`
 const s3keys = calS3.sensors.map((s) => s.key);
 check(
   "a Shimmer3 hides the high-g accel and the alternate magnetometer it does not have",
-  /^Shimmer3 \(hardware id 3\)$/.test(calS3.hw) &&
+  calS3.hw === "Shimmer3 GSR+ (SR48-2-0)" &&
     !s3keys.includes("altAccel") &&
     !s3keys.includes("altMag") &&
     s3keys.join(",") === "lnAccel,gyro,wrAccel,mag,id:36",
@@ -2653,18 +2700,23 @@ check(
     // as much a regression as one that paints wrong.
     tabIds.length === 7 &&
     tabIds.every((t) => panel.perTab[t].visible) &&
-    tabIds.every((t) => panel.perTab[t].name.includes("Shimmer3R")) &&
+    tabIds.every((t) => panel.perTab[t].name === "Shimmer_8091") &&
     tabIds.every((t) => panel.perTab[t].flags === 9) &&
     /V \(.*%\) — charger/.test(panel.perTab.tabSd.batt),
   `${tabIds.join(", ")} — ${panel.perTab.tabSd.batt}`,
 );
 check(
   "and it does not push the tab strip below the fold on a laptop",
-  // 424px is where the tab strip sat before this panel existed, measured on
-  // the same viewport against the previous commit — so the budget is "no
-  // lower than the identity list it replaced", not an arbitrary line.
+  /* 424px is where the tab strip sat before this panel existed, measured on
+     the same viewport against the commit before it — so the budget started as
+     "no lower than the identity list it replaced", not an arbitrary line.
+     Raised to 450 when the Bluetooth-module row was added: one more row costs
+     about 21px, the panel is what decides this height rather than the connect
+     column beside it, and the strip still ends less than two thirds of the way
+     down the shortest laptop viewport measured here. Any further row is a
+     deliberate decision, which is the point of the budget. */
   panel.tabsBottom < panel.viewport &&
-    panel.tabsBottom <= 430 &&
+    panel.tabsBottom <= 450 &&
     panel.refreshInPanel &&
     panel.battDetailGone &&
     panel.clockCard[0] === "Clock" &&
@@ -2837,7 +2889,7 @@ check(
 );
 check(
   "and saying how fresh the flags are still costs the tab strip nothing",
-  started.tabsBottom === read.tabsBottom && started.tabsBottom <= 430,
+  started.tabsBottom === read.tabsBottom && started.tabsBottom <= 450,
   `tab strip ends at ${started.tabsBottom}px, same as with the flags freshly read`,
 );
 
@@ -4168,6 +4220,56 @@ for (const [fn, flags] of Object.entries(MUST_EXPLAIN)) {
   );
 }
 
+/* The board read has to be the ID page, not the card MEMORY page. Firmware
+   maps host offset 0 of the memory read past the first EEPROM page, so
+   `readDaughterCardMem(0, 16)` returns absolute bytes 16..31 and its first
+   three bytes are not an SR code at all. The page inferred the sensor's part
+   generation from them for as long as it did that, and the mistake is
+   invisible on a Shimmer3R (hardware id 10 decides) and silent on a Shimmer3
+   (it just offers the wrong option tables). Checked at source level because
+   the wrong answer is still a well-formed one. */
+const radioConnect = fnBody(pageSrc, "afterConnectRadio") ?? "";
+check(
+  "the SR board comes from the id page, not from the card-memory page",
+  radioConnect.includes("readSrBoard()") &&
+    /* The mistake itself, rather than the string: the page's own comment
+       quotes the old call deliberately, to say why it is not that. */
+    !pageSrc.includes("parseExpansionBoard(await client.readDaughterCardMem"),
+  radioConnect.includes("readSrBoard()")
+    ? "readSrBoard"
+    : "still reading the wrong page",
+);
+check(
+  "and the generation is inferred from that same read, not a second one",
+  (pageSrc.match(/inferShimmer3Generation\(/g) ?? []).length === 2 &&
+    (pageSrc.match(/boardId: srBoard\.boardId/g) ?? []).length === 2,
+  `${(pageSrc.match(/inferShimmer3Generation\(/g) ?? []).length} call sites, ` +
+    `${(pageSrc.match(/boardId: srBoard\.boardId/g) ?? []).length} fed from srBoard`,
+);
+
+/* The Device row prefers the sensor's OWN name over the link's. Pinned
+   because the fallback is what a reader sees when it breaks, and it broke
+   quietly before: on a serial link there is no advertising name at all, so
+   the row read "(name not reported)" on every classic-Bluetooth and USB
+   connection. */
+const nameLabel = fnBody(pageSrc, "deviceNameLabel") ?? "";
+check(
+  "the Device row prefers the configured name and labels the fallback as advertised",
+  nameLabel.includes("configuredName") &&
+    nameLabel.indexOf("configuredName") < nameLabel.indexOf("deviceName") &&
+    nameLabel.includes("advertising name"),
+  nameLabel ? "configured first, advertising named as such" : "not found",
+);
+check(
+  "and it reads that name with a context, which is what parseInfoMem takes",
+  /* Handed a layout instead, parseInfoMem resolves a layout FROM it and reads
+     every field at an undefined offset — which fails silently, as an empty
+     name. */
+  !pageSrc.includes("parseInfoMem(deviceImage, layout)") &&
+    pageSrc.includes("parseInfoMem(deviceImage, context)"),
+  pageSrc.includes("parseInfoMem(deviceImage, context)") ? "context" : "not the context",
+);
+
 /* The one that had drifted: the calibration tab's disabled state must come
    from the same predicate as its sentence, not a hand-copied list. */
 const CALIB_DISABLE = "btn.disabled = !!client && !!calibLinkHeldReason()";
@@ -4668,6 +4770,124 @@ check(
     refreshHook.kept.sens.join(",") === "14,14,14" &&
     refreshHook.kept.faint === 0,
   `offset ${refreshHook.kept.off.join(",")}, sensitivity ${refreshHook.kept.sens.join(",")}, ${refreshHook.kept.faint} greyed`,
+);
+
+// ===========================================================================
+// What the sensor says it is: the identity rows, across the range of answers
+// a sensor can actually give.
+// ===========================================================================
+console.log("\n--- what the sensor says it is ---");
+
+const IDENT = `
+  const t = (id) => document.getElementById(id).textContent;
+  const rows = () => ({ name: t('idName'), hw: t('idHw'), bt: t('idBtModule'),
+                        batt: t('idBatt') });
+`;
+
+await goto(`${BASE}?mock=1&hw=3`);
+check(
+  "connect a Shimmer3 for its module banner",
+  (await evaluate(CONNECT)) === "mock",
+);
+const identS3 = await evaluate(`${IDENT}
+  return { ...rows(),
+    btRaw: window.mockTransport.identity.btVersion,
+    board: JSON.stringify(window.mockTransport.identity.srBoard),
+    idReads: (window.mockTransport.writes ?? [])
+      .filter(w => (w.bytes ?? w.data)[0] === 0x66).length,
+    verReads: (window.mockTransport.writes ?? [])
+      .filter(w => (w.bytes ?? w.data)[0] === 0xa1).length };
+`);
+check(
+  "a Shimmer3 reports its RN module, parsed to the version the module named",
+  /* The reply is the module's own banner, forwarded by the firmware with the
+     RN4678's trailing CMD> prompt stripped. The Java driver labelled two of
+     these with versions their own banner contradicts; this does not. */
+  identS3.bt === "RN4678 v1.23" &&
+    identS3.btRaw.startsWith("RN4678 V1.23 06/30/2021"),
+  `${identS3.bt}  <-  "${identS3.btRaw}"`,
+);
+check(
+  "and its hardware line is platform, board and SR code",
+  identS3.hw === "Shimmer3 GSR+ (SR48-3-0)" &&
+    identS3.board === '{"boardId":48,"boardRev":3,"specialRev":0}',
+  identS3.hw,
+);
+check(
+  "each identity read costs exactly one round trip on connect",
+  identS3.idReads === 1 && identS3.verReads === 1,
+  `id page ${identS3.idReads}, module version ${identS3.verReads}`,
+);
+
+await goto(`${BASE}?mock=1&srBoard=none&btVersion=`);
+check(
+  "connect a sensor that answers neither",
+  (await evaluate(CONNECT)) === "mock",
+);
+const identBlank = await evaluate(`${IDENT} return rows();`);
+check(
+  "an erased id page leaves the platform alone rather than inventing a board",
+  identBlank.hw === "Shimmer3R",
+  identBlank.hw,
+);
+check(
+  "and a module that never answered says so, instead of reading as a fault",
+  /* btVerStrResponse starts zeroed and is filled only once the module has
+     replied to the firmware's own query, so a zero-length answer is a real
+     state and not an error. */
+  identBlank.bt === "not reported",
+  identBlank.bt,
+);
+
+await goto(`${BASE}?mock=1&srBoard=52-1-0`);
+check(
+  "connect a sensor on an unlisted board",
+  (await evaluate(CONNECT)) === "mock",
+);
+const identNew = await evaluate(`${IDENT} return rows();`);
+check(
+  "an SR code newer than the name table still identifies the sensor",
+  /* The code is the half a support engineer needs, so it survives the name
+     being unknown. */
+  identNew.hw === "Shimmer3R (SR52-1-0)",
+  identNew.hw,
+);
+
+await goto(
+  `${BASE}?mock=1&btVersion=${encodeURIComponent("RN4678 V1.23 " + "x".repeat(300))}`,
+);
+check(
+  "connect a sensor whose module reply is longer than the protocol allows",
+  (await evaluate(CONNECT)) === "mock",
+);
+const identLong = await evaluate(`${IDENT}
+  return { ...rows(), rawLen: window.mockTransport.identity.btVersion.length };
+`);
+check(
+  "an over-long module reply is truncated to the firmware's buffer, not wrapped",
+  /* The length byte is one byte. A reply longer than 255 characters would
+     wrap it while the full string still went out, and the host would wait for
+     the wrong number of bytes and time out. A real sensor cannot report more
+     than its own char[100] holds. */
+  identLong.rawLen > 255 && identLong.bt === "RN4678 v1.23",
+  `${identLong.rawLen} chars offered → ${identLong.bt}`,
+);
+
+await goto(`${BASE}?mock=1&srBoard=0-0-0`);
+check(
+  "connect a sensor whose id page was never written",
+  (await evaluate(CONNECT)) === "mock",
+);
+const identZero = await evaluate(`${IDENT}
+  const page = await window.mockClient.readSrBoard();
+  return { ...rows(), board: JSON.stringify(page) };
+`);
+check(
+  "an all-zero id page is no board, not the board SR0-0-0",
+  /* All zeroes is as much "never written" as all 0xFF is "erased", and the
+     SDK has to read BOTH as absent. */
+  identZero.hw === "Shimmer3R" && !identZero.hw.includes("SR0") && identZero.board === "null",
+  `${identZero.hw}  (readSrBoard -> ${identZero.board})`,
 );
 
 // ===========================================================================

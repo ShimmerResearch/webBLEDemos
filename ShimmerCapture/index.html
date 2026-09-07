@@ -478,22 +478,6 @@
             <span class="pill" id="connPill">disconnected</span>
           </div>
           <div class="banner" id="platformBanner"></div>
-          <!-- Measures the LINK, not the card, so it belongs with the connect
-               buttons rather than in the SD panel it used to live in. The
-               result still lands in that panel's stats strip and its download
-               ETAs, which is where it gets used. -->
-          <div class="row">
-            <button
-              id="btnLinkTest"
-              type="button"
-              data-requires="idle"
-              data-cap="linkTest"
-            >
-              Measure link speed (5 s)
-            </button>
-            <span class="pill" id="linkSpeedPill">not measured</span>
-          </div>
-          <div class="field-hint" id="linkTestNote"></div>
         </div>
 
         <aside class="card device-panel" id="devicePanel">
@@ -523,6 +507,8 @@
             <div id="idHw">–</div>
             <div class="muted">Firmware</div>
             <div id="idFw">–</div>
+            <div class="muted">Bluetooth</div>
+            <div id="idBtModule">–</div>
             <div class="muted">Battery</div>
             <div id="idBatt">–</div>
             <div class="muted">Link</div>
@@ -909,6 +895,35 @@
       <!-- ====================================================== Test ===== -->
       <section class="tab" id="tabTest">
         <div class="banner" id="testBanner"></div>
+
+        <!-- Here rather than beside the connect buttons, where it used to be:
+             it is a test that takes the link exclusively for five seconds,
+             which is what everything else on this tab does, and it shares the
+             gating machinery with them. The connect row is where the eye
+             should land on the primary action. -->
+        <div class="card">
+          <div class="card-title">Link speed</div>
+          <div class="field-hint" id="linkTestNote"></div>
+          <div class="row">
+            <button
+              id="btnLinkTest"
+              type="button"
+              data-requires="idle"
+              data-cap="linkTest"
+            >
+              Measure link speed (5 s)
+            </button>
+            <span class="pill" id="linkSpeedPill">not measured</span>
+          </div>
+          <div class="field-hint" style="margin-top: 8px">
+            Streams data for five seconds and counts what arrives, which is the
+            only honest way to know a link's throughput: BLE negotiates its
+            connection interval with the host's own Bluetooth stack, so two
+            hosts and the same sensor can differ severalfold. The figure lands
+            in the SD card tab's stats and drives its download estimates, so
+            measuring once after connecting makes those estimates worth reading.
+          </div>
+        </div>
 
         <div class="card">
           <div class="card-title">Factory self-test</div>
@@ -1458,7 +1473,43 @@
 
       /** Identity, for the CSV file name and the header line. */
       let deviceMac = "";
+      /**
+       * The name the LINK reported — a BLE advertising name, or nothing at
+       * all on a serial link, which has no name to give. Distinct from the
+       * name the SENSOR holds in its configuration; `deviceNameLabel()` says
+       * which is shown and why.
+       */
       let deviceName = "";
+      /** The sensor's own configured name, once the configuration is read. */
+      let configuredName = "";
+      /** The board's SR identity (`{boardId, boardRev, specialRev}`). */
+      let srBoard = null;
+
+      /**
+       * What to put on the Device row.
+       *
+       * The sensor's own configured name comes first. It is the name the
+       * sensor answers to everywhere else — in its recordings' file names, in
+       * Consensys, on the naming tab — it reaches this page over every link
+       * including USB, and it is the one a user set deliberately.
+       *
+       * The link's name is the fallback, and on BLE that is the advertising
+       * name, which is derived from the configured one but can lag it: the
+       * module only re-reads its name at boot, so a rename that has not been
+       * followed by a power-cycle still advertises the old one. Worth showing
+       * when it is all there is, worth not preferring.
+       *
+       * Neither is available before the configuration has been read, and a
+       * serial link never supplies the second, which is why this used to read
+       * "(name not reported)" so much of the time — on classic Bluetooth and
+       * USB it was reported every time, because Web Serial has no device name
+       * to report at all.
+       */
+      function deviceNameLabel(linklessFallback = "(name not reported)") {
+        if (configuredName) return configuredName;
+        if (deviceName) return `${deviceName} (advertising name)`;
+        return linklessFallback;
+      }
 
       /** True while the calibration panel is reading or writing. */
       let calibBusy = false;
@@ -1848,6 +1899,7 @@
           idMac: "–",
           idHw: "–",
           idFw: "–",
+          idBtModule: "–",
           idBatt: "–",
           idLink: "–",
         });
@@ -1855,9 +1907,19 @@
         $("rwcValue").textContent = "–";
       }
 
-      function hardwareLabel(hardwareVersion) {
-        if (hardwareVersion == null) return null;
-        return `${HW_NAMES[hardwareVersion] ?? "unknown"} (hardware id ${hardwareVersion})`;
+      /**
+       * What the sensor is, the way it is written on the box: platform, board
+       * name and SR code — `Shimmer3R GSR+ (SR48-3-0)`.
+       *
+       * The SDK owns the tables and the degrading, because each piece can be
+       * missing on its own: a firmware that will not report a hardware id, a
+       * board whose id page was never written, an SR code newer than the
+       * table. The hardware id alone is kept out of the happy path now — it
+       * told a user nothing that "Shimmer3R" does not.
+       */
+      function hardwareLabel(hardwareVersion, board) {
+        if (hardwareVersion == null && !board) return null;
+        return sdk.describeShimmerHardware(hardwareVersion, board).label;
       }
 
       function firmwareLabel(fw) {
@@ -1880,7 +1942,19 @@
        */
       function batteryLabel(batt) {
         if (!batt || !Number.isFinite(batt.voltage)) return null;
-        const pct = batt.percentage == null ? "–" : `${batt.percentage} %`;
+        /* The SDK returns the polynomial's own output, as a library should —
+           rounding is a display decision. Whole percent: the curve is a
+           four-term fit of a discharge characteristic, so a tenth of a percent
+           claims a precision the estimate does not have, and a full float
+           reads as a fault. A reading below half a percent is shown as `<1 %`
+           rather than `0 %`, which would say "flat" about a sensor still
+           running. */
+        const pct =
+          batt.percentage == null
+            ? "–"
+            : batt.percentage > 0 && batt.percentage < 0.5
+              ? "<1 %"
+              : `${Math.round(batt.percentage)} %`;
         const charger = batt.chargingStatus
           ? ` — charger ${batt.chargingStatus}`
           : "";
@@ -2553,6 +2627,22 @@
        */
       function adoptDeviceImage(bytes) {
         deviceImage = new Uint8Array(bytes);
+        /* The Device row's preferred source, and it arrives here rather than
+           in either connect path because this is the one place both of them
+           funnel the image through.
+
+           `context`, not `layout`: parseInfoMem resolves the layout itself
+           from the context, and handing it a layout leaves it reading fields
+           at undefined offsets. Not caught here for the same reason — a throw
+           would mean the image and the context disagree, which is worth
+           seeing rather than swallowing. An image that fails the parser's own
+           validity check yields an empty name, which `deviceNameLabel` reads
+           as "nothing configured" and falls back from. */
+        if (context) {
+          const parsed = sdk.parseInfoMem(deviceImage, context);
+          configuredName = parsed.deviceName ?? "";
+          setIdentity({ idName: deviceNameLabel() });
+        }
         form.setImage(bytes);
         form.captureBaseline();
         baselineSensors = sensorsFromImage();
@@ -3252,7 +3342,7 @@
        */
       function testUnavailableReason() {
         if (!client) {
-          return "Connect over BLE, Classic Bluetooth or USB-C to run the sensor's built-in self-test, watch its clock drift against this host, or switch its red LED.";
+          return "Connect over BLE, Classic Bluetooth or USB-C to measure the link, run the sensor's built-in self-test, or watch its clock drift against this host.";
         }
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses a self-test while it is — the test takes the whole sensor over for up to a minute. Stop the stream first.";
@@ -3910,11 +4000,47 @@
           );
         }
 
+        /* The board's own SR identity, from the daughter-card ID page.
+           Two jobs: it names the sensor on the panel, and its revision is
+           what separates a new-IMU Shimmer3 from an old-IMU one and so which
+           option tables the configuration form offers.
+
+           This used to read `readDaughterCardMem(0, 16)`, which is a
+           different EEPROM page: the firmware maps host offset 0 of the
+           card-MEMORY read past the first page, to absolute byte 16
+           (`Comms/shimmer_bt_uart.c`, the GET_DAUGHTER_CARD_MEM handler's
+           `eepromRead(dcMemOffset + 16U, ...)`), while the ID page is
+           absolute 0..15. So the three bytes it parsed as an SR code were
+           whatever sits after it, and the generation was being inferred from
+           them. The Java driver asks the way this does now — three bytes at
+           offset 0 of the ID page (`ShimmerBluetooth.readExpansionBoardID`).
+
+           Best-effort: an older firmware may not answer, and a Shimmer3R
+           does not need it for the layout (hardware id 10 decides). */
+        srBoard = await tryDevice("read the board's SR id", () =>
+          typeof client.readSrBoard === "function"
+            ? client.readSrBoard()
+            : Promise.resolve(null),
+        );
+
+        /* What the Bluetooth module says about itself. Worth a round trip
+           because it is the one part of a sensor a host cannot otherwise
+           see, and the answer decides whether a link problem is worth
+           chasing in the module's own release notes. */
+        const btModule = await tryDevice(
+          "read the Bluetooth module version",
+          () =>
+            typeof client.readBtModuleVersion === "function"
+              ? client.readBtModuleVersion()
+              : Promise.resolve(null),
+        );
+
         setIdentity({
-          idName: deviceName || "(name not reported)",
+          idName: deviceNameLabel(),
           idMac: mac ?? "(unavailable)",
-          idHw: hardwareLabel(hw?.hardwareVersion),
+          idHw: hardwareLabel(hw?.hardwareVersion, srBoard),
           idFw: firmwareLabel(fw),
+          idBtModule: btModule?.label ?? "(not read)",
         });
 
         const info = await tryDevice("inquire the channel list", () =>
@@ -3937,21 +4063,10 @@
             internal: fw?.patch ?? 0,
           },
         };
-        /* An expansion board's revision is what separates a new-IMU Shimmer3
-           from an old-IMU one, and therefore which option tables the schema
-           offers. A Shimmer3R does not need it (hardware id 10 decides), so
-           this stays best-effort. */
-        const board = await tryDevice(
-          "read the expansion board id",
-          async () =>
-            typeof client.readDaughterCardMem === "function"
-              ? sdk.parseExpansionBoard(await client.readDaughterCardMem(0, 16))
-              : null,
-        );
         generation = sdk.inferShimmer3Generation(
           ctx,
-          board
-            ? { boardId: board.boardId, boardRev: board.boardRev }
+          srBoard
+            ? { boardId: srBoard.boardId, boardRev: srBoard.boardRev }
             : undefined,
         );
         buildForm(ctx);
@@ -4007,10 +4122,21 @@
         );
         const version = id?.firmwareVersion;
 
+        /* `identify()` already read the ID page over this link, so there is
+           nothing more to ask for. */
+        srBoard = id?.expansionBoard ?? null;
+        const btModule = await tryDevice(
+          "read the Bluetooth module version",
+          () =>
+            typeof client.readBtModuleVersion === "function"
+              ? client.readBtModuleVersion()
+              : Promise.resolve(null),
+        );
+
         setIdentity({
-          idName: deviceName || "(over USB / dock serial)",
+          idName: deviceNameLabel("(over USB / dock serial)"),
           idMac: id?.mac ?? "(unavailable)",
-          idHw: hardwareLabel(id?.hardwareVersion),
+          idHw: hardwareLabel(id?.hardwareVersion, srBoard),
           idFw: firmwareLabel(
             version
               ? {
@@ -4022,6 +4148,7 @@
               : null,
           ),
           idBatt: batteryLabel(batt),
+          idBtModule: btModule?.label ?? "(not read)",
         });
         $("hostClock").textContent = formatClock(Date.now());
 
@@ -4036,11 +4163,8 @@
         };
         generation = sdk.inferShimmer3Generation(
           ctx,
-          id?.expansionBoard
-            ? {
-                boardId: id.expansionBoard.boardId,
-                boardRev: id.expansionBoard.boardRev,
-              }
+          srBoard
+            ? { boardId: srBoard.boardId, boardRev: srBoard.boardRev }
             : undefined,
         );
         buildForm(ctx);
@@ -4097,6 +4221,20 @@
       function resetAfterDisconnect() {
         streaming = false;
         sdLogging = false;
+        /* Everything identifying the sensor that has just gone, so nothing
+           belonging to it can be attributed to the next one.
+           `deviceMac` is the one that matters: it is assigned only when the
+           read succeeds (`if (mac) deviceMac = mac`), so a sensor whose MAC
+           could not be read would otherwise inherit the previous sensor's -
+           and `macId` names the device level of the Consensys backup tree, so
+           a download would be filed under the wrong sensor. `deviceName` is
+           reassigned unconditionally on every connect, so it cannot go stale
+           on its own; it is cleared here for the same reason, not because it
+           can leak. */
+        deviceName = "";
+        deviceMac = "";
+        configuredName = "";
+        srBoard = null;
         csvColumns = null;
         schemaFromFrame = false;
         /* A transfer that outlived its link would keep writing zero-length
@@ -4208,6 +4346,16 @@
           ppm: Number(params.get("ppm")) || 0,
           clockBase: params.get("clockBase") === "local" ? "local" : "utc",
         };
+        /* `srBoard=48-3-0` sets the board's SR identity, `srBoard=none` leaves
+           its id page erased. `btVersion=` (empty) models the module never
+           having answered the firmware's own version query, which is a real
+           state and not an error. Both are read straight through, so a value
+           the mock does not recognise reaches the page as the sensor's answer
+           rather than being corrected here. */
+        const srBoard = params.get("srBoard") ?? undefined;
+        const btVersion = params.has("btVersion")
+          ? params.get("btVersion")
+          : undefined;
         /* `hw=none` (or `hw=0`) NACKs GET_DEVICE_VERSION, so the page cannot
            identify the sensor. Anything else is a hardware id. */
         const hwParam = params.get("hw");
@@ -4254,6 +4402,8 @@
             sdKBps,
             factoryTest,
             rtc,
+            srBoard,
+            btVersion,
             debug: params.get("debug") === "1",
           });
           // Hooks for driving the page from the console while developing:

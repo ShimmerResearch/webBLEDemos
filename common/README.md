@@ -117,12 +117,24 @@ link-speed readout. Options worth knowing:
 - `sdKBps` paces the streamed file blocks, so a download takes long
   enough to have a progress bar, a throughput readout and an ETA worth
   looking at, and long enough to abort mid-flight.
+- `srBoard: '48-3-0'` sets the board's SR identity. The two blank patterns
+  are separate cases: `'none'` fills the page with 0xFF, an **erased** chip,
+  and `'0-0-0'` leaves it all zeroes, a page that was **never written**. The
+  SDK reads both as "no board", so both are worth exercising. Note this is
+  the daughter-card ID page, the first sixteen EEPROM bytes — a different
+  page from the card MEMORY the brand record lives in, which is why the mock
+  keeps two stores.
+- `btVersion` is what the Bluetooth module replied when the firmware asked
+  it: a CYW20820 line by default, an RN4678 banner when the hardware id is
+  3, and an empty string for a module that never answered — a real state,
+  since the firmware's buffer starts zeroed.
 - `debug: true` logs every command and reply to the console.
 
 `transport.emitDisconnect()` simulates a dropped link,
-`transport.writes` is every command the page sent, and
-`transport.sdCard.bytes(path)` is exactly what a download of that card
-file should produce — which is what a test compares against.
+`transport.writes` is every command the page sent,
+`transport.identity` is the SR board and module version as the mock now
+holds them, and `transport.sdCard.bytes(path)` is exactly what a download of
+that card file should produce — which is what a test compares against.
 
 It is a development aid, not a firmware simulator: it does not model
 power or most error paths, and its timing is plausible rather than real.
