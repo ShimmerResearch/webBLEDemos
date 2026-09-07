@@ -6621,8 +6621,11 @@ const SD_RESPONSE_OPCODES = new Set([
  *   bytes (`Comms/shimmer_bt_uart.c`, the SET/GET_INFOMEM and
  *   GET_DAUGHTER_CARD_MEM arg checks)
  * - the daughter-card id page: 16 bytes, one EEPROM page
- * - the Bluetooth module version: whatever the module replied, held in the
- *   firmware's `char btVerStrResponse[100]`
+ * - the Bluetooth module version: whatever the module replied. The firmware
+ *   sends `strlen()` of `char btVerStrResponse[100]`, so 99 is the most it can
+ *   report — the hundredth byte is the terminator. The cap is what separates a
+ *   real response from a stray byte equal to the opcode, so it is worth being
+ *   the true maximum rather than the buffer size
  *
  * A response missing from this table cannot be reassembled on a byte stream —
  * the drain has no way to know where it ends, so it resyncs through it one
@@ -6634,7 +6637,7 @@ const DECLARED_LENGTH_RESPONSE_CAPS = Object.freeze({
     [OPCODES.DAUGHTER_CARD_MEM_RESPONSE]: 128,
     [OPCODES.INFOMEM_RESPONSE]: 128,
     [OPCODES.DAUGHTER_CARD_ID_RESPONSE]: 16,
-    [OPCODES.BT_VERSION_STR_RESPONSE]: 100,
+    [OPCODES.BT_VERSION_STR_RESPONSE]: 99,
 });
 /**
  * Total length (INCLUDING the leading opcode) of the control message at the
