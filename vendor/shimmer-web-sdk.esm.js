@@ -3760,6 +3760,219 @@ function shimmerUartCrcCheck(msg) {
 }
 
 /**
+ * What a Shimmer says about itself when asked: which Bluetooth module it
+ * carries, and which board it is.
+ *
+ * Both answers are shared across the Shimmer3 Bluetooth client, the Shimmer3R
+ * one and the dock — the same SR codes and the same module strings reach the
+ * host over all three links — so the tables and the formatting live here
+ * rather than in any one client.
+ */
+/** Shimmer platform, from the hardware id the sensor reports. */
+const SHIMMER_PLATFORM_NAMES = Object.freeze({
+    3: 'Shimmer3',
+    10: 'Shimmer3R',
+});
+/**
+ * SR code → board name, from the Java driver's `mMapOfShimmerHardware`
+ * (`ShimmerVerDetails.java:136-169`), whose codes match the firmware's own
+ * `SR_BOARD_CODES` enum (`Boards/shimmer_boards.h:26-43`) exactly.
+ *
+ * These are NOT Shimmer3-only. A Shimmer3R reports the same codes for the
+ * same sensor configurations — the firmware tests for them without regard to
+ * platform, and in one place explicitly pairs `HW_ID_SHIMMER3R` with
+ * `EXP_BRD_EXG_UNIFIED` (`Boards/shimmer_boards.c:136-137`).
+ *
+ * Codes 56-59 and 61-68 (ShimmerGQ, Shimmer4, ECGmd and the Verisense family)
+ * are in the Java map but omitted here: they are other product lines, this SDK
+ * addresses them through their own clients, and a Shimmer3-family sensor
+ * reporting one of them would be a fault worth showing raw rather than naming.
+ */
+const SHIMMER_SR_BOARD_NAMES = Object.freeze({
+    8: 'Bridge Amplifier+',
+    9: 'Span',
+    14: 'GSR+',
+    31: 'IMU',
+    36: 'PROTO3 Mini',
+    37: 'ECG/EMG',
+    38: 'PROTO3 Deluxe',
+    41: 'Base15U',
+    42: 'Base6U',
+    44: '200g Accel',
+    46: 'GPS',
+    47: 'ECG/EMG/Resp',
+    48: 'GSR+',
+    49: 'Bridge Amplifier+',
+    55: 'High-g Accel',
+});
+/**
+ * `SR48-3-0` — the form Shimmer's own product documentation and labels use.
+ *
+ * The Java driver's `getBoardVerString()` (`ExpansionBoardDetails.java:100-102`)
+ * joins the same three numbers with dots instead. Hyphens are used here
+ * because that is what is printed on the boards.
+ */
+function formatShimmerSrCode(board) {
+    return `SR${board.boardId}-${board.boardRev}-${board.specialRev}`;
+}
+/**
+ * True when the daughter-card id page holds a real board rather than one of
+ * the two "nothing here" patterns — all zeroes (never written) or all 0xFF
+ * (erased). Port of `isExpansionBoardValid()`
+ * (`ExpansionBoardDetails.java:104-111`).
+ */
+function isShimmerSrBoardValid(board) {
+    if (!board)
+        return false;
+    const { boardId, boardRev, specialRev } = board;
+    if (boardId === 0 && boardRev === 0 && specialRev === 0)
+        return false;
+    if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
+        return false;
+    return true;
+}
+/**
+ * Describe a sensor's hardware for display: platform, board name and SR code.
+ *
+ * Every part is optional because every part can be missing in practice — an
+ * older firmware that does not answer the hardware-version command, a board
+ * whose id page was never written, an SR code newer than this table.
+ */
+function describeShimmerHardware(hardwareVersion, board) {
+    const platform = hardwareVersion == null ? null : (SHIMMER_PLATFORM_NAMES[hardwareVersion] ?? null);
+    const valid = isShimmerSrBoardValid(board) ? board : null;
+    const boardName = valid ? (SHIMMER_SR_BOARD_NAMES[valid.boardId] ?? null) : null;
+    const srCode = valid ? formatShimmerSrCode(valid) : null;
+    /* A sensor that will not say which platform it is still has a board, and
+     * "unknown hardware GSR+ (SR48-3-0)" reads like a fault rather than a
+     * description. When there is no platform to lead with, the board name leads
+     * instead; a known-but-unnamed hardware id is kept, because the number is
+     * real information. */
+    let head = platform;
+    if (!head && hardwareVersion != null)
+        head = `hardware id ${hardwareVersion}`;
+    let named;
+    if (head)
+        named = boardName ? `${head} ${boardName}` : head;
+    else
+        named = boardName ?? 'unknown hardware';
+    const label = srCode ? `${named} (${srCode})` : named;
+    return { platform, boardName, srCode, label };
+}
+/**
+ * The Bluetooth module replies the Shimmer3 firmware is known to capture,
+ * ported from the Java driver's `BT_MODULE_VERSION` enum
+ * (`BluetoothModuleVersionDetails.java:15-39`) — its middle column is the
+ * substring, its third column the user-facing name.
+ *
+ * Two of the Java names disagree with the reply they are matched against and
+ * are corrected here, because a host that shows a version the module did not
+ * report is worse than one that shows none:
+ *
+ * - `RN4678 V1.13.5` was labelled `v1.15.5`
+ * - `RN4678 V1.22` was labelled `v1.23`, the same as the entry below it
+ *
+ * HARDWARE-VERIFY: transcribed from the Java table, not from modules of each
+ * revision. The substrings are what matter and they come from the modules'
+ * own datasheet-documented replies, but only RN4678 v1.23 and the CYW20820
+ * have been seen by this SDK.
+ */
+const BLUETOOTH_MODULE_VERSIONS = Object.freeze([
+    { match: 'Ver 4.77 RN-42', family: 'rn42', model: 'RN42', version: '4.77' },
+    { match: 'Ver 6.15 04', family: 'rn42', model: 'RN42', version: '6.15' },
+    { match: 'Ver 4.77 05', family: 'rn41', model: 'RN41', version: '4.77' },
+    { match: 'RN4678 V1.00.5', family: 'rn4678', model: 'RN4678', version: '1.00.5' },
+    { match: 'RN4678 V1.11.00', family: 'rn4678', model: 'RN4678', version: '1.11.0' },
+    { match: 'RN4678 V1.13.5', family: 'rn4678', model: 'RN4678', version: '1.13.5' },
+    { match: 'RN4678 V1.22', family: 'rn4678', model: 'RN4678', version: '1.22' },
+    { match: 'RN4678 V1.23', family: 'rn4678', model: 'RN4678', version: '1.23' },
+]);
+/**
+ * The Shimmer3R's reply, built by
+ * `BT_generateCyw20820FirmwareVersionStr()` (`CYW20820.c:1893-1903`):
+ *
+ * ```
+ * CYW20820 app=v01.04.18.18, stack=0x00000000, protocol=0x0000, hardware=0x00
+ * ```
+ *
+ * The four application fields are printed `%02d`, so the leading zeroes are
+ * formatting rather than meaning and are dropped for display — `v1.4.18.18`,
+ * which is how the module's own documentation writes it.
+ */
+const CYW20820_PATTERN = /CYW20820\s+app=v(\d+)\.(\d+)\.(\d+)\.(\d+),\s*stack=(0x[0-9a-f]+),\s*protocol=(0x[0-9a-f]+),\s*hardware=(0x[0-9a-f]+)/i;
+/**
+ * Parse the reply to `GET_BT_VERSION_STR_COMMAND` (0xA1).
+ *
+ * The reply is whatever the Bluetooth module said when the firmware asked it,
+ * passed through unaltered apart from the RN4678's trailing `CMD>` prompt,
+ * which the firmware strips (`Comms/shimmer_bt_uart.c:442-458`). So there is
+ * no single grammar: an RN module answers with a Roving Networks / Microchip
+ * banner, and a Shimmer3R answers with a line the Shimmer firmware composes
+ * itself from the CYW20820's binary version record.
+ *
+ * Never throws. An unrecognised reply is returned with `family: 'unknown'` and
+ * the raw text as its label — the Java equivalent has a bug here that returns
+ * an empty name instead (its `NOT_READ` row carries an empty comparison
+ * string, which `String.contains` matches against every input, so an
+ * unrecognised module is reported as "not read"). What the module actually
+ * said is the most useful thing a host can show.
+ */
+function parseBluetoothModuleVersion(raw) {
+    let text = '';
+    if (typeof raw === 'string') {
+        text = raw;
+    }
+    else if (raw) {
+        /* latin1, byte for byte, matching how the rest of this SDK reads ASCII out
+         * of firmware payloads. A TextDecoder would substitute U+FFFD for the high
+         * bytes a garbled reply can carry, and that substitution would then be
+         * shown to a user as the module's name. */
+        for (const b of raw)
+            text += String.fromCharCode(b);
+    }
+    const trimmed = text.replace(/\0+$/, '').trim();
+    const cyw = CYW20820_PATTERN.exec(trimmed);
+    if (cyw) {
+        const version = [cyw[1], cyw[2], cyw[3], cyw[4]].map((n) => String(Number(n))).join('.');
+        return {
+            raw: text,
+            family: 'cyw20820',
+            model: 'CYW20820',
+            version,
+            label: `CYW20820 v${version}`,
+            details: {
+                stack: cyw[5].toLowerCase(),
+                protocol: cyw[6].toLowerCase(),
+                hardware: cyw[7].toLowerCase(),
+            },
+        };
+    }
+    /* First match wins, and the RN-42 rows are ordered before the RN41 one they
+     * would otherwise be shadowed by: "Ver 4.77 RN-42 01/05/10" also contains
+     * "Ver 4.77 05" from the RN41 row. The Java loop takes the LAST match
+     * instead and gets this right only because of where the rows happen to sit
+     * in its enum. */
+    for (const entry of BLUETOOTH_MODULE_VERSIONS) {
+        if (trimmed.includes(entry.match)) {
+            return {
+                raw: text,
+                family: entry.family,
+                model: entry.model,
+                version: entry.version,
+                label: `${entry.model} v${entry.version}`,
+            };
+        }
+    }
+    return {
+        raw: text,
+        family: 'unknown',
+        model: null,
+        version: null,
+        label: trimmed.length ? trimmed : 'not reported',
+    };
+}
+
+/**
  * Constants for the Shimmer wired/dock UART protocol.
  *
  * Ported from the Java driver's wiredProtocol package:
@@ -4345,18 +4558,25 @@ function parseBatteryStatus(payload) {
 }
 /**
  * Parse the first 3 bytes of a daughter-card CARD_ID read as
- * `[boardId, boardRev, specialRev]` (ExpansionBoardDetails.java:58-60). Returns
- * null when the board is absent (an unwritten card memory reads back all 0xFF).
+ * `[boardId, boardRev, specialRev]` (ExpansionBoardDetails.java:58-60).
+ *
+ * Returns null when the board is absent, which is BOTH blank patterns: all
+ * 0xFF for an erased page, and all zeroes for one that was never written.
+ * Only the 0xFF case was rejected until now, so an all-zero page came back as
+ * `{0, 0, 0}` and could be rendered as the board `SR0-0-0`. The Java driver's
+ * own `isExpansionBoardValid()` (`ExpansionBoardDetails.java:104-111`) treats
+ * the two the same way, and {@link isShimmerSrBoardValid} is the one
+ * definition of it here.
  */
 function parseExpansionBoard(payload) {
     if (payload.length < 3)
         return null;
-    const boardId = payload[0] & 0xff;
-    const boardRev = payload[1] & 0xff;
-    const specialRev = payload[2] & 0xff;
-    if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
-        return null;
-    return { boardId, boardRev, specialRev };
+    const board = {
+        boardId: payload[0] & 0xff,
+        boardRev: payload[1] & 0xff,
+        specialRev: payload[2] & 0xff,
+    };
+    return isShimmerSrBoardValid(board) ? board : null;
 }
 /**
  * Classify the head of a dock-UART RX buffer for a factory-test capture.
@@ -4409,219 +4629,6 @@ function classifyFactoryTestAckPacket(buf) {
         };
     // A packet for somebody else (a late DATA_RESPONSE): drop it and keep waiting.
     return { kind: 'ignore', consumed: total };
-}
-
-/**
- * What a Shimmer says about itself when asked: which Bluetooth module it
- * carries, and which board it is.
- *
- * Both answers are shared across the Shimmer3 Bluetooth client, the Shimmer3R
- * one and the dock — the same SR codes and the same module strings reach the
- * host over all three links — so the tables and the formatting live here
- * rather than in any one client.
- */
-/** Shimmer platform, from the hardware id the sensor reports. */
-const SHIMMER_PLATFORM_NAMES = Object.freeze({
-    3: 'Shimmer3',
-    10: 'Shimmer3R',
-});
-/**
- * SR code → board name, from the Java driver's `mMapOfShimmerHardware`
- * (`ShimmerVerDetails.java:136-169`), whose codes match the firmware's own
- * `SR_BOARD_CODES` enum (`Boards/shimmer_boards.h:26-43`) exactly.
- *
- * These are NOT Shimmer3-only. A Shimmer3R reports the same codes for the
- * same sensor configurations — the firmware tests for them without regard to
- * platform, and in one place explicitly pairs `HW_ID_SHIMMER3R` with
- * `EXP_BRD_EXG_UNIFIED` (`Boards/shimmer_boards.c:136-137`).
- *
- * Codes 56-59 and 61-68 (ShimmerGQ, Shimmer4, ECGmd and the Verisense family)
- * are in the Java map but omitted here: they are other product lines, this SDK
- * addresses them through their own clients, and a Shimmer3-family sensor
- * reporting one of them would be a fault worth showing raw rather than naming.
- */
-const SHIMMER_SR_BOARD_NAMES = Object.freeze({
-    8: 'Bridge Amplifier+',
-    9: 'Span',
-    14: 'GSR+',
-    31: 'IMU',
-    36: 'PROTO3 Mini',
-    37: 'ECG/EMG',
-    38: 'PROTO3 Deluxe',
-    41: 'Base15U',
-    42: 'Base6U',
-    44: '200g Accel',
-    46: 'GPS',
-    47: 'ECG/EMG/Resp',
-    48: 'GSR+',
-    49: 'Bridge Amplifier+',
-    55: 'High-g Accel',
-});
-/**
- * `SR48-3-0` — the form Shimmer's own product documentation and labels use.
- *
- * The Java driver's `getBoardVerString()` (`ExpansionBoardDetails.java:100-102`)
- * joins the same three numbers with dots instead. Hyphens are used here
- * because that is what is printed on the boards.
- */
-function formatShimmerSrCode(board) {
-    return `SR${board.boardId}-${board.boardRev}-${board.specialRev}`;
-}
-/**
- * True when the daughter-card id page holds a real board rather than one of
- * the two "nothing here" patterns — all zeroes (never written) or all 0xFF
- * (erased). Port of `isExpansionBoardValid()`
- * (`ExpansionBoardDetails.java:104-111`).
- */
-function isShimmerSrBoardValid(board) {
-    if (!board)
-        return false;
-    const { boardId, boardRev, specialRev } = board;
-    if (boardId === 0 && boardRev === 0 && specialRev === 0)
-        return false;
-    if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
-        return false;
-    return true;
-}
-/**
- * Describe a sensor's hardware for display: platform, board name and SR code.
- *
- * Every part is optional because every part can be missing in practice — an
- * older firmware that does not answer the hardware-version command, a board
- * whose id page was never written, an SR code newer than this table.
- */
-function describeShimmerHardware(hardwareVersion, board) {
-    const platform = hardwareVersion == null ? null : (SHIMMER_PLATFORM_NAMES[hardwareVersion] ?? null);
-    const valid = isShimmerSrBoardValid(board) ? board : null;
-    const boardName = valid ? (SHIMMER_SR_BOARD_NAMES[valid.boardId] ?? null) : null;
-    const srCode = valid ? formatShimmerSrCode(valid) : null;
-    /* A sensor that will not say which platform it is still has a board, and
-     * "unknown hardware GSR+ (SR48-3-0)" reads like a fault rather than a
-     * description. When there is no platform to lead with, the board name leads
-     * instead; a known-but-unnamed hardware id is kept, because the number is
-     * real information. */
-    let head = platform;
-    if (!head && hardwareVersion != null)
-        head = `hardware id ${hardwareVersion}`;
-    let named;
-    if (head)
-        named = boardName ? `${head} ${boardName}` : head;
-    else
-        named = boardName ?? 'unknown hardware';
-    const label = srCode ? `${named} (${srCode})` : named;
-    return { platform, boardName, srCode, label };
-}
-/**
- * The Bluetooth module replies the Shimmer3 firmware is known to capture,
- * ported from the Java driver's `BT_MODULE_VERSION` enum
- * (`BluetoothModuleVersionDetails.java:15-39`) — its middle column is the
- * substring, its third column the user-facing name.
- *
- * Two of the Java names disagree with the reply they are matched against and
- * are corrected here, because a host that shows a version the module did not
- * report is worse than one that shows none:
- *
- * - `RN4678 V1.13.5` was labelled `v1.15.5`
- * - `RN4678 V1.22` was labelled `v1.23`, the same as the entry below it
- *
- * HARDWARE-VERIFY: transcribed from the Java table, not from modules of each
- * revision. The substrings are what matter and they come from the modules'
- * own datasheet-documented replies, but only RN4678 v1.23 and the CYW20820
- * have been seen by this SDK.
- */
-const BLUETOOTH_MODULE_VERSIONS = Object.freeze([
-    { match: 'Ver 4.77 RN-42', family: 'rn42', model: 'RN42', version: '4.77' },
-    { match: 'Ver 6.15 04', family: 'rn42', model: 'RN42', version: '6.15' },
-    { match: 'Ver 4.77 05', family: 'rn41', model: 'RN41', version: '4.77' },
-    { match: 'RN4678 V1.00.5', family: 'rn4678', model: 'RN4678', version: '1.00.5' },
-    { match: 'RN4678 V1.11.00', family: 'rn4678', model: 'RN4678', version: '1.11.0' },
-    { match: 'RN4678 V1.13.5', family: 'rn4678', model: 'RN4678', version: '1.13.5' },
-    { match: 'RN4678 V1.22', family: 'rn4678', model: 'RN4678', version: '1.22' },
-    { match: 'RN4678 V1.23', family: 'rn4678', model: 'RN4678', version: '1.23' },
-]);
-/**
- * The Shimmer3R's reply, built by
- * `BT_generateCyw20820FirmwareVersionStr()` (`CYW20820.c:1893-1903`):
- *
- * ```
- * CYW20820 app=v01.04.18.18, stack=0x00000000, protocol=0x0000, hardware=0x00
- * ```
- *
- * The four application fields are printed `%02d`, so the leading zeroes are
- * formatting rather than meaning and are dropped for display — `v1.4.18.18`,
- * which is how the module's own documentation writes it.
- */
-const CYW20820_PATTERN = /CYW20820\s+app=v(\d+)\.(\d+)\.(\d+)\.(\d+),\s*stack=(0x[0-9a-f]+),\s*protocol=(0x[0-9a-f]+),\s*hardware=(0x[0-9a-f]+)/i;
-/**
- * Parse the reply to `GET_BT_VERSION_STR_COMMAND` (0xA1).
- *
- * The reply is whatever the Bluetooth module said when the firmware asked it,
- * passed through unaltered apart from the RN4678's trailing `CMD>` prompt,
- * which the firmware strips (`Comms/shimmer_bt_uart.c:442-458`). So there is
- * no single grammar: an RN module answers with a Roving Networks / Microchip
- * banner, and a Shimmer3R answers with a line the Shimmer firmware composes
- * itself from the CYW20820's binary version record.
- *
- * Never throws. An unrecognised reply is returned with `family: 'unknown'` and
- * the raw text as its label — the Java equivalent has a bug here that returns
- * an empty name instead (its `NOT_READ` row carries an empty comparison
- * string, which `String.contains` matches against every input, so an
- * unrecognised module is reported as "not read"). What the module actually
- * said is the most useful thing a host can show.
- */
-function parseBluetoothModuleVersion(raw) {
-    let text = '';
-    if (typeof raw === 'string') {
-        text = raw;
-    }
-    else if (raw) {
-        /* latin1, byte for byte, matching how the rest of this SDK reads ASCII out
-         * of firmware payloads. A TextDecoder would substitute U+FFFD for the high
-         * bytes a garbled reply can carry, and that substitution would then be
-         * shown to a user as the module's name. */
-        for (const b of raw)
-            text += String.fromCharCode(b);
-    }
-    const trimmed = text.replace(/\0+$/, '').trim();
-    const cyw = CYW20820_PATTERN.exec(trimmed);
-    if (cyw) {
-        const version = [cyw[1], cyw[2], cyw[3], cyw[4]].map((n) => String(Number(n))).join('.');
-        return {
-            raw: text,
-            family: 'cyw20820',
-            model: 'CYW20820',
-            version,
-            label: `CYW20820 v${version}`,
-            details: {
-                stack: cyw[5].toLowerCase(),
-                protocol: cyw[6].toLowerCase(),
-                hardware: cyw[7].toLowerCase(),
-            },
-        };
-    }
-    /* First match wins, and the RN-42 rows are ordered before the RN41 one they
-     * would otherwise be shadowed by: "Ver 4.77 RN-42 01/05/10" also contains
-     * "Ver 4.77 05" from the RN41 row. The Java loop takes the LAST match
-     * instead and gets this right only because of where the rows happen to sit
-     * in its enum. */
-    for (const entry of BLUETOOTH_MODULE_VERSIONS) {
-        if (trimmed.includes(entry.match)) {
-            return {
-                raw: text,
-                family: entry.family,
-                model: entry.model,
-                version: entry.version,
-                label: `${entry.model} v${entry.version}`,
-            };
-        }
-    }
-    return {
-        raw: text,
-        family: 'unknown',
-        model: null,
-        version: null,
-        label: trimmed.length ? trimmed : 'not reported',
-    };
 }
 
 /**
@@ -10322,9 +10329,9 @@ class Shimmer3RClient extends BaseShimmerClient {
      *
      * This is the page the firmware caches at boot, not a live EEPROM read, so
      * it answers even on a board whose EEPROM has since gone away. Returns null
-     * when the page holds one of the two "nothing here" patterns — all zeroes,
-     * never written, or all 0xFF, erased — which is what
-     * {@link isShimmerSrBoardValid} tests for.
+     * when the page holds either "nothing here" pattern — all zeroes, never
+     * written, or all 0xFF, erased — which {@link parseExpansionBoard} decides
+     * through {@link isShimmerSrBoardValid}.
      *
      * Despite the name there is no separate expansion board on a Shimmer3R: the
      * page carries the SR code of the board itself, drawn from the same table

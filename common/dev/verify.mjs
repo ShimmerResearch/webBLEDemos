@@ -4853,6 +4853,41 @@ check(
   identNew.hw,
 );
 
+await goto(
+  `${BASE}?mock=1&btVersion=${encodeURIComponent("RN4678 V1.23 " + "x".repeat(300))}`,
+);
+check(
+  "connect a sensor whose module reply is longer than the protocol allows",
+  (await evaluate(CONNECT)) === "mock",
+);
+const identLong = await evaluate(`${IDENT}
+  return { ...rows(), rawLen: window.mockTransport.identity.btVersion.length };
+`);
+check(
+  "an over-long module reply is truncated to the firmware's buffer, not wrapped",
+  /* The length byte is one byte. A reply longer than 255 characters would
+     wrap it while the full string still went out, and the host would wait for
+     the wrong number of bytes and time out. A real sensor cannot report more
+     than its own char[100] holds. */
+  identLong.rawLen > 255 && identLong.bt === "RN4678 v1.23",
+  `${identLong.rawLen} chars offered → ${identLong.bt}`,
+);
+
+await goto(`${BASE}?mock=1&srBoard=0-0-0`);
+check(
+  "connect a sensor whose id page was never written",
+  (await evaluate(CONNECT)) === "mock",
+);
+const identZero = await evaluate(`${IDENT}
+  return { ...rows(), board: JSON.stringify(window.mockTransport.identity.srBoard) };
+`);
+check(
+  "an all-zero id page is no board, not the board SR0-0-0",
+  /* All zeroes is as much "never written" as all 0xFF is "erased". */
+  identZero.hw === "Shimmer3R" && !identZero.hw.includes("SR0"),
+  `${identZero.hw}  (mock page ${identZero.board})`,
+);
+
 // ===========================================================================
 console.log("\n--- console ---");
 check(

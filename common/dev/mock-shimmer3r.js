@@ -225,6 +225,14 @@ const INFOMEM_STORE_BYTES = 512;
  */
 const EEPROM_HOST_BYTES = 2032;
 
+/**
+ * Firmware's ceiling on the Bluetooth module version string: the reply is
+ * `strlen()` of `char btVerStrResponse[100]` in
+ * `Comms/shimmer_bt_uart.c`, so 99 characters plus its terminator is the most
+ * a real sensor can report.
+ */
+const BT_VERSION_MAX_BYTES = 99;
+
 /** Firmware's ceiling on one daughter-card read or write. */
 const EEPROM_MAX_PER_CALL = 128;
 
@@ -956,7 +964,7 @@ export function createMockShimmer3RTransport(opts = {}) {
   };
 
   transport.identity = {
-    /** The SR board page's first three bytes, or null when it reads erased. */
+    /** The id page's first three bytes as written, or null when erased. */
     get srBoard() {
       const [boardId, boardRev, specialRev] = srBoardPage;
       if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
@@ -2245,7 +2253,16 @@ export function createMockShimmer3RTransport(opts = {}) {
            on an unframed one the dribble path exercises reassembly. */
         const bytes = [];
         for (const ch of btVersionString) bytes.push(ch.charCodeAt(0) & 0xff);
-        reply(concat([ACK, CMD.BT_VERSION_STR_RESPONSE, bytes.length], bytes));
+        /* Truncated to the firmware's own buffer, so the length byte always
+           matches the payload that follows it. Without this a `&btVersion=`
+           longer than 255 characters would wrap the length byte while the
+           full string still went out, and the host would sit waiting for the
+           wrong number of bytes. The firmware cannot report more than this
+           either - `btVerStrResponse` is `char[100]`. */
+        const capped = bytes.slice(0, BT_VERSION_MAX_BYTES);
+        reply(
+          concat([ACK, CMD.BT_VERSION_STR_RESPONSE, capped.length], capped),
+        );
         return;
       }
 

@@ -3111,8 +3111,15 @@ interface ExpansionBoardInfo {
 }
 /**
  * Parse the first 3 bytes of a daughter-card CARD_ID read as
- * `[boardId, boardRev, specialRev]` (ExpansionBoardDetails.java:58-60). Returns
- * null when the board is absent (an unwritten card memory reads back all 0xFF).
+ * `[boardId, boardRev, specialRev]` (ExpansionBoardDetails.java:58-60).
+ *
+ * Returns null when the board is absent, which is BOTH blank patterns: all
+ * 0xFF for an erased page, and all zeroes for one that was never written.
+ * Only the 0xFF case was rejected until now, so an all-zero page came back as
+ * `{0, 0, 0}` and could be rendered as the board `SR0-0-0`. The Java driver's
+ * own `isExpansionBoardValid()` (`ExpansionBoardDetails.java:104-111`) treats
+ * the two the same way, and {@link isShimmerSrBoardValid} is the one
+ * definition of it here.
  */
 declare function parseExpansionBoard(payload: Uint8Array): ExpansionBoardInfo | null;
 
@@ -5466,9 +5473,9 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      *
      * This is the page the firmware caches at boot, not a live EEPROM read, so
      * it answers even on a board whose EEPROM has since gone away. Returns null
-     * when the page holds one of the two "nothing here" patterns — all zeroes,
-     * never written, or all 0xFF, erased — which is what
-     * {@link isShimmerSrBoardValid} tests for.
+     * when the page holds either "nothing here" pattern — all zeroes, never
+     * written, or all 0xFF, erased — which {@link parseExpansionBoard} decides
+     * through {@link isShimmerSrBoardValid}.
      *
      * Despite the name there is no separate expansion board on a Shimmer3R: the
      * page carries the SR code of the board itself, drawn from the same table

@@ -3342,7 +3342,7 @@
        */
       function testUnavailableReason() {
         if (!client) {
-          return "Connect over BLE, Classic Bluetooth or USB-C to measure the link, run the sensor's built-in self-test, watch its clock drift against this host, or switch its red LED.";
+          return "Connect over BLE, Classic Bluetooth or USB-C to measure the link, run the sensor's built-in self-test, or watch its clock drift against this host.";
         }
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses a self-test while it is — the test takes the whole sensor over for up to a minute. Stop the stream first.";
@@ -4221,6 +4221,18 @@
       function resetAfterDisconnect() {
         streaming = false;
         sdLogging = false;
+        /* Everything identifying the sensor that has just gone, so nothing
+           belonging to it can be attributed to the next one.
+           `deviceMac` is the one that matters: it is assigned only when the
+           read succeeds (`if (mac) deviceMac = mac`), so a sensor whose MAC
+           could not be read would otherwise inherit the previous sensor's -
+           and `macId` names the device level of the Consensys backup tree, so
+           a download would be filed under the wrong sensor. `deviceName` is
+           reassigned unconditionally on every connect, so it cannot go stale
+           on its own; it is cleared here for the same reason, not because it
+           can leak. */
+        deviceName = "";
+        deviceMac = "";
         configuredName = "";
         srBoard = null;
         csvColumns = null;
