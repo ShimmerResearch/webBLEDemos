@@ -3912,7 +3912,12 @@ const CYW20820_PATTERN = /CYW20820\s+app=v(\d+)\.(\d+)\.(\d+)\.(\d+),\s*stack=(0
  * banner, and a Shimmer3R answers with a line the Shimmer firmware composes
  * itself from the CYW20820's binary version record.
  *
- * Never throws. An unrecognised reply is returned with `family: 'unknown'` and
+ * Never throws, and the signature says so: `null` and `undefined` are accepted
+ * because this parses a payload read off a device, and the SDK is consumed from
+ * plain JavaScript as well as TypeScript. A caller should not need a cast to
+ * hand it whatever a read actually produced.
+ *
+ * An unrecognised reply is returned with `family: 'unknown'` and
  * the raw text as its label — the Java equivalent has a bug here that returns
  * an empty name instead (its `NOT_READ` row carries an empty comparison
  * string, which `String.contains` matches against every input, so an
@@ -10223,6 +10228,16 @@ class Shimmer3RClient extends BaseShimmerClient {
                 throw new Error(`${label} response carried no length byte.`);
             }
             want = acc[0];
+            /* Checked against the same cap the byte-stream framer uses, and for the
+             * same reason: a length beyond what the firmware can produce means the
+             * byte was not a length. Without this the two transports fail
+             * differently — the framer refuses it outright, while a framed link
+             * would sit waiting for bytes that cannot arrive and only give up on
+             * the timeout. */
+            const cap = DECLARED_LENGTH_RESPONSE_CAPS[respOpcode];
+            if (cap !== undefined && want > cap) {
+                throw new Error(`${label} declared ${want} bytes, more than the ${cap} this response can carry.`);
+            }
             acc = acc.subarray(1);
             headerBytes = 0;
             expectedOffset = undefined;
