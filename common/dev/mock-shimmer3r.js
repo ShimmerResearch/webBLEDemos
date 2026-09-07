@@ -721,8 +721,10 @@ export function createMockShimmer3RTransport(opts = {}) {
      chip, which is why it is a separate array here too.
 
      Default `[48, 3, 0]` — a GSR+ board, SR48-3-0 — so the page has something
-     to name. `&srBoard=none` empties it to the erased 0xFF pattern a board
-     whose page was never written reports. */
+     to name. The two blank patterns are distinct and both worth modelling:
+     `&srBoard=none` fills the page with 0xFF, an ERASED chip, and
+     `&srBoard=0-0-0` leaves it all zeroes, a page that was NEVER WRITTEN. The
+     SDK reads both as "no board". */
   const srBoardPage = new Uint8Array(16).fill(0xff);
   if (opts.srBoard !== "none") {
     const parts = String(opts.srBoard ?? "48-3-0")

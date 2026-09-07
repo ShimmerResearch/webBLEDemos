@@ -117,10 +117,12 @@ link-speed readout. Options worth knowing:
 - `sdKBps` paces the streamed file blocks, so a download takes long
   enough to have a progress bar, a throughput readout and an ETA worth
   looking at, and long enough to abort mid-flight.
-- `srBoard: '48-3-0'` sets the board's SR identity, and `'none'` leaves its
-  id page erased the way an unwritten board reports it. Note this is the
-  daughter-card ID page, the first sixteen EEPROM bytes — a different page
-  from the card MEMORY the brand record lives in, which is why the mock
+- `srBoard: '48-3-0'` sets the board's SR identity. The two blank patterns
+  are separate cases: `'none'` fills the page with 0xFF, an **erased** chip,
+  and `'0-0-0'` leaves it all zeroes, a page that was **never written**. The
+  SDK reads both as "no board", so both are worth exercising. Note this is
+  the daughter-card ID page, the first sixteen EEPROM bytes — a different
+  page from the card MEMORY the brand record lives in, which is why the mock
   keeps two stores.
 - `btVersion` is what the Bluetooth module replied when the firmware asked
   it: a CYW20820 line by default, an RN4678 banner when the hardware id is
