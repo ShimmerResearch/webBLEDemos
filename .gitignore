@@ -7,3 +7,9 @@
 *.p12
 *.pfx
 *-private-key*
+
+# Per-contributor editor preferences. `.vscode/launch.json` IS shared and
+# tracked; settings.json is not — it has carried one machine's Live Server
+# port into a pull request three times, because `git add -A` cannot tell an
+# untracked local file from a new one that belongs.
+.vscode/settings.json
