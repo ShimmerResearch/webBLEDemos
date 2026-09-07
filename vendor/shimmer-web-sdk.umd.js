@@ -10213,6 +10213,37 @@
          * length that was asked for, so a response with no header at all still
          * reaches the caller intact.
          */
+        /**
+         * Accumulate temp-plane chunks onto `acc` until it holds at least `n` bytes.
+         *
+         * Resolves synchronously when it already does, so the common case costs
+         * nothing. Registers no handler in that case either, which matters: the
+         * caller carries straight on into its own handler with no gap in between,
+         * and chunks arrive as transport tasks rather than microtasks, so nothing
+         * can slip through the join.
+         */
+        _awaitAtLeastBytes(acc, n, timeoutMs, timeoutMessage) {
+            if (acc.length >= n)
+                return Promise.resolve(acc);
+            return new Promise((resolve, reject) => {
+                let buf = acc;
+                const t = setTimeout(() => {
+                    this._offTemp(handler);
+                    reject(new Error(timeoutMessage));
+                }, timeoutMs);
+                const handler = (chunk) => {
+                    if (!chunk || chunk.length === 0)
+                        return;
+                    buf = concatU8(buf, chunk);
+                    if (buf.length >= n) {
+                        clearTimeout(t);
+                        this._offTemp(handler);
+                        resolve(buf);
+                    }
+                };
+                this._onTemp(handler);
+            });
+        }
         async _readLengthPrefixedResponse(cmd, respOpcode, expectedLen, label, headerBytes = 1, ackTimeoutMs = 1500, responseTimeoutMs = 2000, expectedOffset) {
             const remainder = await this._writeExpectingAck(cmd, ackTimeoutMs);
             const first = remainder && remainder[0] === respOpcode
@@ -10228,9 +10259,14 @@
              * header there was has already been read. */
             let want;
             if (expectedLen === 'declared') {
-                if (acc.length < 1) {
-                    throw new Error(`${label} response carried no length byte.`);
-                }
+                /* The length byte does not have to arrive with the opcode.
+                 * `_waitForResponse` resolves as soon as it sees the expected opcode,
+                 * and a BLE notification can be exactly `[opcode]` with everything else
+                 * following — a fragmentation case the continuation logic below handles
+                 * perfectly well once the length is known. Throwing here instead made
+                 * that case fail outright, so wait for the byte and only give up if it
+                 * never comes. */
+                acc = await this._awaitAtLeastBytes(acc, 1, responseTimeoutMs, `${label} response carried no length byte.`);
                 want = acc[0];
                 /* Checked against the same cap the byte-stream framer uses, and for the
                  * same reason: a length beyond what the firmware can produce means the

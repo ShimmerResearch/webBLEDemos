@@ -5452,6 +5452,16 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * length that was asked for, so a response with no header at all still
      * reaches the caller intact.
      */
+    /**
+     * Accumulate temp-plane chunks onto `acc` until it holds at least `n` bytes.
+     *
+     * Resolves synchronously when it already does, so the common case costs
+     * nothing. Registers no handler in that case either, which matters: the
+     * caller carries straight on into its own handler with no gap in between,
+     * and chunks arrive as transport tasks rather than microtasks, so nothing
+     * can slip through the join.
+     */
+    private _awaitAtLeastBytes;
     private _readLengthPrefixedResponse;
     readInfoMem(address: number, length: number): Promise<Uint8Array>;
     /**
