@@ -619,6 +619,34 @@ details.group > summary::-webkit-details-marker {
   color: var(--faint);
 }
 
+/* Settings search, above the configuration groups. */
+.config-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.config-search > label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.config-search > input {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+/* Shown and round-tripped, but never editable — a deprecated option, or one
+   belonging to a licensed feature. Deliberately quiet rather than alarming:
+   nothing is wrong, the setting simply is not changed from here. */
+.field.readonly {
+  background: var(--card-soft, var(--card));
+  border-style: dashed;
+}
+
 /* Field differs from the device's last-read value. */
 .field.dirty {
   border-color: var(--warn);

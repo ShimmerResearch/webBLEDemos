@@ -477,6 +477,30 @@
             </button>
             <span class="pill" id="connPill">disconnected</span>
           </div>
+          <!-- Chosen BEFORE connecting, and applied as part of the connect
+               sequence, because the CRC width changes the size of every packet
+               the sensor sends: switching it mid-session would move every
+               frame boundary. Left here rather than on the Stream tab for the
+               same reason — it is a property of the link, not of one run. -->
+          <div class="row">
+            <label for="crcMode">Link CRC</label>
+            <select id="crcMode">
+              <option value="0">Off</option>
+              <option value="1">1 byte</option>
+              <option value="2" selected>2 bytes</option>
+            </select>
+            <!-- Not hidden before connecting: it shows what the selection
+                 WILL ask for, then what the sensor actually accepted. -->
+            <span class="pill" id="crcPill">CRC 2 bytes</span>
+          </div>
+          <div class="field-hint">
+            Has the sensor append a checksum to every packet, so a corrupted
+            frame is reported as corrupted instead of being plotted. On at two
+            bytes by default, which costs two bytes per frame and is the only
+            way to tell a bad link from a bad decode; one byte lets roughly 1 in
+            256 bad frames through. Firmware that does not support it falls back
+            to off on its own. Applied when you connect.
+          </div>
           <div class="banner" id="platformBanner"></div>
         </div>
 
@@ -672,6 +696,11 @@
           <div class="banner info" id="configBanner">
             Connect a sensor to read its configuration.
           </div>
+          <!-- Fires when the sampling rate outruns the accel/gyro output rate.
+               Nothing else on this page can show that: timestamps, packet loss
+               and the CRC all stay correct while the signal is a staircase of
+               repeated readings. -->
+          <div class="banner warn" id="rateCoverageNote" hidden></div>
           <div id="configForm"></div>
         </div>
 
@@ -1382,6 +1411,10 @@
       });
 
       $("logSeverity").addEventListener("change", updateTapNote);
+      /* Tracks the selection until a link exists; applyLinkCrc takes the pill
+         over from there and reports what the sensor actually accepted. */
+      $("crcMode").addEventListener("change", showPendingLinkCrc);
+      showPendingLinkCrc();
 
       // =====================================================================
       // State
@@ -2380,13 +2413,77 @@
 
       function onSensorToggle() {
         let mask = sensorsFromImage();
+        const before = mask;
         for (const box of document.querySelectorAll("[data-sensor-bit]")) {
           const bit = Number(box.dataset.sensorBit);
           mask = box.checked ? mask | bit : mask & ~bit;
         }
         sensorsToImage(mask);
         log.log(`sensor bitmap now ${hexMask(mask)}`);
+        deriveImuRate({
+          enableChanged: imuEnabled(mask) !== imuEnabled(before),
+        });
         afterImageEdit();
+      }
+
+      /** Is the LSM6DSV's shared rate field in use — either channel enabled? */
+      function imuEnabled(mask) {
+        const bits =
+          sdk.SensorBitmapShimmer3.SENSOR_A_ACCEL |
+          sdk.SensorBitmapShimmer3.SENSOR_GYRO;
+        return (mask & bits) !== 0;
+      }
+
+      /**
+       * Re-derive the LSM6DSV accel/gyro rate from the sampling rate.
+       *
+       * The fan-out Consensys gets for free from
+       * `setShimmerAndSensorsSamplingRate` and `setSensorEnabledState`, which
+       * this page has to reproduce because it edits the InfoMem fields
+       * independently: setting a rate here never used to touch the sensor's own
+       * ODR, so a 51.2 Hz packet rate could sit against a 1.875 Hz IMU and the
+       * signal arrived as a staircase.
+       *
+       * `enableChanged` matters because of a trap in the encoding: "low-power
+       * gyro" IS rate code 1, read back from the rate rather than stored
+       * separately, so a plain re-derivation from an existing 1 keeps 1. Only
+       * an enable clears it — mirroring
+       * `setDefaultLSM6DSVGyroSensorConfig`, the one place the driver does.
+       *
+       * @param {{enableChanged?: boolean}} [opts]
+       */
+      function deriveImuRate(opts = {}) {
+        if (!form || !layout) return;
+        const field = fields.find((f) => f.key === "imuRate.lsm6dsv");
+        if (!field) return; // not a Shimmer3R layout
+        const divider = Number(fieldValue("samplingRate"));
+        const samplingRateHz = sdk.samplingRateHzFromDivider(divider);
+        if (samplingRateHz === null) return;
+        const enabled = imuEnabled(sensorsFromImage());
+
+        const before = Number(fieldValue("imuRate.lsm6dsv"));
+        const next = opts.enableChanged
+          ? sdk.deriveLsm6dsvRateOnEnableChange({ enabled, samplingRateHz })
+          : sdk.deriveLsm6dsvAccelGyroRate({
+              enabled,
+              samplingRateHz,
+              /* Never inferred from the stored value: this page has no
+                 low-power control, so it must not silently produce a
+                 low-power configuration. */
+              lowPower: false,
+            });
+        if (next === before) return;
+
+        sdk.writeInfoMemFieldValue(form.getImage(), field, layout, next);
+        /* The bytes are written straight into the working image, so the
+           control still shows the old value until the form re-reads it.
+           `refresh`, not `setImage`: the latter re-baselines, which would make
+           a derived change look like it came from the device. */
+        form.refresh();
+        log.log(
+          `derived Gyro/Accel Rate ${before} → ${next} ` +
+            `(${enabled ? "enabled" : "disabled"} at ${samplingRateHz.toFixed(1)} Hz)`,
+        );
       }
 
       /** Push the image's sensor bits back into the checkboxes. */
@@ -2554,14 +2651,24 @@
             generation: () => generation,
           }),
           imageSize: IMAGE_BYTES,
+          /* Stored as Unix seconds, which is the right thing to write and the
+             wrong thing to read: the question a configuration stamp answers is
+             "is this configuration recent?". The number stays editable and
+             authoritative; the date is shown beside it. */
+          dateTimeFields: ["configTime"],
           onChange: (key) => {
             log.log(`configuration edit: ${key}`);
+            /* Setting the packet rate re-derives the sensors' own rates, which
+               is what `setShimmerAndSensorsSamplingRate` does in the driver
+               (`ShimmerDevice.java:3399`) and what this page used to skip. */
+            if (key === "samplingRate") deriveImuRate();
             afterImageEdit();
           },
           onDirtyChange: () => updateDirtyPill(),
         });
 
         injectOwnControls();
+        syncRateCoverage();
         banner("configBanner", "", "");
       }
 
@@ -2617,9 +2724,55 @@
       function afterImageEdit() {
         syncSensorGrid();
         syncRateReadout();
+        syncRateCoverage();
         renderHex();
         regate();
       }
+
+      /**
+       * Warn when the IMU cannot keep up with the configured packet rate.
+       *
+       * These are two independent InfoMem fields and the firmware relates them
+       * nowhere, so a sampling rate above the accel/gyro ODR makes the sensor
+       * repeat each reading with a fresh timestamp on it. Nothing else on
+       * screen can tell you: timestamps stay regular, packet loss stays at 0%
+       * and every CRC passes, because none of that is wrong — only the signal
+       * is, and it arrives as a staircase.
+       *
+       * Shown on the form rather than only logged, and re-checked on every
+       * edit, so raising the sampling rate flags it there and then instead of
+       * at the next bench session. Consensys avoids the trap by deriving sensor
+       * ODRs from the trial rate; this page lets the fields be edited
+       * independently, so it has to say when the pair stops making sense.
+       */
+      function syncRateCoverage() {
+        const host = $("rateCoverageNote");
+        if (!host || !form) return;
+        let verdict = null;
+        try {
+          verdict = sdk.checkImuRateCoversPacketRate({
+            samplingRateDivider: Number(fieldValue("samplingRate")),
+            imuRateCode: Number(fieldValue("imuRate.lsm6dsv")),
+            enabledSensors: sensorsFromImage(),
+          });
+        } catch {
+          /* A generation with no LSM6DSV field, or a half-built form. Silence
+             is right: this warns about a specific pair, and cannot warn about
+             fields that do not exist. */
+        }
+        const problem = verdict?.problem ?? "";
+        host.textContent = problem;
+        host.hidden = !problem;
+        if (problem && problem !== lastRateCoverageWarning) {
+          lastRateCoverageWarning = problem;
+          log.warn(problem);
+        } else if (!problem) {
+          lastRateCoverageWarning = "";
+        }
+      }
+
+      /** Last coverage warning logged, so an edit does not repeat it every time. */
+      let lastRateCoverageWarning = "";
 
       /**
        * Take an image the sensor just gave us as the new reference: the form's
@@ -2645,6 +2798,7 @@
         }
         form.setImage(bytes);
         form.captureBaseline();
+        applyIdentityPlaceholders();
         baselineSensors = sensorsFromImage();
         exgMode = "off";
         const select = $("exgMode");
@@ -2652,6 +2806,30 @@
         $("imPill").textContent = `${form.getImage().length} bytes read`;
         $("imPill").classList.add("on");
         afterImageEdit();
+      }
+
+      /**
+       * Show, as placeholders, the names the FIRMWARE will give this device if
+       * the identity fields are left empty.
+       *
+       * These are not this page's inventions: `ShimConfig_setDefaultShimmerName`
+       * and `ShimConfig_setDefaultTrialId` write exactly `Shimmer_` + the last
+       * four MAC characters, and `DefaultTrial`. So an empty Shimmer Name box
+       * showing `Shimmer_F3F8` is a statement about the device, not a
+       * suggestion from us.
+       *
+       * A placeholder rather than a value on purpose. Filling the boxes in
+       * would present an edit the user never made as if it were the device's
+       * own setting, and applying the configuration would then write it — which
+       * is a real change to a sensor that had a blank name for a reason.
+       */
+      function applyIdentityPlaceholders() {
+        if (!form) return;
+        const identity = sdk.defaultTrialIdentity(deviceMac || "");
+        /* Null when the MAC is unusable — no placeholder at all beats one that
+           looks like an identity and identifies nothing. */
+        form.setPlaceholder("deviceName", identity.deviceName ?? "");
+        form.setPlaceholder("trialName", identity.trialName);
       }
 
       /**
@@ -3819,6 +3997,20 @@
           // round that trips a reader who assumes the host's.
           writeCharUUID: defaults.CHAR_RX_UUID,
           notifyCharUUID: defaults.CHAR_TX_UUID,
+          /* These two MUST track Shimmer3RClient._makeWebTransport, which is
+             what the SDK would have built had this page not built the
+             transport itself (it does so only to tap it for the raw-byte log).
+             The SDK moved the device→host subscription to CYSPP's
+             notify-capable characteristic and falls back to the indicate-only
+             one for a device that lacks it; a hand-built transport with a
+             single candidate has no such fallback and would fail the connect
+             where the SDK's own would recover. The flow-control characteristic
+             is observational and the transport tolerates its absence. Both are
+             undefined on an SDK too old to export them, which the transport
+             treats as "not configured" — so this is safe to vendor either way.
+             If _makeWebTransport gains an option, add it here too. */
+          notifyCharUUIDFallback: defaults.CHAR_TX_ACKED_UUID,
+          rxFlowCharUUID: defaults.CHAR_RX_FLOW_UUID,
           requestDeviceOptions: {
             filters: [{ services: [defaults.SERVICE_UUID] }],
             optionalServices: [defaults.SERVICE_UUID],
@@ -3960,13 +4152,118 @@
       }
 
       /** The Bluetooth path: BLE, Classic Bluetooth, or the mock. */
+      /**
+       * Apply the chosen link CRC, first thing after connecting.
+       *
+       * First, so that every packet of the session is framed the same way —
+       * the width changes the size of everything the sensor sends, so a
+       * half-CRC'd session would be worse than none.
+       *
+       * A refusal is logged and left at off rather than failing the connect:
+       * the CRC is a diagnostic, and firmware old enough not to know
+       * SET_CRC_COMMAND still streams perfectly well without it. `crcMode`
+       * on the client is only advanced by a successful call, so the parser
+       * never expects bytes the device is not sending.
+       */
+      /**
+       * Show what the selection will ask for, while not connected.
+       *
+       * The pill means two different things at two different times - what was
+       * requested, then what the sensor agreed to - and saying so before a link
+       * exists is the honest half: a pill reading "2 bytes" on a page that has
+       * not asked anything yet would be claiming a state no device is in.
+       */
+      /**
+       * Lock the CRC selector while a link is up.
+       *
+       * The setting is applied once, during connect, and the SDK refuses to
+       * change the width mid-stream because it would move every frame boundary.
+       * A control that still looks editable invites exactly that expectation,
+       * so it is disabled rather than left to disappoint — and the title says
+       * why, since a greyed control with no explanation is its own puzzle.
+       */
+      function setLinkCrcEditable(editable) {
+        const sel = $("crcMode");
+        if (!sel) return;
+        sel.disabled = !editable;
+        sel.title = editable
+          ? ""
+          : "Applied when the link is established — disconnect to change it.";
+      }
+
+      function showPendingLinkCrc() {
+        const pill = $("crcPill");
+        if (!pill) return;
+        const want = Number($("crcMode")?.value ?? 0);
+        pill.className = "pill";
+        pill.textContent =
+          want > 0
+            ? `CRC ${want} byte${want === 1 ? "" : "s"} (on connect)`
+            : "CRC off";
+      }
+
+      /**
+       * Say the setting does not apply on this link, rather than leaving the
+       * pre-connect selection up.
+       *
+       * The dock/USB route speaks the dock protocol, which has no
+       * SET_CRC_COMMAND, so a pill still reading "CRC 2 bytes (on connect)"
+       * promises something that will never happen on this connection. It is
+       * not the same state as "the firmware refused it" either, which is what
+       * "CRC unavailable" means on a radio link.
+       */
+      function showLinkCrcNotApplicable() {
+        const pill = $("crcPill");
+        if (!pill) return;
+        pill.className = "pill";
+        pill.textContent = "CRC n/a on this link";
+      }
+
+      async function applyLinkCrc() {
+        const want = Number($("crcMode")?.value ?? 0);
+        const pill = $("crcPill");
+        if (!Number.isFinite(want) || want <= 0) {
+          if (pill) {
+            pill.textContent = "CRC off";
+            pill.className = "pill";
+          }
+          return;
+        }
+        await tryDevice("enable the link CRC", () => client.setCrcMode(want));
+        /* Read back from the client rather than from the call: `crcMode` only
+           advances on a successful ACK, so this cannot end up expecting bytes
+           the device is not sending. */
+        const on = client.crcMode > 0;
+        if (pill) {
+          pill.textContent = on
+            ? `CRC ${client.crcMode} byte${client.crcMode === 1 ? "" : "s"}`
+            : "CRC unavailable";
+          pill.className = on ? "pill good" : "pill warn";
+        }
+        if (!on) {
+          log.warn(
+            "this firmware did not accept SET_CRC_COMMAND, so frames arrive unchecked — streaming is unaffected",
+          );
+        }
+      }
+
       async function afterConnectRadio() {
+        setLinkCrcEditable(false);
         const fw = await tryDevice("read the firmware version", () =>
           client.readFwVersion(),
         );
         const hw = await tryDevice("read the hardware version", () =>
           client.readDeviceVersion(),
         );
+        /* The CRC goes AFTER both version reads, per
+           SHIMMER3_BT_COMMUNICATION_PROTOCOL.md section 8.2 constraint 3: the
+           version exchange must not be subject to a CRC the firmware has not
+           been confirmed to support, and a CRC turns on the length-aware
+           framer whose STATUS_RESPONSE span is 1 byte on a Shimmer3 against 2
+           on a Shimmer3R - which only the hardware version settles. Applying
+           it first, as this used to, framed a Shimmer3's status a byte too
+           wide for the whole session. */
+        await applyLinkCrc();
         const mac = await tryDevice("read the MAC address", () =>
           client.getMacAddress(),
         );
@@ -4111,6 +4408,13 @@
        * stream on it at all.
        */
       async function afterConnectWired() {
+        /* The dock speaks its own protocol with no SET_CRC_COMMAND, so the
+           setting does not apply on this link at all — disabled for the same
+           reason as on a radio link, not because it was applied. The pill has
+           to say so too, or it keeps advertising the pre-connect selection as
+           though it were about to be applied. */
+        setLinkCrcEditable(false);
+        showLinkCrcNotApplicable();
         const id = await tryDevice("identify the docked sensor", () =>
           client.identify(),
         );
@@ -4221,6 +4525,17 @@
       function resetAfterDisconnect() {
         streaming = false;
         sdLogging = false;
+        /* Back to reporting the selection, because the link that a CRC was
+           agreed on has gone and leaving "CRC 2 bytes" up would describe a
+           connection that no longer exists.
+
+           Deliberately NOT a claim about what the firmware does on
+           disconnect. Its CRC mode is per POWER CYCLE, not per connection, so
+           a sensor that was not power-cycled may well still have the CRC on -
+           which is exactly why the SDK assumes off on connect and
+           re-establishes rather than trusting either answer. */
+        showPendingLinkCrc();
+        setLinkCrcEditable(true);
         /* Everything identifying the sensor that has just gone, so nothing
            belonging to it can be attributed to the next one.
            `deviceMac` is the one that matters: it is assigned only when the

@@ -341,6 +341,28 @@ function parseControlValue(field, raw) {
 }
 
 /** The string a control should show for a decoded value. */
+/**
+ * Render Unix seconds as a local date/time for DISPLAY only.
+ *
+ * The field keeps its numeric control and its stored bytes; this is shown
+ * beside the value, so what the device holds and what the screen says can
+ * never disagree. A raw second count is unreadable, and the one thing a user
+ * wants from a configuration timestamp — is this configuration recent? — is
+ * unanswerable without it.
+ *
+ * @param {unknown} value seconds since the Unix epoch
+ * @returns {string} a formatted local date/time, or "" when not a usable stamp
+ */
+export function unixSecondsText(value) {
+  const secs = Number(value);
+  if (!Number.isFinite(secs) || secs <= 0) return "";
+  const d = new Date(secs * 1000);
+  if (Number.isNaN(d.getTime())) return "";
+  // Local time, deliberately: this answers a wall-clock question ("was this
+  // configured today?"), and the stored value is timezone-independent.
+  return d.toLocaleString();
+}
+
 function formatForControl(field, value) {
   if (value instanceof Uint8Array) return bytesToHex(value);
   if (Array.isArray(value)) return value.join("\n");
@@ -408,6 +430,12 @@ function formatForControl(field, value) {
  *   (see the header): an editor that has to decode a field's bytes into
  *   something structured needs the SDK's codec for that encoding, so it is
  *   built by the page and passed in.
+ * @param {readonly string[]} [cfg.dateTimeFields] field keys whose value is
+ *   Unix seconds and should additionally be shown as a local date/time. The
+ *   control and the stored bytes are unchanged — the formatting is display
+ *   only, so it cannot disagree with what gets written to the device.
+ * @param {boolean} [cfg.search=true] render a search box above the groups that
+ *   live-filters fields, opens the groups holding matches and hides the rest.
  * @param {number} [cfg.imageSize=384] working-image length
  * @param {Uint8Array} [cfg.image] initial working image; defaults to a
  *   zero-filled buffer, so the form renders before anything has been read
@@ -421,8 +449,10 @@ function formatForControl(field, value) {
  *   dirtyKeys: () => string[],
  *   dirtyFields: () => {key: string, label: string, from: string, to: string}[],
  *   revert: () => void,
+ *   refresh: () => void,
  *   setEnabled: (enabled: boolean) => void,
  *   setFieldSupport: (key: string, supported: boolean, reason?: string) => void,
+ *   setPlaceholder: (key: string, text: string) => void,
  *   focusField: (key: string) => void,
  *   destroy: () => void,
  * }}
@@ -447,6 +477,17 @@ export function createConfigForm(host, cfg) {
 
   const imageSize = cfg.imageSize ?? CONFIG_IMAGE_SIZE_DEFAULT;
   const idPrefix = `cf${++instanceSeq}`;
+  /** Field keys shown with a local date/time beside the raw seconds. */
+  const dateTimeKeys = new Set(cfg.dateTimeFields ?? []);
+  /**
+   * Group id -> the reason its fields are locked. Read once here rather than
+   * per field, so a group-level lock needs no flag on each of its fields.
+   */
+  const lockedGroups = new Map(
+    groups
+      .filter((g) => g.readOnly)
+      .map((g) => [g.id, g.readOnlyReason || "Not editable here."]),
+  );
 
   /** The working document. Every control reads and writes THIS array. */
   let image = adoptImage(cfg.image, imageSize);
@@ -454,6 +495,18 @@ export function createConfigForm(host, cfg) {
   let baseline = new Uint8Array(image);
 
   let enabled = true;
+
+  /**
+   * Open/closed state of every group from before a search began, so clearing
+   * the box restores what the user had rather than leaving everything open.
+   * Null when no search is active.
+   *
+   * Declared up here, with the other mutable state, because `render()` below
+   * reaches it through `refreshGroupPlacement` — a `let` further down the
+   * function is in its temporal dead zone at that point and throws.
+   * @type {Map<HTMLElement, boolean>|null}
+   */
+  let searchOpenState = null;
 
   /** @type {Map<string, object>} field key -> entry */
   const entries = new Map();
@@ -487,7 +540,32 @@ export function createConfigForm(host, cfg) {
     ),
   );
 
-  host.replaceChildren(supportedHost, unsupportedSection);
+  /* Field search, as in the Verisense console: live-filters the field cards,
+     opens the groups that hold matches and hides the rest. There are enough
+     settings here that finding one by scrolling is the slow path. */
+  const searchInput = el("input", {
+    type: "search",
+    id: `${idPrefix}-search`,
+    placeholder: "Search settings…",
+    autocomplete: "off",
+    spellcheck: "false",
+  });
+  const searchCount = el("div", { class: "field-hint muted" });
+  const searchBar = el(
+    "div",
+    { class: "config-search" },
+    el("label", { for: `${idPrefix}-search` }, "Search"),
+    searchInput,
+    searchCount,
+  );
+  const searchEnabled = cfg.search !== false;
+
+  host.replaceChildren(
+    ...(searchEnabled ? [searchBar] : []),
+    supportedHost,
+    unsupportedSection,
+  );
+  if (searchEnabled) searchInput.addEventListener("input", applySearch);
 
   render();
   repopulate();
@@ -508,6 +586,14 @@ export function createConfigForm(host, cfg) {
         dataset: { groupBody: g.id },
       });
       groupBodies.set(g.id, body);
+      // Said once at the top of a locked group rather than on each of its
+      // fields: the reason is a property of the group, and repeating it on
+      // every card buries the settings it is explaining.
+      if (lockedGroups.has(g.id)) {
+        body.appendChild(
+          el("div", { class: "field-hint muted" }, lockedGroups.get(g.id)),
+        );
+      }
       // Ungrouped fields fill this grid; labelled subpanels follow it.
       const grid = el("div", { class: "grid" });
       body.appendChild(grid);
@@ -538,6 +624,10 @@ export function createConfigForm(host, cfg) {
       const entry = buildField(field);
       if (!entry) continue;
       entries.set(field.key, entry);
+      /* Applied at build time, not left to the first setEnabled(): a lock is
+         a property of the setting itself, so a host that never calls
+         setEnabled would otherwise render a locked field as editable. */
+      if (entry.lockReason) applyEnabled(entry);
       // A field may name a subgroup as its group ("sdLogging.startup"); fall
       // back to the group's own grid, and then to the first grid there is, so
       // a schema/group mismatch shows the field somewhere rather than losing
@@ -653,7 +743,29 @@ export function createConfigForm(host, cfg) {
       note,
       supported: true,
       reason: "",
+      /* Locked fields render and round-trip, but are never editable: a
+         deprecated option whose meaning firmware no longer honours, or one
+         belonging to a licensed feature. Group-level locks cover every field
+         in the group, so the field's own flag is only for the exceptions. */
+      lockReason:
+        (field.readOnly ? field.readOnlyReason || "Not editable." : "") ||
+        lockedGroups.get(field.group) ||
+        lockedGroups.get(String(field.group).split(".")[0]) ||
+        "",
+      /** Shows the local date/time for a Unix-seconds field. */
+      dateNote: dateTimeKeys.has(field.key)
+        ? el("div", { class: "field-hint muted" })
+        : null,
     };
+    if (entry.dateNote) wrap.appendChild(entry.dateNote);
+    // Only a field's OWN reason is shown on its card — a group-level one is
+    // already stated once at the top of the group.
+    if (field.readOnly) {
+      wrap.appendChild(
+        el("div", { class: "field-hint muted" }, entry.lockReason),
+      );
+    }
+    wrap.classList.toggle("readonly", !!entry.lockReason);
     entryRef.current = entry;
 
     // An editor commits through its own `onEdit`, on whatever event it
@@ -834,6 +946,12 @@ export function createConfigForm(host, cfg) {
 
   function setControlValue(entry, value) {
     const { field, control } = entry;
+    // Repainted from the SAME value the control is being set to, so the
+    // formatted date can never drift from the number beside it.
+    if (entry.dateNote) {
+      const text = unixSecondsText(value);
+      entry.dateNote.textContent = text ? `= ${text}` : "not set";
+    }
     if (entry.editor) {
       entry.editor.set(value);
       return;
@@ -1016,19 +1134,94 @@ export function createConfigForm(host, cfg) {
       if (!supported) unsupportedGroups++;
     }
     unsupportedSection.hidden = unsupportedGroups === 0;
+    // Placement decides group visibility from support alone, so an active
+    // search has to be re-applied on top of it or a filtered-out group would
+    // reappear. Safe from recursion: the clearing branch of applySearch drops
+    // searchOpenState before it calls back here.
+    if (searchOpenState) applySearch();
+  }
+
+  /** Filter the field cards to those matching the search box. */
+  function applySearch() {
+    const q = String(searchInput.value || "")
+      .trim()
+      .toLowerCase();
+    const allDetails = [
+      ...supportedHost.querySelectorAll("details"),
+      ...unsupportedBody.querySelectorAll("details"),
+    ];
+
+    /* Every `.field` in the host, not just the schema's own: the page injects
+       controls of its own (the sensor grid, the ExG preset, the sampling-rate
+       helper) as sibling cards. Leaving those always-visible kept their groups
+       always-open, so a search for one setting still showed several. */
+    const cards = host.querySelectorAll(".field");
+
+    if (!q) {
+      for (const card of cards) card.hidden = false;
+      for (const d of allDetails) {
+        d.hidden = false;
+        if (searchOpenState?.has(d)) d.open = searchOpenState.get(d);
+      }
+      searchOpenState = null;
+      searchCount.textContent = "";
+      // Group placement decides which host each group belongs to and whether
+      // the unsupported panel shows at all; a search must not outlive that.
+      refreshGroupPlacement();
+      return;
+    }
+
+    if (!searchOpenState) {
+      searchOpenState = new Map(allDetails.map((d) => [d, d.open]));
+    }
+
+    let matches = 0;
+    for (const card of cards) {
+      /* The card's own text covers label, helper text and option labels, and
+         works for a page-injected card too. Schema cards add their key and
+         encoding tooltip, because a byte offset is often what someone is
+         actually searching for. */
+      const entry = entries.get(card.dataset.fieldKey);
+      const hay = entry
+        ? `${card.textContent} ${entry.field.key} ${entry.tooltip}`
+        : card.textContent;
+      const hit = hay.toLowerCase().includes(q);
+      card.hidden = !hit;
+      if (hit) matches++;
+    }
+    for (const d of allDetails) {
+      const any = !!d.querySelector(".field:not([hidden])");
+      d.hidden = !any;
+      if (any) d.open = true;
+    }
+    // The unsupported panel is a <details> in neither list, so it needs the
+    // same treatment: hidden unless something inside it matched.
+    unsupportedSection.hidden = !unsupportedSection.querySelector(
+      ".field:not([hidden])",
+    );
+    searchCount.textContent = matches
+      ? `${matches} match${matches === 1 ? "" : "es"}`
+      : "no matches";
   }
 
   function applyEnabled(entry) {
-    const disabled = !enabled || !entry.supported;
-    const reason = entry.supported ? "" : entry.reason || UNSUPPORTED_TITLE;
+    // A lock is unconditional: unlike the enable/support states it never
+    // lifts, so no later setEnabled(true) can make the field editable.
+    const locked = !!entry.lockReason;
+    const disabled = !enabled || !entry.supported || locked;
+    const reason = entry.supported
+      ? locked
+        ? entry.lockReason
+        : ""
+      : entry.reason || UNSUPPORTED_TITLE;
     if (entry.editor) {
       entry.editor.setDisabled?.(disabled, reason);
       return;
     }
     entry.control.disabled = disabled;
-    entry.control.title = entry.supported
-      ? entry.tooltip
-      : `${reason} — ${entry.tooltip}`;
+    entry.control.title = reason
+      ? `${reason} — ${entry.tooltip}`
+      : entry.tooltip;
   }
 
   // ---- Public API -------------------------------------------------------
@@ -1065,6 +1258,20 @@ export function createConfigForm(host, cfg) {
       return out;
     },
 
+    /**
+     * Re-read every control from the working image, without touching the
+     * baseline.
+     *
+     * For a caller that writes bytes into `getImage()` itself rather than
+     * through a control - a derived value, say, where setting one field implies
+     * another. `setImage` is the wrong tool there: it re-baselines, so the
+     * derived change would look like it came from the device and the edit would
+     * vanish from the dirty set.
+     */
+    refresh() {
+      repopulate();
+    },
+
     revert() {
       // In place, so `getImage()` stays a valid live reference across a
       // revert — a page holding it does not have to re-fetch.
@@ -1087,6 +1294,19 @@ export function createConfigForm(host, cfg) {
       entry.wrap.classList.toggle("unsupported", !entry.supported);
       applyEnabled(entry);
       refreshGroupPlacement();
+    },
+
+    setPlaceholder(key, text) {
+      const entry = entries.get(key);
+      if (!entry) return;
+      // Only a text control has a placeholder; a select or checkbox silently
+      // ignores the attribute, so guard rather than set it and wonder.
+      const control = entry.control;
+      if (!(control instanceof HTMLInputElement) || control.type !== "text") {
+        if (!(control instanceof HTMLTextAreaElement)) return;
+      }
+      if (text) control.placeholder = String(text);
+      else control.removeAttribute("placeholder");
     },
 
     focusField(key) {

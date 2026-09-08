@@ -1,6 +1,6 @@
 /**
  * Live stream statistics strip for the webBLEDemos pages: achieved rate,
- * expected rate, packet loss, throughput, frame count and duration.
+ * expected rate, packet loss, CRC state, throughput, frame count and duration.
  *
  * A thin wrapper over the SDK's `StreamStatsTracker`, which already owns the
  * hard parts — loss derived from gaps in the *device* clock rather than host
@@ -50,6 +50,7 @@ const CELLS = [
   { key: "rate", label: "Rate" },
   { key: "expected", label: "Expected" },
   { key: "loss", label: "Loss" },
+  { key: "crc", label: "CRC" },
   { key: "throughput", label: "Throughput" },
   { key: "frames", label: "Frames" },
   { key: "duration", label: "Duration" },
@@ -84,6 +85,8 @@ export function createStreamStats(container, opts = {}) {
 
   let frames = 0;
   let lastRenderMs = 0;
+  /** Last frame's CRC verdict; null means the link carries no CRC. */
+  let lastCrcOk = null;
 
   container.classList.add("stats");
   /** @type {Record<string, HTMLElement>} */
@@ -117,6 +120,7 @@ export function createStreamStats(container, opts = {}) {
     wrapOffsetTicks = 0;
     frames = 0;
     lastRenderMs = 0;
+    lastCrcOk = null;
     render();
   }
 
@@ -139,7 +143,13 @@ export function createStreamStats(container, opts = {}) {
   /**
    * Account for one decoded frame.
    *
-   * @param {{fields: {name: string, value: number}[], raw?: Uint8Array|null}} oc
+   * @param {{
+   *   fields: {name: string, value: number}[],
+   *   raw?: Uint8Array|null,
+   *   crcOk?: boolean|null,
+   * }} oc `crcOk` is the frame's link-CRC verdict: true verified, false
+   *   failed, and null or absent means the link carries no CRC — which is not
+   *   the same as a pass and is rendered differently.
    * @param {number} [recvMillis] host receive time; defaults to `performance.now()`
    */
   function onFrame(oc, recvMillis) {
@@ -157,10 +167,10 @@ export function createStreamStats(container, opts = {}) {
     tracker.recordPacket({
       sensorId: SENSOR_ID,
       byteLength,
-      // These pages read a Bluetooth stream with no per-frame CRC, so there
-      // is nothing to check — null, not false, which would report every frame
-      // as a CRC failure.
-      crcOk: null,
+      // The sensor appends a CRC only after SET_CRC_COMMAND, so this is null
+      // on an unchecked link — null, not false, which would report every
+      // frame as a CRC failure.
+      crcOk: oc?.crcOk ?? null,
       recvMillis: recv,
       contributions: [
         {
@@ -175,6 +185,14 @@ export function createStreamStats(container, opts = {}) {
       ],
     });
     frames++;
+    lastCrcOk = oc?.crcOk ?? null;
+    /* The tracker counts CRC failures through recordCrcFail, NOT from the
+       `crcOk` passed to recordPacket above - that field is carried for the
+       per-packet record and does not feed the counter (StreamStats.ts:203).
+       Without this call `totalCrcFails` stays 0 and the CRC cell reads "ok"
+       however many frames failed, which is the one thing the cell exists to
+       report. */
+    if (oc?.crcOk === false) tracker.recordCrcFail(SENSOR_ID);
 
     if (recv - lastRenderMs >= RENDER_INTERVAL_MS) render();
   }
@@ -210,6 +228,16 @@ export function createStreamStats(container, opts = {}) {
       "warn",
       lossKnown && snap.lossPct >= 1 && snap.lossPct < 5,
     );
+
+    // Distinguishes "no CRC on this link" from "CRC on and every frame good",
+    // which is the whole reason for turning it on.
+    const anyChecked = frames > 0 && lastCrcOk !== null;
+    values.crc.textContent = !anyChecked
+      ? "off"
+      : snap.totalCrcFails
+        ? `${snap.totalCrcFails} bad`
+        : "ok";
+    values.crc.classList.toggle("bad", anyChecked && snap.totalCrcFails > 0);
 
     values.throughput.textContent = snap.throughputBps
       ? `${(snap.throughputBps / 1024).toFixed(1)} kB/s`

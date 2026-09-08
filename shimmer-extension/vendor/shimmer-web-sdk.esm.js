@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-const SDK_VERSION = '0.2.1';
+const SDK_VERSION = '0.2.2';
 
 /**
  * Container for a single decoded sensor frame.
@@ -29,6 +29,7 @@ class ObjectCluster {
         this.deviceId = deviceId;
         this.fields = [];
         this.raw = null;
+        this.crcOk = null;
     }
     /**
      * Append a named field to this cluster.
@@ -405,7 +406,10 @@ class WebBluetoothTransport {
         this._service = null;
         this._writeChar = null;
         this._notifyChar = null;
+        this._rxFlowChar = null;
+        this._notifyIsAcknowledged = false;
         this._notifyCbs = new Set();
+        this._flowCbs = new Set();
         this._disconnectCbs = new Set();
         this._onCharacteristicChanged = (evt) => {
             const dv = evt.target?.value;
@@ -423,6 +427,21 @@ class WebBluetoothTransport {
                 }
             }
         };
+        this._onFlowChanged = (evt) => {
+            const dv = evt.target?.value;
+            if (!dv)
+                return;
+            const bytes = new Uint8Array(dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength));
+            this._log('flow-control', bytes);
+            for (const cb of this._flowCbs) {
+                try {
+                    cb(bytes);
+                }
+                catch (e) {
+                    this._log('flow-control handler error', e);
+                }
+            }
+        };
         this._onGattServerDisconnected = () => {
             for (const cb of this._disconnectCbs) {
                 try {
@@ -436,6 +455,8 @@ class WebBluetoothTransport {
         this._serviceUUID = opts.serviceUUID;
         this._writeCharUUID = opts.writeCharUUID;
         this._notifyCharUUID = opts.notifyCharUUID;
+        this._notifyCharUUIDFallback = opts.notifyCharUUIDFallback;
+        this._rxFlowCharUUID = opts.rxFlowCharUUID;
         this._requestDeviceOptions = opts.requestDeviceOptions;
         this._device = opts.device ?? null;
         this._defaultWriteWithResponse = opts.defaultWriteWithResponse ?? false;
@@ -458,6 +479,19 @@ class WebBluetoothTransport {
     get notifyCharacteristic() {
         return this._notifyChar;
     }
+    /** The flow-control characteristic, when one was configured and found. */
+    get rxFlowCharacteristic() {
+        return this._rxFlowChar;
+    }
+    /**
+     * True when the device → host subscription had to fall back to an
+     * indicate-only characteristic, which costs a confirmation round trip per
+     * payload and so caps throughput. Useful for diagnosing an unexpectedly slow
+     * link.
+     */
+    get notifyIsAcknowledged() {
+        return this._notifyIsAcknowledged;
+    }
     get deviceName() {
         return this._device?.name ?? undefined;
     }
@@ -479,10 +513,68 @@ class WebBluetoothTransport {
         this._server = await this._device.gatt.connect();
         this._service = await this._server.getPrimaryService(this._serviceUUID);
         this._writeChar = await this._service.getCharacteristic(this._writeCharUUID);
-        this._notifyChar = await this._service.getCharacteristic(this._notifyCharUUID);
+        this._notifyChar = await this._resolveNotifyCharacteristic();
         await this._notifyChar.startNotifications();
         this._notifyChar.addEventListener('characteristicvaluechanged', this._onCharacteristicChanged);
-        this._log('connected', this._device.name ?? '(unnamed)');
+        // Optional and best-effort: a device that does not expose the flow-control
+        // characteristic, or refuses the subscription, still has a working link.
+        if (this._rxFlowCharUUID) {
+            try {
+                this._rxFlowChar = await this._service.getCharacteristic(this._rxFlowCharUUID);
+                await this._rxFlowChar.startNotifications();
+                this._rxFlowChar.addEventListener('characteristicvaluechanged', this._onFlowChanged);
+                this._log('flow-control characteristic subscribed');
+            }
+            catch (e) {
+                this._rxFlowChar = null;
+                this._log('flow-control characteristic unavailable (continuing)', e);
+            }
+        }
+        this._log('connected', this._device.name ?? '(unnamed)', this._notifyIsAcknowledged ? '(acknowledged/indicate subscription)' : '(notify subscription)');
+    }
+    /**
+     * Pick the device → host characteristic, preferring one that can notify.
+     *
+     * Selection is by advertised capability rather than by UUID alone, so the
+     * faster path is chosen whenever the device offers it and a device that only
+     * exposes an indicate-only characteristic still works. An indicate-only
+     * choice is recorded in {@link notifyIsAcknowledged} and logged, because it
+     * halves the achievable throughput and is otherwise invisible.
+     */
+    async _resolveNotifyCharacteristic() {
+        const service = this._service;
+        const candidates = this._notifyCharUUIDFallback
+            ? [this._notifyCharUUID, this._notifyCharUUIDFallback]
+            : [this._notifyCharUUID];
+        let firstError;
+        const indicateOnly = [];
+        for (const uuid of candidates) {
+            let char;
+            try {
+                char = await service.getCharacteristic(uuid);
+            }
+            catch (e) {
+                firstError ?? (firstError = e);
+                continue;
+            }
+            // `properties` is absent in some polyfills and test doubles; treat that
+            // as "unknown, assume subscribable" rather than rejecting outright.
+            if (!char.properties || char.properties.notify) {
+                this._notifyIsAcknowledged = false;
+                return char;
+            }
+            if (char.properties.indicate)
+                indicateOnly.push(char);
+            // Anything else (e.g. a write-only characteristic that happens to sit at
+            // this UUID) cannot be subscribed to at all, so it is not a candidate.
+        }
+        if (indicateOnly[0]) {
+            this._notifyIsAcknowledged = true;
+            this._log('no notify-capable characteristic; subscribing to an indicate-only one -', 'each payload costs a confirmation round trip, roughly halving throughput');
+            return indicateOnly[0];
+        }
+        throw (firstError ??
+            new Error(`No subscribable device → host characteristic (tried ${candidates.join(', ')})`));
     }
     async disconnect() {
         try {
@@ -495,6 +587,15 @@ class WebBluetoothTransport {
                 }
                 this._notifyChar.removeEventListener('characteristicvaluechanged', this._onCharacteristicChanged);
             }
+            if (this._rxFlowChar) {
+                try {
+                    await this._rxFlowChar.stopNotifications();
+                }
+                catch {
+                    /* ignore */
+                }
+                this._rxFlowChar.removeEventListener('characteristicvaluechanged', this._onFlowChanged);
+            }
             if (this._device) {
                 this._device.removeEventListener('gattserverdisconnected', this._onGattServerDisconnected);
             }
@@ -506,6 +607,8 @@ class WebBluetoothTransport {
             this._service = null;
             this._writeChar = null;
             this._notifyChar = null;
+            this._rxFlowChar = null;
+            this._notifyIsAcknowledged = false;
             // Keep `_device` so a caller can reconnect to the same peripheral.
         }
     }
@@ -530,6 +633,19 @@ class WebBluetoothTransport {
     onNotify(cb) {
         this._notifyCbs.add(cb);
         return () => this._notifyCbs.delete(cb);
+    }
+    /**
+     * Subscribe to flow-control values from the device, when
+     * {@link WebBluetoothTransportOptions.rxFlowCharUUID} was configured and the
+     * characteristic was found.
+     *
+     * Values are delivered verbatim and are NOT interpreted here: the CYSPP
+     * guide documents the characteristic's purpose but not its value encoding,
+     * so callers get the raw bytes. Writes are not gated on them.
+     */
+    onFlowControl(cb) {
+        this._flowCbs.add(cb);
+        return () => this._flowCbs.delete(cb);
     }
     onDisconnect(cb) {
         this._disconnectCbs.add(cb);
@@ -1679,13 +1795,50 @@ const OPCODES = Object.freeze({
     NACK_COMMAND_PROCESSED: 0xfe,
     ACK_COMMAND_PROCESSED: 0xff,
 });
-/** Default BLE service / characteristic UUIDs for Shimmer3R. */
+/**
+ * Default BLE service / characteristic UUIDs for Shimmer3R.
+ *
+ * The Shimmer3R's BLE transport is the CYW20820 module's CYSPP profile. Per the
+ * EZ-Serial firmware platform user guide the service exposes three
+ * characteristics, and which one you subscribe to decides the throughput:
+ *
+ * - `…ca101` Acknowledged Data (Write, **Indicate**) — "guaranteed
+ *   reliability". Every payload costs an application-level confirmation round
+ *   trip, so at a 7.5 ms connection interval one PDU takes two intervals.
+ * - `…ca102` Unacknowledged Data (Write without response, **Notify**) — the
+ *   guide's "faster potential throughput" path. One characteristic serves both
+ *   directions. Loss of the ATT-level confirmation only: the BLE link layer
+ *   still retransmits and preserves ordering, and LiteProtocol frames carry
+ *   their own integrity checks on top.
+ * - `…ca103` RX Flow (Indicate) — the server indicates when it can no longer
+ *   safely receive new data.
+ */
 const SHIMMER3R_DEFAULTS = Object.freeze({
     SERVICE_UUID: '65333333-a115-11e2-9e9a-0800200ca100',
-    /** Write characteristic (host → device). */
+    /** Unacknowledged Data — host → device writes (write without response). */
     CHAR_RX_UUID: '65333333-a115-11e2-9e9a-0800200ca102',
-    /** Notify characteristic (device → host). */
-    CHAR_TX_UUID: '65333333-a115-11e2-9e9a-0800200ca101',
+    /**
+     * Device → host subscription. The Unacknowledged Data characteristic, which
+     * is notify-capable and therefore does not pay a confirmation round trip per
+     * payload — the same characteristic {@link CHAR_RX_UUID} writes to, which is
+     * the documented CYSPP client pattern.
+     *
+     * This was `…ca101` (Acknowledged Data) up to SDK 0.2.1. That characteristic
+     * is Indicate-only, so `startNotifications()` subscribed for indications and
+     * device → host throughput was capped at one PDU per two connection
+     * intervals — measured ~32 KB/s against a Windows 11 host, with an HCI
+     * capture confirming ATT indications (opcode 0x1D) and one confirmation per
+     * PDU. {@link WebBluetoothTransportOptions.notifyCharUUIDFallback} keeps the
+     * old characteristic reachable if a device does not offer this one.
+     */
+    CHAR_TX_UUID: '65333333-a115-11e2-9e9a-0800200ca102',
+    /** Acknowledged Data — the pre-0.2.2 device → host subscription. */
+    CHAR_TX_ACKED_UUID: '65333333-a115-11e2-9e9a-0800200ca101',
+    /**
+     * RX Flow. Indicates that the device can no longer safely receive new data;
+     * see {@link WebBluetoothTransportOptions.rxFlowCharUUID}.
+     */
+    CHAR_RX_FLOW_UUID: '65333333-a115-11e2-9e9a-0800200ca103',
 });
 /**
  * Timestamp field descriptors keyed by width.
@@ -1709,6 +1862,193 @@ const SHIMMER3_GSR_RESISTANCE_MIN_MAX_KOHMS = [
     [220.0, 680.0],
     [680.0, 4700.0],
 ];
+
+/**
+ * Shimmer wired/dock UART CRC.
+ *
+ * This is the Shimmer-specific 16-bit CRC used by the dock UART protocol — it is
+ * **not** CRC-16/CCITT-FALSE (the algorithm the Verisense client uses in
+ * `../verisense/protocolUtils.ts#crc16_ccitt_false`), so it cannot be reused:
+ * different seed (0xB0CA), a byte-swap step, and an odd-length zero-pad rule.
+ * Ported verbatim from the Java driver:
+ *   com.shimmerresearch.comms.wiredProtocol.ShimmerCrc (ShimmerCrc.java:12-60).
+ *
+ * All functions are pure. Every operation mirrors the Java `int` (32-bit,
+ * two's-complement) arithmetic exactly — JavaScript bitwise operators are also
+ * 32-bit, so the results are byte-for-byte identical (verified against the Java
+ * implementation compiled and run directly; e.g. CRC over `[0x24, 0xFF]` = the
+ * `TEST_ACK` header+command → `0xD9 0xB2`, matching
+ * `AbstractCommsProtocolWired.TEST_ACK`).
+ */
+/** Seed value for the wired UART CRC (ShimmerCrc.java:29 `CRC_INIT`). */
+const SHIMMER_UART_CRC_INIT = 0xb0ca;
+/**
+ * Fold a single byte into the running CRC.
+ * Ported from `ShimmerCrc.shimmerUartCrcByte` (ShimmerCrc.java:12-21).
+ *
+ * NB: only the first and last lines mask to 0xFFFF, exactly as in Java — the
+ * intermediate byte-swap / shift / XOR steps run on the full 32-bit word. Adding
+ * intermediate masks changes the result, so do not "tidy" this.
+ */
+function shimmerUartCrcByte(crc, b) {
+    crc &= 0xffff;
+    crc = ((crc & 0xffff) >>> 8) | ((crc & 0xffff) << 8);
+    crc ^= b & 0xff;
+    crc ^= (crc & 0xff) >>> 4;
+    crc ^= crc << 12;
+    crc ^= (crc & 0xff) << 5;
+    crc &= 0xffff;
+    return crc;
+}
+/**
+ * Compute the 2-byte CRC over the first `len` bytes of `msg`.
+ * Returns `[LSB, MSB]` — the on-wire order (LSB first), matching
+ * `ShimmerCrc.shimmerUartCrcCalc` (ShimmerCrc.java:28-46).
+ *
+ * If `len` is odd, one `0x00` byte is folded in before finalising
+ * (ShimmerCrc.java:37-39) — the padding is part of the algorithm and must be
+ * kept.
+ *
+ * @param msg the input bytes
+ * @param len number of bytes to CRC (defaults to `msg.length`)
+ */
+function shimmerUartCrcCalc(msg, len = msg.length) {
+    let crc = shimmerUartCrcByte(SHIMMER_UART_CRC_INIT, msg[0]);
+    for (let i = 1; i < len; i++) {
+        crc = shimmerUartCrcByte(crc, msg[i]);
+    }
+    if (len % 2 > 0) {
+        crc = shimmerUartCrcByte(crc, 0x00);
+    }
+    return [crc & 0xff, (crc >> 8) & 0xff];
+}
+/**
+ * Validate a full packet whose last two bytes are the CRC (LSB then MSB).
+ * Recomputes over `msg[0 .. length-2)` and compares, matching
+ * `ShimmerCrc.shimmerUartCrcCheck` (ShimmerCrc.java:52-60).
+ */
+function shimmerUartCrcCheck(msg) {
+    if (msg.length < 3)
+        return false;
+    const [lsb, msb] = shimmerUartCrcCalc(msg, msg.length - 2);
+    return lsb === msg[msg.length - 2] && msb === msg[msg.length - 1];
+}
+
+/**
+ * Bluetooth CRC mode for the Shimmer3 / Shimmer3R LiteProtocol.
+ *
+ * The firmware can append a CRC to everything it sends, in one of three modes,
+ * selected by the host with `SET_CRC_COMMAND` (0x8b). With it on, a host can
+ * *prove* a streaming frame is intact rather than inferring it from where the
+ * preamble bytes fall, which is what keeps a stream from drifting out of sync
+ * after a dropped byte.
+ *
+ * Three properties of the firmware's implementation shape this module, all read
+ * from `log-and-stream-common`:
+ *
+ *  - **It is device-to-host only.** `checkCrc` is called from the EEPROM brand
+ *    record and SD sync and from nowhere else — never on the Bluetooth command
+ *    receive path — so a host never appends a CRC to a command, in any mode.
+ *    Only inbound framing changes.
+ *  - **The algorithm is the dock UART's.** `CRC/shimmer_crc.c:24` calls
+ *    `platform_crcData`, which `Platform/platform_api.c:56-61` defines as
+ *    `ShimSwCrc_calc` and neither platform overrides, and the dock protocol
+ *    calls the same function (`Comms/shimmer_dock_usart.c:676,708`). So this
+ *    module reuses {@link shimmerUartCrcCalc} rather than growing a third copy
+ *    of a CRC that already exists twice in this SDK. Reimplementing its loop
+ *    would be a mistake: the odd-length zero-pad means folding the bytes
+ *    naively gives a different answer.
+ *  - **One byte is the same CRC truncated.** `calculateCrcAndInsert`
+ *    (`CRC/shimmer_crc.c:19-32`) computes over the whole message *including its
+ *    header or opcode byte*, appends the low byte, and appends the high byte as
+ *    well only in two-byte mode. So one-byte mode is not a weaker algorithm,
+ *    just fewer bits of it on the wire.
+ *
+ * Note the firmware's CRC helper takes a `uint8_t` length, so at most 255 bytes
+ * are covered. A worst-case Shimmer3R data packet is well inside that, but it
+ * is a real bound rather than an oversight.
+ */
+/** CRC modes the firmware accepts as `SET_CRC_COMMAND`'s only argument. */
+const CRC_MODE = Object.freeze({
+    /**
+     * No CRC on anything the device sends.
+     *
+     * The firmware's own state after every POWER CYCLE — not after every
+     * connection, which it survives. A host cannot read the mode back, so it
+     * cannot tell a reconnect to a power-cycled device from a reconnect to one
+     * that kept its setting; this SDK therefore assumes off on connect, because
+     * expecting a trailer that is not there misplaces every frame boundary while
+     * expecting none when there is one costs only a resync.
+     */
+    OFF: 0,
+    /** Low byte of the CRC-16 appended to everything the device sends. */
+    ONE_BYTE: 1,
+    /** Both bytes appended, low first. */
+    TWO_BYTE: 2,
+});
+/**
+ * True when `mode` is one the firmware understands.
+ *
+ * Worth checking, because the firmware does not: `SET_CRC_COMMAND` casts
+ * `args[0]` straight into its enum (`shimmer_bt_uart.c:933-937`), so a bad
+ * value from a host becomes an out-of-range mode on the device with no
+ * complaint. Rejecting it here is the only thing standing in the way.
+ */
+function isCrcMode(mode) {
+    return mode === CRC_MODE.OFF || mode === CRC_MODE.ONE_BYTE || mode === CRC_MODE.TWO_BYTE;
+}
+/**
+ * How many bytes `mode` adds to the end of every message the device sends.
+ * Numerically the mode itself, which is why the firmware writes
+ * `packet_length += crcMode`; named so callers read as intent, not arithmetic.
+ */
+function crcTrailerBytes(mode) {
+    return mode;
+}
+/**
+ * Append `mode`'s CRC to `msg`, returning a new array.
+ *
+ * A host has no reason to call this — the firmware does not check commands —
+ * but a test double pretending to *be* the firmware does, and building its
+ * frames with the same function the verifier uses is what stops the two
+ * drifting apart.
+ *
+ * A new array in EVERY mode, off included. Returning `msg` itself when there is
+ * nothing to append would make the return value sometimes owned and sometimes
+ * aliased, so a caller that retained or wrote through it would mutate its own
+ * input in exactly one mode. The copy costs nothing at the sizes this is used
+ * at, and callers are test doubles building frames rather than a hot path.
+ */
+function appendCrc(msg, mode) {
+    if (mode === CRC_MODE.OFF)
+        return new Uint8Array(msg);
+    const [lsb, msb] = shimmerUartCrcCalc(msg, msg.length);
+    const out = new Uint8Array(msg.length + mode);
+    out.set(msg, 0);
+    out[msg.length] = lsb;
+    if (mode === CRC_MODE.TWO_BYTE)
+        out[msg.length + 1] = msb;
+    return out;
+}
+/**
+ * Check the CRC on a complete inbound message: `msg` is the payload followed by
+ * `mode` trailing bytes.
+ *
+ * Mirrors the firmware's own `checkCrc` (`CRC/shimmer_crc.c:56-77`), including
+ * that one-byte mode compares the low byte only and that `CRC_OFF` is vacuously
+ * valid — a caller that has no CRC to check has nothing to reject.
+ */
+function verifyCrc(msg, mode) {
+    if (mode === CRC_MODE.OFF)
+        return true;
+    const payloadLen = msg.length - mode;
+    if (payloadLen < 1)
+        return false;
+    const [lsb, msb] = shimmerUartCrcCalc(msg, payloadLen);
+    if (msg[payloadLen] !== lsb)
+        return false;
+    return mode === CRC_MODE.ONE_BYTE || msg[payloadLen + 1] === msb;
+}
 
 /** `ShimmerVerDetails.HW_ID` values that map onto a {@link ShimmerGeneration}. */
 const HW_ID_SHIMMER_3 = 3;
@@ -3689,77 +4029,6 @@ function getOversamplingRatioADS1292R(samplingRate) {
 }
 
 /**
- * Shimmer wired/dock UART CRC.
- *
- * This is the Shimmer-specific 16-bit CRC used by the dock UART protocol — it is
- * **not** CRC-16/CCITT-FALSE (the algorithm the Verisense client uses in
- * `../verisense/protocolUtils.ts#crc16_ccitt_false`), so it cannot be reused:
- * different seed (0xB0CA), a byte-swap step, and an odd-length zero-pad rule.
- * Ported verbatim from the Java driver:
- *   com.shimmerresearch.comms.wiredProtocol.ShimmerCrc (ShimmerCrc.java:12-60).
- *
- * All functions are pure. Every operation mirrors the Java `int` (32-bit,
- * two's-complement) arithmetic exactly — JavaScript bitwise operators are also
- * 32-bit, so the results are byte-for-byte identical (verified against the Java
- * implementation compiled and run directly; e.g. CRC over `[0x24, 0xFF]` = the
- * `TEST_ACK` header+command → `0xD9 0xB2`, matching
- * `AbstractCommsProtocolWired.TEST_ACK`).
- */
-/** Seed value for the wired UART CRC (ShimmerCrc.java:29 `CRC_INIT`). */
-const SHIMMER_UART_CRC_INIT = 0xb0ca;
-/**
- * Fold a single byte into the running CRC.
- * Ported from `ShimmerCrc.shimmerUartCrcByte` (ShimmerCrc.java:12-21).
- *
- * NB: only the first and last lines mask to 0xFFFF, exactly as in Java — the
- * intermediate byte-swap / shift / XOR steps run on the full 32-bit word. Adding
- * intermediate masks changes the result, so do not "tidy" this.
- */
-function shimmerUartCrcByte(crc, b) {
-    crc &= 0xffff;
-    crc = ((crc & 0xffff) >>> 8) | ((crc & 0xffff) << 8);
-    crc ^= b & 0xff;
-    crc ^= (crc & 0xff) >>> 4;
-    crc ^= crc << 12;
-    crc ^= (crc & 0xff) << 5;
-    crc &= 0xffff;
-    return crc;
-}
-/**
- * Compute the 2-byte CRC over the first `len` bytes of `msg`.
- * Returns `[LSB, MSB]` — the on-wire order (LSB first), matching
- * `ShimmerCrc.shimmerUartCrcCalc` (ShimmerCrc.java:28-46).
- *
- * If `len` is odd, one `0x00` byte is folded in before finalising
- * (ShimmerCrc.java:37-39) — the padding is part of the algorithm and must be
- * kept.
- *
- * @param msg the input bytes
- * @param len number of bytes to CRC (defaults to `msg.length`)
- */
-function shimmerUartCrcCalc(msg, len = msg.length) {
-    let crc = shimmerUartCrcByte(SHIMMER_UART_CRC_INIT, msg[0]);
-    for (let i = 1; i < len; i++) {
-        crc = shimmerUartCrcByte(crc, msg[i]);
-    }
-    if (len % 2 > 0) {
-        crc = shimmerUartCrcByte(crc, 0x00);
-    }
-    return [crc & 0xff, (crc >> 8) & 0xff];
-}
-/**
- * Validate a full packet whose last two bytes are the CRC (LSB then MSB).
- * Recomputes over `msg[0 .. length-2)` and compares, matching
- * `ShimmerCrc.shimmerUartCrcCheck` (ShimmerCrc.java:52-60).
- */
-function shimmerUartCrcCheck(msg) {
-    if (msg.length < 3)
-        return false;
-    const [lsb, msb] = shimmerUartCrcCalc(msg, msg.length - 2);
-    return lsb === msg[msg.length - 2] && msb === msg[msg.length - 1];
-}
-
-/**
  * What a Shimmer says about itself when asked: which Bluetooth module it
  * carries, and which board it is.
  *
@@ -5340,11 +5609,35 @@ function buildShimmer3Schema(channelIds, timestampFmt, onProblem) {
  *
  * @param onProblem optional sink for schema problems (an unrecognised channel
  *   ID); see {@link buildShimmer3Schema}.
+ * @throws if the buffer is shorter than the header, or shorter than the channel
+ *   count it declares. Rejecting is deliberate — see the body — and callers can
+ *   let it propagate: nothing is assigned from the result until it returns.
  */
 function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
-    let base = 0;
-    if (u8[0] === OPCODES.INQUIRY_RESPONSE)
-        base = 1;
+    const base = u8[0] === OPCODES.INQUIRY_RESPONSE ? 1 : 0;
+    /* Refuse a short buffer instead of degrading into a plausible-looking
+     * configuration. The channel count and channel ids used to fall back to
+     * zero/empty on a truncated response, and an empty channel list parses all
+     * the way through to `enabledSensors = 0` and a timestamp-only frame — which
+     * the device then contradicts with every real frame it sends. The only
+     * visible symptom is 100% packet loss at a believable data rate, with nothing
+     * pointing at the inquiry. Fixed for Shimmer3R first; this is the same class
+     * of fault on the classic layout, which differs only in the width of the
+     * config word (4 bytes here, 7 there) and hence where the count sits.
+     *
+     * The response carries no length byte of its own — it is
+     * `9 + numChannels` bytes opcode-inclusive — so the declared count is the
+     * only thing that says how much more to expect, and it has to be read before
+     * it can be trusted. Hence the two checks. */
+    const headerEnd = base + 8;
+    if (u8.length < headerEnd) {
+        throw new Error(`Inquiry response too short: ${u8.length} bytes, need at least ${headerEnd}.`);
+    }
+    const declaredChannels = u8[base + 6];
+    if (u8.length < headerEnd + declaredChannels) {
+        throw new Error(`Inquiry response truncated: ${u8.length} bytes, need ${headerEnd + declaredChannels} ` +
+            `for the ${declaredChannels} channels it declares.`);
+    }
     const adcRaw = u16le$3(u8, base + 0);
     const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
     // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
@@ -5355,13 +5648,21 @@ function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
     const magRange = (configByte0 & 0xe00000) >>> 21;
     const gsrRange = (configByte0 >>> 25) & 0x7;
     const internalExpPower = (configByte0 >>> 24) & 0x1;
-    const numChannels = u8[base + 6] ?? 0;
-    const bufferSize = u8[base + 7] ?? 0;
-    const chStart = base + 8;
+    const numChannels = declaredChannels;
+    const bufferSize = u8[base + 7];
+    const chStart = headerEnd;
     const channelIds = [...u8.slice(chStart, chStart + numChannels)];
     const schema = buildShimmer3Schema(channelIds, timestampFmt, onProblem);
+    /* Normalised to the opcode-inclusive form whichever way the bytes arrived.
+     * `opcode` is by definition INQUIRY_RESPONSE here - `base` is 1 only when
+     * u8[0] already is - and `bytes` is documented as the opcode-inclusive
+     * slice, so a headerless input has it prepended rather than reporting the
+     * sampling divisor's low byte as an opcode and a `bytes` the interface says
+     * it is not. Callers comparing the two forms, or re-parsing `bytes`, see one
+     * shape. */
+    const bytes = base === 1 ? u8.slice(0) : Uint8Array.of(OPCODES.INQUIRY_RESPONSE, ...u8);
     return {
-        opcode: u8[0],
+        opcode: OPCODES.INQUIRY_RESPONSE,
         adcRaw,
         samplingRateHz,
         configByte0,
@@ -5374,7 +5675,7 @@ function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
         bufferSize,
         channelIds,
         schema,
-        bytes: u8.slice(0),
+        bytes,
     };
 }
 /** Decode a DEVICE_VERSION_RESPONSE (0x25) — 1 payload byte = HW version.
@@ -6620,6 +6921,56 @@ const SD_RESPONSE_OPCODES = new Set([
     SD_TRANSFER_OPCODES.FREE_SPACE_RESPONSE,
     SD_TRANSFER_OPCODES.DELETE_RESPONSE,
 ]);
+/**
+ * Message types the firmware sends WITHOUT the link CRC, even when a host has
+ * turned one on with SET_CRC_COMMAND.
+ *
+ * `btCrcMode` is honoured in exactly three places — the command response path
+ * (`ShimBt_sendRspOrAck`, `Comms/shimmer_bt_uart.c:2422`), the instream status
+ * push (`:2545`) and the stream data packet (`Sensing/shimmer_sensing.c:680`).
+ * Everything else that reaches the host reaches it another way:
+ *
+ *  - **The data-rate test** builds its own batch of `[0xA5][counter]` packets
+ *    and calls `BtTransmit()` directly, bypassing the ring and the CRC both
+ *    (`:2987`). It is a raw throughput flood by design.
+ *  - **SD file transfer** writes its status frames and data blocks straight to
+ *    the TX buffer (`Comms/shimmer_sd_file_transfer.c:342,636`). Those blocks
+ *    carry their own CRC-16 per block instead (`:160`).
+ *  - **SD sync** appends a CRC of its own at a FIXED width
+ *    (`SDSync/shimmer_sd_sync.c:441`, `BT_SD_SYNC_CRC_MODE`) that has nothing
+ *    to do with the mode the host selected.
+ *
+ * A host that verifies these anyway rejects every one of them — which is how
+ * enabling a CRC broke the link-speed test, and would have broken SD downloads
+ * next.
+ */
+const CRC_EXEMPT_RESPONSE_OPCODES = new Set([
+    OPCODES.DATA_RATE_TEST_RESPONSE,
+    OPCODES.SD_SYNC_RESPONSE,
+    ...SD_RESPONSE_OPCODES,
+]);
+/**
+ * Whether a whole message carries the link CRC.
+ *
+ * `INSTREAM_CMD_RESPONSE` (0x8A) is the awkward one: it prefixes both the
+ * status push, which IS CRC'd, and the SD-transfer frames, which are not — so
+ * the second byte decides, and a one-byte buffer cannot be judged yet.
+ *
+ * @param msg a complete message, opcode first
+ * @returns true when the firmware would have appended the CRC to it
+ */
+function messageCarriesLinkCrc(msg) {
+    if (msg.length === 0)
+        return false;
+    const opcode = msg[0];
+    if (CRC_EXEMPT_RESPONSE_OPCODES.has(opcode))
+        return false;
+    if (opcode === SD_INSTREAM_BYTE) {
+        // Only the status push under this prefix is CRC'd; the SD frames are not.
+        return msg.length >= 2 && msg[1] === OPCODES.STATUS_RESPONSE;
+    }
+    return true;
+}
 /**
  * Responses shaped `[opcode][length][data…]`, and the largest payload length
  * the firmware will report for each — the value that separates a real response
@@ -8544,7 +8895,17 @@ const SHIMMER3_INFOMEM_FIELD_GROUPS = Object.freeze([
         ],
     },
     { id: 'trial', title: 'Trial / Experiment' },
-    { id: 'sync', title: 'Multi-Shimmer Sync' },
+    {
+        id: 'sync',
+        title: 'Multi-Shimmer Sync',
+        // Readable but not editable: multi-Shimmer sync is a licensed feature of
+        // Consensys, and offering the underlying InfoMem bytes here would be a way
+        // around that licence. The group stays expandable because seeing how a
+        // device is configured is legitimate and often necessary for support.
+        readOnly: true,
+        readOnlyReason: 'Multi-Shimmer Sync is configured with Consensys. These values are shown ' +
+            'as the device has them and are written back unchanged.',
+    },
     { id: 'calibration', title: 'Calibration' },
 ]);
 // ---------------------------------------------------------------------------
@@ -8945,6 +9306,8 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         options: ON_OFF,
         group: 'sdLogging',
         appliesTo: ALL,
+        readOnly: true,
+        readOnlyReason: 'Deprecated - no longer acted on by current firmware.',
         configKey: 'trial.singleTouch',
     },
     {
@@ -8958,6 +9321,8 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
         options: ON_OFF,
         group: 'sdLogging',
         appliesTo: ALL,
+        readOnly: true,
+        readOnlyReason: 'Deprecated - the TCXO is not fitted on current hardware.',
         configKey: 'trial.tcxo',
     },
     {
@@ -9401,6 +9766,282 @@ function inferShimmer3Generation(ctx, expansionBoard) {
     return boardRev >= threshold ? 'shimmer3-new-imu' : 'shimmer3-old-imu';
 }
 
+/**
+ * Default trial identity for a Shimmer3/Shimmer3R configuration.
+ *
+ * These are the values a host should apply when it has to invent a
+ * configuration — a blank or erased InfoMem, or an explicit reset to defaults —
+ * rather than leaving the identity fields empty. They live here, in one place,
+ * so every path that fills in a default agrees; a device named by one screen
+ * and differently by another is worse than one not named at all.
+ *
+ * Deliberately NOT applied automatically on read: silently renaming a device
+ * because its name is blank would present an edit the user did not make as if
+ * it were the device's own setting.
+ */
+/** Experiment ID applied when none is set. */
+const DEFAULT_TRIAL_NAME = 'DefaultTrial';
+/** Prefix for a defaulted device name; the MAC suffix completes it. */
+const DEVICE_NAME_PREFIX = 'Shimmer_';
+/**
+ * Hex characters of the MAC taken as the device's short identity.
+ *
+ * Four, because `Shimmer_` plus four is exactly the 12 ASCII bytes the InfoMem
+ * name field holds (`idxSDShimmerName`) — a longer suffix would be silently
+ * truncated on write, and a device whose stored name does not match the one it
+ * was given is the kind of mismatch that costs an afternoon.
+ */
+const MAC_SUFFIX_CHARS = 4;
+/**
+ * The last {@link MAC_SUFFIX_CHARS} hex characters of a MAC, upper-cased.
+ *
+ * Accepts the separator-free form the device reports (`DF1797A1F3F8`) and the
+ * colon- or dash-separated forms a host may hold, since both reach this code
+ * from different places.
+ *
+ * @param mac a MAC address in any common notation
+ * @returns the suffix, or `null` when `mac` holds too few hex characters
+ */
+function macShortId(mac) {
+    const hex = String(mac ?? '').replace(/[^0-9a-fA-F]/g, '');
+    if (hex.length < MAC_SUFFIX_CHARS)
+        return null;
+    return hex.slice(-MAC_SUFFIX_CHARS).toUpperCase();
+}
+/**
+ * Device name to apply when none is set, e.g. `Shimmer_F3F8`.
+ *
+ * @param mac the device's MAC address, as read from InfoMem or the transport
+ * @returns the defaulted name, or `null` when the MAC is unusable — callers
+ *   should then leave the existing name alone rather than write a placeholder
+ *   that looks like an identity but identifies nothing
+ */
+function defaultDeviceName(mac) {
+    const id = macShortId(mac);
+    return id === null ? null : `${DEVICE_NAME_PREFIX}${id}`;
+}
+/**
+ * Both identity defaults together, for the usual case of applying them as a
+ * pair.
+ *
+ * @param mac the device's MAC address
+ * @returns `deviceName` (null when the MAC is unusable) and `trialName`
+ */
+function defaultTrialIdentity(mac) {
+    return { deviceName: defaultDeviceName(mac), trialName: DEFAULT_TRIAL_NAME };
+}
+
+/**
+ * Does the configured sensor output rate keep up with the configured packet
+ * rate?
+ *
+ * These are two independent InfoMem fields and nothing in the firmware relates
+ * them. The packet rate (`samplingRate`, bytes 0-1) decides how often a frame
+ * is assembled; the IMU's ODR (`ConfigSetupByte1`) decides how often the
+ * LSM6DSV actually produces a new sample. Set the packet rate above the ODR and
+ * the firmware dutifully packages the same sample several times over, with a
+ * fresh timestamp on each - so the stream looks perfect (regular timestamps, no
+ * loss, valid CRCs) while the plotted signal is a staircase of repeats.
+ *
+ * That the two are meant to agree is not an inference. The firmware's own
+ * Shimmer3R defaults pair a 51.2 Hz packet rate with the ODR immediately above
+ * it, and say so:
+ *
+ *     // LSM6DSV Gyro sampling rate, next highest to 51.2Hz
+ *     ShimConfig_gyroRateSet(LSM6DSV_ODR_AT_60Hz);
+ *     -- log-and-stream-common Configuration/shimmer_config.c:183-184
+ *
+ * Consensys maintains the invariant by deriving sensor ODRs from the trial
+ * rate, which is why reconfiguring there makes the staircase disappear. A host
+ * that edits the fields independently has to check it instead, and this is that
+ * check.
+ *
+ * Deliberately scoped to the LSM6DSV accel/gyro pair. The same trap exists for
+ * the wide-range accelerometer and the magnetometers, but each has its own
+ * enable bits and its own ODR table, and a warning that fires on a sensor the
+ * user has not enabled is worse than no warning at all.
+ */
+/** A rate option label parsed to Hz, or null when it names no rate. */
+function labelToHz(label) {
+    // "60.0Hz" / "1.875Hz" / "Power-down". Parsed from the option table rather
+    // than duplicated as numbers, so the two cannot drift apart.
+    const m = /^([\d.]+)\s*Hz$/i.exec(label.trim());
+    if (!m)
+        return null;
+    const hz = Number(m[1]);
+    return Number.isFinite(hz) && hz > 0 ? hz : null;
+}
+/**
+ * Output rate of an LSM6DSV accel/gyro ODR code, in Hz.
+ *
+ * @param code the value stored in `ConfigSetupByte1`
+ * @returns the rate in Hz, or null for power-down and for codes with no rate
+ *   (the Java table carries one writable value it does not name)
+ */
+function lsm6dsvAccelGyroRateHz(code) {
+    const hit = SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS.find(([value]) => value === code);
+    return hit ? labelToHz(hit[1]) : null;
+}
+/** Packet rate in Hz from the stored `samplingRate` divider. */
+function samplingRateHzFromDivider(divider) {
+    if (!Number.isFinite(divider) || divider <= 0)
+        return null;
+    return INFOMEM_SAMPLING_CLOCK_FREQ / divider;
+}
+/**
+ * Check the LSM6DSV ODR against the packet rate.
+ *
+ * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
+ * @param opts.imuRateCode stored `ConfigSetupByte1`
+ * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
+ *   low-noise accelerometer or the gyroscope is actually enabled, since the ODR
+ *   is irrelevant to a stream that carries neither
+ */
+function checkImuRateCoversPacketRate(opts) {
+    const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
+    const imuRateHz = lsm6dsvAccelGyroRateHz(opts.imuRateCode);
+    const usesImu = (opts.enabledSensors &
+        (SensorBitmapShimmer3.SENSOR_A_ACCEL | SensorBitmapShimmer3.SENSOR_GYRO)) !==
+        0;
+    const none = {
+        packetRateHz,
+        imuRateHz,
+        repeatsPerSample: null,
+        short: false,
+        problem: null,
+    };
+    if (!usesImu || packetRateHz === null)
+        return none;
+    if (imuRateHz === null) {
+        // Power-down with the IMU enabled is its own fault, and a worse one: the
+        // sample never changes at all.
+        return {
+            ...none,
+            short: true,
+            problem: `The accelerometer/gyroscope output rate is set to "power-down" while those ` +
+                `sensors are enabled, so every frame will carry the same reading. Raise it to ` +
+                `at least ${packetRateHz.toFixed(1)} Hz.`,
+        };
+    }
+    if (imuRateHz >= packetRateHz)
+        return { ...none, short: false, problem: null };
+    const repeats = packetRateHz / imuRateHz;
+    return {
+        packetRateHz,
+        imuRateHz,
+        repeatsPerSample: repeats,
+        short: true,
+        problem: `The accelerometer/gyroscope output rate (${imuRateHz} Hz) is below the sampling ` +
+            `rate (${packetRateHz.toFixed(1)} Hz), so the sensor will repeat each reading about ` +
+            `${repeats < 10 ? repeats.toFixed(1) : Math.round(repeats)} times instead of ` +
+            `producing new data. Timestamps and packet loss will still look correct while the ` +
+            `signal is a staircase. Raise "Gyro/Accel Rate" to the next value at or above ` +
+            `${packetRateHz.toFixed(1)} Hz.`,
+    };
+}
+
+/**
+ * Derive a sensor's output rate from the configured packet rate, the way the
+ * Java driver does.
+ *
+ * In Consensys a user never writes an ODR: they set the trial rate or toggle a
+ * sensor, and `ShimmerDevice.setShimmerAndSensorsSamplingRate` /
+ * `setSensorEnabledState` fan that out to each sensor
+ * (`ShimmerDevice.java:3399`, `:2357`). A host that edits the InfoMem fields
+ * independently has to do the same fan-out, or it produces pairs the driver
+ * never would — a 51.2 Hz packet rate against a 1.875 Hz IMU being the one that
+ * cost bench time.
+ *
+ * Ported from `SensorLSM6DSV.getGyroRateFromFreq` (`SensorLSM6DSV.java:676`)
+ * and `setDefaultLSM6DSVGyroSensorConfig`, against the checkouts in
+ * `eclipse-java-workspace_2024`.
+ */
+/** ODR codes with a meaning beyond "this many Hz". */
+const LSM6DSV_ODR = Object.freeze({
+    /** Sensor off. What the driver writes when neither channel is enabled. */
+    POWER_DOWN: 0,
+    /**
+     * 1.875 Hz — and *also* how the driver represents "low-power gyro". There is
+     * no separate bit: `checkLowPowerGyro` (`SensorLSM6DSV.java:752`) reads the
+     * flag back **from** the rate. So this value is self-perpetuating — a
+     * re-derivation from an existing 1 keeps 1, because it reads as a low-power
+     * request. Only enabling the sensor clears it, which is why
+     * {@link deriveLsm6dsvAccelGyroRate} takes `lowPower` explicitly rather than
+     * inferring it from the current value.
+     */
+    LOW_POWER: 1,
+});
+/**
+ * The ladder from `getGyroRateFromFreq`, as `[maxFreqHz, code]` pairs in the
+ * order Java tests them. Code 3 (12 Hz) is absent because the Java ladder skips
+ * it — 2 goes straight to 4.
+ */
+const LSM6DSV_LADDER = Object.freeze([
+    [7.5, 2],
+    [30, 4],
+    [60, 5],
+    [120, 6],
+    [240, 7],
+    [480, 8],
+    [960, 9],
+    [1920, 10],
+    [3840, 11],
+    [7680, 12],
+]);
+/**
+ * The LSM6DSV accel+gyro ODR code for a packet rate — "as close to the Shimmer
+ * sampling rate as possible, sensor rate >= shimmer rate", which is the
+ * invariant the driver states in comment after comment and the firmware's own
+ * defaults follow (`shimmer_config.c:183`, *"next highest to 51.2Hz"*).
+ *
+ * @param opts.enabled whether EITHER the low-noise accelerometer or the
+ *   gyroscope is enabled — the two share this one rate field, and Java tests
+ *   them with `||` (`SensorLSM6DSV.java:664-667`)
+ * @param opts.samplingRateHz the configured packet rate
+ * @param opts.lowPower request the low-power rate regardless of the packet
+ *   rate, as Java's disabled-sensor default does. Pass it explicitly; do not
+ *   infer it from the stored value, or a device already at 1.875 Hz stays there
+ * @returns the ODR code to store in `ConfigSetupByte1`
+ */
+function deriveLsm6dsvAccelGyroRate(opts) {
+    if (!opts.enabled)
+        return LSM6DSV_ODR.POWER_DOWN;
+    if (opts.lowPower)
+        return LSM6DSV_ODR.LOW_POWER;
+    const hz = opts.samplingRateHz;
+    if (!Number.isFinite(hz) || hz <= 0)
+        return LSM6DSV_ODR.POWER_DOWN;
+    for (const [maxHz, code] of LSM6DSV_LADDER) {
+        if (hz <= maxHz)
+            return code;
+    }
+    // Above the top of the ladder Java falls through with the last assignment;
+    // the fastest ODR is the only sane answer either way.
+    return LSM6DSV_LADDER[LSM6DSV_LADDER.length - 1][1];
+}
+/**
+ * The rate to store when the IMU's enabled state has just changed, mirroring
+ * `setDefaultLSM6DSVGyroSensorConfig`: enabling clears low-power, disabling
+ * sets it.
+ *
+ * Disabling therefore parks the sensor at 1.875 Hz rather than powering it
+ * down, which is what Java does and is the state that stranded a device when
+ * something later enabled the channel without re-deriving. Enabling is the only
+ * thing that clears it.
+ *
+ * @param opts.enabled the state being applied
+ * @param opts.samplingRateHz the configured packet rate
+ */
+function deriveLsm6dsvRateOnEnableChange(opts) {
+    return opts.enabled
+        ? deriveLsm6dsvAccelGyroRate({
+            enabled: true,
+            samplingRateHz: opts.samplingRateHz,
+            lowPower: false,
+        })
+        : LSM6DSV_ODR.LOW_POWER;
+}
+
 // ---------------------------------------------------------------------------
 // InfoMem constants
 // ---------------------------------------------------------------------------
@@ -9426,6 +10067,77 @@ const SHIMMER3R_INFOMEM_BLE_CHUNK_BYTES = 64;
  * (`Calibration/shimmer_calibration.c:372-380`).
  */
 const CALIB_DUMP_CHUNK_BYTES = 128;
+// ---------------------------------------------------------------------------
+// Inquiry response layout
+// ---------------------------------------------------------------------------
+/**
+ * Header bytes of an inquiry response, opcode included:
+ * `[opcode][samplingRateTicks:2][configSetupByte0..6][numChannels][bufferSize]`,
+ * matching the `INQUIRY_COMMAND` case of `ShimBt_processCmd`
+ * (`log-and-stream-common/Comms/shimmer_bt_uart.c`).
+ *
+ * The full response is `INQUIRY_RSP_HEADER_BYTES + numChannels` bytes — 18 for
+ * a typical six-channel configuration. Unlike every other multi-byte response
+ * it carries **no length byte**, so its size is only knowable after the header
+ * has arrived, which is why it needs a reader of its own rather than
+ * {@link Shimmer3RClient._readLengthPrefixedResponse}.
+ */
+const INQUIRY_RSP_HEADER_BYTES = 12;
+/**
+ * Offset of the channel count within that header (opcode included), i.e. the
+ * one byte that has to be in hand before the total length can be computed.
+ */
+const INQUIRY_RSP_NUM_CHANNELS_OFFSET = 10;
+// ---------------------------------------------------------------------------
+// Stream alignment acquisition
+// ---------------------------------------------------------------------------
+/**
+ * How many frame intervals a timestamp step may span and still be accepted as
+ * evidence of correct alignment.
+ *
+ * The stream parser locks on by finding a preamble one frame apart, but a frame
+ * layout is periodic: a channel resting at zero puts a `0x00` at a fixed offset
+ * in every frame, so a *wrong* offset can satisfy that check on every frame of
+ * the session. The timestamp step is what separates the two — at the true
+ * alignment it is one sampling interval, while a shifted view reads data bytes
+ * as a timestamp and steps by something else.
+ *
+ * Deliberately small. A misalignment by a whole byte multiplies the apparent
+ * step by 256, which is an exact multiple of the interval, so accepting any
+ * multiple would accept the very alignment this exists to reject. A few
+ * intervals is enough to tolerate frames genuinely dropped by the link while
+ * the parser is acquiring.
+ */
+const STREAM_ALIGN_MAX_SKIP = 4;
+/** Fractional tolerance on that comparison, for jitter in the device clock. */
+const STREAM_ALIGN_TICK_TOLERANCE = 0.1;
+/**
+ * Candidates the timestamp check may reject before it stands down.
+ *
+ * The check compares against the rate the inquiry reported, so it is only as
+ * good as that agreeing with what the device is actually sending. If it does
+ * not, every candidate is rejected and the stream yields NOTHING - which is a
+ * worse failure than the misalignment the check exists to prevent, because at
+ * least misaligned data is visibly wrong. After this many rejections the
+ * lenient double-preamble lock is accepted instead, and the reason is logged.
+ */
+const STREAM_ALIGN_MAX_REJECTS = 256;
+/**
+ * Longest a frame interval can be: one second of device ticks.
+ *
+ * Not a guess. The driver clamps the sampling rate to at least 1 Hz
+ * (`ShimmerDevice.correctSamplingRate`) and the firmware stores it as a divider
+ * of the same 32768 Hz clock, so no valid configuration steps further than this
+ * between frames.
+ *
+ * Its value is that it needs no rate from anywhere. A stream locked to the
+ * wrong byte offset reads its "timestamp" out of neighbouring payload bytes,
+ * and those produce steps in the millions - a bench capture of exactly that
+ * gave a rock-steady 4194304 - so a bound this loose still rejects them
+ * outright. That matters most where the reported rate is unusable, because
+ * that is where nothing else is checking.
+ */
+const STREAM_MAX_FRAME_TICKS = 32768;
 // ---------------------------------------------------------------------------
 // Stray-ACK tolerance
 // ---------------------------------------------------------------------------
@@ -9524,6 +10236,39 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._expectingAck = 0;
         this._streaming = false;
         this._lastTs = 0;
+        /**
+         * Whether the stream parser has confirmed its frame alignment against the
+         * device clock. False until a candidate passes the timestamp-step check, and
+         * cleared again whenever the buffer stops looking frame-aligned, so a
+         * re-acquisition is held to the same evidence as the first one.
+         */
+        this._streamAligned = false;
+        /**
+         * CRC bytes the firmware is appending to every message, 0 when off.
+         *
+         * Host-side mirror of the firmware's `btCrcMode`. There is no command to read
+         * it back, so this tracks what {@link setCrcMode} last set.
+         *
+         * Reset to off wherever a link begins or ends, by
+         * {@link _resetLinkProtocolState}. The firmware's mode is per POWER CYCLE
+         * rather than per connection, so a reconnect cannot actually know — off is
+         * assumed because it is the direction that fails safe. The host's standing
+         * request lives in {@link _desiredCrcMode} and is re-established on connect.
+         */
+        this._crcMode = CRC_MODE.OFF;
+        /** Candidate alignments the timestamp check has rejected since the last lock. */
+        this._streamAlignRejects = 0;
+        /** Frames whose CRC failed since streaming last started. */
+        this._crcFailures = 0;
+        /**
+         * CRC mode to (re-)establish on connect.
+         *
+         * Kept across a disconnect precisely because the device does not keep it: a
+         * host that asked for a CRC once means it for the next link too, and the
+         * firmware clears its own mode on every power cycle. {@link _crcMode} tracks
+         * what the device is actually doing; this tracks what was asked for.
+         */
+        this._desiredCrcMode = CRC_MODE.OFF;
         /** True while the active transport is a byte stream with no message framing. */
         this._unframed = false;
         /** Re-framing accumulator, used only when {@link _unframed}. */
@@ -9610,29 +10355,14 @@ class Shimmer3RClient extends BaseShimmerClient {
         this.onFactoryTestStateChange = null;
         /** Handle an unexpected transport disconnect (the link dropped under us). */
         this._handleTransportDisconnect = (reason) => {
-            this._streaming = false;
-            this._sdKnownSession = null;
+            /* The transport itself is deliberately left in place: this is a
+             * notification, and a caller may still call disconnect() to tear down. Only
+             * the protocol state goes. */
+            this._resetLinkProtocolState();
             this._failFactoryTest('The link dropped during the factory self-test.');
             this._emitStatus('Device disconnected');
             this._emitDisconnect(reason);
         };
-        // ---------------------------------------------------------------------------
-        // Notify handler (fed raw notification chunks by the transport)
-        // ---------------------------------------------------------------------------
-        /**
-         * Transport entry point. A framed transport (BLE) delivers one firmware
-         * message per call and goes straight to {@link _handleFramedChunk}; an
-         * unframed one (Web Serial over USB or over a Classic-Bluetooth COM port)
-         * is re-framed first, then funnelled through the very same handler.
-         *
-         * A running factory test is served FIRST, before either path. Its report is
-         * bare ASCII with no opcode, no length and no CRC, so the framer would treat
-         * every line as garbage and resync through it one byte at a time — and the
-         * temp handlers, which only ever see whole framed messages, would never see it
-         * at all. What the capture hands back is what was NOT report traffic (a status
-         * push glued after `TEST END`, a late ACK), and that continues down the normal
-         * path.
-         */
         this._handleNotify = (chunk) => {
             let bytes = chunk;
             if (this._factoryTest) {
@@ -9641,7 +10371,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                     return;
                 bytes = rest;
             }
-            if (this._unframed) {
+            if (this._reframing) {
                 this._handleUnframedChunk(bytes);
                 return;
             }
@@ -9649,10 +10379,46 @@ class Shimmer3RClient extends BaseShimmerClient {
         };
         this._handleFramedChunk = (chunk) => {
             this._log('Notify len=', chunk.length, 'data=', chunk);
+            /* Check and strip the packet's CRC before anything above sees the message.
+             * One place, because every whole control message arrives here - from the
+             * framer on a reframed link, or straight from a framed transport.
+             *
+             * An ACK is NOT exempt, and must not be: `messageCarriesLinkCrc` returns
+             * true for it, because `[ACK][response][CRC]` carries ONE CRC over the
+             * whole packet and that packet arrives here starting with the ACK byte.
+             * Skipping it would leave the response behind it unverified.
+             *
+             * What the `chunk.length > 1` test skips is a BARE one-byte ACK, which has
+             * no trailer in the chunk to check - either the link has no CRC, or the
+             * framer already verified `[ACK][CRC]` and handed the ACK on alone. So a
+             * lone ACK is checked exactly once, and never here. The exempt set is for
+             * message types the firmware genuinely does not CRC at all: the data-rate
+             * test, SD sync and the SD-transfer frames. */
+            const trailer = crcTrailerBytes(this._crcMode);
+            if (trailer > 0 && chunk.length > 1 && messageCarriesLinkCrc(chunk)) {
+                if (!verifyCrc(chunk, this._crcMode)) {
+                    /* Discarded, not passed on. A failed CRC means these bytes are not
+                     * what the firmware composed, and acting on them is worse than losing
+                     * them: the waiter times out and the caller retries, where a corrupt
+                     * reply could set a range or a name to something nobody asked for. */
+                    this._crcFailures++;
+                    this._log(`CRC check failed on a 0x${chunk[0].toString(16)} message (${this._crcFailures} so far); discarding`);
+                    /* Throttled hard. An un-exempt message type that the firmware does not
+                     * actually CRC produces one of these per packet, which buried a whole
+                     * log at 2300 lines - and a fault that floods its own evidence out of
+                     * view is worse than one that reports itself once. */
+                    if (this._crcFailures <= 3 || this._crcFailures === 10 || this._crcFailures % 100 === 0) {
+                        this._emitStatus(`Discarded a reply whose CRC did not check out (${this._crcFailures} so far).`);
+                    }
+                    return;
+                }
+                chunk = chunk.subarray(0, chunk.length - trailer);
+            }
             // 1) Consume an expected ACK
             if (chunk.length >= 1 &&
                 chunk[0] === OPCODES.ACK_COMMAND_PROCESSED &&
-                (this._expectingAck ?? 0) > 0) {
+                (this._expectingAck ?? 0) > 0 &&
+                this._chunkIsCredibleAck(chunk)) {
                 this._log('ACK detected at start of notify (expected)');
                 this._expectingAck = Math.max(0, this._expectingAck - 1);
                 const remainder = chunk.slice(1);
@@ -9715,7 +10481,77 @@ class Shimmer3RClient extends BaseShimmerClient {
          * look perpetually one byte short, so the ACK and its response were never
          * coalesced and the waiter timed out.
          */
-        this._controlMessageLength = (buf) => shimmer3rControlMessageLength(buf, { statusPayloadBytes: this._statusPayloadBytes });
+        this._controlMessageLength = (buf) => {
+            const base = shimmer3rControlMessageLength(buf, {
+                statusPayloadBytes: this._statusPayloadBytes,
+            });
+            /* A CRC rides after the PACKET the firmware transmits, not after each
+             * message in it - and a packet can hold two. `ShimBt_processCmd` stages the
+             * ACK byte into the front of the same `resPacket` as the response
+             * (`Comms/shimmer_bt_uart.c:1844`) and appends one CRC over the whole thing
+             * (`:2422`), so `[ACK][response][CRC]` is one packet with ONE CRC.
+             *
+             * So the trailer is deliberately NOT added for an ACK or NACK. Adding it
+             * there would consume the first bytes of the response behind it as if they
+             * were a CRC, which is worse than not framing the CRC at all. The response
+             * that follows gets its own trailer through this same function when
+             * `_coalesceAckWithResponse` measures it, so the coalesced pair comes out
+             * as 1 + base + trailer - exactly the packet.
+             *
+             * An ACK transmitted alone is `[ACK][CRC]`, and telling that case apart
+             * from `[ACK][response]…` needs the CRC itself to decide the framing. That
+             * is what the ACK branch at the end of this function does: it verifies a
+             * CRC taken over the ACK byte alone and, when that checks out, consumes the
+             * trailer with it. Nothing is left for the resync to drop. */
+            const trailer = crcTrailerBytes(this._crcMode);
+            if (trailer === 0 || base === NEED_MORE || base === RESYNC)
+                return base;
+            /* An exempt type is sized as the firmware sent it: no trailer to add, and
+             * adding one would swallow the bytes of whatever follows. This is the same
+             * fact as the verification exemption and has to agree with it - a message
+             * measured with a trailer it does not have cannot then verify. */
+            if (!messageCarriesLinkCrc(buf.subarray(0, Math.min(buf.length, 2)))) {
+                return base;
+            }
+            const isAck = buf[0] === OPCODES.ACK_COMMAND_PROCESSED || buf[0] === OPCODES.NACK_COMMAND_PROCESSED;
+            if (!isAck) {
+                const total = base + trailer;
+                return buf.length < total ? NEED_MORE : total;
+            }
+            /* An ACK is the one case where the CRC has to decide the framing, because
+             * the firmware may or may not have put a response in the same packet
+             * (`shimmer_bt_uart.c:1844` stages the ACK into the front of the response's
+             * own buffer, and `:2422` appends ONE CRC over whatever ended up there).
+             *
+             * So `[ACK][CRC]` and `[ACK][response][CRC]` are both possible and cannot
+             * be told apart by length alone. Emitting the ACK eagerly loses the packet:
+             * its CRC covers the response too, and once the ACK has been handed up
+             * there is nothing left to verify the rest against. */
+            if (buf.length >= 1 + trailer &&
+                buf[1] !== OPCODES.ACK_COMMAND_PROCESSED &&
+                verifyCrc(buf.subarray(0, 1 + trailer), this._crcMode)) {
+                // A lone ACK: the CRC over just this byte checks out, so nothing follows
+                // it inside the packet. Consume its trailer with it.
+                return 1 + trailer;
+            }
+            /* Otherwise the ACK shares its packet with the message behind it. Measure
+             * that message and return the WHOLE packet, so it is verified and stripped
+             * as one and the ACK branch above sees the response as its remainder -
+             * exactly as it does on a link with no CRC. */
+            const after = shimmer3rControlMessageLength(buf.subarray(1), {
+                statusPayloadBytes: this._statusPayloadBytes,
+            });
+            if (after === NEED_MORE)
+                return NEED_MORE;
+            if (after === RESYNC) {
+                // Not a message this framer knows. Waiting for a lone-ACK CRC that has
+                // already failed would stall, so fall back to the bare ACK and let the
+                // resync deal with whatever follows.
+                return 1;
+            }
+            const total = 1 + after + trailer;
+            return buf.length < total ? NEED_MORE : total;
+        };
         this._coalesceAckWithResponse = (msg, rest) => {
             if (msg.length !== 1 || msg[0] !== OPCODES.ACK_COMMAND_PROCESSED)
                 return 0;
@@ -9807,6 +10643,14 @@ class Shimmer3RClient extends BaseShimmerClient {
             // matching the previous `rx.writeValue(...)` behaviour.
             writeCharUUID: this.rxUUID,
             notifyCharUUID: this.txUUID,
+            // CYSPP's Unacknowledged Data characteristic (the default `txUUID`) is
+            // notify-capable, so device→host payloads do not pay a confirmation
+            // round trip. Fall back to the Acknowledged Data characteristic, which
+            // is indicate-only, for anything that does not expose the former.
+            notifyCharUUIDFallback: SHIMMER3R_DEFAULTS.CHAR_TX_ACKED_UUID,
+            // Observational only - the values are surfaced and logged, not used to
+            // gate writes. See WebBluetoothTransportOptions.rxFlowCharUUID.
+            rxFlowCharUUID: SHIMMER3R_DEFAULTS.CHAR_RX_FLOW_UUID,
             requestDeviceOptions: {
                 filters: [{ services: [this.serviceUUID] }],
                 optionalServices: [this.serviceUUID],
@@ -9832,14 +10676,21 @@ class Shimmer3RClient extends BaseShimmerClient {
     async connect(transport) {
         const t = transport ?? this._injectedTransport ?? this._makeWebTransport();
         this._transport = t;
+        /* Before anything is read over the new link. This clears the CRC mode among
+         * the rest, which matters here rather than only on teardown: a link that
+         * dropped under us never cleared it, and _reestablishCrcMode's own
+         * readDeviceVersion below would then be framed expecting a trailer the
+         * device is not appending. Also clears the SD session counter, which
+         * restarts with the connection, and the stream buffer, so bytes stranded by
+         * a dropped link cannot be parsed as part of the new session's stream. */
+        this._resetLinkProtocolState();
         // A byte-stream transport needs its message boundaries rebuilt; BLE gets
         // them from the notification boundaries and takes the untouched path.
         this._unframed = t.capabilities.framed === false;
-        this._ctrlBuf = new Uint8Array(0);
-        // The firmware's SD session counter restarts with the connection
-        this._sdKnownSession = null;
-        // Both version caches describe the device at the far end of the link, so a
-        // reconnect — possibly to a different sensor — must not inherit them.
+        /* Both version caches describe the device at the far end, and the schema
+         * describes its channel layout, so a reconnect - possibly to a DIFFERENT
+         * sensor - must not inherit any of them. */
+        this.schema = null;
         this._fwVersionCache = null;
         this._deviceVersionCache = null;
         this._statusPayloadBytes = 2;
@@ -9876,6 +10727,46 @@ class Shimmer3RClient extends BaseShimmerClient {
              * unframed link goes wrong. */
             this._emitStatus(`Connected over ${t.kind} (${this._unframed ? 'byte stream, re-framing' : 'framed'})`);
         }
+        await this._reestablishCrcMode();
+    }
+    /**
+     * Re-apply a CRC the caller asked for on an earlier link.
+     *
+     * Done here so a reconnect does not silently come back unchecked — the
+     * firmware clears its mode on every power cycle, and a host that asked once
+     * means it for the next link too.
+     *
+     * A failure is reported and left off, never thrown: the link itself is fine
+     * without a CRC, and turning a working connection into a failed one over a
+     * diagnostic would be the wrong trade. `_crcMode` only advances on success,
+     * so the parser cannot end up expecting bytes the device is not sending.
+     */
+    async _reestablishCrcMode() {
+        if (this._desiredCrcMode === CRC_MODE.OFF)
+            return;
+        const want = this._desiredCrcMode;
+        /* The device version first, which the protocol document requires of any
+         * host before SET_CRC_COMMAND (`SHIMMER3_BT_COMMUNICATION_PROTOCOL.md`
+         * §8.2, constraint 3) - and which matters more here than it does for a
+         * host that asks in its own sequence: a CRC turns on the length-aware
+         * framer, and that framer's STATUS_RESPONSE span is 1 byte on a Shimmer3
+         * against 2 on a Shimmer3R. `_deviceVersionCache` is cleared on
+         * disconnect, so on a reconnect this would otherwise frame a Shimmer3's
+         * status one byte too wide. Cached, so it costs a round trip once. */
+        try {
+            await this.readDeviceVersion();
+        }
+        catch {
+            /* Old firmware may not answer. The framer keeps its Shimmer3R default,
+             * which is this client's documented assumption anyway. */
+        }
+        try {
+            await this.setCrcMode(want);
+        }
+        catch (e) {
+            this._emitStatus(`Could not re-enable the ${want}-byte CRC on this link (${e.message}); ` +
+                `continuing without it.`);
+        }
     }
     async disconnect() {
         // Application-initiated teardown is not a fault, so `onDisconnect` stays
@@ -9897,16 +10788,44 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._notifyUnsub = this._disconnectUnsub = null;
             this._transport = null;
             this.device = null;
-            this._rxBuf = new Uint8Array(0);
-            this._ctrlBuf = new Uint8Array(0);
+            this._resetLinkProtocolState();
             this._unframed = false;
             this.schema = null;
-            this._streaming = false;
             this.ExpPower = 0;
             this._deviceCalibrations = {};
-            this._sdKnownSession = null;
             this._emitStatus('Disconnected');
         }
+    }
+    /**
+     * Protocol state that belongs to ONE link, cleared wherever a link ends or
+     * a new one begins.
+     *
+     * Exists because there are three such places — {@link connect},
+     * {@link disconnect} and {@link _handleTransportDisconnect} — and they had
+     * drifted. Only the explicit disconnect cleared the CRC mode, so a link that
+     * dropped under us left it set; `connect` did not clear it either, despite
+     * {@link _crcMode}'s docblock saying it did. The reconnect's very first
+     * exchange is `readDeviceVersion` inside {@link _reestablishCrcMode}, framed
+     * expecting a trailer the freshly power-cycled device is not appending.
+     *
+     * `_desiredCrcMode` deliberately does NOT reset: that is the host's standing
+     * request, and re-establishing it is the whole point of surviving a
+     * reconnect.
+     */
+    _resetLinkProtocolState() {
+        this._rxBuf = new Uint8Array(0);
+        this._ctrlBuf = new Uint8Array(0);
+        this._streaming = false;
+        this._streamAligned = false;
+        this._streamAlignRejects = 0;
+        this._lastTs = 0;
+        /* Off is the only assumption that fails safe. The firmware's CRC mode is
+         * per power cycle rather than per connection, so a reconnect genuinely
+         * cannot know — but a width the device is not appending misplaces every
+         * frame boundary, while expecting none when there is one costs a resync. */
+        this._crcMode = CRC_MODE.OFF;
+        this._crcFailures = 0;
+        this._sdKnownSession = null;
     }
     /**
      * Abandon an in-flight factory-test capture because the link has gone. No
@@ -9915,6 +10834,76 @@ class Shimmer3RClient extends BaseShimmerClient {
      */
     _failFactoryTest(message) {
         this._factoryTest?.fail(new FactoryTestError('disconnected', message));
+    }
+    // ---------------------------------------------------------------------------
+    // Notify handler (fed raw notification chunks by the transport)
+    // ---------------------------------------------------------------------------
+    /**
+     * Transport entry point. A framed transport (BLE) delivers one firmware
+     * message per call and goes straight to {@link _handleFramedChunk}; an
+     * unframed one (Web Serial over USB or over a Classic-Bluetooth COM port)
+     * is re-framed first, then funnelled through the very same handler.
+     *
+     * A running factory test is served FIRST, before either path. Its report is
+     * bare ASCII with no opcode, no length and no CRC, so the framer would treat
+     * every line as garbage and resync through it one byte at a time — and the
+     * temp handlers, which only ever see whole framed messages, would never see it
+     * at all. What the capture hands back is what was NOT report traffic (a status
+     * push glued after `TEST END`, a late ACK), and that continues down the normal
+     * path.
+     */
+    /**
+     * Whether inbound bytes go through the length-aware byte-stream framer.
+     *
+     * True for a byte-stream transport, and **also true whenever a CRC is on** —
+     * even on BLE. Verifying a CRC means knowing where the packet ends, and a
+     * notification is not reliably one packet: the module's packetization does
+     * not respect message boundaries, so a 132-byte InfoMem reply spans several
+     * notifications and a short reply can share one. Checking per notification
+     * would fail every long response. The framer already sizes each message from
+     * its opcode and length, and already accumulates across reads, so a CRC just
+     * turns on a path that splits correctly.
+     */
+    get _reframing() {
+        return this._unframed || this._crcMode !== CRC_MODE.OFF;
+    }
+    /**
+     * Whether a chunk beginning with 0xFF is really the ACK being waited for,
+     * rather than a sample byte that happens to be 0xFF.
+     *
+     * The ambiguity is confined to the stream plane. `startStreaming` opens it
+     * BEFORE writing the command - it has to, because the firmware streams as
+     * soon as it processes one and a notification does not respect frame
+     * boundaries - so for up to the ACK timeout there are stream bytes arriving
+     * while an ACK is expected. 0xFF is common in at-rest inertial data (a small
+     * negative reading is `…0xFF`), and a notification can begin on any byte, so
+     * "first byte is 0xFF" is not on its own evidence of an ACK. Taken wrongly it
+     * spends the ACK the start command is waiting on and diverts that
+     * notification's samples to the control handlers.
+     *
+     * On the control plane, where nothing else is in flight, the old rule is kept
+     * exactly: an expected ACK is an expected ACK.
+     *
+     * @param chunk a whole message, already CRC-stripped, starting with 0xFF
+     * @returns false only when the chunk is better explained as stream data
+     */
+    _chunkIsCredibleAck(chunk) {
+        if (!this._streaming)
+            return true;
+        /* A lone ACK notification. With a CRC on this is also the only shape that
+           can get here, since the whole packet had to verify first - which is why
+           this hazard is specific to an un-CRC'd link. */
+        if (chunk.length === 1)
+            return true;
+        // `[ACK][frames…]`, which the branch below already handles.
+        if (chunk[1] === OPCODES.DATA_PACKET)
+            return true;
+        /* Otherwise the remainder has to start like something this framer knows -
+           an in-stream status push, say. Arbitrary sample bytes do not, and RESYNC
+           is exactly the framer saying so. */
+        return (shimmer3rControlMessageLength(chunk.subarray(1), {
+            statusPayloadBytes: this._statusPayloadBytes,
+        }) !== RESYNC);
     }
     /**
      * Surface a STATUS_RESPONSE nobody asked for on {@link onDeviceStatus}.
@@ -10168,17 +11157,65 @@ class Shimmer3RClient extends BaseShimmerClient {
     async inquiry() {
         this._emitStatus('INQUIRY_CMD → waiting for ACK then RSP…');
         const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.INQUIRY_COMMAND]), 1500);
-        if (remainder && remainder[0] === OPCODES.INQUIRY_RESPONSE) {
-            this._log('Using post-ACK remainder as response');
-            const info = this._interpretInquiryResponseShimmer3R(remainder);
-            this.onInquiry?.(info);
-            return info;
-        }
-        const rsp = await this._waitForResponse(OPCODES.INQUIRY_RESPONSE, 2000);
+        const rsp = await this._readInquiryResponse(remainder, 2000);
         this._emitStatus(`Inquiry RSP (${rsp.length} bytes)`);
         const info = this._interpretInquiryResponseShimmer3R(rsp);
         this.onInquiry?.(info);
         return info;
+    }
+    /**
+     * Read an inquiry response, reassembling it across notifications.
+     *
+     * A framed transport surfaces one notification per chunk, and the module
+     * decides those boundaries, so a response can arrive split at any point —
+     * including after its first byte. Every other multi-byte response is
+     * accumulated against its length byte by
+     * {@link Shimmer3RClient._readLengthPrefixedResponse}; this one has no length
+     * byte (see {@link INQUIRY_RSP_HEADER_BYTES}), so completeness is judged in
+     * two steps: collect the header, then collect the channel list it sizes.
+     *
+     * Firmware writes the logical response contiguously, so fragments simply
+     * concatenate in order.
+     *
+     * @param seed the post-ACK remainder, when the module packed the start of the
+     *   response in behind its own ACK; otherwise the response is awaited
+     */
+    async _readInquiryResponse(seed, timeoutMs) {
+        let acc = seed && seed[0] === OPCODES.INQUIRY_RESPONSE
+            ? seed
+            : await this._waitForResponse(OPCODES.INQUIRY_RESPONSE, timeoutMs);
+        const isComplete = (buf) => buf.length >= INQUIRY_RSP_HEADER_BYTES &&
+            buf.length >= INQUIRY_RSP_HEADER_BYTES + buf[INQUIRY_RSP_NUM_CHANNELS_OFFSET];
+        if (isComplete(acc))
+            return acc;
+        return new Promise((resolve, reject) => {
+            const t = setTimeout(() => {
+                this._offTemp(handler);
+                /* Reject rather than parse what did arrive: a truncated inquiry
+                 * response is indistinguishable from a valid one describing fewer
+                 * channels, and guessing wrong costs the whole streaming session. */
+                reject(new Error(`Inquiry response truncated: ${acc.length} bytes received` +
+                    (acc.length >= INQUIRY_RSP_HEADER_BYTES
+                        ? `, ${INQUIRY_RSP_HEADER_BYTES + acc[INQUIRY_RSP_NUM_CHANNELS_OFFSET]} expected.`
+                        : `, at least ${INQUIRY_RSP_HEADER_BYTES} expected.`)));
+            }, timeoutMs);
+            const handler = (chunk) => {
+                if (!chunk || chunk.length === 0)
+                    return;
+                /* Every chunk from here is continuation payload — deliberately NOT
+                 * filtering a lone 0xFF as a stray ACK, because a channel id can be
+                 * 0xFF and dropping it would misalign every later channel. This
+                 * command's ACK was consumed by the caller before this handler was
+                 * registered, and commands are issued one at a time. */
+                acc = concatU8(acc, chunk);
+                if (isComplete(acc)) {
+                    clearTimeout(t);
+                    this._offTemp(handler);
+                    resolve(acc);
+                }
+            };
+            this._onTemp(handler);
+        });
     }
     // ---------------------------------------------------------------------------
     // InfoMem
@@ -11242,21 +12279,155 @@ class Shimmer3RClient extends BaseShimmerClient {
     // ---------------------------------------------------------------------------
     // Streaming
     // ---------------------------------------------------------------------------
+    /**
+     * Turn the Bluetooth link's CRC on or off (SET_CRC_COMMAND 0x8B).
+     *
+     * With it on, firmware appends 1 or 2 CRC bytes to every message it sends —
+     * `calculateCrcAndInsert` over the whole packet including its header, seeded
+     * `0xB0CA` with an odd-length zero pad, LSB first
+     * (log-and-stream-common `CRC/shimmer_swCrc.c`). The stream parser then
+     * verifies each frame and reports the result on
+     * {@link ObjectCluster.crcOk}, which is what separates "the link corrupted
+     * these bytes" from "the host decoded them wrongly" — indistinguishable
+     * otherwise, since a wrong value looks exactly like a wrong parse.
+     *
+     * **Set it before streaming starts.** The frame grows by the CRC width, so
+     * changing it mid-stream moves every frame boundary; this refuses to do that
+     * rather than corrupt an in-flight session.
+     *
+     * Two bytes is the useful setting. One byte still catches gross corruption
+     * but lets roughly 1 in 256 bad frames through, and the saving is a single
+     * byte per frame.
+     *
+     * Note this is a property of the link, not of streaming alone: command
+     * responses carry the CRC too. Trailing bytes are ignored by the response
+     * readers here, which parse by opcode and declared length rather than by
+     * total length, so it is safe to leave on — but it is off by default, and
+     * firmware resets it on every power cycle.
+     */
+    async setCrcMode(mode) {
+        if (!this._transport)
+            throw new Error('Not connected (RX missing)');
+        if (!isCrcMode(mode)) {
+            throw new Error(`Invalid CRC mode ${String(mode)} (expected 0, 1 or 2)`);
+        }
+        if (this._streaming) {
+            throw new Error('Cannot change the CRC mode while streaming: it would move every frame boundary.');
+        }
+        const label = mode === CRC_MODE.OFF ? 'off' : `${mode} byte${mode === 1 ? '' : 's'}`;
+        this._emitStatus(`SET_CRC ${label} → waiting for ACK…`);
+        /* Written before the mode is recorded, deliberately - and this ACK is the
+         * one message that arrives framed differently from what the host expects.
+         * The firmware sets its mode while processing these arguments
+         * (`shimmer_bt_uart.c:944`) and composes the ACK afterwards from the NEW
+         * mode (`:2422`), so the ACK already carries a CRC that this client is not
+         * yet looking for. Its trailer therefore arrives as a couple of trailing
+         * bytes behind the ACK, which the control handlers ignore: no waiter
+         * matches them, and a byte-stream link resyncs past them.
+         *
+         * Recording the mode first instead would parse that ACK correctly but
+         * stall for the whole ACK timeout on firmware that does not implement the
+         * command at all, because its bare NACK would be missing the trailer this
+         * client had just started expecting. Two ignorable bytes on the supported
+         * path beats a timeout on the unsupported one. */
+        await this._writeExpectingAck(new Uint8Array([OPCODES.SET_CRC_COMMAND, mode]), 1500);
+        /* Both, and in this order: the wish is recorded only once the device has
+         * agreed, so a mode it refused is not re-attempted on every reconnect. */
+        this._crcMode = mode;
+        this._desiredCrcMode = mode;
+        this._emitStatus(`Link CRC ${label}`);
+    }
+    /** The CRC width currently in force, as last set by {@link setCrcMode}. */
+    get crcMode() {
+        return this._crcMode;
+    }
+    /**
+     * Inbound packets whose CRC did not check out, **stream frames and control
+     * replies alike**.
+     *
+     * Not only frames: `_handleFramedChunk` discards any un-exempt message whose
+     * CRC fails and counts it here, so a corrupt inquiry reply moves this as
+     * surely as a corrupt data packet does. That is deliberate — both mean the
+     * link is delivering bytes the firmware did not compose, which is the one
+     * thing worth knowing — but it does mean the number is not per-plane and
+     * cannot be read as a frame loss rate.
+     *
+     * Zeroed wherever a stream starts ({@link startStreaming}) and wherever a
+     * link begins or ends, NOT by {@link setCrcMode}. Turning the CRC off leaves
+     * the count standing on purpose: a caller inspecting it afterwards is asking
+     * what happened while checking was on, and answering 0 would destroy the only
+     * record of it.
+     *
+     * A zero therefore means "nothing failed", which on a link with no CRC means
+     * "nothing was checked" rather than "nothing went wrong". Read it beside
+     * {@link crcMode}.
+     */
+    get crcFailures() {
+        return this._crcFailures;
+    }
     async startStreaming() {
         if (!this.schema)
             this._emitStatus('Starting stream without schema (not recommended).');
         this._emitStatus('START_STREAM → waiting for ACK…');
-        const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_STREAMING_COMMAND]), 1500);
-        this._streaming = true;
-        if (remainder?.length) {
-            if (remainder[0] === OPCODES.DATA_PACKET) {
-                this._rxBuf = concatU8(this._rxBuf, remainder);
-            }
-            else {
-                this._emitTemp(remainder);
+        this._beginStreamPlane();
+        try {
+            const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_STREAMING_COMMAND]), 1500);
+            this._streaming = true;
+            if (remainder?.length) {
+                if (remainder[0] === OPCODES.DATA_PACKET) {
+                    this._rxBuf = concatU8(this._rxBuf, remainder);
+                }
+                else {
+                    this._emitTemp(remainder);
+                }
             }
         }
+        catch (e) {
+            this._endStreamPlane();
+            throw e;
+        }
         this._emitStatus('START_STREAM ACK received; frames should follow');
+    }
+    /**
+     * Open the stream plane *before* the start command goes out, so that frames
+     * arriving before its ACK are accumulated whole.
+     *
+     * The firmware starts streaming the moment it processes the command, so data
+     * can arrive before the ACK's `await` continuation has run. With `_streaming`
+     * still false, {@link _handleFramedChunk} routes those notifications through
+     * its control branch, which appends one to the stream buffer only when the
+     * notification *starts* with a preamble — so the tail of a frame split across
+     * two notifications was dropped while its head was kept, leaving a truncated
+     * frame at the front of the buffer and every byte after it one frame boundary
+     * out.
+     *
+     * That mattered far more than a few lost bytes: the frame layout is periodic,
+     * so a wrong alignment that satisfies the resync check once satisfies it
+     * forever (a channel resting at zero puts a `0x00` at a fixed offset in every
+     * frame), and the parser stayed locked to it for the whole session, emitting
+     * plausible numbers decoded from the wrong bytes.
+     *
+     * A byte-stream transport never had the problem: its framer stops at the
+     * first preamble and hands the whole remainder over, continuity intact.
+     */
+    _beginStreamPlane() {
+        this._rxBuf = new Uint8Array(0);
+        this._lastTs = 0;
+        this._streamAligned = false;
+        this._streamAlignRejects = 0;
+        this._crcFailures = 0;
+        /* Framed transports only. A byte stream carries the ACK in the same read as
+         * the data and its framer already separates the two, so opening the stream
+         * plane early there would route the ACK itself into the stream buffer and
+         * the start command would wait for an ACK that had already been eaten. */
+        if (!this._reframing)
+            this._streaming = true;
+    }
+    /** Undo {@link _beginStreamPlane} when the start command never took. */
+    _endStreamPlane() {
+        this._streaming = false;
+        this._rxBuf = new Uint8Array(0);
+        this._streamAligned = false;
     }
     /**
      * Stop streaming (STOP_STREAMING_COMMAND 0x20), best-effort: the command goes
@@ -11291,8 +12462,14 @@ class Shimmer3RClient extends BaseShimmerClient {
         catch (err) {
             this._emitStatus(`STOP_STREAM write failed: ${err.message}`);
         }
-        this._streaming = false;
-        this._rxBuf = new Uint8Array(0);
+        /* `_endStreamPlane`, not the two fields by hand. It also clears
+           `_streamAligned`, and leaving that set is not cosmetic: `_parseBySchema`
+           is gated on `schema`, NOT on `_streaming`, and a chunk starting with
+           DATA_PACKET is still appended to `_rxBuf` while not streaming. So frames
+           already in flight when the stop was sent get parsed with alignment still
+           claimed, skipping acquisition entirely and accepting whatever offset they
+           happen to land on. */
+        this._endStreamPlane();
         this._emitStatus('Streaming stopped.');
     }
     /** Start streaming AND SD card logging simultaneously. */
@@ -11300,15 +12477,22 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (!this.schema)
             this._emitStatus('Starting stream without schema (not recommended).');
         this._emitStatus('START_BT_STREAM_SD_LOGGING → waiting for ACK…');
-        const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_SDBT_COMMAND]), 1500);
-        this._streaming = true;
-        if (remainder?.length) {
-            if (remainder[0] === OPCODES.DATA_PACKET) {
-                this._rxBuf = concatU8(this._rxBuf, remainder);
+        this._beginStreamPlane();
+        try {
+            const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_SDBT_COMMAND]), 1500);
+            this._streaming = true;
+            if (remainder?.length) {
+                if (remainder[0] === OPCODES.DATA_PACKET) {
+                    this._rxBuf = concatU8(this._rxBuf, remainder);
+                }
+                else {
+                    this._emitTemp(remainder);
+                }
             }
-            else {
-                this._emitTemp(remainder);
-            }
+        }
+        catch (e) {
+            this._endStreamPlane();
+            throw e;
         }
         this._emitStatus('START_BT_STREAM_SD_LOGGING ACK received; frames should follow');
     }
@@ -11325,17 +12509,41 @@ class Shimmer3RClient extends BaseShimmerClient {
         catch (err) {
             this._emitStatus(`STOP_BT_STREAM_SD_LOGGING write failed: ${err.message}`);
         }
-        this._streaming = false;
-        this._rxBuf = new Uint8Array(0);
+        this._endStreamPlane();
         this._emitStatus('Streaming + logging stopped.');
     }
     // ---------------------------------------------------------------------------
     // Inquiry response / schema building
     // ---------------------------------------------------------------------------
     _interpretInquiryResponseShimmer3R(u8) {
-        let base = 0;
-        if (u8[0] === OPCODES.INQUIRY_RESPONSE && u8.length >= 2)
-            base = 1;
+        /* Whether the opcode byte is present, decided on the byte alone. It used
+           to also require `u8.length >= 2`, which made a lone `[0x02]` chunk look
+           headerless: the offsets below then described a different layout than the
+           buffer actually had, and the minimum-length error under-reported by one.
+           The length checks that follow are what make the extra condition
+           unnecessary — nothing is read before they pass. */
+        const base = u8[0] === OPCODES.INQUIRY_RESPONSE ? 1 : 0;
+        /* Refuse a short buffer instead of degrading into a plausible-looking
+         * configuration. The channel count and the channel ids below used to fall
+         * back to zero/empty on a truncated response, and an empty channel list
+         * parses all the way through to enabledSensors = 0x000000 and a
+         * timestamp-only 4-byte frame — which the device then contradicts with
+         * every real 16/24-byte frame it sends. The only visible symptom was 100%
+         * packet loss at a believable data rate, with nothing pointing at the
+         * inquiry.
+         *
+         * Both lengths are checked here, before any of the parsing below assigns to
+         * `this`, so a rejected response leaves the previous configuration intact
+         * rather than half-replacing it. */
+        const headerEnd = base + 11;
+        if (u8.length < headerEnd) {
+            throw new Error(`Inquiry response too short: ${u8.length} bytes, need at least ${headerEnd}.`);
+        }
+        const numCh = u8[base + 9];
+        if (u8.length < headerEnd + numCh) {
+            throw new Error(`Inquiry response truncated: ${u8.length} bytes, need ${headerEnd + numCh} ` +
+                `for the ${numCh} channels it declares.`);
+        }
         const adcRaw = u16le$3(u8, base + 0);
         const samplingRateHz = 32768 / adcRaw;
         this.samplingRateHz = samplingRateHz;
@@ -11366,10 +12574,8 @@ class Shimmer3RClient extends BaseShimmerClient {
             altAccel: 0,
             altMag: 0,
         };
-        const numCh = u8[base + 9] ?? 0;
-        const bufSize = u8[base + 10] ?? 0;
-        const chStart = base + 11;
-        const channelIds = [...u8.slice(chStart, chStart + numCh)];
+        const bufSize = u8[base + 10];
+        const channelIds = [...u8.slice(headerEnd, headerEnd + numCh)];
         const schema = this._buildSchemaFromChannels(channelIds, this.forceTimestampFmt ?? 'u24');
         this.schema = schema;
         this._log(`Schema built: timestampFmt=${schema.timestampFmt}, fields=${schema.fields.length}, enabledSensors=0x${schema.enabledSensors.toString(16)}`);
@@ -11462,22 +12668,70 @@ class Shimmer3RClient extends BaseShimmerClient {
     // ---------------------------------------------------------------------------
     // Stream frame parser
     // ---------------------------------------------------------------------------
+    /**
+     * Ticks the device clock should advance between consecutive frames, or 0 when
+     * the rate is not known (streaming started without an inquiry), in which case
+     * only the rate-free band below applies.
+     */
+    _expectedFrameTicks() {
+        const hz = this.samplingRateHz;
+        if (!Number.isFinite(hz) || hz <= 0)
+            return 0;
+        return Math.round(32768 / hz);
+    }
+    /**
+     * Whether a timestamp step could belong to ANY valid configuration.
+     *
+     * The weak test, and the only one available when no interval is known or the
+     * known one has already been contradicted by everything on the wire. It
+     * cannot tell 320 ticks from 640, but it does reject the millions-of-ticks
+     * steps a wrong byte offset produces, which is what the fallback used to
+     * accept without looking.
+     */
+    _frameDeltaInPlausibleBand(dt) {
+        return dt >= 1 && dt <= STREAM_MAX_FRAME_TICKS * STREAM_ALIGN_MAX_SKIP;
+    }
+    /**
+     * Whether a timestamp step is consistent with correct frame alignment: one
+     * sampling interval, or a few of them if the link dropped frames.
+     *
+     * The strong test. Falls back to {@link _frameDeltaInPlausibleBand} when no
+     * interval is known, rather than accepting anything.
+     */
+    _plausibleFrameDelta(dt, expectedTicks) {
+        if (expectedTicks <= 0)
+            return this._frameDeltaInPlausibleBand(dt);
+        for (let k = 1; k <= STREAM_ALIGN_MAX_SKIP; k++) {
+            const want = k * expectedTicks;
+            if (Math.abs(dt - want) <= Math.max(2, want * STREAM_ALIGN_TICK_TOLERANCE))
+                return true;
+        }
+        return false;
+    }
     _parseBySchema() {
         const sch = this.schema;
         const preamble = sch.dataPreambleByte;
         const frameBytes = sch.frameBytes >>> 0;
         const tsBytes = sch.timestampFmt === 'u16' ? 2 : 3;
         const TS_MOD = tsBytes === 3 ? 16777216 : 65536;
+        const expectedTicks = this._expectedFrameTicks();
+        /* The firmware appends the CRC to the packet it just built, so the frame ON
+         * THE WIRE is this much wider than the schema's payload. Everything that
+         * steps between frames - the resync stride, the second preamble, the second
+         * timestamp - has to use the wire width, while decoding uses the payload
+         * width. Conflating the two moves every boundary as soon as a CRC is on. */
+        const crcBytes = crcTrailerBytes(this._crcMode);
+        const wireBytes = frameBytes + crcBytes;
         let buf = this._rxBuf;
         let frames = 0;
         let drops = 0;
         let anomalies = 0;
-        while (buf.length >= frameBytes * 2) {
-            if (buf[0] === preamble && buf[frameBytes] === preamble) {
+        while (buf.length >= wireBytes * 2) {
+            if (buf[0] === preamble && buf[wireBytes] === preamble) {
                 let ts1, ts2;
                 try {
                     ts1 = tsBytes === 2 ? u16le$3(buf, 1) : u24le$1(buf, 1);
-                    ts2 = tsBytes === 2 ? u16le$3(buf, frameBytes + 1) : u24le$1(buf, frameBytes + 1);
+                    ts2 = tsBytes === 2 ? u16le$3(buf, wireBytes + 1) : u24le$1(buf, wireBytes + 1);
                 }
                 catch {
                     buf = buf.subarray(1);
@@ -11488,12 +12742,56 @@ class Shimmer3RClient extends BaseShimmerClient {
                 if (dt === 0) {
                     buf = buf.subarray(1);
                     drops++;
+                    this._streamAligned = false;
+                    continue;
+                }
+                /* Two preambles a frame apart are not proof of alignment on a periodic
+                 * layout - see STREAM_ALIGN_MAX_SKIP. Until the device clock agrees,
+                 * keep sliding. Only the acquisition is gated: once aligned, a real gap
+                 * in the link must not be mistaken for a bad lock. */
+                /* Two tiers. While the expected interval is still credible a candidate
+                 * must match it; once every candidate has been rejected that many
+                 * times it is the expectation that is wrong, so the test drops to the
+                 * rate-free band rather than off altogether. Dropping it off
+                 * altogether is what used to let a wrong byte offset lock - its
+                 * "timestamp" stepping by millions of ticks - and then look for all the
+                 * world like a working stream. */
+                const strictTier = this._streamAlignRejects < STREAM_ALIGN_MAX_REJECTS;
+                if (!this._streamAligned &&
+                    !(strictTier
+                        ? this._plausibleFrameDelta(dt, expectedTicks)
+                        : this._frameDeltaInPlausibleBand(dt))) {
+                    buf = buf.subarray(1);
+                    drops++;
+                    if (strictTier) {
+                        this._streamAlignRejects++;
+                        if (this._streamAlignRejects === STREAM_ALIGN_MAX_REJECTS) {
+                            /* Said once, at full volume: the reported rate does not describe
+                             * what is arriving, and that is the thing to fix. */
+                            this._emitStatus(`Frame timing does not match the reported ${expectedTicks}-tick ` +
+                                `interval; accepting any interval a valid configuration could produce.`);
+                        }
+                    }
+                    if (this.debug && drops % 64 === 1) {
+                        this._log(strictTier
+                            ? `align: rejecting candidate, Δt=${dt} ticks is not ~1-${STREAM_ALIGN_MAX_SKIP}× ` +
+                                `the ${expectedTicks}-tick frame interval`
+                            : `align: rejecting candidate, Δt=${dt} ticks is outside any valid frame interval`);
+                    }
                     continue;
                 }
                 const frame = buf.subarray(0, frameBytes);
+                /* Checked before decoding so a corrupt frame is reported as corrupt
+                 * rather than as whatever its bytes happen to decode to. It is still
+                 * emitted, with crcOk false: dropping it silently would hide the very
+                 * corruption the CRC was turned on to find. */
+                const crcOk = crcBytes > 0 ? verifyCrc(buf.subarray(0, wireBytes), this._crcMode) : null;
+                if (crcOk === false)
+                    this._crcFailures++;
                 try {
                     let cursor = 1;
                     const oc = new ObjectCluster(this._deviceLabel());
+                    oc.crcOk = crcOk;
                     const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le$1(frame, cursor);
                     cursor += tsBytes;
                     oc.add('TIMESTAMP', ts, 'ticks', 'raw');
@@ -11539,20 +12837,24 @@ class Shimmer3RClient extends BaseShimmerClient {
                         }
                     }
                     this._lastTs = ts;
+                    this._streamAligned = true;
+                    this._streamAlignRejects = 0;
                     this._calibrateData(oc);
                     this.onStreamFrame?.(oc);
                     frames++;
-                    buf = buf.subarray(frameBytes);
+                    buf = buf.subarray(wireBytes);
                 }
                 catch (e) {
                     this._log('⚠️ frame decode error → sliding 1 byte', e.message);
                     buf = buf.subarray(1);
                     drops++;
+                    this._streamAligned = false;
                 }
                 continue;
             }
             buf = buf.subarray(1);
             drops++;
+            this._streamAligned = false;
             if (this.debug && drops % 64 === 1) {
                 this._log(`resync: dropped ${drops} byte(s) so far; bufLen=${buf.length}`);
             }
@@ -26734,5 +28036,5 @@ function shimmerFactoryTestReportToCsvRows(parsed, meta = {}) {
     return factoryTestReportToCsvRows(parsed, meta);
 }
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, EXG_BANK_LENGTH$1 as EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_BANK_LENGTH$1 as EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

@@ -33,11 +33,13 @@ import {
   SD_TRANSFER_OPCODES,
   SD_XFER,
   buildBrandRecord,
+  defaultTrialIdentity,
   generateCalibDump,
   generateKinematicCalibBlock,
   getDefaultCalibration,
   parseBrandRecord,
   sdCrc16,
+  appendCrc,
 } from "../../vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ const CMD = Object.freeze({
   BT_VERSION_STR_RESPONSE: 0xa2,
   SET_FACTORY_TEST: 0xa8,
   INSTREAM_CMD_RESPONSE: 0x8a,
+  SET_CRC: 0x8b,
   SET_INFOMEM: 0x8c,
   INFOMEM_RESPONSE: 0x8d,
   GET_INFOMEM: 0x8e,
@@ -197,6 +200,11 @@ const IM = Object.freeze({
   sensors2: 5,
   configSetupByte0: 6,
   configSetupByte3: 9,
+  /* Shimmer3R puts the later config bytes in the second segment, and byte 6 is
+     not adjacent to byte 5 (resolveInfoMemLayout: 128, 129, 132). */
+  configSetupByte4: 128,
+  configSetupByte5: 129,
+  configSetupByte6: 132,
   exg1: 10,
   exg2: 20,
   exgBankLength: 10,
@@ -692,7 +700,14 @@ export function createMockShimmer3RTransport(opts = {}) {
     altAccelRange: 0,
     gsrRange: 4,
     expPowerEnabled: 0,
-    configSetupBytes: new Uint8Array(7),
+    /* Seeded to the firmware's own Shimmer3R defaults rather than zeros.
+       Byte 1 is the whole LSM6DSV accel/gyro ODR, and zero means POWER-DOWN -
+       so an all-zero default modelled a device whose IMU never produces a new
+       sample, which is not a state a real sensor ships in. `shimmer_config.c`
+       pairs the 51.2 Hz default packet rate with "next highest", 60 Hz
+       (LSM6DSV_ODR_AT_60Hz = 5), and this follows it so the mock exercises a
+       coherent configuration by default. */
+    configSetupBytes: Uint8Array.of(0x02, 0x05, 0x01, 0x08, 0x00, 0x88, 0x10),
     /** 64-bit RTC ticks, LSB first on the wire. */
     rwcTicks: 0n,
     /** A soft restart has been armed for the next disconnect. */
@@ -818,9 +833,32 @@ export function createMockShimmer3RTransport(opts = {}) {
     infoMem[IM.sensors1] = (sensors >> 8) & 0xff;
     infoMem[IM.sensors2] = (sensors >> 16) & 0xff;
 
+    /* The seven config setup bytes, in step with what the inquiry reports for
+       the same reason the sensor bitmap is: a config form reads them from
+       InfoMem while the stream schema comes from the inquiry, so two sources
+       that disagree would have the page showing one configuration and decoding
+       another. Byte 1 is the accel/gyro ODR, which is exactly the pair a host
+       has to keep coherent with the sampling rate above. */
+    infoMem.set(state.configSetupBytes.subarray(0, 4), IM.configSetupByte0);
+    /* Bytes 4-6 are NOT contiguous with 0-3, and byte 6 is not adjacent to 5
+       either: the Shimmer3R layout puts them at 128, 129 and 132. Writing them
+       as a run is the mistake to avoid - it lands byte 6 on 130, which is a
+       different field. */
+    infoMem[IM.configSetupByte4] = state.configSetupBytes[4];
+    infoMem[IM.configSetupByte5] = state.configSetupBytes[5];
+    infoMem[IM.configSetupByte6] = state.configSetupBytes[6];
+
     infoMem[IM.btCommBaudRate] = 9; // 1 Mbaud, the Shimmer3R default
-    writeName(IM.shimmerName, `Shimmer_${mac.slice(-4).toUpperCase()}`);
-    writeName(IM.expIdName, "DefaultTrial");
+    /* From the SDK rather than hand-rolled, so the mock cannot drift from what
+       the firmware's own ShimConfig_setDefaultShimmerName /
+       ShimConfig_setDefaultTrialId produce. The previous inline
+       `mac.slice(-4)` also assumed a separator-free MAC, which this mock
+       happens to use but a caller passing a colon-separated one would break. */
+    const identity = defaultTrialIdentity(mac);
+    if (identity.deviceName !== null) {
+      writeName(IM.shimmerName, identity.deviceName);
+    }
+    writeName(IM.expIdName, identity.trialName);
 
     // Config time, big-endian over 4 bytes — a plausible "last configured"
     // stamp rather than 0, so a page rendering it shows a real date.
@@ -1021,8 +1059,17 @@ export function createMockShimmer3RTransport(opts = {}) {
    * worst case a serial port can present, and the one the SDK's control-plane
    * re-framing exists for.
    */
+  /**
+   * CRC bytes appended to everything the device sends, per SET_CRC_COMMAND.
+   * Zero until a host asks, which is the state after every power cycle.
+   */
+  let crcMode = 0;
+
   function reply(bytes) {
-    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const u8 = appendCrc(
+      bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
+      crcMode,
+    );
     if (debug) console.log("[mock] ->", hex(u8));
     if (framed) {
       setTimeout(() => transport.notify(u8), REPLY_DELAY_MS);
@@ -1036,7 +1083,8 @@ export function createMockShimmer3RTransport(opts = {}) {
   }
 
   /** Stream data: one buffer per burst, chunked but never spread over time. */
-  function replyStream(u8) {
+  function replyStream(frame) {
+    const u8 = appendCrc(frame, crcMode);
     if (framed || u8.length <= dribbleBytes) {
       transport.notify(u8);
       return;
@@ -2026,6 +2074,21 @@ export function createMockShimmer3RTransport(opts = {}) {
       case CMD.INQUIRY:
         reply(concat([ACK], inquiryResponse()));
         return;
+
+      /* SET_CRC takes effect INCLUDING its own ACK. The firmware sets the mode
+         while processing this command's arguments (`shimmer_bt_uart.c:944`) and
+         composes the ACK afterwards from the new mode (`:2422`), so that ACK
+         already carries a CRC. Setting it after the reply here would model a
+         device that does not exist, and would hide the one message a host
+         receives framed differently from what it expects. An unrecognised
+         value falls back to off rather than being rejected, as the firmware
+         does (`ShimBt_setCrcMode`). */
+      case CMD.SET_CRC: {
+        const mode = cmd[1];
+        crcMode = mode === 1 || mode === 2 ? mode : 0;
+        reply([ACK]);
+        return;
+      }
 
       case CMD.GET_FW_VERSION:
         // fwId u16 LE = 3 (LogAndStream), major u16 LE, then minor and patch
