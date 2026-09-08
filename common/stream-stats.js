@@ -143,7 +143,13 @@ export function createStreamStats(container, opts = {}) {
   /**
    * Account for one decoded frame.
    *
-   * @param {{fields: {name: string, value: number}[], raw?: Uint8Array|null}} oc
+   * @param {{
+   *   fields: {name: string, value: number}[],
+   *   raw?: Uint8Array|null,
+   *   crcOk?: boolean|null,
+   * }} oc `crcOk` is the frame's link-CRC verdict: true verified, false
+   *   failed, and null or absent means the link carries no CRC — which is not
+   *   the same as a pass and is rendered differently.
    * @param {number} [recvMillis] host receive time; defaults to `performance.now()`
    */
   function onFrame(oc, recvMillis) {
@@ -180,6 +186,13 @@ export function createStreamStats(container, opts = {}) {
     });
     frames++;
     lastCrcOk = oc?.crcOk ?? null;
+    /* The tracker counts CRC failures through recordCrcFail, NOT from the
+       `crcOk` passed to recordPacket above - that field is carried for the
+       per-packet record and does not feed the counter (StreamStats.ts:203).
+       Without this call `totalCrcFails` stays 0 and the CRC cell reads "ok"
+       however many frames failed, which is the one thing the cell exists to
+       report. */
+    if (oc?.crcOk === false) tracker.recordCrcFail(SENSOR_ID);
 
     if (recv - lastRenderMs >= RENDER_INTERVAL_MS) render();
   }
