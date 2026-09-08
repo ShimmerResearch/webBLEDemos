@@ -4124,7 +4124,6 @@
       }
 
       async function afterConnectRadio() {
-        await applyLinkCrc();
         setLinkCrcEditable(false);
         const fw = await tryDevice("read the firmware version", () =>
           client.readFwVersion(),
@@ -4132,6 +4131,15 @@
         const hw = await tryDevice("read the hardware version", () =>
           client.readDeviceVersion(),
         );
+        /* The CRC goes AFTER both version reads, per
+           SHIMMER3_BT_COMMUNICATION_PROTOCOL.md section 8.2 constraint 3: the
+           version exchange must not be subject to a CRC the firmware has not
+           been confirmed to support, and a CRC turns on the length-aware
+           framer whose STATUS_RESPONSE span is 1 byte on a Shimmer3 against 2
+           on a Shimmer3R - which only the hardware version settles. Applying
+           it first, as this used to, framed a Shimmer3's status a byte too
+           wide for the whole session. */
+        await applyLinkCrc();
         const mac = await tryDevice("read the MAC address", () =>
           client.getMacAddress(),
         );
