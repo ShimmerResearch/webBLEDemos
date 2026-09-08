@@ -4010,9 +4010,7 @@
           }
           return;
         }
-        await tryDevice("enable the link CRC", () =>
-          client.setCrcMode(want),
-        );
+        await tryDevice("enable the link CRC", () => client.setCrcMode(want));
         /* Read back from the client rather than from the call: `crcMode` only
            advances on a successful ACK, so this cannot end up expecting bytes
            the device is not sending. */
