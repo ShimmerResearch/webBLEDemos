@@ -3997,6 +3997,20 @@
           // round that trips a reader who assumes the host's.
           writeCharUUID: defaults.CHAR_RX_UUID,
           notifyCharUUID: defaults.CHAR_TX_UUID,
+          /* These two MUST track Shimmer3RClient._makeWebTransport, which is
+             what the SDK would have built had this page not built the
+             transport itself (it does so only to tap it for the raw-byte log).
+             The SDK moved the device→host subscription to CYSPP's
+             notify-capable characteristic and falls back to the indicate-only
+             one for a device that lacks it; a hand-built transport with a
+             single candidate has no such fallback and would fail the connect
+             where the SDK's own would recover. The flow-control characteristic
+             is observational and the transport tolerates its absence. Both are
+             undefined on an SDK too old to export them, which the transport
+             treats as "not configured" — so this is safe to vendor either way.
+             If _makeWebTransport gains an option, add it here too. */
+          notifyCharUUIDFallback: defaults.CHAR_TX_ACKED_UUID,
+          rxFlowCharUUID: defaults.CHAR_RX_FLOW_UUID,
           requestDeviceOptions: {
             filters: [{ services: [defaults.SERVICE_UUID] }],
             optionalServices: [defaults.SERVICE_UUID],
