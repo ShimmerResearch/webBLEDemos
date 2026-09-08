@@ -1325,7 +1325,16 @@ declare const GSR_NAME = "GSR";
  */
 /** CRC modes the firmware accepts as `SET_CRC_COMMAND`'s only argument. */
 declare const CRC_MODE: Readonly<{
-    /** No CRC on anything the device sends. The state after every connect. */
+    /**
+     * No CRC on anything the device sends.
+     *
+     * The firmware's own state after every POWER CYCLE — not after every
+     * connection, which it survives. A host cannot read the mode back, so it
+     * cannot tell a reconnect to a power-cycled device from a reconnect to one
+     * that kept its setting; this SDK therefore assumes off on connect, because
+     * expecting a trailer that is not there misplaces every frame boundary while
+     * expecting none when there is one costs only a resync.
+     */
     readonly OFF: 0;
     /** Low byte of the CRC-16 appended to everything the device sends. */
     readonly ONE_BYTE: 1;
@@ -1356,6 +1365,12 @@ declare function crcTrailerBytes(mode: CrcMode): 0 | 1 | 2;
  * but a test double pretending to *be* the firmware does, and building its
  * frames with the same function the verifier uses is what stops the two
  * drifting apart.
+ *
+ * A new array in EVERY mode, off included. Returning `msg` itself when there is
+ * nothing to append would make the return value sometimes owned and sometimes
+ * aliased, so a caller that retained or wrote through it would mutate its own
+ * input in exactly one mode. The copy costs nothing at the sizes this is used
+ * at, and callers are test doubles building frames rather than a hot path.
  */
 declare function appendCrc(msg: Uint8Array, mode: CrcMode): Uint8Array;
 /**
@@ -5483,8 +5498,13 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * CRC bytes the firmware is appending to every message, 0 when off.
      *
      * Host-side mirror of the firmware's `btCrcMode`. There is no command to read
-     * it back, so this tracks what {@link setCrcMode} last set and is reset
-     * on connect — the firmware's own default is off after every power cycle.
+     * it back, so this tracks what {@link setCrcMode} last set.
+     *
+     * Reset to off wherever a link begins or ends, by
+     * {@link _resetLinkProtocolState}. The firmware's mode is per POWER CYCLE
+     * rather than per connection, so a reconnect cannot actually know — off is
+     * assumed because it is the direction that fails safe. The host's standing
+     * request lives in {@link _desiredCrcMode} and is re-established on connect.
      */
     private _crcMode;
     /** Candidate alignments the timestamp check has rejected since the last lock. */
@@ -5618,6 +5638,23 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _reestablishCrcMode;
     disconnect(): Promise<void>;
+    /**
+     * Protocol state that belongs to ONE link, cleared wherever a link ends or
+     * a new one begins.
+     *
+     * Exists because there are three such places — {@link connect},
+     * {@link disconnect} and {@link _handleTransportDisconnect} — and they had
+     * drifted. Only the explicit disconnect cleared the CRC mode, so a link that
+     * dropped under us left it set; `connect` did not clear it either, despite
+     * {@link _crcMode}'s docblock saying it did. The reconnect's very first
+     * exchange is `readDeviceVersion` inside {@link _reestablishCrcMode}, framed
+     * expecting a trailer the freshly power-cycled device is not appending.
+     *
+     * `_desiredCrcMode` deliberately does NOT reset: that is the host's standing
+     * request, and re-establishing it is the whole point of surviving a
+     * reconnect.
+     */
+    private _resetLinkProtocolState;
     /** Handle an unexpected transport disconnect (the link dropped under us). */
     private _handleTransportDisconnect;
     /**
@@ -5655,6 +5692,27 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private get _reframing();
     private _handleNotify;
     private _handleFramedChunk;
+    /**
+     * Whether a chunk beginning with 0xFF is really the ACK being waited for,
+     * rather than a sample byte that happens to be 0xFF.
+     *
+     * The ambiguity is confined to the stream plane. `startStreaming` opens it
+     * BEFORE writing the command - it has to, because the firmware streams as
+     * soon as it processes one and a notification does not respect frame
+     * boundaries - so for up to the ACK timeout there are stream bytes arriving
+     * while an ACK is expected. 0xFF is common in at-rest inertial data (a small
+     * negative reading is `…0xFF`), and a notification can begin on any byte, so
+     * "first byte is 0xFF" is not on its own evidence of an ACK. Taken wrongly it
+     * spends the ACK the start command is waiting on and diverts that
+     * notification's samples to the control handlers.
+     *
+     * On the control plane, where nothing else is in flight, the old rule is kept
+     * exactly: an expected ACK is an expected ACK.
+     *
+     * @param chunk a whole message, already CRC-stripped, starting with 0xFF
+     * @returns false only when the chunk is better explained as stream data
+     */
+    private _chunkIsCredibleAck;
     /**
      * Surface a STATUS_RESPONSE nobody asked for on {@link onDeviceStatus}.
      *
@@ -6340,9 +6398,25 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /** The CRC width currently in force, as last set by {@link setCrcMode}. */
     get crcMode(): CrcMode;
     /**
-     * Frames whose CRC failed since streaming last started, and 0 when the CRC
-     * is off — with no CRC there is nothing to fail, which is not the same as
-     * nothing having gone wrong.
+     * Inbound packets whose CRC did not check out, **stream frames and control
+     * replies alike**.
+     *
+     * Not only frames: `_handleFramedChunk` discards any un-exempt message whose
+     * CRC fails and counts it here, so a corrupt inquiry reply moves this as
+     * surely as a corrupt data packet does. That is deliberate — both mean the
+     * link is delivering bytes the firmware did not compose, which is the one
+     * thing worth knowing — but it does mean the number is not per-plane and
+     * cannot be read as a frame loss rate.
+     *
+     * Zeroed wherever a stream starts ({@link startStreaming}) and wherever a
+     * link begins or ends, NOT by {@link setCrcMode}. Turning the CRC off leaves
+     * the count standing on purpose: a caller inspecting it afterwards is asking
+     * what happened while checking was on, and answering 0 would destroy the only
+     * record of it.
+     *
+     * A zero therefore means "nothing failed", which on a link with no CRC means
+     * "nothing was checked" rather than "nothing went wrong". Read it beside
+     * {@link crcMode}.
      */
     get crcFailures(): number;
     startStreaming(): Promise<void>;

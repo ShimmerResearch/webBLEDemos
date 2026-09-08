@@ -4188,6 +4188,23 @@
             : "CRC off";
       }
 
+      /**
+       * Say the setting does not apply on this link, rather than leaving the
+       * pre-connect selection up.
+       *
+       * The dock/USB route speaks the dock protocol, which has no
+       * SET_CRC_COMMAND, so a pill still reading "CRC 2 bytes (on connect)"
+       * promises something that will never happen on this connection. It is
+       * not the same state as "the firmware refused it" either, which is what
+       * "CRC unavailable" means on a radio link.
+       */
+      function showLinkCrcNotApplicable() {
+        const pill = $("crcPill");
+        if (!pill) return;
+        pill.className = "pill";
+        pill.textContent = "CRC n/a on this link";
+      }
+
       async function applyLinkCrc() {
         const want = Number($("crcMode")?.value ?? 0);
         const pill = $("crcPill");
@@ -4379,8 +4396,11 @@
       async function afterConnectWired() {
         /* The dock speaks its own protocol with no SET_CRC_COMMAND, so the
            setting does not apply on this link at all — disabled for the same
-           reason as on a radio link, not because it was applied. */
+           reason as on a radio link, not because it was applied. The pill has
+           to say so too, or it keeps advertising the pre-connect selection as
+           though it were about to be applied. */
         setLinkCrcEditable(false);
+        showLinkCrcNotApplicable();
         const id = await tryDevice("identify the docked sensor", () =>
           client.identify(),
         );
@@ -4491,10 +4511,15 @@
       function resetAfterDisconnect() {
         streaming = false;
         sdLogging = false;
-        /* Back to reporting the selection: the sensor that agreed to a CRC has
-           gone, and the firmware clears its own mode on disconnect anyway, so
-           leaving "CRC 2 bytes" up would describe a link that no longer
-           exists. */
+        /* Back to reporting the selection, because the link that a CRC was
+           agreed on has gone and leaving "CRC 2 bytes" up would describe a
+           connection that no longer exists.
+
+           Deliberately NOT a claim about what the firmware does on
+           disconnect. Its CRC mode is per POWER CYCLE, not per connection, so
+           a sensor that was not power-cycled may well still have the CRC on -
+           which is exactly why the SDK assumes off on connect and
+           re-establishes rather than trusting either answer. */
         showPendingLinkCrc();
         setLinkCrcEditable(true);
         /* Everything identifying the sensor that has just gone, so nothing
