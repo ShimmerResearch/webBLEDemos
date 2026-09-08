@@ -449,6 +449,7 @@ function formatForControl(field, value) {
  *   dirtyKeys: () => string[],
  *   dirtyFields: () => {key: string, label: string, from: string, to: string}[],
  *   revert: () => void,
+ *   refresh: () => void,
  *   setEnabled: (enabled: boolean) => void,
  *   setFieldSupport: (key: string, supported: boolean, reason?: string) => void,
  *   focusField: (key: string) => void,
@@ -1252,6 +1253,20 @@ export function createConfigForm(host, cfg) {
         });
       }
       return out;
+    },
+
+    /**
+     * Re-read every control from the working image, without touching the
+     * baseline.
+     *
+     * For a caller that writes bytes into `getImage()` itself rather than
+     * through a control - a derived value, say, where setting one field implies
+     * another. `setImage` is the wrong tool there: it re-baselines, so the
+     * derived change would look like it came from the device and the edit would
+     * vanish from the dirty set.
+     */
+    refresh() {
+      repopulate();
     },
 
     revert() {

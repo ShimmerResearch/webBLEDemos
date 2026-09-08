@@ -2413,13 +2413,77 @@
 
       function onSensorToggle() {
         let mask = sensorsFromImage();
+        const before = mask;
         for (const box of document.querySelectorAll("[data-sensor-bit]")) {
           const bit = Number(box.dataset.sensorBit);
           mask = box.checked ? mask | bit : mask & ~bit;
         }
         sensorsToImage(mask);
         log.log(`sensor bitmap now ${hexMask(mask)}`);
+        deriveImuRate({
+          enableChanged: imuEnabled(mask) !== imuEnabled(before),
+        });
         afterImageEdit();
+      }
+
+      /** Is the LSM6DSV's shared rate field in use — either channel enabled? */
+      function imuEnabled(mask) {
+        const bits =
+          sdk.SensorBitmapShimmer3.SENSOR_A_ACCEL |
+          sdk.SensorBitmapShimmer3.SENSOR_GYRO;
+        return (mask & bits) !== 0;
+      }
+
+      /**
+       * Re-derive the LSM6DSV accel/gyro rate from the sampling rate.
+       *
+       * The fan-out Consensys gets for free from
+       * `setShimmerAndSensorsSamplingRate` and `setSensorEnabledState`, which
+       * this page has to reproduce because it edits the InfoMem fields
+       * independently: setting a rate here never used to touch the sensor's own
+       * ODR, so a 51.2 Hz packet rate could sit against a 1.875 Hz IMU and the
+       * signal arrived as a staircase.
+       *
+       * `enableChanged` matters because of a trap in the encoding: "low-power
+       * gyro" IS rate code 1, read back from the rate rather than stored
+       * separately, so a plain re-derivation from an existing 1 keeps 1. Only
+       * an enable clears it — mirroring
+       * `setDefaultLSM6DSVGyroSensorConfig`, the one place the driver does.
+       *
+       * @param {{enableChanged?: boolean}} [opts]
+       */
+      function deriveImuRate(opts = {}) {
+        if (!form || !layout) return;
+        const field = fields.find((f) => f.key === "imuRate.lsm6dsv");
+        if (!field) return; // not a Shimmer3R layout
+        const divider = Number(fieldValue("samplingRate"));
+        const samplingRateHz = sdk.samplingRateHzFromDivider(divider);
+        if (samplingRateHz === null) return;
+        const enabled = imuEnabled(sensorsFromImage());
+
+        const before = Number(fieldValue("imuRate.lsm6dsv"));
+        const next = opts.enableChanged
+          ? sdk.deriveLsm6dsvRateOnEnableChange({ enabled, samplingRateHz })
+          : sdk.deriveLsm6dsvAccelGyroRate({
+              enabled,
+              samplingRateHz,
+              /* Never inferred from the stored value: this page has no
+                 low-power control, so it must not silently produce a
+                 low-power configuration. */
+              lowPower: false,
+            });
+        if (next === before) return;
+
+        sdk.writeInfoMemFieldValue(form.getImage(), field, layout, next);
+        /* The bytes are written straight into the working image, so the
+           control still shows the old value until the form re-reads it.
+           `refresh`, not `setImage`: the latter re-baselines, which would make
+           a derived change look like it came from the device. */
+        form.refresh();
+        log.log(
+          `derived Gyro/Accel Rate ${before} → ${next} ` +
+            `(${enabled ? "enabled" : "disabled"} at ${samplingRateHz.toFixed(1)} Hz)`,
+        );
       }
 
       /** Push the image's sensor bits back into the checkboxes. */
@@ -2594,6 +2658,10 @@
           dateTimeFields: ["configTime"],
           onChange: (key) => {
             log.log(`configuration edit: ${key}`);
+            /* Setting the packet rate re-derives the sensors' own rates, which
+               is what `setShimmerAndSensorsSamplingRate` does in the driver
+               (`ShimmerDevice.java:3399`) and what this page used to skip. */
+            if (key === "samplingRate") deriveImuRate();
             afterImageEdit();
           },
           onDirtyChange: () => updateDirtyPill(),
