@@ -474,6 +474,41 @@ interface WebBluetoothTransportOptions {
     /** Characteristic the host receives notifications from (device → host). */
     notifyCharUUID: string;
     /**
+     * Optional second choice for the device → host subscription.
+     *
+     * The rule is **notify beats candidate order**, not "only when the first is
+     * missing". Both UUIDs are tried in order and the first NOTIFY-capable one
+     * wins; an indicate-only characteristic is held back and used only if
+     * neither candidate can notify. So this fallback is chosen when
+     * {@link notifyCharUUID} is absent, unsubscribable, *or* indicate-only while
+     * this one can notify.
+     *
+     * That ordering exists because the two can differ in *kind*: CYSPP's
+     * Unacknowledged Data characteristic is notify-capable (no confirmation per
+     * payload) while its Acknowledged Data characteristic is indicate-only.
+     * Preferring notify is a large throughput win — indicate costs a
+     * confirmation round trip per payload, roughly halving it — and keeping
+     * indicate as a last resort means a device offering only that still
+     * connects. {@link notifyIsAcknowledged} reports which kind was taken.
+     *
+     * A characteristic with no `properties` at all (some polyfills, and test
+     * doubles) counts as notify-capable rather than being rejected.
+     */
+    notifyCharUUIDFallback?: string;
+    /**
+     * Optional flow-control characteristic to subscribe to (indications), for
+     * devices that expose one - CYSPP's RX Flow characteristic, which the module
+     * uses to signal that it can no longer safely receive new data.
+     *
+     * Subscribing is observational: values are reported through
+     * {@link WebBluetoothTransport.onFlowControl} and logged, and writes are NOT
+     * gated on them. The guide documents the characteristic's purpose but not its
+     * value encoding, so gating is deliberately left until real values have been
+     * observed on hardware - guessing the polarity would risk blocking all
+     * writes. Subscribing also tells the module the client honours flow control.
+     */
+    rxFlowCharUUID?: string;
+    /**
      * Options passed straight to `navigator.bluetooth.requestDevice`. When omitted
      * a filter on `serviceUUID` is used. Ignored when {@link device} is supplied.
      */
@@ -516,6 +551,8 @@ declare class WebBluetoothTransport implements ShimmerTransport {
     private readonly _serviceUUID;
     private readonly _writeCharUUID;
     private readonly _notifyCharUUID;
+    private readonly _notifyCharUUIDFallback?;
+    private readonly _rxFlowCharUUID?;
     private readonly _requestDeviceOptions?;
     private readonly _defaultWriteWithResponse;
     private readonly _debug;
@@ -525,7 +562,10 @@ declare class WebBluetoothTransport implements ShimmerTransport {
     private _service;
     private _writeChar;
     private _notifyChar;
+    private _rxFlowChar;
+    private _notifyIsAcknowledged;
     private readonly _notifyCbs;
+    private readonly _flowCbs;
     private readonly _disconnectCbs;
     constructor(opts: WebBluetoothTransportOptions);
     /** The selected `BluetoothDevice`, once chosen. */
@@ -536,14 +576,44 @@ declare class WebBluetoothTransport implements ShimmerTransport {
     get writeCharacteristic(): BluetoothRemoteGATTCharacteristic | null;
     /** The notify characteristic (device → host), once discovered. */
     get notifyCharacteristic(): BluetoothRemoteGATTCharacteristic | null;
+    /** The flow-control characteristic, when one was configured and found. */
+    get rxFlowCharacteristic(): BluetoothRemoteGATTCharacteristic | null;
+    /**
+     * True when the device → host subscription had to fall back to an
+     * indicate-only characteristic, which costs a confirmation round trip per
+     * payload and so caps throughput. Useful for diagnosing an unexpectedly slow
+     * link.
+     */
+    get notifyIsAcknowledged(): boolean;
     get deviceName(): string | undefined;
     private _log;
     connect(): Promise<void>;
+    /**
+     * Pick the device → host characteristic, preferring one that can notify.
+     *
+     * Selection is by advertised capability rather than by UUID alone, so the
+     * faster path is chosen whenever the device offers it and a device that only
+     * exposes an indicate-only characteristic still works. An indicate-only
+     * choice is recorded in {@link notifyIsAcknowledged} and logged, because it
+     * halves the achievable throughput and is otherwise invisible.
+     */
+    private _resolveNotifyCharacteristic;
     disconnect(): Promise<void>;
     write(data: Uint8Array, opts?: TransportWriteOptions): Promise<void>;
     onNotify(cb: (data: Uint8Array) => void): Unsubscribe;
+    /**
+     * Subscribe to flow-control values from the device, when
+     * {@link WebBluetoothTransportOptions.rxFlowCharUUID} was configured and the
+     * characteristic was found.
+     *
+     * Values are delivered verbatim and are NOT interpreted here: the CYSPP
+     * guide documents the characteristic's purpose but not its value encoding,
+     * so callers get the raw bytes. Writes are not gated on them.
+     */
+    onFlowControl(cb: (data: Uint8Array) => void): Unsubscribe;
     onDisconnect(cb: (reason?: Error) => void): Unsubscribe;
     private _onCharacteristicChanged;
+    private _onFlowChanged;
     private _onGattServerDisconnected;
 }
 
@@ -1259,13 +1329,50 @@ declare const OPCODES: Readonly<{
     readonly ACK_COMMAND_PROCESSED: 255;
 }>;
 type Opcode = (typeof OPCODES)[keyof typeof OPCODES];
-/** Default BLE service / characteristic UUIDs for Shimmer3R. */
+/**
+ * Default BLE service / characteristic UUIDs for Shimmer3R.
+ *
+ * The Shimmer3R's BLE transport is the CYW20820 module's CYSPP profile. Per the
+ * EZ-Serial firmware platform user guide the service exposes three
+ * characteristics, and which one you subscribe to decides the throughput:
+ *
+ * - `…ca101` Acknowledged Data (Write, **Indicate**) — "guaranteed
+ *   reliability". Every payload costs an application-level confirmation round
+ *   trip, so at a 7.5 ms connection interval one PDU takes two intervals.
+ * - `…ca102` Unacknowledged Data (Write without response, **Notify**) — the
+ *   guide's "faster potential throughput" path. One characteristic serves both
+ *   directions. Loss of the ATT-level confirmation only: the BLE link layer
+ *   still retransmits and preserves ordering, and LiteProtocol frames carry
+ *   their own integrity checks on top.
+ * - `…ca103` RX Flow (Indicate) — the server indicates when it can no longer
+ *   safely receive new data.
+ */
 declare const SHIMMER3R_DEFAULTS: Readonly<{
     readonly SERVICE_UUID: "65333333-a115-11e2-9e9a-0800200ca100";
-    /** Write characteristic (host → device). */
+    /** Unacknowledged Data — host → device writes (write without response). */
     readonly CHAR_RX_UUID: "65333333-a115-11e2-9e9a-0800200ca102";
-    /** Notify characteristic (device → host). */
-    readonly CHAR_TX_UUID: "65333333-a115-11e2-9e9a-0800200ca101";
+    /**
+     * Device → host subscription. The Unacknowledged Data characteristic, which
+     * is notify-capable and therefore does not pay a confirmation round trip per
+     * payload — the same characteristic {@link CHAR_RX_UUID} writes to, which is
+     * the documented CYSPP client pattern.
+     *
+     * This was `…ca101` (Acknowledged Data) up to SDK 0.2.1. That characteristic
+     * is Indicate-only, so `startNotifications()` subscribed for indications and
+     * device → host throughput was capped at one PDU per two connection
+     * intervals — measured ~32 KB/s against a Windows 11 host, with an HCI
+     * capture confirming ATT indications (opcode 0x1D) and one confirmation per
+     * PDU. {@link WebBluetoothTransportOptions.notifyCharUUIDFallback} keeps the
+     * old characteristic reachable if a device does not offer this one.
+     */
+    readonly CHAR_TX_UUID: "65333333-a115-11e2-9e9a-0800200ca102";
+    /** Acknowledged Data — the pre-0.2.2 device → host subscription. */
+    readonly CHAR_TX_ACKED_UUID: "65333333-a115-11e2-9e9a-0800200ca101";
+    /**
+     * RX Flow. Indicates that the device can no longer safely receive new data;
+     * see {@link WebBluetoothTransportOptions.rxFlowCharUUID}.
+     */
+    readonly CHAR_RX_FLOW_UUID: "65333333-a115-11e2-9e9a-0800200ca103";
 }>;
 /**
  * Timestamp field descriptors keyed by width.
@@ -3507,6 +3614,9 @@ declare function buildShimmer3Schema(channelIds: number[], timestampFmt: Timesta
  *
  * @param onProblem optional sink for schema problems (an unrecognised channel
  *   ID); see {@link buildShimmer3Schema}.
+ * @throws if the buffer is shorter than the header, or shorter than the channel
+ *   count it declares. Rejecting is deliberate — see the body — and callers can
+ *   let it propagate: nothing is assigned from the result until it returns.
  */
 declare function interpretShimmer3InquiryResponse(u8: Uint8Array, timestampFmt?: TimestampFmt, onProblem?: (message: string) => void): Shimmer3InquiryResult;
 /** Parsed DEVICE_VERSION (a.k.a. Shimmer HW version) response. */

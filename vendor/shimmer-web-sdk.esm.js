@@ -406,7 +406,10 @@ class WebBluetoothTransport {
         this._service = null;
         this._writeChar = null;
         this._notifyChar = null;
+        this._rxFlowChar = null;
+        this._notifyIsAcknowledged = false;
         this._notifyCbs = new Set();
+        this._flowCbs = new Set();
         this._disconnectCbs = new Set();
         this._onCharacteristicChanged = (evt) => {
             const dv = evt.target?.value;
@@ -424,6 +427,21 @@ class WebBluetoothTransport {
                 }
             }
         };
+        this._onFlowChanged = (evt) => {
+            const dv = evt.target?.value;
+            if (!dv)
+                return;
+            const bytes = new Uint8Array(dv.buffer.slice(dv.byteOffset, dv.byteOffset + dv.byteLength));
+            this._log('flow-control', bytes);
+            for (const cb of this._flowCbs) {
+                try {
+                    cb(bytes);
+                }
+                catch (e) {
+                    this._log('flow-control handler error', e);
+                }
+            }
+        };
         this._onGattServerDisconnected = () => {
             for (const cb of this._disconnectCbs) {
                 try {
@@ -437,6 +455,8 @@ class WebBluetoothTransport {
         this._serviceUUID = opts.serviceUUID;
         this._writeCharUUID = opts.writeCharUUID;
         this._notifyCharUUID = opts.notifyCharUUID;
+        this._notifyCharUUIDFallback = opts.notifyCharUUIDFallback;
+        this._rxFlowCharUUID = opts.rxFlowCharUUID;
         this._requestDeviceOptions = opts.requestDeviceOptions;
         this._device = opts.device ?? null;
         this._defaultWriteWithResponse = opts.defaultWriteWithResponse ?? false;
@@ -459,6 +479,19 @@ class WebBluetoothTransport {
     get notifyCharacteristic() {
         return this._notifyChar;
     }
+    /** The flow-control characteristic, when one was configured and found. */
+    get rxFlowCharacteristic() {
+        return this._rxFlowChar;
+    }
+    /**
+     * True when the device → host subscription had to fall back to an
+     * indicate-only characteristic, which costs a confirmation round trip per
+     * payload and so caps throughput. Useful for diagnosing an unexpectedly slow
+     * link.
+     */
+    get notifyIsAcknowledged() {
+        return this._notifyIsAcknowledged;
+    }
     get deviceName() {
         return this._device?.name ?? undefined;
     }
@@ -480,10 +513,68 @@ class WebBluetoothTransport {
         this._server = await this._device.gatt.connect();
         this._service = await this._server.getPrimaryService(this._serviceUUID);
         this._writeChar = await this._service.getCharacteristic(this._writeCharUUID);
-        this._notifyChar = await this._service.getCharacteristic(this._notifyCharUUID);
+        this._notifyChar = await this._resolveNotifyCharacteristic();
         await this._notifyChar.startNotifications();
         this._notifyChar.addEventListener('characteristicvaluechanged', this._onCharacteristicChanged);
-        this._log('connected', this._device.name ?? '(unnamed)');
+        // Optional and best-effort: a device that does not expose the flow-control
+        // characteristic, or refuses the subscription, still has a working link.
+        if (this._rxFlowCharUUID) {
+            try {
+                this._rxFlowChar = await this._service.getCharacteristic(this._rxFlowCharUUID);
+                await this._rxFlowChar.startNotifications();
+                this._rxFlowChar.addEventListener('characteristicvaluechanged', this._onFlowChanged);
+                this._log('flow-control characteristic subscribed');
+            }
+            catch (e) {
+                this._rxFlowChar = null;
+                this._log('flow-control characteristic unavailable (continuing)', e);
+            }
+        }
+        this._log('connected', this._device.name ?? '(unnamed)', this._notifyIsAcknowledged ? '(acknowledged/indicate subscription)' : '(notify subscription)');
+    }
+    /**
+     * Pick the device → host characteristic, preferring one that can notify.
+     *
+     * Selection is by advertised capability rather than by UUID alone, so the
+     * faster path is chosen whenever the device offers it and a device that only
+     * exposes an indicate-only characteristic still works. An indicate-only
+     * choice is recorded in {@link notifyIsAcknowledged} and logged, because it
+     * halves the achievable throughput and is otherwise invisible.
+     */
+    async _resolveNotifyCharacteristic() {
+        const service = this._service;
+        const candidates = this._notifyCharUUIDFallback
+            ? [this._notifyCharUUID, this._notifyCharUUIDFallback]
+            : [this._notifyCharUUID];
+        let firstError;
+        const indicateOnly = [];
+        for (const uuid of candidates) {
+            let char;
+            try {
+                char = await service.getCharacteristic(uuid);
+            }
+            catch (e) {
+                firstError ?? (firstError = e);
+                continue;
+            }
+            // `properties` is absent in some polyfills and test doubles; treat that
+            // as "unknown, assume subscribable" rather than rejecting outright.
+            if (!char.properties || char.properties.notify) {
+                this._notifyIsAcknowledged = false;
+                return char;
+            }
+            if (char.properties.indicate)
+                indicateOnly.push(char);
+            // Anything else (e.g. a write-only characteristic that happens to sit at
+            // this UUID) cannot be subscribed to at all, so it is not a candidate.
+        }
+        if (indicateOnly[0]) {
+            this._notifyIsAcknowledged = true;
+            this._log('no notify-capable characteristic; subscribing to an indicate-only one -', 'each payload costs a confirmation round trip, roughly halving throughput');
+            return indicateOnly[0];
+        }
+        throw (firstError ??
+            new Error(`No subscribable device → host characteristic (tried ${candidates.join(', ')})`));
     }
     async disconnect() {
         try {
@@ -496,6 +587,15 @@ class WebBluetoothTransport {
                 }
                 this._notifyChar.removeEventListener('characteristicvaluechanged', this._onCharacteristicChanged);
             }
+            if (this._rxFlowChar) {
+                try {
+                    await this._rxFlowChar.stopNotifications();
+                }
+                catch {
+                    /* ignore */
+                }
+                this._rxFlowChar.removeEventListener('characteristicvaluechanged', this._onFlowChanged);
+            }
             if (this._device) {
                 this._device.removeEventListener('gattserverdisconnected', this._onGattServerDisconnected);
             }
@@ -507,6 +607,8 @@ class WebBluetoothTransport {
             this._service = null;
             this._writeChar = null;
             this._notifyChar = null;
+            this._rxFlowChar = null;
+            this._notifyIsAcknowledged = false;
             // Keep `_device` so a caller can reconnect to the same peripheral.
         }
     }
@@ -531,6 +633,19 @@ class WebBluetoothTransport {
     onNotify(cb) {
         this._notifyCbs.add(cb);
         return () => this._notifyCbs.delete(cb);
+    }
+    /**
+     * Subscribe to flow-control values from the device, when
+     * {@link WebBluetoothTransportOptions.rxFlowCharUUID} was configured and the
+     * characteristic was found.
+     *
+     * Values are delivered verbatim and are NOT interpreted here: the CYSPP
+     * guide documents the characteristic's purpose but not its value encoding,
+     * so callers get the raw bytes. Writes are not gated on them.
+     */
+    onFlowControl(cb) {
+        this._flowCbs.add(cb);
+        return () => this._flowCbs.delete(cb);
     }
     onDisconnect(cb) {
         this._disconnectCbs.add(cb);
@@ -1680,13 +1795,50 @@ const OPCODES = Object.freeze({
     NACK_COMMAND_PROCESSED: 0xfe,
     ACK_COMMAND_PROCESSED: 0xff,
 });
-/** Default BLE service / characteristic UUIDs for Shimmer3R. */
+/**
+ * Default BLE service / characteristic UUIDs for Shimmer3R.
+ *
+ * The Shimmer3R's BLE transport is the CYW20820 module's CYSPP profile. Per the
+ * EZ-Serial firmware platform user guide the service exposes three
+ * characteristics, and which one you subscribe to decides the throughput:
+ *
+ * - `…ca101` Acknowledged Data (Write, **Indicate**) — "guaranteed
+ *   reliability". Every payload costs an application-level confirmation round
+ *   trip, so at a 7.5 ms connection interval one PDU takes two intervals.
+ * - `…ca102` Unacknowledged Data (Write without response, **Notify**) — the
+ *   guide's "faster potential throughput" path. One characteristic serves both
+ *   directions. Loss of the ATT-level confirmation only: the BLE link layer
+ *   still retransmits and preserves ordering, and LiteProtocol frames carry
+ *   their own integrity checks on top.
+ * - `…ca103` RX Flow (Indicate) — the server indicates when it can no longer
+ *   safely receive new data.
+ */
 const SHIMMER3R_DEFAULTS = Object.freeze({
     SERVICE_UUID: '65333333-a115-11e2-9e9a-0800200ca100',
-    /** Write characteristic (host → device). */
+    /** Unacknowledged Data — host → device writes (write without response). */
     CHAR_RX_UUID: '65333333-a115-11e2-9e9a-0800200ca102',
-    /** Notify characteristic (device → host). */
-    CHAR_TX_UUID: '65333333-a115-11e2-9e9a-0800200ca101',
+    /**
+     * Device → host subscription. The Unacknowledged Data characteristic, which
+     * is notify-capable and therefore does not pay a confirmation round trip per
+     * payload — the same characteristic {@link CHAR_RX_UUID} writes to, which is
+     * the documented CYSPP client pattern.
+     *
+     * This was `…ca101` (Acknowledged Data) up to SDK 0.2.1. That characteristic
+     * is Indicate-only, so `startNotifications()` subscribed for indications and
+     * device → host throughput was capped at one PDU per two connection
+     * intervals — measured ~32 KB/s against a Windows 11 host, with an HCI
+     * capture confirming ATT indications (opcode 0x1D) and one confirmation per
+     * PDU. {@link WebBluetoothTransportOptions.notifyCharUUIDFallback} keeps the
+     * old characteristic reachable if a device does not offer this one.
+     */
+    CHAR_TX_UUID: '65333333-a115-11e2-9e9a-0800200ca102',
+    /** Acknowledged Data — the pre-0.2.2 device → host subscription. */
+    CHAR_TX_ACKED_UUID: '65333333-a115-11e2-9e9a-0800200ca101',
+    /**
+     * RX Flow. Indicates that the device can no longer safely receive new data;
+     * see {@link WebBluetoothTransportOptions.rxFlowCharUUID}.
+     */
+    CHAR_RX_FLOW_UUID: '65333333-a115-11e2-9e9a-0800200ca103',
 });
 /**
  * Timestamp field descriptors keyed by width.
@@ -5457,11 +5609,35 @@ function buildShimmer3Schema(channelIds, timestampFmt, onProblem) {
  *
  * @param onProblem optional sink for schema problems (an unrecognised channel
  *   ID); see {@link buildShimmer3Schema}.
+ * @throws if the buffer is shorter than the header, or shorter than the channel
+ *   count it declares. Rejecting is deliberate — see the body — and callers can
+ *   let it propagate: nothing is assigned from the result until it returns.
  */
 function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
-    let base = 0;
-    if (u8[0] === OPCODES.INQUIRY_RESPONSE)
-        base = 1;
+    const base = u8[0] === OPCODES.INQUIRY_RESPONSE ? 1 : 0;
+    /* Refuse a short buffer instead of degrading into a plausible-looking
+     * configuration. The channel count and channel ids used to fall back to
+     * zero/empty on a truncated response, and an empty channel list parses all
+     * the way through to `enabledSensors = 0` and a timestamp-only frame — which
+     * the device then contradicts with every real frame it sends. The only
+     * visible symptom is 100% packet loss at a believable data rate, with nothing
+     * pointing at the inquiry. Fixed for Shimmer3R first; this is the same class
+     * of fault on the classic layout, which differs only in the width of the
+     * config word (4 bytes here, 7 there) and hence where the count sits.
+     *
+     * The response carries no length byte of its own — it is
+     * `9 + numChannels` bytes opcode-inclusive — so the declared count is the
+     * only thing that says how much more to expect, and it has to be read before
+     * it can be trusted. Hence the two checks. */
+    const headerEnd = base + 8;
+    if (u8.length < headerEnd) {
+        throw new Error(`Inquiry response too short: ${u8.length} bytes, need at least ${headerEnd}.`);
+    }
+    const declaredChannels = u8[base + 6];
+    if (u8.length < headerEnd + declaredChannels) {
+        throw new Error(`Inquiry response truncated: ${u8.length} bytes, need ${headerEnd + declaredChannels} ` +
+            `for the ${declaredChannels} channels it declares.`);
+    }
     const adcRaw = u16le$3(u8, base + 0);
     const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
     // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
@@ -5472,13 +5648,21 @@ function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
     const magRange = (configByte0 & 0xe00000) >>> 21;
     const gsrRange = (configByte0 >>> 25) & 0x7;
     const internalExpPower = (configByte0 >>> 24) & 0x1;
-    const numChannels = u8[base + 6] ?? 0;
-    const bufferSize = u8[base + 7] ?? 0;
-    const chStart = base + 8;
+    const numChannels = declaredChannels;
+    const bufferSize = u8[base + 7];
+    const chStart = headerEnd;
     const channelIds = [...u8.slice(chStart, chStart + numChannels)];
     const schema = buildShimmer3Schema(channelIds, timestampFmt, onProblem);
+    /* Normalised to the opcode-inclusive form whichever way the bytes arrived.
+     * `opcode` is by definition INQUIRY_RESPONSE here - `base` is 1 only when
+     * u8[0] already is - and `bytes` is documented as the opcode-inclusive
+     * slice, so a headerless input has it prepended rather than reporting the
+     * sampling divisor's low byte as an opcode and a `bytes` the interface says
+     * it is not. Callers comparing the two forms, or re-parsing `bytes`, see one
+     * shape. */
+    const bytes = base === 1 ? u8.slice(0) : Uint8Array.of(OPCODES.INQUIRY_RESPONSE, ...u8);
     return {
-        opcode: u8[0],
+        opcode: OPCODES.INQUIRY_RESPONSE,
         adcRaw,
         samplingRateHz,
         configByte0,
@@ -5491,7 +5675,7 @@ function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
         bufferSize,
         channelIds,
         schema,
-        bytes: u8.slice(0),
+        bytes,
     };
 }
 /** Decode a DEVICE_VERSION_RESPONSE (0x25) — 1 payload byte = HW version.
@@ -10459,6 +10643,14 @@ class Shimmer3RClient extends BaseShimmerClient {
             // matching the previous `rx.writeValue(...)` behaviour.
             writeCharUUID: this.rxUUID,
             notifyCharUUID: this.txUUID,
+            // CYSPP's Unacknowledged Data characteristic (the default `txUUID`) is
+            // notify-capable, so device→host payloads do not pay a confirmation
+            // round trip. Fall back to the Acknowledged Data characteristic, which
+            // is indicate-only, for anything that does not expose the former.
+            notifyCharUUIDFallback: SHIMMER3R_DEFAULTS.CHAR_TX_ACKED_UUID,
+            // Observational only - the values are surfaced and logged, not used to
+            // gate writes. See WebBluetoothTransportOptions.rxFlowCharUUID.
+            rxFlowCharUUID: SHIMMER3R_DEFAULTS.CHAR_RX_FLOW_UUID,
             requestDeviceOptions: {
                 filters: [{ services: [this.serviceUUID] }],
                 optionalServices: [this.serviceUUID],
