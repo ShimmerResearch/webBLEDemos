@@ -696,6 +696,11 @@
           <div class="banner info" id="configBanner">
             Connect a sensor to read its configuration.
           </div>
+          <!-- Fires when the sampling rate outruns the accel/gyro output rate.
+               Nothing else on this page can show that: timestamps, packet loss
+               and the CRC all stay correct while the signal is a staircase of
+               repeated readings. -->
+          <div class="banner warn" id="rateCoverageNote" hidden></div>
           <div id="configForm"></div>
         </div>
 
@@ -2595,6 +2600,7 @@
         });
 
         injectOwnControls();
+        syncRateCoverage();
         banner("configBanner", "", "");
       }
 
@@ -2650,9 +2656,55 @@
       function afterImageEdit() {
         syncSensorGrid();
         syncRateReadout();
+        syncRateCoverage();
         renderHex();
         regate();
       }
+
+      /**
+       * Warn when the IMU cannot keep up with the configured packet rate.
+       *
+       * These are two independent InfoMem fields and the firmware relates them
+       * nowhere, so a sampling rate above the accel/gyro ODR makes the sensor
+       * repeat each reading with a fresh timestamp on it. Nothing else on
+       * screen can tell you: timestamps stay regular, packet loss stays at 0%
+       * and every CRC passes, because none of that is wrong — only the signal
+       * is, and it arrives as a staircase.
+       *
+       * Shown on the form rather than only logged, and re-checked on every
+       * edit, so raising the sampling rate flags it there and then instead of
+       * at the next bench session. Consensys avoids the trap by deriving sensor
+       * ODRs from the trial rate; this page lets the fields be edited
+       * independently, so it has to say when the pair stops making sense.
+       */
+      function syncRateCoverage() {
+        const host = $("rateCoverageNote");
+        if (!host || !form) return;
+        let verdict = null;
+        try {
+          verdict = sdk.checkImuRateCoversPacketRate({
+            samplingRateDivider: Number(fieldValue("samplingRate")),
+            imuRateCode: Number(fieldValue("imuRate.lsm6dsv")),
+            enabledSensors: sensorsFromImage(),
+          });
+        } catch {
+          /* A generation with no LSM6DSV field, or a half-built form. Silence
+             is right: this warns about a specific pair, and cannot warn about
+             fields that do not exist. */
+        }
+        const problem = verdict?.problem ?? "";
+        host.textContent = problem;
+        host.hidden = !problem;
+        if (problem && problem !== lastRateCoverageWarning) {
+          lastRateCoverageWarning = problem;
+          log.warn(problem);
+        } else if (!problem) {
+          lastRateCoverageWarning = "";
+        }
+      }
+
+      /** Last coverage warning logged, so an edit does not repeat it every time. */
+      let lastRateCoverageWarning = "";
 
       /**
        * Take an image the sensor just gave us as the new reference: the form's
