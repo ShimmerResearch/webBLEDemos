@@ -38,6 +38,7 @@ import {
   getDefaultCalibration,
   parseBrandRecord,
   sdCrc16,
+  appendCrc,
 } from "../../vendor/shimmer-web-sdk.esm.js";
 
 // ---------------------------------------------------------------------------
@@ -85,6 +86,7 @@ const CMD = Object.freeze({
   BT_VERSION_STR_RESPONSE: 0xa2,
   SET_FACTORY_TEST: 0xa8,
   INSTREAM_CMD_RESPONSE: 0x8a,
+  SET_CRC: 0x8b,
   SET_INFOMEM: 0x8c,
   INFOMEM_RESPONSE: 0x8d,
   GET_INFOMEM: 0x8e,
@@ -1021,8 +1023,17 @@ export function createMockShimmer3RTransport(opts = {}) {
    * worst case a serial port can present, and the one the SDK's control-plane
    * re-framing exists for.
    */
+  /**
+   * CRC bytes appended to everything the device sends, per SET_CRC_COMMAND.
+   * Zero until a host asks, which is the state after every power cycle.
+   */
+  let crcMode = 0;
+
   function reply(bytes) {
-    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const u8 = appendCrc(
+      bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes),
+      crcMode,
+    );
     if (debug) console.log("[mock] ->", hex(u8));
     if (framed) {
       setTimeout(() => transport.notify(u8), REPLY_DELAY_MS);
@@ -1036,7 +1047,8 @@ export function createMockShimmer3RTransport(opts = {}) {
   }
 
   /** Stream data: one buffer per burst, chunked but never spread over time. */
-  function replyStream(u8) {
+  function replyStream(frame) {
+    const u8 = appendCrc(frame, crcMode);
     if (framed || u8.length <= dribbleBytes) {
       transport.notify(u8);
       return;
@@ -2026,6 +2038,18 @@ export function createMockShimmer3RTransport(opts = {}) {
       case CMD.INQUIRY:
         reply(concat([ACK], inquiryResponse()));
         return;
+
+      /* SET_CRC takes effect on everything sent AFTER its own ACK, matching
+         `ShimBt_setCrcMode`: the ACK for this command is still framed under
+         the old mode, so a host that switched the mode before reading it would
+         mis-frame exactly one message. The firmware also falls back to CRC_OFF
+         for a value it does not recognise rather than rejecting it. */
+      case CMD.SET_CRC: {
+        const mode = cmd[1];
+        reply([ACK]);
+        crcMode = mode === 1 || mode === 2 ? mode : 0;
+        return;
+      }
 
       case CMD.GET_FW_VERSION:
         // fwId u16 LE = 3 (LogAndStream), major u16 LE, then minor and patch
