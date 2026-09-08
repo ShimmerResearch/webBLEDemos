@@ -485,19 +485,21 @@
           <div class="row">
             <label for="crcMode">Link CRC</label>
             <select id="crcMode">
-              <option value="0" selected>Off</option>
+              <option value="0">Off</option>
               <option value="1">1 byte</option>
-              <option value="2">2 bytes (recommended)</option>
+              <option value="2" selected>2 bytes</option>
             </select>
             <!-- Not hidden before connecting: it shows what the selection
                  WILL ask for, then what the sensor actually accepted. -->
-            <span class="pill" id="crcPill">CRC off</span>
+            <span class="pill" id="crcPill">CRC 2 bytes</span>
           </div>
           <div class="field-hint">
             Has the sensor append a checksum to every packet, so a corrupted
-            frame is reported as corrupted instead of being plotted. Two bytes
-            is the useful setting; one byte lets roughly 1 in 256 bad frames
-            through. Applied when you connect.
+            frame is reported as corrupted instead of being plotted. On at two
+            bytes by default, which costs two bytes per frame and is the only
+            way to tell a bad link from a bad decode; one byte lets roughly 1 in
+            256 bad frames through. Firmware that does not support it falls back
+            to off on its own. Applied when you connect.
           </div>
           <div class="banner" id="platformBanner"></div>
         </div>
@@ -1404,6 +1406,10 @@
       });
 
       $("logSeverity").addEventListener("change", updateTapNote);
+      /* Tracks the selection until a link exists; applyLinkCrc takes the pill
+         over from there and reports what the sensor actually accepted. */
+      $("crcMode").addEventListener("change", showPendingLinkCrc);
+      showPendingLinkCrc();
 
       // =====================================================================
       // State
@@ -4000,6 +4006,25 @@
        * on the client is only advanced by a successful call, so the parser
        * never expects bytes the device is not sending.
        */
+      /**
+       * Show what the selection will ask for, while not connected.
+       *
+       * The pill means two different things at two different times - what was
+       * requested, then what the sensor agreed to - and saying so before a link
+       * exists is the honest half: a pill reading "2 bytes" on a page that has
+       * not asked anything yet would be claiming a state no device is in.
+       */
+      function showPendingLinkCrc() {
+        const pill = $("crcPill");
+        if (!pill) return;
+        const want = Number($("crcMode")?.value ?? 0);
+        pill.className = "pill";
+        pill.textContent =
+          want > 0
+            ? `CRC ${want} byte${want === 1 ? "" : "s"} (on connect)`
+            : "CRC off";
+      }
+
       async function applyLinkCrc() {
         const want = Number($("crcMode")?.value ?? 0);
         const pill = $("crcPill");
@@ -4290,6 +4315,11 @@
       function resetAfterDisconnect() {
         streaming = false;
         sdLogging = false;
+        /* Back to reporting the selection: the sensor that agreed to a CRC has
+           gone, and the firmware clears its own mode on disconnect anyway, so
+           leaving "CRC 2 bytes" up would describe a link that no longer
+           exists. */
+        showPendingLinkCrc();
         /* Everything identifying the sensor that has just gone, so nothing
            belonging to it can be attributed to the next one.
            `deviceMac` is the one that matters: it is assigned only when the
