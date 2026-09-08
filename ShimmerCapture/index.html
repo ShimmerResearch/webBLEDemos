@@ -2798,6 +2798,7 @@
         }
         form.setImage(bytes);
         form.captureBaseline();
+        applyIdentityPlaceholders();
         baselineSensors = sensorsFromImage();
         exgMode = "off";
         const select = $("exgMode");
@@ -2805,6 +2806,30 @@
         $("imPill").textContent = `${form.getImage().length} bytes read`;
         $("imPill").classList.add("on");
         afterImageEdit();
+      }
+
+      /**
+       * Show, as placeholders, the names the FIRMWARE will give this device if
+       * the identity fields are left empty.
+       *
+       * These are not this page's inventions: `ShimConfig_setDefaultShimmerName`
+       * and `ShimConfig_setDefaultTrialId` write exactly `Shimmer_` + the last
+       * four MAC characters, and `DefaultTrial`. So an empty Shimmer Name box
+       * showing `Shimmer_F3F8` is a statement about the device, not a
+       * suggestion from us.
+       *
+       * A placeholder rather than a value on purpose. Filling the boxes in
+       * would present an edit the user never made as if it were the device's
+       * own setting, and applying the configuration would then write it — which
+       * is a real change to a sensor that had a blank name for a reason.
+       */
+      function applyIdentityPlaceholders() {
+        if (!form) return;
+        const identity = sdk.defaultTrialIdentity(deviceMac || "");
+        /* Null when the MAC is unusable — no placeholder at all beats one that
+           looks like an identity and identifies nothing. */
+        form.setPlaceholder("deviceName", identity.deviceName ?? "");
+        form.setPlaceholder("trialName", identity.trialName);
       }
 
       /**

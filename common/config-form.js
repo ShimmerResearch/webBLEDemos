@@ -452,6 +452,7 @@ function formatForControl(field, value) {
  *   refresh: () => void,
  *   setEnabled: (enabled: boolean) => void,
  *   setFieldSupport: (key: string, supported: boolean, reason?: string) => void,
+ *   setPlaceholder: (key: string, text: string) => void,
  *   focusField: (key: string) => void,
  *   destroy: () => void,
  * }}
@@ -1218,7 +1219,9 @@ export function createConfigForm(host, cfg) {
       return;
     }
     entry.control.disabled = disabled;
-    entry.control.title = reason ? `${reason} — ${entry.tooltip}` : entry.tooltip;
+    entry.control.title = reason
+      ? `${reason} — ${entry.tooltip}`
+      : entry.tooltip;
   }
 
   // ---- Public API -------------------------------------------------------
@@ -1291,6 +1294,19 @@ export function createConfigForm(host, cfg) {
       entry.wrap.classList.toggle("unsupported", !entry.supported);
       applyEnabled(entry);
       refreshGroupPlacement();
+    },
+
+    setPlaceholder(key, text) {
+      const entry = entries.get(key);
+      if (!entry) return;
+      // Only a text control has a placeholder; a select or checkbox silently
+      // ignores the attribute, so guard rather than set it and wonder.
+      const control = entry.control;
+      if (!(control instanceof HTMLInputElement) || control.type !== "text") {
+        if (!(control instanceof HTMLTextAreaElement)) return;
+      }
+      if (text) control.placeholder = String(text);
+      else control.removeAttribute("placeholder");
     },
 
     focusField(key) {

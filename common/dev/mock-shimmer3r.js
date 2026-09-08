@@ -33,6 +33,7 @@ import {
   SD_TRANSFER_OPCODES,
   SD_XFER,
   buildBrandRecord,
+  defaultTrialIdentity,
   generateCalibDump,
   generateKinematicCalibBlock,
   getDefaultCalibration,
@@ -848,8 +849,16 @@ export function createMockShimmer3RTransport(opts = {}) {
     infoMem[IM.configSetupByte6] = state.configSetupBytes[6];
 
     infoMem[IM.btCommBaudRate] = 9; // 1 Mbaud, the Shimmer3R default
-    writeName(IM.shimmerName, `Shimmer_${mac.slice(-4).toUpperCase()}`);
-    writeName(IM.expIdName, "DefaultTrial");
+    /* From the SDK rather than hand-rolled, so the mock cannot drift from what
+       the firmware's own ShimConfig_setDefaultShimmerName /
+       ShimConfig_setDefaultTrialId produce. The previous inline
+       `mac.slice(-4)` also assumed a separator-free MAC, which this mock
+       happens to use but a caller passing a colon-separated one would break. */
+    const identity = defaultTrialIdentity(mac);
+    if (identity.deviceName !== null) {
+      writeName(IM.shimmerName, identity.deviceName);
+    }
+    writeName(IM.expIdName, identity.trialName);
 
     // Config time, big-endian over 4 bytes — a plausible "last configured"
     // stamp rather than 0, so a page rendering it shows a real date.
