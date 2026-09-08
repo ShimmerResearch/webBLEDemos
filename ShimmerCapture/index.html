@@ -4014,6 +4014,24 @@
        * exists is the honest half: a pill reading "2 bytes" on a page that has
        * not asked anything yet would be claiming a state no device is in.
        */
+      /**
+       * Lock the CRC selector while a link is up.
+       *
+       * The setting is applied once, during connect, and the SDK refuses to
+       * change the width mid-stream because it would move every frame boundary.
+       * A control that still looks editable invites exactly that expectation,
+       * so it is disabled rather than left to disappoint — and the title says
+       * why, since a greyed control with no explanation is its own puzzle.
+       */
+      function setLinkCrcEditable(editable) {
+        const sel = $("crcMode");
+        if (!sel) return;
+        sel.disabled = !editable;
+        sel.title = editable
+          ? ""
+          : "Applied when the link is established — disconnect to change it.";
+      }
+
       function showPendingLinkCrc() {
         const pill = $("crcPill");
         if (!pill) return;
@@ -4055,6 +4073,7 @@
 
       async function afterConnectRadio() {
         await applyLinkCrc();
+        setLinkCrcEditable(false);
         const fw = await tryDevice("read the firmware version", () =>
           client.readFwVersion(),
         );
@@ -4205,6 +4224,10 @@
        * stream on it at all.
        */
       async function afterConnectWired() {
+        /* The dock speaks its own protocol with no SET_CRC_COMMAND, so the
+           setting does not apply on this link at all — disabled for the same
+           reason as on a radio link, not because it was applied. */
+        setLinkCrcEditable(false);
         const id = await tryDevice("identify the docked sensor", () =>
           client.identify(),
         );
@@ -4320,6 +4343,7 @@
            leaving "CRC 2 bytes" up would describe a link that no longer
            exists. */
         showPendingLinkCrc();
+        setLinkCrcEditable(true);
         /* Everything identifying the sensor that has just gone, so nothing
            belonging to it can be attributed to the next one.
            `deviceMac` is the one that matters: it is assigned only when the

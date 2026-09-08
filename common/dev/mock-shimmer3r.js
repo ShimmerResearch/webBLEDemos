@@ -2039,15 +2039,18 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply(concat([ACK], inquiryResponse()));
         return;
 
-      /* SET_CRC takes effect on everything sent AFTER its own ACK, matching
-         `ShimBt_setCrcMode`: the ACK for this command is still framed under
-         the old mode, so a host that switched the mode before reading it would
-         mis-frame exactly one message. The firmware also falls back to CRC_OFF
-         for a value it does not recognise rather than rejecting it. */
+      /* SET_CRC takes effect INCLUDING its own ACK. The firmware sets the mode
+         while processing this command's arguments (`shimmer_bt_uart.c:944`) and
+         composes the ACK afterwards from the new mode (`:2422`), so that ACK
+         already carries a CRC. Setting it after the reply here would model a
+         device that does not exist, and would hide the one message a host
+         receives framed differently from what it expects. An unrecognised
+         value falls back to off rather than being rejected, as the firmware
+         does (`ShimBt_setCrcMode`). */
       case CMD.SET_CRC: {
         const mode = cmd[1];
-        reply([ACK]);
         crcMode = mode === 1 || mode === 2 ? mode : 0;
+        reply([ACK]);
         return;
       }
 
