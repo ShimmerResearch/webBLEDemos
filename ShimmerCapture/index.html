@@ -1882,7 +1882,16 @@
        */
       async function withDevice(what, fn, opts = {}) {
         if (!client) {
-          showToast("Connect a sensor first", "warn");
+          /* A tolerated read is a diagnostic, and the connect hook runs them
+             across many awaits - so reaching here usually means the link went
+             mid-sequence, not that nothing was ever connected. "Connect a
+             sensor first" would be untrue, and one toast per remaining read
+             buries the real event. Say what happened, in the log, once each. */
+          if (opts.tolerate) {
+            log.warn(`${what}: the link dropped before this could run`);
+          } else {
+            showToast("Connect a sensor first", "warn");
+          }
           return undefined;
         }
         if (busy) {
@@ -2200,7 +2209,13 @@
 
         // getStatus() on the wired client reports the battery, not the status
         // bits: only the radio protocol carries a STATUS_RESPONSE.
-        if (mode !== "usb" && typeof client.getStatus === "function") {
+        /* `client?.`, not `client.`: the battery read above is awaited, and the
+           connect hook this runs inside spans many awaits, so the link can go
+           between them - which nulls `client` and `mode`. Probing straight
+           through then threw "Cannot read properties of null (reading
+           'getStatus')", and the connect reported that TypeError instead of
+           the dropped link that caused it. */
+        if (mode !== "usb" && typeof client?.getStatus === "function") {
           const status = await tryDevice("read the device status", () =>
             client.getStatus(),
           );
@@ -3060,7 +3075,7 @@
                  configuration file stale after the image was written. What is
                  not acceptable is reporting that as a TypeError, which is what
                  calling straight through produced. */
-              if (typeof client.updateSdLogConfig !== "function") {
+              if (typeof client?.updateSdLogConfig !== "function") {
                 log.warn(
                   "this SDK build has no updateSdLogConfig — the configuration image is written, but the SD header will not be rebuilt until the sensor restarts",
                 );
