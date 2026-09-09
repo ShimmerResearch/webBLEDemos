@@ -5,7 +5,7 @@
  *
  * Kept in sync with package.json by tests/core/version.test.ts.
  */
-declare const SDK_VERSION = "0.2.2";
+declare const SDK_VERSION = "0.3.0";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
@@ -2630,6 +2630,87 @@ declare const EXG_REG8_STATUS_INDEX = 7;
 declare function exgBanksEqualIgnoringStatus(a: Uint8Array, b: Uint8Array): boolean;
 
 /**
+ * ExG (ADS1292R) counts → millivolts.
+ *
+ * The conversion needs two things out of the chip's own register bank — the
+ * per-channel PGA gain and the reference voltage — so it lives beside the
+ * register codec rather than with the kinematic calibration, which is
+ * per-device rather than per-configuration.
+ *
+ * **The 16-bit mode is not a 16-bit conversion, and this is the part that gets
+ * ported wrongly.** The firmware builds the 16-bit sample from bits **22:7** of
+ * the chip's 24-bit conversion — its own header says so, "drops 7 least
+ * significant bits and most significant bit"
+ * (`Shimmer_Driver/EXG/exg.h:134`; the bit-shuffle is `exg.c:288-291` for chip 1
+ * and `:261-266` for chip 2). The word is therefore the 24-bit value over 128
+ * with bit 22 as its sign, and the full-scale denominator has to account for
+ * it. Using `2^15 - 1` alone reports values **exactly twice too large**. The
+ * Java driver's live path gets this right by doubling the gain instead
+ * (`ShimmerObject.java:1856`), which is the same arithmetic; note that
+ * `SensorEXG.computeCalConstantForChannel` (:3121-3132) does **not** double,
+ * and disagrees with it.
+ *
+ * A consequence worth knowing: 16-bit mode halves the usable input range to
+ * ±V_REF / (2·gain). Past that, bit 22 no longer agrees with bit 23, and the
+ * two chips wrap differently — chip 1 takes bit 22 as the sign while chip 2
+ * keeps bit 23 and drops bit 22 — so a saturated CH1 reads differently on the
+ * two chips for the same input.
+ */
+
+/**
+ * The ADS1292R's two reference voltages, selected by `CONFIG2` bit 4
+ * (`VREF_4V`): 0 → 2.42 V, 1 → 4.033 V.
+ *
+ * The datasheet rounds these to 2.4 V and 4 V and the chip header follows it
+ * (`Shimmer_Driver/EXG/ads1292.h:219,235-238`); the Java driver has always used
+ * the unrounded 2.42 V in its conversion constants
+ * (`ShimmerObject.java:721-724`), so these are the Java figures — a recording
+ * from this SDK and one from Consensys agree to the last decimal.
+ *
+ * The firmware's own defaults write `CONFIG2 = 0x80`, i.e. bit 4 clear, so
+ * 2.42 V is what an untouched sensor uses (`Configuration/shimmer_config.c`,
+ * the ECG default set).
+ */
+declare const EXG_VREF_VOLTS: readonly [number, number];
+/** Which resolution the enabled ExG sensor bits selected. */
+type ExgSampleResolution = '24bit' | '16bit';
+/**
+ * The millivolts-per-count factor for one ExG channel.
+ *
+ * @param bank       That chip's 10-byte register bank, or `null` when the host
+ *   has not read it. With `null` the chip's own defaults are assumed — gain 6,
+ *   2.42 V — which is what the firmware writes and what the Java driver
+ *   hard-codes; a caller that cares should read the bank
+ *   (`Shimmer3RClient.readExgConfig()`) and say so to its user.
+ * @param channel    1 or 2.
+ * @param resolution Which sample width the sensor bitmap selected.
+ */
+declare function exgChannelMillivoltFactor(bank: Uint8Array | null, channel: 1 | 2, resolution: ExgSampleResolution): number;
+/**
+ * Convert one ExG sample to millivolts.
+ *
+ * `sample` must already be sign-extended — the stream decoder does that from
+ * the channel's own width.
+ */
+declare function calibrateExgSample(sample: number, bank: Uint8Array | null, channel: 1 | 2, resolution: ExgSampleResolution): number;
+/**
+ * What a host should show about the ExG conversion in force: the reference
+ * voltage and both channels' gains, per chip.
+ */
+interface ExgCalibrationSummary {
+    vrefVolts: number;
+    gainCh1: number;
+    gainCh2: number;
+}
+/** Summarise one chip's bank; the chip defaults when `bank` is `null`. */
+declare function summariseExgCalibration(bank: Uint8Array | null): ExgCalibrationSummary;
+/** Summarise both chips. */
+declare function summariseExgBanks(banks: ExgBanks | null): {
+    chip1: ExgCalibrationSummary;
+    chip2: ExgCalibrationSummary;
+};
+
+/**
  * Building the streaming packet schema from an inquiry response's channel list.
  *
  * Shared by both families: `Shimmer3RClient` (framed BLE) and
@@ -2732,6 +2813,841 @@ interface BuildStreamSchemaOptions {
  * {@link StreamSchemaBase.trusted}.
  */
 declare function buildStreamSchema(channelIds: ArrayLike<number>, timestampFmt: TimestampFmt, opts: BuildStreamSchemaOptions): Required<Pick<StreamSchemaBase, 'generation' | 'unknownChannelIds' | 'trusted'>> & StreamSchemaBase;
+
+/**
+ * Turning a stream's 24-bit tick counter into a monotonic device clock, and
+ * then into wall-clock time.
+ *
+ * Two problems, and they are separable.
+ *
+ * **The counter wraps.** It runs at 32768 Hz in 24 bits, so it returns to zero
+ * every 512 seconds exactly — and in 16 bits, on Shimmer3 firmware older than
+ * LogAndStream 0.5.4, every **2 seconds**. Plotting the raw value against time
+ * draws a sawtooth. Unwrapping it is a matter of counting the wraps, and the
+ * naive rule ("the value went down, so it wrapped") is wrong for a duplicated
+ * or reordered packet: it adds 512 s permanently, which is what the Java
+ * driver's `unwrapTimeStamp` does (`ShimmerObject.java:3830-3848`).
+ *
+ * **The counter has no origin.** It says nothing about what time it is. To place
+ * samples on a wall clock a host has to anchor the counter against something,
+ * and there are three ways of doing that, in descending order of how well they
+ * work:
+ *
+ * | Anchor | When | Accuracy |
+ * |---|---|---|
+ * | `rwc-aligned` | Shimmer3R | exact, to the tick |
+ * | `rwc-estimated` | Shimmer3 | ± half the round trip |
+ * | `host` | no real-world clock set, or firmware without the command | ± half the round trip, and wrong by however wrong the sensor's clock is |
+ *
+ * The first is available because on a Shimmer3R the stream's timestamp **is**
+ * the low 24 bits of the same 64-bit counter `GET_RWC` returns: the packet
+ * timestamp comes from `RTC_get32()` and the real-world clock from
+ * `RTC_get64()` (`Sensing/shimmer_sensing.c:445-476`; `RTC/shimmer_rtc.h:25-28`
+ * defines `RTC_getRwcTime` as `RTC_get64`, and `Core/Src/rtc.c` gives the two
+ * functions identical bodies). So one `GET_RWC` reply pins every subsequent
+ * sample exactly, with no clock-comparison error at all: the host only has to
+ * decide *which* wrap of the counter a sample belongs to, and elapsed host time
+ * settles that with hundreds of seconds of slack.
+ *
+ * A Shimmer3's counter cannot be set. Its real-world clock is that free-running
+ * counter plus a stored offset — `RTC_getRwcTime()` returns
+ * `rwcTimeDiff64 + RTC_get64()` (`Shimmer_Driver/5xx_HAL/hal_RTC.c:73-76`) —
+ * and the offset is not sent over Bluetooth, only into an SD header. So a host
+ * can only estimate where the counter stood when the reply was composed, which
+ * is what `rwc-estimated` does and why it carries the round trip as its
+ * uncertainty.
+ *
+ * `host` is the Consensys method: the host's own clock at the first packet,
+ * carried forward by the device's counter
+ * (`SystemTimestampPlot.java:19-42`). It is the fallback rather than the
+ * default because it inherits the host's clock error rather than the sensor's,
+ * and a sensor whose clock is set is the better reference for its own data.
+ */
+/** The sample counter's frequency, on every Shimmer3-family device. */
+declare const TICKS_PER_SECOND = 32768;
+/** Ticks per millisecond — 32.768, as the firmware and the Java driver have it. */
+declare const TICKS_PER_MS: number;
+/** Where a timeline's wall-clock time came from. See the module docblock. */
+type TimelineSource = 'rwc-aligned' | 'rwc-estimated' | 'host';
+/** How wide the device's sample counter is. */
+type TimestampBits = 16 | 24;
+/** One stamped sample. */
+interface StreamStamp {
+    /** The counter with its wraps added back, monotonic across a session. */
+    unwrappedTicks: number;
+    /**
+     * Milliseconds on the device's own clock: `unwrappedTicks / 32.768`.
+     *
+     * Not zeroed at stream start — it begins wherever the counter stood, which is
+     * what the Java driver emits on its `TIMESTAMP` CAL channel. Subtract the
+     * first sample's value for "seconds since start".
+     */
+    deviceMs: number;
+    /** Unix milliseconds, or `null` when the timeline has no anchor yet. */
+    unixMs: number | null;
+    /** Which anchor produced `unixMs`; `null` when there is none. */
+    source: TimelineSource | null;
+}
+/** What a host should be told about a timeline's anchor. */
+interface TimelineState {
+    source: TimelineSource | null;
+    /** Host clock reading the anchor was taken at, or `null`. */
+    anchorHostMs: number | null;
+    /** Unix time the anchor assigned, or `null`. */
+    anchorUnixMs: number | null;
+    /**
+     * How far out the anchor could be, in milliseconds.
+     *
+     * Zero for `rwc-aligned` — the arithmetic is exact. Half the measured round
+     * trip for the other two, which is the best a single request/response
+     * exchange can say about when the far end read its clock.
+     */
+    anchorUncertaintyMs: number;
+    /**
+     * Device-minus-host at the moment of anchoring, or `null` — including while
+     * the anchor is still waiting for its first sample.
+     */
+    skewMs: number | null;
+    /** How many counter wraps have been counted this session. */
+    wraps: number;
+    /** The counter width in use. */
+    timestampBits: TimestampBits;
+}
+/** Options for {@link StreamTimeline}. */
+interface StreamTimelineOptions {
+    /** Counter width. Default 24. */
+    timestampBits?: TimestampBits;
+}
+/**
+ * Unwraps a device sample counter and, once anchored, reports wall-clock time
+ * for every sample.
+ *
+ * One instance per stream. A client resets it at stream start and re-anchors
+ * whenever the device's clock is written, because that steps the very counter
+ * the samples are timed by.
+ */
+declare class StreamTimeline {
+    private _bits;
+    private _modulo;
+    private _lastRaw;
+    private _lastUnwrapped;
+    private _lastHostMs;
+    private _wraps;
+    private _pending;
+    private _anchor;
+    /**
+     * The last anchor REQUEST, kept so it can be re-bound to a new stream's first
+     * sample. A request is durable in a way a binding is not: it says what the
+     * device's clock read at a known host time, which stays true across a stream
+     * restart, whereas the binding is to an unwrapped tick origin that does not.
+     */
+    private _request;
+    constructor(opts?: StreamTimelineOptions);
+    /** The counter width this timeline is unwrapping. */
+    get timestampBits(): TimestampBits;
+    /**
+     * Change the counter width.
+     *
+     * A Shimmer3 client learns this from the firmware version during its
+     * handshake, which happens after the timeline exists. Resets everything: a
+     * wrap count means nothing against a different modulo, and an anchor is
+     * bound to an unwrapped tick value that is about to start again.
+     */
+    setTimestampBits(bits: TimestampBits): void;
+    /**
+     * Start again: new stream, new counter origin.
+     *
+     * Any anchor is dropped rather than carried over. Between two streams the
+     * counter has kept running, so an anchor bound to the old stream's unwrapped
+     * origin says nothing about the new one, and a host re-reads the clock.
+     */
+    reset(): void;
+    /**
+     * Anchor against the device's real-world clock.
+     *
+     * @param rwcTicks  The 64-bit tick count `GET_RWC` returned.
+     * @param hostMs    The host clock at the **midpoint** of the exchange —
+     *   `(before + after) / 2` — which is the best single estimate of when the
+     *   device composed its reply.
+     * @param opts.rttMs  The exchange's round-trip time. Half of it is the
+     *   uncertainty, and it is ignored for an aligned anchor, which does not
+     *   depend on when the reply was composed.
+     * @param opts.aligned  True when the stream timestamp is the low bits of this
+     *   same counter — a Shimmer3R. False for a Shimmer3, whose counter and
+     *   real-world clock differ by a stored offset the host cannot read.
+     */
+    anchorToRwc(rwcTicks: bigint, hostMs: number, opts: {
+        rttMs?: number;
+        aligned: boolean;
+    }): void;
+    /**
+     * Anchor against the host's own clock, the Consensys method: the next sample
+     * is taken to have happened now, and the device's counter carries time
+     * forward from there.
+     */
+    anchorToHost(hostMs: number, opts?: {
+        rttMs?: number;
+    }): void;
+    /** Drop any anchor and any standing request, leaving the unwrap running. */
+    clearAnchor(): void;
+    /**
+     * True when this timeline has been told how to place samples on a wall clock
+     * — whether or not a sample has arrived to bind it to yet.
+     *
+     * A client checks this before spending a round trip on the clock: one reading
+     * serves every stream of a session.
+     */
+    get hasAnchorRequest(): boolean;
+    /**
+     * Unwrap one sample's counter value and, if anchored, place it on a wall
+     * clock.
+     *
+     * @param raw    The counter value from the packet, wraps included.
+     * @param hostMs The host clock when the packet arrived. Used only to recover
+     *   wraps that went by unseen — see below — never to time the sample, which
+     *   the device's own counter does far better.
+     */
+    stamp(raw: number, hostMs?: number): StreamStamp;
+    private _unwrap;
+    /**
+     * Turn a pending anchor into a resolved one, now that a sample's unwrapped
+     * tick value is known to bind it to.
+     */
+    private _resolveAnchor;
+    /**
+     * What a host should show about this timeline.
+     *
+     * `source` reports what *will* place these samples as soon as one arrives,
+     * not only what already has: a host wants to label its time axis when the
+     * stream starts, not one packet later. {@link anchored} is the narrower
+     * question of whether a sample has bound the anchor yet.
+     */
+    get state(): TimelineState;
+    /** True once wall-clock time is available. */
+    get anchored(): boolean;
+}
+
+/**
+ * Pressure/temperature sensor identity, coefficient block sizes and the shapes
+ * the compensation functions exchange.
+ *
+ * Four Bosch parts appear across the Shimmer3 family, and a host needs to know
+ * which one is fitted before it can turn a raw reading into kPa: three of them
+ * need their factory trim coefficients, and the fourth needs none because it
+ * compensates on-chip.
+ *
+ * The firmware answers that question in-band. `GET_PRESSURE_CALIBRATION_COEFFICIENTS`
+ * (0xA7) replies `[0xA6][1 + n][sensorId][coeffs × n]`, where the length byte
+ * counts the id (`log-and-stream-common/Comms/shimmer_bt_uart.c:2064-2099`, ids
+ * at `Comms/shimmer_bt_uart.h:297-300`). A BMP581 answers with the id and
+ * nothing else, which is a success rather than a refusal — the firmware's own
+ * comment says the id is sent in-band precisely so a host can tell it from an
+ * older firmware's NACK.
+ */
+/** Which Bosch part is fitted. */
+type PressureSensorKind = 'bmp180' | 'bmp280' | 'bmp390' | 'bmp581';
+/**
+ * `sensorId` byte in a `PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE`.
+ * `Comms/shimmer_bt_uart.h:297-300`.
+ */
+declare const PRESSURE_SENSOR_ID: Readonly<Record<number, PressureSensorKind>>;
+/** Inverse of {@link PRESSURE_SENSOR_ID}. */
+declare const PRESSURE_SENSOR_ID_BY_KIND: Readonly<Record<PressureSensorKind, number>>;
+/**
+ * Coefficient bytes each part sends after the id byte.
+ *
+ * BMP180 22 and BMP280 24 (`Shimmer_Driver/BMP280_driver/bmp280.h:693,740`),
+ * BMP390 21 (`BMP3_LEN_CALIB_DATA`, `Shimmer_Driver/BMP3/hal_bmp3.h:16`),
+ * BMP581 **zero** — it streams pre-compensated values.
+ */
+declare const PRESSURE_COEFFICIENT_BYTES: Readonly<Record<PressureSensorKind, number>>;
+/**
+ * Largest payload a 0xA6 response can carry, after the length byte: the id plus
+ * the biggest coefficient block (BMP280's 24). Used to bound the framer so a
+ * corrupt length cannot make a reader wait for bytes that will never come.
+ */
+declare const PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD: number;
+/** BMP180 trim coefficients (BST-BMP180-DS000 §3.4). */
+interface Bmp180Coefficients {
+    ac1: number;
+    ac2: number;
+    ac3: number;
+    ac4: number;
+    ac5: number;
+    ac6: number;
+    b1: number;
+    b2: number;
+    mb: number;
+    mc: number;
+    md: number;
+}
+/** BMP280 trim coefficients (BST-BMP280-DS001 §3.11.2). */
+interface Bmp280Coefficients {
+    digT1: number;
+    digT2: number;
+    digT3: number;
+    digP1: number;
+    digP2: number;
+    digP3: number;
+    digP4: number;
+    digP5: number;
+    digP6: number;
+    digP7: number;
+    digP8: number;
+    digP9: number;
+}
+/**
+ * BMP390 coefficients, already quantized — i.e. each register value divided by
+ * its scale factor, the form Bosch's floating-point compensation consumes
+ * directly (`BMP3_SensorAPI/bmp3.c` `parse_calib_data`).
+ */
+interface Bmp390Coefficients {
+    parT1: number;
+    parT2: number;
+    parT3: number;
+    parP1: number;
+    parP2: number;
+    parP3: number;
+    parP4: number;
+    parP5: number;
+    parP6: number;
+    parP7: number;
+    parP8: number;
+    parP9: number;
+    parP10: number;
+    parP11: number;
+}
+/** Coefficients for whichever part is fitted; `null` for a BMP581. */
+type PressureCoefficients = Bmp180Coefficients | Bmp280Coefficients | Bmp390Coefficients | null;
+/** What {@link parsePressureCalibrationResponse} hands back. */
+interface PressureCalibration {
+    /** Which part answered. */
+    sensor: PressureSensorKind;
+    /**
+     * Parsed coefficients, or `null` when the part needs none (BMP581) **or**
+     * when the block it sent was blank — all `0x00`, all `0xFF`, or the `0x01`
+     * filler a Shimmer3 sends for the wrong legacy command (see
+     * {@link parsePressureCalibrationResponse}).
+     */
+    coefficients: PressureCoefficients;
+    /**
+     * True when this SDK can convert this part's raw readings to kPa and °C.
+     * A BMP581 is `true` with no coefficients; a BMP390 whose block was blank is
+     * `false`, because a compensation run against zeros is not a measurement.
+     */
+    calibrated: boolean;
+    /** The coefficient bytes exactly as received, for a host that wants them. */
+    raw: Uint8Array;
+}
+/** Compensated output, in the units this SDK emits. */
+interface CompensatedPressure {
+    /** Pressure in kilopascals. */
+    pressureKPa: number;
+    /** Temperature in degrees Celsius. */
+    temperatureC: number;
+}
+
+/**
+ * Kinematic (accel/gyro/mag) calibration math and the 21-byte calibration
+ * parameter block codec.
+ *
+ * Pure, dependency-free port of the Shimmer Java driver:
+ *   com.shimmerresearch.driver.calibration.CalibDetailsKinematic
+ *     (parseCalParamByteArray / generateCalParamByteArray / scale factors)
+ *   com.shimmerresearch.driver.calibration.UtilCalibration
+ *     (calibrateInertialSensorData / matrixInverse3x3 — the efficient method)
+ *
+ * Calibration equation (Ferraris, Grimaldi & Parvis 1995), UtilCalibration §14-23:
+ *
+ *     C = R⁻¹ · K⁻¹ · (U − B)
+ *
+ * where C = calibrated vector, U = uncalibrated (raw) vector, B = offset,
+ * R = alignment matrix, K = diagonal sensitivity matrix. The driver's
+ * "efficient method" precomputes M = inv(R)·inv(K) once per calibration set and
+ * then evaluates C = M · (U − B) per sample — this module does the same.
+ */
+/** A parsed/instantiated kinematic calibration set with precomputed matrix M. */
+interface KinematicCalibration {
+    /** Offset vector B (raw ADC counts), per axis. */
+    offset: [number, number, number];
+    /** Diagonal sensitivity K (counts per physical unit), per axis. */
+    sensitivity: [number, number, number];
+    /** Alignment matrix R, row-major 3x3 (length 9). */
+    alignment: number[];
+    /**
+     * Precomputed M = inv(R)·inv(K), row-major 3x3 (length 9). Applied as
+     * C = M·(U − B) by {@link calibrateVector3}.
+     */
+    m: number[];
+}
+/**
+ * Invert a 3x3 matrix (row-major, length 9) via the adjugate/determinant.
+ * Ported verbatim from UtilCalibration.matrixInverse3x3 (:133-162). Returns
+ * `null` when the matrix is singular (determinant 0).
+ */
+declare function matrixInverse3x3(m: readonly number[]): number[] | null;
+/** Multiply two 3x3 row-major matrices (length 9 each). */
+declare function matrixMultiply3x3(x: readonly number[], y: readonly number[]): number[];
+/**
+ * Build a {@link KinematicCalibration} from offset/sensitivity/alignment,
+ * precomputing M = inv(alignment)·inv(diag(sensitivity)) exactly as the Java
+ * efficient path does (UtilCalibration.calibrateInertialSensorData :78 with
+ * CalibArraysKinematic's cached matrixMultiplication(inv(AM), inv(SM))).
+ *
+ * A singular alignment or a zero sensitivity axis falls back to an identity M
+ * component so calibration never throws — matching the driver's tolerance of a
+ * degenerate default (it would emit NaN there rather than crash).
+ */
+declare function makeKinematicCalibration(offset: readonly [number, number, number], sensitivity: readonly [number, number, number], alignment: readonly number[]): KinematicCalibration;
+/**
+ * Apply a calibration set to one raw tri-axial sample:
+ *
+ *     C = M · (U − B)
+ *
+ * with M = inv(R)·inv(K) precomputed in {@link KinematicCalibration.m}.
+ */
+declare function calibrateVector3(raw: readonly [number, number, number], cal: KinematicCalibration): [number, number, number];
+/** Options for {@link parseKinematicCalibBlock}. */
+interface ParseKinematicOptions {
+    /**
+     * Sensitivity scale factor (CALIBRATION_SCALE_FACTOR). The stored sensitivity
+     * i16s are divided by this. 100 for gyro (CalibDetailsKinematic gyro sets
+     * mSensitivityScaleFactor = ONE_HUNDRED), 1 for accel/mag. Alignment is always
+     * divided by 100; offset is never scaled.
+     */
+    sensitivityScale?: number;
+}
+/**
+ * Parse a 21-byte kinematic calibration parameter block.
+ *
+ * Layout (CalibDetailsKinematic.parseCalParamByteArray :250-280, decoded with
+ * UtilParseData.formatDataPacketReverse which is BIG-ENDIAN):
+ *   bytes 0..5   : 3 × i16 big-endian offset  (x, y, z)
+ *   bytes 6..11  : 3 × i16 big-endian sensitivity (x, y, z), ÷ sensitivityScale
+ *   bytes 12..20 : 9 × i8 alignment, row-major, ÷ 100
+ *
+ * An all-0xFF or all-0x00 block means "no calibration stored"
+ * (UtilShimmer.isAllFF / isAllZeros) and yields `null` so the caller keeps its
+ * default.
+ */
+declare function parseKinematicCalibBlock(bytes: Uint8Array, opts?: ParseKinematicOptions): KinematicCalibration | null;
+/**
+ * Serialize offset/sensitivity/alignment back into a 21-byte block, inverse of
+ * {@link parseKinematicCalibBlock}. Ported from
+ * CalibDetailsKinematic.generateCalParamByteArray (:292-327): sensitivity is
+ * rounded after ×sensitivityScale, alignment rounded after ×100, offset stored
+ * as-is; all as big-endian i16 (offset, sensitivity) and i8 (alignment).
+ *
+ * Java truncates the offset with an `(int)` cast (`(int)offsetVector[i][0]`),
+ * NOT Math.round — a fractional offset drops its fractional part toward zero.
+ * We use Math.trunc to match that oracle behaviour exactly. Sensitivity and
+ * alignment are Math.round'd before their `(int)` cast in Java, so they keep
+ * Math.round here.
+ */
+declare function generateKinematicCalibBlock(offset: readonly [number, number, number], sensitivity: readonly [number, number, number], alignment: readonly number[], opts?: ParseKinematicOptions): Uint8Array;
+
+/**
+ * Hard-coded default kinematic calibration matrices, ported from the Shimmer
+ * Java driver's per-sensor default constants. These are the already-scaled real
+ * values (e.g. gyro sensitivity 131, not 13100) the driver instantiates each
+ * CalibDetailsKinematic with when no per-device calibration is available.
+ *
+ * Sources (all READ-ONLY oracle):
+ *   Shimmer3 low-noise accel  : SensorKionixKXRB52042 (:38-55)
+ *   Shimmer3 wide-range accel + mag (old IMU) : SensorLSM303DLHC (:79-183, :325-358)
+ *   Shimmer3 wide-range accel + mag (new IMU) : SensorLSM303AH (:41-89, :174-206)
+ *   Shimmer3 gyro (MPU9x50)   : SensorMPU9X50 (:121-158, gyro scale ×100)
+ *   Shimmer3R LN accel + gyro : SensorLSM6DSV (:53-165, gyro scale ×100)
+ *   Shimmer3R WR accel        : SensorLIS2DW12 (:124-160)
+ *   Shimmer3R mag             : SensorLIS2MDL (:58-66)
+ *   Shimmer3R alt (high-g)    : SensorADXL371 (:113-124)
+ *   Shimmer3R alt mag         : SensorLIS3MDL (:59-89)
+ *
+ * NB: alignment matrices below are written row-major; the values are the true
+ * ±1/0 alignment entries (the driver stores them ×100 on the wire — see
+ * generateKinematicCalibBlock — but keeps the real values in these constants).
+ */
+
+/** IMU sensor family selected from HW version + new-IMU detection. */
+type ImuFamily = 'shimmer3-old' | 'shimmer3-new' | 'shimmer3r';
+/** Inertial channel group. */
+type InertialGroup = 'lnAccel' | 'wrAccel' | 'gyro' | 'mag' | 'altAccel' | 'altMag';
+/**
+ * Emitted unit strings — exact Java strings (Configuration.java :162-164).
+ *
+ * Kept as its own name because callers index it by channel group; the strings
+ * themselves come from {@link CHANNEL_UNITS}, which is the whole vocabulary.
+ */
+declare const INERTIAL_UNITS: Readonly<{
+    readonly accel: "m/(s^2)";
+    readonly gyro: "deg/s";
+    readonly mag: "local_flux";
+}>;
+/** Default calibration info for one channel group of one family. */
+interface GroupDefaults {
+    /** Emitted unit string. */
+    unit: string;
+    /** Sensitivity scale factor for parsing a device block of this group (gyro=100). */
+    sensitivityScale: number;
+    /** Default calibration keyed by hardware range value. */
+    byRange: Readonly<Record<number, KinematicCalibration>>;
+    /** Range value to fall back to when the active range is unknown/unmapped. */
+    fallbackRange: number;
+}
+/** Return the default group table for a family, or null if the group is absent. */
+declare function getGroupDefaults(family: ImuFamily, group: InertialGroup): GroupDefaults | null;
+/**
+ * Select the default {@link KinematicCalibration} for a family/group/range.
+ * Falls back to the group's `fallbackRange` when the range value has no entry.
+ * Returns `null` when the family has no such group.
+ */
+declare function getDefaultCalibration(family: ImuFamily, group: InertialGroup, range: number): {
+    calibration: KinematicCalibration;
+    unit: string;
+    sensitivityScale: number;
+} | null;
+
+/**
+ * Streaming-path inertial calibration.
+ *
+ * Applies kinematic calibration to the inertial channels of a decoded
+ * {@link ObjectCluster}, adding a `'cal'` field per axis (unit m/(s^2) | deg/s |
+ * local_flux) alongside the existing `'raw'` field — exactly how the streaming
+ * clients already emit GSR (raw + calibrated). Calibration is chosen per group:
+ * a device calibration fetched via `readCalibration()` (source-priority ladder)
+ * wins, otherwise the range-selected default is used.
+ */
+
+/** Per-group hardware ranges tracked by a streaming client. */
+interface StreamingImuRanges {
+    lnAccel: number;
+    wrAccel: number;
+    gyro: number;
+    mag: number;
+    altAccel: number;
+    altMag: number;
+}
+
+/**
+ * Per-channel streaming calibration: one registry, both clients.
+ *
+ * Every channel a Shimmer3 or Shimmer3R can stream gets a calibrated value
+ * with a unit here, so a host can plot and record engineering units for all of
+ * them rather than for the inertial triples and GSR alone.
+ *
+ * **What the device calibrates, and what it does not.** Only the kinematic
+ * sensors carry per-device calibration: the firmware seeds exactly those
+ * (`Calibration/shimmer_calibration.c` `ShimCalib_defaultAll`) and
+ * `ShimCalib_findLength` answers zero for every other sensor id. Battery, the
+ * ADC lines, PPG, GSR, the bridge amplifier and both ExG chips have no stored
+ * parameters at all — a host converts them with fixed formulas, and this module
+ * is that. Pressure sits between the two: nothing per-device is stored, but the
+ * part's own factory trim has to be fetched once
+ * (`Shimmer3RClient.readPressureCalibration()`).
+ *
+ * **The ADC reference is 3.0 V at 12 bits, on both generations.** On a
+ * Shimmer3R every analog path right-aligns a 12-bit result and converts against
+ * `VREF_EXTERNAL_SUPPLY_MV` = 3000: the ADS7028 packer masks with `0x0FFF`
+ * (`Core/Src/spi.c:1415-1419`), the driver's own conversion is
+ * `adcValue * 3000 / 4095`
+ * (`Shimmer_Driver/ADS7028_38/hal_ads7028_38.c:614`), and the STM32's ADC runs
+ * at `ADC_RESOLUTION_12B`. The Java driver's `u14` type string for these
+ * channels describes no shipping firmware path — the only 14-bit resolution in
+ * the platform code is under `SHIMMER4_SDK` — so dividing by 16383 would report
+ * values four times too small.
+ */
+
+/** ADC reference, in volts. `Shimmer_Driver/hal_Board.h` `VREF_EXTERNAL_SUPPLY_MV`. */
+declare const ADC_VREF_VOLTS = 3;
+/** ADC resolution in bits, both generations. */
+declare const ADC_BITS = 12;
+/**
+ * The battery input's resistive divider.
+ *
+ * The firmware's own conversions are `((raw * 3000) >> 12) * 2` on Shimmer3 and
+ * `raw * 3000 / 4095 * 2` on Shimmer3R (`Shimmer_Driver/hal_adc.c`,
+ * `saveBatteryVoltageAndUpdateStatus`), and the Java driver's live path also
+ * doubles (`ShimmerObject.java:1343`). Java's `SensorBattVoltage` class instead
+ * carries 1.988; the firmware's figure wins, and the two differ by 0.6%.
+ */
+declare const BATTERY_DIVIDER_RATIO = 2;
+/** Everything {@link calibrateStreamFrame} needs from the client. */
+interface StreamCalibrationState {
+    /** Which generation's channel names this frame carries. */
+    generation: ShimmerGeneration;
+    /** Which IMU family's default calibrations apply. */
+    family: ImuFamily;
+    /** The configured hardware range per inertial group. */
+    ranges: StreamingImuRanges;
+    /** Per-device kinematic calibration, where the host has read any. */
+    device?: Partial<Record<InertialGroup, KinematicCalibration>>;
+    /** Whether to calibrate the inertial groups at all. */
+    emitInertial: boolean;
+    /** The configured GSR range: 0-3 fixed, 4 auto. */
+    gsrRange: number;
+    /** Both ExG chips' register banks, or `null` when the host has not read them. */
+    exg: ExgBanks | null;
+    /** The fitted pressure part's calibration, or `null` when unread/unavailable. */
+    pressure: PressureCalibration | null;
+    /** Configured pressure oversampling, 0-3. Only the BMP180 uses it. */
+    pressureOversampling: number;
+}
+interface ScalarCalibrator {
+    unit: string;
+    calibrate(raw: number, state: StreamCalibrationState): number;
+}
+/**
+ * Every channel whose calibration is a function of one raw value, keyed by the
+ * name the stream decoder emits.
+ *
+ * Both generations' names appear: the ADC block's ids are reused with different
+ * meanings on the two platforms (`EXT_EXP_ADC_A7` on a Shimmer3 is `EXT_ADC_0`
+ * on a Shimmer3R), and the numbers are identical either way, so a name-keyed
+ * table serves both without a generation branch.
+ *
+ * Absent by design: the six inertial triples and GSR (whole-group
+ * calibrations, below), `PRESSURE`/`TEMPERATURE` (a pair, and needing the
+ * fetched coefficients), and `TIMESTAMP` (a clock, handled by the client).
+ */
+declare const SCALAR_CALIBRATORS: Readonly<Record<string, ScalarCalibrator>>;
+/**
+ * `'Timestamp_Unix'` — Unix milliseconds per sample.
+ *
+ * Only present when the client's timeline has an anchor. The name is the one
+ * Consensys writes into its own exports, so a recording from either tool
+ * describes wall-clock time under the same header.
+ */
+declare const UNIX_TIMESTAMP_NAME = "Timestamp_Unix";
+/** `'PRESSURE'`, in kPa once compensated. */
+declare const PRESSURE_NAME = "PRESSURE";
+/** `'TEMPERATURE'`, in °C once compensated. */
+declare const TEMPERATURE_NAME = "TEMPERATURE";
+/**
+ * Add a calibrated (`'cal'`) field, with a unit, for every channel in `oc` this
+ * SDK can convert.
+ *
+ * Purely additive: the raw fields are left exactly as the decoder wrote them,
+ * so a host can plot either and a CSV can carry both. A channel this SDK has no
+ * conversion for keeps its raw field alone rather than gaining a `'cal'` field
+ * that is the same number — which would claim a calibration that does not
+ * exist.
+ */
+declare function calibrateStreamFrame(oc: ObjectCluster, state: StreamCalibrationState): void;
+/** Where an inertial group's calibration came from. */
+type StreamCalibrationSource = 'radio-dump' | 'bt-command' | 'default';
+/** Where the ExG conversion's gain and reference came from. */
+type ExgCalibrationSource = 'device' | 'infomem' | 'default';
+/**
+ * What a client is calibrating each streamed channel against.
+ *
+ * Field names follow `SdLogChannelCalibrationInfo` so a host can report the
+ * provenance of live and logged data the same way.
+ */
+interface StreamCalibrationInfo {
+    /** Per inertial group: the configured range, and whose numbers are in force. */
+    inertial: Partial<Record<InertialGroup, {
+        range: number;
+        source: StreamCalibrationSource;
+        usingDefaultCalibration: boolean;
+        unit: string;
+    }>>;
+    gsr: {
+        range: number;
+    };
+    exg: {
+        source: ExgCalibrationSource;
+        chip1: {
+            vrefVolts: number;
+            gainCh1: number;
+            gainCh2: number;
+        };
+        chip2: {
+            vrefVolts: number;
+            gainCh1: number;
+            gainCh2: number;
+        };
+    };
+    pressure: {
+        /** The fitted part, or `null` when the host has not asked. */
+        sensor: string | null;
+        /** Whether PRESSURE/TEMPERATURE are being converted at all. */
+        calibrated: boolean;
+        oversampling: number;
+    };
+    adc: {
+        vrefVolts: number;
+        bits: number;
+    };
+}
+
+/**
+ * BMP180 — coefficient parsing and Bosch's integer compensation, in floating
+ * point.
+ *
+ * Ported from the Java driver's `CalibDetailsBmp180.parseCalParamByteArray`
+ * (:44-66) and `calibratePressureSensorData` (:93-124), which is itself the
+ * datasheet's algorithm (BST-BMP180-DS000 §3.5) with the integer divisions left
+ * as real divisions. The firmware does not implement any of this: it relays the
+ * chip's trim registers and its raw readings untouched.
+ *
+ * The oversampling setting is part of the pressure maths, not a scale applied
+ * afterwards — it appears twice, as `1 << oss` and `50000 >> oss` — which is why
+ * {@link compensateBmp180} takes it as an argument rather than letting a caller
+ * pre-scale.
+ */
+
+/**
+ * Parse the 22-byte BMP180 trim block.
+ *
+ * Byte order is **big-endian per coefficient** — byte 0 is the MSB of `AC1`.
+ * `AC4`, `AC5` and `AC6` are unsigned; the other eight are signed.
+ *
+ * @returns the coefficients, or `null` when the block carries nothing (see
+ *   {@link parsePressureCalibrationResponse} for which fill patterns count).
+ */
+declare function parseBmp180Coefficients(bytes: Uint8Array): Bmp180Coefficients | null;
+/**
+ * Compensate one BMP180 sample.
+ *
+ * @param rawPressure    The 24-bit `BMP_PRESSURE` channel value, **unshifted**.
+ *   The chip left-aligns its result by `8 - oss` bits and the datasheet's `UP`
+ *   is the right-aligned value, so this function performs that shift itself
+ *   (Java does it one layer up, `SensorBMP180.java:509`).
+ * @param rawTemperature The 16-bit `BMP_TEMPERATURE` channel value.
+ * @param c              Trim coefficients from {@link parseBmp180Coefficients}.
+ * @param oversampling   The configured oversampling setting, 0-3.
+ */
+declare function compensateBmp180(rawPressure: number, rawTemperature: number, c: Bmp180Coefficients, oversampling: number): CompensatedPressure;
+
+/**
+ * BMP280 — coefficient parsing and Bosch's floating-point compensation.
+ *
+ * Ported from the Java driver's `CalibDetailsBmp280.parseCalParamByteArray`
+ * (:56-81) and `calibratePressureSensorData` (:117-146), which is the
+ * datasheet's `bmp280_compensate_T_double` / `_P_double` (BST-BMP280-DS001
+ * §8.2).
+ *
+ * The raw shifts are the part that catches people. The datasheet's `adc_T` and
+ * `adc_P` are **20-bit** values, but the Shimmer3 packet carries temperature in
+ * 2 bytes and pressure in 3 — the chip's XLSB register never reaches the host.
+ * So temperature has to be shifted up by 4 and pressure down by 4 before the
+ * algorithm sees them, which is what `SensorBMP280.java:414-415` does and what
+ * {@link compensateBmp280} does here.
+ */
+
+/**
+ * Parse the 24-byte BMP280 trim block.
+ *
+ * Byte order is **little-endian per coefficient**, the opposite of BMP180's
+ * block. `digT1` and `digP1` are unsigned; the other ten are signed.
+ */
+declare function parseBmp280Coefficients(bytes: Uint8Array): Bmp280Coefficients | null;
+/**
+ * Compensate one BMP280 sample.
+ *
+ * @param rawPressure    The 24-bit `BMP_PRESSURE` channel value, unshifted.
+ * @param rawTemperature The 16-bit `BMP_TEMPERATURE` channel value, unshifted.
+ * @param c              Trim coefficients from {@link parseBmp280Coefficients}.
+ */
+declare function compensateBmp280(rawPressure: number, rawTemperature: number, c: Bmp280Coefficients): CompensatedPressure;
+
+/**
+ * BMP390 — coefficient parsing and Bosch's floating-point compensation.
+ *
+ * Ported from the Bosch Sensor API bundled with the firmware
+ * (`Shimmer_Driver/BMP3/BMP3_SensorAPI/bmp3.c`: `parse_calib_data` :2371-2425,
+ * and the `BMP3_FLOAT_COMPENSATION` arms of `compensate_temperature` /
+ * `compensate_pressure`), cross-checked against the Java driver's
+ * `CalibDetailsBmp390` (:109-268), which is the same algorithm.
+ *
+ * **Two coefficient types follow Bosch rather than Java.** Java reads `par_T1`
+ * and `par_T2` through `(short)`, i.e. signed
+ * (`CalibDetailsBmp390.java:210,214`), where Bosch declares both `uint16_t`
+ * (`bmp3_defs.h:566-567`). A real `par_T1` is well above 32767 — it is a
+ * scaled-up reference temperature — so the Java cast turns it negative and the
+ * reported temperature is wrong by hundreds of degrees. This port uses the
+ * Bosch types.
+ *
+ * The clamps are Bosch's too: −40…85 °C and 30…125 kPa
+ * (`bmp3_defs.h:318-325`). They are wide enough that hitting one means the
+ * input was not a real reading.
+ */
+
+/**
+ * Parse the 21-byte BMP390 trim block into Bosch's quantized form — each
+ * register value already divided by its scale factor, which is what
+ * {@link compensateBmp390} consumes.
+ *
+ * Byte order is little-endian per coefficient.
+ */
+declare function parseBmp390Coefficients(bytes: Uint8Array): Bmp390Coefficients | null;
+/**
+ * Compensate one BMP390 sample.
+ *
+ * Both raw values are the 24-bit channel values as streamed; the BMP390 needs
+ * no pre-shift, unlike the BMP180 and BMP280.
+ */
+declare function compensateBmp390(rawPressure: number, rawTemperature: number, c: Bmp390Coefficients): CompensatedPressure;
+
+/**
+ * BMP581 — no coefficients, two fixed scale factors.
+ *
+ * The BMP581 compensates on-chip, so the firmware relays its output registers
+ * verbatim and there is nothing per-device to read: the 0xA7 reply carries the
+ * sensor id and no coefficient bytes at all
+ * (`log-and-stream-common/Comms/shimmer_bt_uart.c:2067-2077`).
+ *
+ * Scale factors and signedness are the Bosch driver's
+ * (`Shimmer_Driver/BMP5/BMP5_SensorAPI/bmp5.c:682-720`): pressure is an
+ * **unsigned** 24-bit value over 64 for pascals, temperature a **signed**
+ * 24-bit value over 65536 for degrees Celsius. The Java driver agrees
+ * (`CalibDetailsBmp581.java:26-31`).
+ */
+
+/**
+ * Scale one BMP581 sample.
+ *
+ * @param rawPressure    Unsigned 24-bit pressure register value.
+ * @param rawTemperature 24-bit temperature register value, two's complement.
+ */
+declare function compensateBmp581(rawPressure: number, rawTemperature: number): CompensatedPressure;
+
+/**
+ * `PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE` (0xA6) payload parsing.
+ */
+
+/**
+ * Parse a 0xA6 payload — `[sensorId][coeffs…]`, i.e. everything after the
+ * opcode and its length byte.
+ *
+ * @throws RangeError when the payload is empty, the sensor id is not one of the
+ *   four the firmware can report, or the block is not the length that part
+ *   sends. All three mean the bytes are not what they claim to be, and a
+ *   silently accepted short block would be compensated against whatever
+ *   followed it in memory.
+ */
+declare function parsePressureCalibrationResponse(payload: Uint8Array): PressureCalibration;
+
+/**
+ * One entry point for "turn these two raw channel values into kPa and °C".
+ */
+
+/**
+ * Compensate one pressure/temperature pair.
+ *
+ * @param calibration  What {@link parsePressureCalibrationResponse} returned,
+ *   or `null` when the host never read it (or the firmware refused).
+ * @param rawPressure    The `PRESSURE` channel value for this frame.
+ * @param rawTemperature The `TEMPERATURE` channel value for this frame.
+ * @param oversampling   The configured pressure oversampling, 0-3. Only the
+ *   BMP180 uses it; the others ignore it.
+ * @returns the compensated pair, or `null` when there is nothing to compensate
+ *   with — no calibration read, a blank coefficient block, or a part whose
+ *   coefficients this SDK could not parse. `null` is the honest answer and
+ *   callers treat it as one: the channels stay raw-only for that frame rather
+ *   than carrying a number derived from zeros.
+ */
+declare function compensatePressure(calibration: PressureCalibration | null, rawPressure: number, rawTemperature: number, oversampling?: number): CompensatedPressure | null;
 
 /**
  * Decoded STATUS_RESPONSE payload: what the sensor is doing right now.
@@ -3577,6 +4493,12 @@ interface Shimmer3InquiryResult {
     accelRange: number;
     gyroRange: number;
     magRange: number;
+    /**
+     * BMP180/BMP280 oversampling, 0-3 — ConfigSetupByte3 bits 4-5, i.e. bits
+     * 28-29 of the config word. Part of the pressure compensation rather than a
+     * scale applied to its result, so a host converting PRESSURE needs it.
+     */
+    pressureResolution: number;
     numChannels: number;
     bufferSize: number;
     channelIds: number[];
@@ -3735,161 +4657,6 @@ declare const RESYNC$1 = 0;
 declare function shimmer3ControlMessageLength(buf: Uint8Array): number;
 
 /**
- * Kinematic (accel/gyro/mag) calibration math and the 21-byte calibration
- * parameter block codec.
- *
- * Pure, dependency-free port of the Shimmer Java driver:
- *   com.shimmerresearch.driver.calibration.CalibDetailsKinematic
- *     (parseCalParamByteArray / generateCalParamByteArray / scale factors)
- *   com.shimmerresearch.driver.calibration.UtilCalibration
- *     (calibrateInertialSensorData / matrixInverse3x3 — the efficient method)
- *
- * Calibration equation (Ferraris, Grimaldi & Parvis 1995), UtilCalibration §14-23:
- *
- *     C = R⁻¹ · K⁻¹ · (U − B)
- *
- * where C = calibrated vector, U = uncalibrated (raw) vector, B = offset,
- * R = alignment matrix, K = diagonal sensitivity matrix. The driver's
- * "efficient method" precomputes M = inv(R)·inv(K) once per calibration set and
- * then evaluates C = M · (U − B) per sample — this module does the same.
- */
-/** A parsed/instantiated kinematic calibration set with precomputed matrix M. */
-interface KinematicCalibration {
-    /** Offset vector B (raw ADC counts), per axis. */
-    offset: [number, number, number];
-    /** Diagonal sensitivity K (counts per physical unit), per axis. */
-    sensitivity: [number, number, number];
-    /** Alignment matrix R, row-major 3x3 (length 9). */
-    alignment: number[];
-    /**
-     * Precomputed M = inv(R)·inv(K), row-major 3x3 (length 9). Applied as
-     * C = M·(U − B) by {@link calibrateVector3}.
-     */
-    m: number[];
-}
-/**
- * Invert a 3x3 matrix (row-major, length 9) via the adjugate/determinant.
- * Ported verbatim from UtilCalibration.matrixInverse3x3 (:133-162). Returns
- * `null` when the matrix is singular (determinant 0).
- */
-declare function matrixInverse3x3(m: readonly number[]): number[] | null;
-/** Multiply two 3x3 row-major matrices (length 9 each). */
-declare function matrixMultiply3x3(x: readonly number[], y: readonly number[]): number[];
-/**
- * Build a {@link KinematicCalibration} from offset/sensitivity/alignment,
- * precomputing M = inv(alignment)·inv(diag(sensitivity)) exactly as the Java
- * efficient path does (UtilCalibration.calibrateInertialSensorData :78 with
- * CalibArraysKinematic's cached matrixMultiplication(inv(AM), inv(SM))).
- *
- * A singular alignment or a zero sensitivity axis falls back to an identity M
- * component so calibration never throws — matching the driver's tolerance of a
- * degenerate default (it would emit NaN there rather than crash).
- */
-declare function makeKinematicCalibration(offset: readonly [number, number, number], sensitivity: readonly [number, number, number], alignment: readonly number[]): KinematicCalibration;
-/**
- * Apply a calibration set to one raw tri-axial sample:
- *
- *     C = M · (U − B)
- *
- * with M = inv(R)·inv(K) precomputed in {@link KinematicCalibration.m}.
- */
-declare function calibrateVector3(raw: readonly [number, number, number], cal: KinematicCalibration): [number, number, number];
-/** Options for {@link parseKinematicCalibBlock}. */
-interface ParseKinematicOptions {
-    /**
-     * Sensitivity scale factor (CALIBRATION_SCALE_FACTOR). The stored sensitivity
-     * i16s are divided by this. 100 for gyro (CalibDetailsKinematic gyro sets
-     * mSensitivityScaleFactor = ONE_HUNDRED), 1 for accel/mag. Alignment is always
-     * divided by 100; offset is never scaled.
-     */
-    sensitivityScale?: number;
-}
-/**
- * Parse a 21-byte kinematic calibration parameter block.
- *
- * Layout (CalibDetailsKinematic.parseCalParamByteArray :250-280, decoded with
- * UtilParseData.formatDataPacketReverse which is BIG-ENDIAN):
- *   bytes 0..5   : 3 × i16 big-endian offset  (x, y, z)
- *   bytes 6..11  : 3 × i16 big-endian sensitivity (x, y, z), ÷ sensitivityScale
- *   bytes 12..20 : 9 × i8 alignment, row-major, ÷ 100
- *
- * An all-0xFF or all-0x00 block means "no calibration stored"
- * (UtilShimmer.isAllFF / isAllZeros) and yields `null` so the caller keeps its
- * default.
- */
-declare function parseKinematicCalibBlock(bytes: Uint8Array, opts?: ParseKinematicOptions): KinematicCalibration | null;
-/**
- * Serialize offset/sensitivity/alignment back into a 21-byte block, inverse of
- * {@link parseKinematicCalibBlock}. Ported from
- * CalibDetailsKinematic.generateCalParamByteArray (:292-327): sensitivity is
- * rounded after ×sensitivityScale, alignment rounded after ×100, offset stored
- * as-is; all as big-endian i16 (offset, sensitivity) and i8 (alignment).
- *
- * Java truncates the offset with an `(int)` cast (`(int)offsetVector[i][0]`),
- * NOT Math.round — a fractional offset drops its fractional part toward zero.
- * We use Math.trunc to match that oracle behaviour exactly. Sensitivity and
- * alignment are Math.round'd before their `(int)` cast in Java, so they keep
- * Math.round here.
- */
-declare function generateKinematicCalibBlock(offset: readonly [number, number, number], sensitivity: readonly [number, number, number], alignment: readonly number[], opts?: ParseKinematicOptions): Uint8Array;
-
-/**
- * Hard-coded default kinematic calibration matrices, ported from the Shimmer
- * Java driver's per-sensor default constants. These are the already-scaled real
- * values (e.g. gyro sensitivity 131, not 13100) the driver instantiates each
- * CalibDetailsKinematic with when no per-device calibration is available.
- *
- * Sources (all READ-ONLY oracle):
- *   Shimmer3 low-noise accel  : SensorKionixKXRB52042 (:38-55)
- *   Shimmer3 wide-range accel + mag (old IMU) : SensorLSM303DLHC (:79-183, :325-358)
- *   Shimmer3 wide-range accel + mag (new IMU) : SensorLSM303AH (:41-89, :174-206)
- *   Shimmer3 gyro (MPU9x50)   : SensorMPU9X50 (:121-158, gyro scale ×100)
- *   Shimmer3R LN accel + gyro : SensorLSM6DSV (:53-165, gyro scale ×100)
- *   Shimmer3R WR accel        : SensorLIS2DW12 (:124-160)
- *   Shimmer3R mag             : SensorLIS2MDL (:58-66)
- *   Shimmer3R alt (high-g)    : SensorADXL371 (:113-124)
- *   Shimmer3R alt mag         : SensorLIS3MDL (:59-89)
- *
- * NB: alignment matrices below are written row-major; the values are the true
- * ±1/0 alignment entries (the driver stores them ×100 on the wire — see
- * generateKinematicCalibBlock — but keeps the real values in these constants).
- */
-
-/** IMU sensor family selected from HW version + new-IMU detection. */
-type ImuFamily = 'shimmer3-old' | 'shimmer3-new' | 'shimmer3r';
-/** Inertial channel group. */
-type InertialGroup = 'lnAccel' | 'wrAccel' | 'gyro' | 'mag' | 'altAccel' | 'altMag';
-/** Emitted unit strings — exact Java strings (Configuration.java :162-164). */
-declare const INERTIAL_UNITS: Readonly<{
-    readonly accel: "m/(s^2)";
-    readonly gyro: "deg/s";
-    readonly mag: "local_flux";
-}>;
-/** Default calibration info for one channel group of one family. */
-interface GroupDefaults {
-    /** Emitted unit string. */
-    unit: string;
-    /** Sensitivity scale factor for parsing a device block of this group (gyro=100). */
-    sensitivityScale: number;
-    /** Default calibration keyed by hardware range value. */
-    byRange: Readonly<Record<number, KinematicCalibration>>;
-    /** Range value to fall back to when the active range is unknown/unmapped. */
-    fallbackRange: number;
-}
-/** Return the default group table for a family, or null if the group is absent. */
-declare function getGroupDefaults(family: ImuFamily, group: InertialGroup): GroupDefaults | null;
-/**
- * Select the default {@link KinematicCalibration} for a family/group/range.
- * Falls back to the group's `fallbackRange` when the range value has no entry.
- * Returns `null` when the family has no such group.
- */
-declare function getDefaultCalibration(family: ImuFamily, group: InertialGroup, range: number): {
-    calibration: KinematicCalibration;
-    unit: string;
-    sensitivityScale: number;
-} | null;
-
-/**
  * Calibration-dump (0x9A GET_CALIB_DUMP) wire-format codec and the
  * calibration source-priority ladder.
  *
@@ -3987,27 +4754,6 @@ type CalibReadSource = (typeof CALIB_READ_SOURCE)[keyof typeof CALIB_READ_SOURCE
  * preserves the previous behaviour.
  */
 declare function shouldOverrideCalibration(current: CalibReadSource, incoming: CalibReadSource, currentTimeMs?: number, incomingTimeMs?: number): boolean;
-
-/**
- * Streaming-path inertial calibration.
- *
- * Applies kinematic calibration to the inertial channels of a decoded
- * {@link ObjectCluster}, adding a `'cal'` field per axis (unit m/(s^2) | deg/s |
- * local_flux) alongside the existing `'raw'` field — exactly how the streaming
- * clients already emit GSR (raw + calibrated). Calibration is chosen per group:
- * a device calibration fetched via `readCalibration()` (source-priority ladder)
- * wins, otherwise the range-selected default is used.
- */
-
-/** Per-group hardware ranges tracked by a streaming client. */
-interface StreamingImuRanges {
-    lnAccel: number;
-    wrAccel: number;
-    gyro: number;
-    mag: number;
-    altAccel: number;
-    altMag: number;
-}
 
 /**
  * Public types for the Shimmer3-family InfoMem (configuration-memory) codec.
@@ -5685,10 +6431,63 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /** When false, inertial channels are emitted raw-only (no `'cal'` field). Default true. */
     emitCalibratedInertial: boolean;
     /**
-     * Device calibrations fetched via {@link readCalibration}. These override the
-     * range-selected defaults (calibration source-priority ladder).
+     * The kinematic calibration actually applied to each streamed inertial group:
+     * whichever of the dump and the per-sensor commands won, at the range now
+     * configured. Recomputed by {@link _reselectDeviceCalibrations}; a group
+     * absent here streams against its range-selected default.
      */
     private _deviceCalibrations;
+    /**
+     * Every usable block from the calibration dump, by group and range
+     * ({@link applyCalibDump}). Kept whole rather than flattened because the
+     * configured range changes while a host is connected, and the dump covers
+     * ranges that are not currently selected.
+     */
+    private _dumpCalibrations;
+    /**
+     * Blocks fetched by {@link readCalibration}, with the range each was read at.
+     *
+     * The per-sensor commands answer for the *currently configured* range only
+     * and do not say which that was, so the range in force at read time is
+     * recorded with them. Once a range setter runs, a block read at the old range
+     * no longer describes the sensor and is dropped rather than misapplied.
+     */
+    private _btCommandCalibrations;
+    /**
+     * Both ExG chips' register banks, when a host has read them. The millivolt
+     * conversion needs the PGA gain and the reference voltage out of these; with
+     * `null` the chip defaults are assumed (gain 6, 2.42 V).
+     */
+    private _exgBanks;
+    /** Where {@link _exgBanks} came from, for {@link calibrationInfo}. */
+    private _exgBanksSource;
+    /**
+     * The fitted pressure part and its factory trim
+     * ({@link readPressureCalibration}). Without it PRESSURE and TEMPERATURE
+     * stream raw-only — a Bosch compensation against a blank block returns a
+     * confident, wrong pressure.
+     */
+    private _pressureCalibration;
+    /**
+     * Configured pressure oversampling, 0-3, from the inquiry's config word.
+     * Only the BMP180 uses it, and there it is part of the pressure maths rather
+     * than a scale applied afterwards.
+     */
+    pressureOversampling: number;
+    /**
+     * Unwraps the sample counter and, once anchored, places every sample on a
+     * wall clock. See `core/StreamTimeline.ts`.
+     *
+     * On a Shimmer3R the anchor is exact: the packet timestamp is the low 24 bits
+     * of the same counter `GET_RWC` reads, so one clock reading pins the whole
+     * stream to the tick.
+     */
+    private _timeline;
+    /**
+     * Whether {@link startStreaming} reads the real-world clock first, to place
+     * samples on a wall clock. Default true; one round trip.
+     */
+    anchorStreamClock: boolean;
     /** Minimum valid GSR conductance in µS (below this, connectivity = "Disconnected"). */
     readonly LIMIT_MIN_VALID_USIEMENS = 0.03;
     onInquiry: ((info: ReturnType<Shimmer3RClient['_interpretInquiryResponseShimmer3R']>) => void) | null;
@@ -5765,6 +6564,16 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * reconnect.
      */
     private _resetLinkProtocolState;
+    /**
+     * Forget everything read off the device about how to calibrate it.
+     *
+     * Per link, and in the same place as the rest of the per-link state: a
+     * calibration belongs to the device that answered, and carrying one across a
+     * reconnect would calibrate a different sensor's data with it. The
+     * configured ranges are deliberately NOT reset here — they are refreshed by
+     * the next inquiry, which every connect performs.
+     */
+    private _resetCalibrationState;
     /** Handle an unexpected transport disconnect (the link dropped under us). */
     private _handleTransportDisconnect;
     /**
@@ -5912,6 +6721,50 @@ declare class Shimmer3RClient extends BaseShimmerClient {
         gyroRange: number;
         ackRemainder: Uint8Array | null;
     }>;
+    /**
+     * Set the alternative magnetometer (LIS3MDL) range on a Shimmer3R.
+     *
+     * The command is `SET_MAG_GAIN` (0x37) — the same opcode a Shimmer3 uses for
+     * its own magnetometer range, which the Shimmer3R firmware routes to
+     * `altMagRange` (`Comms/shimmer_bt_uart.c`, the `SET_MAG_GAIN` case). The
+     * setting reads back in the inquiry's ConfigSetupByte2 bits 5-7.
+     *
+     * Worth having for calibration rather than for configuration: the LIS3MDL's
+     * four ranges have sensitivities 6842/3421/2281/1711 LSB/gauss, so streaming
+     * an alt-mag channel against the wrong one is out by up to a factor of four.
+     *
+     * @param range 0 = ±4, 1 = ±8, 2 = ±12, 3 = ±16 gauss.
+     */
+    setAltMagRange(range: number): Promise<{
+        altMagRange: number;
+        ackRemainder: Uint8Array | null;
+    }>;
+    /**
+     * Read the fitted pressure sensor's identity and its factory trim
+     * coefficients, so PRESSURE and TEMPERATURE can be streamed in kPa and °C.
+     *
+     * `GET_PRESSURE_CALIBRATION_COEFFICIENTS` (0xA7) answers
+     * `[0xA6][1 + n][sensorId][coeffs × n]`
+     * (`log-and-stream-common/Comms/shimmer_bt_uart.c:2064-2099`). One round trip,
+     * and the answer cannot change while the link is up — the part is soldered
+     * down — so a host calls this once, on connect.
+     *
+     * **A refusal is not an error.** Firmware older than the command NACKs it, and
+     * older still does not answer at all; either way the honest outcome is that
+     * these two channels stream raw-only, which this reports through
+     * {@link onStatus} and by returning `null`. Throwing would make a host choose
+     * between failing a whole connect over an optional capability and swallowing
+     * every pressure fault alike. A BMP581 answering with its id and no
+     * coefficients is a **success**: it compensates on-chip, and the firmware
+     * sends the id in-band precisely so a host can tell that from a NACK.
+     *
+     * HARDWARE-VERIFY: no real sensor has answered this command through this SDK.
+     * The reply shape is read from the firmware source and pinned by tests
+     * against a scripted device.
+     *
+     * @throws Error only when not connected.
+     */
+    readPressureCalibration(timeoutMs?: number): Promise<PressureCalibration | null>;
     getInternalExpPower(): number;
     getEnabledSensors(): number;
     /**
@@ -6152,6 +7005,24 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * field arrives named rather than as an offset a caller has to know.
      */
     readInfoMemConfig(): Promise<InfoMemDeviceConfig>;
+    /**
+     * Take from a configuration image the few settings the streaming conversion
+     * depends on.
+     *
+     * A side effect on a read, which is worth justifying: without it a host that
+     * reads the image — which every connect does — still converts ExG counts
+     * against the chip's default gain, because the stored banks are the only
+     * statement of it available before a stream starts and `readExgConfig`
+     * cannot run during one. The values are the device's own; nothing here
+     * overrides something a host set more recently, because the image IS what the
+     * host would have set.
+     *
+     * The ExG banks are marked as coming from the image rather than the chip:
+     * the firmware forces some bits at sensing start (`CLK_EN` where the clock
+     * lines are tied), so a bank read back from the chip can differ from the
+     * stored one, and {@link calibrationInfo} says which a host is looking at.
+     */
+    private _adoptConfigForCalibration;
     /**
      * Encode and write a configuration to the device over the radio — the
      * radio-side counterpart of `WiredShimmerClient.writeInfoMemConfig`, with the
@@ -6612,7 +7483,83 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /** True when {@link generation} is this SDK's default rather than the device's answer. */
     get generationIsAssumed(): boolean;
     private _buildSchemaFromChannels;
+    /**
+     * `'Timestamp_Unix'` — Unix milliseconds per sample, when the timeline is
+     * anchored.
+     *
+     * Named for Consensys's own column so a CSV from this SDK and one from the
+     * desktop describe the same thing with the same header.
+     */
+    static readonly UNIX_TIMESTAMP_NAME = "Timestamp_Unix";
+    /**
+     * Get the stream timeline ready, and anchor it if asked.
+     *
+     * Called before a stream starts, which is the right moment for two reasons:
+     * the counter's unwrap has to begin from this stream's first sample, and a
+     * clock reading taken now is as close as a host can get to the data it will
+     * time. One round trip, and a failure is not fatal — the timeline falls back
+     * to the host's own clock, which is what Consensys uses always.
+     */
+    private _prepareStreamTimeline;
+    /** Where the streamed wall-clock times come from, and how well. */
+    get timelineState(): TimelineState;
+    /** The calibration state one decoded frame is converted against. */
+    private _streamCalibrationState;
+    /**
+     * Add a calibrated field, with a unit, for every channel in the frame this
+     * SDK can convert. See `devices/calibration/streamChannels.ts` for the
+     * per-channel table and where each formula comes from.
+     */
     private _calibrateData;
+    /**
+     * Re-pick which stored calibration applies to each inertial group, now.
+     *
+     * Runs whenever the inputs move: an inquiry (which refreshes every range), a
+     * range setter, a dump adoption, or a per-sensor calibration read. The dump
+     * wins over the per-sensor commands where both cover a group, which is the
+     * calibration source-priority ladder's own ordering
+     * (`CALIB_READ_SOURCE`: `RADIO_DUMP` outranks `LEGACY_BT_COMMAND`).
+     *
+     * A block read by the per-sensor commands is dropped once the range moves
+     * away from the one it was read at: those commands answer for the configured
+     * range without saying which it was, so after a range change the block
+     * describes a scale the sensor is no longer using. Falling back to that
+     * range's default is the safer of the two wrong answers, and the only honest
+     * one.
+     */
+    private _reselectDeviceCalibrations;
+    /**
+     * Take the calibration a device just handed over as a dump and use it for
+     * streaming.
+     *
+     * `readCalibDump()` returns the bytes and the parsed records but changes no
+     * client state, because a dump is also the thing a host edits and writes
+     * back — adopting every dump that passed through would mean a host could not
+     * inspect one without changing how its data is calibrated. So adoption is
+     * this separate step, and a host calls it for a dump that came off the
+     * device it is streaming from (not for one loaded from a file, which is a
+     * candidate for writing rather than a statement about this sensor).
+     *
+     * Blocks the dump holds for ranges other than the configured ones are kept,
+     * so a later range change re-selects without another read.
+     *
+     * @returns the groups this dump supplied a usable block for, at any range.
+     */
+    applyCalibDump(dump: CalibDump): InertialGroup[];
+    /** Both ExG chips' register banks as last read, or `null`. */
+    get exgBanks(): ExgBanks | null;
+    /** The fitted pressure part and its trim, or `null` if never read. */
+    get pressureCalibration(): PressureCalibration | null;
+    /**
+     * What every streamed channel is being calibrated against, right now.
+     *
+     * The point of this is provenance rather than the numbers: a host showing
+     * "gyro ±500 dps (radio dump)" against "gyro ±500 dps (default)" is telling
+     * a user whether they are looking at this sensor's own calibration or the
+     * factory seed for its part, and those differ by percent. Computed on
+     * demand — nothing here belongs on a per-frame field, at 1 kHz.
+     */
+    get calibrationInfo(): StreamCalibrationInfo;
     /**
      * Ticks the device clock should advance between consecutive frames, or 0 when
      * the rate is not known (streaming started without an inquiry), in which case
@@ -7138,9 +8085,16 @@ declare function calibrateShimmer3RAdcChannel(unCalData: number): number;
  */
 declare function calibrateGsrDataToResistanceFromAmplifierEq(gsrUncalibratedData: number, range: number): number;
 /**
- * Clamp a GSR resistance value to the physical limits of a given range.
+ * Clamp a GSR resistance value to the physical limits of the range in use.
  *
- * When `gsrRangeSetting === 4` (auto-range) no clamping is applied.
+ * On a **fixed** range both ends are clamped, to that range's window. On
+ * **auto-range** (setting 4) only the lower end is, to the smallest resistance
+ * any range can measure — the circuit cannot report below it whatever range it
+ * switched to, but the upper end depends on which range that was, and the
+ * per-sample range bits have already been used to pick the resistor. This
+ * matches `SensorGSR.nudgeGsrResistance` (:415-421); an earlier version of this
+ * function returned an auto-range value unclamped, which let the amplifier
+ * equation report a few hundred ohms of skin resistance near full scale.
  *
  * @param gsrResistanceKOhms Calibrated resistance in kΩ.
  * @param gsrRangeSetting    Range 0–3 (fixed) or 4 (auto).
@@ -7723,6 +8677,36 @@ declare class Shimmer3Client extends BaseShimmerClient {
     emitCalibratedInertial: boolean;
     private _imuFamily;
     private _deviceCalibrations;
+    /**
+     * Every usable block from a calibration dump, by group and range
+     * ({@link applyCalibDump}).
+     */
+    private _dumpCalibrations;
+    /**
+     * Blocks fetched by {@link readCalibration}, with the range each was read at
+     * — those commands answer for the configured range without saying which, so
+     * a block stops applying once a range moves.
+     */
+    private _btCommandCalibrations;
+    /** Both ExG chips' register banks, when read; `null` assumes chip defaults. */
+    private _exgBanks;
+    /** Where {@link _exgBanks} came from, for {@link calibrationInfo}. */
+    private _exgBanksSource;
+    /** The fitted pressure part and its trim, or `null` when unread. */
+    private _pressureCalibration;
+    /**
+     * Configured pressure oversampling, 0-3, from the inquiry's config word. The
+     * BMP180 and BMP280 a Shimmer3 can carry both use it.
+     */
+    pressureOversampling: number;
+    /**
+     * Unwraps the sample counter and, once anchored, places every sample on a
+     * wall clock. The width follows the firmware: 16 bits — a 2-second wrap — on
+     * anything older than LogAndStream 0.5.4.
+     */
+    private _timeline;
+    /** Whether {@link startStreaming} reads the real-world clock first. */
+    anchorStreamClock: boolean;
     /** Minimum valid GSR conductance in µS (below this, connectivity = "Disconnected"). */
     readonly LIMIT_MIN_VALID_USIEMENS = 0.03;
     onInquiry: ((info: Shimmer3InquiryResult) => void) | null;
@@ -7840,6 +8824,87 @@ declare class Shimmer3Client extends BaseShimmerClient {
         exg1: Uint8Array;
         exg2: Uint8Array;
     }>;
+    /**
+     * True when this firmware serves the real-world-clock commands.
+     *
+     * The Java driver gates its own `readRealTimeClock` on LogAndStream with a
+     * firmware version code of 6 or more (`ShimmerBluetooth.java:2847-2853`), and
+     * this follows it. Older firmware answers nothing at all rather than NACKing,
+     * so asking costs a timeout — worth avoiding when the version already says.
+     */
+    get supportsRealWorldClock(): boolean;
+    /**
+     * Read the device's real-world clock (GET_RWC → RWC_RESPONSE).
+     *
+     * **What a Shimmer3's real-world clock is, and why it is not the stream's
+     * timestamp.** The MSP430's counter cannot be set: it free-runs from boot.
+     * Setting the clock stores an offset instead, and the reply to this command
+     * is `rwcTimeDiff64 + RTC_get64()` — counter plus offset
+     * (`Shimmer_Driver/5xx_HAL/hal_RTC.c:73-76,85`). The offset itself never goes
+     * over Bluetooth, only into an SD-file header. So unlike a Shimmer3R, whose
+     * packet timestamp is the low 24 bits of this very value, a Shimmer3 leaves a
+     * host to estimate where the counter stood when the reply was composed. This
+     * anchors the stream timeline accordingly — `rwc-estimated`, carrying half
+     * the round trip as its uncertainty.
+     *
+     * HARDWARE-VERIFY: no real Shimmer3 has answered this command through this
+     * SDK.
+     *
+     * @throws Error when not connected, while streaming, or when the firmware
+     *   does not serve the command.
+     */
+    getRtcTime(timeoutMs?: 2000): Promise<{
+        ticks: bigint;
+        unixMs: number;
+    }>;
+    /**
+     * Set the device's real-world clock (SET_RWC) to a Unix millisecond time,
+     * encoded as 64-bit little-endian 32768 Hz ticks.
+     *
+     * A plain Unix epoch, as desktop Consensys and the dock driver both write.
+     * The firmware stores it as an offset from its free-running counter, so the
+     * stream's own timestamps do not move — but the mapping from them to wall
+     * time does, which is why any existing anchor is dropped.
+     *
+     * HARDWARE-VERIFY: not exercised against a real Shimmer3.
+     */
+    setRtcTime(unixMs: number): Promise<void>;
+    private _assertRwcSupported;
+    /** Where the streamed wall-clock times come from, and how well. */
+    get timelineState(): TimelineState;
+    /**
+     * Get the stream timeline ready, and anchor it if asked. See
+     * `Shimmer3RClient._prepareStreamTimeline`; a Shimmer3's anchor is always the
+     * estimated kind.
+     */
+    private _prepareStreamTimeline;
+    /**
+     * Read the fitted pressure sensor's identity and factory trim, so PRESSURE and
+     * TEMPERATURE can be streamed in kPa and °C.
+     *
+     * The modern command is `GET_PRESSURE_CALIBRATION_COEFFICIENTS` (0xA7),
+     * answering `[0xA6][1 + n][sensorId][coeffs]`. A classic Shimmer3 running
+     * older LogAndStream firmware serves only the two legacy commands instead —
+     * `0xA0 → 0x9F` (BMP280, 24 bytes) and `0x59 → 0x58` (BMP180, 22 bytes) — and
+     * that firmware has **no NACK at all**, so an unsupported command produces
+     * silence rather than a refusal
+     * (`ccs_workspace/FW_Shimmer3/LogAndStream/main.c`, whose command switch has
+     * no `sendNack`). Both legacy paths are therefore tried after the modern one,
+     * and the part they name is inferred from which answered — with one trap
+     * handled in the parser: asked for BMP180 coefficients on a BMP280 board,
+     * that firmware answers a full-length block of `0x01` filler rather than
+     * declining, and compensating against it would yield a confident, wrong
+     * pressure.
+     *
+     * **A refusal is not an error**: the channels stream raw-only and this
+     * returns `null`, having said so through {@link onStatus}.
+     *
+     * HARDWARE-VERIFY: no real Shimmer3 has answered any of the three commands
+     * through this SDK.
+     *
+     * @throws Error only when not connected.
+     */
+    readPressureCalibration(timeoutMs?: 2000): Promise<PressureCalibration | null>;
     private _readExgChip;
     /**
      * Write both ExG chips' 10-byte register banks (SET_EXG_REGS ×2), then read
@@ -7945,8 +9010,34 @@ declare class Shimmer3Client extends BaseShimmerClient {
      */
     private _drainQuiescent;
     private _parseStream;
-    /** Inline GSR calibration, matching Shimmer3RClient. */
+    /** The calibration state one decoded frame is converted against. */
+    private _streamCalibrationState;
+    /**
+     * Add a calibrated field, with a unit, for every channel this SDK can
+     * convert — the same registry the Shimmer3R client uses
+     * (`devices/calibration/streamChannels.ts`), so the two platforms cannot
+     * drift apart on a formula.
+     */
     private _calibrateData;
+    /** Forget everything read off the device about how to calibrate it. */
+    private _resetCalibrationState;
+    /**
+     * Re-pick which stored calibration applies to each inertial group at the
+     * ranges now configured. See the Shimmer3R client's method of the same name
+     * for why a per-sensor block is dropped once its range moves.
+     */
+    private _reselectDeviceCalibrations;
+    /**
+     * Take a calibration dump this device just produced and use it for streaming.
+     * See `Shimmer3RClient.applyCalibDump`.
+     */
+    applyCalibDump(dump: CalibDump): InertialGroup[];
+    /** Both ExG chips' register banks as last read, or `null`. */
+    get exgBanks(): ExgBanks | null;
+    /** The fitted pressure part and its trim, or `null` if never read. */
+    get pressureCalibration(): PressureCalibration | null;
+    /** What every streamed channel is being calibrated against, right now. */
+    get calibrationInfo(): StreamCalibrationInfo;
     /**
      * Fetch the device's per-sensor kinematic calibration over RFCOMM and upgrade
      * the active streaming calibration (overriding the range-selected defaults).
@@ -8799,6 +9890,422 @@ declare class SmartDockClient extends BaseShimmerClient {
     private _offTemp;
     private _emitTemp;
 }
+
+/**
+ * The unit vocabulary emitted on {@link SensorField.unit}.
+ *
+ * These are the Java driver's exact strings (`Configuration.java:117-176`,
+ * `CHANNEL_UNITS`), and they are exact on purpose: a recording made by this SDK
+ * and one made by Consensys describe the same signal with the same word, so a
+ * script that reads a units row does not have to know which tool wrote the
+ * file. That is also why the long spellings survive here — `'Degrees Celsius'`
+ * rather than `'°C'`, `'m/(s^2)'` rather than `'m/s²'`. A user interface is
+ * free to render something prettier (the demo pages do); the recorded string is
+ * the interchange format, and it stays ASCII so a CSV cannot depend on the
+ * reader's encoding.
+ *
+ * Two entries deviate from Java, both deliberately:
+ *
+ * - `TICKS` is lowercase where Java writes `'Ticks'`. This SDK has emitted
+ *   `'ticks'` on the timestamp channel since the first release, the demo pages
+ *   and their tests hard-code it, and the capitalisation carries no
+ *   information.
+ * - Java has no name for "this value is raw ADC counts". It writes
+ *   `NO_UNITS = 'no_units'` there, and so does this SDK — see {@link NO_UNITS}
+ *   for why a raw field carries that rather than `null`.
+ */
+declare const CHANNEL_UNITS: Readonly<{
+    /**
+     * A value with no unit: raw ADC counts, a range code, a register readback.
+     *
+     * Raw fields carry this string rather than `null` because a units row with an
+     * empty cell reads as "the unit was not recorded", where this reads as "there
+     * is no unit" — and those are different facts about a column. Java makes the
+     * same distinction with the same word.
+     */
+    readonly NO_UNITS: "no_units";
+    /** The 32768 Hz sample counter. Lowercase — see the module docblock. */
+    readonly TICKS: "ticks";
+    /** Milliseconds. Used for a calibrated timestamp and a real-world time. */
+    readonly MILLISECONDS: "ms";
+    readonly MILLIVOLTS: "mV";
+    readonly KOHMS: "kOhms";
+    /** Microsiemens. Java's `U_SIEMENS`; this SDK previously said `'uSiemens'`. */
+    readonly MICRO_SIEMENS: "uS";
+    readonly KPASCAL: "kPa";
+    /** Java's `DEGREES_CELSIUS`, spelled out. */
+    readonly DEGREES_CELSIUS: "Degrees Celsius";
+    /** Java's `DEGREES_CELSIUS_SHORT`. For a UI label, never for a recording. */
+    readonly DEGREES_CELSIUS_SHORT: "°C";
+    readonly PERCENT: "%";
+    /** Acceleration. Java's `METER_PER_SECOND_SQUARE` / `ACCEL_CAL_UNIT`. */
+    readonly ACCEL: "m/(s^2)";
+    /** Angular rate. Java's `DEGREES_PER_SECOND` / `GYRO_CAL_UNIT`. */
+    readonly GYRO: "deg/s";
+    /**
+     * Magnetic flux in the magnetometer's own units. Java's `LOCAL_FLUX` /
+     * `MAG_CAL_UNIT` — the kinematic block's sensitivity is in LSB/Gauss on some
+     * parts and LSB/gauss-equivalent on others, and the driver has never claimed
+     * more precision than "local flux" for the result.
+     */
+    readonly MAG: "local_flux";
+    /** Microtesla. What the Verisense decoders emit for their magnetometer. */
+    readonly MICRO_TESLA: "uT";
+}>;
+/** One of the {@link CHANNEL_UNITS} strings. */
+type ChannelUnit = (typeof CHANNEL_UNITS)[keyof typeof CHANNEL_UNITS];
+
+/**
+ * GSR: one raw ADC word → skin resistance, conductance, and the range that
+ * produced them.
+ *
+ * The maths already lived in `devices/shimmer3r/calibration.ts`; what lived in
+ * three places was the *sequence* around it — mask off the range bits, resolve
+ * auto-range from the sample, apply the range-3 floor, clamp, invert. Both
+ * streaming clients and the SD-log decoder each had their own copy, and they
+ * had begun to drift. This is that sequence, once.
+ *
+ * Ported from `SensorGSR.processDataCustom` (:326-358) and
+ * `nudgeGsrResistance` (:415-421).
+ */
+
+/** `'GSR_RESISTANCE'` — skin resistance in kΩ, Java's `GSR_RESISTANCE`. */
+declare const GSR_RESISTANCE_NAME = "GSR_RESISTANCE";
+/**
+ * `'GSR_RANGE'` — which of the four feedback resistors produced this sample.
+ *
+ * Worth recording rather than inferring: on auto-range the firmware reports it
+ * per sample in the top two bits, it changes mid-recording, and a step in the
+ * conductance trace at a range boundary is a switching artefact rather than a
+ * physiological event (`SHIMMER3_GSR_AUTORANGE.md` §4).
+ */
+declare const GSR_RANGE_NAME = "GSR_RANGE";
+/** What one GSR sample resolves to. */
+interface CalibratedGsr {
+    /** The resistor actually in circuit for this sample, 0-3. */
+    range: number;
+    /** Skin resistance in kΩ, clamped to what the range can measure. */
+    resistanceKOhms: number;
+    /** Skin conductance in µS. */
+    conductanceUSiemens: number;
+}
+/**
+ * Resolve the range for one sample.
+ *
+ * A configured range of 0-3 is used as-is. Range 4 is auto, and then the
+ * firmware puts the resistor it chose in bits 14-15 of the sample itself, so it
+ * has to be read per sample and not once per trial
+ * (`SHIMMER3_STREAMING_DATA_FORMAT.md` §8, rule 7).
+ */
+declare function gsrRangeForSample(rawSample: number, gsrRangeSetting: number): number;
+/**
+ * Calibrate one raw GSR word.
+ *
+ * @param rawSample        The 16-bit `GSR` channel value, range bits included.
+ * @param gsrRangeSetting  The configured range: 0-3 fixed, 4 auto.
+ */
+declare function calibrateGsrSample(rawSample: number, gsrRangeSetting: number): CalibratedGsr;
+/**
+ * Add the calibrated GSR fields to a decoded frame, if it carries a GSR
+ * channel. No-op otherwise.
+ *
+ * Three fields, because they answer different questions and two of them cannot
+ * be recovered from the third alone: conductance under the channel's own name
+ * (what a host plots, and what this SDK has always emitted there), resistance
+ * because that is what the amplifier measures and what some analyses want, and
+ * the range because on auto-range it changes underneath the data.
+ */
+declare function calibrateGsrChannel(oc: ObjectCluster, gsrRangeSetting: number): void;
+
+/**
+ * Calibration-domain sensor ids, and the mapping from a calibration dump's
+ * records onto this SDK's inertial channel groups.
+ *
+ * The ids are the firmware's own `SC_SENSOR_*`
+ * (`log-and-stream-common/Calibration/shimmer_calibration.h:99-116`). They are
+ * **not** the SDK's Verisense `CalibSensorId`, which disagrees on two values:
+ * there 40 is an LSM6DS3 accelerometer and 41 an LSM6DS3 gyroscope, where
+ * Shimmer3R firmware uses 40 for the ADXL371 high-g accelerometer and 41 for
+ * the LIS3MDL alternative magnetometer. Reading a Shimmer3R dump through the
+ * Verisense table mislabels two of its six sensors, so the two tables stay
+ * separate and this one is named for the firmware it came from.
+ */
+
+/**
+ * `SC_SENSOR_*` from the firmware. The Shimmer3 and Shimmer3R sets are in
+ * mutually exclusive `#if` blocks there; both are listed here because one host
+ * talks to both platforms and a dump carries its own hardware id.
+ */
+declare const SC_SENSOR: Readonly<{
+    readonly ANALOG_ACCEL: 2;
+    readonly MPU9X50_GYRO: 30;
+    readonly LSM303_ACCEL: 31;
+    readonly LSM303_MAG: 32;
+    readonly MPU9X50_ACCEL: 33;
+    readonly MPU9X50_MAG: 34;
+    readonly BMP180_PRESSURE: 36;
+    readonly LSM6DSV_ACCEL: 37;
+    readonly LSM6DSV_GYRO: 38;
+    readonly LIS2DW12_ACCEL: 39;
+    readonly ADXL371_ACCEL: 40;
+    readonly LIS3MDL_MAG: 41;
+    readonly LIS2MDL_MAG: 42;
+    readonly BMP390_PRESSURE: 43;
+    readonly BMP581_PRESSURE: 44;
+    readonly HOST_ECG: 100;
+    readonly ALL: 255;
+}>;
+/** Human-readable name per id, for a log line or a card title. */
+declare const SC_SENSOR_NAMES: Readonly<Record<number, string>>;
+/**
+ * Which `SC_SENSOR_*` id carries each channel group's calibration, per family.
+ *
+ * A Shimmer3 has no high-g accelerometer and no second magnetometer, so those
+ * two groups are absent from both Shimmer3 rows — a dump from one cannot carry
+ * them, and inventing an id would make a lookup succeed against the wrong
+ * record.
+ */
+declare const CALIB_SENSOR_ID_BY_GROUP: Readonly<Record<ImuFamily, Readonly<Partial<Record<InertialGroup, number>>>>>;
+/** The dump sensor id for one group, or `undefined` if that family lacks it. */
+declare function calibSensorIdForGroup(family: ImuFamily, group: InertialGroup): number | undefined;
+/** The group a dump sensor id belongs to, or `null` for one that is not inertial. */
+declare function groupForCalibSensorId(family: ImuFamily, sensorId: number): InertialGroup | null;
+/** Per group, the calibration this dump holds for each range it covers. */
+type DumpCalibrationsByGroup = Partial<Record<InertialGroup, Record<number, KinematicCalibration>>>;
+/**
+ * Pull every usable inertial calibration out of a parsed dump, keyed by group
+ * and then by hardware range.
+ *
+ * Keyed by range rather than flattened to "the current one" because the dump
+ * carries ranges that are not currently selected — that is most of the point of
+ * it — and the selected range changes while a host is connected. A caller keeps
+ * this and re-selects from it whenever a range setter runs.
+ *
+ * Records this SDK cannot use are dropped rather than guessed at: a sensor id
+ * that is not an inertial group (a pressure coefficient block, say), and a
+ * block that holds nothing — all `0xFF` or all `0x00`, which
+ * {@link parseKinematicCalibBlock} answers `null` for. Dropping the latter is
+ * what keeps a factory default in force instead of calibrating against zeros.
+ */
+declare function selectDumpCalibrations(dump: CalibDump, family: ImuFamily): DumpCalibrationsByGroup;
+
+/**
+ * Which sensors can be enabled together, which need the expansion rail, and
+ * which need a particular board.
+ *
+ * A Shimmer3 or Shimmer3R has more sensors than it has ADC inputs, so some
+ * combinations are impossible. The firmware silently corrects a few of them and
+ * says nothing about the rest, which leaves a host in an awkward position: a
+ * configuration it wrote and read back unchanged can still not be the one in
+ * force, and a channel can stream a well-formed packet of nothing.
+ *
+ * This module is the host-side rule set that closes that gap. It is pure — no
+ * transport, no device state — so a configuration editor can consult it against
+ * an image it has not written yet, which is the whole point: telling somebody
+ * before they press Apply beats correcting them afterwards.
+ *
+ * **Two kinds of rule, and the difference matters to a user.**
+ *
+ * `enforcedBy: 'firmware'` means the device will make this change itself at its
+ * next configuration write, whatever the host sends —
+ * `ShimConfig_checkAndCorrectConfig` (`Configuration/shimmer_config.c`, the
+ * GSR/bridge-amp/ExG-versus-internal-ADC block). A host that reports these is
+ * predicting the device, not overruling it.
+ *
+ * `enforcedBy: 'host'` means the firmware will accept the combination and
+ * stream it, and it still cannot work — most often because the two sensors are
+ * on different expansion boards and only one board can be fitted. These come
+ * from the Java driver's `SensorDetailsRef.mListOfSensorIdsConflicting`, which
+ * is what Consensys enforces in its own editor.
+ *
+ * **On required sensors.** There are none in the enabled-bitmap sense.
+ * `mListOfSensorIdsRequired` is declared on every `SensorDetailsRef`
+ * (`driverUtilities/SensorDetailsRef.java:34`) and populated nowhere in the
+ * Java driver, so the code that reads it (`ShimmerDevice.java:2365`,
+ * `:2519-2536`) never does anything. The real dependencies are the expansion
+ * rail (below), the firmware's own skin-temperature and resistance-amplifier
+ * rule — which forces an internal ADC channel on, and concerns derived channels
+ * this SDK does not model — and the algorithm layer, which does not exist here.
+ * Saying so is more use to a host than inventing a requirement.
+ */
+
+/**
+ * A sensor these rules talk about.
+ *
+ * Everything is a {@link SensorBitmapShimmer3} key except `'EXG'`, which stands
+ * for the ExG front end as a whole. The four ExG bits select a chip and a
+ * sample width rather than a sensor, no combination of them is a different
+ * *sensor*, and every conflict applies to all four alike — so a host chooses an
+ * ExG mode and this module talks about that.
+ */
+type SensorRuleKey = SensorBitmapShimmer3Key | 'EXG';
+/** Any ExG bit set means the ExG front end is enabled. */
+declare const EXG_ANY_MASK: number;
+/** The bitmap mask for one rule key; 0 for `'EXG'`, which owns no single bit. */
+declare function sensorRuleMask(key: SensorRuleKey): number;
+interface ConflictPair {
+    a: SensorRuleKey;
+    b: SensorRuleKey;
+    /** True when the firmware corrects this itself at its next config write. */
+    firmware: boolean;
+    /** What the two share, for the message a host shows. */
+    shares: string;
+}
+/** Conflicts for one key, resolved from the symmetric pair table. */
+declare function sensorConflicts(key: SensorRuleKey): ReadonlyArray<{
+    key: SensorRuleKey;
+    firmware: boolean;
+    shares: string;
+}>;
+/** The whole pair table, for a host that wants to render it. */
+declare const SENSOR_RULE_CONFLICTS: readonly ConflictPair[];
+/** Whether this sensor needs the expansion rail. */
+declare function requiresExpansionPower(key: SensorRuleKey): boolean;
+/**
+ * SR board codes these rules refer to (`ShimmerVerDetails.java:113-126`, the
+ * same codes `devices/identity.ts` names).
+ */
+declare const SR_BOARD: Readonly<{
+    BRIDGE_AMP: 8;
+    BRIDGE_AMP_UNIFIED: 49;
+    GSR: 14;
+    GSR_UNIFIED: 48;
+    EXG: 37;
+    EXG_UNIFIED: 47;
+    PROTO3_MINI: 36;
+    PROTO3_DELUXE: 38;
+    IMU: 31;
+}>;
+/** How firmly a hardware rule should be applied. */
+type SensorGate = 'block' | 'warn';
+/** The configuration these rules are evaluated against. */
+interface SensorRuleState {
+    /** The 24-bit enabled-sensor bitmap. */
+    enabledSensors: number;
+    /**
+     * The host's ExG mode selection, where it has one: `'off'`, or any other
+     * string for an ExG preset. Optional — with it absent the ExG front end
+     * counts as enabled when any of its bitmap bits is set.
+     */
+    exgMode?: string | null;
+    /** The expansion-power bit, or `null` when the host does not know it. */
+    expPower?: 0 | 1 | null;
+    /** The platform, or `null` when the device has not said. */
+    generation?: ShimmerGeneration | null;
+    /** The fitted board's SR id, or `null` when unknown or unreadable. */
+    boardId?: number | null;
+}
+/** One change a rule made, or would make. */
+interface SensorRuleChange {
+    /** The sensor that moved, or `'expPower'` for the rail. */
+    key: SensorRuleKey | 'expPower';
+    from: number;
+    to: number;
+    /** A sentence a host can show as-is. */
+    reason: string;
+}
+/** Something about this configuration that cannot work. */
+interface SensorRuleViolation {
+    kind: 'conflict' | 'expPower' | 'hardware' | 'generation';
+    /** The sensors involved. */
+    sensors: SensorRuleKey[];
+    enforcedBy: 'firmware' | 'host';
+    /** A sentence a host can show as-is. */
+    message: string;
+}
+/** What {@link checkSensorRules} found. */
+interface SensorRuleCheck {
+    violations: SensorRuleViolation[];
+    /** The nearest configuration that breaks no rule. */
+    derivations: {
+        enabledSensors: number;
+        expPower: 0 | 1 | null;
+        exgOff: boolean;
+    };
+    /** How to get from the given state to {@link derivations}. */
+    changes: SensorRuleChange[];
+}
+/** What {@link applySensorToggle} produced. */
+interface SensorToggleResult {
+    enabledSensors: number;
+    expPower: 0 | 1 | null;
+    /** True when the ExG front end was turned off, so a host resets its mode control. */
+    exgOff: boolean;
+    changes: SensorRuleChange[];
+}
+/** Whether a sensor can be offered at all, given the hardware. */
+interface SensorAvailability {
+    available: boolean;
+    gate: SensorGate | null;
+    reason: string | null;
+}
+/** Everything known about one sensor's rules, for a tooltip. */
+interface SensorRuleDescription {
+    key: SensorRuleKey;
+    label: string;
+    bit: number;
+    conflicts: ReadonlyArray<{
+        key: SensorRuleKey;
+        firmware: boolean;
+    }>;
+    requiresExpPower: boolean;
+    boards: readonly number[] | null;
+    generations: readonly ShimmerGeneration[] | null;
+    /** A few lines of prose, ready to be a `title` attribute. */
+    text: string;
+}
+/**
+ * A sensor's name, in the vocabulary of the generation in play.
+ *
+ * The ADC lines are the reason this takes a generation: the same bit is
+ * "Internal ADC A1" on a Shimmer3 and "Internal ADC A3" on a Shimmer3R, and a
+ * message naming the wrong one sends a user looking at the wrong pin.
+ */
+declare function sensorRuleLabel(key: SensorRuleKey, generation?: ShimmerGeneration | null): string;
+/**
+ * The expansion-power bit this configuration should carry.
+ *
+ * Port of `ShimmerDevice.checkIfInternalExpBrdPowerIsNeeded` (:2279-2298): on
+ * if any enabled sensor needs the rail; otherwise off, **unless** an internal
+ * ADC channel is enabled, in which case it is left as it was. That last clause
+ * is deliberate in the Java driver — the internal ADC lines can be wired to
+ * something that needs power without the driver knowing — so `null` in means
+ * `null` out.
+ */
+declare function deriveExpPower(enabledSensors: number, exgOn: boolean, current: 0 | 1 | null | undefined): 0 | 1 | null;
+/**
+ * Whether a sensor can be offered, given what is known about the hardware.
+ *
+ * `available: false` with `gate: 'block'` means a host should refuse the choice
+ * — but only for a sensor that is currently OFF. A host must always be able to
+ * turn off something that is on, whatever the board says, or a configuration
+ * read from a device cannot be corrected.
+ */
+declare function sensorAvailability(key: SensorRuleKey, state: SensorRuleState): SensorAvailability;
+/** Everything known about one sensor's rules, for a tooltip. */
+declare function describeSensorRules(key: SensorRuleKey, generation?: ShimmerGeneration | null): SensorRuleDescription;
+/**
+ * Enable or disable one sensor, correcting whatever that breaks.
+ *
+ * **The newest choice wins**, which is `ShimmerDevice.sensorMapConflictCheckandCorrect`
+ * (:2497-2516): every sensor conflicting with the one just enabled is turned
+ * off, unconditionally. There is no "refuse the edit" path in the Java driver
+ * and there is none here — a user who ticks a box expects the box to tick, and
+ * being told what else changed is friendlier than being told no.
+ *
+ * The expansion rail follows, by {@link deriveExpPower}.
+ *
+ * @returns the corrected bitmap, the derived rail, and a sentence per change.
+ */
+declare function applySensorToggle(state: SensorRuleState, key: SensorRuleKey, enabled: boolean): SensorToggleResult;
+/**
+ * Check a configuration against every rule, and say what the nearest working
+ * one would be.
+ *
+ * Idempotent: checking {@link SensorRuleCheck.derivations} produces no
+ * violations.
+ */
+declare function checkSensorRules(state: SensorRuleState): SensorRuleCheck;
 
 /**
  * Constants for the Shimmer3 / Shimmer3R binary SD-log file format.
@@ -12675,5 +14182,5 @@ declare function parseShimmerFactoryTestReport(text: string): ShimmerFactoryTest
  */
 declare function shimmerFactoryTestReportToCsvRows(parsed: ShimmerFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
 
-export { ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibTsBytesToUnixSeconds, calibrateGsrDataToResistanceFromAmplifierEq, calibrateShimmer3RAdcChannel, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AckVerdict, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BluetoothModuleFamily, BluetoothModuleVersion, BluetoothModuleVersionEntry, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChargingStatus, CrcMode, Cyw20820VersionDetails, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, DrainOptions, DrainResult, DrainVerdict, DropReason, EvaluateParsedSplitInput, ExgApplyInput, ExgApplyResult, ExgBanks, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FactoryTestClassifier, FactoryTestFailureReason, FactoryTestGrammar, FactoryTestLineContext, FactoryTestLineRule, FactoryTestMetricValue, FactoryTestOverall, FactoryTestReportFamily, FactoryTestReportParsedBase, FactoryTestResult, FactoryTestRunOptions, FactoryTestState, FactoryTestVerdict, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, ImuRateCoverage, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, MessageLengthFn, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorBitmapShimmer3Key, SensorField, SensorMap, SensorStreamStats, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FactoryTestType, Shimmer3FactoryTestTypeInfo, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerFactoryTestIoStatus, ShimmerFactoryTestMcuInfo, ShimmerFactoryTestModelInfo, ShimmerFactoryTestReportFamily, ShimmerFactoryTestReportParsed, ShimmerGeneration, ShimmerHardwareDescription, ShimmerSrBoard, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStatsSnapshot, TestModeId, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, summariseExgBanks, summariseExgCalibration, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AckVerdict, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BluetoothModuleFamily, BluetoothModuleVersion, BluetoothModuleVersionEntry, Bmp180Coefficients, Bmp280Coefficients, Bmp390Coefficients, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibratedGsr, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChannelUnit, ChargingStatus, CompensatedPressure, CrcMode, Cyw20820VersionDetails, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, DrainOptions, DrainResult, DrainVerdict, DropReason, DumpCalibrationsByGroup, EvaluateParsedSplitInput, ExgApplyInput, ExgApplyResult, ExgBanks, ExgCalibrationSource, ExgCalibrationSummary, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgSampleResolution, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FactoryTestClassifier, FactoryTestFailureReason, FactoryTestGrammar, FactoryTestLineContext, FactoryTestLineRule, FactoryTestMetricValue, FactoryTestOverall, FactoryTestReportFamily, FactoryTestReportParsedBase, FactoryTestResult, FactoryTestRunOptions, FactoryTestState, FactoryTestVerdict, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, ImuRateCoverage, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, MessageLengthFn, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, PressureCalibration, PressureCoefficients, PressureSensorKind, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorAvailability, SensorBitmapShimmer3Key, SensorField, SensorGate, SensorMap, SensorRuleChange, SensorRuleCheck, SensorRuleDescription, SensorRuleKey, SensorRuleState, SensorRuleViolation, SensorStreamStats, SensorToggleResult, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FactoryTestType, Shimmer3FactoryTestTypeInfo, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerFactoryTestIoStatus, ShimmerFactoryTestMcuInfo, ShimmerFactoryTestModelInfo, ShimmerFactoryTestReportFamily, ShimmerFactoryTestReportParsed, ShimmerGeneration, ShimmerHardwareDescription, ShimmerSrBoard, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamCalibrationInfo, StreamCalibrationSource, StreamCalibrationState, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStamp, StreamStatsSnapshot, StreamTimelineOptions, TestModeId, TimelineSource, TimelineState, TimestampBits, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };

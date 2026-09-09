@@ -11,7 +11,7 @@
      *
      * Kept in sync with package.json by tests/core/version.test.ts.
      */
-    const SDK_VERSION = '0.2.2';
+    const SDK_VERSION = '0.3.0';
 
     /**
      * Container for a single decoded sensor frame.
@@ -3645,6 +3645,107 @@
     }
 
     /**
+     * ExG (ADS1292R) counts → millivolts.
+     *
+     * The conversion needs two things out of the chip's own register bank — the
+     * per-channel PGA gain and the reference voltage — so it lives beside the
+     * register codec rather than with the kinematic calibration, which is
+     * per-device rather than per-configuration.
+     *
+     * **The 16-bit mode is not a 16-bit conversion, and this is the part that gets
+     * ported wrongly.** The firmware builds the 16-bit sample from bits **22:7** of
+     * the chip's 24-bit conversion — its own header says so, "drops 7 least
+     * significant bits and most significant bit"
+     * (`Shimmer_Driver/EXG/exg.h:134`; the bit-shuffle is `exg.c:288-291` for chip 1
+     * and `:261-266` for chip 2). The word is therefore the 24-bit value over 128
+     * with bit 22 as its sign, and the full-scale denominator has to account for
+     * it. Using `2^15 - 1` alone reports values **exactly twice too large**. The
+     * Java driver's live path gets this right by doubling the gain instead
+     * (`ShimmerObject.java:1856`), which is the same arithmetic; note that
+     * `SensorEXG.computeCalConstantForChannel` (:3121-3132) does **not** double,
+     * and disagrees with it.
+     *
+     * A consequence worth knowing: 16-bit mode halves the usable input range to
+     * ±V_REF / (2·gain). Past that, bit 22 no longer agrees with bit 23, and the
+     * two chips wrap differently — chip 1 takes bit 22 as the sign while chip 2
+     * keeps bit 23 and drops bit 22 — so a saturated CH1 reads differently on the
+     * two chips for the same input.
+     */
+    /**
+     * The ADS1292R's two reference voltages, selected by `CONFIG2` bit 4
+     * (`VREF_4V`): 0 → 2.42 V, 1 → 4.033 V.
+     *
+     * The datasheet rounds these to 2.4 V and 4 V and the chip header follows it
+     * (`Shimmer_Driver/EXG/ads1292.h:219,235-238`); the Java driver has always used
+     * the unrounded 2.42 V in its conversion constants
+     * (`ShimmerObject.java:721-724`), so these are the Java figures — a recording
+     * from this SDK and one from Consensys agree to the last decimal.
+     *
+     * The firmware's own defaults write `CONFIG2 = 0x80`, i.e. bit 4 clear, so
+     * 2.42 V is what an untouched sensor uses (`Configuration/shimmer_config.c`,
+     * the ECG default set).
+     */
+    const EXG_VREF_VOLTS = Object.freeze([2.42, 4.033]);
+    /** Gain when the bank says setting 7, which the chip does not define. */
+    const FALLBACK_GAIN = 6;
+    /**
+     * The gain the bank selects for one channel, or {@link FALLBACK_GAIN} when the
+     * setting is the undefined 7 (Java's `convertEXGGainSettingToValue` answers -1
+     * there, `SensorEXG.java:2637-2656`; a negative gain would flip the signal, so
+     * this SDK falls back to the chip's own default instead).
+     */
+    function gainFor(bank, channel) {
+        const setting = readExgField(bank, channel === 1 ? 'ch1Gain' : 'ch2Gain');
+        return GAIN_VALUES[setting] ?? FALLBACK_GAIN;
+    }
+    /** The reference voltage the bank selects. */
+    function vrefFor(bank) {
+        return EXG_VREF_VOLTS[readExgField(bank, 'voltageReference') === 1 ? 1 : 0];
+    }
+    /**
+     * The millivolts-per-count factor for one ExG channel.
+     *
+     * @param bank       That chip's 10-byte register bank, or `null` when the host
+     *   has not read it. With `null` the chip's own defaults are assumed — gain 6,
+     *   2.42 V — which is what the firmware writes and what the Java driver
+     *   hard-codes; a caller that cares should read the bank
+     *   (`Shimmer3RClient.readExgConfig()`) and say so to its user.
+     * @param channel    1 or 2.
+     * @param resolution Which sample width the sensor bitmap selected.
+     */
+    function exgChannelMillivoltFactor(bank, channel, resolution) {
+        const gain = bank ? gainFor(bank, channel) : FALLBACK_GAIN;
+        const vref = bank ? vrefFor(bank) : EXG_VREF_VOLTS[0];
+        return resolution === '24bit'
+            ? (vref * 1000) / gain / (2 ** 23 - 1)
+            : (vref * 1000) / (2 * gain * (2 ** 15 - 1));
+    }
+    /**
+     * Convert one ExG sample to millivolts.
+     *
+     * `sample` must already be sign-extended — the stream decoder does that from
+     * the channel's own width.
+     */
+    function calibrateExgSample(sample, bank, channel, resolution) {
+        return sample * exgChannelMillivoltFactor(bank, channel, resolution);
+    }
+    /** Summarise one chip's bank; the chip defaults when `bank` is `null`. */
+    function summariseExgCalibration(bank) {
+        return {
+            vrefVolts: bank ? vrefFor(bank) : EXG_VREF_VOLTS[0],
+            gainCh1: bank ? gainFor(bank, 1) : FALLBACK_GAIN,
+            gainCh2: bank ? gainFor(bank, 2) : FALLBACK_GAIN,
+        };
+    }
+    /** Summarise both chips. */
+    function summariseExgBanks(banks) {
+        return {
+            chip1: summariseExgCalibration(banks?.exg1 ?? null),
+            chip2: summariseExgCalibration(banks?.exg2 ?? null),
+        };
+    }
+
+    /**
      * Low-level byte-manipulation utilities used by the Shimmer3R protocol decoder.
      * All functions are pure and have no side-effects, making them straightforward
      * to unit-test without a BLE device.
@@ -3657,11 +3758,11 @@
         return out;
     }
     /** Read a 16-bit unsigned integer, little-endian. */
-    function u16le$3(b, o) {
+    function u16le$4(b, o) {
         return (b[o] | (b[o + 1] << 8)) >>> 0;
     }
     /** Read a 16-bit unsigned integer, big-endian. */
-    function u16be$1(b, o) {
+    function u16be$2(b, o) {
         return ((b[o] << 8) | b[o + 1]) >>> 0;
     }
     /** Read a 24-bit unsigned integer, little-endian. */
@@ -3940,6 +4041,383 @@
         };
     }
 
+    /**
+     * The unit vocabulary emitted on {@link SensorField.unit}.
+     *
+     * These are the Java driver's exact strings (`Configuration.java:117-176`,
+     * `CHANNEL_UNITS`), and they are exact on purpose: a recording made by this SDK
+     * and one made by Consensys describe the same signal with the same word, so a
+     * script that reads a units row does not have to know which tool wrote the
+     * file. That is also why the long spellings survive here — `'Degrees Celsius'`
+     * rather than `'°C'`, `'m/(s^2)'` rather than `'m/s²'`. A user interface is
+     * free to render something prettier (the demo pages do); the recorded string is
+     * the interchange format, and it stays ASCII so a CSV cannot depend on the
+     * reader's encoding.
+     *
+     * Two entries deviate from Java, both deliberately:
+     *
+     * - `TICKS` is lowercase where Java writes `'Ticks'`. This SDK has emitted
+     *   `'ticks'` on the timestamp channel since the first release, the demo pages
+     *   and their tests hard-code it, and the capitalisation carries no
+     *   information.
+     * - Java has no name for "this value is raw ADC counts". It writes
+     *   `NO_UNITS = 'no_units'` there, and so does this SDK — see {@link NO_UNITS}
+     *   for why a raw field carries that rather than `null`.
+     */
+    const CHANNEL_UNITS = Object.freeze({
+        /**
+         * A value with no unit: raw ADC counts, a range code, a register readback.
+         *
+         * Raw fields carry this string rather than `null` because a units row with an
+         * empty cell reads as "the unit was not recorded", where this reads as "there
+         * is no unit" — and those are different facts about a column. Java makes the
+         * same distinction with the same word.
+         */
+        NO_UNITS: 'no_units',
+        /** The 32768 Hz sample counter. Lowercase — see the module docblock. */
+        TICKS: 'ticks',
+        /** Milliseconds. Used for a calibrated timestamp and a real-world time. */
+        MILLISECONDS: 'ms',
+        MILLIVOLTS: 'mV',
+        KOHMS: 'kOhms',
+        /** Microsiemens. Java's `U_SIEMENS`; this SDK previously said `'uSiemens'`. */
+        MICRO_SIEMENS: 'uS',
+        KPASCAL: 'kPa',
+        /** Java's `DEGREES_CELSIUS`, spelled out. */
+        DEGREES_CELSIUS: 'Degrees Celsius',
+        /** Java's `DEGREES_CELSIUS_SHORT`. For a UI label, never for a recording. */
+        DEGREES_CELSIUS_SHORT: '°C',
+        PERCENT: '%',
+        /** Acceleration. Java's `METER_PER_SECOND_SQUARE` / `ACCEL_CAL_UNIT`. */
+        ACCEL: 'm/(s^2)',
+        /** Angular rate. Java's `DEGREES_PER_SECOND` / `GYRO_CAL_UNIT`. */
+        GYRO: 'deg/s',
+        /**
+         * Magnetic flux in the magnetometer's own units. Java's `LOCAL_FLUX` /
+         * `MAG_CAL_UNIT` — the kinematic block's sensitivity is in LSB/Gauss on some
+         * parts and LSB/gauss-equivalent on others, and the driver has never claimed
+         * more precision than "local flux" for the result.
+         */
+        MAG: 'local_flux',
+        /** Microtesla. What the Verisense decoders emit for their magnetometer. */
+        MICRO_TESLA: 'uT',
+    });
+
+    /**
+     * Turning a stream's 24-bit tick counter into a monotonic device clock, and
+     * then into wall-clock time.
+     *
+     * Two problems, and they are separable.
+     *
+     * **The counter wraps.** It runs at 32768 Hz in 24 bits, so it returns to zero
+     * every 512 seconds exactly — and in 16 bits, on Shimmer3 firmware older than
+     * LogAndStream 0.5.4, every **2 seconds**. Plotting the raw value against time
+     * draws a sawtooth. Unwrapping it is a matter of counting the wraps, and the
+     * naive rule ("the value went down, so it wrapped") is wrong for a duplicated
+     * or reordered packet: it adds 512 s permanently, which is what the Java
+     * driver's `unwrapTimeStamp` does (`ShimmerObject.java:3830-3848`).
+     *
+     * **The counter has no origin.** It says nothing about what time it is. To place
+     * samples on a wall clock a host has to anchor the counter against something,
+     * and there are three ways of doing that, in descending order of how well they
+     * work:
+     *
+     * | Anchor | When | Accuracy |
+     * |---|---|---|
+     * | `rwc-aligned` | Shimmer3R | exact, to the tick |
+     * | `rwc-estimated` | Shimmer3 | ± half the round trip |
+     * | `host` | no real-world clock set, or firmware without the command | ± half the round trip, and wrong by however wrong the sensor's clock is |
+     *
+     * The first is available because on a Shimmer3R the stream's timestamp **is**
+     * the low 24 bits of the same 64-bit counter `GET_RWC` returns: the packet
+     * timestamp comes from `RTC_get32()` and the real-world clock from
+     * `RTC_get64()` (`Sensing/shimmer_sensing.c:445-476`; `RTC/shimmer_rtc.h:25-28`
+     * defines `RTC_getRwcTime` as `RTC_get64`, and `Core/Src/rtc.c` gives the two
+     * functions identical bodies). So one `GET_RWC` reply pins every subsequent
+     * sample exactly, with no clock-comparison error at all: the host only has to
+     * decide *which* wrap of the counter a sample belongs to, and elapsed host time
+     * settles that with hundreds of seconds of slack.
+     *
+     * A Shimmer3's counter cannot be set. Its real-world clock is that free-running
+     * counter plus a stored offset — `RTC_getRwcTime()` returns
+     * `rwcTimeDiff64 + RTC_get64()` (`Shimmer_Driver/5xx_HAL/hal_RTC.c:73-76`) —
+     * and the offset is not sent over Bluetooth, only into an SD header. So a host
+     * can only estimate where the counter stood when the reply was composed, which
+     * is what `rwc-estimated` does and why it carries the round trip as its
+     * uncertainty.
+     *
+     * `host` is the Consensys method: the host's own clock at the first packet,
+     * carried forward by the device's counter
+     * (`SystemTimestampPlot.java:19-42`). It is the fallback rather than the
+     * default because it inherits the host's clock error rather than the sensor's,
+     * and a sensor whose clock is set is the better reference for its own data.
+     */
+    /** The sample counter's frequency, on every Shimmer3-family device. */
+    const TICKS_PER_SECOND = 32768;
+    /** Ticks per millisecond — 32.768, as the firmware and the Java driver have it. */
+    const TICKS_PER_MS = TICKS_PER_SECOND / 1000;
+    /**
+     * Unwraps a device sample counter and, once anchored, reports wall-clock time
+     * for every sample.
+     *
+     * One instance per stream. A client resets it at stream start and re-anchors
+     * whenever the device's clock is written, because that steps the very counter
+     * the samples are timed by.
+     */
+    class StreamTimeline {
+        constructor(opts = {}) {
+            this._lastRaw = null;
+            this._lastUnwrapped = 0;
+            this._lastHostMs = null;
+            this._wraps = 0;
+            this._pending = null;
+            this._anchor = null;
+            /**
+             * The last anchor REQUEST, kept so it can be re-bound to a new stream's first
+             * sample. A request is durable in a way a binding is not: it says what the
+             * device's clock read at a known host time, which stays true across a stream
+             * restart, whereas the binding is to an unwrapped tick origin that does not.
+             */
+            this._request = null;
+            this._bits = opts.timestampBits ?? 24;
+            this._modulo = 2 ** this._bits;
+        }
+        /** The counter width this timeline is unwrapping. */
+        get timestampBits() {
+            return this._bits;
+        }
+        /**
+         * Change the counter width.
+         *
+         * A Shimmer3 client learns this from the firmware version during its
+         * handshake, which happens after the timeline exists. Resets everything: a
+         * wrap count means nothing against a different modulo, and an anchor is
+         * bound to an unwrapped tick value that is about to start again.
+         */
+        setTimestampBits(bits) {
+            if (bits === this._bits)
+                return;
+            this._bits = bits;
+            this._modulo = 2 ** bits;
+            this.reset();
+        }
+        /**
+         * Start again: new stream, new counter origin.
+         *
+         * Any anchor is dropped rather than carried over. Between two streams the
+         * counter has kept running, so an anchor bound to the old stream's unwrapped
+         * origin says nothing about the new one, and a host re-reads the clock.
+         */
+        reset() {
+            this._lastRaw = null;
+            this._lastUnwrapped = 0;
+            this._lastHostMs = null;
+            this._wraps = 0;
+            this._anchor = null;
+            /* The binding goes; the request stays, to be re-bound to this stream's
+               first sample. So a host that read the clock once, on connect, gets a
+               wall-clock axis on every later stream without asking again — and for an
+               aligned anchor it is still exact, because the answer comes from each
+               sample's own counter bits rather than from elapsed time. */
+            this._pending = this._request;
+        }
+        /**
+         * Anchor against the device's real-world clock.
+         *
+         * @param rwcTicks  The 64-bit tick count `GET_RWC` returned.
+         * @param hostMs    The host clock at the **midpoint** of the exchange —
+         *   `(before + after) / 2` — which is the best single estimate of when the
+         *   device composed its reply.
+         * @param opts.rttMs  The exchange's round-trip time. Half of it is the
+         *   uncertainty, and it is ignored for an aligned anchor, which does not
+         *   depend on when the reply was composed.
+         * @param opts.aligned  True when the stream timestamp is the low bits of this
+         *   same counter — a Shimmer3R. False for a Shimmer3, whose counter and
+         *   real-world clock differ by a stored offset the host cannot read.
+         */
+        anchorToRwc(rwcTicks, hostMs, opts) {
+            this._pending = {
+                kind: opts.aligned ? 'rwc-aligned' : 'rwc-estimated',
+                rwcTicks,
+                hostMs,
+                uncertaintyMs: opts.aligned ? 0 : (opts.rttMs ?? 0) / 2,
+            };
+            this._request = this._pending;
+            this._anchor = null;
+        }
+        /**
+         * Anchor against the host's own clock, the Consensys method: the next sample
+         * is taken to have happened now, and the device's counter carries time
+         * forward from there.
+         */
+        anchorToHost(hostMs, opts = {}) {
+            this._pending = {
+                kind: 'host',
+                hostMs,
+                uncertaintyMs: (opts.rttMs ?? 0) / 2,
+            };
+            this._request = this._pending;
+            this._anchor = null;
+        }
+        /** Drop any anchor and any standing request, leaving the unwrap running. */
+        clearAnchor() {
+            this._pending = null;
+            this._request = null;
+            this._anchor = null;
+        }
+        /**
+         * True when this timeline has been told how to place samples on a wall clock
+         * — whether or not a sample has arrived to bind it to yet.
+         *
+         * A client checks this before spending a round trip on the clock: one reading
+         * serves every stream of a session.
+         */
+        get hasAnchorRequest() {
+            return this._request !== null;
+        }
+        /**
+         * Unwrap one sample's counter value and, if anchored, place it on a wall
+         * clock.
+         *
+         * @param raw    The counter value from the packet, wraps included.
+         * @param hostMs The host clock when the packet arrived. Used only to recover
+         *   wraps that went by unseen — see below — never to time the sample, which
+         *   the device's own counter does far better.
+         */
+        stamp(raw, hostMs) {
+            const unwrapped = this._unwrap(raw, hostMs);
+            this._lastRaw = ((raw % this._modulo) + this._modulo) % this._modulo;
+            this._lastUnwrapped = unwrapped;
+            /* How many counter boundaries this session has crossed. The unwrapped value
+               starts below one modulo (it starts AT a raw counter value), so flooring
+               the division counts crossings directly. Clamped at zero because a
+               reordered packet arriving first can carry the value slightly negative. */
+            this._wraps = Math.max(0, Math.floor(unwrapped / this._modulo));
+            if (hostMs !== undefined)
+                this._lastHostMs = hostMs;
+            if (this._pending)
+                this._resolveAnchor(unwrapped, hostMs);
+            const deviceMs = unwrapped / TICKS_PER_MS;
+            if (!this._anchor) {
+                return { unwrappedTicks: unwrapped, deviceMs, unixMs: null, source: null };
+            }
+            const unixMs = this._anchor.unixMs + (unwrapped - this._anchor.unwrappedTicks) / TICKS_PER_MS;
+            return { unwrappedTicks: unwrapped, deviceMs, unixMs, source: this._anchor.source };
+        }
+        _unwrap(raw, hostMs) {
+            const value = ((raw % this._modulo) + this._modulo) % this._modulo;
+            if (this._lastRaw === null)
+                return value;
+            const half = this._modulo / 2;
+            /* Forward distance from the last sample. A step of less than half a modulo
+               is taken as forward motion (crossing a wrap if it has to); more than half
+               is taken as a small step BACKWARDS, i.e. a duplicated or reordered
+               packet. Without that guard one out-of-order packet adds a whole modulo —
+               512 s on a Shimmer3R — for the rest of the session. */
+            const forward = (value - this._lastRaw + this._modulo) % this._modulo;
+            let unwrapped = forward <= half
+                ? this._lastUnwrapped + forward
+                : this._lastUnwrapped - (this._modulo - forward);
+            /* The rule above cannot see a wrap that went by entirely — more than a
+               whole modulo of samples missed, which is 512 s on a 24-bit counter but
+               only 2 s on the 16-bit one older Shimmer3 firmware uses. The host clock
+               is the only witness. Its jitter is irrelevant at this scale: it is being
+               asked how many whole modulos went by, not when the sample happened. */
+            if (hostMs !== undefined && this._lastHostMs !== null) {
+                const elapsedTicks = (hostMs - this._lastHostMs) * TICKS_PER_MS;
+                if (elapsedTicks > half) {
+                    const expected = this._lastUnwrapped + elapsedTicks;
+                    const missed = Math.round((expected - unwrapped) / this._modulo);
+                    if (missed > 0)
+                        unwrapped += missed * this._modulo;
+                }
+            }
+            return unwrapped;
+        }
+        /**
+         * Turn a pending anchor into a resolved one, now that a sample's unwrapped
+         * tick value is known to bind it to.
+         */
+        _resolveAnchor(unwrapped, hostMs) {
+            const pending = this._pending;
+            if (!pending)
+                return;
+            const at = hostMs ?? pending.hostMs;
+            if (pending.kind === 'host') {
+                this._pending = null;
+                this._anchor = {
+                    source: 'host',
+                    unwrappedTicks: unwrapped,
+                    unixMs: at,
+                    hostMs: at,
+                    uncertaintyMs: pending.uncertaintyMs,
+                    skewMs: null,
+                };
+                return;
+            }
+            const rwcTicks = pending.rwcTicks;
+            if (rwcTicks === undefined) {
+                this._pending = null;
+                return;
+            }
+            /* Where the device's clock stood when this sample was taken, estimated from
+               the anchor plus however long the host says has passed since. Good to tens
+               of milliseconds, which is all that is needed below. */
+            const elapsedSinceAnchorTicks = (at - pending.hostMs) * TICKS_PER_MS;
+            const approxTicks = Number(rwcTicks) + elapsedSinceAnchorTicks;
+            let absoluteTicks;
+            if (pending.kind === 'rwc-aligned') {
+                /* The sample's counter value IS the low bits of the device's real-world
+                   clock, so the answer is the value congruent to it that lies nearest the
+                   estimate above. The estimate only has to be right to within half a
+                   modulo — 256 seconds — so this is exact in practice however sloppy the
+                   host clock is. */
+                const low = ((unwrapped % this._modulo) + this._modulo) % this._modulo;
+                const base = Math.round((approxTicks - low) / this._modulo) * this._modulo;
+                absoluteTicks = base + low;
+            }
+            else {
+                /* No congruence to exploit: a Shimmer3's counter and its real-world clock
+                   differ by an offset only the device knows. The estimate is the answer,
+                   and its error is the link's latency asymmetry. */
+                absoluteTicks = approxTicks;
+            }
+            const unixMs = absoluteTicks / TICKS_PER_MS;
+            this._pending = null;
+            this._anchor = {
+                source: pending.kind,
+                unwrappedTicks: unwrapped,
+                unixMs,
+                hostMs: at,
+                uncertaintyMs: pending.uncertaintyMs,
+                skewMs: unixMs - at,
+            };
+        }
+        /**
+         * What a host should show about this timeline.
+         *
+         * `source` reports what *will* place these samples as soon as one arrives,
+         * not only what already has: a host wants to label its time axis when the
+         * stream starts, not one packet later. {@link anchored} is the narrower
+         * question of whether a sample has bound the anchor yet.
+         */
+        get state() {
+            return {
+                source: this._anchor?.source ?? this._pending?.kind ?? this._request?.kind ?? null,
+                anchorHostMs: this._anchor?.hostMs ?? null,
+                anchorUnixMs: this._anchor?.unixMs ?? null,
+                anchorUncertaintyMs: this._anchor?.uncertaintyMs ?? 0,
+                skewMs: this._anchor?.skewMs ?? null,
+                wraps: this._wraps,
+                timestampBits: this._bits,
+            };
+        }
+        /** True once wall-clock time is available. */
+        get anchored() {
+            return this._anchor !== null;
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // ADC helpers
     // ---------------------------------------------------------------------------
@@ -3986,17 +4464,25 @@
         return rSource;
     }
     /**
-     * Clamp a GSR resistance value to the physical limits of a given range.
+     * Clamp a GSR resistance value to the physical limits of the range in use.
      *
-     * When `gsrRangeSetting === 4` (auto-range) no clamping is applied.
+     * On a **fixed** range both ends are clamped, to that range's window. On
+     * **auto-range** (setting 4) only the lower end is, to the smallest resistance
+     * any range can measure — the circuit cannot report below it whatever range it
+     * switched to, but the upper end depends on which range that was, and the
+     * per-sample range bits have already been used to pick the resistor. This
+     * matches `SensorGSR.nudgeGsrResistance` (:415-421); an earlier version of this
+     * function returned an auto-range value unclamped, which let the amplifier
+     * equation report a few hundred ohms of skin resistance near full scale.
      *
      * @param gsrResistanceKOhms Calibrated resistance in kΩ.
      * @param gsrRangeSetting    Range 0–3 (fixed) or 4 (auto).
      * @returns Clamped resistance in kΩ.
      */
     function nudgeGsrResistance(gsrResistanceKOhms, gsrRangeSetting) {
-        if (gsrRangeSetting === 4)
-            return gsrResistanceKOhms;
+        if (gsrRangeSetting === 4) {
+            return Math.max(SHIMMER3_GSR_RESISTANCE_MIN_MAX_KOHMS[0][0], gsrResistanceKOhms);
+        }
         const [minVal, maxVal] = SHIMMER3_GSR_RESISTANCE_MIN_MAX_KOHMS[gsrRangeSetting];
         return Math.max(minVal, Math.min(maxVal, gsrResistanceKOhms));
     }
@@ -4032,6 +4518,1316 @@
         if (samplingRate < 4000)
             return 5;
         return 6; // ≥ 4000 Hz
+    }
+
+    /**
+     * Byte readers for the coefficient blocks.
+     *
+     * Local to this module rather than shared with `devices/shimmer3r/protocol.ts`
+     * because the three parts disagree about byte order within the block — BMP180
+     * sends each 16-bit coefficient MSB first, BMP280 and BMP390 send them LSB
+     * first — and a reader named for the part it serves is harder to point at the
+     * wrong block.
+     */
+    /** Unsigned 16-bit, most-significant byte first (BMP180). */
+    const u16be$1 = (b, o) => (b[o] << 8) | b[o + 1];
+    /** Unsigned 16-bit, least-significant byte first (BMP280, BMP390). */
+    const u16le$3 = (b, o) => b[o] | (b[o + 1] << 8);
+    /** Sign-extend an unsigned 16-bit value to a signed one. */
+    const s16 = (v) => (v & 0x8000 ? v - 0x10000 : v);
+    /** Sign-extend an unsigned 8-bit value to a signed one. */
+    const s8 = (v) => (v & 0x80 ? v - 0x100 : v);
+    /** Signed 16-bit, most-significant byte first (BMP180). */
+    const i16be$1 = (b, o) => s16(u16be$1(b, o));
+    /** Signed 16-bit, least-significant byte first (BMP280, BMP390). */
+    const i16le$1 = (b, o) => s16(u16le$3(b, o));
+    /**
+     * Sign-extend an unsigned 24-bit value to a signed one.
+     *
+     * The BMP581 streams its temperature as 24-bit two's complement — the Bosch
+     * driver does this same extension before scaling
+     * (`Shimmer_Driver/BMP5/BMP5_SensorAPI/bmp5.c:684-693`).
+     */
+    const s24 = (v) => (v & 0x800000 ? v - 0x1000000 : v);
+
+    /**
+     * BMP180 — coefficient parsing and Bosch's integer compensation, in floating
+     * point.
+     *
+     * Ported from the Java driver's `CalibDetailsBmp180.parseCalParamByteArray`
+     * (:44-66) and `calibratePressureSensorData` (:93-124), which is itself the
+     * datasheet's algorithm (BST-BMP180-DS000 §3.5) with the integer divisions left
+     * as real divisions. The firmware does not implement any of this: it relays the
+     * chip's trim registers and its raw readings untouched.
+     *
+     * The oversampling setting is part of the pressure maths, not a scale applied
+     * afterwards — it appears twice, as `1 << oss` and `50000 >> oss` — which is why
+     * {@link compensateBmp180} takes it as an argument rather than letting a caller
+     * pre-scale.
+     */
+    /**
+     * Parse the 22-byte BMP180 trim block.
+     *
+     * Byte order is **big-endian per coefficient** — byte 0 is the MSB of `AC1`.
+     * `AC4`, `AC5` and `AC6` are unsigned; the other eight are signed.
+     *
+     * @returns the coefficients, or `null` when the block carries nothing (see
+     *   {@link parsePressureCalibrationResponse} for which fill patterns count).
+     */
+    function parseBmp180Coefficients(bytes) {
+        if (bytes.length < 22)
+            return null;
+        return {
+            ac1: i16be$1(bytes, 0),
+            ac2: i16be$1(bytes, 2),
+            ac3: i16be$1(bytes, 4),
+            ac4: u16be$1(bytes, 6),
+            ac5: u16be$1(bytes, 8),
+            ac6: u16be$1(bytes, 10),
+            b1: i16be$1(bytes, 12),
+            b2: i16be$1(bytes, 14),
+            mb: i16be$1(bytes, 16),
+            mc: i16be$1(bytes, 18),
+            md: i16be$1(bytes, 20),
+        };
+    }
+    /**
+     * Compensate one BMP180 sample.
+     *
+     * @param rawPressure    The 24-bit `BMP_PRESSURE` channel value, **unshifted**.
+     *   The chip left-aligns its result by `8 - oss` bits and the datasheet's `UP`
+     *   is the right-aligned value, so this function performs that shift itself
+     *   (Java does it one layer up, `SensorBMP180.java:509`).
+     * @param rawTemperature The 16-bit `BMP_TEMPERATURE` channel value.
+     * @param c              Trim coefficients from {@link parseBmp180Coefficients}.
+     * @param oversampling   The configured oversampling setting, 0-3.
+     */
+    function compensateBmp180(rawPressure, rawTemperature, c, oversampling) {
+        const oss = Math.max(0, Math.min(3, Math.trunc(oversampling)));
+        const up = rawPressure / 2 ** (8 - oss);
+        const ut = rawTemperature;
+        // Temperature.
+        let x1 = (ut - c.ac6) * (c.ac5 / 32768);
+        let x2 = (c.mc * 2048) / (x1 + c.md);
+        const b5 = x1 + x2;
+        const t = (b5 + 8) / 16;
+        // Pressure.
+        const b6 = b5 - 4000;
+        x1 = (c.b2 * (b6 ** 2 / 4096)) / 2048;
+        x2 = (c.ac2 * b6) / 2048;
+        let x3 = x1 + x2;
+        const b3 = ((c.ac1 * 4 + x3) * (1 << oss) + 2) / 4;
+        x1 = (c.ac3 * b6) / 8192;
+        x2 = (c.b1 * (b6 ** 2 / 4096)) / 65536;
+        x3 = (x1 + x2 + 2) / 4;
+        const b4 = (c.ac4 * (x3 + 32768)) / 32768;
+        const b7 = (up - b3) * (50000 >> oss);
+        // The datasheet's branch on 0x80000000 is an unsigned-overflow guard for
+        // 32-bit integer maths. It is kept because it changes the rounding, not
+        // because it can overflow here.
+        let p = b7 < 2147483648 ? (b7 * 2) / b4 : (b7 / b4) * 2;
+        x1 = ((p / 256) * (p / 256) * 3038) / 65536;
+        x2 = (-7357 * p) / 65536;
+        p = p + (x1 + x2 + 3791) / 16;
+        return { pressureKPa: p / 1000, temperatureC: t / 10 };
+    }
+
+    /**
+     * BMP280 — coefficient parsing and Bosch's floating-point compensation.
+     *
+     * Ported from the Java driver's `CalibDetailsBmp280.parseCalParamByteArray`
+     * (:56-81) and `calibratePressureSensorData` (:117-146), which is the
+     * datasheet's `bmp280_compensate_T_double` / `_P_double` (BST-BMP280-DS001
+     * §8.2).
+     *
+     * The raw shifts are the part that catches people. The datasheet's `adc_T` and
+     * `adc_P` are **20-bit** values, but the Shimmer3 packet carries temperature in
+     * 2 bytes and pressure in 3 — the chip's XLSB register never reaches the host.
+     * So temperature has to be shifted up by 4 and pressure down by 4 before the
+     * algorithm sees them, which is what `SensorBMP280.java:414-415` does and what
+     * {@link compensateBmp280} does here.
+     */
+    /**
+     * Parse the 24-byte BMP280 trim block.
+     *
+     * Byte order is **little-endian per coefficient**, the opposite of BMP180's
+     * block. `digT1` and `digP1` are unsigned; the other ten are signed.
+     */
+    function parseBmp280Coefficients(bytes) {
+        if (bytes.length < 24)
+            return null;
+        return {
+            digT1: u16le$3(bytes, 0),
+            digT2: i16le$1(bytes, 2),
+            digT3: i16le$1(bytes, 4),
+            digP1: u16le$3(bytes, 6),
+            digP2: i16le$1(bytes, 8),
+            digP3: i16le$1(bytes, 10),
+            digP4: i16le$1(bytes, 12),
+            digP5: i16le$1(bytes, 14),
+            digP6: i16le$1(bytes, 16),
+            digP7: i16le$1(bytes, 18),
+            digP8: i16le$1(bytes, 20),
+            digP9: i16le$1(bytes, 22),
+        };
+    }
+    /**
+     * Compensate one BMP280 sample.
+     *
+     * @param rawPressure    The 24-bit `BMP_PRESSURE` channel value, unshifted.
+     * @param rawTemperature The 16-bit `BMP_TEMPERATURE` channel value, unshifted.
+     * @param c              Trim coefficients from {@link parseBmp280Coefficients}.
+     */
+    function compensateBmp280(rawPressure, rawTemperature, c) {
+        // Recover the 20-bit values the algorithm is written for.
+        const adcT = rawTemperature * 16;
+        const adcP = rawPressure / 16;
+        let var1 = (adcT / 16384 - c.digT1 / 1024) * c.digT2;
+        let var2 = (adcT / 131072 - c.digT1 / 8192) * (adcT / 131072 - c.digT1 / 8192) * c.digT3;
+        const tFine = var1 + var2;
+        const t = tFine / 5120;
+        var1 = tFine / 2 - 64000;
+        var2 = (var1 * var1 * c.digP6) / 32768;
+        var2 = var2 + var1 * c.digP5 * 2;
+        var2 = var2 / 4 + c.digP4 * 65536;
+        var1 = ((c.digP3 * var1 * var1) / 524288 + c.digP2 * var1) / 524288;
+        var1 = (1 + var1 / 32768) * c.digP1;
+        // A zero `var1` would divide by zero below. The datasheet returns 0 Pa; the
+        // Java port comments the guard out and lets it produce Infinity. Neither is
+        // a measurement, so this reports it as one: NaN, which a plot breaks on
+        // rather than drawing a spike to infinity.
+        if (var1 === 0)
+            return { pressureKPa: NaN, temperatureC: t };
+        let p = 1048576 - adcP;
+        p = ((p - var2 / 4096) * 6250) / var1;
+        var1 = (c.digP9 * p * p) / 2147483648;
+        var2 = (p * c.digP8) / 32768;
+        p = p + (var1 + var2 + c.digP7) / 16;
+        return { pressureKPa: p / 1000, temperatureC: t };
+    }
+
+    /**
+     * BMP390 — coefficient parsing and Bosch's floating-point compensation.
+     *
+     * Ported from the Bosch Sensor API bundled with the firmware
+     * (`Shimmer_Driver/BMP3/BMP3_SensorAPI/bmp3.c`: `parse_calib_data` :2371-2425,
+     * and the `BMP3_FLOAT_COMPENSATION` arms of `compensate_temperature` /
+     * `compensate_pressure`), cross-checked against the Java driver's
+     * `CalibDetailsBmp390` (:109-268), which is the same algorithm.
+     *
+     * **Two coefficient types follow Bosch rather than Java.** Java reads `par_T1`
+     * and `par_T2` through `(short)`, i.e. signed
+     * (`CalibDetailsBmp390.java:210,214`), where Bosch declares both `uint16_t`
+     * (`bmp3_defs.h:566-567`). A real `par_T1` is well above 32767 — it is a
+     * scaled-up reference temperature — so the Java cast turns it negative and the
+     * reported temperature is wrong by hundreds of degrees. This port uses the
+     * Bosch types.
+     *
+     * The clamps are Bosch's too: −40…85 °C and 30…125 kPa
+     * (`bmp3_defs.h:318-325`). They are wide enough that hitting one means the
+     * input was not a real reading.
+     */
+    /** Bosch's compensation limits (`bmp3_defs.h:318-325`). */
+    const MIN_TEMP_C = -40;
+    const MAX_TEMP_C = 85;
+    const MIN_PRES_PA = 30000;
+    const MAX_PRES_PA = 125000;
+    /**
+     * Parse the 21-byte BMP390 trim block into Bosch's quantized form — each
+     * register value already divided by its scale factor, which is what
+     * {@link compensateBmp390} consumes.
+     *
+     * Byte order is little-endian per coefficient.
+     */
+    function parseBmp390Coefficients(bytes) {
+        if (bytes.length < 21)
+            return null;
+        return {
+            // 1 / 2^8 — dividing by 0.00390625 is multiplying by 256.
+            parT1: u16le$3(bytes, 0) / 0.00390625,
+            parT2: u16le$3(bytes, 2) / 1073741824,
+            parT3: s8(bytes[4]) / 281474976710656,
+            parP1: (i16le$1(bytes, 5) - 16384) / 1048576,
+            parP2: (i16le$1(bytes, 7) - 16384) / 536870912,
+            parP3: s8(bytes[9]) / 4294967296,
+            parP4: s8(bytes[10]) / 137438953472,
+            // 1 / 2^3
+            parP5: u16le$3(bytes, 11) / 0.125,
+            parP6: u16le$3(bytes, 13) / 64,
+            parP7: s8(bytes[15]) / 256,
+            parP8: s8(bytes[16]) / 32768,
+            parP9: i16le$1(bytes, 17) / 281474976710656,
+            parP10: s8(bytes[19]) / 281474976710656,
+            parP11: s8(bytes[20]) / 36893488147419103232,
+        };
+    }
+    /**
+     * Compensate one BMP390 sample.
+     *
+     * Both raw values are the 24-bit channel values as streamed; the BMP390 needs
+     * no pre-shift, unlike the BMP180 and BMP280.
+     */
+    function compensateBmp390(rawPressure, rawTemperature, c) {
+        // Temperature, and `tLin` which the pressure maths needs.
+        const partialDataT1 = rawTemperature - c.parT1;
+        const partialDataT2 = partialDataT1 * c.parT2;
+        let tLin = partialDataT2 + partialDataT1 * partialDataT1 * c.parT3;
+        if (tLin < MIN_TEMP_C)
+            tLin = MIN_TEMP_C;
+        if (tLin > MAX_TEMP_C)
+            tLin = MAX_TEMP_C;
+        // Pressure.
+        let partialData1 = c.parP6 * tLin;
+        let partialData2 = c.parP7 * tLin ** 2;
+        let partialData3 = c.parP8 * tLin ** 3;
+        const partialOut1 = c.parP5 + partialData1 + partialData2 + partialData3;
+        partialData1 = c.parP2 * tLin;
+        partialData2 = c.parP3 * tLin ** 2;
+        partialData3 = c.parP4 * tLin ** 3;
+        const partialOut2 = rawPressure * (c.parP1 + partialData1 + partialData2 + partialData3);
+        partialData1 = rawPressure ** 2;
+        partialData2 = c.parP9 + c.parP10 * tLin;
+        partialData3 = partialData1 * partialData2;
+        const partialData4 = partialData3 + rawPressure ** 3 * c.parP11;
+        let pressurePa = partialOut1 + partialOut2 + partialData4;
+        if (pressurePa < MIN_PRES_PA)
+            pressurePa = MIN_PRES_PA;
+        if (pressurePa > MAX_PRES_PA)
+            pressurePa = MAX_PRES_PA;
+        return { pressureKPa: pressurePa / 1000, temperatureC: tLin };
+    }
+
+    /**
+     * BMP581 — no coefficients, two fixed scale factors.
+     *
+     * The BMP581 compensates on-chip, so the firmware relays its output registers
+     * verbatim and there is nothing per-device to read: the 0xA7 reply carries the
+     * sensor id and no coefficient bytes at all
+     * (`log-and-stream-common/Comms/shimmer_bt_uart.c:2067-2077`).
+     *
+     * Scale factors and signedness are the Bosch driver's
+     * (`Shimmer_Driver/BMP5/BMP5_SensorAPI/bmp5.c:682-720`): pressure is an
+     * **unsigned** 24-bit value over 64 for pascals, temperature a **signed**
+     * 24-bit value over 65536 for degrees Celsius. The Java driver agrees
+     * (`CalibDetailsBmp581.java:26-31`).
+     */
+    /**
+     * Scale one BMP581 sample.
+     *
+     * @param rawPressure    Unsigned 24-bit pressure register value.
+     * @param rawTemperature 24-bit temperature register value, two's complement.
+     */
+    function compensateBmp581(rawPressure, rawTemperature) {
+        return {
+            // Pa = raw / 64, and this SDK reports kPa.
+            pressureKPa: rawPressure / 64 / 1000,
+            temperatureC: s24(rawTemperature) / 65536,
+        };
+    }
+
+    /**
+     * One entry point for "turn these two raw channel values into kPa and °C".
+     */
+    /**
+     * Compensate one pressure/temperature pair.
+     *
+     * @param calibration  What {@link parsePressureCalibrationResponse} returned,
+     *   or `null` when the host never read it (or the firmware refused).
+     * @param rawPressure    The `PRESSURE` channel value for this frame.
+     * @param rawTemperature The `TEMPERATURE` channel value for this frame.
+     * @param oversampling   The configured pressure oversampling, 0-3. Only the
+     *   BMP180 uses it; the others ignore it.
+     * @returns the compensated pair, or `null` when there is nothing to compensate
+     *   with — no calibration read, a blank coefficient block, or a part whose
+     *   coefficients this SDK could not parse. `null` is the honest answer and
+     *   callers treat it as one: the channels stay raw-only for that frame rather
+     *   than carrying a number derived from zeros.
+     */
+    function compensatePressure(calibration, rawPressure, rawTemperature, oversampling = 0) {
+        if (!calibration?.calibrated)
+            return null;
+        switch (calibration.sensor) {
+            case 'bmp180':
+                return calibration.coefficients
+                    ? compensateBmp180(rawPressure, rawTemperature, calibration.coefficients, oversampling)
+                    : null;
+            case 'bmp280':
+                return calibration.coefficients
+                    ? compensateBmp280(rawPressure, rawTemperature, calibration.coefficients)
+                    : null;
+            case 'bmp390':
+                return calibration.coefficients
+                    ? compensateBmp390(rawPressure, rawTemperature, calibration.coefficients)
+                    : null;
+            case 'bmp581':
+                return compensateBmp581(rawPressure, rawTemperature);
+        }
+    }
+
+    /**
+     * GSR: one raw ADC word → skin resistance, conductance, and the range that
+     * produced them.
+     *
+     * The maths already lived in `devices/shimmer3r/calibration.ts`; what lived in
+     * three places was the *sequence* around it — mask off the range bits, resolve
+     * auto-range from the sample, apply the range-3 floor, clamp, invert. Both
+     * streaming clients and the SD-log decoder each had their own copy, and they
+     * had begun to drift. This is that sequence, once.
+     *
+     * Ported from `SensorGSR.processDataCustom` (:326-358) and
+     * `nudgeGsrResistance` (:415-421).
+     */
+    /** `'GSR_RESISTANCE'` — skin resistance in kΩ, Java's `GSR_RESISTANCE`. */
+    const GSR_RESISTANCE_NAME = 'GSR_RESISTANCE';
+    /**
+     * `'GSR_RANGE'` — which of the four feedback resistors produced this sample.
+     *
+     * Worth recording rather than inferring: on auto-range the firmware reports it
+     * per sample in the top two bits, it changes mid-recording, and a step in the
+     * conductance trace at a range boundary is a switching artefact rather than a
+     * physiological event (`SHIMMER3_GSR_AUTORANGE.md` §4).
+     */
+    const GSR_RANGE_NAME = 'GSR_RANGE';
+    /**
+     * Resolve the range for one sample.
+     *
+     * A configured range of 0-3 is used as-is. Range 4 is auto, and then the
+     * firmware puts the resistor it chose in bits 14-15 of the sample itself, so it
+     * has to be read per sample and not once per trial
+     * (`SHIMMER3_STREAMING_DATA_FORMAT.md` §8, rule 7).
+     */
+    function gsrRangeForSample(rawSample, gsrRangeSetting) {
+        return gsrRangeSetting === 4 ? (rawSample >> 14) & 0x03 : gsrRangeSetting;
+    }
+    /**
+     * Calibrate one raw GSR word.
+     *
+     * @param rawSample        The 16-bit `GSR` channel value, range bits included.
+     * @param gsrRangeSetting  The configured range: 0-3 fixed, 4 auto.
+     */
+    function calibrateGsrSample(rawSample, gsrRangeSetting) {
+        const range = gsrRangeForSample(rawSample, gsrRangeSetting);
+        let adc12 = rawSample & 0x0fff;
+        // On the largest range the amplifier is non-linear below this count, and the
+        // firmware's own conversion floors it rather than extrapolating.
+        if (range === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3)
+            adc12 = GSR_UNCAL_LIMIT_RANGE3;
+        const resistanceKOhms = nudgeGsrResistance(calibrateGsrDataToResistanceFromAmplifierEq(adc12, range), gsrRangeSetting);
+        return {
+            range,
+            resistanceKOhms,
+            conductanceUSiemens: 1000 / resistanceKOhms,
+        };
+    }
+    /**
+     * Add the calibrated GSR fields to a decoded frame, if it carries a GSR
+     * channel. No-op otherwise.
+     *
+     * Three fields, because they answer different questions and two of them cannot
+     * be recovered from the third alone: conductance under the channel's own name
+     * (what a host plots, and what this SDK has always emitted there), resistance
+     * because that is what the amplifier measures and what some analyses want, and
+     * the range because on auto-range it changes underneath the data.
+     */
+    function calibrateGsrChannel(oc, gsrRangeSetting) {
+        const raw = oc.get(GSR_NAME, 'raw')?.value;
+        if (raw === undefined || raw === null || !Number.isFinite(raw))
+            return;
+        const { range, resistanceKOhms, conductanceUSiemens } = calibrateGsrSample(raw, gsrRangeSetting);
+        oc.add(GSR_NAME, conductanceUSiemens, CHANNEL_UNITS.MICRO_SIEMENS, 'cal');
+        oc.add(GSR_RESISTANCE_NAME, resistanceKOhms, CHANNEL_UNITS.KOHMS, 'cal');
+        oc.add(GSR_RANGE_NAME, range, CHANNEL_UNITS.NO_UNITS, 'cal');
+    }
+
+    /**
+     * Kinematic (accel/gyro/mag) calibration math and the 21-byte calibration
+     * parameter block codec.
+     *
+     * Pure, dependency-free port of the Shimmer Java driver:
+     *   com.shimmerresearch.driver.calibration.CalibDetailsKinematic
+     *     (parseCalParamByteArray / generateCalParamByteArray / scale factors)
+     *   com.shimmerresearch.driver.calibration.UtilCalibration
+     *     (calibrateInertialSensorData / matrixInverse3x3 — the efficient method)
+     *
+     * Calibration equation (Ferraris, Grimaldi & Parvis 1995), UtilCalibration §14-23:
+     *
+     *     C = R⁻¹ · K⁻¹ · (U − B)
+     *
+     * where C = calibrated vector, U = uncalibrated (raw) vector, B = offset,
+     * R = alignment matrix, K = diagonal sensitivity matrix. The driver's
+     * "efficient method" precomputes M = inv(R)·inv(K) once per calibration set and
+     * then evaluates C = M · (U − B) per sample — this module does the same.
+     */
+    /**
+     * Invert a 3x3 matrix (row-major, length 9) via the adjugate/determinant.
+     * Ported verbatim from UtilCalibration.matrixInverse3x3 (:133-162). Returns
+     * `null` when the matrix is singular (determinant 0).
+     */
+    function matrixInverse3x3(m) {
+        const a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5], g = m[6], h = m[7], i = m[8];
+        const det = a * e * i + b * f * g + c * d * h - c * e * g - b * d * i - a * f * h;
+        if (det === 0)
+            return null;
+        const inv = 1 / det;
+        return [
+            inv * (e * i - f * h),
+            inv * (c * h - b * i),
+            inv * (b * f - c * e),
+            inv * (f * g - d * i),
+            inv * (a * i - c * g),
+            inv * (c * d - a * f),
+            inv * (d * h - e * g),
+            inv * (g * b - a * h),
+            inv * (a * e - b * d),
+        ];
+    }
+    /** Multiply two 3x3 row-major matrices (length 9 each). */
+    function matrixMultiply3x3(x, y) {
+        const out = new Array(9);
+        for (let r = 0; r < 3; r++) {
+            for (let col = 0; col < 3; col++) {
+                out[r * 3 + col] =
+                    x[r * 3 + 0] * y[0 * 3 + col] +
+                        x[r * 3 + 1] * y[1 * 3 + col] +
+                        x[r * 3 + 2] * y[2 * 3 + col];
+            }
+        }
+        return out;
+    }
+    /**
+     * Build a {@link KinematicCalibration} from offset/sensitivity/alignment,
+     * precomputing M = inv(alignment)·inv(diag(sensitivity)) exactly as the Java
+     * efficient path does (UtilCalibration.calibrateInertialSensorData :78 with
+     * CalibArraysKinematic's cached matrixMultiplication(inv(AM), inv(SM))).
+     *
+     * A singular alignment or a zero sensitivity axis falls back to an identity M
+     * component so calibration never throws — matching the driver's tolerance of a
+     * degenerate default (it would emit NaN there rather than crash).
+     */
+    function makeKinematicCalibration(offset, sensitivity, alignment) {
+        const sm = [sensitivity[0], 0, 0, 0, sensitivity[1], 0, 0, 0, sensitivity[2]];
+        const invA = matrixInverse3x3(alignment) ?? [1, 0, 0, 0, 1, 0, 0, 0, 1];
+        const invS = matrixInverse3x3(sm) ?? [1, 0, 0, 0, 1, 0, 0, 0, 1];
+        const m = matrixMultiply3x3(invA, invS);
+        return {
+            offset: [offset[0], offset[1], offset[2]],
+            sensitivity: [sensitivity[0], sensitivity[1], sensitivity[2]],
+            alignment: [...alignment],
+            m,
+        };
+    }
+    /**
+     * Apply a calibration set to one raw tri-axial sample:
+     *
+     *     C = M · (U − B)
+     *
+     * with M = inv(R)·inv(K) precomputed in {@link KinematicCalibration.m}.
+     */
+    function calibrateVector3(raw, cal) {
+        const d0 = raw[0] - cal.offset[0];
+        const d1 = raw[1] - cal.offset[1];
+        const d2 = raw[2] - cal.offset[2];
+        const m = cal.m;
+        return [
+            m[0] * d0 + m[1] * d1 + m[2] * d2,
+            m[3] * d0 + m[4] * d1 + m[5] * d2,
+            m[6] * d0 + m[7] * d1 + m[8] * d2,
+        ];
+    }
+    const i16be = (b, o) => {
+        const v = ((b[o] << 8) | b[o + 1]) & 0xffff;
+        return v >= 0x8000 ? v - 0x10000 : v;
+    };
+    const i8 = (v) => (v >= 0x80 ? v - 0x100 : v);
+    const isAll = (b, byte) => {
+        for (let i = 0; i < b.length; i++)
+            if (b[i] !== byte)
+                return false;
+        return true;
+    };
+    /**
+     * Parse a 21-byte kinematic calibration parameter block.
+     *
+     * Layout (CalibDetailsKinematic.parseCalParamByteArray :250-280, decoded with
+     * UtilParseData.formatDataPacketReverse which is BIG-ENDIAN):
+     *   bytes 0..5   : 3 × i16 big-endian offset  (x, y, z)
+     *   bytes 6..11  : 3 × i16 big-endian sensitivity (x, y, z), ÷ sensitivityScale
+     *   bytes 12..20 : 9 × i8 alignment, row-major, ÷ 100
+     *
+     * An all-0xFF or all-0x00 block means "no calibration stored"
+     * (UtilShimmer.isAllFF / isAllZeros) and yields `null` so the caller keeps its
+     * default.
+     */
+    function parseKinematicCalibBlock(bytes, opts = {}) {
+        if (bytes.length < 21)
+            return null;
+        if (isAll(bytes, 0xff) || isAll(bytes, 0x00))
+            return null;
+        const sensScale = opts.sensitivityScale ?? 1;
+        const offset = [i16be(bytes, 0), i16be(bytes, 2), i16be(bytes, 4)];
+        const sensitivity = [
+            i16be(bytes, 6) / sensScale,
+            i16be(bytes, 8) / sensScale,
+            i16be(bytes, 10) / sensScale,
+        ];
+        const alignment = new Array(9);
+        for (let k = 0; k < 9; k++)
+            alignment[k] = i8(bytes[12 + k]) / 100;
+        return makeKinematicCalibration(offset, sensitivity, alignment);
+    }
+    /**
+     * Serialize offset/sensitivity/alignment back into a 21-byte block, inverse of
+     * {@link parseKinematicCalibBlock}. Ported from
+     * CalibDetailsKinematic.generateCalParamByteArray (:292-327): sensitivity is
+     * rounded after ×sensitivityScale, alignment rounded after ×100, offset stored
+     * as-is; all as big-endian i16 (offset, sensitivity) and i8 (alignment).
+     *
+     * Java truncates the offset with an `(int)` cast (`(int)offsetVector[i][0]`),
+     * NOT Math.round — a fractional offset drops its fractional part toward zero.
+     * We use Math.trunc to match that oracle behaviour exactly. Sensitivity and
+     * alignment are Math.round'd before their `(int)` cast in Java, so they keep
+     * Math.round here.
+     */
+    function generateKinematicCalibBlock(offset, sensitivity, alignment, opts = {}) {
+        const sensScale = opts.sensitivityScale ?? 1;
+        const out = new Uint8Array(21);
+        for (let i = 0; i < 3; i++) {
+            const v = Math.trunc(offset[i]) & 0xffff; // Java (int) cast truncates toward zero
+            out[i * 2] = (v >> 8) & 0xff;
+            out[i * 2 + 1] = v & 0xff;
+        }
+        for (let i = 0; i < 3; i++) {
+            const v = Math.round(sensitivity[i] * sensScale) & 0xffff;
+            out[6 + i * 2] = (v >> 8) & 0xff;
+            out[6 + i * 2 + 1] = v & 0xff;
+        }
+        for (let k = 0; k < 9; k++) {
+            out[12 + k] = Math.round(alignment[k] * 100) & 0xff;
+        }
+        return out;
+    }
+
+    /**
+     * Hard-coded default kinematic calibration matrices, ported from the Shimmer
+     * Java driver's per-sensor default constants. These are the already-scaled real
+     * values (e.g. gyro sensitivity 131, not 13100) the driver instantiates each
+     * CalibDetailsKinematic with when no per-device calibration is available.
+     *
+     * Sources (all READ-ONLY oracle):
+     *   Shimmer3 low-noise accel  : SensorKionixKXRB52042 (:38-55)
+     *   Shimmer3 wide-range accel + mag (old IMU) : SensorLSM303DLHC (:79-183, :325-358)
+     *   Shimmer3 wide-range accel + mag (new IMU) : SensorLSM303AH (:41-89, :174-206)
+     *   Shimmer3 gyro (MPU9x50)   : SensorMPU9X50 (:121-158, gyro scale ×100)
+     *   Shimmer3R LN accel + gyro : SensorLSM6DSV (:53-165, gyro scale ×100)
+     *   Shimmer3R WR accel        : SensorLIS2DW12 (:124-160)
+     *   Shimmer3R mag             : SensorLIS2MDL (:58-66)
+     *   Shimmer3R alt (high-g)    : SensorADXL371 (:113-124)
+     *   Shimmer3R alt mag         : SensorLIS3MDL (:59-89)
+     *
+     * NB: alignment matrices below are written row-major; the values are the true
+     * ±1/0 alignment entries (the driver stores them ×100 on the wire — see
+     * generateKinematicCalibBlock — but keeps the real values in these constants).
+     */
+    /**
+     * Emitted unit strings — exact Java strings (Configuration.java :162-164).
+     *
+     * Kept as its own name because callers index it by channel group; the strings
+     * themselves come from {@link CHANNEL_UNITS}, which is the whole vocabulary.
+     */
+    const INERTIAL_UNITS = Object.freeze({
+        accel: CHANNEL_UNITS.ACCEL,
+        gyro: CHANNEL_UNITS.GYRO,
+        mag: CHANNEL_UNITS.MAG,
+    });
+    const cal = (r) => makeKinematicCalibration(r.offset, r.sens, r.align);
+    // --- Common alignment matrices -----------------------------------------------
+    const ALIGN_KIONIX_LN = [0, -1, 0, -1, 0, 0, 0, 0, -1]; // Kionix KXRB LN accel (S3)
+    const ALIGN_MPU_GYRO = [0, -1, 0, -1, 0, 0, 0, 0, -1]; // MPU9x50 gyro (S3)
+    const ALIGN_LSM303DLHC = [-1, 0, 0, 0, 1, 0, 0, 0, -1]; // WR accel + mag (S3 old IMU)
+    const ALIGN_LSM303AH = [0, -1, 0, 1, 0, 0, 0, 0, -1]; // WR accel + mag (S3 new IMU)
+    const ALIGN_LSM6DSV = [-1, 0, 0, 0, 1, 0, 0, 0, -1]; // LN accel + gyro (S3R)
+    const ALIGN_LIS2DW12 = [0, -1, 0, -1, 0, 0, 0, 0, -1]; // WR accel (S3R)
+    const ALIGN_LIS2MDL = [-1, 0, 0, 0, -1, 0, 0, 0, -1]; // mag (S3R)
+    const ALIGN_LIS3MDL = [1, 0, 0, 0, -1, 0, 0, 0, -1]; // alt mag (S3R)
+    const ALIGN_ADXL371 = [0, 1, 0, 1, 0, 0, 0, 0, -1]; // high-g accel (S3R)
+    const ZERO_OFFSET = [0, 0, 0];
+    const diag = (s) => [s, s, s];
+    // -----------------------------------------------------------------------------
+    // Shimmer3, old IMU (LSM303DLHC accel+mag, MPU9x50 gyro, Kionix LN accel)
+    // -----------------------------------------------------------------------------
+    const SHIMMER3_OLD = Object.freeze({
+        lnAccel: {
+            unit: INERTIAL_UNITS.accel,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_KIONIX_LN, sens: diag(83), offset: [2047, 2047, 2047] }),
+            },
+        },
+        wrAccel: {
+            unit: INERTIAL_UNITS.accel,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LSM303DLHC, sens: diag(1631), offset: ZERO_OFFSET }),
+                1: cal({ align: ALIGN_LSM303DLHC, sens: diag(815), offset: ZERO_OFFSET }),
+                2: cal({ align: ALIGN_LSM303DLHC, sens: diag(408), offset: ZERO_OFFSET }),
+                3: cal({ align: ALIGN_LSM303DLHC, sens: diag(135), offset: ZERO_OFFSET }),
+            },
+        },
+        gyro: {
+            unit: INERTIAL_UNITS.gyro,
+            sensitivityScale: 100,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_MPU_GYRO, sens: diag(131), offset: ZERO_OFFSET }),
+                1: cal({ align: ALIGN_MPU_GYRO, sens: diag(65.5), offset: ZERO_OFFSET }),
+                2: cal({ align: ALIGN_MPU_GYRO, sens: diag(32.8), offset: ZERO_OFFSET }),
+                3: cal({ align: ALIGN_MPU_GYRO, sens: diag(16.4), offset: ZERO_OFFSET }),
+            },
+        },
+        mag: {
+            unit: INERTIAL_UNITS.mag,
+            sensitivityScale: 1,
+            fallbackRange: 1, // LSM303DLHC has no range 0; driver default is 1.3 Ga (range 1)
+            byRange: {
+                1: cal({ align: ALIGN_LSM303DLHC, sens: [1100, 1100, 980], offset: ZERO_OFFSET }),
+                2: cal({ align: ALIGN_LSM303DLHC, sens: [855, 855, 760], offset: ZERO_OFFSET }),
+                3: cal({ align: ALIGN_LSM303DLHC, sens: [670, 670, 600], offset: ZERO_OFFSET }),
+                4: cal({ align: ALIGN_LSM303DLHC, sens: [450, 450, 400], offset: ZERO_OFFSET }),
+                5: cal({ align: ALIGN_LSM303DLHC, sens: [400, 400, 355], offset: ZERO_OFFSET }),
+                6: cal({ align: ALIGN_LSM303DLHC, sens: [330, 330, 295], offset: ZERO_OFFSET }),
+                7: cal({ align: ALIGN_LSM303DLHC, sens: [230, 230, 205], offset: ZERO_OFFSET }),
+            },
+        },
+    });
+    // -----------------------------------------------------------------------------
+    // Shimmer3, new IMU (LSM303AHTR accel+mag, MPU9x50 gyro, Kionix LN accel).
+    // LSM303AH accel range→sensitivity mapping uses config values {0,2,3,1}
+    // (ListofLSM303AccelRangeConfigValues) → 2g/4g/8g/16g respectively.
+    // -----------------------------------------------------------------------------
+    const SHIMMER3_NEW = Object.freeze({
+        lnAccel: SHIMMER3_OLD.lnAccel, // Kionix LN accel unchanged on new-IMU boards
+        wrAccel: {
+            unit: INERTIAL_UNITS.accel,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LSM303AH, sens: diag(1671), offset: ZERO_OFFSET }), // 2g
+                2: cal({ align: ALIGN_LSM303AH, sens: diag(836), offset: ZERO_OFFSET }), // 4g
+                3: cal({ align: ALIGN_LSM303AH, sens: diag(418), offset: ZERO_OFFSET }), // 8g
+                1: cal({ align: ALIGN_LSM303AH, sens: diag(209), offset: ZERO_OFFSET }), // 16g
+            },
+        },
+        gyro: SHIMMER3_OLD.gyro, // MPU9x50 gyro unchanged
+        mag: {
+            unit: INERTIAL_UNITS.mag,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LSM303AH, sens: diag(667), offset: ZERO_OFFSET }),
+            },
+        },
+    });
+    // -----------------------------------------------------------------------------
+    // Shimmer3R (LSM6DSV LN accel+gyro, LIS2DW12 WR accel, LIS2MDL mag,
+    // ADXL371 high-g alt accel, LIS3MDL alt mag).
+    // -----------------------------------------------------------------------------
+    const SHIMMER3R = Object.freeze({
+        lnAccel: {
+            unit: INERTIAL_UNITS.accel,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LSM6DSV, sens: diag(1672), offset: ZERO_OFFSET }),
+                1: cal({ align: ALIGN_LSM6DSV, sens: diag(836), offset: ZERO_OFFSET }),
+                2: cal({ align: ALIGN_LSM6DSV, sens: diag(418), offset: ZERO_OFFSET }),
+                3: cal({ align: ALIGN_LSM6DSV, sens: diag(209), offset: ZERO_OFFSET }),
+            },
+        },
+        gyro: {
+            unit: INERTIAL_UNITS.gyro,
+            sensitivityScale: 100,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LSM6DSV, sens: diag(229), offset: ZERO_OFFSET }), // 125 dps
+                1: cal({ align: ALIGN_LSM6DSV, sens: diag(114), offset: ZERO_OFFSET }), // 250 dps
+                2: cal({ align: ALIGN_LSM6DSV, sens: diag(57), offset: ZERO_OFFSET }), // 500 dps
+                3: cal({ align: ALIGN_LSM6DSV, sens: diag(29), offset: ZERO_OFFSET }), // 1000 dps
+                4: cal({ align: ALIGN_LSM6DSV, sens: diag(14), offset: ZERO_OFFSET }), // 2000 dps
+                5: cal({ align: ALIGN_LSM6DSV, sens: diag(7), offset: ZERO_OFFSET }), // 4000 dps
+            },
+        },
+        wrAccel: {
+            unit: INERTIAL_UNITS.accel,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LIS2DW12, sens: diag(1671), offset: ZERO_OFFSET }),
+                1: cal({ align: ALIGN_LIS2DW12, sens: diag(836), offset: ZERO_OFFSET }),
+                2: cal({ align: ALIGN_LIS2DW12, sens: diag(418), offset: ZERO_OFFSET }),
+                3: cal({ align: ALIGN_LIS2DW12, sens: diag(209), offset: ZERO_OFFSET }),
+            },
+        },
+        mag: {
+            unit: INERTIAL_UNITS.mag,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LIS2MDL, sens: diag(667), offset: ZERO_OFFSET }),
+            },
+        },
+        altAccel: {
+            unit: INERTIAL_UNITS.accel,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_ADXL371, sens: diag(1), offset: [10, 10, 10] }),
+            },
+        },
+        altMag: {
+            unit: INERTIAL_UNITS.mag,
+            sensitivityScale: 1,
+            fallbackRange: 0,
+            byRange: {
+                0: cal({ align: ALIGN_LIS3MDL, sens: diag(6842), offset: ZERO_OFFSET }), // 4 Ga
+                1: cal({ align: ALIGN_LIS3MDL, sens: diag(3421), offset: ZERO_OFFSET }), // 8 Ga
+                2: cal({ align: ALIGN_LIS3MDL, sens: diag(2281), offset: ZERO_OFFSET }), // 12 Ga
+                3: cal({ align: ALIGN_LIS3MDL, sens: diag(1711), offset: ZERO_OFFSET }), // 16 Ga
+            },
+        },
+    });
+    const FAMILY_DEFAULTS = Object.freeze({
+        'shimmer3-old': SHIMMER3_OLD,
+        'shimmer3-new': SHIMMER3_NEW,
+        shimmer3r: SHIMMER3R,
+    });
+    /** Return the default group table for a family, or null if the group is absent. */
+    function getGroupDefaults(family, group) {
+        return FAMILY_DEFAULTS[family][group] ?? null;
+    }
+    /**
+     * Select the default {@link KinematicCalibration} for a family/group/range.
+     * Falls back to the group's `fallbackRange` when the range value has no entry.
+     * Returns `null` when the family has no such group.
+     */
+    function getDefaultCalibration(family, group, range) {
+        const g = getGroupDefaults(family, group);
+        if (!g)
+            return null;
+        const calibration = g.byRange[range] ?? g.byRange[g.fallbackRange];
+        if (!calibration)
+            return null;
+        return { calibration, unit: g.unit, sensitivityScale: g.sensitivityScale };
+    }
+
+    /**
+     * Streaming-path inertial calibration.
+     *
+     * Applies kinematic calibration to the inertial channels of a decoded
+     * {@link ObjectCluster}, adding a `'cal'` field per axis (unit m/(s^2) | deg/s |
+     * local_flux) alongside the existing `'raw'` field — exactly how the streaming
+     * clients already emit GSR (raw + calibrated). Calibration is chosen per group:
+     * a device calibration fetched via `readCalibration()` (source-priority ladder)
+     * wins, otherwise the range-selected default is used.
+     */
+    /**
+     * Streaming channel triples by group. Names match the SDK's streaming channel
+     * naming (CHANNEL_FORMATS / Shimmer3 schema); a group is calibrated only when
+     * all three axis channels are present in the frame.
+     */
+    const STREAM_GROUPS = Object.freeze([
+        { group: 'lnAccel', axes: ['LN_ACCEL_X', 'LN_ACCEL_Y', 'LN_ACCEL_Z'] },
+        { group: 'wrAccel', axes: ['WR_ACCEL_X', 'WR_ACCEL_Y', 'WR_ACCEL_Z'] },
+        { group: 'gyro', axes: ['GYRO_X', 'GYRO_Y', 'GYRO_Z'] },
+        { group: 'mag', axes: ['MAG_X', 'MAG_Y', 'MAG_Z'] },
+        { group: 'altAccel', axes: ['HG_ACCEL_X', 'HG_ACCEL_Y', 'HG_ACCEL_Z'] },
+        { group: 'altMag', axes: ['ALT_MAG_X', 'ALT_MAG_Y', 'ALT_MAG_Z'] },
+    ]);
+    const rangeFor = (ranges, group) => ranges[group];
+    /**
+     * Add calibrated (`'cal'`) fields to the inertial channels present in `oc`.
+     * No-op for channels not present. Uses the raw (`'raw'`) fields as input.
+     */
+    function applyStreamingCalibration(oc, state) {
+        for (const { group, axes } of STREAM_GROUPS) {
+            const fx = oc.get(axes[0], 'raw');
+            const fy = oc.get(axes[1], 'raw');
+            const fz = oc.get(axes[2], 'raw');
+            if (!fx || !fy || !fz)
+                continue;
+            const def = getDefaultCalibration(state.family, group, rangeFor(state.ranges, group));
+            if (!def)
+                continue;
+            const cal = state.device?.[group] ?? def.calibration;
+            const [cx, cy, cz] = calibrateVector3([fx.value, fy.value, fz.value], cal);
+            oc.add(axes[0], cx, def.unit, 'cal');
+            oc.add(axes[1], cy, def.unit, 'cal');
+            oc.add(axes[2], cz, def.unit, 'cal');
+        }
+    }
+
+    /**
+     * Per-channel streaming calibration: one registry, both clients.
+     *
+     * Every channel a Shimmer3 or Shimmer3R can stream gets a calibrated value
+     * with a unit here, so a host can plot and record engineering units for all of
+     * them rather than for the inertial triples and GSR alone.
+     *
+     * **What the device calibrates, and what it does not.** Only the kinematic
+     * sensors carry per-device calibration: the firmware seeds exactly those
+     * (`Calibration/shimmer_calibration.c` `ShimCalib_defaultAll`) and
+     * `ShimCalib_findLength` answers zero for every other sensor id. Battery, the
+     * ADC lines, PPG, GSR, the bridge amplifier and both ExG chips have no stored
+     * parameters at all — a host converts them with fixed formulas, and this module
+     * is that. Pressure sits between the two: nothing per-device is stored, but the
+     * part's own factory trim has to be fetched once
+     * (`Shimmer3RClient.readPressureCalibration()`).
+     *
+     * **The ADC reference is 3.0 V at 12 bits, on both generations.** On a
+     * Shimmer3R every analog path right-aligns a 12-bit result and converts against
+     * `VREF_EXTERNAL_SUPPLY_MV` = 3000: the ADS7028 packer masks with `0x0FFF`
+     * (`Core/Src/spi.c:1415-1419`), the driver's own conversion is
+     * `adcValue * 3000 / 4095`
+     * (`Shimmer_Driver/ADS7028_38/hal_ads7028_38.c:614`), and the STM32's ADC runs
+     * at `ADC_RESOLUTION_12B`. The Java driver's `u14` type string for these
+     * channels describes no shipping firmware path — the only 14-bit resolution in
+     * the platform code is under `SHIMMER4_SDK` — so dividing by 16383 would report
+     * values four times too small.
+     */
+    // ---------------------------------------------------------------------------
+    // ADC constants
+    // ---------------------------------------------------------------------------
+    /** ADC reference, in volts. `Shimmer_Driver/hal_Board.h` `VREF_EXTERNAL_SUPPLY_MV`. */
+    const ADC_VREF_VOLTS = 3;
+    /** ADC resolution in bits, both generations. */
+    const ADC_BITS = 12;
+    /**
+     * The battery input's resistive divider.
+     *
+     * The firmware's own conversions are `((raw * 3000) >> 12) * 2` on Shimmer3 and
+     * `raw * 3000 / 4095 * 2` on Shimmer3R (`Shimmer_Driver/hal_adc.c`,
+     * `saveBatteryVoltageAndUpdateStatus`), and the Java driver's live path also
+     * doubles (`ShimmerObject.java:1343`). Java's `SensorBattVoltage` class instead
+     * carries 1.988; the firmware's figure wins, and the two differ by 0.6%.
+     */
+    const BATTERY_DIVIDER_RATIO = 2;
+    /** Raw ADC counts → millivolts, the one formula every analog channel uses. */
+    const adcMillivolts = (raw) => calibrateU12AdcValue(raw, 0, ADC_VREF_VOLTS, 1);
+    /** An ADC line reported in millivolts, with no scaling of its own. */
+    const adcChannel = {
+        unit: CHANNEL_UNITS.MILLIVOLTS,
+        calibrate: (raw) => adcMillivolts(raw),
+    };
+    /** An ExG signal channel. */
+    const exgChannel = (chip, channel, resolution) => ({
+        unit: CHANNEL_UNITS.MILLIVOLTS,
+        calibrate: (raw, state) => calibrateExgSample(raw, chip === 1 ? (state.exg?.exg1 ?? null) : (state.exg?.exg2 ?? null), channel, resolution),
+    });
+    /**
+     * Every channel whose calibration is a function of one raw value, keyed by the
+     * name the stream decoder emits.
+     *
+     * Both generations' names appear: the ADC block's ids are reused with different
+     * meanings on the two platforms (`EXT_EXP_ADC_A7` on a Shimmer3 is `EXT_ADC_0`
+     * on a Shimmer3R), and the numbers are identical either way, so a name-keyed
+     * table serves both without a generation branch.
+     *
+     * Absent by design: the six inertial triples and GSR (whole-group
+     * calibrations, below), `PRESSURE`/`TEMPERATURE` (a pair, and needing the
+     * fetched coefficients), and `TIMESTAMP` (a clock, handled by the client).
+     */
+    const SCALAR_CALIBRATORS = Object.freeze({
+        // Battery: an ADC line behind a x2 divider.
+        BATTERY: {
+            unit: CHANNEL_UNITS.MILLIVOLTS,
+            calibrate: (raw) => adcMillivolts(raw) * BATTERY_DIVIDER_RATIO,
+        },
+        // External ADC — Shimmer3 names, then Shimmer3R names for the same lines.
+        EXT_EXP_ADC_A7: adcChannel,
+        EXT_EXP_ADC_A6: adcChannel,
+        EXT_EXP_ADC_A15: adcChannel,
+        EXT_ADC_0: adcChannel,
+        EXT_ADC_1: adcChannel,
+        EXT_ADC_2: adcChannel,
+        // Internal ADC.
+        INT_EXP_ADC_A1: adcChannel,
+        INT_EXP_ADC_A12: adcChannel,
+        INT_EXP_ADC_A14: adcChannel,
+        INT_ADC_3: adcChannel,
+        INT_ADC_0: adcChannel,
+        INT_ADC_2: adcChannel,
+        /*
+         * PPG is the internal ADC line the optical front end sits on, and the Java
+         * driver calibrates it as exactly that — `SensorPPG.processDataCustom`
+         * delegates to `SensorADC.processMspAdcChannel` (:853-855). There is no
+         * optical scaling to apply: millivolts at the ADC is what the sensor
+         * measures.
+         */
+        PPG: adcChannel,
+        /*
+         * Bridge amplifier, Shimmer3 only. Offset and gain are the SR49 board's, held
+         * host-side because the firmware does not know them
+         * (`SensorBridgeAmp.java:315-337`).
+         */
+        BRIDGE_AMP_HIGH: {
+            unit: CHANNEL_UNITS.MILLIVOLTS,
+            calibrate: (raw) => calibrateU12AdcValue(raw, 60, ADC_VREF_VOLTS, 551),
+        },
+        BRIDGE_AMP_LOW: {
+            unit: CHANNEL_UNITS.MILLIVOLTS,
+            calibrate: (raw) => calibrateU12AdcValue(raw, 1950, ADC_VREF_VOLTS, 183.7),
+        },
+        // ExG signal channels, both chips at both widths.
+        Exg1_CH1_24Bit: exgChannel(1, 1, '24bit'),
+        Exg1_CH2_24Bit: exgChannel(1, 2, '24bit'),
+        Exg2_CH1_24Bit: exgChannel(2, 1, '24bit'),
+        Exg2_CH2_24Bit: exgChannel(2, 2, '24bit'),
+        Exg1_CH1_16Bit: exgChannel(1, 1, '16bit'),
+        Exg1_CH2_16Bit: exgChannel(1, 2, '16bit'),
+        Exg2_CH1_16Bit: exgChannel(2, 1, '16bit'),
+        Exg2_CH2_16Bit: exgChannel(2, 2, '16bit'),
+        /*
+         * The ExG status byte is the chip's lead-off register passed through
+         * untouched, so its "calibrated" value is the same number with no unit —
+         * which is what the Java driver emits for it (`SensorEXG.java:1127`,
+         * `ShimmerObject.java:1767`). Emitting it keeps a CSV's lead-off columns
+         * present when a host records calibrated values only.
+         */
+        Exg1_Status: {
+            unit: CHANNEL_UNITS.NO_UNITS,
+            calibrate: (raw) => raw,
+        },
+        Exg2_Status: {
+            unit: CHANNEL_UNITS.NO_UNITS,
+            calibrate: (raw) => raw,
+        },
+    });
+    // ---------------------------------------------------------------------------
+    // Pressure / temperature
+    // ---------------------------------------------------------------------------
+    /**
+     * `'Timestamp_Unix'` — Unix milliseconds per sample.
+     *
+     * Only present when the client's timeline has an anchor. The name is the one
+     * Consensys writes into its own exports, so a recording from either tool
+     * describes wall-clock time under the same header.
+     */
+    const UNIX_TIMESTAMP_NAME = 'Timestamp_Unix';
+    /** `'PRESSURE'`, in kPa once compensated. */
+    const PRESSURE_NAME = 'PRESSURE';
+    /** `'TEMPERATURE'`, in °C once compensated. */
+    const TEMPERATURE_NAME = 'TEMPERATURE';
+    /**
+     * Compensate the pressure/temperature pair, or leave both raw-only.
+     *
+     * The two are compensated together — the pressure maths needs the linearised
+     * temperature — so either both cal fields appear or neither does. Nothing
+     * appears at all without the part's coefficients: a Bosch compensation run
+     * against a blank block returns a confident, wrong pressure, so the honest
+     * answer is to say nothing and let the host report that the channels are
+     * raw-only.
+     */
+    function calibratePressurePair(oc, state) {
+        const pressure = oc.get(PRESSURE_NAME, 'raw')?.value;
+        const temperature = oc.get(TEMPERATURE_NAME, 'raw')?.value;
+        if (!Number.isFinite(pressure) || !Number.isFinite(temperature))
+            return;
+        const out = compensatePressure(state.pressure, pressure, temperature, state.pressureOversampling);
+        if (!out)
+            return;
+        oc.add(PRESSURE_NAME, out.pressureKPa, CHANNEL_UNITS.KPASCAL, 'cal');
+        oc.add(TEMPERATURE_NAME, out.temperatureC, CHANNEL_UNITS.DEGREES_CELSIUS, 'cal');
+    }
+    // ---------------------------------------------------------------------------
+    // Entry point
+    // ---------------------------------------------------------------------------
+    /**
+     * Add a calibrated (`'cal'`) field, with a unit, for every channel in `oc` this
+     * SDK can convert.
+     *
+     * Purely additive: the raw fields are left exactly as the decoder wrote them,
+     * so a host can plot either and a CSV can carry both. A channel this SDK has no
+     * conversion for keeps its raw field alone rather than gaining a `'cal'` field
+     * that is the same number — which would claim a calibration that does not
+     * exist.
+     */
+    function calibrateStreamFrame(oc, state) {
+        // Snapshot first: the loop adds fields, and iterating the live array would
+        // then walk over its own output.
+        for (const field of [...oc.fields]) {
+            if (field.kind !== 'raw')
+                continue;
+            const calibrator = SCALAR_CALIBRATORS[field.name];
+            if (!calibrator)
+                continue;
+            if (!Number.isFinite(field.value))
+                continue;
+            oc.add(field.name, calibrator.calibrate(field.value, state), calibrator.unit, 'cal');
+        }
+        calibrateGsrChannel(oc, state.gsrRange);
+        calibratePressurePair(oc, state);
+        if (state.emitInertial) {
+            applyStreamingCalibration(oc, {
+                family: state.family,
+                ranges: state.ranges,
+                device: state.device,
+            });
+        }
+    }
+
+    /**
+     * Calibration-domain sensor ids, and the mapping from a calibration dump's
+     * records onto this SDK's inertial channel groups.
+     *
+     * The ids are the firmware's own `SC_SENSOR_*`
+     * (`log-and-stream-common/Calibration/shimmer_calibration.h:99-116`). They are
+     * **not** the SDK's Verisense `CalibSensorId`, which disagrees on two values:
+     * there 40 is an LSM6DS3 accelerometer and 41 an LSM6DS3 gyroscope, where
+     * Shimmer3R firmware uses 40 for the ADXL371 high-g accelerometer and 41 for
+     * the LIS3MDL alternative magnetometer. Reading a Shimmer3R dump through the
+     * Verisense table mislabels two of its six sensors, so the two tables stay
+     * separate and this one is named for the firmware it came from.
+     */
+    /**
+     * `SC_SENSOR_*` from the firmware. The Shimmer3 and Shimmer3R sets are in
+     * mutually exclusive `#if` blocks there; both are listed here because one host
+     * talks to both platforms and a dump carries its own hardware id.
+     */
+    const SC_SENSOR = Object.freeze({
+        ANALOG_ACCEL: 2,
+        MPU9X50_GYRO: 30,
+        LSM303_ACCEL: 31,
+        LSM303_MAG: 32,
+        MPU9X50_ACCEL: 33,
+        MPU9X50_MAG: 34,
+        BMP180_PRESSURE: 36,
+        LSM6DSV_ACCEL: 37,
+        LSM6DSV_GYRO: 38,
+        LIS2DW12_ACCEL: 39,
+        ADXL371_ACCEL: 40,
+        LIS3MDL_MAG: 41,
+        LIS2MDL_MAG: 42,
+        BMP390_PRESSURE: 43,
+        BMP581_PRESSURE: 44,
+        HOST_ECG: 100,
+        ALL: 0xff,
+    });
+    /** Human-readable name per id, for a log line or a card title. */
+    const SC_SENSOR_NAMES = Object.freeze({
+        [SC_SENSOR.ANALOG_ACCEL]: 'Low-noise accelerometer (analog)',
+        [SC_SENSOR.MPU9X50_GYRO]: 'Gyroscope (MPU9x50/ICM20948)',
+        [SC_SENSOR.LSM303_ACCEL]: 'Wide-range accelerometer (LSM303)',
+        [SC_SENSOR.LSM303_MAG]: 'Magnetometer (LSM303)',
+        [SC_SENSOR.MPU9X50_ACCEL]: 'Accelerometer (MPU9x50/ICM20948)',
+        [SC_SENSOR.MPU9X50_MAG]: 'Magnetometer (MPU9x50/ICM20948)',
+        [SC_SENSOR.BMP180_PRESSURE]: 'Pressure (BMP180/BMP280)',
+        [SC_SENSOR.LSM6DSV_ACCEL]: 'Low-noise accelerometer (LSM6DSV)',
+        [SC_SENSOR.LSM6DSV_GYRO]: 'Gyroscope (LSM6DSV)',
+        [SC_SENSOR.LIS2DW12_ACCEL]: 'Wide-range accelerometer (LIS2DW12)',
+        [SC_SENSOR.ADXL371_ACCEL]: 'High-g accelerometer (ADXL371)',
+        [SC_SENSOR.LIS3MDL_MAG]: 'Alternative magnetometer (LIS3MDL)',
+        [SC_SENSOR.LIS2MDL_MAG]: 'Magnetometer (LIS2MDL)',
+        [SC_SENSOR.BMP390_PRESSURE]: 'Pressure (BMP390)',
+        [SC_SENSOR.BMP581_PRESSURE]: 'Pressure (BMP581)',
+        [SC_SENSOR.HOST_ECG]: 'ECG (host-derived)',
+    });
+    /**
+     * Which `SC_SENSOR_*` id carries each channel group's calibration, per family.
+     *
+     * A Shimmer3 has no high-g accelerometer and no second magnetometer, so those
+     * two groups are absent from both Shimmer3 rows — a dump from one cannot carry
+     * them, and inventing an id would make a lookup succeed against the wrong
+     * record.
+     */
+    const CALIB_SENSOR_ID_BY_GROUP = Object.freeze({
+        'shimmer3-old': Object.freeze({
+            lnAccel: SC_SENSOR.ANALOG_ACCEL,
+            wrAccel: SC_SENSOR.LSM303_ACCEL,
+            gyro: SC_SENSOR.MPU9X50_GYRO,
+            mag: SC_SENSOR.LSM303_MAG,
+        }),
+        'shimmer3-new': Object.freeze({
+            lnAccel: SC_SENSOR.ANALOG_ACCEL,
+            wrAccel: SC_SENSOR.LSM303_ACCEL,
+            gyro: SC_SENSOR.MPU9X50_GYRO,
+            mag: SC_SENSOR.LSM303_MAG,
+        }),
+        shimmer3r: Object.freeze({
+            lnAccel: SC_SENSOR.LSM6DSV_ACCEL,
+            wrAccel: SC_SENSOR.LIS2DW12_ACCEL,
+            gyro: SC_SENSOR.LSM6DSV_GYRO,
+            mag: SC_SENSOR.LIS2MDL_MAG,
+            altAccel: SC_SENSOR.ADXL371_ACCEL,
+            altMag: SC_SENSOR.LIS3MDL_MAG,
+        }),
+    });
+    /** The dump sensor id for one group, or `undefined` if that family lacks it. */
+    function calibSensorIdForGroup(family, group) {
+        return CALIB_SENSOR_ID_BY_GROUP[family][group];
+    }
+    /** The group a dump sensor id belongs to, or `null` for one that is not inertial. */
+    function groupForCalibSensorId(family, sensorId) {
+        const table = CALIB_SENSOR_ID_BY_GROUP[family];
+        for (const group of Object.keys(table)) {
+            if (table[group] === sensorId)
+                return group;
+        }
+        return null;
+    }
+    /**
+     * Pull every usable inertial calibration out of a parsed dump, keyed by group
+     * and then by hardware range.
+     *
+     * Keyed by range rather than flattened to "the current one" because the dump
+     * carries ranges that are not currently selected — that is most of the point of
+     * it — and the selected range changes while a host is connected. A caller keeps
+     * this and re-selects from it whenever a range setter runs.
+     *
+     * Records this SDK cannot use are dropped rather than guessed at: a sensor id
+     * that is not an inertial group (a pressure coefficient block, say), and a
+     * block that holds nothing — all `0xFF` or all `0x00`, which
+     * {@link parseKinematicCalibBlock} answers `null` for. Dropping the latter is
+     * what keeps a factory default in force instead of calibrating against zeros.
+     */
+    function selectDumpCalibrations(dump, family) {
+        const out = {};
+        for (const record of dump.records) {
+            const group = groupForCalibSensorId(family, record.sensorId);
+            if (!group)
+                continue;
+            const defaults = getDefaultCalibration(family, group, record.range);
+            if (!defaults)
+                continue;
+            const parsed = parseKinematicCalibBlock(record.calibBytes, {
+                sensitivityScale: defaults.sensitivityScale,
+            });
+            if (!parsed)
+                continue;
+            (out[group] ?? (out[group] = {}))[record.range] = parsed;
+        }
+        return out;
+    }
+
+    /**
+     * Pressure/temperature sensor identity, coefficient block sizes and the shapes
+     * the compensation functions exchange.
+     *
+     * Four Bosch parts appear across the Shimmer3 family, and a host needs to know
+     * which one is fitted before it can turn a raw reading into kPa: three of them
+     * need their factory trim coefficients, and the fourth needs none because it
+     * compensates on-chip.
+     *
+     * The firmware answers that question in-band. `GET_PRESSURE_CALIBRATION_COEFFICIENTS`
+     * (0xA7) replies `[0xA6][1 + n][sensorId][coeffs × n]`, where the length byte
+     * counts the id (`log-and-stream-common/Comms/shimmer_bt_uart.c:2064-2099`, ids
+     * at `Comms/shimmer_bt_uart.h:297-300`). A BMP581 answers with the id and
+     * nothing else, which is a success rather than a refusal — the firmware's own
+     * comment says the id is sent in-band precisely so a host can tell it from an
+     * older firmware's NACK.
+     */
+    /**
+     * `sensorId` byte in a `PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE`.
+     * `Comms/shimmer_bt_uart.h:297-300`.
+     */
+    const PRESSURE_SENSOR_ID = Object.freeze({
+        0: 'bmp180',
+        1: 'bmp280',
+        2: 'bmp390',
+        3: 'bmp581',
+    });
+    /** Inverse of {@link PRESSURE_SENSOR_ID}. */
+    const PRESSURE_SENSOR_ID_BY_KIND = Object.freeze({
+        bmp180: 0,
+        bmp280: 1,
+        bmp390: 2,
+        bmp581: 3,
+    });
+    /**
+     * Coefficient bytes each part sends after the id byte.
+     *
+     * BMP180 22 and BMP280 24 (`Shimmer_Driver/BMP280_driver/bmp280.h:693,740`),
+     * BMP390 21 (`BMP3_LEN_CALIB_DATA`, `Shimmer_Driver/BMP3/hal_bmp3.h:16`),
+     * BMP581 **zero** — it streams pre-compensated values.
+     */
+    const PRESSURE_COEFFICIENT_BYTES = Object.freeze({
+        bmp180: 22,
+        bmp280: 24,
+        bmp390: 21,
+        bmp581: 0,
+    });
+    /**
+     * Largest payload a 0xA6 response can carry, after the length byte: the id plus
+     * the biggest coefficient block (BMP280's 24). Used to bound the framer so a
+     * corrupt length cannot make a reader wait for bytes that will never come.
+     */
+    const PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD = 1 + 24;
+
+    /**
+     * `PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE` (0xA6) payload parsing.
+     */
+    /**
+     * Fill patterns that mean "there is nothing here".
+     *
+     * `0xFF` is erased flash and `0x00` an unwritten block — the two the Java
+     * driver rejects (`CalibDetailsBmp180.parseCalParamByteArray:46-49`). `0x01` is
+     * this SDK's addition, and it is not hypothetical: asked for BMP180
+     * coefficients on a board carrying a BMP280, the classic Shimmer3 firmware
+     * answers a full-length block of `0x01` filler rather than refusing
+     * (`ccs_workspace/FW_Shimmer3/LogAndStream/main.c` `GET_BMP180_CALIBRATION_…`,
+     * and the same `memset(…, 0x01, …)` survives in
+     * `log-and-stream-common/Comms/shimmer_bt_uart.c:2033-2037`). Compensating
+     * against it yields a confident, wrong pressure.
+     */
+    const BLANK_FILL_BYTES = [0x00, 0xff, 0x01];
+    const isBlankBlock = (bytes) => bytes.length === 0 || BLANK_FILL_BYTES.some((fill) => isUniformByteArray(bytes, fill));
+    function parseCoefficients(sensor, bytes) {
+        switch (sensor) {
+            case 'bmp180':
+                return parseBmp180Coefficients(bytes);
+            case 'bmp280':
+                return parseBmp280Coefficients(bytes);
+            case 'bmp390':
+                return parseBmp390Coefficients(bytes);
+            case 'bmp581':
+                return null;
+        }
+    }
+    /**
+     * Parse a 0xA6 payload — `[sensorId][coeffs…]`, i.e. everything after the
+     * opcode and its length byte.
+     *
+     * @throws RangeError when the payload is empty, the sensor id is not one of the
+     *   four the firmware can report, or the block is not the length that part
+     *   sends. All three mean the bytes are not what they claim to be, and a
+     *   silently accepted short block would be compensated against whatever
+     *   followed it in memory.
+     */
+    function parsePressureCalibrationResponse(payload) {
+        if (payload.length < 1) {
+            throw new RangeError('Pressure calibration response carried no sensor id.');
+        }
+        const id = payload[0];
+        const sensor = PRESSURE_SENSOR_ID[id];
+        if (!sensor) {
+            throw new RangeError(`Pressure calibration response reported unknown sensor id ${id}; ` +
+                `expected 0 (BMP180), 1 (BMP280), 2 (BMP390) or 3 (BMP581).`);
+        }
+        const raw = payload.slice(1);
+        const expected = PRESSURE_COEFFICIENT_BYTES[sensor];
+        if (raw.length !== expected) {
+            throw new RangeError(`Pressure calibration response for ${sensor} carried ${raw.length} coefficient ` +
+                `byte(s); expected ${expected}.`);
+        }
+        // A BMP581 sends no block, and that is the whole point — it needs none.
+        if (sensor === 'bmp581') {
+            return { sensor, coefficients: null, calibrated: true, raw };
+        }
+        if (isBlankBlock(raw)) {
+            return { sensor, coefficients: null, calibrated: false, raw };
+        }
+        const coefficients = parseCoefficients(sensor, raw);
+        return { sensor, coefficients, calibrated: coefficients !== null, raw };
     }
 
     /**
@@ -5644,7 +7440,7 @@
             throw new Error(`Inquiry response truncated: ${u8.length} bytes, need ${headerEnd + declaredChannels} ` +
                 `for the ${declaredChannels} channels it declares.`);
         }
-        const adcRaw = u16le$3(u8, base + 0);
+        const adcRaw = u16le$4(u8, base + 0);
         const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
         // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
         const configByte0 = ((u8[base + 2] | (u8[base + 3] << 8) | (u8[base + 4] << 16) | (u8[base + 5] << 24)) >>> 0) >>>
@@ -5654,6 +7450,7 @@
         const magRange = (configByte0 & 0xe00000) >>> 21;
         const gsrRange = (configByte0 >>> 25) & 0x7;
         const internalExpPower = (configByte0 >>> 24) & 0x1;
+        const pressureResolution = (configByte0 >>> 28) & 0x3;
         const numChannels = declaredChannels;
         const bufferSize = u8[base + 7];
         const chStart = headerEnd;
@@ -5677,6 +7474,7 @@
             accelRange,
             gyroRange,
             magRange,
+            pressureResolution,
             numChannels,
             bufferSize,
             channelIds,
@@ -5841,6 +7639,13 @@
         [OPCODES.DEVICE_VERSION_RESPONSE]: 1, // 0x25
         [OPCODES.GSR_RANGE_RESPONSE]: 1, // 0x22
         [OPCODES.INTERNAL_EXP_POWER_ENABLE_RESPONSE]: 1, // 0x5F
+        /* The two legacy pressure-coefficient replies are a bare fixed-length block
+           with no length byte: 22 bytes for a BMP180 and 24 for a BMP280
+           (`Shimmer_Driver/BMP280_driver/bmp280.h:693,740`). Older LogAndStream
+           firmware serves only these, and serves them without a NACK for the wrong
+           one, so a host tries both — see `Shimmer3Client.readPressureCalibration`. */
+        [OPCODES.BMP180_CALIBRATION_COEFFICIENTS_RESPONSE]: 22, // 0x58
+        [OPCODES.BMP280_CALIBRATION_COEFFICIENTS_RESPONSE]: 24, // 0x9F
     });
     /** Sentinel: need more bytes before the message length can be determined. */
     const NEED_MORE$1 = -1;
@@ -5908,6 +7713,18 @@
             if (memLen > 128)
                 return RESYNC$1;
             return 2 + memLen;
+        }
+        if (opcode === OPCODES.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE) {
+            // Variable length: [opcode][1 + n][sensorId][coeffs...]. The length byte
+            // counts the sensor id, and the largest block any part sends is the
+            // BMP280's 24 bytes, so anything beyond that is garbage rather than a
+            // giant response. A BMP581 answers length 1 — the id alone.
+            if (buf.length < 2)
+                return NEED_MORE$1;
+            const declared = buf[1];
+            if (declared < 1 || declared > PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD)
+                return RESYNC$1;
+            return 2 + declared;
         }
         const payload = SHIMMER3_RESPONSE_PAYLOAD_LENGTHS[opcode];
         if (payload === undefined)
@@ -6919,6 +8736,13 @@
         [OPCODES.RWC_RESPONSE]: 8, // 0x90 64-bit ticks, LSB first
         // 0xA5 — DATA_RATE_TEST_PACKET_SIZE is 5 in the firmware: header + u32 counter
         [OPCODES.DATA_RATE_TEST_RESPONSE]: 4,
+        /* The two legacy pressure-coefficient replies: a bare fixed-length block
+           with no length byte, 22 bytes for a BMP180 and 24 for a BMP280. Only
+           firmware old enough to lack 0xA7 serves them, and this client also drives
+           a classic Shimmer3 over RFCOMM, where an unframed reply would otherwise
+           resync a byte at a time. */
+        [OPCODES.BMP180_CALIBRATION_COEFFICIENTS_RESPONSE]: 22,
+        [OPCODES.BMP280_CALIBRATION_COEFFICIENTS_RESPONSE]: 24,
     });
     /** SD-transfer response opcodes, which {@link sdMessageSpan} owns. */
     const SD_RESPONSE_OPCODES = new Set([
@@ -7003,6 +8827,10 @@
         [OPCODES.INFOMEM_RESPONSE]: 128,
         [OPCODES.DAUGHTER_CARD_ID_RESPONSE]: 16,
         [OPCODES.BT_VERSION_STR_RESPONSE]: 99,
+        /* [0xA6][1 + n][sensorId][coeffs…]: the id plus the largest coefficient
+           block any part sends (the BMP280's 24). A BMP581 answers with the id
+           alone, length 1, which this cap admits. */
+        [OPCODES.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE]: PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD,
     });
     /**
      * Total length (INCLUDING the leading opcode) of the control message at the
@@ -7095,383 +8923,6 @@
             return RESYNC;
         const total = 1 + payload;
         return buf.length < total ? NEED_MORE : total;
-    }
-
-    /**
-     * Kinematic (accel/gyro/mag) calibration math and the 21-byte calibration
-     * parameter block codec.
-     *
-     * Pure, dependency-free port of the Shimmer Java driver:
-     *   com.shimmerresearch.driver.calibration.CalibDetailsKinematic
-     *     (parseCalParamByteArray / generateCalParamByteArray / scale factors)
-     *   com.shimmerresearch.driver.calibration.UtilCalibration
-     *     (calibrateInertialSensorData / matrixInverse3x3 — the efficient method)
-     *
-     * Calibration equation (Ferraris, Grimaldi & Parvis 1995), UtilCalibration §14-23:
-     *
-     *     C = R⁻¹ · K⁻¹ · (U − B)
-     *
-     * where C = calibrated vector, U = uncalibrated (raw) vector, B = offset,
-     * R = alignment matrix, K = diagonal sensitivity matrix. The driver's
-     * "efficient method" precomputes M = inv(R)·inv(K) once per calibration set and
-     * then evaluates C = M · (U − B) per sample — this module does the same.
-     */
-    /**
-     * Invert a 3x3 matrix (row-major, length 9) via the adjugate/determinant.
-     * Ported verbatim from UtilCalibration.matrixInverse3x3 (:133-162). Returns
-     * `null` when the matrix is singular (determinant 0).
-     */
-    function matrixInverse3x3(m) {
-        const a = m[0], b = m[1], c = m[2], d = m[3], e = m[4], f = m[5], g = m[6], h = m[7], i = m[8];
-        const det = a * e * i + b * f * g + c * d * h - c * e * g - b * d * i - a * f * h;
-        if (det === 0)
-            return null;
-        const inv = 1 / det;
-        return [
-            inv * (e * i - f * h),
-            inv * (c * h - b * i),
-            inv * (b * f - c * e),
-            inv * (f * g - d * i),
-            inv * (a * i - c * g),
-            inv * (c * d - a * f),
-            inv * (d * h - e * g),
-            inv * (g * b - a * h),
-            inv * (a * e - b * d),
-        ];
-    }
-    /** Multiply two 3x3 row-major matrices (length 9 each). */
-    function matrixMultiply3x3(x, y) {
-        const out = new Array(9);
-        for (let r = 0; r < 3; r++) {
-            for (let col = 0; col < 3; col++) {
-                out[r * 3 + col] =
-                    x[r * 3 + 0] * y[0 * 3 + col] +
-                        x[r * 3 + 1] * y[1 * 3 + col] +
-                        x[r * 3 + 2] * y[2 * 3 + col];
-            }
-        }
-        return out;
-    }
-    /**
-     * Build a {@link KinematicCalibration} from offset/sensitivity/alignment,
-     * precomputing M = inv(alignment)·inv(diag(sensitivity)) exactly as the Java
-     * efficient path does (UtilCalibration.calibrateInertialSensorData :78 with
-     * CalibArraysKinematic's cached matrixMultiplication(inv(AM), inv(SM))).
-     *
-     * A singular alignment or a zero sensitivity axis falls back to an identity M
-     * component so calibration never throws — matching the driver's tolerance of a
-     * degenerate default (it would emit NaN there rather than crash).
-     */
-    function makeKinematicCalibration(offset, sensitivity, alignment) {
-        const sm = [sensitivity[0], 0, 0, 0, sensitivity[1], 0, 0, 0, sensitivity[2]];
-        const invA = matrixInverse3x3(alignment) ?? [1, 0, 0, 0, 1, 0, 0, 0, 1];
-        const invS = matrixInverse3x3(sm) ?? [1, 0, 0, 0, 1, 0, 0, 0, 1];
-        const m = matrixMultiply3x3(invA, invS);
-        return {
-            offset: [offset[0], offset[1], offset[2]],
-            sensitivity: [sensitivity[0], sensitivity[1], sensitivity[2]],
-            alignment: [...alignment],
-            m,
-        };
-    }
-    /**
-     * Apply a calibration set to one raw tri-axial sample:
-     *
-     *     C = M · (U − B)
-     *
-     * with M = inv(R)·inv(K) precomputed in {@link KinematicCalibration.m}.
-     */
-    function calibrateVector3(raw, cal) {
-        const d0 = raw[0] - cal.offset[0];
-        const d1 = raw[1] - cal.offset[1];
-        const d2 = raw[2] - cal.offset[2];
-        const m = cal.m;
-        return [
-            m[0] * d0 + m[1] * d1 + m[2] * d2,
-            m[3] * d0 + m[4] * d1 + m[5] * d2,
-            m[6] * d0 + m[7] * d1 + m[8] * d2,
-        ];
-    }
-    const i16be = (b, o) => {
-        const v = ((b[o] << 8) | b[o + 1]) & 0xffff;
-        return v >= 0x8000 ? v - 0x10000 : v;
-    };
-    const i8 = (v) => (v >= 0x80 ? v - 0x100 : v);
-    const isAll = (b, byte) => {
-        for (let i = 0; i < b.length; i++)
-            if (b[i] !== byte)
-                return false;
-        return true;
-    };
-    /**
-     * Parse a 21-byte kinematic calibration parameter block.
-     *
-     * Layout (CalibDetailsKinematic.parseCalParamByteArray :250-280, decoded with
-     * UtilParseData.formatDataPacketReverse which is BIG-ENDIAN):
-     *   bytes 0..5   : 3 × i16 big-endian offset  (x, y, z)
-     *   bytes 6..11  : 3 × i16 big-endian sensitivity (x, y, z), ÷ sensitivityScale
-     *   bytes 12..20 : 9 × i8 alignment, row-major, ÷ 100
-     *
-     * An all-0xFF or all-0x00 block means "no calibration stored"
-     * (UtilShimmer.isAllFF / isAllZeros) and yields `null` so the caller keeps its
-     * default.
-     */
-    function parseKinematicCalibBlock(bytes, opts = {}) {
-        if (bytes.length < 21)
-            return null;
-        if (isAll(bytes, 0xff) || isAll(bytes, 0x00))
-            return null;
-        const sensScale = opts.sensitivityScale ?? 1;
-        const offset = [i16be(bytes, 0), i16be(bytes, 2), i16be(bytes, 4)];
-        const sensitivity = [
-            i16be(bytes, 6) / sensScale,
-            i16be(bytes, 8) / sensScale,
-            i16be(bytes, 10) / sensScale,
-        ];
-        const alignment = new Array(9);
-        for (let k = 0; k < 9; k++)
-            alignment[k] = i8(bytes[12 + k]) / 100;
-        return makeKinematicCalibration(offset, sensitivity, alignment);
-    }
-    /**
-     * Serialize offset/sensitivity/alignment back into a 21-byte block, inverse of
-     * {@link parseKinematicCalibBlock}. Ported from
-     * CalibDetailsKinematic.generateCalParamByteArray (:292-327): sensitivity is
-     * rounded after ×sensitivityScale, alignment rounded after ×100, offset stored
-     * as-is; all as big-endian i16 (offset, sensitivity) and i8 (alignment).
-     *
-     * Java truncates the offset with an `(int)` cast (`(int)offsetVector[i][0]`),
-     * NOT Math.round — a fractional offset drops its fractional part toward zero.
-     * We use Math.trunc to match that oracle behaviour exactly. Sensitivity and
-     * alignment are Math.round'd before their `(int)` cast in Java, so they keep
-     * Math.round here.
-     */
-    function generateKinematicCalibBlock(offset, sensitivity, alignment, opts = {}) {
-        const sensScale = opts.sensitivityScale ?? 1;
-        const out = new Uint8Array(21);
-        for (let i = 0; i < 3; i++) {
-            const v = Math.trunc(offset[i]) & 0xffff; // Java (int) cast truncates toward zero
-            out[i * 2] = (v >> 8) & 0xff;
-            out[i * 2 + 1] = v & 0xff;
-        }
-        for (let i = 0; i < 3; i++) {
-            const v = Math.round(sensitivity[i] * sensScale) & 0xffff;
-            out[6 + i * 2] = (v >> 8) & 0xff;
-            out[6 + i * 2 + 1] = v & 0xff;
-        }
-        for (let k = 0; k < 9; k++) {
-            out[12 + k] = Math.round(alignment[k] * 100) & 0xff;
-        }
-        return out;
-    }
-
-    /**
-     * Hard-coded default kinematic calibration matrices, ported from the Shimmer
-     * Java driver's per-sensor default constants. These are the already-scaled real
-     * values (e.g. gyro sensitivity 131, not 13100) the driver instantiates each
-     * CalibDetailsKinematic with when no per-device calibration is available.
-     *
-     * Sources (all READ-ONLY oracle):
-     *   Shimmer3 low-noise accel  : SensorKionixKXRB52042 (:38-55)
-     *   Shimmer3 wide-range accel + mag (old IMU) : SensorLSM303DLHC (:79-183, :325-358)
-     *   Shimmer3 wide-range accel + mag (new IMU) : SensorLSM303AH (:41-89, :174-206)
-     *   Shimmer3 gyro (MPU9x50)   : SensorMPU9X50 (:121-158, gyro scale ×100)
-     *   Shimmer3R LN accel + gyro : SensorLSM6DSV (:53-165, gyro scale ×100)
-     *   Shimmer3R WR accel        : SensorLIS2DW12 (:124-160)
-     *   Shimmer3R mag             : SensorLIS2MDL (:58-66)
-     *   Shimmer3R alt (high-g)    : SensorADXL371 (:113-124)
-     *   Shimmer3R alt mag         : SensorLIS3MDL (:59-89)
-     *
-     * NB: alignment matrices below are written row-major; the values are the true
-     * ±1/0 alignment entries (the driver stores them ×100 on the wire — see
-     * generateKinematicCalibBlock — but keeps the real values in these constants).
-     */
-    /** Emitted unit strings — exact Java strings (Configuration.java :162-164). */
-    const INERTIAL_UNITS = Object.freeze({
-        accel: 'm/(s^2)',
-        gyro: 'deg/s',
-        mag: 'local_flux',
-    });
-    const cal = (r) => makeKinematicCalibration(r.offset, r.sens, r.align);
-    // --- Common alignment matrices -----------------------------------------------
-    const ALIGN_KIONIX_LN = [0, -1, 0, -1, 0, 0, 0, 0, -1]; // Kionix KXRB LN accel (S3)
-    const ALIGN_MPU_GYRO = [0, -1, 0, -1, 0, 0, 0, 0, -1]; // MPU9x50 gyro (S3)
-    const ALIGN_LSM303DLHC = [-1, 0, 0, 0, 1, 0, 0, 0, -1]; // WR accel + mag (S3 old IMU)
-    const ALIGN_LSM303AH = [0, -1, 0, 1, 0, 0, 0, 0, -1]; // WR accel + mag (S3 new IMU)
-    const ALIGN_LSM6DSV = [-1, 0, 0, 0, 1, 0, 0, 0, -1]; // LN accel + gyro (S3R)
-    const ALIGN_LIS2DW12 = [0, -1, 0, -1, 0, 0, 0, 0, -1]; // WR accel (S3R)
-    const ALIGN_LIS2MDL = [-1, 0, 0, 0, -1, 0, 0, 0, -1]; // mag (S3R)
-    const ALIGN_LIS3MDL = [1, 0, 0, 0, -1, 0, 0, 0, -1]; // alt mag (S3R)
-    const ALIGN_ADXL371 = [0, 1, 0, 1, 0, 0, 0, 0, -1]; // high-g accel (S3R)
-    const ZERO_OFFSET = [0, 0, 0];
-    const diag = (s) => [s, s, s];
-    // -----------------------------------------------------------------------------
-    // Shimmer3, old IMU (LSM303DLHC accel+mag, MPU9x50 gyro, Kionix LN accel)
-    // -----------------------------------------------------------------------------
-    const SHIMMER3_OLD = Object.freeze({
-        lnAccel: {
-            unit: INERTIAL_UNITS.accel,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_KIONIX_LN, sens: diag(83), offset: [2047, 2047, 2047] }),
-            },
-        },
-        wrAccel: {
-            unit: INERTIAL_UNITS.accel,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LSM303DLHC, sens: diag(1631), offset: ZERO_OFFSET }),
-                1: cal({ align: ALIGN_LSM303DLHC, sens: diag(815), offset: ZERO_OFFSET }),
-                2: cal({ align: ALIGN_LSM303DLHC, sens: diag(408), offset: ZERO_OFFSET }),
-                3: cal({ align: ALIGN_LSM303DLHC, sens: diag(135), offset: ZERO_OFFSET }),
-            },
-        },
-        gyro: {
-            unit: INERTIAL_UNITS.gyro,
-            sensitivityScale: 100,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_MPU_GYRO, sens: diag(131), offset: ZERO_OFFSET }),
-                1: cal({ align: ALIGN_MPU_GYRO, sens: diag(65.5), offset: ZERO_OFFSET }),
-                2: cal({ align: ALIGN_MPU_GYRO, sens: diag(32.8), offset: ZERO_OFFSET }),
-                3: cal({ align: ALIGN_MPU_GYRO, sens: diag(16.4), offset: ZERO_OFFSET }),
-            },
-        },
-        mag: {
-            unit: INERTIAL_UNITS.mag,
-            sensitivityScale: 1,
-            fallbackRange: 1, // LSM303DLHC has no range 0; driver default is 1.3 Ga (range 1)
-            byRange: {
-                1: cal({ align: ALIGN_LSM303DLHC, sens: [1100, 1100, 980], offset: ZERO_OFFSET }),
-                2: cal({ align: ALIGN_LSM303DLHC, sens: [855, 855, 760], offset: ZERO_OFFSET }),
-                3: cal({ align: ALIGN_LSM303DLHC, sens: [670, 670, 600], offset: ZERO_OFFSET }),
-                4: cal({ align: ALIGN_LSM303DLHC, sens: [450, 450, 400], offset: ZERO_OFFSET }),
-                5: cal({ align: ALIGN_LSM303DLHC, sens: [400, 400, 355], offset: ZERO_OFFSET }),
-                6: cal({ align: ALIGN_LSM303DLHC, sens: [330, 330, 295], offset: ZERO_OFFSET }),
-                7: cal({ align: ALIGN_LSM303DLHC, sens: [230, 230, 205], offset: ZERO_OFFSET }),
-            },
-        },
-    });
-    // -----------------------------------------------------------------------------
-    // Shimmer3, new IMU (LSM303AHTR accel+mag, MPU9x50 gyro, Kionix LN accel).
-    // LSM303AH accel range→sensitivity mapping uses config values {0,2,3,1}
-    // (ListofLSM303AccelRangeConfigValues) → 2g/4g/8g/16g respectively.
-    // -----------------------------------------------------------------------------
-    const SHIMMER3_NEW = Object.freeze({
-        lnAccel: SHIMMER3_OLD.lnAccel, // Kionix LN accel unchanged on new-IMU boards
-        wrAccel: {
-            unit: INERTIAL_UNITS.accel,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LSM303AH, sens: diag(1671), offset: ZERO_OFFSET }), // 2g
-                2: cal({ align: ALIGN_LSM303AH, sens: diag(836), offset: ZERO_OFFSET }), // 4g
-                3: cal({ align: ALIGN_LSM303AH, sens: diag(418), offset: ZERO_OFFSET }), // 8g
-                1: cal({ align: ALIGN_LSM303AH, sens: diag(209), offset: ZERO_OFFSET }), // 16g
-            },
-        },
-        gyro: SHIMMER3_OLD.gyro, // MPU9x50 gyro unchanged
-        mag: {
-            unit: INERTIAL_UNITS.mag,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LSM303AH, sens: diag(667), offset: ZERO_OFFSET }),
-            },
-        },
-    });
-    // -----------------------------------------------------------------------------
-    // Shimmer3R (LSM6DSV LN accel+gyro, LIS2DW12 WR accel, LIS2MDL mag,
-    // ADXL371 high-g alt accel, LIS3MDL alt mag).
-    // -----------------------------------------------------------------------------
-    const SHIMMER3R = Object.freeze({
-        lnAccel: {
-            unit: INERTIAL_UNITS.accel,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LSM6DSV, sens: diag(1672), offset: ZERO_OFFSET }),
-                1: cal({ align: ALIGN_LSM6DSV, sens: diag(836), offset: ZERO_OFFSET }),
-                2: cal({ align: ALIGN_LSM6DSV, sens: diag(418), offset: ZERO_OFFSET }),
-                3: cal({ align: ALIGN_LSM6DSV, sens: diag(209), offset: ZERO_OFFSET }),
-            },
-        },
-        gyro: {
-            unit: INERTIAL_UNITS.gyro,
-            sensitivityScale: 100,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LSM6DSV, sens: diag(229), offset: ZERO_OFFSET }), // 125 dps
-                1: cal({ align: ALIGN_LSM6DSV, sens: diag(114), offset: ZERO_OFFSET }), // 250 dps
-                2: cal({ align: ALIGN_LSM6DSV, sens: diag(57), offset: ZERO_OFFSET }), // 500 dps
-                3: cal({ align: ALIGN_LSM6DSV, sens: diag(29), offset: ZERO_OFFSET }), // 1000 dps
-                4: cal({ align: ALIGN_LSM6DSV, sens: diag(14), offset: ZERO_OFFSET }), // 2000 dps
-                5: cal({ align: ALIGN_LSM6DSV, sens: diag(7), offset: ZERO_OFFSET }), // 4000 dps
-            },
-        },
-        wrAccel: {
-            unit: INERTIAL_UNITS.accel,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LIS2DW12, sens: diag(1671), offset: ZERO_OFFSET }),
-                1: cal({ align: ALIGN_LIS2DW12, sens: diag(836), offset: ZERO_OFFSET }),
-                2: cal({ align: ALIGN_LIS2DW12, sens: diag(418), offset: ZERO_OFFSET }),
-                3: cal({ align: ALIGN_LIS2DW12, sens: diag(209), offset: ZERO_OFFSET }),
-            },
-        },
-        mag: {
-            unit: INERTIAL_UNITS.mag,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LIS2MDL, sens: diag(667), offset: ZERO_OFFSET }),
-            },
-        },
-        altAccel: {
-            unit: INERTIAL_UNITS.accel,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_ADXL371, sens: diag(1), offset: [10, 10, 10] }),
-            },
-        },
-        altMag: {
-            unit: INERTIAL_UNITS.mag,
-            sensitivityScale: 1,
-            fallbackRange: 0,
-            byRange: {
-                0: cal({ align: ALIGN_LIS3MDL, sens: diag(6842), offset: ZERO_OFFSET }), // 4 Ga
-                1: cal({ align: ALIGN_LIS3MDL, sens: diag(3421), offset: ZERO_OFFSET }), // 8 Ga
-                2: cal({ align: ALIGN_LIS3MDL, sens: diag(2281), offset: ZERO_OFFSET }), // 12 Ga
-                3: cal({ align: ALIGN_LIS3MDL, sens: diag(1711), offset: ZERO_OFFSET }), // 16 Ga
-            },
-        },
-    });
-    const FAMILY_DEFAULTS = Object.freeze({
-        'shimmer3-old': SHIMMER3_OLD,
-        'shimmer3-new': SHIMMER3_NEW,
-        shimmer3r: SHIMMER3R,
-    });
-    /** Return the default group table for a family, or null if the group is absent. */
-    function getGroupDefaults(family, group) {
-        return FAMILY_DEFAULTS[family][group] ?? null;
-    }
-    /**
-     * Select the default {@link KinematicCalibration} for a family/group/range.
-     * Falls back to the group's `fallbackRange` when the range value has no entry.
-     * Returns `null` when the family has no such group.
-     */
-    function getDefaultCalibration(family, group, range) {
-        const g = getGroupDefaults(family, group);
-        if (!g)
-            return null;
-        const calibration = g.byRange[range] ?? g.byRange[g.fallbackRange];
-        if (!calibration)
-            return null;
-        return { calibration, unit: g.unit, sensitivityScale: g.sensitivityScale };
     }
 
     /**
@@ -7623,52 +9074,6 @@
             return true;
         }
         return incoming >= current;
-    }
-
-    /**
-     * Streaming-path inertial calibration.
-     *
-     * Applies kinematic calibration to the inertial channels of a decoded
-     * {@link ObjectCluster}, adding a `'cal'` field per axis (unit m/(s^2) | deg/s |
-     * local_flux) alongside the existing `'raw'` field — exactly how the streaming
-     * clients already emit GSR (raw + calibrated). Calibration is chosen per group:
-     * a device calibration fetched via `readCalibration()` (source-priority ladder)
-     * wins, otherwise the range-selected default is used.
-     */
-    /**
-     * Streaming channel triples by group. Names match the SDK's streaming channel
-     * naming (CHANNEL_FORMATS / Shimmer3 schema); a group is calibrated only when
-     * all three axis channels are present in the frame.
-     */
-    const STREAM_GROUPS = Object.freeze([
-        { group: 'lnAccel', axes: ['LN_ACCEL_X', 'LN_ACCEL_Y', 'LN_ACCEL_Z'] },
-        { group: 'wrAccel', axes: ['WR_ACCEL_X', 'WR_ACCEL_Y', 'WR_ACCEL_Z'] },
-        { group: 'gyro', axes: ['GYRO_X', 'GYRO_Y', 'GYRO_Z'] },
-        { group: 'mag', axes: ['MAG_X', 'MAG_Y', 'MAG_Z'] },
-        { group: 'altAccel', axes: ['HG_ACCEL_X', 'HG_ACCEL_Y', 'HG_ACCEL_Z'] },
-        { group: 'altMag', axes: ['ALT_MAG_X', 'ALT_MAG_Y', 'ALT_MAG_Z'] },
-    ]);
-    const rangeFor = (ranges, group) => ranges[group];
-    /**
-     * Add calibrated (`'cal'`) fields to the inertial channels present in `oc`.
-     * No-op for channels not present. Uses the raw (`'raw'`) fields as input.
-     */
-    function applyStreamingCalibration(oc, state) {
-        for (const { group, axes } of STREAM_GROUPS) {
-            const fx = oc.get(axes[0], 'raw');
-            const fy = oc.get(axes[1], 'raw');
-            const fz = oc.get(axes[2], 'raw');
-            if (!fx || !fy || !fz)
-                continue;
-            const def = getDefaultCalibration(state.family, group, rangeFor(state.ranges, group));
-            if (!def)
-                continue;
-            const cal = state.device?.[group] ?? def.calibration;
-            const [cx, cy, cz] = calibrateVector3([fx.value, fy.value, fz.value], cal);
-            oc.add(axes[0], cx, def.unit, 'cal');
-            oc.add(axes[1], cy, def.unit, 'cal');
-            oc.add(axes[2], cz, def.unit, 'cal');
-        }
     }
 
     /**
@@ -10322,10 +11727,63 @@
             /** When false, inertial channels are emitted raw-only (no `'cal'` field). Default true. */
             this.emitCalibratedInertial = true;
             /**
-             * Device calibrations fetched via {@link readCalibration}. These override the
-             * range-selected defaults (calibration source-priority ladder).
+             * The kinematic calibration actually applied to each streamed inertial group:
+             * whichever of the dump and the per-sensor commands won, at the range now
+             * configured. Recomputed by {@link _reselectDeviceCalibrations}; a group
+             * absent here streams against its range-selected default.
              */
             this._deviceCalibrations = {};
+            /**
+             * Every usable block from the calibration dump, by group and range
+             * ({@link applyCalibDump}). Kept whole rather than flattened because the
+             * configured range changes while a host is connected, and the dump covers
+             * ranges that are not currently selected.
+             */
+            this._dumpCalibrations = {};
+            /**
+             * Blocks fetched by {@link readCalibration}, with the range each was read at.
+             *
+             * The per-sensor commands answer for the *currently configured* range only
+             * and do not say which that was, so the range in force at read time is
+             * recorded with them. Once a range setter runs, a block read at the old range
+             * no longer describes the sensor and is dropped rather than misapplied.
+             */
+            this._btCommandCalibrations = {};
+            /**
+             * Both ExG chips' register banks, when a host has read them. The millivolt
+             * conversion needs the PGA gain and the reference voltage out of these; with
+             * `null` the chip defaults are assumed (gain 6, 2.42 V).
+             */
+            this._exgBanks = null;
+            /** Where {@link _exgBanks} came from, for {@link calibrationInfo}. */
+            this._exgBanksSource = null;
+            /**
+             * The fitted pressure part and its factory trim
+             * ({@link readPressureCalibration}). Without it PRESSURE and TEMPERATURE
+             * stream raw-only — a Bosch compensation against a blank block returns a
+             * confident, wrong pressure.
+             */
+            this._pressureCalibration = null;
+            /**
+             * Configured pressure oversampling, 0-3, from the inquiry's config word.
+             * Only the BMP180 uses it, and there it is part of the pressure maths rather
+             * than a scale applied afterwards.
+             */
+            this.pressureOversampling = 0;
+            /**
+             * Unwraps the sample counter and, once anchored, places every sample on a
+             * wall clock. See `core/StreamTimeline.ts`.
+             *
+             * On a Shimmer3R the anchor is exact: the packet timestamp is the low 24 bits
+             * of the same counter `GET_RWC` reads, so one clock reading pins the whole
+             * stream to the tick.
+             */
+            this._timeline = new StreamTimeline({ timestampBits: 24 });
+            /**
+             * Whether {@link startStreaming} reads the real-world clock first, to place
+             * samples on a wall clock. Default true; one round trip.
+             */
+            this.anchorStreamClock = true;
             /** Minimum valid GSR conductance in µS (below this, connectivity = "Disconnected"). */
             this.LIMIT_MIN_VALID_USIEMENS = 0.03;
             // Callbacks
@@ -10832,6 +12290,25 @@
             this._crcMode = CRC_MODE.OFF;
             this._crcFailures = 0;
             this._sdKnownSession = null;
+            this._resetCalibrationState();
+            this._timeline.reset();
+        }
+        /**
+         * Forget everything read off the device about how to calibrate it.
+         *
+         * Per link, and in the same place as the rest of the per-link state: a
+         * calibration belongs to the device that answered, and carrying one across a
+         * reconnect would calibrate a different sensor's data with it. The
+         * configured ranges are deliberately NOT reset here — they are refreshed by
+         * the next inquiry, which every connect performs.
+         */
+        _resetCalibrationState() {
+            this._deviceCalibrations = {};
+            this._dumpCalibrations = {};
+            this._btCommandCalibrations = {};
+            this._exgBanks = null;
+            this._exgBanksSource = null;
+            this._pressureCalibration = null;
         }
         /**
          * Abandon an in-flight factory-test capture because the link has gone. No
@@ -11098,7 +12575,83 @@
             const ackRemainder = await this._writeExpectingAck(cmd, 1500);
             this._emitStatus('SET_GYRO_RANGE (ACK received).');
             this.imuRanges = { ...this.imuRanges, gyro: gyroRange };
+            this._reselectDeviceCalibrations();
             return { gyroRange, ackRemainder };
+        }
+        /**
+         * Set the alternative magnetometer (LIS3MDL) range on a Shimmer3R.
+         *
+         * The command is `SET_MAG_GAIN` (0x37) — the same opcode a Shimmer3 uses for
+         * its own magnetometer range, which the Shimmer3R firmware routes to
+         * `altMagRange` (`Comms/shimmer_bt_uart.c`, the `SET_MAG_GAIN` case). The
+         * setting reads back in the inquiry's ConfigSetupByte2 bits 5-7.
+         *
+         * Worth having for calibration rather than for configuration: the LIS3MDL's
+         * four ranges have sensitivities 6842/3421/2281/1711 LSB/gauss, so streaming
+         * an alt-mag channel against the wrong one is out by up to a factor of four.
+         *
+         * @param range 0 = ±4, 1 = ±8, 2 = ±12, 3 = ±16 gauss.
+         */
+        async setAltMagRange(range) {
+            if (!Number.isInteger(range) || range < 0 || range > 3) {
+                throw new Error('altMagRange must be 0–3 (±4/8/12/16 Ga)');
+            }
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            const cmd = new Uint8Array([OPCODES.SET_MAG_GAIN_COMMAND, range & 0xff]);
+            this._emitStatus('SET_MAG_GAIN (alt mag range) → waiting for ACK…');
+            const ackRemainder = await this._writeExpectingAck(cmd, 1500);
+            this._emitStatus('SET_MAG_GAIN (ACK received).');
+            this.imuRanges = { ...this.imuRanges, altMag: range };
+            this._reselectDeviceCalibrations();
+            return { altMagRange: range, ackRemainder };
+        }
+        /**
+         * Read the fitted pressure sensor's identity and its factory trim
+         * coefficients, so PRESSURE and TEMPERATURE can be streamed in kPa and °C.
+         *
+         * `GET_PRESSURE_CALIBRATION_COEFFICIENTS` (0xA7) answers
+         * `[0xA6][1 + n][sensorId][coeffs × n]`
+         * (`log-and-stream-common/Comms/shimmer_bt_uart.c:2064-2099`). One round trip,
+         * and the answer cannot change while the link is up — the part is soldered
+         * down — so a host calls this once, on connect.
+         *
+         * **A refusal is not an error.** Firmware older than the command NACKs it, and
+         * older still does not answer at all; either way the honest outcome is that
+         * these two channels stream raw-only, which this reports through
+         * {@link onStatus} and by returning `null`. Throwing would make a host choose
+         * between failing a whole connect over an optional capability and swallowing
+         * every pressure fault alike. A BMP581 answering with its id and no
+         * coefficients is a **success**: it compensates on-chip, and the firmware
+         * sends the id in-band precisely so a host can tell that from a NACK.
+         *
+         * HARDWARE-VERIFY: no real sensor has answered this command through this SDK.
+         * The reply shape is read from the firmware source and pinned by tests
+         * against a scripted device.
+         *
+         * @throws Error only when not connected.
+         */
+        async readPressureCalibration(timeoutMs = 2000) {
+            if (!this._transport)
+                throw new Error('Not connected (RX missing)');
+            try {
+                const payload = await this._readLengthPrefixedResponse(new Uint8Array([OPCODES.GET_PRESSURE_CALIBRATION_COEFFICIENTS_COMMAND]), OPCODES.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE, 'declared', 'Pressure calibration read', 1, 1500, timeoutMs);
+                const calibration = parsePressureCalibrationResponse(payload);
+                this._pressureCalibration = calibration;
+                this._emitStatus(calibration.calibrated
+                    ? `Pressure sensor ${calibration.sensor}: ${calibration.coefficients
+                    ? 'coefficients loaded'
+                    : 'pre-compensated, no coefficients needed'}.`
+                    : `Pressure sensor ${calibration.sensor} returned a blank coefficient block; ` +
+                        'PRESSURE and TEMPERATURE stream raw-only.');
+                return calibration;
+            }
+            catch (err) {
+                this._pressureCalibration = null;
+                this._emitStatus('This firmware does not serve GET_PRESSURE_CALIBRATION_COEFFICIENTS (0xA7), so ' +
+                    `PRESSURE and TEMPERATURE stream raw-only (${err.message}).`);
+                return null;
+            }
         }
         getInternalExpPower() {
             return this.ExpPower;
@@ -11653,7 +13206,35 @@
             if (!this._transport)
                 throw new Error('Not connected (RX missing)');
             const ctx = await this._infoMemCtx();
-            return parseInfoMem(await this._readInfoMemBytesImpl(ctx), ctx);
+            const config = parseInfoMem(await this._readInfoMemBytesImpl(ctx), ctx);
+            this._adoptConfigForCalibration(config);
+            return config;
+        }
+        /**
+         * Take from a configuration image the few settings the streaming conversion
+         * depends on.
+         *
+         * A side effect on a read, which is worth justifying: without it a host that
+         * reads the image — which every connect does — still converts ExG counts
+         * against the chip's default gain, because the stored banks are the only
+         * statement of it available before a stream starts and `readExgConfig`
+         * cannot run during one. The values are the device's own; nothing here
+         * overrides something a host set more recently, because the image IS what the
+         * host would have set.
+         *
+         * The ExG banks are marked as coming from the image rather than the chip:
+         * the firmware forces some bits at sensing start (`CLK_EN` where the clock
+         * lines are tied), so a bank read back from the chip can differ from the
+         * stored one, and {@link calibrationInfo} says which a host is looking at.
+         */
+        _adoptConfigForCalibration(config) {
+            if (config.exg1?.length === EXG_BANK_LENGTH$1 && config.exg2?.length === EXG_BANK_LENGTH$1) {
+                // A bank read from the chip itself is the better source; do not demote it.
+                if (this._exgBanksSource !== 'device') {
+                    this._exgBanks = { exg1: config.exg1, exg2: config.exg2 };
+                    this._exgBanksSource = 'infomem';
+                }
+            }
         }
         /**
          * Encode and write a configuration to the device over the radio — the
@@ -11865,6 +13446,7 @@
         async getRtcTime() {
             if (!this._transport)
                 throw new Error('Not connected (RX missing)');
+            const hostBeforeMs = Date.now();
             const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_RWC_COMMAND]), 1500);
             const rsp = remainder && remainder[0] === OPCODES.RWC_RESPONSE
                 ? remainder
@@ -11881,7 +13463,20 @@
             for (let i = 8; i >= 1; i--) {
                 ticks = (ticks << 8n) | BigInt(rsp[i]);
             }
-            return { ticks, unixMs: Number(ticks) / 32.768 };
+            const unixMs = Number(ticks) / 32.768;
+            /* Anchor the stream timeline on the way past. The midpoint of the exchange
+               is the best single estimate of when the device composed its reply, and
+               the round trip is the uncertainty — neither matters for the aligned case,
+               where the sample's own counter value carries the answer, but both are
+               recorded so `timelineState` can report honestly either way. */
+            const hostAfterMs = Date.now();
+            this._timeline.anchorToRwc(ticks, (hostBeforeMs + hostAfterMs) / 2, {
+                rttMs: hostAfterMs - hostBeforeMs,
+                // The Shimmer3R's packet timestamp IS the low 24 bits of this counter
+                // (`Sensing/shimmer_sensing.c:445-476`, `RTC/shimmer_rtc.h:25-28`).
+                aligned: this.generation === 'shimmer3r',
+            });
+            return { ticks, unixMs };
         }
         /**
          * Set the device's real-world clock (SET_RWC_COMMAND) to the given Unix
@@ -11905,6 +13500,11 @@
             cmd[0] = OPCODES.SET_RWC_COMMAND;
             cmd.set(msToRtcBytesLE(unixMs), 1);
             await this._writeExpectingAck(cmd, 1500);
+            /* The write steps the very counter the samples are timed by, so any anchor
+               taken before it is now void. Dropped rather than adjusted: the host knows
+               what it asked for but not what the device rounded it to, and a re-read is
+               one round trip. */
+            this._timeline.clearAnchor();
             this._emitStatus('RWC set');
         }
         // ---------------------------------------------------------------------------
@@ -11933,6 +13533,12 @@
                 throw new Error('Cannot read ExG registers while streaming');
             const exg1 = await this._readExgChip(EXG_CHIP1, timeoutMs);
             const exg2 = await this._readExgChip(EXG_CHIP2, timeoutMs);
+            /* Cache for the streaming conversion: the millivolt factor needs the PGA
+               gain and the reference voltage, and this is the authoritative answer for
+               both — the chip's own registers rather than what the stored image says
+               they should be. */
+            this._exgBanks = { exg1, exg2 };
+            this._exgBanksSource = 'device';
             return { exg1, exg2 };
         }
         /**
@@ -12140,7 +13746,10 @@
                 try {
                     const cal = await this._readOneCalibration(group, get, resp, timeoutMs);
                     if (cal) {
-                        this._deviceCalibrations[group] = cal;
+                        /* With the range it was read at: these commands answer for the
+                           CONFIGURED range and do not say which that was, so the block stops
+                           applying the moment a range setter runs. */
+                        this._btCommandCalibrations[group] = { cal, range: this.imuRanges[group] };
                         done.push(group);
                     }
                 }
@@ -12148,6 +13757,7 @@
                     this._emitStatus(`readCalibration(${group}) skipped: ${err.message}`);
                 }
             }
+            this._reselectDeviceCalibrations();
             return done;
         }
         async _readOneCalibration(group, getOpcode, respOpcode, timeoutMs) {
@@ -12198,7 +13808,7 @@
             }
             // +2: the u16 length field counts the bytes AFTER itself
             // (`ShimCalib_ramWrite`, Calibration/shimmer_calibration.c:346-349).
-            const total = u16le$3(head, 0) + 2;
+            const total = u16le$4(head, 0) + 2;
             if (total <= 2 || total > MAX_CALIB_DUMP_BYTES) {
                 throw new Error(`Calibration dump reports an implausible length (${total} bytes); ` +
                     `expected 3..${MAX_CALIB_DUMP_BYTES}. The device's calibration memory ` +
@@ -12374,6 +13984,7 @@
         async startStreaming() {
             if (!this.schema)
                 this._emitStatus('Starting stream without schema (not recommended).');
+            this._prepareStreamTimeline();
             this._emitStatus('START_STREAM → waiting for ACK…');
             this._beginStreamPlane();
             try {
@@ -12482,6 +14093,7 @@
         async startStreamingAndLogging() {
             if (!this.schema)
                 this._emitStatus('Starting stream without schema (not recommended).');
+            this._prepareStreamTimeline();
             this._emitStatus('START_BT_STREAM_SD_LOGGING → waiting for ACK…');
             this._beginStreamPlane();
             try {
@@ -12550,7 +14162,7 @@
                 throw new Error(`Inquiry response truncated: ${u8.length} bytes, need ${headerEnd + numCh} ` +
                     `for the ${numCh} channels it declares.`);
             }
-            const adcRaw = u16le$3(u8, base + 0);
+            const adcRaw = u16le$4(u8, base + 0);
             const samplingRateHz = 32768 / adcRaw;
             this.samplingRateHz = samplingRateHz;
             const cfg = BigInt(u8[base + 2]) |
@@ -12569,7 +14181,9 @@
             //   gyro (LSM6DSV): LSB setup2 bits 0-1 (cfg bits 16-17) + MSB setup4 bit 2
             //     (cfg bit 34) → 6 ranges (0-5)
             //   LN accel (LSM6DSV): setup3 bits 6-7 → cfg bits 30-31
-            // mag/alt-accel/alt-mag are single-range or not carried here → 0.
+            //   alt mag (LIS3MDL): setup2 bits 5-7 → cfg bits 21-23
+            // The LIS2MDL magnetometer and the ADXL371 high-g accel are single-range
+            // parts, so 0 is not a placeholder for them — it is their only range.
             const gyroLsb = Number((cfg >> 16n) & 0x3n);
             const gyroMsb = Number((cfg >> 34n) & 0x1n);
             this.imuRanges = {
@@ -12578,8 +14192,16 @@
                 gyro: gyroLsb | (gyroMsb << 2),
                 mag: 0,
                 altAccel: 0,
-                altMag: 0,
+                altMag: Number((cfg >> 21n) & 0x7n),
             };
+            /* Pressure oversampling: ConfigSetupByte3 bits 4-5 → cfg bits 28-29, plus
+               the MSB at ConfigSetupByte4 bit 0 → cfg bit 32 for the BMP390/BMP581's
+               wider ladder (schema keys `pressureOversampling.bmpX80` and
+               `.bmp390_581`). The BMP180 is the only part whose compensation consumes
+               it, and there it is part of the maths rather than a later scale. */
+            this.pressureOversampling = Number((cfg >> 28n) & 0x3n) | (Number((cfg >> 32n) & 0x1n) << 2);
+            // The ranges just moved, so re-pick which stored block applies to each group.
+            this._reselectDeviceCalibrations();
             const bufSize = u8[base + 10];
             const channelIds = [...u8.slice(headerEnd, headerEnd + numCh)];
             const schema = this._buildSchemaFromChannels(channelIds, this.forceTimestampFmt ?? 'u24');
@@ -12636,40 +14258,169 @@
             this.enabledSensors = schema.enabledSensors;
             return schema;
         }
-        // ---------------------------------------------------------------------------
-        // GSR calibration (applied inline during stream parsing)
-        // ---------------------------------------------------------------------------
+        /**
+         * Get the stream timeline ready, and anchor it if asked.
+         *
+         * Called before a stream starts, which is the right moment for two reasons:
+         * the counter's unwrap has to begin from this stream's first sample, and a
+         * clock reading taken now is as close as a host can get to the data it will
+         * time. One round trip, and a failure is not fatal — the timeline falls back
+         * to the host's own clock, which is what Consensys uses always.
+         */
+        _prepareStreamTimeline() {
+            this._timeline.reset();
+            if (!this.anchorStreamClock || this._timeline.hasAnchorRequest)
+                return;
+            /* Nobody has read the sensor's clock, so fall back to this host's — the
+               Consensys method, `SystemTimestampPlot.java:19-42`: the first sample is
+               taken to have happened now and the device's counter carries time forward
+               from there.
+        
+               Deliberately NOT a `getRtcTime()` call. Spending a round trip inside
+               `startStreaming` would delay every stream, and on firmware that does not
+               answer the command it would delay it by a whole timeout — a cost the host
+               never asked for. A host that wants the sensor's own clock as the
+               reference calls `getRtcTime()` once, which anchors the timeline for the
+               rest of the session; reading the clock on connect, as a host generally
+               does anyway, is enough. */
+            this._timeline.anchorToHost(Date.now());
+            this._emitStatus("Stream clock anchored to this host's clock. Read the sensor's real-world " +
+                'clock (getRtcTime) for times taken from the sensor itself.');
+        }
+        /** Where the streamed wall-clock times come from, and how well. */
+        get timelineState() {
+            return this._timeline.state;
+        }
+        /** The calibration state one decoded frame is converted against. */
+        _streamCalibrationState() {
+            return {
+                generation: this.generation,
+                family: 'shimmer3r',
+                ranges: this.imuRanges,
+                device: this._deviceCalibrations,
+                emitInertial: this.emitCalibratedInertial,
+                gsrRange: this.gsrRangeSetting,
+                exg: this._exgBanks,
+                pressure: this._pressureCalibration,
+                pressureOversampling: this.pressureOversampling,
+            };
+        }
+        /**
+         * Add a calibrated field, with a unit, for every channel in the frame this
+         * SDK can convert. See `devices/calibration/streamChannels.ts` for the
+         * per-channel table and where each formula comes from.
+         */
         _calibrateData(oc) {
-            const snapshot = [...oc.fields];
-            for (const field of snapshot) {
-                if (field.name === GSR_NAME) {
-                    const rawField = oc.get(GSR_NAME, 'raw');
-                    const gsrraw = rawField?.value ?? null;
-                    if (gsrraw === null)
-                        continue;
-                    let adc12 = gsrraw & 0x0fff;
-                    let currentRange = this.gsrRangeSetting;
-                    if (currentRange === 4) {
-                        currentRange = (gsrraw >> 14) & 0x03;
-                    }
-                    if (currentRange === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3) {
-                        adc12 = GSR_UNCAL_LIMIT_RANGE3;
-                    }
-                    let gsrkOhm = calibrateGsrDataToResistanceFromAmplifierEq(adc12, currentRange);
-                    gsrkOhm = nudgeGsrResistance(gsrkOhm, this.gsrRangeSetting);
-                    const gsrConductanceUSiemens = (1.0 / gsrkOhm) * 1000;
-                    oc.add(GSR_NAME, gsrConductanceUSiemens, 'uSiemens', 'cal');
+            calibrateStreamFrame(oc, this._streamCalibrationState());
+        }
+        /**
+         * Re-pick which stored calibration applies to each inertial group, now.
+         *
+         * Runs whenever the inputs move: an inquiry (which refreshes every range), a
+         * range setter, a dump adoption, or a per-sensor calibration read. The dump
+         * wins over the per-sensor commands where both cover a group, which is the
+         * calibration source-priority ladder's own ordering
+         * (`CALIB_READ_SOURCE`: `RADIO_DUMP` outranks `LEGACY_BT_COMMAND`).
+         *
+         * A block read by the per-sensor commands is dropped once the range moves
+         * away from the one it was read at: those commands answer for the configured
+         * range without saying which it was, so after a range change the block
+         * describes a scale the sensor is no longer using. Falling back to that
+         * range's default is the safer of the two wrong answers, and the only honest
+         * one.
+         */
+        _reselectDeviceCalibrations() {
+            const next = {};
+            const groups = Object.keys(this.imuRanges);
+            for (const group of groups) {
+                const range = this.imuRanges[group];
+                const fromDump = this._dumpCalibrations[group]?.[range];
+                if (fromDump) {
+                    next[group] = fromDump;
+                    continue;
                 }
+                const fromCommand = this._btCommandCalibrations[group];
+                if (fromCommand && fromCommand.range === range)
+                    next[group] = fromCommand.cal;
             }
-            // Inertial calibration (accel/gyro/mag/alt): device calibration from
-            // readCalibration() when available, else the range-selected default.
-            if (this.emitCalibratedInertial) {
-                applyStreamingCalibration(oc, {
-                    family: 'shimmer3r',
-                    ranges: this.imuRanges,
-                    device: this._deviceCalibrations,
-                });
+            this._deviceCalibrations = next;
+        }
+        /**
+         * Take the calibration a device just handed over as a dump and use it for
+         * streaming.
+         *
+         * `readCalibDump()` returns the bytes and the parsed records but changes no
+         * client state, because a dump is also the thing a host edits and writes
+         * back — adopting every dump that passed through would mean a host could not
+         * inspect one without changing how its data is calibrated. So adoption is
+         * this separate step, and a host calls it for a dump that came off the
+         * device it is streaming from (not for one loaded from a file, which is a
+         * candidate for writing rather than a statement about this sensor).
+         *
+         * Blocks the dump holds for ranges other than the configured ones are kept,
+         * so a later range change re-selects without another read.
+         *
+         * @returns the groups this dump supplied a usable block for, at any range.
+         */
+        applyCalibDump(dump) {
+            this._dumpCalibrations = selectDumpCalibrations(dump, 'shimmer3r');
+            this._reselectDeviceCalibrations();
+            const groups = Object.keys(this._dumpCalibrations);
+            this._emitStatus(groups.length
+                ? `Streaming calibration now follows the dump for: ${groups.join(', ')}.`
+                : 'The calibration dump held no usable inertial block; defaults stay in force.');
+            return groups;
+        }
+        /** Both ExG chips' register banks as last read, or `null`. */
+        get exgBanks() {
+            return this._exgBanks;
+        }
+        /** The fitted pressure part and its trim, or `null` if never read. */
+        get pressureCalibration() {
+            return this._pressureCalibration;
+        }
+        /**
+         * What every streamed channel is being calibrated against, right now.
+         *
+         * The point of this is provenance rather than the numbers: a host showing
+         * "gyro ±500 dps (radio dump)" against "gyro ±500 dps (default)" is telling
+         * a user whether they are looking at this sensor's own calibration or the
+         * factory seed for its part, and those differ by percent. Computed on
+         * demand — nothing here belongs on a per-frame field, at 1 kHz.
+         */
+        get calibrationInfo() {
+            const inertial = {};
+            const groups = Object.keys(this.imuRanges);
+            for (const group of groups) {
+                const range = this.imuRanges[group];
+                const defaults = getDefaultCalibration('shimmer3r', group, range);
+                if (!defaults)
+                    continue;
+                const fromDump = this._dumpCalibrations[group]?.[range];
+                const fromCommand = this._btCommandCalibrations[group];
+                const source = fromDump
+                    ? 'radio-dump'
+                    : fromCommand && fromCommand.range === range
+                        ? 'bt-command'
+                        : 'default';
+                inertial[group] = {
+                    range,
+                    source,
+                    usingDefaultCalibration: source === 'default',
+                    unit: defaults.unit,
+                };
             }
+            return {
+                inertial,
+                gsr: { range: this.gsrRangeSetting },
+                exg: { source: this._exgBanksSource ?? 'default', ...summariseExgBanks(this._exgBanks) },
+                pressure: {
+                    sensor: this._pressureCalibration?.sensor ?? null,
+                    calibrated: this._pressureCalibration?.calibrated ?? false,
+                    oversampling: this.pressureOversampling,
+                },
+                adc: { vrefVolts: ADC_VREF_VOLTS, bits: ADC_BITS },
+            };
         }
         // ---------------------------------------------------------------------------
         // Stream frame parser
@@ -12736,8 +14487,8 @@
                 if (buf[0] === preamble && buf[wireBytes] === preamble) {
                     let ts1, ts2;
                     try {
-                        ts1 = tsBytes === 2 ? u16le$3(buf, 1) : u24le$1(buf, 1);
-                        ts2 = tsBytes === 2 ? u16le$3(buf, wireBytes + 1) : u24le$1(buf, wireBytes + 1);
+                        ts1 = tsBytes === 2 ? u16le$4(buf, 1) : u24le$1(buf, 1);
+                        ts2 = tsBytes === 2 ? u16le$4(buf, wireBytes + 1) : u24le$1(buf, wireBytes + 1);
                     }
                     catch {
                         buf = buf.subarray(1);
@@ -12798,9 +14549,17 @@
                         let cursor = 1;
                         const oc = new ObjectCluster(this._deviceLabel());
                         oc.crcOk = crcOk;
-                        const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le$1(frame, cursor);
+                        const ts = tsBytes === 2 ? u16le$4(frame, cursor) : u24le$1(frame, cursor);
                         cursor += tsBytes;
-                        oc.add('TIMESTAMP', ts, 'ticks', 'raw');
+                        oc.add('TIMESTAMP', ts, CHANNEL_UNITS.TICKS, 'raw');
+                        /* The raw counter wraps every 512 s; the timeline unwraps it and, when
+                           anchored, places it on a wall clock. Both go on the frame as
+                           calibrated fields so a plot and a CSV can use them like any other. */
+                        const stamped = this._timeline.stamp(ts, Date.now());
+                        oc.add('TIMESTAMP', stamped.deviceMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
+                        if (stamped.unixMs !== null) {
+                            oc.add(UNIX_TIMESTAMP_NAME, stamped.unixMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
+                        }
                         for (const f of sch.fields) {
                             if (cursor + f.sizeBytes > frame.length) {
                                 throw new Error(`short frame: need ${f.sizeBytes} @${cursor}, have ${frame.length}`);
@@ -12808,10 +14567,10 @@
                             let v;
                             switch (f.fmt) {
                                 case 'i16':
-                                    v = f.endian === 'be' ? sign16(u16be$1(frame, cursor)) : sign16(u16le$3(frame, cursor));
+                                    v = f.endian === 'be' ? sign16(u16be$2(frame, cursor)) : sign16(u16le$4(frame, cursor));
                                     break;
                                 case 'u16':
-                                    v = f.endian === 'be' ? u16be$1(frame, cursor) : u16le$3(frame, cursor);
+                                    v = f.endian === 'be' ? u16be$2(frame, cursor) : u16le$4(frame, cursor);
                                     break;
                                 case 'i24':
                                     v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
@@ -12830,10 +14589,10 @@
                                     v = frame[cursor];
                                     break;
                                 default:
-                                    v = u16le$3(frame, cursor);
+                                    v = u16le$4(frame, cursor);
                             }
                             cursor += f.sizeBytes;
-                            oc.add(f.name, v, null, 'raw');
+                            oc.add(f.name, v, CHANNEL_UNITS.NO_UNITS, 'raw');
                         }
                         if (this._lastTs) {
                             const dLast = (((ts - this._lastTs) % TS_MOD) + TS_MOD) % TS_MOD;
@@ -13716,6 +15475,17 @@
             }
         }
     }
+    // ---------------------------------------------------------------------------
+    // Streaming calibration
+    // ---------------------------------------------------------------------------
+    /**
+     * `'Timestamp_Unix'` — Unix milliseconds per sample, when the timeline is
+     * anchored.
+     *
+     * Named for Consensys's own column so a CSV from this SDK and one from the
+     * desktop describe the same thing with the same header.
+     */
+    Shimmer3RClient.UNIX_TIMESTAMP_NAME = UNIX_TIMESTAMP_NAME;
 
     /**
      * EEPROM brand (advertising name) record.
@@ -15785,6 +17555,36 @@
             /** When false, inertial channels are emitted raw-only (no `'cal'` field). Default true. */
             this.emitCalibratedInertial = true;
             this._deviceCalibrations = {};
+            /**
+             * Every usable block from a calibration dump, by group and range
+             * ({@link applyCalibDump}).
+             */
+            this._dumpCalibrations = {};
+            /**
+             * Blocks fetched by {@link readCalibration}, with the range each was read at
+             * — those commands answer for the configured range without saying which, so
+             * a block stops applying once a range moves.
+             */
+            this._btCommandCalibrations = {};
+            /** Both ExG chips' register banks, when read; `null` assumes chip defaults. */
+            this._exgBanks = null;
+            /** Where {@link _exgBanks} came from, for {@link calibrationInfo}. */
+            this._exgBanksSource = null;
+            /** The fitted pressure part and its trim, or `null` when unread. */
+            this._pressureCalibration = null;
+            /**
+             * Configured pressure oversampling, 0-3, from the inquiry's config word. The
+             * BMP180 and BMP280 a Shimmer3 can carry both use it.
+             */
+            this.pressureOversampling = 0;
+            /**
+             * Unwraps the sample counter and, once anchored, places every sample on a
+             * wall clock. The width follows the firmware: 16 bits — a 2-second wrap — on
+             * anything older than LogAndStream 0.5.4.
+             */
+            this._timeline = new StreamTimeline({ timestampBits: 24 });
+            /** Whether {@link startStreaming} reads the real-world clock first. */
+            this.anchorStreamClock = true;
             /** Minimum valid GSR conductance in µS (below this, connectivity = "Disconnected"). */
             this.LIMIT_MIN_VALID_USIEMENS = 0.03;
             // Callbacks
@@ -15935,7 +17735,8 @@
                 this._streaming = false;
                 this._streamStarting = false;
                 this.ExpPower = 0;
-                this._deviceCalibrations = {};
+                this._resetCalibrationState();
+                this._timeline.reset();
                 this._emitStatus('Disconnected');
             }
         }
@@ -16148,7 +17949,214 @@
                 throw new Error('Cannot read ExG registers while streaming');
             const exg1 = await this._readExgChip(EXG_CHIP1, timeoutMs);
             const exg2 = await this._readExgChip(EXG_CHIP2, timeoutMs);
+            /* Cache for the streaming conversion: the millivolt factor needs the PGA
+               gain and the reference voltage out of these registers. */
+            this._exgBanks = { exg1, exg2 };
+            this._exgBanksSource = 'device';
             return { exg1, exg2 };
+        }
+        // ---------------------------------------------------------------------------
+        // Real-world clock
+        // ---------------------------------------------------------------------------
+        /**
+         * True when this firmware serves the real-world-clock commands.
+         *
+         * The Java driver gates its own `readRealTimeClock` on LogAndStream with a
+         * firmware version code of 6 or more (`ShimmerBluetooth.java:2847-2853`), and
+         * this follows it. Older firmware answers nothing at all rather than NACKing,
+         * so asking costs a timeout — worth avoiding when the version already says.
+         */
+        get supportsRealWorldClock() {
+            if (this.firmwareVersion == null || this.deviceVersion == null)
+                return false;
+            return (deriveShimmer3FirmwareVersionCode(this.firmwareVersion, this.deviceVersion.hardwareVersion) >=
+                6);
+        }
+        /**
+         * Read the device's real-world clock (GET_RWC → RWC_RESPONSE).
+         *
+         * **What a Shimmer3's real-world clock is, and why it is not the stream's
+         * timestamp.** The MSP430's counter cannot be set: it free-runs from boot.
+         * Setting the clock stores an offset instead, and the reply to this command
+         * is `rwcTimeDiff64 + RTC_get64()` — counter plus offset
+         * (`Shimmer_Driver/5xx_HAL/hal_RTC.c:73-76,85`). The offset itself never goes
+         * over Bluetooth, only into an SD-file header. So unlike a Shimmer3R, whose
+         * packet timestamp is the low 24 bits of this very value, a Shimmer3 leaves a
+         * host to estimate where the counter stood when the reply was composed. This
+         * anchors the stream timeline accordingly — `rwc-estimated`, carrying half
+         * the round trip as its uncertainty.
+         *
+         * HARDWARE-VERIFY: no real Shimmer3 has answered this command through this
+         * SDK.
+         *
+         * @throws Error when not connected, while streaming, or when the firmware
+         *   does not serve the command.
+         */
+        async getRtcTime(timeoutMs = SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+            if (!this._transport)
+                throw new Error('Not connected');
+            if (this._streaming)
+                throw new Error('Cannot read the real-world clock while streaming');
+            this._assertRwcSupported('read');
+            const hostBeforeMs = Date.now();
+            await this._write(new Uint8Array([OPCODES.GET_RWC_COMMAND]));
+            const rsp = await this._waitForResponse(OPCODES.RWC_RESPONSE, timeoutMs);
+            if (rsp[0] !== OPCODES.RWC_RESPONSE || rsp.length < 9) {
+                throw new Error(`Malformed RWC response (${rsp.length} bytes).`);
+            }
+            let ticks = 0n;
+            for (let i = 8; i >= 1; i--)
+                ticks = (ticks << 8n) | BigInt(rsp[i]);
+            const hostAfterMs = Date.now();
+            this._timeline.anchorToRwc(ticks, (hostBeforeMs + hostAfterMs) / 2, {
+                rttMs: hostAfterMs - hostBeforeMs,
+                // Never aligned on a Shimmer3: see the docblock above.
+                aligned: false,
+            });
+            return { ticks, unixMs: Number(ticks) / TICKS_PER_MS };
+        }
+        /**
+         * Set the device's real-world clock (SET_RWC) to a Unix millisecond time,
+         * encoded as 64-bit little-endian 32768 Hz ticks.
+         *
+         * A plain Unix epoch, as desktop Consensys and the dock driver both write.
+         * The firmware stores it as an offset from its free-running counter, so the
+         * stream's own timestamps do not move — but the mapping from them to wall
+         * time does, which is why any existing anchor is dropped.
+         *
+         * HARDWARE-VERIFY: not exercised against a real Shimmer3.
+         */
+        async setRtcTime(unixMs) {
+            if (!this._transport)
+                throw new Error('Not connected');
+            if (!Number.isFinite(unixMs))
+                throw new Error('setRtcTime: unixMs must be a finite number.');
+            this._assertRwcSupported('write');
+            const cmd = new Uint8Array(9);
+            cmd[0] = OPCODES.SET_RWC_COMMAND;
+            cmd.set(msToRtcBytesLE(unixMs), 1);
+            await this._writeExpectingAck(cmd, SHIMMER3_DEFAULTS.ACK_TIMEOUT_MS);
+            this._timeline.clearAnchor();
+            this._emitStatus('RWC set');
+        }
+        _assertRwcSupported(verb) {
+            if (this.supportsRealWorldClock)
+                return;
+            if (this.firmwareVersion == null || this.deviceVersion == null) {
+                throw new Error(`Cannot ${verb} the real-world clock before the handshake has read the ` +
+                    'firmware and device versions.');
+            }
+            const { major, minor, internal } = this.firmwareVersion;
+            throw new Error(`This firmware does not serve the real-world-clock commands ` +
+                `(v${major}.${minor}.${internal}). They need a firmware version code of 6 ` +
+                'or more — LogAndStream 0.5.0 and later.');
+        }
+        /** Where the streamed wall-clock times come from, and how well. */
+        get timelineState() {
+            return this._timeline.state;
+        }
+        /**
+         * Get the stream timeline ready, and anchor it if asked. See
+         * `Shimmer3RClient._prepareStreamTimeline`; a Shimmer3's anchor is always the
+         * estimated kind.
+         */
+        _prepareStreamTimeline() {
+            // The width is a firmware property the handshake has established by now:
+            // 16 bits, wrapping every 2 s, on anything older than LogAndStream 0.5.4.
+            this._timeline.setTimestampBits(this._timestampFmt === 'u16' ? 16 : 24);
+            this._timeline.reset();
+            if (!this.anchorStreamClock || this._timeline.hasAnchorRequest)
+                return;
+            /* This host's clock, the Consensys method. No round trip is spent here —
+               see `Shimmer3RClient._prepareStreamTimeline` for why. A host wanting the
+               sensor's own clock as the reference calls {@link getRtcTime} once, which
+               needs LogAndStream 0.5.0 or later ({@link supportsRealWorldClock}). */
+            this._timeline.anchorToHost(Date.now());
+            this._emitStatus("Stream clock anchored to this host's clock" +
+                (this.supportsRealWorldClock
+                    ? ". Read the sensor's real-world clock (getRtcTime) for times taken from the sensor itself."
+                    : ' — this firmware has no real-world clock.'));
+        }
+        /**
+         * Read the fitted pressure sensor's identity and factory trim, so PRESSURE and
+         * TEMPERATURE can be streamed in kPa and °C.
+         *
+         * The modern command is `GET_PRESSURE_CALIBRATION_COEFFICIENTS` (0xA7),
+         * answering `[0xA6][1 + n][sensorId][coeffs]`. A classic Shimmer3 running
+         * older LogAndStream firmware serves only the two legacy commands instead —
+         * `0xA0 → 0x9F` (BMP280, 24 bytes) and `0x59 → 0x58` (BMP180, 22 bytes) — and
+         * that firmware has **no NACK at all**, so an unsupported command produces
+         * silence rather than a refusal
+         * (`ccs_workspace/FW_Shimmer3/LogAndStream/main.c`, whose command switch has
+         * no `sendNack`). Both legacy paths are therefore tried after the modern one,
+         * and the part they name is inferred from which answered — with one trap
+         * handled in the parser: asked for BMP180 coefficients on a BMP280 board,
+         * that firmware answers a full-length block of `0x01` filler rather than
+         * declining, and compensating against it would yield a confident, wrong
+         * pressure.
+         *
+         * **A refusal is not an error**: the channels stream raw-only and this
+         * returns `null`, having said so through {@link onStatus}.
+         *
+         * HARDWARE-VERIFY: no real Shimmer3 has answered any of the three commands
+         * through this SDK.
+         *
+         * @throws Error only when not connected.
+         */
+        async readPressureCalibration(timeoutMs = SHIMMER3_DEFAULTS.RESPONSE_TIMEOUT_MS) {
+            if (!this._transport)
+                throw new Error('Not connected');
+            if (this._streaming)
+                throw new Error('Cannot read the pressure calibration while streaming');
+            const attempts = [
+                {
+                    cmd: OPCODES.GET_PRESSURE_CALIBRATION_COEFFICIENTS_COMMAND,
+                    resp: OPCODES.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE,
+                    label: 'GET_PRESSURE_CALIBRATION_COEFFICIENTS (0xA7)',
+                    legacy: null,
+                },
+                {
+                    cmd: OPCODES.GET_BMP280_CALIBRATION_COEFFICIENTS_COMMAND,
+                    resp: OPCODES.BMP280_CALIBRATION_COEFFICIENTS_RESPONSE,
+                    label: 'GET_BMP280_CALIBRATION_COEFFICIENTS (0xA0)',
+                    legacy: 1,
+                },
+                {
+                    cmd: OPCODES.GET_BMP180_CALIBRATION_COEFFICIENTS_COMMAND,
+                    resp: OPCODES.BMP180_CALIBRATION_COEFFICIENTS_RESPONSE,
+                    label: 'GET_BMP180_CALIBRATION_COEFFICIENTS (0x59)',
+                    legacy: 0,
+                },
+            ];
+            for (const attempt of attempts) {
+                try {
+                    await this._write(new Uint8Array([attempt.cmd]));
+                    const frame = await this._waitForResponse(attempt.resp, timeoutMs);
+                    /* The modern reply is length-prefixed and self-describing; the legacy
+                       ones are a bare fixed-length block, so the sensor id has to come from
+                       which command answered. */
+                    const payload = attempt.legacy === null
+                        ? frame.subarray(2)
+                        : Uint8Array.from([attempt.legacy, ...frame.subarray(1)]);
+                    const calibration = parsePressureCalibrationResponse(payload);
+                    this._pressureCalibration = calibration;
+                    this._emitStatus(calibration.calibrated
+                        ? `Pressure sensor ${calibration.sensor}: coefficients loaded.`
+                        : `Pressure sensor ${calibration.sensor} returned a blank coefficient block; ` +
+                            'PRESSURE and TEMPERATURE stream raw-only.');
+                    if (calibration.calibrated)
+                        return calibration;
+                    // A blank block means this was the wrong command for the fitted part;
+                    // keep trying the others rather than settling for it.
+                }
+                catch {
+                    /* No answer, or an answer that was not what it claimed. Try the next. */
+                }
+            }
+            this._pressureCalibration = null;
+            this._emitStatus('No pressure calibration is available from this firmware, so PRESSURE and ' +
+                'TEMPERATURE stream raw-only.');
+            return null;
         }
         async _readExgChip(chip, timeoutMs) {
             // GET is ACK-then-response, and _waitForResponse already tolerates the
@@ -16269,6 +18277,9 @@
                 altAccel: 0,
                 altMag: 0,
             };
+            this.pressureOversampling = info.pressureResolution;
+            // The ranges just moved, so re-pick which stored block applies to each group.
+            this._reselectDeviceCalibrations();
             this._emitStatus(`Inquiry: ${info.numChannels} ch, ${info.samplingRateHz.toFixed(2)} Hz, ` +
                 `sensors=0x${info.schema.enabledSensors.toString(16).toUpperCase()}`);
             try {
@@ -16461,6 +18472,7 @@
                 throw new Error('Not connected');
             if (!this.schema)
                 this._emitStatus('Starting stream without schema (not recommended).');
+            this._prepareStreamTimeline();
             // Stale buffered bytes (e.g. residual post-stop stream data) would desync
             // the ACK wait for START — drain to quiescence and discard them first. A
             // clean state (empty buffer) skips this entirely.
@@ -16575,17 +18587,24 @@
                         const frame = buf.subarray(0, frameBytes);
                         let cursor = 1;
                         const oc = new ObjectCluster(this._deviceLabel());
-                        const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le$1(frame, cursor);
+                        const ts = tsBytes === 2 ? u16le$4(frame, cursor) : u24le$1(frame, cursor);
                         cursor += tsBytes;
-                        oc.add('TIMESTAMP', ts, 'ticks', 'raw');
+                        oc.add('TIMESTAMP', ts, CHANNEL_UNITS.TICKS, 'raw');
+                        /* Unwrap the counter — every 2 s on older firmware, every 512 s on
+                           newer — and place it on a wall clock when anchored. */
+                        const stamped = this._timeline.stamp(ts, Date.now());
+                        oc.add('TIMESTAMP', stamped.deviceMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
+                        if (stamped.unixMs !== null) {
+                            oc.add(UNIX_TIMESTAMP_NAME, stamped.unixMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
+                        }
                         for (const f of sch.fields) {
                             let v;
                             switch (f.fmt) {
                                 case 'i16':
-                                    v = f.endian === 'be' ? sign16(u16be$1(frame, cursor)) : sign16(u16le$3(frame, cursor));
+                                    v = f.endian === 'be' ? sign16(u16be$2(frame, cursor)) : sign16(u16le$4(frame, cursor));
                                     break;
                                 case 'u16':
-                                    v = f.endian === 'be' ? u16be$1(frame, cursor) : u16le$3(frame, cursor);
+                                    v = f.endian === 'be' ? u16be$2(frame, cursor) : u16le$4(frame, cursor);
                                     break;
                                 case 'i24':
                                     v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
@@ -16602,10 +18621,10 @@
                                     v = frame[cursor];
                                     break;
                                 default:
-                                    v = u16le$3(frame, cursor);
+                                    v = u16le$4(frame, cursor);
                             }
                             cursor += f.sizeBytes;
-                            oc.add(f.name, v, null, 'raw');
+                            oc.add(f.name, v, CHANNEL_UNITS.NO_UNITS, 'raw');
                         }
                         this._lastTs = ts;
                         this._calibrateData(oc);
@@ -16622,33 +18641,114 @@
             }
             this._rxBuf = buf.length ? new Uint8Array(buf) : new Uint8Array(0);
         }
-        /** Inline GSR calibration, matching Shimmer3RClient. */
+        /** The calibration state one decoded frame is converted against. */
+        _streamCalibrationState() {
+            return {
+                generation: 'shimmer3',
+                family: this._imuFamily,
+                ranges: this.imuRanges,
+                device: this._deviceCalibrations,
+                emitInertial: this.emitCalibratedInertial,
+                gsrRange: this.gsrRangeSetting,
+                exg: this._exgBanks,
+                pressure: this._pressureCalibration,
+                pressureOversampling: this.pressureOversampling,
+            };
+        }
+        /**
+         * Add a calibrated field, with a unit, for every channel this SDK can
+         * convert — the same registry the Shimmer3R client uses
+         * (`devices/calibration/streamChannels.ts`), so the two platforms cannot
+         * drift apart on a formula.
+         */
         _calibrateData(oc) {
-            for (const field of [...oc.fields]) {
-                if (field.name !== GSR_NAME)
+            calibrateStreamFrame(oc, this._streamCalibrationState());
+        }
+        /** Forget everything read off the device about how to calibrate it. */
+        _resetCalibrationState() {
+            this._deviceCalibrations = {};
+            this._dumpCalibrations = {};
+            this._btCommandCalibrations = {};
+            this._exgBanks = null;
+            this._exgBanksSource = null;
+            this._pressureCalibration = null;
+        }
+        /**
+         * Re-pick which stored calibration applies to each inertial group at the
+         * ranges now configured. See the Shimmer3R client's method of the same name
+         * for why a per-sensor block is dropped once its range moves.
+         */
+        _reselectDeviceCalibrations() {
+            const next = {};
+            const groups = Object.keys(this.imuRanges);
+            for (const group of groups) {
+                const range = this.imuRanges[group];
+                const fromDump = this._dumpCalibrations[group]?.[range];
+                if (fromDump) {
+                    next[group] = fromDump;
                     continue;
-                const gsrraw = oc.get(GSR_NAME, 'raw')?.value ?? null;
-                if (gsrraw === null)
+                }
+                const fromCommand = this._btCommandCalibrations[group];
+                if (fromCommand && fromCommand.range === range)
+                    next[group] = fromCommand.cal;
+            }
+            this._deviceCalibrations = next;
+        }
+        /**
+         * Take a calibration dump this device just produced and use it for streaming.
+         * See `Shimmer3RClient.applyCalibDump`.
+         */
+        applyCalibDump(dump) {
+            this._dumpCalibrations = selectDumpCalibrations(dump, this._imuFamily);
+            this._reselectDeviceCalibrations();
+            const groups = Object.keys(this._dumpCalibrations);
+            this._emitStatus(groups.length
+                ? `Streaming calibration now follows the dump for: ${groups.join(', ')}.`
+                : 'The calibration dump held no usable inertial block; defaults stay in force.');
+            return groups;
+        }
+        /** Both ExG chips' register banks as last read, or `null`. */
+        get exgBanks() {
+            return this._exgBanks;
+        }
+        /** The fitted pressure part and its trim, or `null` if never read. */
+        get pressureCalibration() {
+            return this._pressureCalibration;
+        }
+        /** What every streamed channel is being calibrated against, right now. */
+        get calibrationInfo() {
+            const inertial = {};
+            const groups = Object.keys(this.imuRanges);
+            for (const group of groups) {
+                const range = this.imuRanges[group];
+                const defaults = getDefaultCalibration(this._imuFamily, group, range);
+                if (!defaults)
                     continue;
-                let adc12 = gsrraw & 0x0fff;
-                let currentRange = this.gsrRangeSetting;
-                if (currentRange === 4)
-                    currentRange = (gsrraw >> 14) & 0x03;
-                if (currentRange === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3)
-                    adc12 = GSR_UNCAL_LIMIT_RANGE3;
-                let gsrkOhm = calibrateGsrDataToResistanceFromAmplifierEq(adc12, currentRange);
-                gsrkOhm = nudgeGsrResistance(gsrkOhm, this.gsrRangeSetting);
-                oc.add(GSR_NAME, (1.0 / gsrkOhm) * 1000, 'uSiemens', 'cal');
+                const fromDump = this._dumpCalibrations[group]?.[range];
+                const fromCommand = this._btCommandCalibrations[group];
+                const source = fromDump
+                    ? 'radio-dump'
+                    : fromCommand && fromCommand.range === range
+                        ? 'bt-command'
+                        : 'default';
+                inertial[group] = {
+                    range,
+                    source,
+                    usingDefaultCalibration: source === 'default',
+                    unit: defaults.unit,
+                };
             }
-            // Inertial calibration (LN/WR accel, gyro, mag): device calibration from
-            // readCalibration() when available, else the range-selected default.
-            if (this.emitCalibratedInertial) {
-                applyStreamingCalibration(oc, {
-                    family: this._imuFamily,
-                    ranges: this.imuRanges,
-                    device: this._deviceCalibrations,
-                });
-            }
+            return {
+                inertial,
+                gsr: { range: this.gsrRangeSetting },
+                exg: { source: this._exgBanksSource ?? 'default', ...summariseExgBanks(this._exgBanks) },
+                pressure: {
+                    sensor: this._pressureCalibration?.sensor ?? null,
+                    calibrated: this._pressureCalibration?.calibrated ?? false,
+                    oversampling: this.pressureOversampling,
+                },
+                adc: { vrefVolts: ADC_VREF_VOLTS, bits: ADC_BITS },
+            };
         }
         /**
          * Fetch the device's per-sensor kinematic calibration over RFCOMM and upgrade
@@ -16698,7 +18798,7 @@
                     const scale = getGroupDefaults(this._imuFamily, group)?.sensitivityScale ?? 1;
                     const cal = parseKinematicCalibBlock(rsp.subarray(1, 22), { sensitivityScale: scale });
                     if (cal) {
-                        this._deviceCalibrations[group] = cal;
+                        this._btCommandCalibrations[group] = { cal, range: this.imuRanges[group] };
                         done.push(group);
                     }
                 }
@@ -16706,6 +18806,7 @@
                     this._emitStatus(`readCalibration(${group}) skipped: ${err.message}`);
                 }
             }
+            this._reselectDeviceCalibrations();
             return done;
         }
         // ---------------------------------------------------------------------------
@@ -18309,6 +20410,654 @@
     }
 
     /**
+     * Which sensors can be enabled together, which need the expansion rail, and
+     * which need a particular board.
+     *
+     * A Shimmer3 or Shimmer3R has more sensors than it has ADC inputs, so some
+     * combinations are impossible. The firmware silently corrects a few of them and
+     * says nothing about the rest, which leaves a host in an awkward position: a
+     * configuration it wrote and read back unchanged can still not be the one in
+     * force, and a channel can stream a well-formed packet of nothing.
+     *
+     * This module is the host-side rule set that closes that gap. It is pure — no
+     * transport, no device state — so a configuration editor can consult it against
+     * an image it has not written yet, which is the whole point: telling somebody
+     * before they press Apply beats correcting them afterwards.
+     *
+     * **Two kinds of rule, and the difference matters to a user.**
+     *
+     * `enforcedBy: 'firmware'` means the device will make this change itself at its
+     * next configuration write, whatever the host sends —
+     * `ShimConfig_checkAndCorrectConfig` (`Configuration/shimmer_config.c`, the
+     * GSR/bridge-amp/ExG-versus-internal-ADC block). A host that reports these is
+     * predicting the device, not overruling it.
+     *
+     * `enforcedBy: 'host'` means the firmware will accept the combination and
+     * stream it, and it still cannot work — most often because the two sensors are
+     * on different expansion boards and only one board can be fitted. These come
+     * from the Java driver's `SensorDetailsRef.mListOfSensorIdsConflicting`, which
+     * is what Consensys enforces in its own editor.
+     *
+     * **On required sensors.** There are none in the enabled-bitmap sense.
+     * `mListOfSensorIdsRequired` is declared on every `SensorDetailsRef`
+     * (`driverUtilities/SensorDetailsRef.java:34`) and populated nowhere in the
+     * Java driver, so the code that reads it (`ShimmerDevice.java:2365`,
+     * `:2519-2536`) never does anything. The real dependencies are the expansion
+     * rail (below), the firmware's own skin-temperature and resistance-amplifier
+     * rule — which forces an internal ADC channel on, and concerns derived channels
+     * this SDK does not model — and the algorithm layer, which does not exist here.
+     * Saying so is more use to a host than inventing a requirement.
+     */
+    /** Any ExG bit set means the ExG front end is enabled. */
+    const EXG_ANY_MASK = SensorBitmapShimmer3.SENSOR_EXG1_24BIT |
+        SensorBitmapShimmer3.SENSOR_EXG2_24BIT |
+        SensorBitmapShimmer3.SENSOR_EXG1_16BIT |
+        SensorBitmapShimmer3.SENSOR_EXG2_16BIT;
+    /** The four internal ADC bits, whose enables leave the expansion rail alone. */
+    const INTERNAL_ADC_KEYS = Object.freeze([
+        'SENSOR_INT_A0',
+        'SENSOR_INT_A1',
+        'SENSOR_INT_A2',
+        'SENSOR_INT_A3',
+    ]);
+    /** The bitmap mask for one rule key; 0 for `'EXG'`, which owns no single bit. */
+    function sensorRuleMask(key) {
+        return key === 'EXG' ? EXG_ANY_MASK : SensorBitmapShimmer3[key];
+    }
+    /**
+     * Every pair that cannot be enabled together.
+     *
+     * Listed once per pair and applied both ways, so the table cannot become
+     * asymmetric. The Java lists it is drawn from ARE asymmetric in places — GSR
+     * names internal A1 and A14 while neither names GSR back, and
+     * `sensorPpgHostPPG1_A13` omits an ExG mode its sibling includes — but those
+     * asymmetries are in derived PPG and skin-temperature channels this SDK does
+     * not model, and a rule that fires in one direction only would be a bug
+     * wherever it did apply.
+     *
+     * Shimmer3 ADC names map onto the bitmap keys as A1 → `SENSOR_INT_A3`,
+     * A12 → `SENSOR_INT_A0`, A13 → `SENSOR_INT_A1`, A14 → `SENSOR_INT_A2`
+     * (`SensorADC.java:210,234,262,290` against `SensorBitmap.ts:33-36`). On a
+     * Shimmer3R the same bits are A3, A0, A1 and A2 — the firmware's own logical
+     * indices — which is why {@link describeSensorRules} takes a generation.
+     */
+    const CONFLICT_PAIRS = Object.freeze([
+        // --- Firmware-enforced (shimmer_config.c, ShimConfig_checkAndCorrectConfig).
+        {
+            a: 'SENSOR_GSR',
+            b: 'SENSOR_INT_A3',
+            firmware: true,
+            shares: 'one ADC input (Shimmer3 A1, Shimmer3R A3)',
+        },
+        {
+            a: 'SENSOR_BRIDGE_AMP',
+            b: 'SENSOR_INT_A1',
+            firmware: true,
+            shares: 'one ADC input (Shimmer3 A13, Shimmer3R A1)',
+        },
+        {
+            a: 'SENSOR_BRIDGE_AMP',
+            b: 'SENSOR_INT_A2',
+            firmware: true,
+            shares: 'one ADC input (Shimmer3 A14, Shimmer3R A2)',
+        },
+        {
+            a: 'EXG',
+            b: 'SENSOR_INT_A3',
+            firmware: true,
+            shares: 'one ADC input (Shimmer3 A1, Shimmer3R A3)',
+        },
+        {
+            a: 'EXG',
+            b: 'SENSOR_INT_A2',
+            firmware: true,
+            shares: 'one ADC input (Shimmer3 A14, Shimmer3R A2)',
+        },
+        // --- Host-enforced (SensorDetailsRef conflict lists; Consensys's rules).
+        {
+            a: 'SENSOR_GSR',
+            b: 'SENSOR_INT_A2',
+            firmware: false,
+            shares: 'the GSR+ board’s own ADC line',
+        },
+        {
+            a: 'SENSOR_GSR',
+            b: 'SENSOR_BRIDGE_AMP',
+            firmware: false,
+            shares: 'the expansion connector — they are different boards',
+        },
+        {
+            a: 'SENSOR_GSR',
+            b: 'EXG',
+            firmware: false,
+            shares: 'the expansion connector — they are different boards',
+        },
+        {
+            a: 'SENSOR_BRIDGE_AMP',
+            b: 'SENSOR_INT_A0',
+            firmware: false,
+            shares: 'one ADC input (Shimmer3 A12, Shimmer3R A0)',
+        },
+        {
+            a: 'SENSOR_BRIDGE_AMP',
+            b: 'EXG',
+            firmware: false,
+            shares: 'the expansion connector — they are different boards',
+        },
+        {
+            a: 'EXG',
+            b: 'SENSOR_INT_A0',
+            firmware: false,
+            shares: 'one ADC input (Shimmer3 A12, Shimmer3R A0)',
+        },
+        {
+            a: 'EXG',
+            b: 'SENSOR_INT_A1',
+            firmware: false,
+            shares: 'one ADC input (Shimmer3 A13, Shimmer3R A1)',
+        },
+    ]);
+    /** Conflicts for one key, resolved from the symmetric pair table. */
+    function sensorConflicts(key) {
+        const out = [];
+        for (const p of CONFLICT_PAIRS) {
+            if (p.a === key)
+                out.push({ key: p.b, firmware: p.firmware, shares: p.shares });
+            else if (p.b === key)
+                out.push({ key: p.a, firmware: p.firmware, shares: p.shares });
+        }
+        return out;
+    }
+    /** The whole pair table, for a host that wants to render it. */
+    const SENSOR_RULE_CONFLICTS = CONFLICT_PAIRS;
+    // ---------------------------------------------------------------------------
+    // Expansion-board power
+    // ---------------------------------------------------------------------------
+    /**
+     * Sensors that need the internal expansion rail switched on.
+     *
+     * `mIntExpBoardPowerRequired` in the Java driver: GSR
+     * (`SensorGSR.java:168`), the bridge amplifier (`SensorBridgeAmp.java:121`) and
+     * every ExG mode (`SensorEXG.java:374` and its siblings). The internal ADC
+     * channels are `false` there, which is why enabling one leaves the bit alone
+     * rather than clearing it.
+     *
+     * **The firmware never derives this.** The bit defaults to off
+     * (`ShimConfig_setDefaultConfig`), is read once at sensing start to raise the
+     * rail (`Sensing/shimmer_sensing.c:181-184`), and appears nowhere in
+     * `ShimConfig_checkAndCorrectConfig`. So a host can enable GSR, get an ACK,
+     * read back exactly what it wrote, and stream a perfectly well-formed packet
+     * from an unpowered front end.
+     *
+     * On a Shimmer3R the bit does not in fact power the ExG board — the ADS1292R
+     * comes up through `EXG_RESET_N` from its own driver (`EXG/ads1292.c:161-183`)
+     * — but Consensys sets it for ExG on every platform, a Shimmer3 genuinely needs
+     * it, and matching Consensys keeps the two tools' images identical. So ExG is
+     * listed.
+     */
+    const EXP_POWER_REQUIRED = new Set([
+        'SENSOR_GSR',
+        'SENSOR_BRIDGE_AMP',
+        'EXG',
+    ]);
+    /** Whether this sensor needs the expansion rail. */
+    function requiresExpansionPower(key) {
+        return EXP_POWER_REQUIRED.has(key);
+    }
+    // ---------------------------------------------------------------------------
+    // Hardware
+    // ---------------------------------------------------------------------------
+    /**
+     * SR board codes these rules refer to (`ShimmerVerDetails.java:113-126`, the
+     * same codes `devices/identity.ts` names).
+     */
+    const SR_BOARD = Object.freeze({
+        BRIDGE_AMP: 8,
+        BRIDGE_AMP_UNIFIED: 49,
+        GSR: 14,
+        GSR_UNIFIED: 48,
+        EXG: 37,
+        EXG_UNIFIED: 47,
+        PROTO3_MINI: 36,
+        PROTO3_DELUXE: 38,
+        IMU: 31,
+    });
+    /**
+     * What board and platform each sensor needs.
+     *
+     * Drawn from the Java driver's `mListOfCompatibleVersionInfo`
+     * (`Configuration.java:1406-1441` ExG, `:1457-1461` GSR, `:1574-1578` bridge
+     * amplifier, `:1588-1637` the internal ADCs), which
+     * `sensorMapCheckandCorrectHwDependencies` (`ShimmerDevice.java:2538-2551`)
+     * enforces by disabling anything incompatible.
+     *
+     * The gate differs on purpose. A `'block'` sensor is one whose front end is
+     * simply absent on the wrong board, so the channel would stream noise. The
+     * internal ADC lines only `'warn'`: Java's per-line lists are
+     * board-revision-specific and name boards this SDK's SR table does not carry
+     * (the 200 g accelerometer, for one), so refusing on an incomplete table would
+     * reject configurations that work.
+     *
+     * A sensor absent from this table has no hardware requirement.
+     */
+    const HARDWARE_RULES = Object.freeze({
+        SENSOR_GSR: {
+            boards: [SR_BOARD.GSR, SR_BOARD.GSR_UNIFIED],
+            generations: ['shimmer3', 'shimmer3r'],
+            gate: 'block',
+            needs: 'a GSR+ board (SR14 or SR48)',
+        },
+        SENSOR_BRIDGE_AMP: {
+            boards: [SR_BOARD.BRIDGE_AMP, SR_BOARD.BRIDGE_AMP_UNIFIED],
+            // Shimmer3 only: the Shimmer3R channel table has no bridge-amplifier
+            // channel at all, so the firmware cannot stream one.
+            generations: ['shimmer3'],
+            gate: 'block',
+            needs: 'a Bridge Amplifier+ board (SR8 or SR49) on a Shimmer3',
+        },
+        EXG: {
+            boards: [SR_BOARD.EXG, SR_BOARD.EXG_UNIFIED],
+            generations: ['shimmer3', 'shimmer3r'],
+            gate: 'block',
+            needs: 'an ECG/EMG board (SR37 or SR47)',
+        },
+        SENSOR_INT_A0: {
+            boards: [
+                SR_BOARD.GSR,
+                SR_BOARD.GSR_UNIFIED,
+                SR_BOARD.PROTO3_MINI,
+                SR_BOARD.PROTO3_DELUXE,
+                SR_BOARD.BRIDGE_AMP,
+                SR_BOARD.BRIDGE_AMP_UNIFIED,
+            ],
+            generations: ['shimmer3', 'shimmer3r'],
+            gate: 'warn',
+            needs: 'a board with the internal expansion connector',
+        },
+    });
+    // The three remaining internal ADC lines share A0's rule.
+    const INT_ADC_RULE = HARDWARE_RULES.SENSOR_INT_A0;
+    const hardwareRuleFor = (key) => INTERNAL_ADC_KEYS.includes(key) ? INT_ADC_RULE : HARDWARE_RULES[key];
+    // ---------------------------------------------------------------------------
+    // Labels
+    // ---------------------------------------------------------------------------
+    /** Per-generation names for the ADC lines, whose labels differ by platform. */
+    const GENERATION_LABELS = Object.freeze({
+        SENSOR_INT_A0: { shimmer3: 'Internal ADC A12', shimmer3r: 'Internal ADC A0' },
+        SENSOR_INT_A1: { shimmer3: 'Internal ADC A13', shimmer3r: 'Internal ADC A1' },
+        SENSOR_INT_A2: { shimmer3: 'Internal ADC A14', shimmer3r: 'Internal ADC A2' },
+        SENSOR_INT_A3: { shimmer3: 'Internal ADC A1', shimmer3r: 'Internal ADC A3' },
+        SENSOR_EXT_A0: { shimmer3: 'External ADC A7', shimmer3r: 'External ADC A0' },
+        SENSOR_EXT_A1: { shimmer3: 'External ADC A6', shimmer3r: 'External ADC A1' },
+        SENSOR_EXT_A2: { shimmer3: 'External ADC A15', shimmer3r: 'External ADC A2' },
+    });
+    const BASE_LABELS = Object.freeze({
+        EXG: 'ExG',
+        SENSOR_GSR: 'GSR',
+        SENSOR_BRIDGE_AMP: 'Bridge amplifier',
+        SENSOR_A_ACCEL: 'Low-noise accelerometer',
+        SENSOR_D_ACCEL: 'Wide-range accelerometer',
+        SENSOR_ACCEL_ALT: 'Alt accelerometer (high-g)',
+        SENSOR_GYRO: 'Gyroscope',
+        SENSOR_MAG: 'Magnetometer',
+        SENSOR_MAG_ALT: 'Alt magnetometer',
+        SENSOR_PRESSURE: 'Pressure / temperature',
+        SENSOR_VBATT: 'Battery voltage',
+    });
+    /**
+     * A sensor's name, in the vocabulary of the generation in play.
+     *
+     * The ADC lines are the reason this takes a generation: the same bit is
+     * "Internal ADC A1" on a Shimmer3 and "Internal ADC A3" on a Shimmer3R, and a
+     * message naming the wrong one sends a user looking at the wrong pin.
+     */
+    function sensorRuleLabel(key, generation) {
+        const perGeneration = generation ? GENERATION_LABELS[key]?.[generation] : undefined;
+        if (perGeneration)
+            return perGeneration;
+        // With no generation to hand, name both rather than guessing one.
+        const both = GENERATION_LABELS[key];
+        if (both)
+            return `${both.shimmer3r} (Shimmer3: ${both.shimmer3?.replace(/^.*ADC /, 'ADC ')})`;
+        return BASE_LABELS[key] ?? key;
+    }
+    // ---------------------------------------------------------------------------
+    // Queries
+    // ---------------------------------------------------------------------------
+    const isOn = (mask, key) => (mask & sensorRuleMask(key)) !== 0;
+    /**
+     * Is the ExG front end enabled?
+     *
+     * A host that owns an ExG mode control is the authority — its selection is what
+     * the next Apply will write, and the bitmap bits may not have caught up. With
+     * no mode given, the bits are all there is.
+     */
+    function exgEnabled(state) {
+        if (state.exgMode !== undefined && state.exgMode !== null) {
+            if (state.exgMode !== 'off')
+                return true;
+            // An explicit 'off' still defers to bits that are actually set: they are
+            // what the device would stream.
+            return (state.enabledSensors & EXG_ANY_MASK) !== 0;
+        }
+        return (state.enabledSensors & EXG_ANY_MASK) !== 0;
+    }
+    const enabledKeys = (state) => {
+        const keys = [];
+        for (const key of Object.keys(SensorBitmapShimmer3)) {
+            // The ExG bits are spoken for by the 'EXG' key.
+            if (sensorRuleMask(key) & EXG_ANY_MASK)
+                continue;
+            if (isOn(state.enabledSensors, key))
+                keys.push(key);
+        }
+        if (exgEnabled(state))
+            keys.push('EXG');
+        return keys;
+    };
+    /**
+     * The expansion-power bit this configuration should carry.
+     *
+     * Port of `ShimmerDevice.checkIfInternalExpBrdPowerIsNeeded` (:2279-2298): on
+     * if any enabled sensor needs the rail; otherwise off, **unless** an internal
+     * ADC channel is enabled, in which case it is left as it was. That last clause
+     * is deliberate in the Java driver — the internal ADC lines can be wired to
+     * something that needs power without the driver knowing — so `null` in means
+     * `null` out.
+     */
+    function deriveExpPower(enabledSensors, exgOn, current) {
+        const state = { enabledSensors, exgMode: exgOn ? 'on' : 'off' };
+        for (const key of enabledKeys(state)) {
+            if (requiresExpansionPower(key))
+                return 1;
+        }
+        const anyInternalAdc = INTERNAL_ADC_KEYS.some((k) => isOn(enabledSensors, k));
+        if (anyInternalAdc)
+            return current ?? null;
+        return 0;
+    }
+    /**
+     * Whether a sensor can be offered, given what is known about the hardware.
+     *
+     * `available: false` with `gate: 'block'` means a host should refuse the choice
+     * — but only for a sensor that is currently OFF. A host must always be able to
+     * turn off something that is on, whatever the board says, or a configuration
+     * read from a device cannot be corrected.
+     */
+    function sensorAvailability(key, state) {
+        const rule = hardwareRuleFor(key);
+        if (!rule)
+            return { available: true, gate: null, reason: null };
+        const label = sensorRuleLabel(key, state.generation);
+        if (state.generation && !rule.generations.includes(state.generation)) {
+            return {
+                available: false,
+                gate: 'block',
+                reason: state.generation === 'shimmer3r'
+                    ? `${label} does not exist on a Shimmer3R: its firmware has no such channel.`
+                    : `${label} is not available on a Shimmer3.`,
+            };
+        }
+        // An unknown board gates nothing: a blank daughter-card id page is a real
+        // state, and refusing every board sensor on one would be worse than useless.
+        if (state.boardId == null)
+            return { available: true, gate: null, reason: null };
+        if (rule.boards.includes(state.boardId))
+            return { available: true, gate: null, reason: null };
+        return {
+            available: rule.gate === 'warn',
+            gate: rule.gate,
+            reason: `${label} needs ${rule.needs}; this board reports SR${state.boardId}.`,
+        };
+    }
+    /** Everything known about one sensor's rules, for a tooltip. */
+    function describeSensorRules(key, generation) {
+        if (key !== 'EXG' && !(key in SensorBitmapShimmer3)) {
+            throw new RangeError(`Unknown sensor rule key: ${String(key)}`);
+        }
+        const label = sensorRuleLabel(key, generation);
+        const conflicts = sensorConflicts(key);
+        const rule = hardwareRuleFor(key);
+        const bit = sensorRuleMask(key);
+        const lines = [`${label} — bitmap 0x${bit.toString(16).padStart(6, '0')}`];
+        if (conflicts.length) {
+            lines.push('Cannot be enabled with: ' +
+                conflicts
+                    .map((c) => sensorRuleLabel(c.key, generation) + (c.firmware ? ' (the firmware unticks it)' : ''))
+                    .join(', ') +
+                '.');
+        }
+        if (requiresExpansionPower(key))
+            lines.push('Turns expansion-board power on.');
+        if (rule)
+            lines.push(`Needs ${rule.needs}.`);
+        return {
+            key,
+            label,
+            bit,
+            conflicts: conflicts.map((c) => ({ key: c.key, firmware: c.firmware })),
+            requiresExpPower: requiresExpansionPower(key),
+            boards: rule?.boards ?? null,
+            generations: rule?.generations ?? null,
+            text: lines.join('\n'),
+        };
+    }
+    // ---------------------------------------------------------------------------
+    // Toggling
+    // ---------------------------------------------------------------------------
+    const clearKey = (mask, key) => mask & ~sensorRuleMask(key);
+    /**
+     * Enable or disable one sensor, correcting whatever that breaks.
+     *
+     * **The newest choice wins**, which is `ShimmerDevice.sensorMapConflictCheckandCorrect`
+     * (:2497-2516): every sensor conflicting with the one just enabled is turned
+     * off, unconditionally. There is no "refuse the edit" path in the Java driver
+     * and there is none here — a user who ticks a box expects the box to tick, and
+     * being told what else changed is friendlier than being told no.
+     *
+     * The expansion rail follows, by {@link deriveExpPower}.
+     *
+     * @returns the corrected bitmap, the derived rail, and a sentence per change.
+     */
+    function applySensorToggle(state, key, enabled) {
+        if (key !== 'EXG' && !(key in SensorBitmapShimmer3)) {
+            throw new RangeError(`Unknown sensor rule key: ${String(key)}`);
+        }
+        const changes = [];
+        let mask = state.enabledSensors;
+        let exgOff = false;
+        const label = sensorRuleLabel(key, state.generation);
+        if (enabled) {
+            for (const c of sensorConflicts(key)) {
+                const on = c.key === 'EXG' ? exgEnabled({ ...state, enabledSensors: mask }) : isOn(mask, c.key);
+                if (!on)
+                    continue;
+                mask = clearKey(mask, c.key);
+                if (c.key === 'EXG')
+                    exgOff = true;
+                const other = sensorRuleLabel(c.key, state.generation);
+                changes.push({
+                    key: c.key,
+                    from: 1,
+                    to: 0,
+                    reason: c.firmware
+                        ? `${other} unticked — it shares ${c.shares} with ${label}, and the firmware ` +
+                            'clears it itself on the next write.'
+                        : `${other} unticked — it cannot be used with ${label} (they share ${c.shares}).`,
+                });
+            }
+        }
+        // 'EXG' owns no single bit: a host ORs in the width bits its preset chose.
+        if (key !== 'EXG') {
+            mask = enabled ? mask | sensorRuleMask(key) : clearKey(mask, key);
+        }
+        else if (!enabled) {
+            mask = clearKey(mask, 'EXG');
+            exgOff = true;
+        }
+        const exgOn = key === 'EXG' ? enabled : exgEnabled({ ...state, enabledSensors: mask });
+        const expPower = deriveExpPower(mask, exgOn, state.expPower);
+        if (expPower !== (state.expPower ?? null)) {
+            changes.push({
+                key: 'expPower',
+                from: state.expPower ?? 0,
+                to: expPower ?? 0,
+                reason: expPowerReason(expPower, mask, exgOn, state),
+            });
+        }
+        return { enabledSensors: mask, expPower, exgOff, changes };
+    }
+    function expPowerReason(next, mask, exgOn, state) {
+        if (next !== 1)
+            return 'Expansion-board power switched off — nothing enabled needs the rail.';
+        const needing = enabledKeys({ ...state, enabledSensors: mask, exgMode: exgOn ? 'on' : 'off' })
+            .filter(requiresExpansionPower)
+            .map((k) => sensorRuleLabel(k, state.generation));
+        let reason = `Expansion-board power switched on — ${needing.join(' and ')} ${needing.length > 1 ? 'need' : 'needs'} the internal expansion rail.`;
+        if (exgOn && state.generation === 'shimmer3r') {
+            reason +=
+                ' On a Shimmer3R the ExG front end has its own power control, but Consensys sets ' +
+                    'this bit for ExG on every platform and this matches it.';
+        }
+        return reason;
+    }
+    // ---------------------------------------------------------------------------
+    // Checking an existing configuration
+    // ---------------------------------------------------------------------------
+    /**
+     * Priority when an image already breaks a rule and there is no "newest" choice.
+     *
+     * A configuration read off a device, or loaded from a file, has to be corrected
+     * without knowing what the user meant. The order is:
+     *
+     * 1. For a firmware-enforced pair, the ADC channel loses — that is what the
+     *    device itself will do.
+     * 2. For a host-enforced ADC pair, the ADC channel loses too, for consistency.
+     * 3. When two owners of the expansion connector are both on, keep the one the
+     *    fitted board is for. With no board known, keep ExG over GSR over the
+     *    bridge amplifier: an ExG mode is the most deliberate choice a host can
+     *    have made, since it takes a control of its own.
+     */
+    const CONNECTOR_OWNERS = Object.freeze([
+        'EXG',
+        'SENSOR_GSR',
+        'SENSOR_BRIDGE_AMP',
+    ]);
+    function preferredConnectorOwner(state) {
+        const board = state.boardId;
+        if (board != null) {
+            for (const key of CONNECTOR_OWNERS) {
+                const rule = hardwareRuleFor(key);
+                if (rule?.boards.includes(board))
+                    return key;
+            }
+        }
+        return 'EXG';
+    }
+    /**
+     * Check a configuration against every rule, and say what the nearest working
+     * one would be.
+     *
+     * Idempotent: checking {@link SensorRuleCheck.derivations} produces no
+     * violations.
+     */
+    function checkSensorRules(state) {
+        const violations = [];
+        const changes = [];
+        let mask = state.enabledSensors;
+        let exgOn = exgEnabled(state);
+        let exgOff = false;
+        const drop = (key, reason) => {
+            mask = clearKey(mask, key);
+            if (key === 'EXG') {
+                exgOn = false;
+                exgOff = true;
+            }
+            changes.push({ key, from: 1, to: 0, reason });
+        };
+        const on = (key) => key === 'EXG' ? exgOn : isOn(mask, key) && (mask & sensorRuleMask(key)) !== 0;
+        // --- hardware and generation, first: a sensor the board does not have
+        // cannot be part of any other rule's resolution.
+        for (const key of enabledKeys(state)) {
+            const availability = sensorAvailability(key, state);
+            if (availability.available || availability.gate !== 'block')
+                continue;
+            const generationRule = state.generation && !(hardwareRuleFor(key)?.generations.includes(state.generation) ?? true);
+            violations.push({
+                kind: generationRule ? 'generation' : 'hardware',
+                sensors: [key],
+                enforcedBy: 'host',
+                message: availability.reason,
+            });
+            drop(key, `${sensorRuleLabel(key, state.generation)} unticked — ${availability.reason}`);
+        }
+        // --- conflicts
+        const owner = preferredConnectorOwner(state);
+        for (const pair of CONFLICT_PAIRS) {
+            if (!on(pair.a) || !on(pair.b))
+                continue;
+            const aLabel = sensorRuleLabel(pair.a, state.generation);
+            const bLabel = sensorRuleLabel(pair.b, state.generation);
+            violations.push({
+                kind: 'conflict',
+                sensors: [pair.a, pair.b],
+                enforcedBy: pair.firmware ? 'firmware' : 'host',
+                message: pair.firmware
+                    ? `${aLabel} and ${bLabel} both share ${pair.shares}; the firmware will untick ` +
+                        'one of them at its next configuration write.'
+                    : `${aLabel} cannot be used with ${bLabel} — they share ${pair.shares}.`,
+            });
+            // Resolve: an ADC channel loses to a front end; between two front ends the
+            // board decides.
+            const aIsAdc = INTERNAL_ADC_KEYS.includes(pair.a);
+            const bIsAdc = INTERNAL_ADC_KEYS.includes(pair.b);
+            if (aIsAdc !== bIsAdc) {
+                const loser = aIsAdc ? pair.a : pair.b;
+                const keeper = aIsAdc ? pair.b : pair.a;
+                drop(loser, `${sensorRuleLabel(loser, state.generation)} unticked — it shares ${pair.shares} with ` +
+                    `${sensorRuleLabel(keeper, state.generation)}.`);
+            }
+            else {
+                const loser = pair.a === owner ? pair.b : pair.a;
+                const keeper = loser === pair.a ? pair.b : pair.a;
+                drop(loser, `${sensorRuleLabel(loser, state.generation)} unticked — it cannot be used with ` +
+                    `${sensorRuleLabel(keeper, state.generation)} (they share ${pair.shares}).`);
+            }
+        }
+        // --- expansion power
+        const expPower = deriveExpPower(mask, exgOn, state.expPower);
+        const currentExpPower = state.expPower ?? null;
+        if (expPower !== currentExpPower) {
+            const needing = enabledKeys({ ...state, enabledSensors: mask, exgMode: exgOn ? 'on' : 'off' })
+                .filter(requiresExpansionPower)
+                .map((k) => sensorRuleLabel(k, state.generation));
+            if (expPower === 1 && currentExpPower === 0) {
+                violations.push({
+                    kind: 'expPower',
+                    sensors: needing.length
+                        ? enabledKeys({ ...state, enabledSensors: mask, exgMode: exgOn ? 'on' : 'off' }).filter(requiresExpansionPower)
+                        : [],
+                    enforcedBy: 'host',
+                    message: `${needing.join(' and ')} ${needing.length > 1 ? 'are' : 'is'} enabled but ` +
+                        'expansion-board power is off: the board will not be powered, and its channels ' +
+                        'will read nothing.',
+                });
+            }
+            changes.push({
+                key: 'expPower',
+                from: currentExpPower ?? 0,
+                to: expPower ?? 0,
+                reason: expPowerReason(expPower, mask, exgOn, state),
+            });
+        }
+        return {
+            violations,
+            derivations: { enabledSensors: mask, expPower, exgOff },
+            changes,
+        };
+    }
+
+    /**
      * Constants for the Shimmer3 / Shimmer3R binary SD-log file format.
      *
      * Ported from the Shimmer Java driver:
@@ -18497,7 +21246,7 @@
      */
     const gsrChannel = () => ({
         name: 'GSR',
-        unit: 'uSiemens',
+        unit: CHANNEL_UNITS.MICRO_SIEMENS,
         calibrated: true,
         dataType: 'u16',
         sizeBytes: 2,
@@ -19213,25 +21962,15 @@
      *     scope — carried rollover state across files)
      */
     /**
-     * Convert a raw GSR sample to conductance in µS, reusing the streaming
-     * clients' amplifier-equation path (Shimmer3Client/Shimmer3RClient
-     * #_calibrateData) seeded with the header's GSR range setting.
+     * Convert a raw GSR sample to conductance in µS, through the one shared
+     * amplifier-equation path (`devices/calibration/gsr.ts`) that the streaming
+     * clients also use, seeded with the header's GSR range setting.
      */
     // HARDWARE-VERIFY: GSR amplifier-equation calibration is shared by the SDK's
     // Shimmer3 and Shimmer3R streaming clients; confirm it holds for SD-logged
     // GSR data on older (pre-GSR+) Shimmer3 expansion boards.
     function calibrateGsr(raw, gsrRangeSetting) {
-        let adc12 = raw & 0x0fff;
-        let range = gsrRangeSetting;
-        if (range === 4) {
-            range = (raw >> 14) & 0x03; // auto-range: range travels in bits 14-15
-        }
-        if (range === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3) {
-            adc12 = GSR_UNCAL_LIMIT_RANGE3;
-        }
-        let gsrkOhm = calibrateGsrDataToResistanceFromAmplifierEq(adc12, range);
-        gsrkOhm = nudgeGsrResistance(gsrkOhm, gsrRangeSetting);
-        return (1.0 / gsrkOhm) * 1000;
+        return calibrateGsrSample(raw, gsrRangeSetting).conductanceUSiemens;
     }
     function decodeRecordsFromFile(bytes, parsed, out, budget) {
         const { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz } = parsed;
@@ -28042,9 +30781,12 @@
         return factoryTestReportToCsvRows(parsed, meta);
     }
 
+    exports.ADC_BITS = ADC_BITS;
+    exports.ADC_VREF_VOLTS = ADC_VREF_VOLTS;
     exports.ASM_COMMAND = ASM_COMMAND;
     exports.ASM_PROPERTY = ASM_PROPERTY;
     exports.BASE_HARDWARE_IDS = BASE_HARDWARE_IDS;
+    exports.BATTERY_DIVIDER_RATIO = BATTERY_DIVIDER_RATIO;
     exports.BLE_LINK_MIN_FW = BLE_LINK_MIN_FW;
     exports.BLUETOOTH_MODULE_VERSIONS = BLUETOOTH_MODULE_VERSIONS;
     exports.BRAND_BLE_MAX_CHARS = BRAND_BLE_MAX_CHARS;
@@ -28060,8 +30802,10 @@
     exports.BT_FEATURE = BT_FEATURE;
     exports.BaseShimmerClient = BaseShimmerClient;
     exports.CALIB_READ_SOURCE = CALIB_READ_SOURCE;
+    exports.CALIB_SENSOR_ID_BY_GROUP = CALIB_SENSOR_ID_BY_GROUP;
     exports.CHANNEL_FORMATS = CHANNEL_FORMATS;
     exports.CHANNEL_FORMAT_OVERRIDES = CHANNEL_FORMAT_OVERRIDES;
+    exports.CHANNEL_UNITS = CHANNEL_UNITS;
     exports.CHARGING_STATUS_BYTE = CHARGING_STATUS_BYTE;
     exports.CHOP_FREQUENCY_LABELS = CHOP_FREQUENCY_LABELS;
     exports.COMPARATOR_THRESHOLD_LABELS = COMPARATOR_THRESHOLD_LABELS;
@@ -28074,6 +30818,7 @@
     exports.DATA_RATE_OPTIONS = DATA_RATE_OPTIONS;
     exports.DEBUG_COMMAND_ID = DEBUG_COMMAND_ID;
     exports.DEFAULT_TRIAL_NAME = DEFAULT_TRIAL_NAME;
+    exports.EXG_ANY_MASK = EXG_ANY_MASK;
     exports.EXG_BANK_LENGTH = EXG_BANK_LENGTH$1;
     exports.EXG_CHIP1 = EXG_CHIP1;
     exports.EXG_CHIP2 = EXG_CHIP2;
@@ -28083,6 +30828,7 @@
     exports.EXG_REG8_STATUS_INDEX = EXG_REG8_STATUS_INDEX;
     exports.EXG_REGS_RESPONSE = EXG_REGS_RESPONSE;
     exports.EXG_REGS_RESPONSE_PAYLOAD_LENGTH = EXG_REGS_RESPONSE_PAYLOAD_LENGTH;
+    exports.EXG_VREF_VOLTS = EXG_VREF_VOLTS;
     exports.ExgKnobError = ExgKnobError;
     exports.ExgKnobValueError = ExgKnobValueError;
     exports.ExgRespirationLockedError = ExgRespirationLockedError;
@@ -28097,6 +30843,8 @@
     exports.GAIN_VALUES = GAIN_VALUES;
     exports.GET_EXG_REGS_COMMAND = GET_EXG_REGS_COMMAND;
     exports.GSR_NAME = GSR_NAME;
+    exports.GSR_RANGE_NAME = GSR_RANGE_NAME;
+    exports.GSR_RESISTANCE_NAME = GSR_RESISTANCE_NAME;
     exports.INERTIAL_UNITS = INERTIAL_UNITS;
     exports.INFOMEM_ADDR_FLAT = INFOMEM_ADDR_FLAT;
     exports.INFOMEM_ADDR_LEGACY = INFOMEM_ADDR_LEGACY;
@@ -28136,6 +30884,11 @@
     exports.PACKET_OVERHEAD_RESPONSE_DATA = PACKET_OVERHEAD_RESPONSE_DATA;
     exports.PACKET_OVERHEAD_RESPONSE_OTHER = PACKET_OVERHEAD_RESPONSE_OTHER;
     exports.POWER_DOWN_LABELS = POWER_DOWN_LABELS;
+    exports.PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD = PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD;
+    exports.PRESSURE_COEFFICIENT_BYTES = PRESSURE_COEFFICIENT_BYTES;
+    exports.PRESSURE_NAME = PRESSURE_NAME;
+    exports.PRESSURE_SENSOR_ID = PRESSURE_SENSOR_ID;
+    exports.PRESSURE_SENSOR_ID_BY_KIND = PRESSURE_SENSOR_ID_BY_KIND;
     exports.REFERENCE_ELECTRODE_OPTIONS = REFERENCE_ELECTRODE_OPTIONS;
     exports.RESPIRATION_CONTROL_LABELS = RESPIRATION_CONTROL_LABELS;
     exports.RESPIRATION_FREQUENCY_LABELS = RESPIRATION_FREQUENCY_LABELS;
@@ -28145,12 +30898,15 @@
     exports.RESYNC = RESYNC;
     exports.RLD_REFERENCE_SIGNAL_LABELS = RLD_REFERENCE_SIGNAL_LABELS;
     exports.RtcDriftMonitor = RtcDriftMonitor;
+    exports.SCALAR_CALIBRATORS = SCALAR_CALIBRATORS;
     exports.SC_CALIB_FORMAT_VERSION = SC_CALIB_FORMAT_VERSION;
     exports.SC_CAL_QUALITY_MASK = SC_CAL_QUALITY_MASK;
     exports.SC_CAL_QUALITY_SHIFT = SC_CAL_QUALITY_SHIFT;
     exports.SC_CAL_RANGE_MASK = SC_CAL_RANGE_MASK;
     exports.SC_DATA_LEN_IMU = SC_DATA_LEN_IMU;
     exports.SC_GLOBAL_HEADER_BYTES = SC_GLOBAL_HEADER_BYTES;
+    exports.SC_SENSOR = SC_SENSOR;
+    exports.SC_SENSOR_NAMES = SC_SENSOR_NAMES;
     exports.SDK_VERSION = SDK_VERSION;
     exports.SDLOG_CLOCK_FREQ = SDLOG_CLOCK_FREQ;
     exports.SDLOG_DATA_TYPE_BYTES = SDLOG_DATA_TYPE_BYTES;
@@ -28169,6 +30925,7 @@
     exports.SD_STATUS = SD_STATUS;
     exports.SD_TRANSFER_OPCODES = SD_TRANSFER_OPCODES;
     exports.SD_XFER = SD_XFER;
+    exports.SENSOR_RULE_CONFLICTS = SENSOR_RULE_CONFLICTS;
     exports.SERIAL_DFU_EXTENDED_ERROR_NAMES = SERIAL_DFU_EXTENDED_ERROR_NAMES;
     exports.SERIAL_DFU_OBJECT_TYPE = SERIAL_DFU_OBJECT_TYPE;
     exports.SERIAL_DFU_OP = SERIAL_DFU_OP;
@@ -28240,6 +30997,7 @@
     exports.SMARTDOCK_CONNECTION_TYPE = SMARTDOCK_CONNECTION_TYPE;
     exports.SMARTDOCK_DEFAULTS = SMARTDOCK_DEFAULTS;
     exports.SMARTDOCK_LINE_TERMINATOR = SMARTDOCK_LINE_TERMINATOR;
+    exports.SR_BOARD = SR_BOARD;
     exports.STREAM_MODE = STREAM_MODE;
     exports.SdLogFormatError = SdLogFormatError;
     exports.SdTransferError = SdTransferError;
@@ -28258,8 +31016,12 @@
     exports.SlipDecoder = SlipDecoder;
     exports.SmartDockClient = SmartDockClient;
     exports.StreamStatsTracker = StreamStatsTracker;
+    exports.StreamTimeline = StreamTimeline;
+    exports.TEMPERATURE_NAME = TEMPERATURE_NAME;
     exports.TEST_MODE_ID = TEST_MODE_ID;
     exports.TEST_SIGNAL_FREQUENCY_LABELS = TEST_SIGNAL_FREQUENCY_LABELS;
+    exports.TICKS_PER_MS = TICKS_PER_MS;
+    exports.TICKS_PER_SECOND = TICKS_PER_SECOND;
     exports.TIMESTAMP_FIELD = TIMESTAMP_FIELD;
     exports.UART_COMPONENT = UART_COMPONENT;
     exports.UART_CONFIG_COMMANDS = UART_CONFIG_COMMANDS;
@@ -28267,6 +31029,7 @@
     exports.UART_PACKET_CMD = UART_PACKET_CMD;
     exports.UART_PACKET_HEADER = UART_PACKET_HEADER;
     exports.UART_PROP = UART_PROP;
+    exports.UNIX_TIMESTAMP_NAME = UNIX_TIMESTAMP_NAME;
     exports.UNKNOWN_CHANNEL_ASSUMED_BYTES = UNKNOWN_CHANNEL_ASSUMED_BYTES;
     exports.UnknownExgKnobError = UnknownExgKnobError;
     exports.VERISENSE_BLE_SCHEDULE_DEFAULTS = VERISENSE_BLE_SCHEDULE_DEFAULTS;
@@ -28315,6 +31078,7 @@
     exports.applyExgMustBeBits = applyExgMustBeBits;
     exports.applyExgPreset = applyExgPreset;
     exports.applyImuCalibration = applyImuCalibration;
+    exports.applySensorToggle = applySensorToggle;
     exports.asmRtcBytesToUnixSeconds = asmRtcBytesToUnixSeconds;
     exports.asmRtcMinutesBytesToUnixSeconds = asmRtcMinutesBytesToUnixSeconds;
     exports.badResponseReason = badResponseReason;
@@ -28350,9 +31114,14 @@
     exports.buildVerisenseAdvertisedName = buildVerisenseAdvertisedName;
     exports.buildVerisenseDfuRequestDeviceOptions = buildVerisenseDfuRequestDeviceOptions;
     exports.buildWritePacket = buildWritePacket;
+    exports.calibSensorIdForGroup = calibSensorIdForGroup;
     exports.calibTsBytesToUnixSeconds = calibTsBytesToUnixSeconds;
+    exports.calibrateExgSample = calibrateExgSample;
+    exports.calibrateGsrChannel = calibrateGsrChannel;
     exports.calibrateGsrDataToResistanceFromAmplifierEq = calibrateGsrDataToResistanceFromAmplifierEq;
+    exports.calibrateGsrSample = calibrateGsrSample;
     exports.calibrateShimmer3RAdcChannel = calibrateShimmer3RAdcChannel;
+    exports.calibrateStreamFrame = calibrateStreamFrame;
     exports.calibrateU12AdcValue = calibrateU12AdcValue;
     exports.calibrateVector3 = calibrateVector3;
     exports.calibrationBlobCrc = calibrationBlobCrc;
@@ -28361,6 +31130,7 @@
     exports.channelLayoutDiffersByGeneration = channelLayoutDiffersByGeneration;
     exports.checkConfigBytesValid = checkConfigBytesValid;
     exports.checkImuRateCoversPacketRate = checkImuRateCoversPacketRate;
+    exports.checkSensorRules = checkSensorRules;
     exports.classifyBaseResponse = classifyBaseResponse;
     exports.classifyFactoryTestAckPacket = classifyFactoryTestAckPacket;
     exports.classifyLiteProtocolAck = classifyLiteProtocolAck;
@@ -28368,6 +31138,11 @@
     exports.clearExgResolutionFlags = clearExgResolutionFlags;
     exports.compareInfoMemExcluding = compareInfoMemExcluding;
     exports.compareVerisenseFirmwareVersion = compareVerisenseFirmwareVersion;
+    exports.compensateBmp180 = compensateBmp180;
+    exports.compensateBmp280 = compensateBmp280;
+    exports.compensateBmp390 = compensateBmp390;
+    exports.compensateBmp581 = compensateBmp581;
+    exports.compensatePressure = compensatePressure;
     exports.computeVerisensePairingPin = computeVerisensePairingPin;
     exports.consensysBackupSegments = consensysBackupSegments;
     exports.consensysMacFolderName = consensysMacFolderName;
@@ -28387,11 +31162,13 @@
     exports.defaultTrialIdentity = defaultTrialIdentity;
     exports.defaultVerisensePasskeyForId = defaultVerisensePasskeyForId;
     exports.deleteDownloadedFromCard = deleteDownloadedFromCard;
+    exports.deriveExpPower = deriveExpPower;
     exports.deriveLsm6dsvAccelGyroRate = deriveLsm6dsvAccelGyroRate;
     exports.deriveLsm6dsvRateOnEnableChange = deriveLsm6dsvRateOnEnableChange;
     exports.deriveShimmer3FirmwareVersionCode = deriveShimmer3FirmwareVersionCode;
     exports.deriveVerisenseMacIdFromName = deriveVerisenseMacIdFromName;
     exports.describePlatformSupport = describePlatformSupport;
+    exports.describeSensorRules = describeSensorRules;
     exports.describeShimmerHardware = describeShimmerHardware;
     exports.describeVerisenseChargerStatus = describeVerisenseChargerStatus;
     exports.detectExgPreset = detectExgPreset;
@@ -28407,6 +31184,7 @@
     exports.enumerateSdTree = enumerateSdTree;
     exports.evaluateParsedFileSplit = evaluateParsedFileSplit;
     exports.exgBanksEqualIgnoringStatus = exgBanksEqualIgnoringStatus;
+    exports.exgChannelMillivoltFactor = exgChannelMillivoltFactor;
     exports.exgConflictingSensors = exgConflictingSensors;
     exports.exgKnobOptions = exgKnobOptions;
     exports.exgPresetLabel = exgPresetLabel;
@@ -28446,6 +31224,8 @@
     exports.getVerisenseStreamSensorLabel = getVerisenseStreamSensorLabel;
     exports.getVerisenseStreamingBatteryVoltageMultiplier = getVerisenseStreamingBatteryVoltageMultiplier;
     exports.getVerisenseSupportedOperationalFieldGroupIds = getVerisenseSupportedOperationalFieldGroupIds;
+    exports.groupForCalibSensorId = groupForCalibSensorId;
+    exports.gsrRangeForSample = gsrRangeForSample;
     exports.hasSensorBit = hasSensorBit;
     exports.hhmmToMinutesSinceMidnight = hhmmToMinutesSinceMidnight;
     exports.inferShimmer3Generation = inferShimmer3Generation;
@@ -28493,6 +31273,9 @@
     exports.parseBatteryStatus = parseBatteryStatus;
     exports.parseBleLinkDebugPayload = parseBleLinkDebugPayload;
     exports.parseBluetoothModuleVersion = parseBluetoothModuleVersion;
+    exports.parseBmp180Coefficients = parseBmp180Coefficients;
+    exports.parseBmp280Coefficients = parseBmp280Coefficients;
+    exports.parseBmp390Coefficients = parseBmp390Coefficients;
     exports.parseBrandRecord = parseBrandRecord;
     exports.parseCalibDump = parseCalibDump;
     exports.parseCalibrationBlob = parseCalibrationBlob;
@@ -28510,6 +31293,7 @@
     exports.parseMessage = parseMessage;
     exports.parsePayloadCrcErrorBankIndexes = parsePayloadCrcErrorBankIndexes;
     exports.parsePendingEvents = parsePendingEvents;
+    exports.parsePressureCalibrationResponse = parsePressureCalibrationResponse;
     exports.parseProductionConfigPayload = parseProductionConfigPayload;
     exports.parseProductionConfigPayloadFull = parseProductionConfigPayloadFull;
     exports.parseRecordBufferDetailsPayload = parseRecordBufferDetailsPayload;
@@ -28536,6 +31320,7 @@
     exports.readInfoMemFieldValue = readInfoMemFieldValue;
     exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
     exports.requireShimmer3FactoryTestType = requireShimmer3FactoryTestType;
+    exports.requiresExpansionPower = requiresExpansionPower;
     exports.resolveChannelFormat = resolveChannelFormat;
     exports.resolveFieldIndex = resolveFieldIndex;
     exports.resolveInfoMemLayout = resolveInfoMemLayout;
@@ -28548,6 +31333,11 @@
     exports.sdMessageSpan = sdMessageSpan;
     exports.sdStatusToString = sdStatusToString;
     exports.sdXferStatusToString = sdXferStatusToString;
+    exports.selectDumpCalibrations = selectDumpCalibrations;
+    exports.sensorAvailability = sensorAvailability;
+    exports.sensorConflicts = sensorConflicts;
+    exports.sensorRuleLabel = sensorRuleLabel;
+    exports.sensorRuleMask = sensorRuleMask;
     exports.serializeCalibrationBlob = serializeCalibrationBlob;
     exports.setExgFieldPreserving = setExgFieldPreserving;
     exports.setVerisenseDfuModeWithRetry = setVerisenseDfuModeWithRetry;
@@ -28564,6 +31354,8 @@
     exports.shimmerUartCrcCheck = shimmerUartCrcCheck;
     exports.shouldOverrideCalibration = shouldOverrideCalibration;
     exports.slipEncode = slipEncode;
+    exports.summariseExgBanks = summariseExgBanks;
+    exports.summariseExgCalibration = summariseExgCalibration;
     exports.supportsVerisenseCalibration = supportsVerisenseCalibration;
     exports.supportsVerisenseMagnetometer = supportsVerisenseMagnetometer;
     exports.transportAdvice = transportAdvice;
