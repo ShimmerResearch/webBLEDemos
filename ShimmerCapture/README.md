@@ -3,7 +3,10 @@
 An example of configuring, streaming, plotting and recording **one** Shimmer3R
 from a web browser, with no installer and no driver.
 
-It is a worked example, not a replacement for the desktop application. There
+It is a worked example, not a replacement for **Consensys**, Shimmer's desktop
+application — which is where configuring, streaming, recording and analysing
+data across your devices belongs. This page says so on its Sensor link card,
+because somebody who arrived from a search should not have to work it out. There
 is no device list, no trial management, no multi-sensor synchronisation and no
 analysis: one sensor, one connection, one recording at a time. What it does
 show is that everything a Shimmer3R can be told over its Bluetooth or USB link
@@ -116,6 +119,65 @@ Two things the page owns rather than the schema:
   values, so a single control picks one of the known-good banks — EMG, ECG or
   test signal, 16-bit — and takes over the ExG sensor bits so two controls can
   never fight over them.
+- **The sensor rules.** A Shimmer3R has more sensors than it has ADC inputs, so
+  some combinations are impossible; see below.
+
+### Which sensors can be enabled together
+
+The page behaves as Consensys does: **the newest choice wins.** Tick a sensor
+that conflicts with one already on and the other is unticked, with a line in the
+banner and the log saying which and why. Nothing is ever refused — a box you
+click ticks, and being told what else moved is friendlier than being told no.
+
+Every message distinguishes two kinds of rule, because they mean different
+things to you:
+
+- **The firmware enforces it.** GSR, the bridge amplifier and ExG each share an
+  ADC input with an internal ADC channel, and the firmware clears the loser
+  itself at its next configuration write whatever the page sends. Reporting
+  these is predicting the device, not overruling it.
+- **Only Consensys enforces it.** GSR, the bridge amplifier and ExG are three
+  different expansion boards and only one board can be fitted, so the firmware
+  will accept the combination, stream it, and give you nothing usable. These
+  come from the desktop driver's own conflict tables.
+
+**Expansion-board power is derived, not left to you.** GSR, the bridge amplifier
+and ExG run off the internal expansion rail, and the firmware never switches it
+on for them: the bit defaults to off, is read once when sensing starts, and
+appears nowhere in the firmware's own configuration correction. So a sensor can
+accept your configuration, hand it straight back unchanged, and stream a
+perfectly well-formed packet from an unpowered front end. The page turns the
+rail on whenever something needs it and off when nothing does — except when an
+internal ADC channel is enabled, where it leaves the bit alone, because that
+line may be wired to something the page cannot know about. (On a Shimmer3R the
+bit does not in fact power the ExG board, which comes up through its own reset
+line; Consensys sets it for ExG on every platform, a Shimmer3 genuinely needs
+it, and matching Consensys keeps the two tools' images identical.)
+
+**A sensor this hardware does not have is greyed out**, with the board it needs
+in its tooltip: GSR wants a GSR+ board, ExG an ECG/EMG board, and the bridge
+amplifier an SR8 or SR49 **on a Shimmer3** — the Shimmer3R firmware has no
+bridge-amplifier channel at all. The internal ADC lines only warn rather than
+refuse, because the desktop driver's board lists for them are
+revision-specific and name boards this page's table does not carry. A board that
+will not say what it is gates nothing. And a box that is already ticked is never
+disabled, whatever the board says: a configuration read off a device can contain
+anything, and you have to be able to untick it.
+
+**An image that arrives already broken** — read from the device, or loaded from
+a `.bin` — cannot be corrected by "newest wins", because nothing was newest. It
+gets the same banner with a **Fix** button, which edits the form the way
+Consensys would and leaves the writing to you.
+
+**On required channels: there are none**, in the enable-bitmap sense, and it is
+worth saying so rather than leaving a gap. The desktop driver declares a
+required-sensor list on every sensor and populates it nowhere, so the code that
+reads it never does anything. The real dependencies are the expansion rail
+above; the firmware's own rule that forces an internal ADC channel on for the
+skin-temperature and resistance-amplifier probes, which are derived channels
+this page does not model; and the algorithm layer, which this page does not
+have. Pressure and temperature are one enable bit and one checkbox, which is
+the closest thing to a required pair here.
 
 **The working document is the 384-byte image.** Every control reads and writes
 those bytes directly, so the reserved bits and the regions no field on the page
@@ -240,6 +302,10 @@ others read as those three being the only ones with a calibration date, when
 what it meant was that the rest have no calibration at all — a different fact,
 and one the pill beside each title already makes.
 
+The dump read on connect is also handed to the streaming conversion, so a
+stream started afterwards reports this sensor's own numbers rather than its
+part's factory seed — see **Streaming**.
+
 Reads, writes and the raw dump's save and load all work over a Bluetooth link.
 The dock protocol has no calibration-dump command, so the controls are greyed
 out over USB. One ordering the firmware imposes and the tab says out loud:
@@ -257,12 +323,74 @@ reads the achieved rate, the configured rate, packet loss — measured against
 gaps in the _device_ clock, not host arrival times, so host Bluetooth buffering
 cannot invent losses — throughput, frame count and elapsed time.
 
+### Every channel, in its own units
+
+**Calibrated means calibrated, for all of them.** Battery, the external and
+internal ADC lines, PPG and the bridge amplifier read in millivolts; GSR in
+microsiemens, with its resistance in kΩ and the resistor it used alongside;
+pressure in kilopascals and temperature in degrees Celsius; ExG in millivolts;
+and the six inertial groups in m/(s^2), deg/s and local flux. Until now
+nineteen of the thirty-eight channels a sensor can send reached the plot as bare
+ADC counts while the selector said "Calibrated", because only the inertial
+groups and GSR had a conversion.
+
+Only the inertial sensors carry calibration **on the device**; everything else
+is a fixed conversion the host has to know, which is why this was worth doing
+once and properly. Pressure sits between the two: nothing per-device is stored,
+but the part's own factory trim has to be fetched, so the page reads it on
+connect over Bluetooth. Firmware that does not serve that command leaves
+pressure and temperature raw-only, and the log says so rather than inventing a
+number.
+
+The inertial values use **this sensor's own calibration**, from the dump read on
+connect, falling back to its part's factory seed where the dump has nothing for
+the configured range. Which of the two is in force appears in the log at stream
+start, because the difference is a percent or so and invisible otherwise.
+
+Each quantity gets its own plot panel and its own axis label — battery,
+pressure, temperature, the ADC lines and the bridge amplifier used to share one
+axis with everything unrecognised, which stops working the moment they are
+millivolts, kilopascals and degrees Celsius at the same time.
+
+### The time axis
+
+The x axis reads the **local time of day**. Two things can anchor it:
+
+- **The sensor's own real-world clock**, which is exact on a Shimmer3R: its
+  packet timestamp is the low 24 bits of the very counter its clock is kept in,
+  so one reading pins every later sample to the tick. On a Shimmer3 the counter
+  cannot be set and the clock is that counter plus an offset the firmware keeps
+  to itself, so the anchor is estimated from the request's round trip and the
+  log says by how much.
+- **This host's clock**, if the sensor's is unset or its firmware has no clock
+  command. That is what Consensys does for every device, and it means the times
+  carry your computer's clock error rather than the sensor's.
+
+Switch the **Time axis** control to _Elapsed_ for seconds since the stream
+started. Either way the counter is unwrapped first, so the axis no longer jumps
+back to zero every 512 seconds — and a duplicated packet no longer adds 512
+seconds permanently, which the desktop driver's own rule does.
+
+Setting the sensor's clock mid-stream steps the counter the samples are timed
+by, so the page re-reads it rather than carrying a stale anchor.
+
+### The recording
+
 Recording writes a CSV named `Shimmer3R_<last 4 of MAC>_<yyyymmdd_hhmmss>.csv`.
 Its columns are derived from the first frame that arrives, so they are the
 channels the sensor is sending rather than the ones the page expected, and rows
 stream straight to the file you pick instead of being held in memory — a long
 session is not lost if the tab closes. If the link drops mid-recording the file
 is closed properly and what was captured is kept.
+
+Every channel appears twice, `_RAW` and `_CAL`, with the unit in the second row
+— `mV`, `uS`, `kOhms`, `kPa`, `Degrees Celsius`, `m/(s^2)`, `deg/s`,
+`local_flux`, and `no_units` for a raw column, which are the words Consensys
+writes so one script can read either tool's files. Alongside them:
+`HostTime_ms` when each frame reached this computer, `TIMESTAMP` as the raw
+counter in ticks, `TIMESTAMP_CAL` as the device's own clock in milliseconds
+(unwrapped), and `Timestamp_Unix_CAL` as wall-clock milliseconds whenever the
+axis has an anchor.
 
 ## The event log
 
@@ -414,7 +542,9 @@ temperature gives the comparable figure.
 
 - A **Shimmer3R**. Firmware v1.0.22 or later for BLE streaming; the
   configuration and calibration paths need firmware that serves the InfoMem
-  commands.
+  commands. Calibrated pressure and temperature need firmware that serves
+  `GET_PRESSURE_CALIBRATION_COEFFICIENTS`; without it those two channels stream
+  raw-only and the log says so.
 - A **Chromium browser** — Chrome or Edge. BLE needs Web Bluetooth; classic
   Bluetooth and USB-C need Web Serial. Neither is available in iOS browsers,
   and Android has Web Serial for paired Bluetooth ports only.
@@ -447,6 +577,8 @@ one is a useful thing to be able to see.
 | `&clockBase=local` | Start the sensor's clock on this host's civil time rather than UTC — what a sensor set by a tool using the other convention looks like.                                                                 |
 | `&srBoard=`        | The board's SR identity, as `id-rev-special` (default `48-3-0`, a GSR+). `none` fills the id page with 0xFF, an erased chip; `0-0-0` leaves it all zeroes, a page never written. Both read as no board. |
 | `&btVersion=`      | What the Bluetooth module replied. Defaults to a CYW20820 line, or an RN4678 banner with `&hw=3`. Empty models a module that never answered.                                                            |
+| `&sensors=`        | Preload the enabled-sensor bitmap, `0x0422E6` or decimal — how a calibrated multi-channel stream, or an image that already breaks a sensor rule, is reachable from a URL. |
+| `&pressure=`       | Which pressure part the mock claims: `390`, `581`, `180`, or `nack` / `silent` for the two ways real firmware fails to serve the coefficients. |
 | `&debug=1`         | Log every command and reply to the browser console.                                                                                                                                                     |
 
 While the mock is connected, `mockTransport.writes` in the console is every
@@ -470,3 +602,20 @@ recording holds up at high rates, that the self-test report arrives whole over
 a real link, that the red LED really lights — want confirming on hardware
 before anyone relies on them for real work. Check a recording before it
 matters.
+
+The calibrated values are the newest part and the least proven. Worth checking
+against Consensys reading the same sensor, in this order:
+
+- **Pressure and temperature.** The whole conversion is host-side and none of it
+  has met a real BMP390 or BMP581. A Shimmer3 with a BMP280 is worth its own
+  look: its 20-bit registers are reassembled from a 16-bit temperature and a
+  24-bit pressure, and getting that wrong is not subtle.
+- **GSR in µS and kΩ**, and the battery in mV — both against Consensys, and the
+  battery against a meter.
+- **ExG in mV** with the test-signal preset, whose amplitude is known.
+- **The time axis.** That a Shimmer3R's packet timestamp really is the low bits
+  of its real-world clock is read out of the firmware, not measured; if it is
+  wrong the axis will be out by a whole multiple of 512 seconds, which is
+  obvious the moment you compare it with the Device panel's clock.
+- **The sensor rules**, by writing an image that breaks one and reading it back:
+  the device should correct exactly what the banner predicted.
