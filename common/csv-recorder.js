@@ -199,6 +199,20 @@ export function createCsvRecorder(opts = {}) {
   }
 
   /**
+   * Is this the tick-counter timestamp that gets its own second column?
+   *
+   * Kind, not just name: the SDK emits `TIMESTAMP` twice per frame — `raw` in
+   * ticks and `cal` in unwrapped milliseconds — and only the first is the
+   * dedicated column. Matching on the name alone dropped the calibrated one
+   * from the file and, on the row path, let it overwrite the raw cell it was
+   * mistaken for. `null` counts as raw so a vendored bundle from before the
+   * kinds were set still writes its timestamp where it always did.
+   */
+  function isRawTimestamp(f) {
+    return f.name === "TIMESTAMP" && (f.kind ?? "raw") === "raw";
+  }
+
+  /**
    * Hand everything buffered to the sink. Returns a promise, but callers on
    * the hot path deliberately do not await it.
    */
@@ -241,7 +255,11 @@ export function createCsvRecorder(opts = {}) {
    *
    * @param {{name: string, kind?: string|null, unit?: string|null, header?: string}[]} cols
    *   the data columns, in file order. The page derives them from the first
-   *   frame; `TIMESTAMP` is written separately and should not appear here.
+   *   frame. The RAW `TIMESTAMP` is written separately, as the second column,
+   *   and is dropped from here if present; a `TIMESTAMP` of any other kind is
+   *   kept as an ordinary column, because `TIMESTAMP_CAL` is a different
+   *   number — unwrapped milliseconds, where the raw column is a 24-bit tick
+   *   counter that restarts every 512 seconds. Consensys writes both.
    * @returns {Promise<boolean>} false if the user cancelled the picker
    */
   async function start(cols) {
@@ -250,7 +268,7 @@ export function createCsvRecorder(opts = {}) {
       return false;
     }
     columns = (cols ?? [])
-      .filter((c) => c?.name && c.name !== "TIMESTAMP")
+      .filter((c) => c?.name && !isRawTimestamp(c))
       .map((c) => ({
         name: c.name,
         kind: c.kind ?? null,
@@ -355,7 +373,7 @@ export function createCsvRecorder(opts = {}) {
     const tsAt = at++;
     const base = at;
     for (const f of fields) {
-      if (f.name === "TIMESTAMP") {
+      if (isRawTimestamp(f)) {
         cells[tsAt] = f.value;
         continue;
       }

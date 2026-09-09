@@ -919,6 +919,12 @@ const stream = await evaluate(`
     return { title: ch.options.plugins.title.text, traces: ch.data.datasets.map(d=>d.label),
       points: ch.data.datasets.map(d=>d.data.length) };
   });
+  const axisTitles = {};
+  for (const c of document.querySelectorAll('.plot-panel canvas')) {
+    const ch = Chart.getChart(c);
+    axisTitles[ch.options.plugins.title.text] =
+      ch.options.scales.y.title?.display ? ch.options.scales.y.title.text : '';
+  }
   const cells = {};
   for (const d of document.querySelectorAll('#stats > div'))
     cells[d.querySelector('.stat-label').textContent] = d.querySelector('.stat-value').textContent;
@@ -931,7 +937,7 @@ const stream = await evaluate(`
   window.scrollTo(0, document.documentElement.scrollHeight);
   await new Promise(r => requestAnimationFrame(r));
   const panels = document.querySelectorAll('.plot-panel');
-  return { charts, cells,
+  return { charts, cells, axisTitles,
     drawerOpen: document.documentElement.dataset.logOpen,
     plotWidth: plotBox.width, pageWidth: pageBox.width,
     scrolledTo: window.scrollY,
@@ -953,9 +959,25 @@ check(
 );
 check(
   "stream draws one panel per sensor group with points",
-  stream.charts.length === 3 &&
+  /* Five, not three: pressure and temperature reach the plot now that the SDK
+     decodes them and `plot.js` gives each its own panel. They are separate
+     panels on purpose — kPa and °C share no axis with each other, let alone
+     with an accelerometer. */
+  stream.charts.length === 5 &&
     stream.charts.every((c) => c.points.every((p) => p > 50)),
   stream.charts.map((c) => `${c.title}: ${c.points.join("/")} pts`).join(", "),
+);
+check(
+  "and each panel's y axis is titled with the unit its traces share",
+  /* The axis title is the unit of the RESOLVED kind, so it follows the
+     Raw/Calibrated selector rather than being fixed at schema time. A panel
+     whose traces disagree on a unit gets no title, which is why pressure and
+     temperature cannot be one panel. */
+  stream.axisTitles["Low-noise accelerometer"] === "m/s²" &&
+    stream.axisTitles["Gyroscope"] === "deg/s" &&
+    stream.axisTitles["Pressure"] === "kPa" &&
+    stream.axisTitles["Temperature"] === "°C",
+  JSON.stringify(stream.axisTitles),
 );
 check(
   "stats strip reads a sane rate and 0% loss",
@@ -1052,9 +1074,27 @@ check(
 );
 check(
   "CSV header matches the stream columns",
-  rec.csv.header.startsWith("HostTime_ms,TIMESTAMP,LN_ACCEL_X_RAW") &&
-    rec.csv.units.startsWith("ms,ticks,"),
-  rec.csv.header.slice(0, 90) + "…",
+  /* Three time columns, and they are three different numbers: the host's
+     arrival time, the sensor's raw tick counter (which restarts every 512 s),
+     and the unwrapped milliseconds those ticks amount to. `Timestamp_Unix_CAL`
+     is the name Consensys writes for the wall clock, so a file from this page
+     and one from Consensys can be compared column for column. */
+  rec.csv.header.startsWith(
+    "HostTime_ms,TIMESTAMP,TIMESTAMP_CAL,Timestamp_Unix_CAL,",
+  ) &&
+    rec.csv.units.startsWith("ms,ticks,ms,ms,") &&
+    /,LN_ACCEL_X_RAW,/.test(rec.csv.header) &&
+    /,LN_ACCEL_X_CAL,/.test(rec.csv.header),
+  rec.csv.header.slice(0, 110) + "…",
+);
+check(
+  "and a raw column's unit is 'no_units', not an empty cell",
+  /* An empty cell reads as "the unit was not recorded"; `no_units` says there
+     is no unit. Java draws the same distinction with the same word. */
+  rec.csv.units.split(",")[
+    rec.csv.header.split(",").indexOf("LN_ACCEL_X_RAW")
+  ] === "no_units",
+  rec.csv.units.slice(0, 110) + "…",
 );
 check(
   "row count matches what the page reported",
@@ -4267,7 +4307,9 @@ check(
      name. */
   !pageSrc.includes("parseInfoMem(deviceImage, layout)") &&
     pageSrc.includes("parseInfoMem(deviceImage, context)"),
-  pageSrc.includes("parseInfoMem(deviceImage, context)") ? "context" : "not the context",
+  pageSrc.includes("parseInfoMem(deviceImage, context)")
+    ? "context"
+    : "not the context",
 );
 
 /* The one that had drifted: the calibration tab's disabled state must come
@@ -4886,8 +4928,491 @@ check(
   "an all-zero id page is no board, not the board SR0-0-0",
   /* All zeroes is as much "never written" as all 0xFF is "erased", and the
      SDK has to read BOTH as absent. */
-  identZero.hw === "Shimmer3R" && !identZero.hw.includes("SR0") && identZero.board === "null",
+  identZero.hw === "Shimmer3R" &&
+    !identZero.hw.includes("SR0") &&
+    identZero.board === "null",
   `${identZero.hw}  (readSrBoard -> ${identZero.board})`,
+);
+
+// ===========================================================================
+console.log("\n--- the Consensys note ---");
+await goto(`${BASE}?mock=1`);
+const note = await evaluate(`
+  const n = document.getElementById('consensysNote');
+  return { text: n.textContent.replace(/\\s+/g, ' ').trim(),
+    next: n.nextElementSibling?.id ?? null,
+    card: n.closest('.card')?.querySelector('.card-title')?.textContent?.trim() ?? null,
+    links: n.querySelectorAll('a').length };
+`);
+check(
+  "the page says it is an example and names Consensys, on the link card",
+  /* On the card a user reaches first, not buried in a tab: somebody who
+     arrived from a search should not mistake this for the product. */
+  /example application/.test(note.text) &&
+    /Consensys/.test(note.text) &&
+    note.next === "platformBanner",
+  `${note.card}: ${note.text.slice(0, 80)}…`,
+);
+check(
+  "and it points at no URL, rather than guessing one",
+  note.links === 0,
+  `${note.links} links`,
+);
+
+// ===========================================================================
+console.log("\n--- the sensor rules, newest choice wins ---");
+const B = {
+  GSR: 0x000004,
+  INT_A3: 0x000400,
+  INT_A0: 0x000200,
+  BRIDGE: 0x008000,
+};
+/* Ticking a box the way a user does — the change event is what the page
+   listens to — then reading back what the form now holds. `expPower` is read
+   through the form's own field so this cannot pass against a page that only
+   updated its own variable. */
+const RULES = `
+  const box = (bit) => document.querySelector('[data-sensor-bit="' + bit + '"]');
+  const tick = async (bit, on) => {
+    const b = box(bit);
+    b.checked = on;
+    b.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 120));
+  };
+  const expPower = () => {
+    const f = document.querySelector('#configForm .field[data-field-key="expPower"]');
+    const c = f?.querySelector('select, input');
+    return c ? (c.type === 'checkbox' ? (c.checked ? '1' : '0') : c.value) : null;
+  };
+  const banner = () => {
+    const n = document.getElementById('sensorRulesNote');
+    return { hidden: n.hidden, kind: n.className,
+      text: n.textContent.replace(/\\s+/g, ' ').trim(),
+      fix: !!document.getElementById('btnSensorRulesFix') };
+  };
+  const logLines = () => [...document.querySelectorAll('#log .log-line')]
+    .map(l => l.textContent).filter(t => /sensor rule/.test(t));
+`;
+await goto(`${BASE}?mock=1`);
+check("connect for the sensor-rule pass", (await evaluate(CONNECT)) === "mock");
+const toggles = await evaluate(`${RULES}
+  await tick(${B.INT_A3}, true);
+  const first = { banner: banner(), expPower: expPower() };
+  await tick(${B.GSR}, true);
+  const second = { banner: banner(), expPower: expPower(),
+    intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
+    log: logLines() };
+  await tick(${B.INT_A3}, true);
+  const third = { expPower: expPower(),
+    intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
+    banner: banner() };
+  await tick(${B.INT_A3}, false);
+  const fourth = { expPower: expPower() };
+  return { first, second, third, fourth,
+    changed: [...document.querySelectorAll('.hexview-byte.changed')]
+      .map(b => Number(/byte (\d+)/.exec(b.title)?.[1])) };
+`);
+check(
+  "an internal ADC channel on its own breaks no rule",
+  toggles.first.banner.hidden && toggles.first.expPower === "0",
+  `banner hidden=${toggles.first.banner.hidden}, expPower=${toggles.first.expPower}`,
+);
+check(
+  "enabling GSR unticks the ADC channel it shares an input with",
+  /* What the firmware would do at its next write, done here so the user sees
+     it before pressing Apply rather than discovering it on read-back. */
+  toggles.second.gsr &&
+    !toggles.second.intA3 &&
+    /Internal ADC A3/.test(toggles.second.banner.text),
+  toggles.second.banner.text.slice(0, 120),
+);
+check(
+  "and derives the expansion rail GSR needs, saying so",
+  toggles.second.expPower === "1" &&
+    /Expansion-board power switched on/.test(toggles.second.banner.text),
+  `expPower=${toggles.second.expPower}`,
+);
+check(
+  "the explanation reaches the log as well as the banner",
+  toggles.second.log.length >= 2,
+  JSON.stringify(toggles.second.log).slice(0, 160),
+);
+check(
+  "the newest choice wins in both directions",
+  /* Ticking the ADC channel back unticks GSR, rather than refusing the click.
+     A rule that only ever pushes one way makes the second sensor unreachable
+     without knowing which box to untick first. */
+  toggles.third.intA3 && !toggles.third.gsr && toggles.third.expPower === "1",
+  `intA3=${toggles.third.intA3} gsr=${toggles.third.gsr} expPower=${toggles.third.expPower}`,
+);
+check(
+  "and the rail goes off again when nothing left needs it",
+  toggles.fourth.expPower === "0",
+  `expPower=${toggles.fourth.expPower}`,
+);
+check(
+  "only the sensor bytes and the expansion-power byte moved",
+  /* Bytes 3-4 are the enabled-sensor bitmap's low words and 9 carries the
+     expansion-power bit. A rule that reached any further would be editing
+     something the user did not touch. */
+  toggles.changed.every((b) => [3, 4, 5, 9].includes(b)),
+  `changed bytes ${toggles.changed.join(",")}`,
+);
+
+const exgRule = await evaluate(`${RULES}
+  const mode = document.getElementById('exgMode');
+  await tick(${B.INT_A0}, true);
+  mode.value = [...mode.options].map(o => o.value).find(v => v !== 'off' && v !== mode.value);
+  mode.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 200));
+  return { chosen: mode.value, intA0: box(${B.INT_A0}).checked,
+    expPower: expPower(), banner: banner() };
+`);
+check(
+  "choosing an ExG mode clears the ADC channels ExG cannot share with",
+  exgRule.chosen !== "off" && !exgRule.intA0 && exgRule.expPower === "1",
+  `${exgRule.chosen}: intA0=${exgRule.intA0} expPower=${exgRule.expPower}`,
+);
+
+// ---- an image that arrived already broken gets a Fix button
+await goto(`${BASE}?mock=1&sensors=0x000404`);
+check(
+  "connect a sensor whose stored image already breaks a rule",
+  (await evaluate(CONNECT)) === "mock",
+);
+const broken = await evaluate(`${RULES}
+  const before = banner();
+  document.getElementById('btnSensorRulesFix').click();
+  await new Promise(r => setTimeout(r, 200));
+  return { before, after: banner(), expPower: expPower(),
+    intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
+    dirty: document.getElementById('dirtyPill').textContent,
+    log: logLines() };
+`);
+check(
+  "an image read off the device is explained, not silently corrected",
+  /* Nothing here is a "newest choice", so there is nothing to correct
+     automatically — the user's own stored configuration is not the page's to
+     rewrite behind their back. It says what is wrong and offers a Fix. */
+  !broken.before.hidden && /warn/.test(broken.before.kind) && broken.before.fix,
+  broken.before.text.slice(0, 140),
+);
+check(
+  "and Fix applies exactly what the banner described",
+  broken.gsr && !broken.intA3 && broken.expPower === "1",
+  `gsr=${broken.gsr} intA3=${broken.intA3} expPower=${broken.expPower}`,
+);
+check(
+  "after which the warning is replaced by a note saying what changed",
+  /* Not hidden: the same rules that had a violation to report now have a
+     change to report, and a banner that vanished would leave a user looking
+     at a form they did not edit. The Fix button goes, though — there is
+     nothing left to fix. */
+  !broken.after.hidden &&
+    /info/.test(broken.after.kind) &&
+    !broken.after.fix &&
+    /Internal ADC A3/.test(broken.after.text),
+  `${broken.after.kind}: ${broken.after.text.slice(0, 90)}`,
+);
+check(
+  "and the form is left dirty, for the user to Apply",
+  /* Fix edits the working image, exactly as any other field edit does. It
+     does not write to the sensor. */
+  /change/.test(broken.dirty),
+  broken.dirty,
+);
+check(
+  "Fix says what it changed, in the log, as a fix",
+  broken.log.some((l) => /sensor rule fix/.test(l)),
+  JSON.stringify(broken.log.filter((l) => /fix/.test(l))).slice(0, 160),
+);
+
+// ---- gating: a board that cannot carry a sensor
+await goto(`${BASE}?mock=1&srBoard=37-1-0`);
+check(
+  "connect an ECG/EMG board for the gating pass",
+  (await evaluate(CONNECT)) === "mock",
+);
+const gated = await evaluate(`${RULES}
+  const b = (bit) => { const x = box(bit); return { disabled: x.disabled,
+    title: (x.closest('label')?.title ?? '').replace(/\\s+/g, ' ') }; };
+  return { gsr: b(${B.GSR}), bridge: b(${B.BRIDGE}),
+    exgMode: document.getElementById('exgMode').disabled };
+`);
+check(
+  "a sensor this board cannot have is greyed out, with the board named",
+  gated.gsr.disabled && /SR37|ECG\/EMG/.test(gated.gsr.title),
+  gated.gsr.title.slice(0, 130),
+);
+check(
+  "and the ExG control this board CAN carry stays live",
+  gated.exgMode === false,
+  `exgMode disabled=${gated.exgMode}`,
+);
+check(
+  "the bridge amplifier is refused on a Shimmer3R at all",
+  /* There is no bridge-amplifier channel in the Shimmer3R packers, so the bit
+     would stream nothing whatever board is fitted. */
+  gated.bridge.disabled && /Shimmer3R/.test(gated.bridge.title),
+  gated.bridge.title.slice(0, 130),
+);
+
+await goto(`${BASE}?mock=1&srBoard=none`);
+check(
+  "connect a sensor with no board id",
+  (await evaluate(CONNECT)) === "mock",
+);
+const ungated = await evaluate(`${RULES}
+  return { disabled: [...document.querySelectorAll('[data-sensor-bit]')]
+    .filter(b => b.disabled).map(b => b.dataset.sensorKey),
+    exgMode: document.getElementById('exgMode').disabled };
+`);
+check(
+  "an unknown board gates nothing on the board's account",
+  /* A blank id page is a real state — an unprovisioned board — and refusing
+     every sensor on one would make the page useless exactly where it is most
+     needed. The bridge amplifier stays refused, because that is the
+     GENERATION saying so: no Shimmer3R packer emits a bridge channel, whatever
+     board is fitted. */
+  ungated.disabled.length === 1 &&
+    ungated.disabled[0] === "SENSOR_BRIDGE_AMP" &&
+    ungated.exgMode === false,
+  `disabled: ${ungated.disabled.join(", ") || "none"}`,
+);
+
+// ===========================================================================
+console.log("\n--- calibrated channels and the clock axis ---");
+await goto(`${BASE}?mock=1&sensors=0x0422e4&pressure=390&rate=51.2`);
+check(
+  "connect a sensor with pressure, GSR, battery and ADC enabled",
+  (await evaluate(CONNECT)) === "mock",
+);
+const calStream = await evaluate(`
+  const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
+  /* The page owns onStreamFrame; wrapping it is how a frame is read without
+     the page having to expose one for testing. */
+  const client = window.mockClient;
+  let frame = null;
+  document.querySelector('.tabs [data-tab="tabStream"]').click();
+  document.getElementById('btnStreamStart').click();
+  /* Wrapped AFTER the click, not before: startStream assigns its own handler
+     as it goes, so a wrapper installed first is simply overwritten. */
+  await new Promise(r => setTimeout(r, 400));
+  const prev = client.onStreamFrame;
+  client.onStreamFrame = (f) => { frame = f; prev?.call(client, f); };
+  await new Promise(r => setTimeout(r, 3000));
+  const oc = frame;
+  const val = (n, k) => oc?.get(n, k)?.value ?? null;
+  const unit = (n, k) => oc?.get(n, k)?.unit ?? null;
+  const panels = [...document.querySelectorAll('.plot-panel canvas')].map(c => {
+    const ch = Chart.getChart(c);
+    return { title: ch.options.plugins.title.text,
+      axis: ch.options.scales.y.title?.display ? ch.options.scales.y.title.text : '',
+      xTitle: ch.options.scales.x.title.display ? ch.options.scales.x.title.text : '',
+      firstTick: ch.scales.x.ticks?.[0]?.label ?? null,
+      xMin: ch.scales.x.min, xMax: ch.scales.x.max,
+      traces: ch.data.datasets.map(d => d.label) };
+  });
+  return {
+    kinds: oc ? [...new Set(oc.fields.map(f => f.kind))] : null,
+    batteryMv: val('BATTERY', 'cal'), batteryUnit: unit('BATTERY', 'cal'),
+    pressure: val('PRESSURE', 'cal'), pressureUnit: unit('PRESSURE', 'cal'),
+    temperature: val('TEMPERATURE', 'cal'), temperatureUnit: unit('TEMPERATURE', 'cal'),
+    gsrUnit: unit('GSR', 'cal'), gsrResistance: unit('GSR_RESISTANCE', 'cal'),
+    unixMs: val('Timestamp_Unix', 'cal'),
+    /* The page's own clock, read as the frame is read. Comparing the sensor's
+       wall clock against Node's would fold in the CDP round trip and make the
+       measurement about this script's latency. */
+    hostMs: Date.now(),
+    rawUnit: unit('LN_ACCEL_X', 'raw'),
+    timeline: window.mockClient?.timelineState ?? null,
+    calibration: window.mockClient?.calibrationInfo ?? null,
+    panels,
+    pressureLog: log().filter(l => /pressure/i.test(l)),
+    clockLog: log().filter(l => /clock/i.test(l)),
+  };
+`);
+check(
+  "the frame carries a calibrated value with a unit for every family",
+  calStream.batteryUnit === "mV" &&
+    calStream.pressureUnit === "kPa" &&
+    calStream.temperatureUnit === "Degrees Celsius" &&
+    calStream.gsrUnit === "uS" &&
+    calStream.gsrResistance === "kOhms" &&
+    calStream.rawUnit === "no_units",
+  `${calStream.batteryUnit} / ${calStream.pressureUnit} / ${calStream.temperatureUnit} / ${calStream.gsrUnit} / ${calStream.gsrResistance}`,
+);
+check(
+  "and the values are physical, not counts",
+  /* A plausible cell voltage, sea-level-ish pressure and a room temperature.
+     The mock feeds the compensation the BMP390's real reference coefficients,
+     so the pressure and temperature here are the compensation arithmetic
+     rather than a passthrough — 100.9 kPa and 23.2 °C are the datasheet
+     vector's own answers. The battery bound is loose at the bottom because
+     the mock swings its ADC sine around 2048 counts, which lands just under
+     3.0 V at the trough. */
+  calStream.batteryMv > 2800 &&
+    calStream.batteryMv < 4500 &&
+    calStream.pressure > 80 &&
+    calStream.pressure < 120 &&
+    calStream.temperature > 5 &&
+    calStream.temperature < 45,
+  `${calStream.batteryMv?.toFixed(1)} mV, ${calStream.pressure?.toFixed(3)} kPa, ${calStream.temperature?.toFixed(2)} °C`,
+);
+check(
+  "the pressure part is named in the log, having been asked for",
+  calStream.pressureLog.some((l) => /BMP390/i.test(l)),
+  JSON.stringify(calStream.pressureLog).slice(0, 160),
+);
+check(
+  "a Shimmer3R stream is pinned to the sensor's own clock, exactly",
+  /* `rwc-aligned` is only available because the packet timestamp IS the low
+     24 bits of the counter GET_RWC returns. The mock models that identity, so
+     a regression to a host anchor — or to an aligned anchor against a counter
+     that starts at zero — shows up here. */
+  calStream.timeline?.source === "rwc-aligned" &&
+    calStream.timeline?.anchorUncertaintyMs === 0,
+  JSON.stringify(calStream.timeline),
+);
+check(
+  "and the wall clock it produces agrees with the host's",
+  /* The mock's sensor clock runs on this host's, so the two should differ by
+     no more than the link's own latency. Minutes apart would be an anchor
+     placed in the wrong wrap of the counter. */
+  Math.abs(calStream.unixMs - calStream.hostMs) < 2000,
+  `sensor ${new Date(calStream.unixMs).toISOString()} vs host ` +
+    `${new Date(calStream.hostMs).toISOString()} — ` +
+    `${(calStream.unixMs - calStream.hostMs).toFixed(0)} ms apart`,
+);
+check(
+  "the x axis reads a local clock time, and says so",
+  calStream.panels.every((p) => /^\d\d:\d\d:\d\d/.test(p.firstTick ?? "")) &&
+    calStream.panels.every((p) => /local/.test(p.xTitle)),
+  `${calStream.panels[0]?.firstTick} — ${calStream.panels[0]?.xTitle}`,
+);
+check(
+  "which calibration the inertial channels are using is reportable",
+  calStream.calibration?.inertial?.lnAccel?.source != null &&
+    calStream.calibration?.adc?.vrefVolts === 3 &&
+    calStream.calibration?.adc?.bits === 12,
+  `lnAccel ${calStream.calibration?.inertial?.lnAccel?.source}, ADC ${calStream.calibration?.adc?.vrefVolts} V / ${calStream.calibration?.adc?.bits}-bit`,
+);
+
+const elapsed = await evaluate(`
+  const sel = document.getElementById('selTimeAxis');
+  sel.value = 'elapsed';
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 600));
+  const ch = Chart.getChart(document.querySelector('.plot-panel canvas'));
+  return { firstTick: ch.scales.x.ticks?.[0]?.label ?? null,
+    xTitle: ch.options.scales.x.title.text, xMin: ch.scales.x.min };
+`);
+check(
+  "switching the axis to Elapsed counts seconds from the stream's first sample",
+  /* Plain seconds, not a clock time, and small — the first tick is the left
+     edge of the rolling window, so it is a few seconds in on a stream that
+     has been running for a few seconds, and never an epoch-sized number. */
+  /^-?\d+(\.\d+)?$/.test(String(elapsed.firstTick)) &&
+    Math.abs(Number(elapsed.firstTick)) < 60 &&
+    /Time since start/.test(elapsed.xTitle),
+  `${elapsed.firstTick} — ${elapsed.xTitle}`,
+);
+
+// ---- pressure with no coefficients stays raw, and says so
+await goto(`${BASE}?mock=1&sensors=0x0400e0&pressure=nack`);
+check(
+  "connect a sensor whose firmware will not serve 0xA7",
+  (await evaluate(CONNECT)) === "mock",
+);
+const rawOnly = await evaluate(`
+  const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
+  const client = window.mockClient;
+  let frame = null;
+  document.querySelector('.tabs [data-tab="tabStream"]').click();
+  document.getElementById('btnStreamStart').click();
+  /* Wrapped AFTER the click, not before: startStream assigns its own handler
+     as it goes, so a wrapper installed first is simply overwritten. */
+  await new Promise(r => setTimeout(r, 400));
+  const prev = client.onStreamFrame;
+  client.onStreamFrame = (f) => { frame = f; prev?.call(client, f); };
+  await new Promise(r => setTimeout(r, 2000));
+  const oc = frame;
+  return { raw: oc?.get('PRESSURE', 'raw')?.value ?? null,
+    cal: oc?.get('PRESSURE', 'cal') ?? null,
+    log: log().filter(l => /pressure/i.test(l)) };
+`);
+check(
+  "pressure streams raw-only rather than inventing a calibration",
+  /* Compensating against filler or defaults would produce a confident, wrong
+     kPa. A raw-only column is the honest answer, and the log says which it
+     is. */
+  rawOnly.raw != null && rawOnly.cal === null,
+  `raw ${rawOnly.raw}, cal ${JSON.stringify(rawOnly.cal)}`,
+);
+check(
+  "and the log says the firmware would not serve the coefficients",
+  rawOnly.log.some((l) => /raw only|raw-only|does not serve/i.test(l)),
+  JSON.stringify(rawOnly.log).slice(0, 200),
+);
+
+// ---- a counter wrap must not walk the axis backwards
+await goto(`${BASE}?mock=1&rtcWrapIn=6&rate=204.8`);
+check(
+  "connect a sensor about to roll its counter over",
+  (await evaluate(CONNECT)) === "mock",
+);
+const wrap = await evaluate(`
+  const client = window.mockClient;
+  let frame = null;
+  document.querySelector('.tabs [data-tab="tabStream"]').click();
+  document.getElementById('btnStreamStart').click();
+  /* Wrapped AFTER the click, not before: startStream assigns its own handler
+     as it goes, so a wrapper installed first is simply overwritten. */
+  await new Promise(r => setTimeout(r, 400));
+  const prev = client.onStreamFrame;
+  client.onStreamFrame = (f) => { frame = f; prev?.call(client, f); };
+  /* Waiting for the wrap rather than timing it: how long the connect
+     handshake took decides when in the stream it lands, and a fixed sleep
+     would make this check pass or fail on the host's speed. */
+  for (let i = 0; i < 200; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    if ((client.timelineState?.wraps ?? 0) >= 1 && i > 10) break;
+  }
+  const oc = frame;
+  const ch = Chart.getChart(document.querySelector('.plot-panel canvas'));
+  const xs = ch.data.datasets[0].data.map(p => p.x);
+  let back = 0;
+  for (let i = 1; i < xs.length; i++) if (xs[i] < xs[i-1]) back++;
+  return { back, span: xs.length ? xs[xs.length-1] - xs[0] : 0,
+    hostMs: Date.now(),
+    wraps: window.mockClient?.timelineState?.wraps ?? null,
+    deviceMs: oc?.get('TIMESTAMP', 'cal')?.value ?? null,
+    unixMs: oc?.get('Timestamp_Unix', 'cal')?.value ?? null };
+`);
+check(
+  "the counter wraps during the run",
+  wrap.wraps >= 1,
+  `${wrap.wraps} wrap(s), device clock ${wrap.deviceMs?.toFixed(0)} ms`,
+);
+check(
+  "and nothing on the axis goes backwards across it",
+  /* The naive unwrap — "the value went down, so it wrapped" — survives this
+     too; what it does not survive is a reordered packet. Both are the SDK's
+     to get right, and this is the end-to-end half of it. */
+  wrap.back === 0 && wrap.span > 0,
+  `${wrap.back} backwards steps over ${wrap.span.toFixed(2)} s`,
+);
+check(
+  "and the wall clock stays on the sensor's own time across it",
+  /* Within one wrap of this host, not equal to it: `rtcWrapIn` moves the
+     sensor's clock forward by up to 512 s to put the counter where it is
+     about to roll over. Ahead by less than a wrap is the sensor's real time;
+     wrong by a multiple of 512 s would be an anchor in the wrong wrap. */
+  wrap.unixMs > wrap.hostMs &&
+    wrap.unixMs - wrap.hostMs < 512000 &&
+    wrap.deviceMs > 0,
+  `sensor ${new Date(wrap.unixMs).toISOString()}, ` +
+    `${((wrap.unixMs - wrap.hostMs) / 1000).toFixed(1)} s ahead of this host`,
 );
 
 // ===========================================================================

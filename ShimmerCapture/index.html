@@ -5104,6 +5104,14 @@
         const rtc = {
           ppm: Number(params.get("ppm")) || 0,
           clockBase: params.get("clockBase") === "local" ? "local" : "utc",
+          /* `rtcWrapIn=3` puts the sensor's clock three seconds short of the
+                   point where the 24-bit stream counter rolls over, so a short
+                   stream crosses a wrap. Worth being able to reach from a URL: the
+                   wrap is 512 seconds apart otherwise, and an unwrap that is wrong
+                   looks like a 512-second jump backwards on the plot. */
+          wrapInSec: params.has("rtcWrapIn")
+            ? Number(params.get("rtcWrapIn"))
+            : undefined,
         };
         /* `srBoard=48-3-0` sets the board's SR identity, `srBoard=none` leaves
                  its id page erased. `btVersion=` (empty) models the module never

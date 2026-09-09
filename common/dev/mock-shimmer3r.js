@@ -497,7 +497,14 @@ function buildSyntheticCalibDump(hardwareVersion, fw) {
   const CAL_A = Date.UTC(2026, 5, 11, 12, 0, 0) / 1000;
   const CAL_B = Date.UTC(2026, 3, 2, 12, 0, 0) / 1000;
   /* Not a kinematic block: the pressure chips' factory coefficients, which
-     the calibration tab has to show as present-but-not-editable. */
+     the calibration tab has to show as present-but-not-editable.
+
+     A record no FIRMWARE would write, on purpose. `ShimCalib_findLength`
+     returns 0 for id 43, so a Shimmer3R never creates one — but
+     `SET_CALIB_DUMP` writes bytes straight into the blob at a host-chosen
+     offset, so a host CAN put one there and the device will store and echo it
+     without ever applying it. Serving one here keeps a host honest about that:
+     a dump is not a statement of what the device understands. */
   const pressure = Uint8Array.from({ length: 22 }, (_, i) => 0x40 + i);
 
   if (hw === 3) {
@@ -811,12 +818,29 @@ export function createMockShimmer3RTransport(opts = {}) {
   const rtcOpts = opts.rtc ?? {};
   const rtcPpm = Number.isFinite(rtcOpts.ppm) ? Number(rtcOpts.ppm) : 0;
   const rtcClockBase = rtcOpts.clockBase === "local" ? "local" : "utc";
+  /* `wrapInSec` puts the sensor's clock where its low 24 bits are about to
+     roll over, so a short stream crosses a wrap. It moves the CLOCK, not the
+     stream counter, because on a Shimmer3R the two are the same number (see
+     `startStreaming`) and moving one without the other would model a sensor
+     that does not exist. Up to 512 s of date shift is the price, and that is
+     itself a legitimate sensor state. */
+  const rtcWrapInSec = Number.isFinite(rtcOpts.wrapInSec)
+    ? Math.max(0, Number(rtcOpts.wrapInSec))
+    : null;
   const rtc = {
     devMsAtSet:
       Date.now() +
       (rtcClockBase === "local" ? -new Date().getTimezoneOffset() * 60000 : 0),
     setAtHostMs: Date.now(),
   };
+  if (rtcWrapInSec != null) {
+    const ticks = Math.round(rtc.devMsAtSet * 32.768);
+    const target = 0x1000000 - Math.round(rtcWrapInSec * SAMPLING_CLOCK_HZ);
+    // Forward to the next tick count whose low 24 bits are `target`, so the
+    // clock never moves backwards past a reading a host may already hold.
+    const ahead = (target - (ticks % 0x1000000) + 0x1000000) % 0x1000000;
+    rtc.devMsAtSet = (ticks + ahead) / 32.768;
+  }
   /** The sensor's clock now, in its own epoch, drifting at `rtcPpm`. */
   const deviceNowMs = () =>
     rtc.devMsAtSet + (Date.now() - rtc.setAtHostMs) * (1 + rtcPpm / 1e6);
@@ -1373,10 +1397,33 @@ export function createMockShimmer3RTransport(opts = {}) {
     return out;
   }
 
+  /**
+   * Where the stream's tick counter starts, which is a per-generation fact.
+   *
+   * On a **Shimmer3R** the packet timestamp is `RTC_get32()` — the low 24 bits
+   * of the very counter `GET_RWC` reports as `RTC_get64()`
+   * (`RTC/shimmer_rtc.h:25-28`; `Core/Src/rtc.c` gives the two identical
+   * bodies). That identity is the whole reason a host can pin a Shimmer3R
+   * stream to a wall clock exactly, so a mock that started the counter at zero
+   * would let an aligned anchor look like it worked while placing every sample
+   * up to 256 s from the truth — the error is bounded by the wrap, so it never
+   * looks absurd enough to notice.
+   *
+   * On a **Shimmer3** it is a free-running counter since boot
+   * (`Shimmer_Driver/5xx_HAL/hal_RTC.c`), and the real-world clock is that
+   * counter plus a stored offset which never leaves the device. Zero is right
+   * there: a host has to estimate the offset from the request round trip, and
+   * a mock whose counter happened to agree with its clock would hide that.
+   */
+  function streamStartTicks() {
+    if (hardwareVersion === 3) return 0;
+    return Number(BigInt(Math.round(deviceNowMs() * 32.768)) & 0xffffffn);
+  }
+
   function startStreaming() {
     if (streamTimer) return;
     const ids = channelIds();
-    streamTicks = 0;
+    streamTicks = streamStartTicks();
     samplesEmitted = 0;
     streamStartMs = performance.now();
     const ticksPerSample = SAMPLING_CLOCK_HZ / state.rateHz;
