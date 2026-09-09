@@ -4996,21 +4996,26 @@ const RULES = `
 await goto(`${BASE}?mock=1`);
 check("connect for the sensor-rule pass", (await evaluate(CONNECT)) === "mock");
 const toggles = await evaluate(`${RULES}
+  /* Which image bytes differ from the sensor's, right now. Sampled after
+     every toggle rather than once at the end: the sequence below is
+     deliberately reversible, so a single reading taken after the last untick
+     is an EMPTY array — which satisfies any "every byte is one of these"
+     assertion without testing a thing. */
+  const moved = () => [...document.querySelectorAll('.hexview-byte.changed')]
+    .map(b => Number(b.title.split(' ')[1]));
   await tick(${B.INT_A3}, true);
-  const first = { banner: banner(), expPower: expPower() };
+  const first = { banner: banner(), expPower: expPower(), moved: moved() };
   await tick(${B.GSR}, true);
   const second = { banner: banner(), expPower: expPower(),
     intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
-    log: logLines() };
+    moved: moved(), log: logLines() };
   await tick(${B.INT_A3}, true);
   const third = { expPower: expPower(),
     intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
-    banner: banner() };
+    moved: moved(), banner: banner() };
   await tick(${B.INT_A3}, false);
-  const fourth = { expPower: expPower() };
-  return { first, second, third, fourth,
-    changed: [...document.querySelectorAll('.hexview-byte.changed')]
-      .map(b => Number(/byte (\d+)/.exec(b.title)?.[1])) };
+  const fourth = { expPower: expPower(), moved: moved() };
+  return { first, second, third, fourth };
 `);
 check(
   "an internal ADC channel on its own breaks no rule",
@@ -5050,13 +5055,32 @@ check(
   toggles.fourth.expPower === "0",
   `expPower=${toggles.fourth.expPower}`,
 );
+const movedByStep = [
+  toggles.first.moved,
+  toggles.second.moved,
+  toggles.third.moved,
+  toggles.fourth.moved,
+];
+const movedEver = [...new Set(movedByStep.flat())].sort((a, b) => a - b);
 check(
-  "only the sensor bytes and the expansion-power byte moved",
-  /* Bytes 3-4 are the enabled-sensor bitmap's low words and 9 carries the
+  "only the sensor bitmap and the expansion-power byte ever moved",
+  /* Bytes 3-5 are the enabled-sensor bitmap and byte 9 carries the
      expansion-power bit. A rule that reached any further would be editing
-     something the user did not touch. */
-  toggles.changed.every((b) => [3, 4, 5, 9].includes(b)),
-  `changed bytes ${toggles.changed.join(",")}`,
+     something the user did not touch. The first three steps must each have
+     moved SOMETHING, or this is asserting over an empty set. */
+  movedEver.length > 0 &&
+    movedEver.every((b) => [3, 4, 5, 9].includes(b)) &&
+    movedByStep.slice(0, 3).every((m) => m.length > 0),
+  `moved ${movedEver.join(",")} across steps ` +
+    movedByStep.map((m) => `[${m.join(",")}]`).join(" "),
+);
+check(
+  "and the four toggles leave no residue when they undo each other",
+  /* Tick A, tick B (which unticks A), tick A again (which unticks B), untick
+     A: the image is back where it started, expansion power included. A
+     derived bit that latched on would show up here as a byte still dirty. */
+  toggles.fourth.moved.length === 0 && toggles.fourth.expPower === "0",
+  `${toggles.fourth.moved.length} bytes dirty, expPower=${toggles.fourth.expPower}`,
 );
 
 const exgRule = await evaluate(`${RULES}
