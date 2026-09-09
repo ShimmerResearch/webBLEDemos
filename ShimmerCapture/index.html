@@ -501,6 +501,17 @@
             256 bad frames through. Firmware that does not support it falls back
             to off on its own. Applied when you connect.
           </div>
+          <!-- Where this page stops. It is a worked example of the Web SDK
+               driving one sensor, and somebody who arrived from a search should
+               not mistake it for the product. Plain text, no link: there is no
+               stable Consensys product URL in these repositories to point at,
+               and a guessed one that 404s would be worse than none. -->
+          <div class="field-hint" id="consensysNote">
+            This page is an <strong>example application</strong>, not a product:
+            one sensor, one connection, one recording. For configuring,
+            streaming, recording and analysing data across your Shimmer devices,
+            use <strong>Consensys</strong>, Shimmer's desktop application.
+          </div>
           <div class="banner" id="platformBanner"></div>
         </div>
 
@@ -701,6 +712,12 @@
                and the CRC all stay correct while the signal is a staircase of
                repeated readings. -->
           <div class="banner warn" id="rateCoverageNote" hidden></div>
+          <!-- Sensor rules: two sensors on one ADC input, a board sensor
+               without expansion power, a sensor this board or generation does
+               not have. Carries a Fix button when it is describing an image
+               that arrived already broken — from the device, or from a file —
+               because there is no "newest choice" to correct in that case. -->
+          <div class="banner warn" id="sensorRulesNote" hidden></div>
           <div id="configForm"></div>
         </div>
 
@@ -843,6 +860,15 @@
             <select id="selKind">
               <option value="cal" selected>Calibrated</option>
               <option value="raw">Raw</option>
+            </select>
+            <!-- The clock axis needs the frames to carry wall-clock time, which
+                 they do once the sensor's real-world clock has been read (the
+                 connect handshake does it) or, failing that, from this host's
+                 own clock. Elapsed always works. -->
+            <label for="selTimeAxis">Time axis</label>
+            <select id="selTimeAxis">
+              <option value="clock" selected>Clock</option>
+              <option value="elapsed">Elapsed</option>
             </select>
             <button id="btnPause" type="button" data-requires="streaming">
               Pause plot
@@ -1113,8 +1139,8 @@
         mockEnabledFromUrl,
       } from "../common/dev/mock-shimmer3r.js";
       /* The whole namespace, not destructured names: a vendored bundle that
-         predates one of these exports then degrades to a warning instead of
-         breaking the page's import. */
+               predates one of these exports then degrades to a warning instead of
+               breaking the page's import. */
       import * as sdk from "../vendor/shimmer-web-sdk.esm.js";
 
       // =====================================================================
@@ -1160,20 +1186,20 @@
       // =====================================================================
 
       /* ------------------------------------------- the event log drawer --
-         Collapsed the drawer is one bar: the newest line, and a count of the
-         errors and warnings that have not been seen — which is not the same
-         as unopened, because a drawer left open and scrolled back through
-         history is showing the user everything except the thing that just
-         went wrong. That count is the reason the log moved to the bottom of
-         the viewport at all: an error at the foot of a long page is an error
-         nobody scrolled to. */
+               Collapsed the drawer is one bar: the newest line, and a count of the
+               errors and warnings that have not been seen — which is not the same
+               as unopened, because a drawer left open and scrolled back through
+               history is showing the user everything except the thing that just
+               went wrong. That count is the reason the log moved to the bottom of
+               the viewport at all: an error at the foot of a long page is an error
+               nobody scrolled to. */
 
       /** localStorage key. Also read by the pre-paint script in <head>. */
       const LOG_DRAWER_KEY = "shimmerCaptureLogDrawer";
 
       /** Errors and warnings that arrived while the newest line was not on
-          screen. Cleared by opening the drawer, by scrolling back to the tail
-          with it open, and by clearing the log. */
+                screen. Cleared by opening the drawer, by scrolling back to the tail
+                with it open, and by clearing the log. */
       let logAlerts = 0;
       /** The newest line, held until the next frame paints the bar. */
       let pendingBarLine = null;
@@ -1192,12 +1218,12 @@
        */
       function noteLogLine(text, sev) {
         /* The date is the same all session and the bar is one line wide, so
-           only the clock time earns its place there. */
+                 only the clock time earns its place there. */
         pendingBarLine = text.replace(/^\d{4}-\d{2}-\d{2} /, "");
         /* Badge whenever the line would not in fact be seen: the drawer
-           closed, or open but scrolled back through history. Counting only
-           while closed meant that leaving the drawer open switched the alert
-           off altogether, which is the opposite of what it is for. */
+                 closed, or open but scrolled back through history. Counting only
+                 while closed meant that leaving the drawer open switched the alert
+                 off altogether, which is the opposite of what it is for. */
         if (
           (sev === "err" || sev === "warn") &&
           (!logDrawerIsOpen() || !log?.atTail?.())
@@ -1228,7 +1254,7 @@
        *   came out of storage in the first place
        */
       /* Scrolling back to the newest line is as much an acknowledgement as
-         opening the drawer: the lines are on screen either way. */
+               opening the drawer: the lines are on screen either way. */
       function noteLogScrolledToTail() {
         if (logDrawerIsOpen() && log?.atTail?.() && logAlerts !== 0) {
           logAlerts = 0;
@@ -1244,11 +1270,11 @@
         );
         if (open) {
           /* Opening IS the acknowledgement, so the count starts again from
-             here. */
+                   here. */
           logAlerts = 0;
           /* A panel that was display:none has no scroll position, so the
-             log's own stick-to-the-tail never had anything to stick to.
-             Restore it once, as the drawer becomes visible. */
+                   log's own stick-to-the-tail never had anything to stick to.
+                   Restore it once, as the drawer becomes visible. */
           const panel = $("log");
           panel.scrollTop = panel.scrollHeight;
         }
@@ -1258,7 +1284,7 @@
             localStorage.setItem(LOG_DRAWER_KEY, open ? "open" : "closed");
           } catch {
             /* A private window throws on the first write. The drawer still
-               works; it just opens closed next time. */
+                     works; it just opens closed next time. */
           }
         }
       }
@@ -1284,11 +1310,11 @@
       });
 
       /* The pre-paint script already applied the remembered state to the root
-         element; this catches the chrome up with it without writing it back. */
+               element; this catches the chrome up with it without writing it back. */
       setLogDrawer(logDrawerIsOpen(), false);
 
       /* Clearing the log clears what the bar was reporting about it. Added
-         after createLog, which wires its own handler on the same button. */
+               after createLog, which wires its own handler on the same button. */
       $("btnLogClear").addEventListener("click", () => {
         logAlerts = 0;
         pendingBarLine = null;
@@ -1302,11 +1328,11 @@
         onSelect: (id) => {
           if (id === "tabStream") refreshRecordName();
           /* The names are what the naming tab is FOR, so opening it reads
-             them — but only once per link, and only if nothing has been read
-             yet, so switching back and forth is not a round trip each time.
-             Deliberately not on connect: a page that read the brand record
-             every time anything connected would spend a round trip on it for
-             the majority of sessions that never open this tab. */
+                   them — but only once per link, and only if nothing has been read
+                   yet, so switching back and forth is not a round trip each time.
+                   Deliberately not on connect: a page that read the brand record
+                   every time anything connected would spend a round trip on it for
+                   the majority of sessions that never open this tab. */
           if (id === "tabBrand" && client && caps.branding && !brand.record()) {
             brand.read().catch(() => {});
           }
@@ -1366,8 +1392,8 @@
           );
         } else if (sev === "txrx" && !client) {
           /* The other half of the same trap: the tap is on, the filter is
-             right, and the log is still empty — because nothing is connected
-             for bytes to cross. */
+                   right, and the log is still empty — because nothing is connected
+                   for bytes to cross. */
           banner(
             "tapNote",
             "info",
@@ -1387,12 +1413,12 @@
       $("chkRawBytes").addEventListener("change", (e) => {
         const on = e.target.checked;
         /* The data-packet opt-in is meaningless with the tap off, and a
-           checkbox that does nothing is worse than one that is disabled. */
+                 checkbox that does nothing is worse than one that is disabled. */
         $("chkRawData").disabled = !on;
         tap?.tap.setEnabled(on);
         /* Deliberately worded without a bare "TX" or "RX": those two words are
-           exactly what routes a line into the TX/RX filter, and a status line
-           about the tap is not a byte the sensor sent. */
+                 exactly what routes a line into the TX/RX filter, and a status line
+                 about the tap is not a byte the sensor sent. */
         log.log(
           on
             ? "raw byte logging on — every command and every reply crossing the link is now logged as a hex line"
@@ -1412,7 +1438,7 @@
 
       $("logSeverity").addEventListener("change", updateTapNote);
       /* Tracks the selection until a link exists; applyLinkCrc takes the pill
-         over from there and reports what the sensor actually accepted. */
+               over from there and reports what the sensor actually accepted. */
       $("crcMode").addEventListener("change", showPendingLinkCrc);
       showPendingLinkCrc();
 
@@ -1642,17 +1668,17 @@
         // Capability floors the markup gates on but only the page can know.
         caps.record = !!csvColumns;
         /* Exactly one stop button is live at a time. STOP_STREAMING (0x20)
-           and STOP_SDBT (0x97) are different commands: the first leaves an SD
-           recording running, so offering both would let one click end a
-           stream and silently leave the card still being written. */
+                 and STOP_SDBT (0x97) are different commands: the first leaves an SD
+                 recording running, so offering both would let one click end a
+                 stream and silently leave the card still being written. */
         caps.btStop = streaming && !sdLogging;
         caps.sdStop = sdLogging;
 
         /* An SD download, a name write, a calibration write and everything
-           else on this page compete for one link, so any of them in flight
-           counts as busy for every other control — Apply included. No panel's
-           own controls are gated from here; each owns its own (see the
-           `setEnabled` calls below). */
+                 else on this page compete for one link, so any of them in flight
+                 counts as busy for every other control — Apply included. No panel's
+                 own controls are gated from here; each owns its own (see the
+                 `setEnabled` calls below). */
         gate.apply({
           connected: !!client,
           streaming,
@@ -1662,11 +1688,11 @@
         });
 
         /* Each panel is enabled on everything EXCEPT its own busy flag: this
-           is the floor for whether the LINK can do the thing at all, and each
-           panel already refuses a second operation of its own. Folding a
-           panel's own flag back in here would have the first progress event
-           tear down the panel reporting it. The OTHER panels' flags do
-           belong, because all three share one link. */
+                 is the floor for whether the LINK can do the thing at all, and each
+                 panel already refuses a second operation of its own. Folding a
+                 panel's own flag back in here would have the first progress event
+                 tear down the panel reporting it. The OTHER panels' flags do
+                 belong, because all three share one link. */
         sd.setEnabled(
           !!client &&
             !!caps.sdTransfer &&
@@ -1692,11 +1718,11 @@
         paintBrandGating();
 
         /* Not gated on `caps.calibration`: a link without the dump commands
-           still shows the calibration blocks out of the configuration image,
-           read-only, and the panel itself decides which store that is. What
-           it IS gated on is the link being free — the firmware NACKs a
-           calibration command while sensing, exactly as it does a
-           configuration one. */
+                 still shows the calibration blocks out of the configuration image,
+                 read-only, and the panel itself decides which store that is. What
+                 it IS gated on is the link being free — the firmware NACKs a
+                 calibration command while sensing, exactly as it does a
+                 configuration one. */
         cal.setEnabled(
           !!client &&
             (!!caps.calibration || !!caps.infomem) &&
@@ -1710,8 +1736,8 @@
         paintCalibGating();
 
         /* The self-test's own flag is excluded, as everywhere else: this is
-           the floor for STARTING one, and folding it in would disable Cancel
-           at the moment it is needed. */
+                 the floor for STARTING one, and folding it in would disable Cancel
+                 at the moment it is needed. */
         selfTest.setEnabled(
           !!client &&
             !!caps.factoryTest &&
@@ -1724,9 +1750,9 @@
             !linkTesting,
         );
         /* The drift monitor is not disabled by the other panels: it takes one
-           round trip every N seconds and simply SKIPS a tick while somebody
-           else holds the link (see driftSampleSkipReason), which keeps a long
-           measurement running across an SD download instead of ending it. */
+                 round trip every N seconds and simply SKIPS a tick while somebody
+                 else holds the link (see driftSampleSkipReason), which keeps a long
+                 measurement running across an SD download instead of ending it. */
         drift.setEnabled(
           !!client && !!caps.rtcRead && !streaming && !sdLogging && !testBusy,
         );
@@ -1741,9 +1767,9 @@
         if (!mockBtn.hidden) mockBtn.disabled = !!client || busy;
 
         /* Apply is refused while the sensor is sensing — the firmware NACKs
-           every configuration SET while it is. buildApplyPlan reports that as
-           `blocked`, and the reason on screen is worth more than a greyed
-           button with no explanation. */
+                 every configuration SET while it is. buildApplyPlan reports that as
+                 `blocked`, and the reason on screen is worth more than a greyed
+                 button with no explanation. */
         const plan = form && client ? currentPlan() : null;
         if (plan?.blocked) {
           $("btnApply").disabled = true;
@@ -1753,8 +1779,8 @@
             "Waiting for the link-speed test to finish — it saturates the link on purpose, which is the whole point of it.";
         } else if (sdBusy) {
           /* Not the firmware refusing this time — the page is. One link, one
-             conversation: a configuration write in the middle of a file
-             transfer would interleave with the block stream. */
+                   conversation: a configuration write in the middle of a file
+                   transfer would interleave with the block stream. */
           $("applyNote").textContent =
             "Waiting for the SD card transfer to finish — a download and a configuration write cannot share the link.";
         } else if (brandBusy) {
@@ -1774,7 +1800,7 @@
         updateDirtyPill();
         refreshRecordName();
         /* The tap note depends on whether anything is connected, so it is
-           re-evaluated wherever the connection state is. */
+                 re-evaluated wherever the connection state is. */
         updateTapNote();
       }
 
@@ -1853,10 +1879,10 @@
         }
         if (/NACK/i.test(raw)) {
           /* The firmware answered, so the link is fine. Two things produce a
-             NACK, and the page cannot tell them apart from here: a command
-             refused because the sensor is sensing, and a command this
-             firmware does not implement at all. Say both rather than
-             asserting the wrong one. */
+                   NACK, and the page cannot tell them apart from here: a command
+                   refused because the sensor is sensing, and a command this
+                   firmware does not implement at all. Say both rather than
+                   asserting the wrong one. */
           return (
             `The sensor refused "${what}". Configuration commands are ` +
             `refused while it is streaming or logging — if it is idle, its ` +
@@ -1976,12 +2002,12 @@
       function batteryLabel(batt) {
         if (!batt || !Number.isFinite(batt.voltage)) return null;
         /* The SDK returns the polynomial's own output, as a library should —
-           rounding is a display decision. Whole percent: the curve is a
-           four-term fit of a discharge characteristic, so a tenth of a percent
-           claims a precision the estimate does not have, and a full float
-           reads as a fault. A reading below half a percent is shown as `<1 %`
-           rather than `0 %`, which would say "flat" about a sensor still
-           running. */
+                 rounding is a display decision. Whole percent: the curve is a
+                 four-term fit of a discharge characteristic, so a tenth of a percent
+                 claims a precision the estimate does not have, and a full float
+                 reads as a fault. A reading below half a percent is shown as `<1 %`
+                 rather than `0 %`, which would say "flat" about a sensor still
+                 running. */
         const pct =
           batt.percentage == null
             ? "–"
@@ -2047,9 +2073,9 @@
           return;
         }
         /* A value this page inferred and the sensor now contradicts is worth
-           saying out loud before it is quietly replaced: the command was
-           accepted but did not take effect — a full card, a bad file, a trial
-           that had already ended. This is the one moment both are known. */
+                 saying out loud before it is quietly replaced: the command was
+                 accepted but did not take effect — a full card, a bad file, a trial
+                 that had already ended. This is the one moment both are known. */
         for (const key of statusView?.inferred ?? []) {
           if (statusView.status[key] !== status[key]) {
             log.warn(
@@ -2068,10 +2094,10 @@
         };
         paintStatus();
         /* The sensor is the authority on whether it is sensing: a status read
-           is how a host learns its button was pressed while nobody was
-           streaming, and every configuration command is NACKed until it
-           stops. Only worth saying for something the sensor stated — an
-           inferred value can teach nobody anything. */
+                 is how a host learns its button was pressed while nobody was
+                 streaming, and every configuration command is NACKed until it
+                 stops. Only worth saying for something the sensor stated — an
+                 inferred value can teach nobody anything. */
         if (status.sensing && !streaming) {
           log.warn(
             "the sensor reports it is sensing — it was started from its own button or by another host, and will refuse configuration commands until it stops",
@@ -2108,9 +2134,9 @@
        */
       function inferStatus(patch) {
         /* Patched onto whatever was last known, or onto nothing at all if no
-           read has ever succeeded — `paintStatus` omits a flag that is not a
-           boolean, so the flags this page did not touch stay absent rather
-           than claiming to be off. */
+                 read has ever succeeded — `paintStatus` omits a flag that is not a
+                 boolean, so the flags this page did not touch stay absent rather
+                 than claiming to be off. */
         statusView = {
           status: { ...(statusView?.status ?? {}), ...patch },
           source: "inferred",
@@ -2146,9 +2172,9 @@
         host.replaceChildren(
           ...STATUS_FLAGS
             /* Not a boolean, so not shown: a Shimmer3 omits the second status
-               byte entirely rather than sending a zero, which is why
-               `usbPluggedIn` can be null — and the same rule keeps a flag the
-               page inferred before it ever read one from claiming to be off. */
+                     byte entirely rather than sending a zero, which is why
+                     `usbPluggedIn` can be null — and the same rule keeps a flag the
+                     page inferred before it ever read one from claiming to be off. */
             .filter(([key]) => typeof status[key] === "boolean")
             .map(([key, label, badWhenOn]) => {
               const on = status[key];
@@ -2215,10 +2241,10 @@
         }
 
         /* `canReadRwc`, not a `getRtcTime` property test: the USB-C link has
-           no such command but the dock protocol has a read-only property that
-           answers with the same eight bytes, and `caps.rtcRead` — which gates
-           the button — already counts it. Testing the method here left the row
-           at "–" over a link that can in fact answer. */
+                 no such command but the dock protocol has a read-only property that
+                 answers with the same eight bytes, and `caps.rtcRead` — which gates
+                 the button — already counts it. Testing the method here left the row
+                 at "–" over a link that can in fact answer. */
         if (canReadRwc(client)) {
           const rtc = await tryDevice("read the real-world clock", () =>
             readDeviceRwc(client, mode),
@@ -2240,8 +2266,8 @@
        */
       async function setDeviceClock() {
         /* A plain Unix epoch, which is what desktop Consensys and the dock
-           software write: a sensor set here and a sensor set there must read
-           the same. */
+                 software write: a sensor set here and a sensor set there must read
+                 the same. */
         const nowMs = Date.now();
         const write =
           typeof client.setRtcTime === "function"
@@ -2257,8 +2283,8 @@
           await withDevice("set the real-world clock", write);
           showToast("Sensor clock set from this host", "ok");
           /* Any drift measurement in progress spans a discontinuity now, so
-             its baseline goes with the write rather than being fitted across
-             the step. */
+                   its baseline goes with the write rather than being fitted across
+                   the step. */
           drift.noteClockWritten();
           await refreshDeviceState();
         } catch {
@@ -2381,6 +2407,67 @@
       }
 
       /** Build the sensor checkbox grid, ready to inject into the form. */
+      /**
+       * Whether this vendored SDK carries the sensor rules.
+       *
+       * The page imports the whole namespace precisely so an older bundle
+       * degrades rather than failing to load, and this is where that matters:
+       * without the rules the grid keeps its previous behaviour — the user's
+       * bitmap, untouched — which is the behaviour that shipped.
+       */
+      const HAS_SENSOR_RULES = typeof sdk.applySensorToggle === "function";
+
+      /** The state the sensor rules are evaluated against. */
+      function ruleState() {
+        const exp = fieldValue("expPower");
+        return {
+          enabledSensors: sensorsFromImage(),
+          exgMode,
+          expPower: exp === undefined ? null : Number(exp) ? 1 : 0,
+          /* Only claim a generation the device actually stated. The rules gate
+                   the bridge amplifier on it, and asserting a default would refuse a
+                   sensor on a device that never said what it is. */
+          generation: identifiedHardwareVersion == null ? null : generation,
+          boardId: srBoard?.boardId ?? null,
+        };
+      }
+
+      /**
+       * Write the derived expansion-power bit into the image.
+       *
+       * Through `writeInfoMemFieldValue` and `form.refresh()`, the same path
+       * `deriveImuRate` uses — NOT `setFieldValue`, whose synthetic change
+       * event re-enters `afterImageEdit` and logs the write as if the user had
+       * typed it.
+       */
+      function writeDerivedExpPower(value) {
+        if (value == null || !form || !layout) return;
+        const current = fieldValue("expPower");
+        if (current !== undefined && Number(current) === Number(value)) return;
+        const field = fields.find((f) => f.key === "expPower");
+        if (!field) return;
+        sdk.writeInfoMemFieldValue(form.getImage(), field, layout, value);
+        form.refresh();
+      }
+
+      /** Put the ExG mode control back to "off", after the rules cleared it. */
+      function resetExgMode() {
+        exgMode = "off";
+        const select = $("exgMode");
+        if (select) select.value = "off";
+      }
+
+      /**
+       * What the rules changed, waiting to be shown once the form has settled.
+       *
+       * A toggle corrects the image and then `afterImageEdit` repaints
+       * everything, so the explanation has to survive that one hop.
+       */
+      let pendingRuleNote = null;
+
+      /** Last violation set logged, so an edit does not repeat it every time. */
+      let lastSensorRuleWarning = "";
+
       function buildSensorGrid() {
         const grid = el("div", { class: "sensor-groups" });
         for (const group of SENSOR_GROUPS) {
@@ -2396,10 +2483,12 @@
               bits.map(([key, bit]) =>
                 el(
                   "label",
-                  { title: `${key} — bitmap ${hexMask(bit)}` },
+                  { title: sensorBoxTitle(key, bit) },
                   el("input", {
                     type: "checkbox",
-                    dataset: { sensorBit: String(bit) },
+                    /* The key as well as the bit: the rules are keyed on the
+                             sensor, and several distinct sensors share a bit. */
+                    dataset: { sensorBit: String(bit), sensorKey: key },
                     onchange: onSensorToggle,
                   }),
                   SENSOR_LABELS[key] ?? key,
@@ -2411,17 +2500,86 @@
         return grid;
       }
 
-      function onSensorToggle() {
-        let mask = sensorsFromImage();
-        const before = mask;
-        for (const box of document.querySelectorAll("[data-sensor-bit]")) {
-          const bit = Number(box.dataset.sensorBit);
-          mask = box.checked ? mask | bit : mask & ~bit;
+      /**
+       * A sensor checkbox moved.
+       *
+       * With the rules available this is Consensys's behaviour: the newest
+       * choice wins, whatever it conflicts with is unticked, and the expansion
+       * rail is derived — then the banner and the log say what changed and why.
+       * `applySensorToggle` does the deciding (it is a port of the Java
+       * driver's own `sensorMapConflictCheckandCorrect`); this function only
+       * has to apply the answer and explain it.
+       *
+       * Without the rules — an older vendored SDK — it keeps the previous
+       * behaviour: recompute the mask from the boxes and write it, untouched.
+       */
+      /**
+       * A checkbox's tooltip: the bitmap bit, and what the rules say about it.
+       *
+       * The bitmap line comes first and unchanged — it is what somebody
+       * cross-referencing the firmware is looking for.
+       */
+      function sensorBoxTitle(key, bit) {
+        const base = `${key} — bitmap ${hexMask(bit)}`;
+        if (!HAS_SENSOR_RULES) return base;
+        try {
+          const described = sdk.describeSensorRules(
+            key,
+            ruleState().generation,
+          );
+          const availability = sdk.sensorAvailability(key, ruleState());
+          const lines = [base, ...described.text.split("\n").slice(1)];
+          if (availability.reason) lines.push(availability.reason);
+          return lines.join("\n");
+        } catch {
+          // A key the rules do not know is not a reason to lose the tooltip.
+          return base;
         }
-        sensorsToImage(mask);
-        log.log(`sensor bitmap now ${hexMask(mask)}`);
+      }
+
+      function onSensorToggle(event) {
+        const before = sensorsFromImage();
+
+        if (!HAS_SENSOR_RULES) {
+          let mask = before;
+          for (const box of document.querySelectorAll("[data-sensor-bit]")) {
+            const bit = Number(box.dataset.sensorBit);
+            mask = box.checked ? mask | bit : mask & ~bit;
+          }
+          sensorsToImage(mask);
+          log.log(`sensor bitmap now ${hexMask(mask)}`);
+          deriveImuRate({
+            enableChanged: imuEnabled(mask) !== imuEnabled(before),
+          });
+          afterImageEdit();
+          return;
+        }
+
+        const box = event?.currentTarget ?? event?.target;
+        const key = box?.dataset?.sensorKey;
+        if (!key) return;
+        const result = sdk.applySensorToggle(ruleState(), key, !!box.checked);
+
+        sensorsToImage(result.enabledSensors);
+        if (result.exgOff) resetExgMode();
+        writeDerivedExpPower(result.expPower);
+
+        log.log(`sensor bitmap now ${hexMask(result.enabledSensors)}`);
+        for (const change of result.changes) {
+          log.log(`sensor rule: ${change.reason}`);
+        }
+        pendingRuleNote = result.changes.length
+          ? {
+              lead: `${sdk.sensorRuleLabel(key, ruleState().generation)} ${
+                box.checked ? "enabled" : "disabled"
+              }:`,
+              changes: result.changes,
+            }
+          : null;
+
         deriveImuRate({
-          enableChanged: imuEnabled(mask) !== imuEnabled(before),
+          enableChanged:
+            imuEnabled(result.enabledSensors) !== imuEnabled(before),
         });
         afterImageEdit();
       }
@@ -2468,17 +2626,17 @@
               enabled,
               samplingRateHz,
               /* Never inferred from the stored value: this page has no
-                 low-power control, so it must not silently produce a
-                 low-power configuration. */
+                       low-power control, so it must not silently produce a
+                       low-power configuration. */
               lowPower: false,
             });
         if (next === before) return;
 
         sdk.writeInfoMemFieldValue(form.getImage(), field, layout, next);
         /* The bytes are written straight into the working image, so the
-           control still shows the old value until the form re-reads it.
-           `refresh`, not `setImage`: the latter re-baselines, which would make
-           a derived change look like it came from the device. */
+                 control still shows the old value until the form re-reads it.
+                 `refresh`, not `setImage`: the latter re-baselines, which would make
+                 a derived change look like it came from the device. */
         form.refresh();
         log.log(
           `derived Gyro/Accel Rate ${before} → ${next} ` +
@@ -2524,20 +2682,48 @@
         exgMode = event.target.value;
         if (exgMode === "off") {
           log.log("the ExG registers will be left as stored");
+          afterImageEdit();
+          return;
+        }
+
+        /* Enabling ExG is a sensor choice like any other, so it goes through
+                 the same rules: everything sharing the expansion connector or an ADC
+                 input with the ExG front end is unticked, and the rail is derived.
+                 Then the preset's own width bits go on — the presets all stream
+                 16-bit, so the stored image has to say so too, or the running and
+                 stored configurations disagree until the sensor next reboots. */
+        if (HAS_SENSOR_RULES) {
+          const result = sdk.applySensorToggle(ruleState(), "EXG", true);
+          sensorsToImage(
+            (result.enabledSensors | EXG_16BIT_MASK) & ~EXG_24BIT_MASK,
+          );
+          writeDerivedExpPower(result.expPower);
+          for (const change of result.changes) {
+            log.log(`sensor rule: ${change.reason}`);
+          }
+          pendingRuleNote = {
+            lead: `ExG mode "${exgMode}" selected:`,
+            changes: [
+              {
+                key: "EXG",
+                reason:
+                  "16-bit ExG bits set in the image, to match what the preset streams.",
+              },
+              ...result.changes,
+            ],
+          };
         } else {
-          // The presets all stream 16-bit ExG, so the stored image should say
-          // so too — otherwise the running and stored configurations disagree
-          // until the sensor next reboots.
           sensorsToImage(
             (sensorsFromImage() | EXG_16BIT_MASK) & ~EXG_24BIT_MASK,
           );
-          // The ExG front end runs off the internal expansion rail, and the SDK
-          // helper switches it on live; record that in the image as well.
+          /* The ExG front end runs off the internal expansion rail on a
+                   Shimmer3, and Consensys sets this bit for ExG on every platform;
+                   the SDK helper switches it on live, so record it in the image too. */
           setFieldValue("expPower", 1);
-          log.log(
-            `ExG mode "${exgMode}" selected — 16-bit ExG bits and the internal expansion rail set in the image`,
-          );
         }
+        log.log(
+          `ExG mode "${exgMode}" selected — 16-bit ExG bits and the internal expansion rail set in the image`,
+        );
         afterImageEdit();
       }
 
@@ -2641,26 +2827,26 @@
             writeInfoMemFieldValue: sdk.writeInfoMemFieldValue,
           },
           /* The Calibration group's six 21-byte blocks render as the same
-             offset / sensitivity / alignment grids the Calibration tab uses,
-             with the range this image is configured for shown beside them,
-             rather than as forty-two hex characters each. Every other field
-             keeps its default control — the factory returns null for anything
-             that is not a calibration block. */
+                   offset / sensitivity / alignment grids the Calibration tab uses,
+                   with the range this image is configured for shown beside them,
+                   rather than as forty-two hex characters each. Every other field
+                   keeps its default control — the factory returns null for anything
+                   that is not a calibration block. */
           editorFor: createKinematicBlockEditorFactory({
             fields,
             generation: () => generation,
           }),
           imageSize: IMAGE_BYTES,
           /* Stored as Unix seconds, which is the right thing to write and the
-             wrong thing to read: the question a configuration stamp answers is
-             "is this configuration recent?". The number stays editable and
-             authoritative; the date is shown beside it. */
+                   wrong thing to read: the question a configuration stamp answers is
+                   "is this configuration recent?". The number stays editable and
+                   authoritative; the date is shown beside it. */
           dateTimeFields: ["configTime"],
           onChange: (key) => {
             log.log(`configuration edit: ${key}`);
             /* Setting the packet rate re-derives the sensors' own rates, which
-               is what `setShimmerAndSensorsSamplingRate` does in the driver
-               (`ShimmerDevice.java:3399`) and what this page used to skip. */
+                     is what `setShimmerAndSensorsSamplingRate` does in the driver
+                     (`ShimmerDevice.java:3399`) and what this page used to skip. */
             if (key === "samplingRate") deriveImuRate();
             afterImageEdit();
           },
@@ -2683,9 +2869,9 @@
         if (sensorsBody) {
           sensorsBody.appendChild(buildSensorGrid());
           /* The schema deliberately declares no fields in this group — the
-             Sensors0-4 bitmaps are per-channel enable maps rather than scalar
-             settings — so the form rendered the group hidden. It has content
-             now. */
+                   Sensors0-4 bitmaps are per-channel enable maps rather than scalar
+                   settings — so the form rendered the group hidden. It has content
+                   now. */
           const details = sensorsBody.closest("details.group");
           if (details) {
             details.hidden = false;
@@ -2703,9 +2889,9 @@
         }
 
         /* The two ExG register banks are opaque 10-byte runs, and the ExG
-           preset above is what installs a known-good one. They stay editable
-           for anyone who really does have a register bank to paste, but they
-           are worth a word of explanation. */
+                 preset above is what installs a known-good one. They stay editable
+                 for anyone who really does have a register bank to paste, but they
+                 are worth a word of explanation. */
         for (const key of ["exg1", "exg2"]) {
           const wrap = host.querySelector(`.field[data-field-key="${key}"]`);
           if (!wrap) continue;
@@ -2725,8 +2911,163 @@
         syncSensorGrid();
         syncRateReadout();
         syncRateCoverage();
+        syncSensorRules();
         renderHex();
         regate();
+      }
+
+      /**
+       * Show what the sensor rules make of the image as it now stands, and grey
+       * out what this board cannot do.
+       *
+       * Three states. A **violation** gets a warning banner and a Fix button:
+       * that only happens for an image that arrived already broken — from the
+       * device, or from a `.bin` — because a toggle corrects itself as it goes.
+       * A **change just made** gets an informational banner explaining it,
+       * which lives until the next edit. Otherwise the banner goes away.
+       *
+       * The log gets each violation once per distinct set, not once per
+       * keystroke: `syncRateCoverage` above does the same, for the same reason.
+       */
+      function syncSensorRules() {
+        const host = $("sensorRulesNote");
+        if (!host) return;
+        if (!HAS_SENSOR_RULES || !form) {
+          host.replaceChildren();
+          host.hidden = true;
+          return;
+        }
+
+        const state = ruleState();
+        let check = null;
+        try {
+          check = sdk.checkSensorRules(state);
+        } catch {
+          /* A half-built form, or a schema with no expPower field. Silence is
+                   right: this warns about specific relationships and cannot warn
+                   about fields that do not exist. */
+        }
+        paintSensorGating(state);
+
+        if (check?.violations?.length) {
+          renderRuleBanner(host, "warn", {
+            lines: check.violations.map((v) => v.message),
+            footer:
+              "Fix edits the form the way Consensys would; press Apply to write it to the sensor.",
+            fix: () => applyRuleDerivations(check),
+          });
+          const signature = check.violations.map((v) => v.message).join("|");
+          if (signature !== lastSensorRuleWarning) {
+            lastSensorRuleWarning = signature;
+            for (const v of check.violations)
+              log.warn(`sensor rule: ${v.message}`);
+          }
+        } else if (pendingRuleNote) {
+          renderRuleBanner(host, "info", {
+            lines: [
+              pendingRuleNote.lead,
+              ...pendingRuleNote.changes.map((c) => c.reason),
+            ],
+          });
+          lastSensorRuleWarning = "";
+        } else {
+          host.replaceChildren();
+          host.hidden = true;
+          lastSensorRuleWarning = "";
+        }
+        pendingRuleNote = null;
+      }
+
+      /**
+       * Build the banner's contents.
+       *
+       * `banner()` above only sets text, and this one needs a list and
+       * sometimes a button, so it assembles nodes instead.
+       */
+      function renderRuleBanner(host, kind, { lines, footer, fix }) {
+        host.className = `banner ${kind}`;
+        const children = lines.map((line) => el("div", {}, line));
+        if (footer) children.push(el("div", { class: "field-hint" }, footer));
+        if (fix) {
+          children.push(
+            el(
+              "div",
+              { class: "row" },
+              el(
+                "button",
+                {
+                  type: "button",
+                  class: "secondary",
+                  id: "btnSensorRulesFix",
+                  onclick: fix,
+                },
+                "Fix",
+              ),
+            ),
+          );
+        }
+        host.replaceChildren(...children);
+        host.hidden = false;
+      }
+
+      /**
+       * Grey out the sensors this board or platform cannot have.
+       *
+       * A box that is currently CHECKED is never disabled, whatever the rules
+       * say: an image read off a device can contain anything, and a user has to
+       * be able to untick it. Only an unticked box the hardware cannot support
+       * is refused.
+       */
+      function paintSensorGating(state) {
+        for (const box of document.querySelectorAll("[data-sensor-key]")) {
+          const key = box.dataset.sensorKey;
+          let availability = null;
+          try {
+            availability = sdk.sensorAvailability(key, state);
+          } catch {
+            continue;
+          }
+          const blocked =
+            !availability.available && availability.gate === "block";
+          box.disabled = blocked && !box.checked;
+          const label = box.closest("label");
+          if (label)
+            label.title = sensorBoxTitle(key, Number(box.dataset.sensorBit));
+        }
+        const exg = $("exgMode");
+        if (exg) {
+          let availability = null;
+          try {
+            availability = sdk.sensorAvailability("EXG", state);
+          } catch {
+            availability = null;
+          }
+          const exgBitsSet =
+            (state.enabledSensors & (sdk.EXG_ANY_MASK ?? 0)) !== 0;
+          exg.disabled =
+            !!availability &&
+            !availability.available &&
+            availability.gate === "block" &&
+            !exgBitsSet;
+        }
+      }
+
+      /** The Fix button: apply what the rules would do, and say what it did. */
+      function applyRuleDerivations(check) {
+        const before = sensorsFromImage();
+        sensorsToImage(check.derivations.enabledSensors);
+        if (check.derivations.exgOff) resetExgMode();
+        writeDerivedExpPower(check.derivations.expPower);
+        for (const change of check.changes) {
+          log.log(`sensor rule fix: ${change.reason}`);
+        }
+        pendingRuleNote = { lead: "Fixed:", changes: check.changes };
+        lastSensorRuleWarning = "";
+        deriveImuRate({
+          enableChanged:
+            imuEnabled(check.derivations.enabledSensors) !== imuEnabled(before),
+        });
+        afterImageEdit();
       }
 
       /**
@@ -2757,8 +3098,8 @@
           });
         } catch {
           /* A generation with no LSM6DSV field, or a half-built form. Silence
-             is right: this warns about a specific pair, and cannot warn about
-             fields that do not exist. */
+                   is right: this warns about a specific pair, and cannot warn about
+                   fields that do not exist. */
         }
         const problem = verdict?.problem ?? "";
         host.textContent = problem;
@@ -2781,16 +3122,16 @@
       function adoptDeviceImage(bytes) {
         deviceImage = new Uint8Array(bytes);
         /* The Device row's preferred source, and it arrives here rather than
-           in either connect path because this is the one place both of them
-           funnel the image through.
+                 in either connect path because this is the one place both of them
+                 funnel the image through.
 
-           `context`, not `layout`: parseInfoMem resolves the layout itself
-           from the context, and handing it a layout leaves it reading fields
-           at undefined offsets. Not caught here for the same reason — a throw
-           would mean the image and the context disagree, which is worth
-           seeing rather than swallowing. An image that fails the parser's own
-           validity check yields an empty name, which `deviceNameLabel` reads
-           as "nothing configured" and falls back from. */
+                 `context`, not `layout`: parseInfoMem resolves the layout itself
+                 from the context, and handing it a layout leaves it reading fields
+                 at undefined offsets. Not caught here for the same reason — a throw
+                 would mean the image and the context disagree, which is worth
+                 seeing rather than swallowing. An image that fails the parser's own
+                 validity check yields an empty name, which `deviceNameLabel` reads
+                 as "nothing configured" and falls back from. */
         if (context) {
           const parsed = sdk.parseInfoMem(deviceImage, context);
           configuredName = parsed.deviceName ?? "";
@@ -2827,7 +3168,7 @@
         if (!form) return;
         const identity = sdk.defaultTrialIdentity(deviceMac || "");
         /* Null when the MAC is unusable — no placeholder at all beats one that
-           looks like an identity and identifies nothing. */
+                 looks like an identity and identifies nothing. */
         form.setPlaceholder("deviceName", identity.deviceName ?? "");
         form.setPlaceholder("trialName", identity.trialName);
       }
@@ -2879,8 +3220,8 @@
           exgModeChanged: exgMode !== "off",
           sensorsChanged: sensorsChanged(),
           /* An ExG preset derives its oversampling ratio from the RUNNING
-             sampling rate, so the rate has to be re-applied even when its own
-             field is untouched. */
+                   sampling rate, so the rate has to be re-applied even when its own
+                   field is untouched. */
           samplingRateChanged:
             exgMode !== "off" || dirtyConfigKeys.includes("samplingRateHz"),
         });
@@ -3054,12 +3395,12 @@
 
             case "updateSdLogConfig":
               /* Feature-detected like every other step here. The plan lists
-                 this one unless the capability is positively denied, so a
-                 caller that has not wired up caps still gets it -- better than
-                 silently dropping the SD-header rebuild and leaving the card's
-                 configuration file stale after the image was written. What is
-                 not acceptable is reporting that as a TypeError, which is what
-                 calling straight through produced. */
+                       this one unless the capability is positively denied, so a
+                       caller that has not wired up caps still gets it -- better than
+                       silently dropping the SD-header rebuild and leaving the card's
+                       configuration file stale after the image was written. What is
+                       not acceptable is reporting that as a TypeError, which is what
+                       calling straight through produced. */
               if (typeof client.updateSdLogConfig !== "function") {
                 log.warn(
                   "this SDK build has no updateSdLogConfig — the configuration image is written, but the SD header will not be rebuilt until the sensor restarts",
@@ -3067,8 +3408,8 @@
                 return true;
               }
               /* Worth attempting and not worth aborting for: the InfoMem is
-                 already written, and firmware that does not serve 0x9C has no
-                 SD configuration file to rebuild in the first place. */
+                       already written, and firmware that does not serve 0x9C has no
+                       SD configuration file to rebuild in the first place. */
               await withDevice(
                 "rebuild the SD configuration header",
                 () => client.updateSdLogConfig(),
@@ -3206,10 +3547,10 @@
         fileNameFn: () => recordFileName(),
         log,
         /* The recorder gave up on the file part way through — it has already
-           stopped itself and written the detail to the log. All that is left
-           is to make sure the page does not go on claiming it is recording,
-           and that the researcher hears about it before they walk away with a
-           file that is short. */
+                 stopped itself and written the detail to the log. All that is left
+                 is to make sure the page does not go on claiming it is recording,
+                 and that the researcher hears about it before they walk away with a
+                 file that is short. */
         onError: (info) => {
           paintRecordingStopped(info);
           showToast(
@@ -3227,22 +3568,22 @@
       // =====================================================================
 
       /* The panel is mounted once and handed a GETTER for the client, so it
-         reads whatever is connected now rather than holding the client the
-         page happened to have at startup (which is none). */
+               reads whatever is connected now rather than holding the client the
+               page happened to have at startup (which is none). */
       const sd = createSdBrowser($("sdPanel"), {
         client: () => client,
         log,
         fmtBytes,
         /* Names the device level of the Consensys Backup tree. A getter
-           because `deviceMac` is filled in during the connect handshake,
-           after this panel is mounted. */
+                 because `deviceMac` is filled in during the connect handshake,
+                 after this panel is mounted. */
         macId: () => deviceMac,
         onBusyChange: (transferring) => {
           sdBusy = transferring;
           regate();
         },
         /* The link-speed button lives in the Sensor link card, so the running
-           figure has to come back out of the panel to be shown there. */
+                 figure has to come back out of the panel to be shown there. */
         onLinkSpeed: (kBps, final) => {
           $("linkSpeedPill").textContent =
             kBps == null
@@ -3275,8 +3616,8 @@
           return "The sensor is sensing, and the firmware refuses every SD command while it is — a download and a live stream would compete for the same link. Stop the stream to download from the card.";
         }
         /* The other holders of the one link. This panel is disabled for all
-           three (see its setEnabled call), so leaving them unsaid greyed the
-           card out with no reason on screen. */
+                 three (see its setEnabled call), so leaving them unsaid greyed the
+                 card out with no reason on screen. */
         if (linkTesting) {
           return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
         }
@@ -3317,29 +3658,29 @@
       // =====================================================================
 
       /* Mounted once and handed GETTERS, like the other two panels.
-         `generation` is what `inferShimmer3Generation` decided, which is what
-         picks the sensor list and the default calibration tables — a Shimmer3
-         has no high-g accel and no alternate magnetometer, and offering them
-         would say a calibration could be set for a chip that is not there.
+               `generation` is what `inferShimmer3Generation` decided, which is what
+               picks the sensor list and the default calibration tables — a Shimmer3
+               has no high-g accel and no alternate magnetometer, and offering them
+               would say a calibration could be set for a chip that is not there.
 
-         `infoMemBlocks` and `readInfoMem` are the read-only fallback for a
-         link with no calibration-dump commands (the USB-C dock, and the
-         classic `Shimmer3Client`): the panel then shows the six calibration
-         blocks out of the configuration image the page already holds, rather
-         than showing nothing. It does not write them — that image belongs to
-         the form above, unsaved edits and all. */
+               `infoMemBlocks` and `readInfoMem` are the read-only fallback for a
+               link with no calibration-dump commands (the USB-C dock, and the
+               classic `Shimmer3Client`): the panel then shows the six calibration
+               blocks out of the configuration image the page already holds, rather
+               than showing nothing. It does not write them — that image belongs to
+               the form above, unsaved edits and all. */
       const cal = createCalibrationEditor($("calPanel"), {
         client: () => client,
         /* Only when the sensor really said what it is. `generation` is
-           derived from the InfoMem context's hardware version, which is
-           DEFAULTED to a Shimmer3R when the identification read fails —
-           because the field schema needs some layout to render a form at
-           all. Passing that default here would offer a possibly-Shimmer3 two
-           sensors it does not have, which is the exact mistake the
-           device-naming panel's `identifiedHardwareVersion` note is about.
-           With nothing passed, the panel takes the hardware id out of the
-           dump's own version header instead — the device's own statement
-           about what wrote those records. */
+                 derived from the InfoMem context's hardware version, which is
+                 DEFAULTED to a Shimmer3R when the identification read fails —
+                 because the field schema needs some layout to render a form at
+                 all. Passing that default here would offer a possibly-Shimmer3 two
+                 sensors it does not have, which is the exact mistake the
+                 device-naming panel's `identifiedHardwareVersion` note is about.
+                 With nothing passed, the panel takes the hardware id out of the
+                 dump's own version header instead — the device's own statement
+                 about what wrote those records. */
         generation: () =>
           identifiedHardwareVersion == null ? null : generation,
         hardwareVersion: () => identifiedHardwareVersion,
@@ -3356,9 +3697,9 @@
       });
 
       /* The two Test-tab panels. Both are handed `canRun`/`canSample` rather
-         than being told when they may act: the page owns the reason, and a
-         panel that asked at click time can never be out of step with a gate
-         that was painted a moment earlier. */
+               than being told when they may act: the page owns the reason, and a
+               panel that asked at click time can never be out of step with a gate
+               that was painted a moment earlier. */
       const selfTest = createFactoryTestPanel($("selfTestPanel"), {
         client: () => client,
         mode: () => mode,
@@ -3387,16 +3728,16 @@
         deviceLabel: () => deviceName || deviceMac || "",
         canSample: driftSampleSkipReason,
         /* Each sample goes through the page's own busy flag, so a self-test or
-           an Apply cannot start in the middle of one. `tolerate` keeps a
-           missed read a skipped sample rather than a toast every interval. */
+                 an Apply cannot start in the middle of one. `tolerate` keeps a
+                 missed read a skipped sample rather than a toast every interval. */
         withLink: (fn) =>
           withDevice("read the sensor clock", fn, {
             quiet: true,
             tolerate: true,
           }),
         /* The sensor's real-world clock is a plain Unix epoch, as Consensys
-           and the dock software write it, so the host time goes across
-           unmodified. One hook, so a convention change is one line. */
+                 and the dock software write it, so the host time goes across
+                 unmodified. One hook, so a convention change is one line. */
         hostToDeviceMillis: (ms) => ms,
         onClockWritten: () => {
           inferStatus({ rtcSet: true });
@@ -3441,7 +3782,7 @@
           return sdk.parseInfoMem(deviceImage, context).calibration ?? null;
         } catch {
           /* A blank or unreadable image is not an error worth a log line
-             here — the configuration card has already said so. */
+                   here — the configuration card has already said so. */
           return null;
         }
       }
@@ -3611,15 +3952,15 @@
         banner("testBanner", reason ? (client ? "warn" : "info") : "", reason);
         const btn = $("tabBtnTest");
         /* Transient reasons only, and no bounce to another tab: everything
-           here works on every link, so the tab is never permanently
-           impossible — and while another panel merely holds the link, the
-           drift plot is still worth watching. Only the firmware-level refusal
-           closes it. */
+                 here works on every link, so the tab is never permanently
+                 impossible — and while another panel merely holds the link, the
+                 drift plot is still worth watching. Only the firmware-level refusal
+                 closes it. */
         btn.disabled = !!client && (streaming || sdLogging);
         btn.title = reason ?? "";
         /* The refusal if there is one, otherwise whatever is worth knowing
-           about this link. Both end up in the same place on screen; only one
-           of them may reach the run gate. */
+                 about this link. Both end up in the same place on screen; only one
+                 of them may reach the run gate. */
         $("selfTestNote").textContent = client
           ? (selfTestUnavailableReason() ?? selfTestLinkNote() ?? "")
           : "";
@@ -3664,8 +4005,8 @@
           want == null ? client.toggleLed() : client.setRedLed(want),
         );
         /* Read the flag back rather than assuming it followed: `setRedLed`
-           verifies, but `toggleLed` is fire-and-acknowledge, and the pill is
-           supposed to be the sensor's word. */
+                 verifies, but `toggleLed` is fire-and-acknowledge, and the pill is
+                 supposed to be the sensor's word. */
         if (client) await refreshDeviceState();
         paintLed();
       }
@@ -3675,12 +4016,12 @@
       // =====================================================================
 
       /* Mounted once and handed GETTERS for everything that changes with the
-         link, so it reads whatever is connected now.
+               link, so it reads whatever is connected now.
 
-         `identifiedHardwareVersion` is the raw identification result, NOT the
-         `?? 10` default the InfoMem context uses: the panel narrows the BLE
-         prefix length with it, and a defaulted Shimmer3R would defeat that
-         narrowing in exactly the case it exists for. */
+               `identifiedHardwareVersion` is the raw identification result, NOT the
+               `?? 10` default the InfoMem context uses: the panel narrows the BLE
+               prefix length with it, and a defaulted Shimmer3R would defeat that
+               narrowing in exactly the case it exists for. */
       const brand = createBrandEditor($("brandPanel"), {
         client: () => client,
         identifiedHardwareVersion: () => identifiedHardwareVersion,
@@ -3693,9 +4034,9 @@
           regate();
         },
         /* The panel arms the restart and then needs the link dropped for it
-           to fire. Its own default would call `client.disconnect()`, which on
-           this page would leave a recording unclosed and the UI still showing
-           a connected sensor — so it gets the page's own teardown instead. */
+                 to fire. Its own default would call `client.disconnect()`, which on
+                 this page would leave a recording unclosed and the UI still showing
+                 a connected sensor — so it gets the page's own teardown instead. */
         disconnect: () => disconnectFromSensor(),
       });
 
@@ -3798,10 +4139,11 @@
         if (info) noteInquiry(info);
 
         /* Seed the panels from the inquiry's channel list so they are on screen
-           before the first sample arrives. Those ChannelFields carry no raw/cal
-           kind, though, and the plot routes traces on name AND kind — so the
-           schema is refined once from the first real frame (see onFrame). */
+                 before the first sample arrives. Those ChannelFields carry no raw/cal
+                 kind, though, and the plot routes traces on name AND kind — so the
+                 schema is refined once from the first real frame (see onFrame). */
         plot.setSchema(info?.schema?.fields ?? [], streamRateHz ?? undefined);
+        plot.setTimeAxis($("selTimeAxis").value);
         plot.clear();
         plotPaused = false;
         plot.resume();
@@ -3830,10 +4172,11 @@
             ? "streaming to this host and logging to the sensor's SD card"
             : "streaming to this host",
         );
+        logCalibrationSummary();
         /* Only what this command actually changed: START_STREAMING does not
-           touch SD logging, and asserting it off would overwrite a recording
-           the sensor's own button had started. `sensing` follows because the
-           firmware sets it for either kind of recording. */
+                 touch SD logging, and asserting it off would overwrite a recording
+                 the sensor's own button had started. `sensing` follows because the
+                 firmware sets it for either kind of recording. */
         inferStatus(
           withSd
             ? { sensing: true, streaming: true, sdLogging: true }
@@ -3853,7 +4196,7 @@
           );
         } catch {
           /* Logged and toasted. Fall through anyway: leaving the page stuck in
-             "streaming" would refuse every later command for no good reason. */
+                   "streaming" would refuse every later command for no good reason. */
         }
         streaming = false;
         sdLogging = false;
@@ -3872,6 +4215,66 @@
         regate();
       }
 
+      /**
+       * One line saying what this stream's numbers mean.
+       *
+       * The line a hardware check compares against Consensys: which
+       * calibration each sensor group is using and whether it is the sensor's
+       * own or its part's factory seed, what the ADC reference is, which
+       * pressure part is fitted, and what the time axis is anchored to. All of
+       * it is `?.`-guarded — a vendored SDK older than these getters should
+       * degrade to saying less, not to a broken stream.
+       */
+      function logCalibrationSummary() {
+        const info = client?.calibrationInfo;
+        const timeline = client?.timelineState;
+        const parts = [];
+        if (info?.inertial) {
+          for (const [group, entry] of Object.entries(info.inertial)) {
+            parts.push(`${group} range ${entry.range} (${entry.source})`);
+          }
+        }
+        if (info?.gsr) parts.push(`GSR range ${info.gsr.range}`);
+        if (info?.pressure) {
+          parts.push(
+            info.pressure.sensor
+              ? `pressure ${info.pressure.sensor} ${
+                  info.pressure.calibrated ? "calibrated" : "raw only"
+                }`
+              : "pressure not read",
+          );
+        }
+        if (info?.adc)
+          parts.push(`ADC ${info.adc.vrefVolts} V / ${info.adc.bits}-bit`);
+        if (parts.length) log.log(`calibration: ${parts.join(" · ")}`);
+        if (timeline?.source) {
+          log.log(
+            `stream clock: ${describeTimelineSource(timeline)}${
+              Number.isFinite(timeline.skewMs)
+                ? `, sensor is ${Math.round(timeline.skewMs)} ms ` +
+                  `${timeline.skewMs >= 0 ? "ahead of" : "behind"} this host`
+                : ""
+            }`,
+          );
+        }
+      }
+
+      /** Plain English for a stream timeline's anchor. */
+      function describeTimelineSource(timeline) {
+        switch (timeline?.source) {
+          case "rwc-aligned":
+            return "the sensor's own real-world clock (exact)";
+          case "rwc-estimated":
+            return `the sensor's real-world clock (±${Math.round(
+              timeline.anchorUncertaintyMs,
+            )} ms)`;
+          case "host":
+            return "this host's clock";
+          default:
+            return "not anchored — the axis shows elapsed time only";
+        }
+      }
+
       function onFrame(oc) {
         const hostMs = Date.now();
 
@@ -3881,21 +4284,38 @@
           plot.setSchema(oc.fields, streamRateHz ?? undefined);
           plot.setWindow(Number($("selWindow").value));
           plot.setKind($("selKind").value);
+          plot.setTimeAxis($("selTimeAxis").value);
         }
         if (!csvColumns) {
           csvColumns = sdk.objectClusterColumns(oc);
+          const calCount = csvColumns.filter((c) => c.kind === "cal").length;
           log.log(
             `stream schema: ${oc.fields.length} fields per frame, ` +
-              `${csvColumns.length} CSV data columns`,
+              `${csvColumns.length} CSV data columns (${calCount} calibrated)`,
           );
           regate();
         }
 
-        const ticks = oc.get?.("TIMESTAMP")?.value;
-        plot.push(
-          oc,
-          Number.isFinite(ticks) ? ticks / TICKS_PER_SECOND : hostMs / 1000,
-        );
+        /* The x value, in order of preference:
+                   1. `Timestamp_Unix` — wall-clock seconds, when the SDK's stream
+                      timeline found an anchor. This is what makes the axis readable
+                      as a time of day.
+                   2. `TIMESTAMP` calibrated — the device's own clock in ms,
+                      UNWRAPPED, so it does not jump back every 512 s the way the raw
+                      counter does.
+                   3. This host's arrival time, if a frame somehow carries neither.
+                 The raw counter is deliberately no longer used: dividing it by 32768
+                 gave "seconds since the counter last wrapped", which is not a
+                 quantity anybody wants on an axis. */
+        const unixMs = oc.get?.("Timestamp_Unix", "cal")?.value;
+        const deviceMs = oc.get?.("TIMESTAMP", "cal")?.value;
+        const haveUnix = Number.isFinite(unixMs);
+        const xSec = haveUnix
+          ? unixMs / 1000
+          : Number.isFinite(deviceMs)
+            ? deviceMs / 1000
+            : hostMs / 1000;
+        plot.push(oc, xSec, { unix: haveUnix });
         stats.onFrame(oc, performance.now());
         if (recorder.active && recorder.push(hostMs, oc)) recordedRows++;
       }
@@ -3909,7 +4329,7 @@
           return;
         }
         /* showSaveFilePicker is gesture-gated, so this runs straight off the
-           click with nothing awaited in front of it. */
+                 click with nothing awaited in front of it. */
         const started = await recorder.start(csvColumns);
         if (!started) {
           log.log("recording cancelled");
@@ -3950,7 +4370,7 @@
           );
         } else {
           /* Only reachable when the failure happened during the close; a
-             failure mid-recording has already gone through onError. */
+                   failure mid-recording has already gone through onError. */
           showToast(
             `${result.fileName} is INCOMPLETE — ` +
               `${result.rowsDropped.toLocaleString()} rows were lost (${result.error})`,
@@ -3962,7 +4382,7 @@
       }
 
       /* One cheap tick a second: the row counter while recording, and the
-         file-name preview the rest of the time. */
+               file-name preview the rest of the time. */
       setInterval(() => {
         if (recorder.active) {
           $("recRows").textContent = recordedRows.toLocaleString();
@@ -3998,17 +4418,17 @@
           writeCharUUID: defaults.CHAR_RX_UUID,
           notifyCharUUID: defaults.CHAR_TX_UUID,
           /* These two MUST track Shimmer3RClient._makeWebTransport, which is
-             what the SDK would have built had this page not built the
-             transport itself (it does so only to tap it for the raw-byte log).
-             The SDK moved the device→host subscription to CYSPP's
-             notify-capable characteristic and falls back to the indicate-only
-             one for a device that lacks it; a hand-built transport with a
-             single candidate has no such fallback and would fail the connect
-             where the SDK's own would recover. The flow-control characteristic
-             is observational and the transport tolerates its absence. Both are
-             undefined on an SDK too old to export them, which the transport
-             treats as "not configured" — so this is safe to vendor either way.
-             If _makeWebTransport gains an option, add it here too. */
+                   what the SDK would have built had this page not built the
+                   transport itself (it does so only to tap it for the raw-byte log).
+                   The SDK moved the device→host subscription to CYSPP's
+                   notify-capable characteristic and falls back to the indicate-only
+                   one for a device that lacks it; a hand-built transport with a
+                   single candidate has no such fallback and would fail the connect
+                   where the SDK's own would recover. The flow-control characteristic
+                   is observational and the transport tolerates its absence. Both are
+                   undefined on an SDK too old to export them, which the transport
+                   treats as "not configured" — so this is safe to vendor either way.
+                   If _makeWebTransport gains an option, add it here too. */
           notifyCharUUIDFallback: defaults.CHAR_TX_ACKED_UUID,
           rxFlowCharUUID: defaults.CHAR_RX_FLOW_UUID,
           requestDeviceOptions: {
@@ -4034,25 +4454,25 @@
         sdkNs: sdk,
         makeClients: {
           /* The client would happily build its own Web Bluetooth transport,
-             and did until the raw byte tap arrived: a transport the page never
-             sees is a transport the page cannot tap, which left BLE — the link
-             most sessions use — as the one link with no byte-level
-             diagnostics.
+                   and did until the raw byte tap arrived: a transport the page never
+                   sees is a transport the page cannot tap, which left BLE — the link
+                   most sessions use — as the one link with no byte-level
+                   diagnostics.
 
-             So the page builds it, matching Shimmer3RClient._makeWebTransport
-             option for option: the same three UUIDs (read off the SDK's own
-             SHIMMER3R_DEFAULTS rather than typed out here), the same
-             requestDevice filter and optionalServices, and
-             defaultWriteWithResponse: true, which is the one that would change
-             behaviour rather than just labels if it were wrong — the Shimmer3R
-             protocol is ACK-first and its commands are written with a
-             response. */
+                   So the page builds it, matching Shimmer3RClient._makeWebTransport
+                   option for option: the same three UUIDs (read off the SDK's own
+                   SHIMMER3R_DEFAULTS rather than typed out here), the same
+                   requestDevice filter and optionalServices, and
+                   defaultWriteWithResponse: true, which is the one that would change
+                   behaviour rather than just labels if it were wrong — the Shimmer3R
+                   protocol is ACK-first and its commands are written with a
+                   response. */
           ble: () => {
             const raw = makeBleTransport();
             if (!raw) {
               /* An older vendored bundle with no WebBluetoothTransport export:
-                 fall back to the client's own, which costs the tap on this
-                 link and nothing else. */
+                       fall back to the client's own, which costs the tap on this
+                       link and nothing else. */
               log.warn(
                 "this SDK bundle does not export WebBluetoothTransport, so the BLE link cannot be tapped — raw TX/RX logging will be empty over BLE",
               );
@@ -4066,10 +4486,10 @@
           },
           bt: () => {
             /* A Classic-Bluetooth link is a serial port, so the transport is
-               built here and handed back alongside the client — the controller
-               needs it to log which RFCOMM service class the browser's picker
-               actually gave us. 64 KB of buffer because a serial read can
-               arrive in one large gulp. */
+                     built here and handed back alongside the client — the controller
+                     needs it to log which RFCOMM service class the browser's picker
+                     actually gave us. 64 KB of buffer because a serial read can
+                     arrive in one large gulp. */
             const transport = tapTransport(
               new sdk.WebSerialTransport({
                 ...sdk.SHIMMER3_SPP_SERIAL_OPTIONS,
@@ -4105,31 +4525,31 @@
         mode = session.mode;
         caps = describeShimmer3Caps(client, mode);
         /* One capability the shared feature detection does not cover: a clock
-           write, which the dock client spells `writeRtcFromHostTime` rather
-           than `setRtcTime`. */
+                 write, which the dock client spells `writeRtcFromHostTime` rather
+                 than `setRtcTime`. */
         caps.rtcWrite =
           typeof client.setRtcTime === "function" ||
           typeof client.writeRtcFromHostTime === "function";
         /* Deliberately gated on the link as well as on the method: the dock
-           command set has no data-rate test, so the reason the button is off
-           over USB is the protocol, not a missing SDK export. */
+                 command set has no data-rate test, so the reason the button is off
+                 over USB is the protocol, not a missing SDK export. */
         caps.linkTest =
           mode !== "usb" && typeof client.runDataRateTest === "function";
         regate();
 
         /* The sensor's own news, which nothing on this page used to hear.
-           The firmware pushes an unsolicited STATUS_RESPONSE whenever it is
-           docked or undocked (`LogAndStream_setupDock` / `setupUndock`,
-           log-and-stream-common `log_and_stream_common.c`) and on a sensing
-           change it made itself — the user button, a trial ending, a low
-           battery. A read's own answer is NOT delivered here, so this cannot
-           double-render what Refresh already showed.
+                 The firmware pushes an unsolicited STATUS_RESPONSE whenever it is
+                 docked or undocked (`LogAndStream_setupDock` / `setupUndock`,
+                 log-and-stream-common `log_and_stream_common.c`) and on a sensing
+                 change it made itself — the user button, a trial ending, a low
+                 battery. A read's own answer is NOT delivered here, so this cannot
+                 double-render what Refresh already showed.
 
-           It only fires while idle: once a stream is live the SDK's parser
-           consumes the push, which is why a stream start reflects its own
-           change (`inferStatus`) instead of waiting for one. Guarded by a
-           property check because the dock client has no such callback — and
-           no status bytes to put in it. */
+                 It only fires while idle: once a stream is live the SDK's parser
+                 consumes the push, which is why a stream start reflects its own
+                 change (`inferStatus`) instead of waiting for one. Guarded by a
+                 property check because the dock client has no such callback — and
+                 no status bytes to put in it. */
         if ("onDeviceStatus" in client) {
           client.onDeviceStatus = (status) => {
             log.log(
@@ -4231,8 +4651,8 @@
         }
         await tryDevice("enable the link CRC", () => client.setCrcMode(want));
         /* Read back from the client rather than from the call: `crcMode` only
-           advances on a successful ACK, so this cannot end up expecting bytes
-           the device is not sending. */
+                 advances on a successful ACK, so this cannot end up expecting bytes
+                 the device is not sending. */
         const on = client.crcMode > 0;
         if (pill) {
           pill.textContent = on
@@ -4256,20 +4676,20 @@
           client.readDeviceVersion(),
         );
         /* The CRC goes AFTER both version reads, per
-           SHIMMER3_BT_COMMUNICATION_PROTOCOL.md section 8.2 constraint 3: the
-           version exchange must not be subject to a CRC the firmware has not
-           been confirmed to support, and a CRC turns on the length-aware
-           framer whose STATUS_RESPONSE span is 1 byte on a Shimmer3 against 2
-           on a Shimmer3R - which only the hardware version settles. Applying
-           it first, as this used to, framed a Shimmer3's status a byte too
-           wide for the whole session. */
+                 SHIMMER3_BT_COMMUNICATION_PROTOCOL.md section 8.2 constraint 3: the
+                 version exchange must not be subject to a CRC the firmware has not
+                 been confirmed to support, and a CRC turns on the length-aware
+                 framer whose STATUS_RESPONSE span is 1 byte on a Shimmer3 against 2
+                 on a Shimmer3R - which only the hardware version settles. Applying
+                 it first, as this used to, framed a Shimmer3's status a byte too
+                 wide for the whole session. */
         await applyLinkCrc();
         const mac = await tryDevice("read the MAC address", () =>
           client.getMacAddress(),
         );
         if (mac) deviceMac = mac;
         /* The raw answer, deliberately NOT defaulted — see the declaration.
-           `hw` is undefined when the read was refused or timed out. */
+                 `hw` is undefined when the read was refused or timed out. */
         identifiedHardwareVersion = hw?.hardwareVersion ?? null;
         if (identifiedHardwareVersion === null) {
           log.warn(
@@ -4278,12 +4698,12 @@
         }
 
         /* The firmware gate on top of the method-and-link check
-           `describeShimmer3Caps` did: v1.01.009 and v1.01.010 serve the
-           SD-transfer protocol and ship every 512-byte block shifted three
-           bytes, so the corruption arrives as valid frames nothing on the
-           host can detect. The version is the only reliable probe, and
-           `supportsSdTransfer` owns the threshold — it reuses the version
-           just read, so this costs no extra round trip. */
+                 `describeShimmer3Caps` did: v1.01.009 and v1.01.010 serve the
+                 SD-transfer protocol and ship every 512-byte block shifted three
+                 bytes, so the corruption arrives as valid frames nothing on the
+                 host can detect. The version is the only reliable probe, and
+                 `supportsSdTransfer` owns the threshold — it reuses the version
+                 just read, so this costs no extra round trip. */
         if (caps.sdTransfer) {
           const ok = await client.supportsSdTransfer().catch(() => false);
           caps.sdTransfer = ok === true;
@@ -4298,22 +4718,22 @@
         }
 
         /* The board's own SR identity, from the daughter-card ID page.
-           Two jobs: it names the sensor on the panel, and its revision is
-           what separates a new-IMU Shimmer3 from an old-IMU one and so which
-           option tables the configuration form offers.
+                 Two jobs: it names the sensor on the panel, and its revision is
+                 what separates a new-IMU Shimmer3 from an old-IMU one and so which
+                 option tables the configuration form offers.
 
-           This used to read `readDaughterCardMem(0, 16)`, which is a
-           different EEPROM page: the firmware maps host offset 0 of the
-           card-MEMORY read past the first page, to absolute byte 16
-           (`Comms/shimmer_bt_uart.c`, the GET_DAUGHTER_CARD_MEM handler's
-           `eepromRead(dcMemOffset + 16U, ...)`), while the ID page is
-           absolute 0..15. So the three bytes it parsed as an SR code were
-           whatever sits after it, and the generation was being inferred from
-           them. The Java driver asks the way this does now — three bytes at
-           offset 0 of the ID page (`ShimmerBluetooth.readExpansionBoardID`).
+                 This used to read `readDaughterCardMem(0, 16)`, which is a
+                 different EEPROM page: the firmware maps host offset 0 of the
+                 card-MEMORY read past the first page, to absolute byte 16
+                 (`Comms/shimmer_bt_uart.c`, the GET_DAUGHTER_CARD_MEM handler's
+                 `eepromRead(dcMemOffset + 16U, ...)`), while the ID page is
+                 absolute 0..15. So the three bytes it parsed as an SR code were
+                 whatever sits after it, and the generation was being inferred from
+                 them. The Java driver asks the way this does now — three bytes at
+                 offset 0 of the ID page (`ShimmerBluetooth.readExpansionBoardID`).
 
-           Best-effort: an older firmware may not answer, and a Shimmer3R
-           does not need it for the layout (hardware id 10 decides). */
+                 Best-effort: an older firmware may not answer, and a Shimmer3R
+                 does not need it for the layout (hardware id 10 decides). */
         srBoard = await tryDevice("read the board's SR id", () =>
           typeof client.readSrBoard === "function"
             ? client.readSrBoard()
@@ -4321,9 +4741,9 @@
         );
 
         /* What the Bluetooth module says about itself. Worth a round trip
-           because it is the one part of a sensor a host cannot otherwise
-           see, and the answer decides whether a link problem is worth
-           chasing in the module's own release notes. */
+                 because it is the one part of a sensor a host cannot otherwise
+                 see, and the answer decides whether a link problem is worth
+                 chasing in the module's own release notes. */
         const btModule = await tryDevice(
           "read the Bluetooth module version",
           () =>
@@ -4377,25 +4797,49 @@
         }
 
         /* And the calibration, for the same reason the configuration image is
-           read here: a page that shows a sensor's settings without showing
-           what it is calibrated to has told half the story, and the tab
-           otherwise sat empty until somebody thought to press Read.
+                 read here: a page that shows a sensor's settings without showing
+                 what it is calibrated to has told half the story, and the tab
+                 otherwise sat empty until somebody thought to press Read.
 
-           LAST, deliberately. It needs the generation and the configured
-           ranges the reads above establish — the panel opens each card on the
-           range the image says the sensor is set to — and it is the one read
-           here that is worth a page of traffic (the dump is up to 209 bytes
-           over 128-byte pages), so it goes behind everything the rest of the
-           page needs to render at all.
+                 LAST, deliberately. It needs the generation and the configured
+                 ranges the reads above establish — the panel opens each card on the
+                 range the image says the sensor is set to — and it is the one read
+                 here that is worth a page of traffic (the dump is up to 209 bytes
+                 over 128-byte pages), so it goes behind everything the rest of the
+                 page needs to render at all.
 
-           `reuseInfoMem` because the image arrived a few lines ago: on a link
-           with no dump commands the panel falls back to showing the InfoMem
-           blocks, and without this it would re-read all 384 bytes to get the
-           ones it has already been handed. Tolerated rather than awaited for
-           success: an older firmware NACKs GET_CALIB_DUMP, and a tab that
-           could not be filled is not a connection that failed. */
+                 `reuseInfoMem` because the image arrived a few lines ago: on a link
+                 with no dump commands the panel falls back to showing the InfoMem
+                 blocks, and without this it would re-read all 384 bytes to get the
+                 ones it has already been handed. Tolerated rather than awaited for
+                 success: an older firmware NACKs GET_CALIB_DUMP, and a tab that
+                 could not be filled is not a connection that failed. */
         if (caps.calibration || caps.infomem) {
           await cal.read({ reuseInfoMem: true }).catch(() => null);
+        }
+
+        /* The pressure sensor's factory trim
+                 (GET_PRESSURE_CALIBRATION_COEFFICIENTS, 0xA7). One round trip, and
+                 the answer cannot change while the link is up because the part is
+                 soldered down. Without it PRESSURE and TEMPERATURE stream raw-only:
+                 the firmware relays the chips' raw registers, so kPa and °C are
+                 entirely the host's job. Tolerated rather than required — firmware
+                 older than the command refuses it, and the SDK says so through its
+                 status messages. */
+        if (caps.pressureCalibration) {
+          const pressure = await tryDevice(
+            "read the pressure calibration",
+            () => client.readPressureCalibration(),
+          );
+          if (pressure) {
+            log.log(
+              `pressure sensor ${pressure.sensor}: ${
+                pressure.calibrated
+                  ? "pressure and temperature will stream in kPa and °C"
+                  : "no usable coefficients — pressure and temperature stream raw only"
+              }`,
+            );
+          }
         }
       }
 
@@ -4409,10 +4853,10 @@
        */
       async function afterConnectWired() {
         /* The dock speaks its own protocol with no SET_CRC_COMMAND, so the
-           setting does not apply on this link at all — disabled for the same
-           reason as on a radio link, not because it was applied. The pill has
-           to say so too, or it keeps advertising the pre-connect selection as
-           though it were about to be applied. */
+                 setting does not apply on this link at all — disabled for the same
+                 reason as on a radio link, not because it was applied. The pill has
+                 to say so too, or it keeps advertising the pre-connect selection as
+                 though it were about to be applied. */
         setLinkCrcEditable(false);
         showLinkCrcNotApplicable();
         const id = await tryDevice("identify the docked sensor", () =>
@@ -4427,7 +4871,7 @@
         const version = id?.firmwareVersion;
 
         /* `identify()` already read the ID page over this link, so there is
-           nothing more to ask for. */
+                 nothing more to ask for. */
         srBoard = id?.expansionBoard ?? null;
         const btModule = await tryDevice(
           "read the Bluetooth module version",
@@ -4486,9 +4930,9 @@
         }
 
         /* The calibration too, as on the radio path. There are no dump
-           commands over the dock, so this is the InfoMem fallback showing the
-           blocks out of the image just read — `reuseInfoMem` is what stops it
-           reading all 384 bytes a second time to see them. */
+                 commands over the dock, so this is the InfoMem fallback showing the
+                 blocks out of the image just read — `reuseInfoMem` is what stops it
+                 reading all 384 bytes a second time to see them. */
         if (caps.infomem) {
           await cal.read({ reuseInfoMem: true }).catch(() => null);
         }
@@ -4526,26 +4970,26 @@
         streaming = false;
         sdLogging = false;
         /* Back to reporting the selection, because the link that a CRC was
-           agreed on has gone and leaving "CRC 2 bytes" up would describe a
-           connection that no longer exists.
+                 agreed on has gone and leaving "CRC 2 bytes" up would describe a
+                 connection that no longer exists.
 
-           Deliberately NOT a claim about what the firmware does on
-           disconnect. Its CRC mode is per POWER CYCLE, not per connection, so
-           a sensor that was not power-cycled may well still have the CRC on -
-           which is exactly why the SDK assumes off on connect and
-           re-establishes rather than trusting either answer. */
+                 Deliberately NOT a claim about what the firmware does on
+                 disconnect. Its CRC mode is per POWER CYCLE, not per connection, so
+                 a sensor that was not power-cycled may well still have the CRC on -
+                 which is exactly why the SDK assumes off on connect and
+                 re-establishes rather than trusting either answer. */
         showPendingLinkCrc();
         setLinkCrcEditable(true);
         /* Everything identifying the sensor that has just gone, so nothing
-           belonging to it can be attributed to the next one.
-           `deviceMac` is the one that matters: it is assigned only when the
-           read succeeds (`if (mac) deviceMac = mac`), so a sensor whose MAC
-           could not be read would otherwise inherit the previous sensor's -
-           and `macId` names the device level of the Consensys backup tree, so
-           a download would be filed under the wrong sensor. `deviceName` is
-           reassigned unconditionally on every connect, so it cannot go stale
-           on its own; it is cleared here for the same reason, not because it
-           can leak. */
+                 belonging to it can be attributed to the next one.
+                 `deviceMac` is the one that matters: it is assigned only when the
+                 read succeeds (`if (mac) deviceMac = mac`), so a sensor whose MAC
+                 could not be read would otherwise inherit the previous sensor's -
+                 and `macId` names the device level of the Consensys backup tree, so
+                 a download would be filed under the wrong sensor. `deviceName` is
+                 reassigned unconditionally on every connect, so it cannot go stale
+                 on its own; it is cleared here for the same reason, not because it
+                 can leak. */
         deviceName = "";
         deviceMac = "";
         configuredName = "";
@@ -4553,22 +4997,22 @@
         csvColumns = null;
         schemaFromFrame = false;
         /* A transfer that outlived its link would keep writing zero-length
-           windows into the destination folder. Abort first, then drop the
-           client the panel reads through. */
+                 windows into the destination folder. Abort first, then drop the
+                 client the panel reads through. */
         sd.abort();
         /* Nothing is coming from a link that has gone, so the capture is
-           abandoned rather than drained, and the busy flag it set is released
-           here in case the drop happened mid-report. */
+                 abandoned rather than drained, and the busy flag it set is released
+                 here in case the drop happened mid-report. */
         selfTest.cancel("disconnect");
         drift.stop();
         testBusy = false;
         /* Report whatever the tap was still holding back before the transport
-           it wrapped goes away — a count that never lands reads as bytes that
-           were never sent. */
+                 it wrapped goes away — a count that never lands reads as bytes that
+                 were never sent. */
         tap?.tap.flush();
         tap = null;
         /* A status pushed by a link the page has already let go would paint a
-           departed sensor's flags into a panel that is about to say "–". */
+                 departed sensor's flags into a panel that is about to say "–". */
         if (client) client.onDeviceStatus = null;
         client = null;
         mode = null;
@@ -4577,7 +5021,7 @@
         identifiedHardwareVersion = null;
         form?.setEnabled(false);
         /* A KB/s figure belongs to the link that produced it, so it goes with
-           the link rather than lingering beside the next one. */
+                 the link rather than lingering beside the next one. */
         $("linkSpeedPill").textContent = "not measured";
         clearIdentity();
         $("tabBtnStream").disabled = false;
@@ -4645,8 +5089,8 @@
         const framed = params.get("framed") !== "0";
         const rateHz = Number(params.get("rate")) || 51.2;
         /* `1.01.010` — major.minor.patch, the way the firmware releases are
-           named, so the value pasted into the URL is the one from the
-           release notes. */
+                 named, so the value pasted into the URL is the one from the
+                 release notes. */
         const fwParts = (params.get("fw") ?? "").split(".").map(Number);
         const firmware =
           fwParts.length === 3 && fwParts.every(Number.isFinite)
@@ -4662,22 +5106,44 @@
           clockBase: params.get("clockBase") === "local" ? "local" : "utc",
         };
         /* `srBoard=48-3-0` sets the board's SR identity, `srBoard=none` leaves
-           its id page erased. `btVersion=` (empty) models the module never
-           having answered the firmware's own version query, which is a real
-           state and not an error. Both are read straight through, so a value
-           the mock does not recognise reaches the page as the sensor's answer
-           rather than being corrected here. */
+                 its id page erased. `btVersion=` (empty) models the module never
+                 having answered the firmware's own version query, which is a real
+                 state and not an error. Both are read straight through, so a value
+                 the mock does not recognise reaches the page as the sensor's answer
+                 rather than being corrected here. */
         const srBoard = params.get("srBoard") ?? undefined;
+        /* `pressure=390|581|180|nack|silent` — which pressure part the
+                 mock claims, or how it refuses. Defaults to the one the
+                 hardware version implies. `nack` and `silent` are the two ways
+                 real firmware fails to serve 0xA7, and both leave pressure and
+                 temperature streaming raw-only. */
+        const pressure = params.get("pressure") ?? undefined;
+        /* `sensors=0x0422E6` (or decimal) preloads the enabled-sensor
+                 bitmap, which is how a calibrated multi-channel stream, or an
+                 image that already breaks a sensor rule, is reachable from a
+                 URL rather than by clicking. */
+        const sensorsParam = params.get("sensors");
+        const sensors =
+          sensorsParam == null
+            ? undefined
+            : Number.isFinite(Number(sensorsParam))
+              ? Number(sensorsParam)
+              : undefined;
+        if (sensorsParam != null && sensors === undefined) {
+          log.warn(
+            `mock mode: ignoring sensors="${sensorsParam}" — not a number. Use 0x… or a decimal bitmap.`,
+          );
+        }
         const btVersion = params.has("btVersion")
           ? params.get("btVersion")
           : undefined;
         /* `hw=none` (or `hw=0`) NACKs GET_DEVICE_VERSION, so the page cannot
-           identify the sensor. Anything else is a hardware id. */
+                 identify the sensor. Anything else is a hardware id. */
         const hwParam = params.get("hw");
         /* A hw= that is not a number is a typo, not a hardware id. Passing the
-           NaN on gave GET_DEVICE_VERSION a masked 0 -- a fourth answer that is
-           neither a real id, nor the default, nor the unidentified sensor the
-           author was probably reaching for. Treated as absent instead. */
+                 NaN on gave GET_DEVICE_VERSION a masked 0 -- a fourth answer that is
+                 neither a real id, nor the default, nor the unidentified sensor the
+                 author was probably reaching for. Treated as absent instead. */
         const hwNumber = hwParam == null ? NaN : Number(hwParam);
         const hardwareVersion =
           hwParam == null
@@ -4696,9 +5162,9 @@
         btn.hidden = false;
         btn.textContent = `Connect (mock, ${framed ? "framed" : "unframed"})`;
         /* The BLE transport builder, so its options can be read off on a host
-           with no sensor and no Web Bluetooth — constructing one does not go
-           near the radio, only `connect()` does. Side-effect free: the tap is
-           applied by the connect factory, not here. */
+                 with no sensor and no Web Bluetooth — constructing one does not go
+                 near the radio, only `connect()` does. Side-effect free: the tap is
+                 applied by the connect factory, not here. */
         window.makeBleTransport = makeBleTransport;
         log.warn(
           `mock mode: no real sensor is involved. The transport is ${
@@ -4719,6 +5185,8 @@
             rtc,
             srBoard,
             btVersion,
+            pressure,
+            sensors,
             debug: params.get("debug") === "1",
           });
           // Hooks for driving the page from the console while developing:
@@ -4738,16 +5206,16 @@
           window.factoryTestPanel = selfTest;
           window.rtcDriftPanel = drift;
           /* Also the client itself, so a link's feature set can be taken
-             apart from the console: shadowing a method on it is how the
-             "this link cannot do X" paths get exercised without owning the
-             hardware that cannot do X. */
+                   apart from the console: shadowing a method on it is how the
+                   "this link cannot do X" paths get exercised without owning the
+                   hardware that cannot do X. */
           const mockClient = new sdk.Shimmer3RClient({
             debug: false,
             /* Tapped like every real link, so the raw byte log can be
-               exercised with no hardware on the desk. `window.mockTransport`
-               stays the RAW mock deliberately: its `writes`, `sdCard` and
-               `eeprom` are what a developer (and the test harness) reaches
-               for, and reading them through the tap would prove nothing. */
+                     exercised with no hardware on the desk. `window.mockTransport`
+                     stays the RAW mock deliberately: its `writes`, `sdCard` and
+                     `eeprom` are what a developer (and the test harness) reaches
+                     for, and reading them through the tap would prove nothing. */
             transport: tapTransport(transport),
           });
           window.mockClient = mockClient;
@@ -4808,7 +5276,7 @@
       async function disconnectFromSensor() {
         sd.abort();
         /* Disconnecting is the ONLY escape from a running self-test — the
-           firmware has no abort — so it must not wait for one to finish. */
+                 firmware has no abort — so it must not wait for one to finish. */
         selfTest.cancel("disconnect");
         drift.stop();
         if (streaming) await stopStream(sdLogging);
@@ -4830,8 +5298,8 @@
       }
 
       /* NOT wrapped in `reported`: an error escaping the teardown is a bug
-         worth seeing, and the page's unhandledrejection handler puts it in
-         the downloadable log. */
+               worth seeing, and the page's unhandledrejection handler puts it in
+               the downloadable log. */
       $("btnDisconnect").addEventListener("click", () => {
         void disconnectFromSensor();
       });
@@ -4842,8 +5310,8 @@
       );
 
       /* The panel still owns the measurement — its result belongs in the card
-         stats and the download ETAs — but the button that starts it belongs
-         with the link it measures. */
+               stats and the download ETAs — but the button that starts it belongs
+               with the link it measures. */
       $("btnLinkTest").addEventListener("click", () => {
         $("linkSpeedPill").textContent = "measuring…";
         linkTesting = true;
@@ -4959,8 +5427,8 @@
           return;
         }
         /* Loaded as an EDIT, not as a new reference: `deviceImage` still holds
-           what the sensor gave us, so the hex view highlights every byte that
-           differs and Apply still knows which live setters to replay. */
+                 what the sensor gave us, so the hex view highlights every byte that
+                 differs and Apply still knows which live setters to replay. */
         form.setImage(bytes);
         afterImageEdit();
         const n = dirtyCount();
@@ -4975,7 +5443,7 @@
       });
 
       /* Nothing here for calibration: `common/calibration-editor.js` owns its
-         own buttons, exactly as the SD and device-naming panels do. */
+               own buttons, exactly as the SD and device-naming panels do. */
 
       $("btnStreamStart").addEventListener(
         "click",
@@ -5012,6 +5480,26 @@
         );
       });
 
+      $("selTimeAxis").addEventListener("change", (e) => {
+        plot.setTimeAxis(e.target.value);
+        const timeline = client?.timelineState;
+        if (e.target.value === "clock" && !timeline?.source) {
+          /* Nothing to show a time of day from, so the axis stays on elapsed
+                   seconds. Said out loud rather than silently ignored: an axis that
+                   does not do what the control says is worse than a control that
+                   explains itself. */
+          log.warn(
+            "the clock axis needs wall-clock time on the frames — read the sensor's real-world clock, or the axis will keep showing elapsed seconds",
+          );
+        } else {
+          log.log(
+            e.target.value === "clock"
+              ? `time axis: local clock, from ${describeTimelineSource(timeline)}`
+              : "time axis: seconds since the first sample",
+          );
+        }
+      });
+
       $("btnPause").addEventListener("click", () => {
         plotPaused = !plotPaused;
         if (plotPaused) plot.pause();
@@ -5020,7 +5508,7 @@
       });
 
       /* NOT wrapped: showSaveFilePicker is gesture-gated, so `startRecording`
-         must be reached straight off the click. It reports its own failures. */
+               must be reached straight off the click. It reports its own failures. */
       $("btnRecStart").addEventListener("click", () => {
         startRecording().catch(() => {});
       });
@@ -5031,9 +5519,9 @@
       // =====================================================================
 
       /* Anything that still escapes belongs in the log the user can download,
-         not only in a console they will never open. Deliberately NOT
-         `preventDefault()`ed: it stays a console error too, because a
-         rejection nobody handled is a bug worth seeing. */
+               not only in a console they will never open. Deliberately NOT
+               `preventDefault()`ed: it stays a console error too, because a
+               rejection nobody handled is a bug worth seeing. */
       window.addEventListener("unhandledrejection", (event) => {
         log.error(
           `unhandled error: ${event.reason?.message ?? event.reason ?? "unknown"}`,
@@ -5049,9 +5537,9 @@
         "ready — connect over BLE or Classic Bluetooth to configure, stream, record, download from the SD card, change the sensor's names, run its self-test and watch its clock drift, or over USB-C for everything but streaming and the LED",
       );
       /* The page has finished building itself. A test harness waits on this
-         rather than on some particular panel having rendered — the module
-         graph grows, and a probe tied to one panel ages the moment another
-         one is added after it. */
+               rather than on some particular panel having rendered — the module
+               graph grows, and a probe tied to one panel ages the moment another
+               one is added after it. */
       document.documentElement.dataset.booted = "true";
     </script>
   </body>

@@ -53,6 +53,16 @@ export const PLOT_GROUPS = Object.freeze([
   { id: "EXG", label: "ExG" },
   { id: "GSR", label: "GSR" },
   { id: "PPG", label: "PPG" },
+  /* Battery, pressure, temperature, the ADC lines and the bridge amplifier
+     used to share OTHER's single y axis. That was tolerable while they were all
+     raw ADC counts; calibrated they are millivolts, kilopascals and degrees
+     Celsius, and one axis cannot show three units. The ADC lines keep a panel
+     between them because they really are the same scale: 0-3000 mV. */
+  { id: "BATTERY", label: "Battery" },
+  { id: "PRESSURE", label: "Pressure" },
+  { id: "TEMPERATURE", label: "Temperature" },
+  { id: "ADC", label: "ADC (expansion connector)" },
+  { id: "BRIDGE_AMP", label: "Bridge amplifier" },
   { id: "OTHER", label: "Other channels" },
 ]);
 
@@ -61,7 +71,34 @@ export const PLOT_GROUPS = Object.freeze([
  * time as its own argument, so plotting it would draw a straight ramp across
  * whichever panel it landed in.
  */
-const NOT_A_TRACE = new Set(["TIMESTAMP"]);
+const NOT_A_TRACE = new Set(["TIMESTAMP", "Timestamp_Unix"]);
+
+/**
+ * Recorded but not plotted.
+ *
+ * GSR's resistance is the reciprocal of its conductance and its range is a code
+ * from 0 to 3; on the conductance panel's axis the first swamps the trace and
+ * the second is a flat line at the bottom. Both go in the CSV, where an
+ * analysis can use them.
+ */
+const CSV_ONLY = new Set(["GSR_RESISTANCE", "GSR_RANGE"]);
+
+/** The SDK's name for "this value has no unit". Never an axis label. */
+const NO_UNITS = "no_units";
+
+/**
+ * Prettier spellings for an axis, for display only.
+ *
+ * The recorded strings are the Java driver's, so a CSV from this page and one
+ * from Consensys agree; an axis label has no such constraint and can use the
+ * symbols a reader expects.
+ */
+const AXIS_UNIT_ALIASES = Object.freeze({
+  "Degrees Celsius": "°C",
+  "m/(s^2)": "m/s²",
+});
+
+const axisUnitLabel = (unit) => AXIS_UNIT_ALIASES[unit] ?? unit;
 
 /** Hard ceiling on ring length, whatever the rate × window works out to. */
 const MAX_RING = 65536;
@@ -92,6 +129,11 @@ export function groupForField(name) {
   if (n.startsWith("HG_ACCEL")) return "HG_ACCEL";
   if (n.startsWith("GYRO")) return "GYRO";
   if (n.startsWith("MAG")) return "MAG";
+  if (n === "BATTERY") return "BATTERY";
+  if (n === "PRESSURE") return "PRESSURE";
+  if (n === "TEMPERATURE") return "TEMPERATURE";
+  if (/^(EXT|INT)_(EXP_)?ADC/.test(n)) return "ADC";
+  if (n.startsWith("BRIDGE_AMP")) return "BRIDGE_AMP";
   // The ExG status byte is a register readback, not a signal, so it is not an
   // ExG trace — it falls through to OTHER with the rest of the odds and ends.
   if (
@@ -174,6 +216,12 @@ export function createStreamPlot(host, opts = {}) {
   let windowSec = opts.windowSec ?? 10;
   let rateHz = opts.rateHz ?? ASSUMED_RATE_HZ;
   let preferredKind = "cal";
+  /** "clock" = local time of day; "elapsed" = seconds since the first sample. */
+  let timeAxis = "clock";
+  /** The first sample's x value, for the elapsed axis. */
+  let originSec = null;
+  /** Whether the x values are unix seconds — set by `push`, per stream. */
+  let xIsUnix = false;
   let paused = false;
   let destroyed = false;
 
@@ -223,6 +271,59 @@ export function createStreamPlot(host, opts = {}) {
     };
   }
 
+  /** Two decimals of a second, when the visible span is short enough to need it. */
+  const subSecond = () => windowSec <= 10;
+
+  /**
+   * One x tick label.
+   *
+   * `clock` shows the local time of day, because that is what a wall-clock axis
+   * is for — the date goes in the axis title, once, rather than on every tick.
+   * `elapsed` shows seconds since this stream's first sample.
+   */
+  function formatXTick(value) {
+    const v = Number(value);
+    if (!Number.isFinite(v)) return "";
+    if (timeAxis === "clock" && xIsUnix) {
+      const d = new Date(v * 1000);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      if (!subSecond()) return `${hh}:${mm}:${ss}`;
+      return `${hh}:${mm}:${ss}.${String(d.getMilliseconds()).padStart(3, "0").slice(0, 2)}`;
+    }
+    const base = originSec ?? 0;
+    const elapsed = v - base;
+    return subSecond() ? elapsed.toFixed(2) : elapsed.toFixed(1);
+  }
+
+  /**
+   * The axis title.
+   *
+   * On a clock axis it carries the date, since the tick labels do not — a
+   * recording that crosses midnight would otherwise be unreadable.
+   */
+  function xAxisTitle() {
+    if (timeAxis !== "clock" || !xIsUnix) return "Time since start (s)";
+    const at = originSec ?? Date.now() / 1000;
+    const d = new Date(at * 1000);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+      d.getDate(),
+    ).padStart(2, "0")}`;
+    return `Time — ${iso}, local`;
+  }
+
+  function applyXAxisTitle() {
+    const colors = themeColors();
+    for (const panel of Object.values(panels)) {
+      panel.chart.options.scales.x.title = {
+        display: true,
+        text: xAxisTitle(),
+        color: colors.tick,
+      };
+    }
+  }
+
   function makePanel(def) {
     const colors = themeColors();
     const wrap = document.createElement("div");
@@ -255,10 +356,19 @@ export function createStreamPlot(host, opts = {}) {
         },
         scales: {
           x: {
+            /* Still a linear scale, deliberately. The vendored Chart.js build
+               carries no date adapter (there is no build step here to add one),
+               and the min-max decimation that makes a 512 Hz stream affordable
+               only applies to a linear x axis. So the values stay numeric and
+               only the tick LABELS are formatted — see `formatXTick`. */
             type: "linear",
-            title: { display: true, text: "Time (s)", color: colors.tick },
+            title: { display: true, text: "Time", color: colors.tick },
             grid: { color: colors.grid },
-            ticks: { color: colors.tick, maxTicksLimit: 8 },
+            ticks: {
+              color: colors.tick,
+              maxTicksLimit: 8,
+              callback: (value) => formatXTick(value),
+            },
           },
           y: {
             grid: { color: colors.grid },
@@ -328,9 +438,31 @@ export function createStreamPlot(host, opts = {}) {
     series.forEach((s, i) => {
       s.kind = resolveKind(s.kinds);
       routeByKey.set(`${s.name}|${s.kind ?? ""}`, i);
-      s.dataset.label = s.kind ? `${s.name} (${s.kind})` : s.name;
+      const unit = s.units?.get(s.kind ?? null) ?? "";
+      /* The unit belongs in the legend as well as on the axis: a panel can
+         hold two traces the device reports in different units, and then the
+         axis has to stay blank. */
+      s.dataset.label = s.kind
+        ? `${s.name} (${s.kind}${unit ? `, ${axisUnitLabel(unit)}` : ""})`
+        : s.name;
     });
-    for (const panel of Object.values(panels)) panel.chart.update("none");
+
+    /* One axis title per panel, and only when every trace on it agrees — which
+       is why this lives here rather than in setSchema: the answer changes when
+       `setKind` switches between raw counts and calibrated units. */
+    const colors = themeColors();
+    for (const panel of Object.values(panels)) {
+      const units = new Set(
+        series
+          .filter((s) => s.group === panel.id)
+          .map((s) => s.units?.get(s.kind ?? null) ?? ""),
+      );
+      const shared = units.size === 1 ? [...units][0] : "";
+      panel.chart.options.scales.y.title = shared
+        ? { display: true, text: axisUnitLabel(shared), color: colors.tick }
+        : { display: false };
+      panel.chart.update("none");
+    }
   }
 
   /**
@@ -357,14 +489,19 @@ export function createStreamPlot(host, opts = {}) {
     // Re-apply the high-rate cap now that the real rate is known.
     setWindow(windowSec);
 
-    /** @type {Map<string, {unit: string, kinds: Set<string|null>}>} */
+    /** @type {Map<string, {units: Map<string|null, string>, kinds: Set<string|null>}>} */
     const byName = new Map();
     for (const f of fields ?? []) {
       const name = typeof f === "string" ? f : f?.name;
-      if (!name || NOT_A_TRACE.has(name)) continue;
+      if (!name || NOT_A_TRACE.has(name) || CSV_ONLY.has(name)) continue;
       const kind = typeof f === "string" ? null : (f?.kind ?? null);
-      const entry = byName.get(name) ?? { unit: "", kinds: new Set() };
-      if (typeof f !== "string" && f?.unit) entry.unit = f.unit;
+      const entry = byName.get(name) ?? { units: new Map(), kinds: new Set() };
+      /* Per KIND, because they differ: a raw field is counts and a calibrated
+         one is millivolts, and the axis has to follow whichever `setKind`
+         resolved. `no_units` is a unit name meaning "there isn't one", so it
+         must not become an axis label. */
+      const unit = typeof f === "string" ? "" : (f?.unit ?? "");
+      if (unit && unit !== NO_UNITS) entry.units.set(kind, unit);
       entry.kinds.add(kind);
       byName.set(name, entry);
     }
@@ -406,7 +543,7 @@ export function createStreamPlot(host, opts = {}) {
         series.push({
           name,
           group: def.id,
-          unit: entry.unit,
+          units: entry.units,
           kinds: entry.kinds,
           kind: null,
           buf: new Float32Array(maxPoints),
@@ -414,14 +551,6 @@ export function createStreamPlot(host, opts = {}) {
           dataset,
         });
       });
-      const unit = byName.get(names[0])?.unit;
-      if (unit) {
-        panel.chart.options.scales.y.title = {
-          display: true,
-          text: unit,
-          color: themeColors().tick,
-        };
-      }
     }
 
     rebuildRoutes();
@@ -437,8 +566,19 @@ export function createStreamPlot(host, opts = {}) {
    * @param {{fields: {name: string, value: number, kind: string|null}[]}} oc
    * @param {number} tSec frame time in seconds (device clock, unwrapped)
    */
-  function push(oc, tSec) {
+  function push(oc, tSec, opts) {
     if (destroyed || !series.length) return;
+    /* Whether these x values are unix seconds is a property of the stream, not
+       of one sample, and only the caller knows it — it depends on whether the
+       client's timeline found an anchor. */
+    if (opts && typeof opts.unix === "boolean" && opts.unix !== xIsUnix) {
+      xIsUnix = opts.unix;
+      applyXAxisTitle();
+    }
+    if (originSec === null) {
+      originSec = tSec;
+      applyXAxisTitle();
+    }
     const w = write;
     times[w] = tSec;
     // A channel absent from this frame reads NaN, which breaks the line
@@ -604,6 +744,31 @@ export function createStreamPlot(host, opts = {}) {
   }
 
   /**
+   * Choose what the x axis reads.
+   *
+   * @param {"clock"|"elapsed"} mode `clock` = local time of day, which needs
+   *   the frames to carry wall-clock time (the client's stream timeline has to
+   *   have found an anchor); `elapsed` = seconds since this stream's first
+   *   sample, which always works.
+   * @returns {string} the mode actually applied
+   */
+  function setTimeAxis(mode) {
+    const next = mode === "elapsed" ? "elapsed" : "clock";
+    if (next === timeAxis) return timeAxis;
+    timeAxis = next;
+    // Only the labels change, so the buffered history stays valid — unlike a
+    // units change, which `setKind` has to clear for.
+    applyXAxisTitle();
+    for (const panel of Object.values(panels)) panel.chart.update("none");
+    return timeAxis;
+  }
+
+  /** Which x axis is in use. */
+  function getTimeAxis() {
+    return timeAxis;
+  }
+
+  /**
    * Choose raw or calibrated traces. Falls back per name to whatever the
    * device actually offers.
    *
@@ -639,6 +804,8 @@ export function createStreamPlot(host, opts = {}) {
   function clear() {
     write = 0;
     count = 0;
+    // A new stream has its own first sample, so the elapsed axis re-bases.
+    originSec = null;
     times.fill(0);
     for (const s of series) {
       s.buf.fill(NaN);
@@ -680,6 +847,8 @@ export function createStreamPlot(host, opts = {}) {
     push,
     setWindow,
     setKind,
+    setTimeAxis,
+    getTimeAxis,
     pause,
     resume,
     clear,

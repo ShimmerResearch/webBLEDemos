@@ -94,31 +94,38 @@ const STAMP_MIN_MS = Date.UTC(2010, 0, 1);
 const STAMP_MAX_MS = Date.UTC(2100, 0, 1);
 
 /**
- * Calibration-domain sensor ids, from the firmware the dump comes from:
- * `SC_SENSOR_*` in log-and-stream-common `Calibration/shimmer_calibration.h`.
+ * Calibration-domain sensor ids, from the SDK — which takes them from the
+ * firmware the dump comes from (`SC_SENSOR_*` in log-and-stream-common
+ * `Calibration/shimmer_calibration.h`).
+ *
+ * This table used to be copied here. It is the SDK's now because the streaming
+ * calibration needs the same mapping to decide which dump record belongs to
+ * which channel group, and two copies of a table like this drift.
  *
  * NOT the SDK's `CalibSensorId`, which is the Verisense/ASM domain and
  * disagrees on two values — there 40 is an LSM6DS3 accel and 41 an LSM6DS3
- * gyro, whereas Shimmer3R firmware uses 40 for the ADXL371 high-g accel and
- * 41 for the LIS3MDL alt-mag. Reading a Shimmer3R dump through that table
+ * gyro, whereas Shimmer3R firmware uses 40 for the ADXL371 high-g accel and 41
+ * for the LIS3MDL alt-mag. Reading a Shimmer3R dump through that table
  * mislabels two of its six sensors.
  */
-const SC_SENSOR = Object.freeze({
-  ANALOG_ACCEL: 2,
-  MPU9X50_GYRO: 30,
-  LSM303_ACCEL: 31,
-  LSM303_MAG: 32,
-  MPU9X50_ACCEL: 33,
-  MPU9X50_MAG: 34,
-  BMP180_PRESSURE: 36,
-  LSM6DSV_ACCEL: 37,
-  LSM6DSV_GYRO: 38,
-  LIS2DW12_ACCEL: 39,
-  ADXL371_ACCEL: 40,
-  LIS3MDL_MAG: 41,
-  LIS2MDL_MAG: 42,
-  BMP390_PRESSURE: 43,
-});
+const SC_SENSOR =
+  sdk.SC_SENSOR ??
+  Object.freeze({
+    ANALOG_ACCEL: 2,
+    MPU9X50_GYRO: 30,
+    LSM303_ACCEL: 31,
+    LSM303_MAG: 32,
+    MPU9X50_ACCEL: 33,
+    MPU9X50_MAG: 34,
+    BMP180_PRESSURE: 36,
+    LSM6DSV_ACCEL: 37,
+    LSM6DSV_GYRO: 38,
+    LIS2DW12_ACCEL: 39,
+    ADXL371_ACCEL: 40,
+    LIS3MDL_MAG: 41,
+    LIS2MDL_MAG: 42,
+    BMP390_PRESSURE: 43,
+  });
 
 /**
  * Every sensor the panel can name, in the order the cards appear.
@@ -1619,6 +1626,35 @@ export function createCalibrationEditor(host, opts = {}) {
    * @returns {Promise<object|null>} the parsed dump (or the InfoMem blocks) or
    *   null on failure
    */
+  /**
+   * Hand a dump the DEVICE just produced to the streaming calibration, so the
+   * next stream's calibrated inertial values use this sensor's own numbers
+   * rather than its part's factory seed.
+   *
+   * Only for a dump that came off the link. A dump loaded from a file
+   * (`adopt(..., true)`) is a candidate for WRITING — a statement about what
+   * the sensor should hold, not about what it does — and adopting one would
+   * calibrate this sensor's data with another's numbers.
+   *
+   * `?.`-guarded: a vendored SDK older than `applyCalibDump` should leave the
+   * stream calibrated against defaults, not break the calibration tab.
+   */
+  function pushDumpToClient(client, dump) {
+    if (typeof client?.applyCalibDump !== "function" || !dump) return;
+    try {
+      const groups = client.applyCalibDump(dump);
+      if (groups?.length) {
+        log.log(
+          `streaming calibration now follows this sensor's own dump for: ${groups.join(", ")}`,
+        );
+      }
+    } catch (err) {
+      log.warn(
+        `the SDK did not accept the dump for streaming calibration: ${err?.message ?? err}`,
+      );
+    }
+  }
+
   async function read(opts = {}) {
     const which = store();
     if (which === "infomem") return readInfoMemFallback(opts);
@@ -1629,6 +1665,7 @@ export function createCalibrationEditor(host, opts = {}) {
       log.log("reading the calibration dump (GET_CALIB_DUMP, 128-byte pages)…");
       const { bytes, dump } = await client.readCalibDump();
       adopt(bytes, dump, false);
+      pushDumpToClient(client, dump);
       log.log(
         `calibration dump: ${bytes.length} bytes, ${dump.records.length} record(s) — ` +
           (dump.records.length
@@ -1815,6 +1852,8 @@ export function createCalibrationEditor(host, opts = {}) {
       const back = await client.readCalibDump();
       const same = bytesEqual(bytes, back.bytes);
       adopt(back.bytes, back.dump, false);
+      // The device holds different numbers now, so the stream must too.
+      pushDumpToClient(client, back.dump);
       if (same) {
         log.log(
           "calibration written and verified — the dump read back byte-identical",
