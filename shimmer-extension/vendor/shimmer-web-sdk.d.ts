@@ -6564,8 +6564,30 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     onFactoryTestStateChange: ((state: FactoryTestState) => void) | null;
     constructor(opts?: Shimmer3RClientOptions);
-    /** Best-effort label for `ObjectCluster`s and status messages. */
-    private _deviceLabel;
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * Read off the transport rather than off `this.device`: for a
+     * {@link WebBluetoothTransport} the two are the same string (`device` returns
+     * the same `BluetoothDevice` whose `name` `deviceName` reads), so preferring
+     * the field buys nothing and costs correctness — it is the one source that can
+     * be left over from an earlier link.
+     *
+     * An empty or whitespace name counts as none. A transport that reports `''`
+     * has told us nothing, and both callers below need to agree on that.
+     */
+    private _reportedDeviceName;
+    /**
+     * Stable, non-null identifier for {@link ObjectCluster.deviceId}, which every
+     * streamed frame carries.
+     *
+     * The generation name is the fallback because a frame must always be
+     * attributable to something — and that is precisely why it must never be
+     * printed as though it were a name the link supplied. Status text uses
+     * {@link _reportedDeviceName} instead; keeping the two apart is the whole
+     * point of there being two methods.
+     */
+    private _deviceId;
     /** Build the default Web Bluetooth transport over the configured UUIDs. */
     private _makeWebTransport;
     protected _log(...args: unknown[]): void;
@@ -6801,9 +6823,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * coefficients is a **success**: it compensates on-chip, and the firmware
      * sends the id in-band precisely so a host can tell that from a NACK.
      *
-     * HARDWARE-VERIFY: no real sensor has answered this command through this SDK.
      * The reply shape is read from the firmware source and pinned by tests
-     * against a scripted device.
+     * against a scripted device, not from a captured exchange.
      *
      * @throws Error only when not connected.
      */
@@ -8768,8 +8789,24 @@ declare class Shimmer3Client extends BaseShimmerClient {
     onExpPowerChanged: ((expPower: number) => void) | null;
     constructor(opts?: Shimmer3ClientOptions);
     protected _log(...args: unknown[]): void;
-    /** Best-effort label for `ObjectCluster`s and status messages. */
-    private _deviceLabel;
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * An empty or whitespace name counts as none: a transport reporting `''` has
+     * told us nothing, and both callers below need to agree on that.
+     */
+    private _reportedDeviceName;
+    /**
+     * Stable, non-null identifier for {@link ObjectCluster.deviceId}, which every
+     * streamed frame carries.
+     *
+     * The generation name is the fallback because a frame must always be
+     * attributable to something — and that is precisely why it must never be
+     * printed as though it were a name the link supplied. Status text uses
+     * {@link _reportedDeviceName} instead; keeping the two apart is the whole
+     * point of there being two methods.
+     */
+    private _deviceId;
     /** The streaming timestamp width currently in effect. */
     get timestampFmt(): TimestampFmt;
     /**
@@ -8902,9 +8939,6 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * anchors the stream timeline accordingly — `rwc-estimated`, carrying half
      * the round trip as its uncertainty.
      *
-     * HARDWARE-VERIFY: no real Shimmer3 has answered this command through this
-     * SDK.
-     *
      * @throws Error when not connected, while streaming, or when the firmware
      *   does not serve the command.
      */
@@ -8920,8 +8954,6 @@ declare class Shimmer3Client extends BaseShimmerClient {
      * The firmware stores it as an offset from its free-running counter, so the
      * stream's own timestamps do not move — but the mapping from them to wall
      * time does, which is why any existing anchor is dropped.
-     *
-     * HARDWARE-VERIFY: not exercised against a real Shimmer3.
      */
     setRtcTime(unixMs: number): Promise<void>;
     private _assertRwcSupported;
@@ -8953,9 +8985,6 @@ declare class Shimmer3Client extends BaseShimmerClient {
      *
      * **A refusal is not an error**: the channels stream raw-only and this
      * returns `null`, having said so through {@link onStatus}.
-     *
-     * HARDWARE-VERIFY: no real Shimmer3 has answered any of the three commands
-     * through this SDK.
      *
      * @throws Error only when not connected.
      */
@@ -9211,7 +9240,17 @@ declare class WiredShimmerClient extends BaseShimmerClient {
     identity: WiredIdentity | null;
     constructor(opts?: WiredShimmerClientOptions);
     protected _log(...args: unknown[]): void;
-    private _deviceLabel;
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * This client builds no `ObjectCluster` — the dock protocol has no streaming —
+     * so there is no second caller needing a non-null identifier. The old
+     * `?? 'Shimmer(dock)'` fired on every real connect (the wired link is a
+     * `WebSerialTransport`, which reports no name), and it named a dock that need
+     * not be there: this client also drives a Shimmer3R over a direct USB-C
+     * cable, which is the same protocol and no dock at all.
+     */
+    private _reportedDeviceName;
     /**
      * Open the dock UART connection. A transport is REQUIRED (constructor option
      * or this parameter). Mirrors `BasicDock#setupDock` (open port); the identify
@@ -9835,7 +9874,16 @@ declare class SmartDockClient extends BaseShimmerClient {
     activeSlot: number;
     constructor(opts?: SmartDockClientOptions);
     protected _log(...args: unknown[]): void;
-    private _deviceLabel;
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * This client builds no `ObjectCluster` — the dock protocol has no streaming —
+     * so unlike the Shimmer3/3R clients there is no second caller needing a
+     * non-null identifier, and nothing to trade off against saying so plainly.
+     * The old `?? 'SmartDock'` fired on every real connect, because the base UART
+     * arrives over a `WebSerialTransport` and Web Serial reports no name at all.
+     */
+    private _reportedDeviceName;
     /**
      * Open the SmartDock base UART connection. A base transport is REQUIRED
      * (constructor option or this parameter). The per-Shimmer transport (if

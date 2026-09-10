@@ -446,7 +446,7 @@
       scanBtn.addEventListener("click", async () => {
         try {
           await shimmer.connect();
-          const name = shimmer.device?.name || "Shimmer3R";
+          const name = shimmer.device?.name || "(name not reported)";
           updateStatus("Device selected: " + name);
           setButtons({
             scan: true,

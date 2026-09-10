@@ -521,7 +521,7 @@
       scanBtn.addEventListener("click", async () => {
         try {
           await client.connect(); // requestDevice + connect + start notifications
-          deviceNameEl.textContent = `Selected: ${client.device?.name || "Shimmer3R"}`;
+          deviceNameEl.textContent = `Selected: ${client.device?.name || "(name not reported)"}`;
           streamBtn.disabled = false;
           disconfigureBtn.disabled = false;
           configureBtn.disabled = false; // optional: not used in this flow

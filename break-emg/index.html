@@ -420,7 +420,7 @@
           // Optional: Inquiry to build schema (channels, timestamp width, etc.)
           await client.inquiry();
 
-          deviceNameEl.textContent = `Selected: ${client.device?.name || "Shimmer3R"}`;
+          deviceNameEl.textContent = `Selected: ${client.device?.name || "(name not reported)"}`;
           document.getElementById("streamBtn").disabled = false;
           document.getElementById("disconnectBtn").disabled = false;
           appendToConsole("✅ Connected via API");

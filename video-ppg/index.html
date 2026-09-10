@@ -625,7 +625,7 @@
 
       shim.onInquiry = (info) => {
         // Show selected device & parsed schema
-        el.deviceName.textContent = `Selected: ${shim.device?.name || "Shimmer3R"}`;
+        el.deviceName.textContent = `Selected: ${shim.device?.name || "(name not reported)"}`;
         console.log("Inquiry info:", info);
         // Enable streaming once schema is known
         setButtons({
@@ -662,7 +662,7 @@
         el.scanBtn.addEventListener("click", async () => {
           try {
             await shim.connect();
-            el.deviceName.textContent = `Selected: ${shim.device?.name || "Shimmer3R"}`;
+            el.deviceName.textContent = `Selected: ${shim.device?.name || "(name not reported)"}`;
             setButtons({
               scan: true,
               connect: true,
