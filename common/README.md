@@ -171,7 +171,8 @@ reading the result meant running the pass by hand — and a regression could hav
 hidden among them without anyone noticing which failures were new.
 
 So the gate is about **change**. `dev/verify-known-failures.json` lists what is
-known broken, one entry per check, each with the reason it is still there:
+known broken, one entry per check, each with the reason it is still there. It
+is **empty**, and worth keeping that way:
 
 - a failing check that is **not** in the list is a regression, and fails the
   build
@@ -184,10 +185,11 @@ Regenerate the list from a run with `node common/dev/verify.mjs
 decision to ship a known-broken check, and it needs a reason written next to
 it — the file is the record of that decision, not a mute allow-list.
 
-`VERIFY_CRC=0` runs the whole pass with the link CRC off. Worth knowing about:
-every entry in the current list passes that way, which is how they were
-identified as one CRC interaction rather than as flakiness. CI runs that
-variant too, non-blocking, since the baseline describes the default run.
+`VERIFY_CRC=0` runs the whole pass with the link CRC off. That switch is what
+emptied the list: eleven SD-transfer checks failed with a CRC on and passed
+with it off, which said they shared a cause rather than being flaky, and the
+cause turned out to be the mock applying the link CRC to transfer frames the
+firmware sends raw. CI runs that variant too, non-blocking.
 
 **Do not run Prettier across the whole repository from here.** This checkout
 has CRLF line endings, so `--list-different "**/*.html"` flags every HTML file

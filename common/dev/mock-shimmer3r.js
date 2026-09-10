@@ -1281,9 +1281,20 @@ export function createMockShimmer3RTransport(opts = {}) {
     }
   }
 
-  /** Stream data: one buffer per burst, chunked but never spread over time. */
-  function replyStream(frame) {
-    const u8 = appendCrc(frame, crcMode);
+  /**
+   * Bulk traffic: one buffer per burst, chunked but never spread over time.
+   *
+   * `crc` says whether the LINK CRC belongs on it, because that is a property
+   * of which firmware path sent the bytes rather than of how they are
+   * delivered. `btCrcMode` is honoured in exactly three places — the command
+   * response path, the instream status push and the stream data packet
+   * (`Sensing/shimmer_sensing.c:680`) — so a data packet carries it and an SD
+   * transfer frame does not: those are written straight to the TX buffer with
+   * their own CRC-16 per frame (`Comms/shimmer_sd_file_transfer.c:340,634`).
+   * The data-rate test bypasses the ring and the CRC both (`:2987`).
+   */
+  function sendBulk(frame, { crc }) {
+    const u8 = crc ? appendCrc(frame, crcMode) : frame;
     if (framed || u8.length <= dribbleBytes) {
       transport.notify(u8);
       return;
@@ -1292,6 +1303,21 @@ export function createMockShimmer3RTransport(opts = {}) {
       transport.notify(u8.slice(off, off + dribbleBytes));
     }
   }
+
+  /** Stream data packets, which the firmware DOES CRC. */
+  const replyStream = (frame) => sendBulk(frame, { crc: true });
+
+  /**
+   * SD-transfer frames and the data-rate test, which it does not.
+   *
+   * Applying the link CRC to these was a mock defect that read as an SDK one:
+   * the client correctly treats them as exempt, so the two extra bytes per
+   * frame desynchronised every download on a link with a CRC — which is the
+   * default the demo page connects with. Eleven checks in the verification
+   * pass failed on it, and passed with `VERIFY_CRC=0`, which is what
+   * eventually pointed at the mock rather than at the SDK.
+   */
+  const replyStreamNoCrc = (frame) => sendBulk(frame, { crc: false });
 
   function hex(u8) {
     return Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join(" ");
@@ -1573,8 +1599,8 @@ export function createMockShimmer3RTransport(opts = {}) {
     out[8 + payload.length] = (crc >> 8) & 0xff;
     // Bulk data, so delivered like stream data: chunked on an unframed
     // transport but never spread over macrotasks, or a 293 KB file would be
-    // a hundred thousand timers.
-    replyStream(out);
+    // a hundred thousand timers. No LINK CRC on top of the frame's own.
+    replyStreamNoCrc(out);
   }
 
   /** `[0x8A][0xC6][sess][status][nextOffset u32][crc16]` */
@@ -1588,7 +1614,7 @@ export function createMockShimmer3RTransport(opts = {}) {
     const crc = sdCrc16(out, 8);
     out[8] = crc & 0xff;
     out[9] = (crc >> 8) & 0xff;
-    replyStream(out);
+    replyStreamNoCrc(out);
   }
 
   // -------------------------------------------------------------------------
@@ -1903,7 +1929,8 @@ export function createMockShimmer3RTransport(opts = {}) {
         out[i * 5] = CMD.DATA_RATE_TEST_RESPONSE;
         view.setUint32(i * 5 + 1, rateCounter++ >>> 0, true);
       }
-      replyStream(out);
+      // A raw throughput flood by design: no link CRC.
+      replyStreamNoCrc(out);
     }, SD_TICK_MS);
     return true;
   }

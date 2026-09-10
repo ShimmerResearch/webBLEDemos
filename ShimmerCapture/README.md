@@ -318,7 +318,11 @@ before.
 Start a stream on its own, or a stream and an SD recording together. The plot
 draws one panel per sensor group from the channels the sensor is actually
 sending, in raw or calibrated units, over a 5, 10 or 30 second window, and can
-be paused without interrupting the stream. Alongside it a statistics strip
+be paused or cleared without interrupting the stream. **Clear plots** drops
+what is on screen and keeps going, which is how you get a clean view of what
+happens next; it leaves the recording alone, and it leaves the time axis
+counting from the stream's first sample, so the plot and the CSV never
+disagree about when something happened. Alongside it a statistics strip
 reads the achieved rate, the configured rate, packet loss — measured against
 gaps in the _device_ clock, not host arrival times, so host Bluetooth buffering
 cannot invent losses — throughput, frame count and elapsed time.

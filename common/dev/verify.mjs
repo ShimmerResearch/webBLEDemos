@@ -5441,6 +5441,48 @@ check(
     `gyro ${JSON.stringify(calStream.calibration?.inertial?.gyro)}`,
 );
 
+const cleared = await evaluate(`
+  const pts = () => [...document.querySelectorAll('.plot-panel canvas')]
+    .map(c => Chart.getChart(c).data.datasets[0].data.length);
+  const before = pts();
+  const axisBefore = Chart.getChart(document.querySelector('.plot-panel canvas'))
+    .options.scales.x.title.text;
+  document.getElementById('btnClearPlots').click();
+  await new Promise(r => setTimeout(r, 60));
+  const emptied = pts();
+  const logged = [...document.querySelectorAll('#log .log-line')]
+    .some(l => /plots cleared/.test(l.textContent));
+  // And it fills again, so clearing did not stop the plot.
+  await new Promise(r => setTimeout(r, 700));
+  return { before, emptied, refilled: pts(), logged, axisBefore,
+    axisAfter: Chart.getChart(document.querySelector('.plot-panel canvas'))
+      .options.scales.x.title.text,
+    gated: document.getElementById('btnClearPlots').disabled };
+`);
+check(
+  "Clear plots empties every panel and says so, and the stream carries on",
+  /* The Verisense console's equivalent zeroes its ring buffers and repaints;
+     this does the same through `plot.clear`. Logged because a gap in a trace
+     should be distinguishable afterwards from a dropped link. */
+  cleared.before.every((n) => n > 20) &&
+    /* Not zero: frames keep arriving while this is measured, so a live stream
+       has a few samples back on the panel by the time it is read. The claim is
+       that the history went, not that the plot stopped. */
+    cleared.emptied.every((n, i) => n < cleared.before[i] / 10) &&
+    cleared.refilled.every((n, i) => n > cleared.emptied[i]) &&
+    cleared.logged &&
+    !cleared.gated,
+  `${cleared.before.join(",")} → ${cleared.emptied.join(",")} → ${cleared.refilled.join(",")}`,
+);
+check(
+  "and it does not re-zero the time axis, which the CSV keeps counting from",
+  /* A view control must not make the plot disagree with the file about when
+     something happened: `TIMESTAMP_CAL` counts from the stream's first sample
+     whatever this button does. */
+  cleared.axisAfter === cleared.axisBefore,
+  `${cleared.axisBefore} → ${cleared.axisAfter}`,
+);
+
 const elapsed = await evaluate(`
   const sel = document.getElementById('selTimeAxis');
   sel.value = 'elapsed';
