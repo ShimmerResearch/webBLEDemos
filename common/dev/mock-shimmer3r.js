@@ -273,11 +273,34 @@ const PLAUSIBLE_SAMPLES = Object.freeze({
   0x1c: { centre: 2000, amplitude: 300 }, // GSR, inside range 0's window
   0x27: { centre: 2048, amplitude: 300 }, // bridge amp
   0x28: { centre: 2048, amplitude: 300 },
-  /* The BMP390's raw registers, from the coefficient block below: about
-     100.9 kPa and 23 °C. A Shimmer3 (BMP180/BMP280) reads differently through
-     its own compensation, which is fine — it is still in range. */
-  0x1b: { centre: 0x640d00, amplitude: 0x400 },
-  0x1a: { centre: 0x7fba00, amplitude: 0x200 },
+});
+
+/**
+ * The pressure pair, whose raw registers mean different things on the two
+ * generations — and whose Shimmer3R values do not even FIT a Shimmer3's
+ * channel widths.
+ *
+ * A Shimmer3 sends temperature as 2 bytes, so the BMP390's `0x7FBA00` is
+ * truncated to `0xBA00` on the wire: fed through the BMP180 compensation that
+ * is about 149 °C, and its 24-bit pressure is eight times the BMP180's largest
+ * possible reading. Keying these by channel id alone made a `&hw=3` mock look
+ * like a broken conversion.
+ *
+ * Shimmer3R values are the BMP390 vector's own registers (about 100.9 kPa and
+ * 23.2 °C through the fixture below). Shimmer3 values are the BMP180
+ * datasheet's worked example, `UT = 27898` and `UP = 23843 << 8` — the same
+ * numbers the SDK's own compensation tests use, so a mock stream and a unit
+ * test agree on what the answer should be.
+ */
+const PRESSURE_SAMPLES = Object.freeze({
+  shimmer3: {
+    0x1b: { centre: 23843 << 8, amplitude: 0x400 },
+    0x1a: { centre: 27898, amplitude: 40 },
+  },
+  shimmer3r: {
+    0x1b: { centre: 0x640d00, amplitude: 0x400 },
+    0x1a: { centre: 0x7fba00, amplitude: 0x200 },
+  },
 });
 
 /**
@@ -824,9 +847,18 @@ export function createMockShimmer3RTransport(opts = {}) {
      `startStreaming`) and moving one without the other would model a sensor
      that does not exist. Up to 512 s of date shift is the price, and that is
      itself a legitimate sensor state. */
-  const rtcWrapInSec = Number.isFinite(rtcOpts.wrapInSec)
-    ? Math.max(0, Number(rtcOpts.wrapInSec))
-    : null;
+  /* A bad value is a typo, not a request. `hw=` and `sensors=` both warn on
+     one; this said nothing and behaved as though the option were absent. */
+  const rtcWrapInSec =
+    rtcOpts.wrapInSec === undefined || rtcOpts.wrapInSec === null
+      ? null
+      : Number.isFinite(Number(rtcOpts.wrapInSec)) &&
+          Number(rtcOpts.wrapInSec) >= 0
+        ? Number(rtcOpts.wrapInSec)
+        : (console.warn(
+            `mock: ignoring rtcWrapIn="${rtcOpts.wrapInSec}" — it must be a non-negative number of seconds.`,
+          ),
+          null);
   const rtc = {
     devMsAtSet:
       Date.now() +
@@ -1359,7 +1391,10 @@ export function createMockShimmer3RTransport(opts = {}) {
        3000 mV of battery or 125 kPa of air and makes a calibrated plot useless
        for telling right from wrong. The rest keep the old full-scale sine,
        which is what makes an axis mix-up obvious. */
-    const plausible = PLAUSIBLE_SAMPLES[id];
+    const plausible =
+      (hardwareVersion === 3
+        ? PRESSURE_SAMPLES.shimmer3
+        : PRESSURE_SAMPLES.shimmer3r)[id] ?? PLAUSIBLE_SAMPLES[id];
     if (plausible) {
       return Math.max(
         0,
@@ -1425,13 +1460,19 @@ export function createMockShimmer3RTransport(opts = {}) {
     const ids = channelIds();
     streamTicks = streamStartTicks();
     samplesEmitted = 0;
-    streamStartMs = performance.now();
+    /* The DEVICE's clock, not this host's. A real sensor times its samples
+       from the same crystal its real-world clock runs on, so under `&ppm=` the
+       two must drift together; pacing the stream off `performance.now()` let
+       the counter and the clock separate linearly over a long run, which on a
+       Shimmer3R would break the very identity `streamStartTicks` exists to
+       model. */
+    streamStartMs = deviceNowMs();
     const ticksPerSample = SAMPLING_CLOCK_HZ / state.rateHz;
     streamTimer = setInterval(() => {
       // Emit whatever is due since the last tick rather than one frame per
       // timer callback: browsers clamp timers, so a fixed one-frame tick
       // would silently cap the rate at ~250 Hz.
-      const elapsed = (performance.now() - streamStartMs) / 1000;
+      const elapsed = (deviceNowMs() - streamStartMs) / 1000;
       const due = Math.floor(elapsed * state.rateHz) - samplesEmitted;
       for (let i = 0; i < due; i++) {
         replyStream(
@@ -2645,6 +2686,19 @@ export function createMockShimmer3RTransport(opts = {}) {
         // sensor keeps its own time, and keeps drifting at `rtc.ppm`.
         rtc.devMsAtSet = Number(ticks) / 32.768;
         rtc.setAtHostMs = Date.now();
+        /* And re-seat the STREAM counter with it, on a Shimmer3R, because
+           there the two are one number: the packet timestamp is the low 24
+           bits of the counter `GET_RWC` reports. Setting the clock mid-stream
+           is allowed by the firmware, and leaving the counter where it was
+           would model a sensor whose packets disagree with its own clock —
+           which is precisely the shape a host's aligned anchor would then be
+           tested against, wrongly. On a Shimmer3 the counter is independent of
+           the clock and correctly stays put. */
+        if (hardwareVersion !== 3 && streamTimer) {
+          streamTicks = streamStartTicks();
+          streamStartMs = deviceNowMs();
+          samplesEmitted = 0;
+        }
         // What the "Clock set" status bit means: not that the clock reads
         // something, but that a host has set it since the sensor last lost
         // power (`RTC_isRwcTimeSet`).

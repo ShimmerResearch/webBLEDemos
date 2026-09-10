@@ -4157,6 +4157,17 @@
     /** Ticks per millisecond — 32.768, as the firmware and the Java driver have it. */
     const TICKS_PER_MS = TICKS_PER_SECOND / 1000;
     /**
+     * Relative drift assumed between the sensor's clock and the host's, in parts
+     * per million, when an anchor is bound to a stream some time after the reading
+     * that produced it.
+     *
+     * An assumption, not a measurement: it turns the age of a reading into an
+     * uncertainty a caller can see, and nothing here corrects for it. Twenty ppm
+     * is a plain 32768 Hz crystal's order of magnitude, so an hour-old reading is
+     * reported as good to about 72 ms rather than to the round trip that took it.
+     */
+    const CLOCK_DRIFT_PPM_ASSUMED = 20;
+    /**
      * Unwraps a device sample counter and, once anchored, reports wall-clock time
      * for every sample.
      *
@@ -4181,6 +4192,7 @@
             this._request = null;
             this._bits = opts.timestampBits ?? 24;
             this._modulo = 2 ** this._bits;
+            this._reorderWindow = this._modulo / 8;
         }
         /** The counter width this timeline is unwrapping. */
         get timestampBits() {
@@ -4199,6 +4211,7 @@
                 return;
             this._bits = bits;
             this._modulo = 2 ** bits;
+            this._reorderWindow = this._modulo / 8;
             this.reset();
         }
         /**
@@ -4291,8 +4304,10 @@
             /* How many counter boundaries this session has crossed. The unwrapped value
                starts below one modulo (it starts AT a raw counter value), so flooring
                the division counts crossings directly. Clamped at zero because a
-               reordered packet arriving first can carry the value slightly negative. */
-            this._wraps = Math.max(0, Math.floor(unwrapped / this._modulo));
+               reordered packet arriving first can carry the value slightly negative,
+               and never allowed to fall: a reordered packet that lands just before a
+               boundary would otherwise un-count a crossing the session really made. */
+            this._wraps = Math.max(this._wraps, Math.max(0, Math.floor(unwrapped / this._modulo)));
             if (hostMs !== undefined)
                 this._lastHostMs = hostMs;
             if (this._pending)
@@ -4309,15 +4324,28 @@
             if (this._lastRaw === null)
                 return value;
             const half = this._modulo / 2;
-            /* Forward distance from the last sample. A step of less than half a modulo
-               is taken as forward motion (crossing a wrap if it has to); more than half
-               is taken as a small step BACKWARDS, i.e. a duplicated or reordered
-               packet. Without that guard one out-of-order packet adds a whole modulo —
-               512 s on a Shimmer3R — for the rest of the session. */
+            /* Forward distance from the last sample, and whether to read it as forward
+               motion (crossing a wrap if it has to) or as a small step BACKWARDS —
+               a duplicated or reordered packet. Without the backwards case one
+               out-of-order packet adds a whole modulo, 512 s on a Shimmer3R, for the
+               rest of the session.
+        
+               The threshold is the REORDER WINDOW, not half the modulo. Half looks
+               like the natural split and is wrong on the 16-bit counter: its whole
+               modulo is 2 s, so a genuine forward gap of more than a second — which a
+               single missed Bluetooth window produces — reads as a step backwards, and
+               the sample lands almost a modulo early. What actually distinguishes the
+               two is magnitude: a reorder swaps packets that are adjacent in time, so
+               it is a handful of sample periods, while a gap is whatever the link
+               dropped. An eighth of the modulo is 64 s on the 24-bit counter and
+               0.25 s on the 16-bit one — far larger than any reorder, far smaller than
+               a gap worth recovering. A duplicate (`forward === 0`) is unaffected
+               either way. */
             const forward = (value - this._lastRaw + this._modulo) % this._modulo;
-            let unwrapped = forward <= half
-                ? this._lastUnwrapped + forward
-                : this._lastUnwrapped - (this._modulo - forward);
+            const backwards = this._modulo - forward;
+            let unwrapped = backwards <= this._reorderWindow && forward !== 0
+                ? this._lastUnwrapped - backwards
+                : this._lastUnwrapped + forward;
             /* The rule above cannot see a wrap that went by entirely — more than a
                whole modulo of samples missed, which is 512 s on a 24-bit counter but
                only 2 s on the 16-bit one older Shimmer3 firmware uses. The host clock
@@ -4335,6 +4363,22 @@
             return unwrapped;
         }
         /**
+         * How much the sensor's clock and this host's may have separated between a
+         * clock reading and the sample that binds it.
+         *
+         * Zero for the aligned source, whose value does not depend on the age of the
+         * reading. For the others it is the elapsed time at
+         * {@link CLOCK_DRIFT_PPM_ASSUMED} — a stated assumption rather than a
+         * measurement, which is why it is an uncertainty and not a correction. A
+         * host that wants better should read the clock again.
+         */
+        _staleAnchorDriftMs(kind, readAtHostMs, boundAtHostMs) {
+            if (kind === 'rwc-aligned')
+                return 0;
+            const ageMs = Math.abs(boundAtHostMs - readAtHostMs);
+            return (ageMs * CLOCK_DRIFT_PPM_ASSUMED) / 1e6;
+        }
+        /**
          * Turn a pending anchor into a resolved one, now that a sample's unwrapped
          * tick value is known to bind it to.
          */
@@ -4350,7 +4394,8 @@
                     unwrappedTicks: unwrapped,
                     unixMs: at,
                     hostMs: at,
-                    uncertaintyMs: pending.uncertaintyMs,
+                    uncertaintyMs: pending.uncertaintyMs + this._staleAnchorDriftMs('host', pending.hostMs, at),
+                    wrapMarginMs: null,
                     skewMs: null,
                 };
                 return;
@@ -4366,15 +4411,22 @@
             const elapsedSinceAnchorTicks = (at - pending.hostMs) * TICKS_PER_MS;
             const approxTicks = Number(rwcTicks) + elapsedSinceAnchorTicks;
             let absoluteTicks;
+            let wrapMarginMs = null;
             if (pending.kind === 'rwc-aligned') {
                 /* The sample's counter value IS the low bits of the device's real-world
                    clock, so the answer is the value congruent to it that lies nearest the
-                   estimate above. The estimate only has to be right to within half a
-                   modulo — 256 seconds — so this is exact in practice however sloppy the
-                   host clock is. */
+                   estimate above. Exact to the tick — but only once the right wrap is
+                   chosen, and it is the host clock that chooses it. Get that wrong and
+                   the error is a clean multiple of 512 s, not a small one.
+                   `wrapMarginMs` is how far the host clock could have been out and still
+                   have picked this wrap, so a caller can tell a comfortable choice from
+                   a marginal one instead of reading `anchorUncertaintyMs: 0` as a
+                   promise the host clock cannot make. */
                 const low = ((unwrapped % this._modulo) + this._modulo) % this._modulo;
-                const base = Math.round((approxTicks - low) / this._modulo) * this._modulo;
+                const wraps = (approxTicks - low) / this._modulo;
+                const base = Math.round(wraps) * this._modulo;
                 absoluteTicks = base + low;
+                wrapMarginMs = ((0.5 - Math.abs(wraps - Math.round(wraps))) * this._modulo) / TICKS_PER_MS;
             }
             else {
                 /* No congruence to exploit: a Shimmer3's counter and its real-world clock
@@ -4389,7 +4441,14 @@
                 unwrappedTicks: unwrapped,
                 unixMs,
                 hostMs: at,
-                uncertaintyMs: pending.uncertaintyMs,
+                /* An anchor request survives a stream restart, so the reading being
+                   bound here can be hours old, and over hours the two clocks separate.
+                   The aligned case is immune — the congruence re-derives the value from
+                   the sample itself, and what age costs there is wrap margin, reported
+                   above — but an estimated anchor carries the whole of that drift into
+                   its offset. */
+                uncertaintyMs: pending.uncertaintyMs + this._staleAnchorDriftMs(pending.kind, pending.hostMs, at),
+                wrapMarginMs,
                 skewMs: unixMs - at,
             };
         }
@@ -4407,6 +4466,7 @@
                 anchorHostMs: this._anchor?.hostMs ?? null,
                 anchorUnixMs: this._anchor?.unixMs ?? null,
                 anchorUncertaintyMs: this._anchor?.uncertaintyMs ?? 0,
+                wrapMarginMs: this._anchor?.wrapMarginMs ?? null,
                 skewMs: this._anchor?.skewMs ?? null,
                 wraps: this._wraps,
                 timestampBits: this._bits,
@@ -7306,16 +7366,36 @@
      *
      * The firmware answers the command with the generic one-byte ACK (0xFF) or NACK
      * (0xFE) and then prints the report as bare ASCII on the same link, so anything
-     * that is not one of those two bytes is already report text. Both answers are
-     * one byte, so this never needs more.
+     * that is not one of those two bytes is already report text.
+     *
+     * **The link CRC counts, and this is the one place in the report path that has
+     * to know about it.** A capture is fed the RAW notification, before the
+     * client's CRC verification — it has to be, because report bytes are unframed
+     * ASCII and must not reach the framer — so with a CRC on, the ACK arrives as
+     * `[0xFF][crc…]` and `consumed: 1` leaves the trailer to be transcribed as the
+     * first bytes of the report. The visible symptom was a report beginning
+     * `e//**** TEST START`: of the two-byte trailer `F4 65`, `0xF4` fails
+     * `isReportByte` and is counted as noise while `0x65` is printable ASCII and
+     * became text. Anything comparing the report byte-for-byte against what the
+     * sensor printed then failed, and only with the CRC on.
+     *
+     * @param crcBytes width of the link CRC in force, 0 when it is off
      */
-    function classifyLiteProtocolAck(buf) {
+    function classifyLiteProtocolAck(buf, crcBytes = 0) {
         if (buf.length === 0)
             return { kind: 'need-more' };
-        if (buf[0] === OPCODES.ACK_COMMAND_PROCESSED)
-            return { kind: 'ack', consumed: 1 };
+        const answer = 1 + crcBytes;
+        if (buf[0] === OPCODES.ACK_COMMAND_PROCESSED) {
+            // The trailer belongs to the ACK, so wait for it rather than reading a
+            // half-arrived one as report text.
+            if (buf.length < answer)
+                return { kind: 'need-more' };
+            return { kind: 'ack', consumed: answer };
+        }
         if (buf[0] === OPCODES.NACK_COMMAND_PROCESSED) {
-            return { kind: 'nack', consumed: 1, detail: 'NACK 0xFE' };
+            if (buf.length < answer)
+                return { kind: 'need-more' };
+            return { kind: 'nack', consumed: answer, detail: 'NACK 0xFE' };
         }
         return { kind: 'text' };
     }
@@ -8831,6 +8911,20 @@
            block any part sends (the BMP280's 24). A BMP581 answers with the id
            alone, length 1, which this cap admits. */
         [OPCODES.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE]: PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD,
+        /* [0x62][count][regs…]: the count is echoed from the request
+           (`Comms/shimmer_bt_uart.c:2223-2225`) and one ADS1292R bank is
+           `EXG_BANK_LENGTH` registers, which is the most this SDK ever asks for.
+
+           This entry was missing, and the gap only showed with a link CRC on. With
+           the CRC off a BLE notification is taken as one whole message and the
+           reply parses; with it on, every inbound chunk goes through this framer
+           (verifying a CRC means knowing where the message ends), and an opcode it
+           cannot size falls through to a resync. The ExG install then failed its
+           CRC check against a mis-sized chunk and timed out — so ExG could not be
+           configured at all on a link with a CRC, which is the default this page
+           connects with. `Shimmer3Client`'s framer has always known this reply
+           (`devices/shimmer3/protocol.ts`); this one did not. */
+        [OPCODES.EXG_REGS_RESPONSE]: EXG_BANK_LENGTH$1,
     });
     /**
      * Total length (INCLUDING the leading opcode) of the control message at the
@@ -11777,6 +11871,10 @@
              * On a Shimmer3R the anchor is exact: the packet timestamp is the low 24 bits
              * of the same counter `GET_RWC` reads, so one clock reading pins the whole
              * stream to the tick.
+             *
+             * Constructed at 24 bits, which is what a Shimmer3R sends; the width is set
+             * again from `timestampFmt` at every stream start, because that option can
+             * ask for the 16-bit format.
              */
             this._timeline = new StreamTimeline({ timestampBits: 24 });
             /**
@@ -13945,7 +14043,14 @@
              * stall for the whole ACK timeout on firmware that does not implement the
              * command at all, because its bare NACK would be missing the trailer this
              * client had just started expecting. Two ignorable bytes on the supported
-             * path beats a timeout on the unsupported one. */
+             * path beats a timeout on the unsupported one.
+             *
+             * "Ignorable" is load-bearing and was once wrong. A reader that takes RAW
+             * inbound bytes sees them — the factory-test capture is fed ahead of this
+             * client's CRC handling, on purpose, because a report is unframed ASCII
+             * that must not reach the framer. That reader now accounts for the trailer
+             * itself (`classifyLiteProtocolAck`); everything else on the control plane
+             * genuinely does ignore an unmatched byte. */
             await this._writeExpectingAck(new Uint8Array([OPCODES.SET_CRC_COMMAND, mode]), 1500);
             /* Both, and in this order: the wish is recorded only once the device has
              * agreed, so a mode it refused is not re-attempted on every reconnect. */
@@ -14268,6 +14373,13 @@
          * to the host's own clock, which is what Consensys uses always.
          */
         _prepareStreamTimeline() {
+            /* The counter width, before anything else. It is a per-client choice here
+               rather than a firmware property (`timestampFmt`, default `'u24'`), and a
+               timeline left at 24 bits while the parser reads two bytes never sees a
+               wrap: every 2 s the unwrapped value drops back and an anchored stream
+               sawtooths for its whole length. `Shimmer3Client` has always done this;
+               this client had the same option and did not. */
+            this._timeline.setTimestampBits(this.forceTimestampFmt === 'u16' ? 16 : 24);
             this._timeline.reset();
             if (!this.anchorStreamClock || this._timeline.hasAnchorRequest)
                 return;
@@ -15097,7 +15209,14 @@
             // Nothing left over from before may be mistaken for the first report line.
             this._rxBuf = new Uint8Array(0);
             this._ctrlBuf = new Uint8Array(0);
-            const capture = new FactoryTestCapture(classifyLiteProtocolAck, {
+            /* The classifier is told the CRC width because the capture sees the raw
+               notification, ahead of this client's CRC handling — so the ACK it
+               consumes carries its trailer with it. Bound at run time rather than at
+               construction: the mode cannot change during a run (`setCrcMode` refuses
+               while sensing, and a run holds the link), but reading it here keeps the
+               one source of truth. */
+            const crcBytes = crcTrailerBytes(this._crcMode);
+            const capture = new FactoryTestCapture((buf) => classifyLiteProtocolAck(buf, crcBytes), {
                 ...opts,
                 timeoutMs: opts.timeoutMs ?? info.defaultTimeoutMs,
                 onStateChange: (state) => {
@@ -20438,6 +20557,32 @@
      * from the Java driver's `SensorDetailsRef.mListOfSensorIdsConflicting`, which
      * is what Consensys enforces in its own editor.
      *
+     * **Those lists are easy to look for and not find.** Almost every Shimmer3
+     * entry passes its list as argument 5 of the eight-argument `SensorDetailsRef`
+     * constructor (`driverUtilities/SensorDetailsRef.java:122-140`) rather than
+     * assigning the field, so a search for `mListOfSensorIdsConflicting =` turns up
+     * the Shimmer2 block (`driver/Configuration.java:337-380`) and little else.
+     * Read the constructor calls: `sensors/SensorGSR.java:139-167` names both
+     * internal ADC channels, the bridge amplifier and the host ExG modes, and
+     * `sensors/SensorBridgeAmp.java:97-121` names GSR back.
+     *
+     * Two details of those lists are worth knowing, because they explain what this
+     * table does and does not say. The ExG conflicts are listed as the **host
+     * algorithm** ids (`HOST_ECG`, `HOST_EMG`, `HOST_EXG_TEST` and the rest) and
+     * the four raw ExG bit ids sit commented out beside them, so Java expresses
+     * "GSR cannot be used with ExG" at the level of a chosen ExG mode — which is
+     * exactly what `'EXG'` is here. And Java's per-channel lists are asymmetric
+     * where a derived channel is involved (PPG, the resistance amplifier, skin
+     * temperature); this SDK models none of those, so its table is symmetric.
+     *
+     * **One firmware rule is deliberately absent.** `checkAndCorrectConfig` also
+     * clears a chip's 16-bit ExG flag when its 24-bit flag is set
+     * (`Configuration/shimmer_config.c:839-848`). That is a sample width, not a
+     * pair of sensors, and `'EXG'` covers all four bits at once here — so it cannot
+     * be expressed as a conflict and is not one. A host picks a width when it picks
+     * a preset; `exgResolutionFromSensors` in `devices/exg/` reads back which one a
+     * bitmap holds.
+     *
      * **On required sensors.** There are none in the enabled-bitmap sense.
      * `mListOfSensorIdsRequired` is declared on every `SensorDetailsRef`
      * (`driverUtilities/SensorDetailsRef.java:34`) and populated nowhere in the
@@ -20905,7 +21050,7 @@
                 reason: expPowerReason(expPower, mask, exgOn, state),
             });
         }
-        return { enabledSensors: mask, expPower, exgOff, changes };
+        return { enabledSensors: mask, expPower, exgOff, exgOn, changes };
     }
     function expPowerReason(next, mask, exgOn, state) {
         if (next !== 1)
@@ -21018,8 +21163,26 @@
                     `${sensorRuleLabel(keeper, state.generation)}.`);
             }
             else {
-                const loser = pair.a === owner ? pair.b : pair.a;
-                const keeper = loser === pair.a ? pair.b : pair.a;
+                /* Two connector owners. The preferred one is kept and the other dropped
+                   — and when NEITHER is the preferred one (a GSR-plus-bridge image on a
+                   board that is neither, or with no board known, where the preference is
+                   ExG) the ranking still has to decide. Taking `pair.b` unless `pair.a`
+                   is the winner got that backwards: it dropped whichever side the table
+                   happened to list first, so a GSR + bridge-amplifier image kept the
+                   bridge amplifier and unticked GSR, the reverse of the documented
+                   order. */
+                const rank = (key) => {
+                    const at = CONNECTOR_OWNERS.indexOf(key);
+                    return at === -1 ? CONNECTOR_OWNERS.length : at;
+                };
+                const keeper = pair.a === owner
+                    ? pair.a
+                    : pair.b === owner
+                        ? pair.b
+                        : rank(pair.a) <= rank(pair.b)
+                            ? pair.a
+                            : pair.b;
+                const loser = keeper === pair.a ? pair.b : pair.a;
                 drop(loser, `${sensorRuleLabel(loser, state.generation)} unticked — it cannot be used with ` +
                     `${sensorRuleLabel(keeper, state.generation)} (they share ${pair.shares}).`);
             }

@@ -2950,8 +2950,21 @@
         paintSensorGating(state);
 
         if (check?.violations?.length) {
+          /* The user's own edit first, when there was one, then what is still
+             wrong. Dropping the note because a violation coexists lost the
+             explanation of the click that had just happened — and a standing
+             violation is exactly when a user most needs to know what their
+             edit did. */
+          const lines = pendingRuleNote
+            ? [
+                pendingRuleNote.lead,
+                ...pendingRuleNote.changes.map((c) => c.reason),
+                "Still to fix:",
+                ...check.violations.map((v) => v.message),
+              ]
+            : check.violations.map((v) => v.message);
           renderRuleBanner(host, "warn", {
-            lines: check.violations.map((v) => v.message),
+            lines,
             footer:
               "Fix edits the form the way Consensys would; press Apply to write it to the sensor.",
             fix: () => applyRuleDerivations(check),

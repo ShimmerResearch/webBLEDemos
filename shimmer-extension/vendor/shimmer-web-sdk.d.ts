@@ -2873,7 +2873,16 @@ type TimelineSource = 'rwc-aligned' | 'rwc-estimated' | 'host';
 type TimestampBits = 16 | 24;
 /** One stamped sample. */
 interface StreamStamp {
-    /** The counter with its wraps added back, monotonic across a session. */
+    /**
+     * The counter with its wraps added back.
+     *
+     * **Not monotonic.** A reordered or duplicated packet reports the position it
+     * actually holds, which is behind the sample before it — that is the honest
+     * answer for a consumer plotting samples against their own times, and the
+     * alternative (clamping to the running maximum) would place a late packet at
+     * a time it was not taken. {@link TimelineState.wraps} *is* monotonic,
+     * because a session's wrap count is not a property of one sample.
+     */
     unwrappedTicks: number;
     /**
      * Milliseconds on the device's own clock: `unwrappedTicks / 32.768`.
@@ -2908,7 +2917,20 @@ interface TimelineState {
      * the anchor is still waiting for its first sample.
      */
     skewMs: number | null;
-    /** How many counter wraps have been counted this session. */
+    /**
+     * For an aligned anchor, how far this host's clock could have been wrong and
+     * still have selected the same wrap of the counter, in milliseconds. `null`
+     * for the other sources, which do not choose a wrap.
+     *
+     * Read it beside `anchorUncertaintyMs`, which is zero for an aligned anchor
+     * and honestly so: the value is exact to the tick once the wrap is right.
+     * This is the size of the assumption that makes it right. A margin of
+     * minutes is comfortable; one of seconds means a host clock that stepped
+     * (a resumed laptop, an NTP correction) could have placed the whole stream a
+     * clean 512 seconds out.
+     */
+    wrapMarginMs: number | null;
+    /** How many counter wraps have been counted this session. Never decreases. */
     wraps: number;
     /** The counter width in use. */
     timestampBits: TimestampBits;
@@ -2933,6 +2955,12 @@ declare class StreamTimeline {
     private _lastUnwrapped;
     private _lastHostMs;
     private _wraps;
+    /**
+     * How far behind the previous sample a value may be and still be read as a
+     * reordered packet rather than as forward motion across a wrap. An eighth of
+     * the modulo; see {@link _unwrap} for why not half.
+     */
+    private _reorderWindow;
     private _pending;
     private _anchor;
     /**
@@ -3009,6 +3037,17 @@ declare class StreamTimeline {
      */
     stamp(raw: number, hostMs?: number): StreamStamp;
     private _unwrap;
+    /**
+     * How much the sensor's clock and this host's may have separated between a
+     * clock reading and the sample that binds it.
+     *
+     * Zero for the aligned source, whose value does not depend on the age of the
+     * reading. For the others it is the elapsed time at
+     * {@link CLOCK_DRIFT_PPM_ASSUMED} — a stated assumption rather than a
+     * measurement, which is why it is an uncertainty and not a correction. A
+     * host that wants better should read the clock again.
+     */
+    private _staleAnchorDriftMs;
     /**
      * Turn a pending anchor into a resolved one, now that a sample's unwrapped
      * tick value is known to bind it to.
@@ -6481,6 +6520,10 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * On a Shimmer3R the anchor is exact: the packet timestamp is the low 24 bits
      * of the same counter `GET_RWC` reads, so one clock reading pins the whole
      * stream to the tick.
+     *
+     * Constructed at 24 bits, which is what a Shimmer3R sends; the width is set
+     * again from `timestampFmt` at every stream start, because that option can
+     * ask for the 16-bit format.
      */
     private _timeline;
     /**
@@ -8196,10 +8239,22 @@ declare function buildSetFactoryTestCommand(type: number): Uint8Array;
  *
  * The firmware answers the command with the generic one-byte ACK (0xFF) or NACK
  * (0xFE) and then prints the report as bare ASCII on the same link, so anything
- * that is not one of those two bytes is already report text. Both answers are
- * one byte, so this never needs more.
+ * that is not one of those two bytes is already report text.
+ *
+ * **The link CRC counts, and this is the one place in the report path that has
+ * to know about it.** A capture is fed the RAW notification, before the
+ * client's CRC verification — it has to be, because report bytes are unframed
+ * ASCII and must not reach the framer — so with a CRC on, the ACK arrives as
+ * `[0xFF][crc…]` and `consumed: 1` leaves the trailer to be transcribed as the
+ * first bytes of the report. The visible symptom was a report beginning
+ * `e//**** TEST START`: of the two-byte trailer `F4 65`, `0xF4` fails
+ * `isReportByte` and is counted as noise while `0x65` is printable ASCII and
+ * became text. Anything comparing the report byte-for-byte against what the
+ * sensor printed then failed, and only with the CRC on.
+ *
+ * @param crcBytes width of the link CRC in force, 0 when it is off
  */
-declare function classifyLiteProtocolAck(buf: Uint8Array): AckVerdict;
+declare function classifyLiteProtocolAck(buf: Uint8Array, crcBytes?: number): AckVerdict;
 
 /**
  * EEPROM brand (advertising name) record.
@@ -10118,6 +10173,32 @@ declare function selectDumpCalibrations(dump: CalibDump, family: ImuFamily): Dum
  * from the Java driver's `SensorDetailsRef.mListOfSensorIdsConflicting`, which
  * is what Consensys enforces in its own editor.
  *
+ * **Those lists are easy to look for and not find.** Almost every Shimmer3
+ * entry passes its list as argument 5 of the eight-argument `SensorDetailsRef`
+ * constructor (`driverUtilities/SensorDetailsRef.java:122-140`) rather than
+ * assigning the field, so a search for `mListOfSensorIdsConflicting =` turns up
+ * the Shimmer2 block (`driver/Configuration.java:337-380`) and little else.
+ * Read the constructor calls: `sensors/SensorGSR.java:139-167` names both
+ * internal ADC channels, the bridge amplifier and the host ExG modes, and
+ * `sensors/SensorBridgeAmp.java:97-121` names GSR back.
+ *
+ * Two details of those lists are worth knowing, because they explain what this
+ * table does and does not say. The ExG conflicts are listed as the **host
+ * algorithm** ids (`HOST_ECG`, `HOST_EMG`, `HOST_EXG_TEST` and the rest) and
+ * the four raw ExG bit ids sit commented out beside them, so Java expresses
+ * "GSR cannot be used with ExG" at the level of a chosen ExG mode — which is
+ * exactly what `'EXG'` is here. And Java's per-channel lists are asymmetric
+ * where a derived channel is involved (PPG, the resistance amplifier, skin
+ * temperature); this SDK models none of those, so its table is symmetric.
+ *
+ * **One firmware rule is deliberately absent.** `checkAndCorrectConfig` also
+ * clears a chip's 16-bit ExG flag when its 24-bit flag is set
+ * (`Configuration/shimmer_config.c:839-848`). That is a sample width, not a
+ * pair of sensors, and `'EXG'` covers all four bits at once here — so it cannot
+ * be expressed as a conflict and is not one. A host picks a width when it picks
+ * a preset; `exgResolutionFromSensors` in `devices/exg/` reads back which one a
+ * bitmap holds.
+ *
  * **On required sensors.** There are none in the enabled-bitmap sense.
  * `mListOfSensorIdsRequired` is declared on every `SensorDetailsRef`
  * (`driverUtilities/SensorDetailsRef.java:34`) and populated nowhere in the
@@ -10231,6 +10312,18 @@ interface SensorToggleResult {
     expPower: 0 | 1 | null;
     /** True when the ExG front end was turned off, so a host resets its mode control. */
     exgOff: boolean;
+    /**
+     * Whether the ExG front end is on after this toggle.
+     *
+     * Feed it back as {@link SensorRuleState.exgMode} on the next call. It is not
+     * derivable from `enabledSensors`, because `'EXG'` owns no single bit: a host
+     * ORs in the width bits its chosen preset needs, and until it does, an ExG
+     * that this call turned on is invisible in the bitmap. Without it a caller
+     * that toggles and then validates gets `expPower` derived on by the toggle
+     * and derived straight back off by {@link checkSensorRules}, which would
+     * read the rail off the bits and find none set.
+     */
+    exgOn: boolean;
     changes: SensorRuleChange[];
 }
 /** Whether a sensor can be offered at all, given the hardware. */

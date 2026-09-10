@@ -1,0 +1,82 @@
+# The ShimmerCapture verification pass, on every push and pull request.
+#
+# `common/dev/verify.mjs` drives the real page in a real browser over CDP
+# against the ?mock=1 transport: ~290 checks over the connect handshake, the
+# configuration form, the sensor rules, the plot, the CSV recorder, the SD
+# browser, the self-test and the clock. It has existed for a while and nothing
+# ran it, so its failures were invisible unless somebody ran it by hand and
+# read the output — which is how a block of eleven broken checks survived, and
+# how a regression could have hidden among them.
+#
+# It gates on CHANGE, not on the total: `common/dev/verify-known-failures.json`
+# lists what is known broken and why, a failure outside that list fails the
+# build, and a listed check that starts passing ALSO fails the build so the
+# list shrinks rather than rots. See the tail of verify.mjs.
+name: Verify ShimmerCapture
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # The pass needs a real Chrome with a remote-debugging port. Chrome ships
+      # on the GitHub runners, but pinning the action keeps a runner-image
+      # change from silently moving the browser under us.
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      # Serves the REPO ROOT, not the demo folder: the cross-demo checks walk
+      # up from the demo to the root to police which files may import the
+      # extension's private SDK copy.
+      - name: Serve the repository
+        run: |
+          npx --yes http-server . -p 8129 -c-1 --silent &
+          for i in $(seq 1 40); do
+            if curl -fsS -o /dev/null http://localhost:8129/ShimmerCapture/; then
+              echo "server up"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "the static server never came up"; exit 1
+
+      - name: Start headless Chrome
+        run: |
+          chrome --headless=new --remote-debugging-port=9333 \
+            --user-data-dir="${RUNNER_TEMP}/chrome-verify" \
+            --no-first-run --no-default-browser-check --disable-gpu \
+            --disable-dev-shm-usage about:blank &
+          for i in $(seq 1 40); do
+            if curl -fsS -o /dev/null http://127.0.0.1:9333/json/version; then
+              echo "cdp up"; exit 0
+            fi
+            sleep 0.5
+          done
+          echo "Chrome never opened its debugging port"; exit 1
+
+      - name: Run the verification pass
+        run: node common/dev/verify.mjs
+
+      # The same pass with the link CRC off. Every check passes that way today,
+      # which is what identified the known failures as a CRC interaction rather
+      # than as flakiness — so it is worth keeping honest. Non-blocking,
+      # because the baseline describes the default (CRC on) run and this one
+      # would report every entry in it as "fixed".
+      - name: Run the pass again with the link CRC off (informational)
+        continue-on-error: true
+        env:
+          VERIFY_CRC: "0"
+        run: node common/dev/verify.mjs

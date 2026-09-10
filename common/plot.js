@@ -50,6 +50,7 @@ export const PLOT_GROUPS = Object.freeze([
   { id: "HG_ACCEL", label: "High-g accelerometer" },
   { id: "GYRO", label: "Gyroscope" },
   { id: "MAG", label: "Magnetometer" },
+  { id: "ALT_MAG", label: "Alternate magnetometer" },
   { id: "EXG", label: "ExG" },
   { id: "GSR", label: "GSR" },
   { id: "PPG", label: "PPG" },
@@ -128,6 +129,11 @@ export function groupForField(name) {
   if (n.startsWith("WR_ACCEL")) return "WR_ACCEL";
   if (n.startsWith("HG_ACCEL")) return "HG_ACCEL";
   if (n.startsWith("GYRO")) return "GYRO";
+  /* Before MAG, and before the generic prefix tests: the second magnetometer
+     is `ALT_MAG_*`, which `startsWith("MAG")` does not catch and `OTHER` was
+     silently collecting. Its own panel rather than MAG's, because the two
+     parts have different ranges and a Shimmer3R streams both. */
+  if (n.startsWith("ALT_MAG")) return "ALT_MAG";
   if (n.startsWith("MAG")) return "MAG";
   if (n === "BATTERY") return "BATTERY";
   if (n === "PRESSURE") return "PRESSURE";
@@ -780,7 +786,8 @@ export function createStreamPlot(host, opts = {}) {
     preferredKind = next;
     // The buffered history is in the old units, so it cannot be re-labelled —
     // start the window again rather than splicing two scales into one trace.
-    clear();
+    // The stream itself has not restarted, so the elapsed axis keeps its zero.
+    clear({ keepOrigin: true });
     rebuildRoutes();
   }
 
@@ -800,12 +807,20 @@ export function createStreamPlot(host, opts = {}) {
     if (dirty) schedule();
   }
 
-  /** Drop all buffered samples and empty the panels. */
-  function clear() {
+  /**
+   * Drop all buffered samples and empty the panels.
+   *
+   * @param {{keepOrigin?: boolean}} [opts] `keepOrigin` leaves the elapsed
+   *   axis's zero where it is. Set it whenever the STREAM has not restarted —
+   *   switching raw/cal clears the buffers because their units changed, and
+   *   re-basing the axis there made a five-minute-old recording restart at
+   *   0.00 s on screen while the CSV kept counting from the real start.
+   */
+  function clear(opts = {}) {
     write = 0;
     count = 0;
     // A new stream has its own first sample, so the elapsed axis re-bases.
-    originSec = null;
+    if (!opts.keepOrigin) originSec = null;
     times.fill(0);
     for (const s of series) {
       s.buf.fill(NaN);
