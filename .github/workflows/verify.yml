@@ -79,7 +79,11 @@ jobs:
             exit 1
           fi
 
-          node common/dev/verify.mjs
+          # Strict here and only here: CI is the environment the baseline
+          # describes, so a listed check that starts passing has to fail the
+          # build. Elsewhere it is a note, or nobody could run the pass on a
+          # laptop without editing the baseline first.
+          VERIFY_STRICT_BASELINE=1 node common/dev/verify.mjs
           status=$?
           if [ "$status" != "0" ]; then
             echo "--- chrome ---"; tail -40 "$RUNNER_TEMP/chrome.log" || true

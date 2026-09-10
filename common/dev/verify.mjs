@@ -130,6 +130,16 @@ async function goto(url) {
    known-failure list points at. */
 const CRC_MODE = process.env.VERIFY_CRC ?? "2";
 
+/**
+ * How far down a 700px laptop viewport the tab strip may end.
+ *
+ * Two checks share it. Platform-dependent to within about 13px, because the
+ * system font stack resolves to different metrics on Linux and on Windows, so
+ * the budget carries room for the taller of the two rather than being
+ * calibrated on whichever machine last measured it.
+ */
+const TAB_STRIP_BUDGET_PX = 480;
+
 const CONNECT = `
   delete window.showSaveFilePicker;
   {
@@ -2803,9 +2813,18 @@ check(
      about 21px, the panel is what decides this height rather than the connect
      column beside it, and the strip still ends less than two thirds of the way
      down the shortest laptop viewport measured here. Any further row is a
-     deliberate decision, which is the point of the budget. */
+     deliberate decision, which is the point of the budget.
+
+     Raised again to `TAB_STRIP_BUDGET_PX` because the same DOM is about 13px
+     taller on Linux than on Windows — the system font stack resolves
+     differently — so a budget calibrated on one platform failed on the other,
+     and a check that cannot agree with itself across platforms cannot gate
+     anything. The number now comes from the intent it always had: the strip
+     must end well clear of the fold on the shortest laptop viewport measured
+     here, 700px, with room for the widest font metrics seen rather than the
+     narrowest. It is still a budget, and one more row still breaks it. */
   panel.tabsBottom < panel.viewport &&
-    panel.tabsBottom <= 450 &&
+    panel.tabsBottom <= TAB_STRIP_BUDGET_PX &&
     panel.refreshInPanel &&
     panel.battDetailGone &&
     panel.clockCard[0] === "Clock" &&
@@ -2978,7 +2997,8 @@ check(
 );
 check(
   "and saying how fresh the flags are still costs the tab strip nothing",
-  started.tabsBottom === read.tabsBottom && started.tabsBottom <= 450,
+  started.tabsBottom === read.tabsBottom &&
+    started.tabsBottom <= TAB_STRIP_BUDGET_PX,
   `tab strip ends at ${started.tabsBottom}px, same as with the flags freshly read`,
 );
 
@@ -5635,13 +5655,31 @@ if (regressions.length) {
   );
   for (const f of regressions) console.log(`  - ${f.name}`);
 }
+/* A listed check that now passes has to be reported, or the list rots — but
+   failing on it is only sound in ONE fixed environment. Some of these failures
+   are environment-sensitive (a transfer that runs out of time on a loaded
+   machine), so a developer's laptop and CI disagree about a couple of entries,
+   and a hard failure there would mean nobody could run the pass locally
+   without editing the baseline first. CI sets `VERIFY_STRICT_BASELINE=1` and
+   is the authority; everywhere else this is a note to act on when convenient. */
+const strict = process.env.VERIFY_STRICT_BASELINE === "1";
 if (fixed.length) {
   console.log(
-    `\nFIXED — ${fixed.length} baseline entr${fixed.length === 1 ? "y" : "ies"} now passing. ` +
-      "Remove them from common/dev/verify-known-failures.json:",
+    `
+${strict ? "FIXED" : "note"} — ${fixed.length} baseline ` +
+      `entr${fixed.length === 1 ? "y" : "ies"} now passing` +
+      (strict
+        ? ". Remove them from common/dev/verify-known-failures.json:"
+        : ":"),
   );
   for (const name of fixed) console.log(`  - ${name}`);
+  if (!strict) {
+    console.log(
+      "  (not a failure here — regenerate the baseline from a CI run, which is" +
+        "   the environment it describes: node common/dev/verify.mjs --update-baseline)",
+    );
+  }
 }
 
 ws.close();
-process.exit(regressions.length || fixed.length ? 1 : 0);
+process.exit(regressions.length || (strict && fixed.length) ? 1 : 0);
