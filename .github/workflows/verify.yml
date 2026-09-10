@@ -21,7 +21,7 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -31,52 +31,57 @@ jobs:
         with:
           node-version: "24"
 
-      # The pass needs a real Chrome with a remote-debugging port. Chrome ships
-      # on the GitHub runners, but pinning the action keeps a runner-image
-      # change from silently moving the browser under us.
+      # Pinned rather than relying on whatever Chrome the runner image carries,
+      # so a runner-image change cannot move the browser under the pass.
       - name: Setup Chrome
+        id: chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      # Serves the REPO ROOT, not the demo folder: the cross-demo checks walk
-      # up from the demo to the root to police which files may import the
-      # extension's private SDK copy.
-      - name: Serve the repository
-        run: |
-          npx --yes http-server . -p 8129 -c-1 --silent &
-          for i in $(seq 1 40); do
-            if curl -fsS -o /dev/null http://localhost:8129/ShimmerCapture/; then
-              echo "server up"; exit 0
-            fi
-            sleep 0.5
-          done
-          echo "the static server never came up"; exit 1
-
-      - name: Start headless Chrome
-        run: |
-          chrome --headless=new --remote-debugging-port=9333 \
-            --user-data-dir="${RUNNER_TEMP}/chrome-verify" \
-            --no-first-run --no-default-browser-check --disable-gpu \
-            --disable-dev-shm-usage about:blank &
-          for i in $(seq 1 40); do
-            if curl -fsS -o /dev/null http://127.0.0.1:9333/json/version; then
-              echo "cdp up"; exit 0
-            fi
-            sleep 0.5
-          done
-          echo "Chrome never opened its debugging port"; exit 1
-
+      # One step for the server, the browser and the pass. Backgrounded
+      # processes are not guaranteed to outlive the step that started them, and
+      # a pass that cannot say WHY the browser did not come up is a pass
+      # nobody can fix from the log — so both get a log file, and both logs are
+      # printed when something goes wrong.
       - name: Run the verification pass
-        run: node common/dev/verify.mjs
-
-      # The same pass with the link CRC off. Every check passes that way today,
-      # which is what identified the known failures as a CRC interaction rather
-      # than as flakiness — so it is worth keeping honest. Non-blocking,
-      # because the baseline describes the default (CRC on) run and this one
-      # would report every entry in it as "fixed".
-      - name: Run the pass again with the link CRC off (informational)
-        continue-on-error: true
         env:
-          VERIFY_CRC: "0"
-        run: node common/dev/verify.mjs
+          # Chrome's sandbox does not come up on the runners, and this is a
+          # throwaway container loading only localhost.
+          CHROME_FLAGS: >-
+            --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage
+            --no-first-run --no-default-browser-check
+        run: |
+          set -uo pipefail
+          CHROME='${{ steps.chrome.outputs.chrome-path }}'
+          echo "chrome: $CHROME"
+          "$CHROME" --version
+
+          # Serves the REPO ROOT, not the demo folder: the cross-demo checks
+          # walk up from the demo to the root to police which files may import
+          # the extension's private SDK copy.
+          npx --yes http-server . -p 8129 -c-1 --silent > "$RUNNER_TEMP/http.log" 2>&1 &
+          "$CHROME" $CHROME_FLAGS --remote-debugging-port=9333 \
+            --user-data-dir="$RUNNER_TEMP/chrome-verify" \
+            about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
+
+          up() { curl -fsS -o /dev/null "$1"; }
+          for i in $(seq 1 60); do
+            if up http://localhost:8129/ShimmerCapture/ && up http://127.0.0.1:9333/json/version; then
+              ready=1; break
+            fi
+            sleep 1
+          done
+          if [ "${ready:-0}" != "1" ]; then
+            echo "::error::the static server or Chrome never came up"
+            echo "--- http-server ---"; cat "$RUNNER_TEMP/http.log" || true
+            echo "--- chrome ---";      cat "$RUNNER_TEMP/chrome.log" || true
+            exit 1
+          fi
+
+          node common/dev/verify.mjs
+          status=$?
+          if [ "$status" != "0" ]; then
+            echo "--- chrome ---"; tail -40 "$RUNNER_TEMP/chrome.log" || true
+          fi
+          exit $status
