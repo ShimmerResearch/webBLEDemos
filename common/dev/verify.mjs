@@ -1179,7 +1179,11 @@ check(
     rec.after.bleEnabled &&
     rec.after.stopDisabled &&
     rec.after.streamTabEnabled,
-  JSON.stringify(rec.after.toasts),
+  /* Every field, not just the toasts. Six things have to be true here and the
+     detail used to name none of them, so a failure said only that something
+     about the recovery was wrong — which is no use at all when it fails on a
+     machine you cannot attach a debugger to. */
+  JSON.stringify(rec.after),
 );
 
 // ===========================================================================
