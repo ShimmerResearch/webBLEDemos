@@ -24,7 +24,9 @@
  * goes in os.tmpdir() — never in the working tree, which this pass has to be
  * able to run against without dirtying.
  */
-const PORT = process.argv[2] ?? "9333";
+import { readFile, writeFile } from "node:fs/promises";
+
+const PORT = process.argv.find((a) => /^\d+$/.test(a)) ?? "9333";
 const BASE = process.env.VERIFY_BASE ?? "http://localhost:8129/ShimmerCapture/";
 
 const targets = await (
@@ -120,8 +122,35 @@ async function goto(url) {
   throw new Error(`page did not finish booting: ${url}`);
 }
 
+/* The link CRC the pass connects with. The page defaults to 2 bytes and every
+   check below runs that way; `VERIFY_CRC=0` runs the whole pass with it off,
+   which is how a failure that only happens with the CRC on is separated from
+   one that happens either way. Worth having as a switch rather than a one-off
+   probe: eighteen checks were failing here, and the CRC-off run coming back
+   clean said they were defects of the CRC path rather than flaky tests --
+   three separate causes, none of them reachable with the CRC off. CI runs both
+   variants, the CRC-off one non-blocking. */
+const CRC_MODE = process.env.VERIFY_CRC ?? "2";
+
+/**
+ * How far down a 700px laptop viewport the tab strip may end.
+ *
+ * Two checks share it. Platform-dependent to within about 13px, because the
+ * system font stack resolves to different metrics on Linux and on Windows, so
+ * the budget carries room for the taller of the two rather than being
+ * calibrated on whichever machine last measured it.
+ */
+const TAB_STRIP_BUDGET_PX = 480;
+
 const CONNECT = `
   delete window.showSaveFilePicker;
+  {
+    const sel = document.getElementById('crcMode');
+    if (sel && !sel.disabled) {
+      sel.value = '${CRC_MODE}';
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
   window.__blobs = [];
   const realCOU = URL.createObjectURL.bind(URL);
   URL.createObjectURL = (b) => { window.__blobs.push(b); return realCOU(b); };
@@ -425,7 +454,25 @@ const sens = await evaluate(`
 `);
 check(
   "sensor toggle counts as a change and moves sensors2",
-  sens.pill === "3 changes" && sens.changed.includes("byte 5 (0x5)"),
+  /* Four changes by now, not three, and five dirty bytes. The pass has edited
+     the wide-range accel range (byte 6) and the sampling rate (bytes 0-1),
+     and setting 204.8 Hz also DERIVES the shared LSM6DSV accel/gyro rate into
+     byte 7 — "derived Gyro/Accel Rate 5 → 7 (enabled at 204.8 Hz)" in the log.
+     That derivation arrived with the rate-coverage work and this pin was never
+     updated for it. Pressure itself moves byte 5 alone, which a fresh page
+     confirms: one change, one byte. */
+  sens.pill === "4 changes" &&
+    sens.changed.includes("byte 5 (0x5)") &&
+    sens.changed.includes("byte 7 (0x7)") &&
+    sens.changed.every((b) =>
+      [
+        "byte 0 (0x0)",
+        "byte 1 (0x1)",
+        "byte 5 (0x5)",
+        "byte 6 (0x6)",
+        "byte 7 (0x7)",
+      ].includes(b),
+    ),
   JSON.stringify(sens),
 );
 
@@ -691,8 +738,11 @@ const sdRate = await evaluate(`
   const withRate = seen.filter(t => /@ [\\d.]+ KB\\/s, ETA /.test(t));
   const rates = withRate.map(t => Number(/@ ([\\d.]+) KB/.exec(t)[1]));
   const etas = withRate.map(t => /ETA (.+)$/.exec(t)[1]);
+  // Same defensiveness as the resume block below: a transfer that wrote
+  // nothing must make this check FAIL, not throw out of the whole pass.
+  const bigKey = [...window.__fs.files.keys()].find(k => k.endsWith('-000/000'));
   return { seen, withRate, rates, etas, final: label.textContent,
-    big: window.__fs.files.get([...window.__fs.files.keys()].find(k => k.endsWith('-000/000'))).length };
+    big: bigKey ? window.__fs.files.get(bigKey).length : 0 };
 `);
 check(
   "progress reports a rolling throughput and an ETA while a multi-window file transfers",
@@ -781,6 +831,15 @@ check(
 // ---- an aborted download resumes into the same import folder
 const sdResume = await evaluate(`
   const partialKey = [...window.__fs.files.keys()].find(k => k.endsWith('-000/000'));
+  /* A check whose PREREQUISITE failed must fail, not throw: the abort above
+     leaves a part-written file, and when that transfer failed outright there
+     is nothing on disk to resume from. Reading \`.length\` off the missing
+     entry threw out of \`evaluate\`, which ended the whole pass on the spot
+     and took roughly 150 later checks with it — so one flaky area could hide
+     every regression after it. */
+  if (!partialKey) {
+    return { unavailable: 'the aborted transfer left nothing on disk to resume from' };
+  }
   const before = window.__fs.files.get(partialKey).length;
   const preview = window.__sdRole('preview').textContent;
   window.mockTransport.writes.length = 0;
@@ -802,14 +861,16 @@ const sdResume = await evaluate(`
 `);
 check(
   "re-running after an abort resumes into the same import folder, from the bytes on disk",
-  sdResume.before > 0 &&
+  !sdResume.unavailable &&
+    sdResume.before > 0 &&
     sdResume.stampReused &&
     sdResume.copies === 1 &&
     sdResume.firstOffset === sdResume.before &&
     sdResume.size === 293117 &&
     sdResume.mismatchAt === -1,
-  `resumed at offset ${sdResume.firstOffset} (${sdResume.before} B on disk) → ${sdResume.size} B` +
-    `, mismatchAt ${sdResume.mismatchAt}, ${sdResume.copies} copy on disk`,
+  sdResume.unavailable ??
+    `resumed at offset ${sdResume.firstOffset} (${sdResume.before} B on disk) → ${sdResume.size} B` +
+      `, mismatchAt ${sdResume.mismatchAt}, ${sdResume.copies} copy on disk`,
 );
 
 // ---- delete only what was downloaded AND verified
@@ -919,6 +980,12 @@ const stream = await evaluate(`
     return { title: ch.options.plugins.title.text, traces: ch.data.datasets.map(d=>d.label),
       points: ch.data.datasets.map(d=>d.data.length) };
   });
+  const axisTitles = {};
+  for (const c of document.querySelectorAll('.plot-panel canvas')) {
+    const ch = Chart.getChart(c);
+    axisTitles[ch.options.plugins.title.text] =
+      ch.options.scales.y.title?.display ? ch.options.scales.y.title.text : '';
+  }
   const cells = {};
   for (const d of document.querySelectorAll('#stats > div'))
     cells[d.querySelector('.stat-label').textContent] = d.querySelector('.stat-value').textContent;
@@ -931,7 +998,7 @@ const stream = await evaluate(`
   window.scrollTo(0, document.documentElement.scrollHeight);
   await new Promise(r => requestAnimationFrame(r));
   const panels = document.querySelectorAll('.plot-panel');
-  return { charts, cells,
+  return { charts, cells, axisTitles,
     drawerOpen: document.documentElement.dataset.logOpen,
     plotWidth: plotBox.width, pageWidth: pageBox.width,
     scrolledTo: window.scrollY,
@@ -953,9 +1020,25 @@ check(
 );
 check(
   "stream draws one panel per sensor group with points",
-  stream.charts.length === 3 &&
+  /* Five, not three: pressure and temperature reach the plot now that the SDK
+     decodes them and `plot.js` gives each its own panel. They are separate
+     panels on purpose — kPa and °C share no axis with each other, let alone
+     with an accelerometer. */
+  stream.charts.length === 5 &&
     stream.charts.every((c) => c.points.every((p) => p > 50)),
   stream.charts.map((c) => `${c.title}: ${c.points.join("/")} pts`).join(", "),
+);
+check(
+  "and each panel's y axis is titled with the unit its traces share",
+  /* The axis title is the unit of the RESOLVED kind, so it follows the
+     Raw/Calibrated selector rather than being fixed at schema time. A panel
+     whose traces disagree on a unit gets no title, which is why pressure and
+     temperature cannot be one panel. */
+  stream.axisTitles["Low-noise accelerometer"] === "m/s²" &&
+    stream.axisTitles["Gyroscope"] === "deg/s" &&
+    stream.axisTitles["Pressure"] === "kPa" &&
+    stream.axisTitles["Temperature"] === "°C",
+  JSON.stringify(stream.axisTitles),
 );
 check(
   "stats strip reads a sane rate and 0% loss",
@@ -1018,13 +1101,32 @@ const rec = await evaluate(`
   const mid = { pill: document.getElementById('recPill').textContent,
     rows: document.getElementById('recRows').textContent };
   window.mockTransport.emitDisconnect(new Error('cable yanked (mock)'));
-  await new Promise(r=>setTimeout(r,1500));
+  /* Wait for the page to have SETTLED, rather than for a length of time. The
+     drop unwinds several things — the stream stops, the recorder closes its
+     file, the identity clears, the connect buttons come back — and a fixed
+     1.5 s was enough on a developer's laptop and not on a loaded CI runner,
+     where this failed while the behaviour was perfectly correct. The last
+     thing to land is the recording pill, because closing the file is async. */
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 50));
+    if (document.getElementById('connPill').textContent === 'disconnected'
+        && document.getElementById('recPill').textContent === 'not recording'
+        && window.__blobs.length) break;
+  }
   const after = { connPill: document.getElementById('connPill').textContent,
     recPill: document.getElementById('recPill').textContent,
     rows: document.getElementById('recRows').textContent,
     bytes: document.getElementById('recBytes').textContent,
     idName: document.getElementById('idName').textContent,
     bleEnabled: !document.getElementById('btnBle').disabled,
+    /* Whether this BROWSER has Web Bluetooth at all. The BLE button is gated
+       on the capability as well as on the connection, and capability is a
+       floor the connected-state cannot lift — so on a browser without it the
+       button correctly stays disabled after a drop, and an assertion that it
+       comes back is asserting something about the host rather than about the
+       page. Headless Chrome on Linux has no Web Bluetooth; the same Chrome on
+       Windows does, which is why this passed locally and failed in CI. */
+    bleSupported: !!navigator.bluetooth,
     stopDisabled: document.getElementById('btnStreamStop').disabled,
     streamTabEnabled: !document.getElementById('tabBtnStream').disabled,
     toasts: [...document.querySelectorAll('.toast')].map(t=>t.textContent) };
@@ -1052,9 +1154,27 @@ check(
 );
 check(
   "CSV header matches the stream columns",
-  rec.csv.header.startsWith("HostTime_ms,TIMESTAMP,LN_ACCEL_X_RAW") &&
-    rec.csv.units.startsWith("ms,ticks,"),
-  rec.csv.header.slice(0, 90) + "…",
+  /* Three time columns, and they are three different numbers: the host's
+     arrival time, the sensor's raw tick counter (which restarts every 512 s),
+     and the unwrapped milliseconds those ticks amount to. `Timestamp_Unix_CAL`
+     is the name Consensys writes for the wall clock, so a file from this page
+     and one from Consensys can be compared column for column. */
+  rec.csv.header.startsWith(
+    "HostTime_ms,TIMESTAMP,TIMESTAMP_CAL,Timestamp_Unix_CAL,",
+  ) &&
+    rec.csv.units.startsWith("ms,ticks,ms,ms,") &&
+    /,LN_ACCEL_X_RAW,/.test(rec.csv.header) &&
+    /,LN_ACCEL_X_CAL,/.test(rec.csv.header),
+  rec.csv.header.slice(0, 110) + "…",
+);
+check(
+  "and a raw column's unit is 'no_units', not an empty cell",
+  /* An empty cell reads as "the unit was not recorded"; `no_units` says there
+     is no unit. Java draws the same distinction with the same word. */
+  rec.csv.units.split(",")[
+    rec.csv.header.split(",").indexOf("LN_ACCEL_X_RAW")
+  ] === "no_units",
+  rec.csv.units.slice(0, 110) + "…",
 );
 check(
   "row count matches what the page reported",
@@ -1066,10 +1186,15 @@ check(
   rec.after.connPill === "disconnected" &&
     rec.after.recPill === "not recording" &&
     rec.after.idName === "–" &&
-    rec.after.bleEnabled &&
+    // Live again if and only if this browser can do BLE at all.
+    rec.after.bleEnabled === rec.after.bleSupported &&
     rec.after.stopDisabled &&
     rec.after.streamTabEnabled,
-  JSON.stringify(rec.after.toasts),
+  /* Every field, not just the toasts. Six things have to be true here and the
+     detail used to name none of them, so a failure said only that something
+     about the recovery was wrong — which is no use at all when it fails on a
+     machine you cannot attach a debugger to. */
+  JSON.stringify(rec.after),
 );
 
 // ===========================================================================
@@ -2714,9 +2839,18 @@ check(
      about 21px, the panel is what decides this height rather than the connect
      column beside it, and the strip still ends less than two thirds of the way
      down the shortest laptop viewport measured here. Any further row is a
-     deliberate decision, which is the point of the budget. */
+     deliberate decision, which is the point of the budget.
+
+     Raised again to `TAB_STRIP_BUDGET_PX` because the same DOM is about 13px
+     taller on Linux than on Windows — the system font stack resolves
+     differently — so a budget calibrated on one platform failed on the other,
+     and a check that cannot agree with itself across platforms cannot gate
+     anything. The number now comes from the intent it always had: the strip
+     must end well clear of the fold on the shortest laptop viewport measured
+     here, 700px, with room for the widest font metrics seen rather than the
+     narrowest. It is still a budget, and one more row still breaks it. */
   panel.tabsBottom < panel.viewport &&
-    panel.tabsBottom <= 450 &&
+    panel.tabsBottom <= TAB_STRIP_BUDGET_PX &&
     panel.refreshInPanel &&
     panel.battDetailGone &&
     panel.clockCard[0] === "Clock" &&
@@ -2889,7 +3023,8 @@ check(
 );
 check(
   "and saying how fresh the flags are still costs the tab strip nothing",
-  started.tabsBottom === read.tabsBottom && started.tabsBottom <= 450,
+  started.tabsBottom === read.tabsBottom &&
+    started.tabsBottom <= TAB_STRIP_BUDGET_PX,
   `tab strip ends at ${started.tabsBottom}px, same as with the flags freshly read`,
 );
 
@@ -4267,7 +4402,9 @@ check(
      name. */
   !pageSrc.includes("parseInfoMem(deviceImage, layout)") &&
     pageSrc.includes("parseInfoMem(deviceImage, context)"),
-  pageSrc.includes("parseInfoMem(deviceImage, context)") ? "context" : "not the context",
+  pageSrc.includes("parseInfoMem(deviceImage, context)")
+    ? "context"
+    : "not the context",
 );
 
 /* The one that had drifted: the calibration tab's disabled state must come
@@ -4748,8 +4885,13 @@ const refreshHook = await evaluate(`
 `);
 check(
   "changing the range repaints the block's range chip and its greyed defaults",
-  refreshHook.before.pill === "configured: +/- 125dps" &&
-    refreshHook.before.sens.join(",") === "229,229,229" &&
+  /* The mock's stored image configures 250 dps, not 125 — so the default
+     sensitivity it shows is 114, the 11400 of the seed table over 100. This
+     pin said 125 dps and 229, which was the image's default before the mock
+     grew a realistic one; the rest of the check (the range change moving the
+     chip and the greyed defaults to 2000 dps and 14) was right all along. */
+  refreshHook.before.pill === "configured: +/- 250dps" &&
+    refreshHook.before.sens.join(",") === "114,114,114" &&
     refreshHook.moved.pill === "configured: +/- 2000dps" &&
     // 2000 dps is a far coarser LSB, so the default sensitivity really moves.
     refreshHook.moved.sens.join(",") === "14,14,14" &&
@@ -4886,8 +5028,646 @@ check(
   "an all-zero id page is no board, not the board SR0-0-0",
   /* All zeroes is as much "never written" as all 0xFF is "erased", and the
      SDK has to read BOTH as absent. */
-  identZero.hw === "Shimmer3R" && !identZero.hw.includes("SR0") && identZero.board === "null",
+  identZero.hw === "Shimmer3R" &&
+    !identZero.hw.includes("SR0") &&
+    identZero.board === "null",
   `${identZero.hw}  (readSrBoard -> ${identZero.board})`,
+);
+
+// ===========================================================================
+console.log("\n--- the Consensys note ---");
+await goto(`${BASE}?mock=1`);
+const note = await evaluate(`
+  const n = document.getElementById('consensysNote');
+  return { text: n.textContent.replace(/\\s+/g, ' ').trim(),
+    next: n.nextElementSibling?.id ?? null,
+    card: n.closest('.card')?.querySelector('.card-title')?.textContent?.trim() ?? null,
+    links: n.querySelectorAll('a').length };
+`);
+check(
+  "the page says it is an example and names Consensys, on the link card",
+  /* On the card a user reaches first, not buried in a tab: somebody who
+     arrived from a search should not mistake this for the product. */
+  /example application/.test(note.text) &&
+    /Consensys/.test(note.text) &&
+    note.next === "platformBanner",
+  `${note.card}: ${note.text.slice(0, 80)}…`,
+);
+check(
+  "and it points at no URL, rather than guessing one",
+  /* No link, but there IS text — `links === 0` alone is satisfied by an empty
+     element, which is also what a broken template would leave behind. */
+  note.links === 0 && note.text.length > 80,
+  `${note.links} links, ${note.text.length} chars`,
+);
+
+// ===========================================================================
+console.log("\n--- the sensor rules, newest choice wins ---");
+const B = {
+  GSR: 0x000004,
+  INT_A3: 0x000400,
+  INT_A0: 0x000200,
+  BRIDGE: 0x008000,
+};
+/* Ticking a box the way a user does — the change event is what the page
+   listens to — then reading back what the form now holds. `expPower` is read
+   through the form's own field so this cannot pass against a page that only
+   updated its own variable. */
+const RULES = `
+  const box = (bit) => document.querySelector('[data-sensor-bit="' + bit + '"]');
+  const tick = async (bit, on) => {
+    const b = box(bit);
+    b.checked = on;
+    b.dispatchEvent(new Event('change', { bubbles: true }));
+    await new Promise(r => setTimeout(r, 120));
+  };
+  const expPower = () => {
+    const f = document.querySelector('#configForm .field[data-field-key="expPower"]');
+    const c = f?.querySelector('select, input');
+    return c ? (c.type === 'checkbox' ? (c.checked ? '1' : '0') : c.value) : null;
+  };
+  const banner = () => {
+    const n = document.getElementById('sensorRulesNote');
+    return { hidden: n.hidden, kind: n.className,
+      text: n.textContent.replace(/\\s+/g, ' ').trim(),
+      fix: !!document.getElementById('btnSensorRulesFix') };
+  };
+  const logLines = () => [...document.querySelectorAll('#log .log-line')]
+    .map(l => l.textContent).filter(t => /sensor rule/.test(t));
+`;
+await goto(`${BASE}?mock=1`);
+check("connect for the sensor-rule pass", (await evaluate(CONNECT)) === "mock");
+const toggles = await evaluate(`${RULES}
+  /* Which image bytes differ from the sensor's, right now. Sampled after
+     every toggle rather than once at the end: the sequence below is
+     deliberately reversible, so a single reading taken after the last untick
+     is an EMPTY array — which satisfies any "every byte is one of these"
+     assertion without testing a thing. */
+  const moved = () => [...document.querySelectorAll('.hexview-byte.changed')]
+    .map(b => Number(b.title.split(' ')[1]));
+  await tick(${B.INT_A3}, true);
+  const first = { banner: banner(), expPower: expPower(), moved: moved() };
+  await tick(${B.GSR}, true);
+  const second = { banner: banner(), expPower: expPower(),
+    intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
+    moved: moved(), log: logLines() };
+  await tick(${B.INT_A3}, true);
+  const third = { expPower: expPower(),
+    intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
+    moved: moved(), banner: banner() };
+  await tick(${B.INT_A3}, false);
+  const fourth = { expPower: expPower(), moved: moved() };
+  return { first, second, third, fourth };
+`);
+check(
+  "an internal ADC channel on its own breaks no rule",
+  toggles.first.banner.hidden && toggles.first.expPower === "0",
+  `banner hidden=${toggles.first.banner.hidden}, expPower=${toggles.first.expPower}`,
+);
+check(
+  "enabling GSR unticks the ADC channel it shares an input with",
+  /* What the firmware would do at its next write, done here so the user sees
+     it before pressing Apply rather than discovering it on read-back. */
+  toggles.second.gsr &&
+    !toggles.second.intA3 &&
+    /Internal ADC A3/.test(toggles.second.banner.text),
+  toggles.second.banner.text.slice(0, 120),
+);
+check(
+  "and derives the expansion rail GSR needs, saying so",
+  toggles.second.expPower === "1" &&
+    /Expansion-board power switched on/.test(toggles.second.banner.text),
+  `expPower=${toggles.second.expPower}`,
+);
+check(
+  "the explanation reaches the log as well as the banner",
+  /* Both changes, by content. A count alone passed on any two lines matching
+     `sensor rule`, including two copies of one message. */
+  toggles.second.log.some((l) => /Internal ADC A3 unticked/.test(l)) &&
+    toggles.second.log.some((l) => /Expansion-board power switched on/.test(l)),
+  JSON.stringify(toggles.second.log).slice(0, 200),
+);
+check(
+  "the newest choice wins in both directions",
+  /* Ticking the ADC channel back unticks GSR, rather than refusing the click.
+     A rule that only ever pushes one way makes the second sensor unreachable
+     without knowing which box to untick first. */
+  toggles.third.intA3 && !toggles.third.gsr && toggles.third.expPower === "1",
+  `intA3=${toggles.third.intA3} gsr=${toggles.third.gsr} expPower=${toggles.third.expPower}`,
+);
+check(
+  "and the rail goes off again when nothing left needs it",
+  toggles.fourth.expPower === "0",
+  `expPower=${toggles.fourth.expPower}`,
+);
+const movedByStep = [
+  toggles.first.moved,
+  toggles.second.moved,
+  toggles.third.moved,
+  toggles.fourth.moved,
+];
+const movedEver = [...new Set(movedByStep.flat())].sort((a, b) => a - b);
+check(
+  "only the sensor bitmap and the expansion-power byte ever moved",
+  /* Bytes 3-5 are the enabled-sensor bitmap and byte 9 carries the
+     expansion-power bit. A rule that reached any further would be editing
+     something the user did not touch. The first three steps must each have
+     moved SOMETHING, or this is asserting over an empty set. */
+  movedEver.length > 0 &&
+    movedEver.every((b) => [3, 4, 5, 9].includes(b)) &&
+    movedByStep.slice(0, 3).every((m) => m.length > 0),
+  `moved ${movedEver.join(",")} across steps ` +
+    movedByStep.map((m) => `[${m.join(",")}]`).join(" "),
+);
+check(
+  "and the four toggles leave no residue when they undo each other",
+  /* Tick A, tick B (which unticks A), tick A again (which unticks B), untick
+     A: the image is back where it started, expansion power included. A
+     derived bit that latched on would show up here as a byte still dirty. */
+  toggles.fourth.moved.length === 0 && toggles.fourth.expPower === "0",
+  `${toggles.fourth.moved.length} bytes dirty, expPower=${toggles.fourth.expPower}`,
+);
+
+const exgRule = await evaluate(`${RULES}
+  const mode = document.getElementById('exgMode');
+  await tick(${B.INT_A0}, true);
+  mode.value = [...mode.options].map(o => o.value).find(v => v !== 'off' && v !== mode.value);
+  mode.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 200));
+  return { chosen: mode.value, intA0: box(${B.INT_A0}).checked,
+    expPower: expPower(), banner: banner() };
+`);
+check(
+  "choosing an ExG mode clears the ADC channels ExG cannot share with",
+  exgRule.chosen !== "off" && !exgRule.intA0 && exgRule.expPower === "1",
+  `${exgRule.chosen}: intA0=${exgRule.intA0} expPower=${exgRule.expPower}`,
+);
+
+// ---- an image that arrived already broken gets a Fix button
+await goto(`${BASE}?mock=1&sensors=0x000404`);
+check(
+  "connect a sensor whose stored image already breaks a rule",
+  (await evaluate(CONNECT)) === "mock",
+);
+const broken = await evaluate(`${RULES}
+  const before = banner();
+  document.getElementById('btnSensorRulesFix').click();
+  await new Promise(r => setTimeout(r, 200));
+  return { before, after: banner(), expPower: expPower(),
+    intA3: box(${B.INT_A3}).checked, gsr: box(${B.GSR}).checked,
+    dirty: document.getElementById('dirtyPill').textContent,
+    log: logLines() };
+`);
+check(
+  "an image read off the device is explained, not silently corrected",
+  /* Nothing here is a "newest choice", so there is nothing to correct
+     automatically — the user's own stored configuration is not the page's to
+     rewrite behind their back. It says what is wrong and offers a Fix. */
+  !broken.before.hidden && /warn/.test(broken.before.kind) && broken.before.fix,
+  broken.before.text.slice(0, 140),
+);
+check(
+  "and Fix applies exactly what the banner described",
+  /* The banner named the ADC channel and the rail before the click; the form
+     has to match afterwards. Reading the before-text into the assertion is
+     what makes this "exactly what it described" rather than "something". */
+  broken.gsr &&
+    !broken.intA3 &&
+    broken.expPower === "1" &&
+    /Internal ADC A3/.test(broken.before.text),
+  `gsr=${broken.gsr} intA3=${broken.intA3} expPower=${broken.expPower}; ` +
+    `banner said: ${broken.before.text.slice(0, 70)}`,
+);
+check(
+  "after which the warning is replaced by a note saying what changed",
+  /* Not hidden: the same rules that had a violation to report now have a
+     change to report, and a banner that vanished would leave a user looking
+     at a form they did not edit. The Fix button goes, though — there is
+     nothing left to fix. */
+  !broken.after.hidden &&
+    /info/.test(broken.after.kind) &&
+    !broken.after.fix &&
+    /Internal ADC A3/.test(broken.after.text),
+  `${broken.after.kind}: ${broken.after.text.slice(0, 90)}`,
+);
+check(
+  "and the form is left dirty, for the user to Apply",
+  /* Fix edits the working image, exactly as any other field edit does. It
+     does not write to the sensor. */
+  /change/.test(broken.dirty),
+  broken.dirty,
+);
+check(
+  "Fix says what it changed, in the log, as a fix",
+  broken.log.some((l) => /sensor rule fix/.test(l)),
+  JSON.stringify(broken.log.filter((l) => /fix/.test(l))).slice(0, 160),
+);
+
+// ---- gating: a board that cannot carry a sensor
+await goto(`${BASE}?mock=1&srBoard=37-1-0`);
+check(
+  "connect an ECG/EMG board for the gating pass",
+  (await evaluate(CONNECT)) === "mock",
+);
+const gated = await evaluate(`${RULES}
+  const b = (bit) => { const x = box(bit); return { disabled: x.disabled,
+    title: (x.closest('label')?.title ?? '').replace(/\\s+/g, ' ') }; };
+  return { gsr: b(${B.GSR}), bridge: b(${B.BRIDGE}),
+    exgMode: document.getElementById('exgMode').disabled };
+`);
+check(
+  "a sensor this board cannot have is greyed out, with the board named",
+  gated.gsr.disabled && /SR37|ECG\/EMG/.test(gated.gsr.title),
+  gated.gsr.title.slice(0, 130),
+);
+check(
+  "and the ExG control this board CAN carry stays live",
+  /* An SR37 is an ExG board, so the ExG control must NOT be gated — and the
+     `disabled === false` half of that is a select's default, true of a page
+     with no gating at all. Paired with the GSR box above, which this same
+     board must gate, the two together can only both hold if the gating ran
+     and discriminated. */
+  gated.exgMode === false && gated.gsr.disabled === true,
+  `exgMode disabled=${gated.exgMode}, GSR disabled=${gated.gsr.disabled}`,
+);
+check(
+  "the bridge amplifier is refused on a Shimmer3R at all",
+  /* There is no bridge-amplifier channel in the Shimmer3R packers, so the bit
+     would stream nothing whatever board is fitted. */
+  gated.bridge.disabled && /Shimmer3R/.test(gated.bridge.title),
+  gated.bridge.title.slice(0, 130),
+);
+
+await goto(`${BASE}?mock=1&srBoard=none`);
+check(
+  "connect a sensor with no board id",
+  (await evaluate(CONNECT)) === "mock",
+);
+const ungated = await evaluate(`${RULES}
+  return { disabled: [...document.querySelectorAll('[data-sensor-bit]')]
+    .filter(b => b.disabled).map(b => b.dataset.sensorKey),
+    exgMode: document.getElementById('exgMode').disabled };
+`);
+check(
+  "an unknown board gates nothing on the board's account",
+  /* A blank id page is a real state — an unprovisioned board — and refusing
+     every sensor on one would make the page useless exactly where it is most
+     needed. The bridge amplifier stays refused, because that is the
+     GENERATION saying so: no Shimmer3R packer emits a bridge channel, whatever
+     board is fitted. */
+  ungated.disabled.length === 1 &&
+    ungated.disabled[0] === "SENSOR_BRIDGE_AMP" &&
+    ungated.exgMode === false,
+  `disabled: ${ungated.disabled.join(", ") || "none"}`,
+);
+
+// ===========================================================================
+console.log("\n--- calibrated channels and the clock axis ---");
+await goto(`${BASE}?mock=1&sensors=0x2422e4&pressure=390&rate=51.2`);
+check(
+  "connect a sensor with pressure, GSR, battery, ADC and both magnetometers",
+  (await evaluate(CONNECT)) === "mock",
+);
+const calStream = await evaluate(`
+  const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
+  /* The page owns onStreamFrame; wrapping it is how a frame is read without
+     the page having to expose one for testing. */
+  const client = window.mockClient;
+  let frame = null;
+  document.querySelector('.tabs [data-tab="tabStream"]').click();
+  document.getElementById('btnStreamStart').click();
+  /* Wrapped AFTER the page installs its own handler, not before: startStream
+     assigns onStreamFrame once its inquiry round trip returns, so a wrapper
+     installed first is overwritten. Waiting for the handler to APPEAR rather
+     than sleeping a guessed 400 ms — the round trip is a mock's, but a slow
+     machine still loses that race, and losing it makes every assertion below
+     fail on a null frame rather than on the thing being tested. */
+  for (let i = 0; i < 100 && !client.onStreamFrame; i++)
+    await new Promise(r => setTimeout(r, 50));
+  const prev = client.onStreamFrame;
+  client.onStreamFrame = (f) => { frame = f; prev?.call(client, f); };
+  await new Promise(r => setTimeout(r, 3000));
+  const oc = frame;
+  const val = (n, k) => oc?.get(n, k)?.value ?? null;
+  const unit = (n, k) => oc?.get(n, k)?.unit ?? null;
+  const panels = [...document.querySelectorAll('.plot-panel canvas')].map(c => {
+    const ch = Chart.getChart(c);
+    return { title: ch.options.plugins.title.text,
+      axis: ch.options.scales.y.title?.display ? ch.options.scales.y.title.text : '',
+      xTitle: ch.options.scales.x.title.display ? ch.options.scales.x.title.text : '',
+      firstTick: ch.scales.x.ticks?.[0]?.label ?? null,
+      xMin: ch.scales.x.min, xMax: ch.scales.x.max,
+      traces: ch.data.datasets.map(d => d.label) };
+  });
+  return {
+    kinds: oc ? [...new Set(oc.fields.map(f => f.kind))] : null,
+    batteryMv: val('BATTERY', 'cal'), batteryUnit: unit('BATTERY', 'cal'),
+    pressure: val('PRESSURE', 'cal'), pressureUnit: unit('PRESSURE', 'cal'),
+    temperature: val('TEMPERATURE', 'cal'), temperatureUnit: unit('TEMPERATURE', 'cal'),
+    gsrUnit: unit('GSR', 'cal'), gsrResistance: unit('GSR_RESISTANCE', 'cal'),
+    unixMs: val('Timestamp_Unix', 'cal'),
+    /* The page's own clock, read as the frame is read. Comparing the sensor's
+       wall clock against Node's would fold in the CDP round trip and make the
+       measurement about this script's latency. */
+    hostMs: Date.now(),
+    rawUnit: unit('LN_ACCEL_X', 'raw'),
+    timeline: window.mockClient?.timelineState ?? null,
+    calibration: window.mockClient?.calibrationInfo ?? null,
+    panels,
+    pressureLog: log().filter(l => /pressure/i.test(l)),
+    clockLog: log().filter(l => /clock/i.test(l)),
+  };
+`);
+check(
+  "the second magnetometer gets its own panel rather than Other channels",
+  /* `groupForField` matched `MAG` by prefix, which `ALT_MAG_X` does not start
+     with, so a Shimmer3R's second magnetometer fell into OTHER and shared an
+     axis with whatever else landed there. */
+  calStream.panels.some((p) => p.title === "Alternate magnetometer") &&
+    !calStream.panels.some((p) => p.title === "Other channels"),
+  calStream.panels.map((p) => p.title).join(", "),
+);
+check(
+  "the frame carries a calibrated value with a unit for every family",
+  calStream.batteryUnit === "mV" &&
+    calStream.pressureUnit === "kPa" &&
+    calStream.temperatureUnit === "Degrees Celsius" &&
+    calStream.gsrUnit === "uS" &&
+    calStream.gsrResistance === "kOhms" &&
+    calStream.rawUnit === "no_units",
+  `${calStream.batteryUnit} / ${calStream.pressureUnit} / ${calStream.temperatureUnit} / ${calStream.gsrUnit} / ${calStream.gsrResistance}`,
+);
+check(
+  "and the values are physical, not counts",
+  /* A plausible cell voltage, sea-level-ish pressure and a room temperature.
+     The mock feeds the compensation the BMP390's real reference coefficients,
+     so the pressure and temperature here are the compensation arithmetic
+     rather than a passthrough — 100.9 kPa and 23.2 °C are the datasheet
+     vector's own answers. The battery bound is loose at the bottom because
+     the mock swings its ADC sine around 2048 counts, which lands just under
+     3.0 V at the trough. */
+  calStream.batteryMv > 2800 &&
+    calStream.batteryMv < 4500 &&
+    calStream.pressure > 80 &&
+    calStream.pressure < 120 &&
+    calStream.temperature > 5 &&
+    calStream.temperature < 45,
+  `${calStream.batteryMv?.toFixed(1)} mV, ${calStream.pressure?.toFixed(3)} kPa, ${calStream.temperature?.toFixed(2)} °C`,
+);
+check(
+  "the pressure part is named in the log, having been asked for",
+  calStream.pressureLog.some((l) => /BMP390/i.test(l)),
+  JSON.stringify(calStream.pressureLog).slice(0, 160),
+);
+check(
+  "a Shimmer3R stream is pinned to the sensor's own clock, exactly",
+  /* `rwc-aligned` is only available because the packet timestamp IS the low
+     24 bits of the counter GET_RWC returns. The mock models that identity, so
+     a regression to a host anchor — or to an aligned anchor against a counter
+     that starts at zero — shows up here. */
+  calStream.timeline?.source === "rwc-aligned" &&
+    calStream.timeline?.anchorUncertaintyMs === 0,
+  JSON.stringify(calStream.timeline),
+);
+check(
+  "and the wall clock it produces agrees with the host's",
+  /* The mock's sensor clock runs on this host's, so the two should differ by
+     no more than the link's own latency. Minutes apart would be an anchor
+     placed in the wrong wrap of the counter. */
+  Math.abs(calStream.unixMs - calStream.hostMs) < 2000,
+  `sensor ${new Date(calStream.unixMs).toISOString()} vs host ` +
+    `${new Date(calStream.hostMs).toISOString()} — ` +
+    `${(calStream.unixMs - calStream.hostMs).toFixed(0)} ms apart`,
+);
+check(
+  "the x axis reads a local clock time, and says so",
+  calStream.panels.every((p) => /^\d\d:\d\d:\d\d/.test(p.firstTick ?? "")) &&
+    calStream.panels.every((p) => /local/.test(p.xTitle)),
+  `${calStream.panels[0]?.firstTick} — ${calStream.panels[0]?.xTitle}`,
+);
+check(
+  "the device's own calibration is what the inertial channels are using",
+  /* `source` non-null was too weak: `'default'` is non-null and means the
+     factory seed, which is the state this whole feature exists to move off.
+     The low-noise accelerometer has to read `radio-dump`, because the mock
+     serves a dump whose record matches the range the image configures.
+
+     The gyro is the more interesting half. The mock's dump carries a gyro
+     record at range 3 while the image configures range 1, and a block read at
+     one range says nothing about another — so the honest answer is that
+     range's default, and that is what this pins. A host applying the range-3
+     numbers to range-1 counts would be out by a factor of four and would look
+     perfectly calibrated. */
+  calStream.calibration?.inertial?.lnAccel?.source === "radio-dump" &&
+    calStream.calibration?.inertial?.lnAccel?.usingDefaultCalibration ===
+      false &&
+    calStream.calibration?.inertial?.gyro?.source === "default" &&
+    calStream.calibration?.inertial?.gyro?.range === 1,
+  `lnAccel ${JSON.stringify(calStream.calibration?.inertial?.lnAccel)}, ` +
+    `gyro ${JSON.stringify(calStream.calibration?.inertial?.gyro)}`,
+);
+
+const cleared = await evaluate(`
+  const pts = () => [...document.querySelectorAll('.plot-panel canvas')]
+    .map(c => Chart.getChart(c).data.datasets[0].data.length);
+  const before = pts();
+  const axisBefore = Chart.getChart(document.querySelector('.plot-panel canvas'))
+    .options.scales.x.title.text;
+  document.getElementById('btnClearPlots').click();
+  await new Promise(r => setTimeout(r, 60));
+  const emptied = pts();
+  const logged = [...document.querySelectorAll('#log .log-line')]
+    .some(l => /plots cleared/.test(l.textContent));
+  // And it fills again, so clearing did not stop the plot.
+  await new Promise(r => setTimeout(r, 700));
+  return { before, emptied, refilled: pts(), logged, axisBefore,
+    axisAfter: Chart.getChart(document.querySelector('.plot-panel canvas'))
+      .options.scales.x.title.text,
+    gated: document.getElementById('btnClearPlots').disabled };
+`);
+check(
+  "Clear plots empties every panel and says so, and the stream carries on",
+  /* The Verisense console's equivalent zeroes its ring buffers and repaints;
+     this does the same through `plot.clear`. Logged because a gap in a trace
+     should be distinguishable afterwards from a dropped link. */
+  cleared.before.every((n) => n > 20) &&
+    /* Not zero: frames keep arriving while this is measured, so a live stream
+       has a few samples back on the panel by the time it is read. The claim is
+       that the history went, not that the plot stopped. */
+    cleared.emptied.every((n, i) => n < cleared.before[i] / 10) &&
+    cleared.refilled.every((n, i) => n > cleared.emptied[i]) &&
+    cleared.logged &&
+    !cleared.gated,
+  `${cleared.before.join(",")} → ${cleared.emptied.join(",")} → ${cleared.refilled.join(",")}`,
+);
+const elapsed = await evaluate(`
+  const sel = document.getElementById('selTimeAxis');
+  sel.value = 'elapsed';
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+  await new Promise(r => setTimeout(r, 600));
+  const ch = () => Chart.getChart(document.querySelector('.plot-panel canvas'));
+  /* Clear a SECOND time, here in Elapsed mode, because this is the only mode
+     the origin shows up in — and keeping it is the whole reason the handler
+     passes keepOrigin. In Clock mode the x values are unix seconds and the
+     axis title carries only the date, so nothing there tells the two
+     behaviours apart.
+
+     Read from the TICK LABEL, not from scales.x.min. The scale holds raw x
+     values — unix seconds — in BOTH modes, and the Elapsed view is produced
+     entirely by a ticks.callback that subtracts the origin (formatXTick in
+     common/plot.js), so the origin is invisible to the scale's own min.
+     Reading x.min here gave a check that compared two epoch timestamps and
+     could only ever report that time had moved forward. */
+  const firstTick = () => ch().scales.x.ticks?.[0]?.label ?? null;
+  const tickBeforeClear = firstTick();
+  document.getElementById('btnClearPlots').click();
+  await new Promise(r => setTimeout(r, 700));
+  return { firstTick: firstTick(), tickBeforeClear,
+    xTitle: ch().options.scales.x.title.text };
+`);
+check(
+  "switching the axis to Elapsed counts seconds from the stream's first sample",
+  /* Plain seconds, not a clock time, and small — the first tick is the left
+     edge of the rolling window, so it is a few seconds in on a stream that
+     has been running for a few seconds, and never an epoch-sized number.
+     Above one, too: a zero here would mean the axis had re-based itself on the
+     clear just performed, which is what the next check is about. */
+  /^-?\d+(\.\d+)?$/.test(String(elapsed.firstTick)) &&
+    Number(elapsed.firstTick) > 1 &&
+    Number(elapsed.firstTick) < 60 &&
+    /Time since start/.test(elapsed.xTitle),
+  `${elapsed.firstTick} — ${elapsed.xTitle}`,
+);
+check(
+  "and clearing does not re-zero it, so the plot and the CSV agree on when",
+  /* A view control must not make the plot disagree with the file about when
+     something happened: `TIMESTAMP_CAL` counts from the stream's first sample
+     whatever this button does, so the axis has to as well.
+
+     Asserted as "the labelled left edge moved forward", which is the
+     invariant: with the origin kept, the samples after a clear sit further
+     along the same axis than the window that was discarded. Re-basing the
+     origin instead puts the left edge back at zero, so this goes backwards.
+
+     Two earlier versions of this check could not fail, which is why it is
+     spelt out. The first compared the CLOCK-mode axis TITLE, which carries the
+     date and not the origin. The second compared `scales.x.min`, which is a
+     raw unix timestamp in both modes and so only ever showed that time had
+     passed. Both left the pass at 293/293 with keepOrigin flipped off, while
+     the first Elapsed tick visibly went from 2.99 to 0.00. */
+  Number(elapsed.firstTick) > Number(elapsed.tickBeforeClear) &&
+    cleared.axisAfter === cleared.axisBefore,
+  `elapsed first tick ${elapsed.tickBeforeClear} → ${elapsed.firstTick} s; ` +
+    `clock axis "${cleared.axisBefore}" kept`,
+);
+
+// ---- pressure with no coefficients stays raw, and says so
+await goto(`${BASE}?mock=1&sensors=0x0400e0&pressure=nack`);
+check(
+  "connect a sensor whose firmware will not serve 0xA7",
+  (await evaluate(CONNECT)) === "mock",
+);
+const rawOnly = await evaluate(`
+  const log = () => [...document.querySelectorAll('#log .log-line')].map(l => l.textContent);
+  const client = window.mockClient;
+  let frame = null;
+  document.querySelector('.tabs [data-tab="tabStream"]').click();
+  document.getElementById('btnStreamStart').click();
+  /* Wrapped AFTER the page installs its own handler, not before: startStream
+     assigns onStreamFrame once its inquiry round trip returns, so a wrapper
+     installed first is overwritten. Waiting for the handler to APPEAR rather
+     than sleeping a guessed 400 ms — the round trip is a mock's, but a slow
+     machine still loses that race, and losing it makes every assertion below
+     fail on a null frame rather than on the thing being tested. */
+  for (let i = 0; i < 100 && !client.onStreamFrame; i++)
+    await new Promise(r => setTimeout(r, 50));
+  const prev = client.onStreamFrame;
+  client.onStreamFrame = (f) => { frame = f; prev?.call(client, f); };
+  await new Promise(r => setTimeout(r, 2000));
+  const oc = frame;
+  return { raw: oc?.get('PRESSURE', 'raw')?.value ?? null,
+    cal: oc?.get('PRESSURE', 'cal') ?? null,
+    log: log().filter(l => /pressure/i.test(l)) };
+`);
+check(
+  "pressure streams raw-only rather than inventing a calibration",
+  /* Compensating against filler or defaults would produce a confident, wrong
+     kPa. A raw-only column is the honest answer, and the log says which it
+     is. */
+  rawOnly.raw != null && rawOnly.cal === null,
+  `raw ${rawOnly.raw}, cal ${JSON.stringify(rawOnly.cal)}`,
+);
+check(
+  "and the log says the firmware would not serve the coefficients",
+  rawOnly.log.some((l) => /raw only|raw-only|does not serve/i.test(l)),
+  JSON.stringify(rawOnly.log).slice(0, 200),
+);
+
+// ---- a counter wrap must not walk the axis backwards
+await goto(`${BASE}?mock=1&rtcWrapIn=6&rate=204.8`);
+check(
+  "connect a sensor about to roll its counter over",
+  (await evaluate(CONNECT)) === "mock",
+);
+const wrap = await evaluate(`
+  const client = window.mockClient;
+  let frame = null;
+  document.querySelector('.tabs [data-tab="tabStream"]').click();
+  document.getElementById('btnStreamStart').click();
+  /* Wrapped AFTER the page installs its own handler, not before: startStream
+     assigns onStreamFrame once its inquiry round trip returns, so a wrapper
+     installed first is overwritten. Waiting for the handler to APPEAR rather
+     than sleeping a guessed 400 ms — the round trip is a mock's, but a slow
+     machine still loses that race, and losing it makes every assertion below
+     fail on a null frame rather than on the thing being tested. */
+  for (let i = 0; i < 100 && !client.onStreamFrame; i++)
+    await new Promise(r => setTimeout(r, 50));
+  const prev = client.onStreamFrame;
+  client.onStreamFrame = (f) => { frame = f; prev?.call(client, f); };
+  /* Waiting for the wrap rather than timing it: how long the connect
+     handshake took decides when in the stream it lands, and a fixed sleep
+     would make this check pass or fail on the host's speed. */
+  for (let i = 0; i < 200; i++) {
+    await new Promise(r => setTimeout(r, 100));
+    if ((client.timelineState?.wraps ?? 0) >= 1 && i > 10) break;
+  }
+  const oc = frame;
+  const ch = Chart.getChart(document.querySelector('.plot-panel canvas'));
+  const xs = ch.data.datasets[0].data.map(p => p.x);
+  let back = 0;
+  for (let i = 1; i < xs.length; i++) if (xs[i] < xs[i-1]) back++;
+  return { back, span: xs.length ? xs[xs.length-1] - xs[0] : 0,
+    hostMs: Date.now(),
+    wraps: window.mockClient?.timelineState?.wraps ?? null,
+    deviceMs: oc?.get('TIMESTAMP', 'cal')?.value ?? null,
+    unixMs: oc?.get('Timestamp_Unix', 'cal')?.value ?? null };
+`);
+check(
+  "the counter wraps during the run",
+  wrap.wraps >= 1,
+  `${wrap.wraps} wrap(s), device clock ${wrap.deviceMs?.toFixed(0)} ms`,
+);
+check(
+  "and nothing on the axis goes backwards across it",
+  /* The `wraps >= 1` guard is the point of the check, not decoration. Where
+     the wrap lands inside the run depends on how long the connect handshake
+     took, so a slow connect can push it past the end — and without the guard
+     "no backwards step" then passes over a run that never wrapped at all,
+     which is exactly the run a broken unwrap would survive. */
+  wrap.wraps >= 1 && wrap.back === 0 && wrap.span > 0,
+  `${wrap.wraps} wrap(s), ${wrap.back} backwards steps over ${wrap.span.toFixed(2)} s`,
+);
+check(
+  "and the wall clock stays on the sensor's own time across it",
+  /* Within one wrap of this host, not equal to it: `rtcWrapIn` moves the
+     sensor's clock forward by up to 512 s to put the counter where it is
+     about to roll over. Ahead by less than a wrap is the sensor's real time;
+     wrong by a multiple of 512 s would be an anchor in the wrong wrap. */
+  wrap.unixMs > wrap.hostMs &&
+    wrap.unixMs - wrap.hostMs < 512000 &&
+    wrap.deviceMs > 0,
+  `sensor ${new Date(wrap.unixMs).toISOString()}, ` +
+    `${((wrap.unixMs - wrap.hostMs) / 1000).toFixed(1)} s ahead of this host`,
 );
 
 // ===========================================================================
@@ -4904,5 +5684,102 @@ console.log(
 );
 if (failed.length)
   console.log("FAILED:", failed.map((f) => f.name).join(" | "));
+
+/* ---------------------------------------------------------------------------
+   The known-failure baseline.
+
+   This pass carries failures that predate it and that nobody has fixed, and
+   for a long time nothing looked at the exit code, so they were invisible
+   unless somebody ran the pass by hand and read the output. Two bad outcomes
+   from that: a regression hides among them, and the list quietly grows.
+
+   `common/dev/verify-known-failures.json` names each one with the reason it is
+   still there. The exit code is then about CHANGE rather than about the total:
+
+   - a failing check that is NOT in the file is a regression → exit 1
+   - a check in the file that now PASSES is stale → exit 1, so the file shrinks
+     as things are fixed rather than rotting
+   - a failing check that is in the file is reported and tolerated
+
+   `--update-baseline` rewrites the file from this run, which is how the list
+   shrinks after a fix. Read the diff before committing it: adding a name here
+   is a decision to ship a known-broken check, and it needs a reason.
+   --------------------------------------------------------------------------- */
+const baselineFile = new URL("./verify-known-failures.json", import.meta.url);
+let baseline = { known: {} };
+try {
+  baseline = JSON.parse(await readFile(baselineFile, "utf8"));
+} catch (e) {
+  if (e.code !== "ENOENT") throw e;
+  console.log("\n(no known-failure baseline; every failure counts as new)");
+}
+const known = baseline.known ?? {};
+
+if (process.argv.includes("--update-baseline")) {
+  const next = {
+    _comment:
+      "Checks in common/dev/verify.mjs that are known to fail, each with why. " +
+      "A failure NOT listed here fails CI; a listed check that starts passing " +
+      "also fails CI, so this list has to shrink as things are fixed. " +
+      "Regenerate with: node common/dev/verify.mjs --update-baseline",
+    known: Object.fromEntries(
+      failed.map((f) => [
+        f.name,
+        known[f.name] ?? "TODO: say why this is still failing",
+      ]),
+    ),
+  };
+  await writeFile(baselineFile, JSON.stringify(next, null, 2) + "\n", "utf8");
+  console.log(`\nBaseline updated: ${failed.length} known failure(s).`);
+  ws.close();
+  process.exit(0);
+}
+
+const regressions = failed.filter((f) => !(f.name in known));
+/* A baseline entry counts as fixed only when the check RAN and passed. A run
+   that never reached it — the pass ends early on a page error — must not read
+   as "fixed" and empty the list. */
+const fixed = Object.keys(known).filter((name) =>
+  results.some((r) => r.name === name && r.pass),
+);
+const stillKnown = failed.filter((f) => f.name in known);
+
+if (stillKnown.length) {
+  console.log(`\n${stillKnown.length} known failure(s), tolerated:`);
+  for (const f of stillKnown)
+    console.log(`  - ${f.name}\n      ${known[f.name]}`);
+}
+if (regressions.length) {
+  console.log(
+    `\nREGRESSION — ${regressions.length} failure(s) not in the baseline:`,
+  );
+  for (const f of regressions) console.log(`  - ${f.name}`);
+}
+/* A listed check that now passes has to be reported, or the list rots — but
+   failing on it is only sound in ONE fixed environment. Some of these failures
+   are environment-sensitive (a transfer that runs out of time on a loaded
+   machine), so a developer's laptop and CI disagree about a couple of entries,
+   and a hard failure there would mean nobody could run the pass locally
+   without editing the baseline first. CI sets `VERIFY_STRICT_BASELINE=1` and
+   is the authority; everywhere else this is a note to act on when convenient. */
+const strict = process.env.VERIFY_STRICT_BASELINE === "1";
+if (fixed.length) {
+  console.log(
+    `
+${strict ? "FIXED" : "note"} — ${fixed.length} baseline ` +
+      `entr${fixed.length === 1 ? "y" : "ies"} now passing` +
+      (strict
+        ? ". Remove them from common/dev/verify-known-failures.json:"
+        : ":"),
+  );
+  for (const name of fixed) console.log(`  - ${name}`);
+  if (!strict) {
+    console.log(
+      "  (not a failure here — regenerate the baseline from a CI run, which is" +
+        "   the environment it describes: node common/dev/verify.mjs --update-baseline)",
+    );
+  }
+}
+
 ws.close();
-process.exit(failed.length ? 1 : 0);
+process.exit(regressions.length || (strict && fixed.length) ? 1 : 0);

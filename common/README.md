@@ -41,7 +41,7 @@ Three rules the whole library follows, so a page can rely on them:
 | `rtc-drift-panel.js`        | `createRtcDriftPanel` — samples the sensor's real-world clock against this host's, least-squares fits the drift in ppm, plots it, holds a screen wake lock, detects a stepped host clock and a sensor set on a different time convention, and exports CSV with its metadata.                                                                                                                                                                                                                                                                    |
 | `vendor/chart.umd.min.js`   | Chart.js 4.5.1, pinned. See `vendor/README.md`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `dev/mock-shimmer3r.js`     | `createMockShimmer3RTransport`, `mockEnabledFromUrl` — a scripted Shimmer3R for developing without hardware.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `dev/verify.mjs`            | The browser verification pass — see below.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `dev/verify.mjs`            | The browser verification pass — see below. Runs in CI.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 ## Using it from a page
 
@@ -161,6 +161,35 @@ can name every OTHER panel's busy flag. All the panels compete for one link, so
 each new panel silently ages the refusal text of every panel written before it
 — a control greys out with nothing on screen to say why. Adding a panel means
 adding its flag to that matrix.
+
+### It runs in CI, and gates on change rather than on the total
+
+`.github/workflows/verify.yml` runs the pass on every push and pull request.
+For a long time nothing did, and that cost more than it saved: a block of
+eleven genuinely broken checks sat failing for months, invisible because
+reading the result meant running the pass by hand — and a regression could have
+hidden among them without anyone noticing which failures were new.
+
+So the gate is about **change**. `dev/verify-known-failures.json` lists what is
+known broken, one entry per check, each with the reason it is still there. It
+is **empty**, and worth keeping that way:
+
+- a failing check that is **not** in the list is a regression, and fails the
+  build
+- a check in the list that now **passes** is stale, and also fails the build,
+  so the list shrinks as things get fixed rather than growing quietly
+- a failing check that is in the list is printed with its reason and tolerated
+
+Regenerate the list from a run with `node common/dev/verify.mjs
+--update-baseline`, then read the diff before committing it. Adding a name is a
+decision to ship a known-broken check, and it needs a reason written next to
+it — the file is the record of that decision, not a mute allow-list.
+
+`VERIFY_CRC=0` runs the whole pass with the link CRC off. That switch is what
+emptied the list: eleven SD-transfer checks failed with a CRC on and passed
+with it off, which said they shared a cause rather than being flaky, and the
+cause turned out to be the mock applying the link CRC to transfer frames the
+firmware sends raw. CI runs that variant too, non-blocking.
 
 **Do not run Prettier across the whole repository from here.** This checkout
 has CRLF line endings, so `--list-different "**/*.html"` flags every HTML file

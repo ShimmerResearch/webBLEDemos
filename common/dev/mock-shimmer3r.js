@@ -96,6 +96,8 @@ const CMD = Object.freeze({
   GET_RWC: 0x91,
   VBATT_RESPONSE: 0x94,
   GET_VBATT: 0x95,
+  PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE: 0xa6,
+  GET_PRESSURE_CALIBRATION_COEFFICIENTS: 0xa7,
   STOP_SDBT: 0x97,
   SET_CALIB_DUMP: 0x98,
   RSP_CALIB_DUMP: 0x99,
@@ -151,7 +153,39 @@ const SENSOR_CHANNELS = Object.freeze([
   { bit: 0x000008, label: "ExG2 24-bit", ids: [0x20, 0x21, 0x22] },
   { bit: 0x100000, label: "ExG1 16-bit", ids: [0x1d, 0x23, 0x24] },
   { bit: 0x080000, label: "ExG2 16-bit", ids: [0x20, 0x25, 0x26] },
+  /* The rest of what a real sensor can send. Absent until now, which meant the
+     mock could not exercise the calibrated ADC, battery, pressure or
+     bridge-amplifier paths at all. */
+  { bit: 0x002000, label: "battery", ids: [0x03] },
+  { bit: 0x200000, label: "alt mag", ids: [0x17, 0x18, 0x19] },
+  { bit: 0x000002, label: "ext ADC 0", ids: [0x0d] },
+  { bit: 0x000001, label: "ext ADC 1", ids: [0x0e] },
+  { bit: 0x000800, label: "ext ADC 2", ids: [0x0f] },
+  { bit: 0x000400, label: "int ADC 3", ids: [0x10] },
+  { bit: 0x000200, label: "int ADC 0", ids: [0x11] },
+  { bit: 0x800000, label: "int ADC 2", ids: [0x13] },
+  /* Pressure and temperature are one enable bit and two channels, and the
+     firmware emits them in the OPPOSITE order on the two generations —
+     pressure first on a Shimmer3R, temperature first on a Shimmer3 — with
+     different widths too. `sensorChannelsFor` picks the right pair. */
+  { bit: 0x040000, label: "pressure/temperature", ids: [0x1b, 0x1a] },
+  // Shimmer3 only: there is no Shimmer3R bridge-amplifier channel.
+  { bit: 0x008000, label: "bridge amp", ids: [0x27, 0x28], shimmer3Only: true },
 ]);
+
+/**
+ * The channel table for one hardware generation.
+ *
+ * Two things differ. A Shimmer3 has no ADS7028 and its bridge amplifier is a
+ * real expansion board, so `0x27`/`0x28` exist there and nowhere else; and the
+ * BMP pair is emitted in the opposite order with different widths.
+ */
+function sensorChannelsFor(hardwareVersion) {
+  const isShimmer3 = hardwareVersion === 3;
+  return SENSOR_CHANNELS.filter((g) => isShimmer3 || !g.shimmer3Only).map(
+    (g) => (g.bit === 0x040000 && isShimmer3 ? { ...g, ids: [0x1a, 0x1b] } : g),
+  );
+}
 
 /**
  * Channel width and byte order, per channel ID. The same table the SDK's
@@ -186,7 +220,125 @@ const CHANNEL_WIDTH = Object.freeze({
   0x24: { bytes: 2, be: true },
   0x25: { bytes: 2, be: true },
   0x26: { bytes: 2, be: true },
+  0x03: { bytes: 2, be: false, unsigned: true },
+  0x0d: { bytes: 2, be: false, unsigned: true },
+  0x0e: { bytes: 2, be: false, unsigned: true },
+  0x0f: { bytes: 2, be: false, unsigned: true },
+  0x10: { bytes: 2, be: false, unsigned: true },
+  0x11: { bytes: 2, be: false, unsigned: true },
+  0x13: { bytes: 2, be: false, unsigned: true },
+  0x17: { bytes: 2, be: false },
+  0x18: { bytes: 2, be: false },
+  0x19: { bytes: 2, be: false },
+  0x27: { bytes: 2, be: false, unsigned: true },
+  0x28: { bytes: 2, be: false, unsigned: true },
 });
+
+/**
+ * The pressure/temperature widths, which are the one place the two generations
+ * disagree about a channel's LAYOUT rather than its name: 3 little-endian bytes
+ * each on a Shimmer3R, 2 big-endian temperature bytes plus 3 big-endian
+ * pressure bytes on a Shimmer3 (`CHANNEL_FORMAT_OVERRIDES`).
+ */
+const BMP_WIDTH = Object.freeze({
+  shimmer3: {
+    0x1a: { bytes: 2, be: true, unsigned: true },
+    0x1b: { bytes: 3, be: true, unsigned: true },
+  },
+  shimmer3r: {
+    0x1a: { bytes: 3, be: false, unsigned: true },
+    0x1b: { bytes: 3, be: false, unsigned: true },
+  },
+});
+
+/**
+ * Raw values that convert to something a person would believe.
+ *
+ * A full-scale sine is the right synthetic signal for an accelerometer axis,
+ * where the point is to see the trace move. It is the wrong one for a channel
+ * whose calibrated value is a physical quantity: 4095 counts of battery is
+ * 6 V, and a BMP390 fed a sine reports the compensation clamp. These centres
+ * and amplitudes are chosen so the CALIBRATED plot reads plausibly — about
+ * 3.9 V of battery, room temperature, sea-level pressure, mid-scale ADC.
+ */
+const PLAUSIBLE_SAMPLES = Object.freeze({
+  0x03: { centre: 2000, amplitude: 12 }, // battery ≈ 3.93 V after the ×2 divider
+  0x0d: { centre: 2048, amplitude: 400 }, // ext ADC ≈ 1.5 V ± 0.3
+  0x0e: { centre: 2048, amplitude: 400 },
+  0x0f: { centre: 2048, amplitude: 400 },
+  0x10: { centre: 2048, amplitude: 400 }, // int ADC
+  0x11: { centre: 2048, amplitude: 400 },
+  0x13: { centre: 2048, amplitude: 400 },
+  0x12: { centre: 2048, amplitude: 600 }, // PPG
+  0x1c: { centre: 2000, amplitude: 300 }, // GSR, inside range 0's window
+  0x27: { centre: 2048, amplitude: 300 }, // bridge amp
+  0x28: { centre: 2048, amplitude: 300 },
+});
+
+/**
+ * The pressure pair, whose raw registers mean different things on the two
+ * generations — and whose Shimmer3R values do not even FIT a Shimmer3's
+ * channel widths.
+ *
+ * A Shimmer3 sends temperature as 2 bytes, so the BMP390's `0x7FBA00` is
+ * truncated to `0xBA00` on the wire: fed through the BMP180 compensation that
+ * is about 149 °C, and its 24-bit pressure is eight times the BMP180's largest
+ * possible reading. Keying these by channel id alone made a `&hw=3` mock look
+ * like a broken conversion.
+ *
+ * Shimmer3R values are the BMP390 vector's own registers (about 100.9 kPa and
+ * 23.2 °C through the fixture below). Shimmer3 values are the BMP180
+ * datasheet's worked example, `UT = 27898` and `UP = 23843 << 8` — the same
+ * numbers the SDK's own compensation tests use, so a mock stream and a unit
+ * test agree on what the answer should be.
+ */
+const PRESSURE_SAMPLES = Object.freeze({
+  shimmer3: {
+    0x1b: { centre: 23843 << 8, amplitude: 0x400 },
+    0x1a: { centre: 27898, amplitude: 40 },
+  },
+  shimmer3r: {
+    0x1b: { centre: 0x640d00, amplitude: 0x400 },
+    0x1a: { centre: 0x7fba00, amplitude: 0x200 },
+  },
+});
+
+/**
+ * What the mock answers `GET_PRESSURE_CALIBRATION_COEFFICIENTS` with.
+ *
+ * The BMP390 block is the vector in the Java driver's own
+ * `CalibDetailsBmp390.main()`, so the kPa and °C this mock produces can be
+ * checked against a number nobody here chose. The BMP180 block is the
+ * datasheet's worked example (BST-BMP180-DS000 §3.5). A BMP581 sends no
+ * coefficients at all — that is the part, not a fault.
+ *
+ * There is no BMP280 fixture: no public worked vector was to hand, and
+ * inventing coefficients would produce a confident, unverifiable pressure.
+ */
+const PRESSURE_FIXTURES = Object.freeze({
+  390: {
+    id: 2,
+    coeffs: [
+      0xe7, 0x6b, 0xf0, 0x4a, 0xf9, 0xab, 0x1c, 0x9b, 0x15, 0x06, 0x01, 0xd2,
+      0x49, 0x18, 0x5f, 0x03, 0xfa, 0x3a, 0x0f, 0x07, 0xf5,
+    ],
+  },
+  581: { id: 3, coeffs: [] },
+  180: {
+    id: 0,
+    // AC1..MD, big-endian pairs, from the datasheet's example.
+    coeffs: [
+      0x01, 0x98, 0xff, 0xb8, 0xc7, 0xd1, 0x7f, 0xe5, 0x7f, 0xf5, 0x5a, 0x71,
+      0x18, 0x2e, 0x00, 0x04, 0x80, 0x00, 0xdd, 0xf9, 0x0b, 0x34,
+    ],
+  },
+});
+
+/** Width for one channel id, on one generation. */
+function channelWidthFor(id, hardwareVersion) {
+  const bmp = BMP_WIDTH[hardwareVersion === 3 ? "shimmer3" : "shimmer3r"][id];
+  return bmp ?? CHANNEL_WIDTH[id] ?? { bytes: 2, be: false };
+}
 
 /** Sampling clock: rate = 32768 / divisor. */
 const SAMPLING_CLOCK_HZ = 32768;
@@ -368,7 +520,14 @@ function buildSyntheticCalibDump(hardwareVersion, fw) {
   const CAL_A = Date.UTC(2026, 5, 11, 12, 0, 0) / 1000;
   const CAL_B = Date.UTC(2026, 3, 2, 12, 0, 0) / 1000;
   /* Not a kinematic block: the pressure chips' factory coefficients, which
-     the calibration tab has to show as present-but-not-editable. */
+     the calibration tab has to show as present-but-not-editable.
+
+     A record no FIRMWARE would write, on purpose. `ShimCalib_findLength`
+     returns 0 for id 43, so a Shimmer3R never creates one — but
+     `SET_CALIB_DUMP` writes bytes straight into the blob at a host-chosen
+     offset, so a host CAN put one there and the device will store and echo it
+     without ever applying it. Serving one here keeps a host honest about that:
+     a dump is not a statement of what the device understands. */
   const pressure = Uint8Array.from({ length: 22 }, (_, i) => 0x40 + i);
 
   if (hw === 3) {
@@ -622,6 +781,13 @@ export function mockEnabledFromUrl() {
  *   reports. Pass `null` to NACK it instead, which is how a page's
  *   "hardware not positively identified" path gets exercised — the one a
  *   defaulted hardware version silently defeats.
+ * @param {"390"|"581"|"180"|"nack"|"silent"} [opts.pressure] how the mock
+ *   answers GET_PRESSURE_CALIBRATION_COEFFICIENTS (0xA7). Defaults to the part
+ *   the hardware version implies — BMP390 on a Shimmer3R, BMP180 on a
+ *   Shimmer3. `nack` refuses it, as firmware without the command does; `silent`
+ *   answers nothing at all, as firmware old enough to lack even the refusal
+ *   does. Either way pressure and temperature stream raw-only, which is a path
+ *   worth being able to see.
  * @param {number} [opts.sdKBps=120] throughput of streamed SD file blocks
  * @param {number} [opts.linkKBps=180] throughput reported by the firmware
  *   data-rate test (SET_DATA_RATE_TEST)
@@ -656,6 +822,13 @@ export function createMockShimmer3RTransport(opts = {}) {
     (opts.hardwareVersion !== null && !Number.isFinite(opts.hardwareVersion))
       ? 10
       : opts.hardwareVersion;
+
+  /* Which pressure part this mock claims to carry. Defaults to the one the
+     platform really would: a Shimmer3R has a BMP390 or BMP581, a Shimmer3 a
+     BMP180 or BMP280. */
+  const pressureMode = String(
+    opts.pressure ?? (hardwareVersion === 3 ? "180" : "390"),
+  );
   const sdKBps = Math.max(1, opts.sdKBps ?? SD_DEFAULT_KBPS);
   const linkKBps = Math.max(1, opts.linkKBps ?? LINK_DEFAULT_KBPS);
 
@@ -668,12 +841,38 @@ export function createMockShimmer3RTransport(opts = {}) {
   const rtcOpts = opts.rtc ?? {};
   const rtcPpm = Number.isFinite(rtcOpts.ppm) ? Number(rtcOpts.ppm) : 0;
   const rtcClockBase = rtcOpts.clockBase === "local" ? "local" : "utc";
+  /* `wrapInSec` puts the sensor's clock where its low 24 bits are about to
+     roll over, so a short stream crosses a wrap. It moves the CLOCK, not the
+     stream counter, because on a Shimmer3R the two are the same number (see
+     `startStreaming`) and moving one without the other would model a sensor
+     that does not exist. Up to 512 s of date shift is the price, and that is
+     itself a legitimate sensor state. */
+  /* A bad value is a typo, not a request. `hw=` and `sensors=` both warn on
+     one; this said nothing and behaved as though the option were absent. */
+  const rtcWrapInSec =
+    rtcOpts.wrapInSec === undefined || rtcOpts.wrapInSec === null
+      ? null
+      : Number.isFinite(Number(rtcOpts.wrapInSec)) &&
+          Number(rtcOpts.wrapInSec) >= 0
+        ? Number(rtcOpts.wrapInSec)
+        : (console.warn(
+            `mock: ignoring rtcWrapIn="${rtcOpts.wrapInSec}" — it must be a non-negative number of seconds.`,
+          ),
+          null);
   const rtc = {
     devMsAtSet:
       Date.now() +
       (rtcClockBase === "local" ? -new Date().getTimezoneOffset() * 60000 : 0),
     setAtHostMs: Date.now(),
   };
+  if (rtcWrapInSec != null) {
+    const ticks = Math.round(rtc.devMsAtSet * 32.768);
+    const target = 0x1000000 - Math.round(rtcWrapInSec * SAMPLING_CLOCK_HZ);
+    // Forward to the next tick count whose low 24 bits are `target`, so the
+    // clock never moves backwards past a reading a host may already hold.
+    const ahead = (target - (ticks % 0x1000000) + 0x1000000) % 0x1000000;
+    rtc.devMsAtSet = (ticks + ahead) / 32.768;
+  }
   /** The sensor's clock now, in its own epoch, drifting at `rtcPpm`. */
   const deviceNowMs = () =>
     rtc.devMsAtSet + (Date.now() - rtc.setAtHostMs) * (1 + rtcPpm / 1e6);
@@ -1082,9 +1281,20 @@ export function createMockShimmer3RTransport(opts = {}) {
     }
   }
 
-  /** Stream data: one buffer per burst, chunked but never spread over time. */
-  function replyStream(frame) {
-    const u8 = appendCrc(frame, crcMode);
+  /**
+   * Bulk traffic: one buffer per burst, chunked but never spread over time.
+   *
+   * `crc` says whether the LINK CRC belongs on it, because that is a property
+   * of which firmware path sent the bytes rather than of how they are
+   * delivered. `btCrcMode` is honoured in exactly three places — the command
+   * response path, the instream status push and the stream data packet
+   * (`Sensing/shimmer_sensing.c:680`) — so a data packet carries it and an SD
+   * transfer frame does not: those are written straight to the TX buffer with
+   * their own CRC-16 per frame (`Comms/shimmer_sd_file_transfer.c:340,634`).
+   * The data-rate test bypasses the ring and the CRC both (`:2987`).
+   */
+  function sendBulk(frame, { crc }) {
+    const u8 = crc ? appendCrc(frame, crcMode) : frame;
     if (framed || u8.length <= dribbleBytes) {
       transport.notify(u8);
       return;
@@ -1093,6 +1303,21 @@ export function createMockShimmer3RTransport(opts = {}) {
       transport.notify(u8.slice(off, off + dribbleBytes));
     }
   }
+
+  /** Stream data packets, which the firmware DOES CRC. */
+  const replyStream = (frame) => sendBulk(frame, { crc: true });
+
+  /**
+   * SD-transfer frames and the data-rate test, which it does not.
+   *
+   * Applying the link CRC to these was a mock defect that read as an SDK one:
+   * the client correctly treats them as exempt, so the two extra bytes per
+   * frame desynchronised every download on a link with a CRC — which is the
+   * default the demo page connects with. Eleven checks in the verification
+   * pass failed on it, and passed with `VERIFY_CRC=0`, which is what
+   * eventually pointed at the mock rather than at the SDK.
+   */
+  const replyStreamNoCrc = (frame) => sendBulk(frame, { crc: false });
 
   function hex(u8) {
     return Array.from(u8, (b) => b.toString(16).padStart(2, "0")).join(" ");
@@ -1146,7 +1371,7 @@ export function createMockShimmer3RTransport(opts = {}) {
   /** Enabled channel IDs, deduplicated, in firmware report order. */
   function channelIds() {
     const ids = [];
-    for (const group of SENSOR_CHANNELS) {
+    for (const group of sensorChannelsFor(hardwareVersion)) {
       if (!(state.sensors & group.bit)) continue;
       for (const id of group.ids) if (!ids.includes(id)) ids.push(id);
     }
@@ -1181,14 +1406,31 @@ export function createMockShimmer3RTransport(opts = {}) {
    * broken one at a glance, and to make an axis mix-up obvious.
    */
   function sampleFor(id, n) {
-    const width = CHANNEL_WIDTH[id] ?? { bytes: 2, be: false };
-    const full = width.unsigned
-      ? (1 << (width.bytes * 8)) - 1
-      : (1 << (width.bytes * 8 - 1)) - 1;
+    const width = channelWidthFor(id, hardwareVersion);
     const t = n / state.rateHz;
     const phase = ((id * 37) % 360) * (Math.PI / 180);
     const freq = 0.7 + (id % 5) * 0.4;
     const swing = Math.sin(2 * Math.PI * freq * t + phase);
+
+    /* The channels whose calibrated value is a physical quantity get a
+       plausible one, because a full-scale sine through the ADC formula reads as
+       3000 mV of battery or 125 kPa of air and makes a calibrated plot useless
+       for telling right from wrong. The rest keep the old full-scale sine,
+       which is what makes an axis mix-up obvious. */
+    const plausible =
+      (hardwareVersion === 3
+        ? PRESSURE_SAMPLES.shimmer3
+        : PRESSURE_SAMPLES.shimmer3r)[id] ?? PLAUSIBLE_SAMPLES[id];
+    if (plausible) {
+      return Math.max(
+        0,
+        Math.round(plausible.centre + plausible.amplitude * swing),
+      );
+    }
+
+    const full = width.unsigned
+      ? (1 << (width.bytes * 8)) - 1
+      : (1 << (width.bytes * 8 - 1)) - 1;
     if (width.unsigned) return Math.round(full * (0.5 + 0.3 * swing));
     return Math.round(full * 0.45 * swing);
   }
@@ -1196,7 +1438,7 @@ export function createMockShimmer3RTransport(opts = {}) {
   /** `[0x00][ts u24 LE][channel values…]` for one sample. */
   function dataFrame(ids, ticks, n) {
     let size = 1 + 3;
-    for (const id of ids) size += CHANNEL_WIDTH[id]?.bytes ?? 2;
+    for (const id of ids) size += channelWidthFor(id, hardwareVersion).bytes;
     const out = new Uint8Array(size);
     out[0] = CMD.DATA_PACKET;
     out[1] = ticks & 0xff;
@@ -1204,7 +1446,7 @@ export function createMockShimmer3RTransport(opts = {}) {
     out[3] = (ticks >> 16) & 0xff;
     let at = 4;
     for (const id of ids) {
-      const width = CHANNEL_WIDTH[id] ?? { bytes: 2, be: false };
+      const width = channelWidthFor(id, hardwareVersion);
       let v = sampleFor(id, n);
       if (!width.unsigned && v < 0) v += 1 << (width.bytes * 8);
       for (let i = 0; i < width.bytes; i++) {
@@ -1216,18 +1458,47 @@ export function createMockShimmer3RTransport(opts = {}) {
     return out;
   }
 
+  /**
+   * Where the stream's tick counter starts, which is a per-generation fact.
+   *
+   * On a **Shimmer3R** the packet timestamp is `RTC_get32()` — the low 24 bits
+   * of the very counter `GET_RWC` reports as `RTC_get64()`
+   * (`RTC/shimmer_rtc.h:25-28`; `Core/Src/rtc.c` gives the two identical
+   * bodies). That identity is the whole reason a host can pin a Shimmer3R
+   * stream to a wall clock exactly, so a mock that started the counter at zero
+   * would let an aligned anchor look like it worked while placing every sample
+   * up to 256 s from the truth — the error is bounded by the wrap, so it never
+   * looks absurd enough to notice.
+   *
+   * On a **Shimmer3** it is a free-running counter since boot
+   * (`Shimmer_Driver/5xx_HAL/hal_RTC.c`), and the real-world clock is that
+   * counter plus a stored offset which never leaves the device. Zero is right
+   * there: a host has to estimate the offset from the request round trip, and
+   * a mock whose counter happened to agree with its clock would hide that.
+   */
+  function streamStartTicks() {
+    if (hardwareVersion === 3) return 0;
+    return Number(BigInt(Math.round(deviceNowMs() * 32.768)) & 0xffffffn);
+  }
+
   function startStreaming() {
     if (streamTimer) return;
     const ids = channelIds();
-    streamTicks = 0;
+    streamTicks = streamStartTicks();
     samplesEmitted = 0;
-    streamStartMs = performance.now();
+    /* The DEVICE's clock, not this host's. A real sensor times its samples
+       from the same crystal its real-world clock runs on, so under `&ppm=` the
+       two must drift together; pacing the stream off `performance.now()` let
+       the counter and the clock separate linearly over a long run, which on a
+       Shimmer3R would break the very identity `streamStartTicks` exists to
+       model. */
+    streamStartMs = deviceNowMs();
     const ticksPerSample = SAMPLING_CLOCK_HZ / state.rateHz;
     streamTimer = setInterval(() => {
       // Emit whatever is due since the last tick rather than one frame per
       // timer callback: browsers clamp timers, so a fixed one-frame tick
       // would silently cap the rate at ~250 Hz.
-      const elapsed = (performance.now() - streamStartMs) / 1000;
+      const elapsed = (deviceNowMs() - streamStartMs) / 1000;
       const due = Math.floor(elapsed * state.rateHz) - samplesEmitted;
       for (let i = 0; i < due; i++) {
         replyStream(
@@ -1328,8 +1599,8 @@ export function createMockShimmer3RTransport(opts = {}) {
     out[8 + payload.length] = (crc >> 8) & 0xff;
     // Bulk data, so delivered like stream data: chunked on an unframed
     // transport but never spread over macrotasks, or a 293 KB file would be
-    // a hundred thousand timers.
-    replyStream(out);
+    // a hundred thousand timers. No LINK CRC on top of the frame's own.
+    replyStreamNoCrc(out);
   }
 
   /** `[0x8A][0xC6][sess][status][nextOffset u32][crc16]` */
@@ -1343,7 +1614,7 @@ export function createMockShimmer3RTransport(opts = {}) {
     const crc = sdCrc16(out, 8);
     out[8] = crc & 0xff;
     out[9] = (crc >> 8) & 0xff;
-    replyStream(out);
+    replyStreamNoCrc(out);
   }
 
   // -------------------------------------------------------------------------
@@ -1658,7 +1929,8 @@ export function createMockShimmer3RTransport(opts = {}) {
         out[i * 5] = CMD.DATA_RATE_TEST_RESPONSE;
         view.setUint32(i * 5 + 1, rateCounter++ >>> 0, true);
       }
-      replyStream(out);
+      // A raw throughput flood by design: no link CRC.
+      replyStreamNoCrc(out);
     }, SD_TICK_MS);
     return true;
   }
@@ -2122,6 +2394,31 @@ export function createMockShimmer3RTransport(opts = {}) {
         reply(concat([ACK], statusResponse()));
         return;
 
+      case CMD.GET_PRESSURE_CALIBRATION_COEFFICIENTS: {
+        /* `[0xA6][1 + n][sensorId][coeffs]` — the length byte counts the id
+           (`Comms/shimmer_bt_uart.c:2064-2099`). A BMP581 sends the id alone,
+           which is a SUCCESS: it compensates on-chip, and the firmware sends
+           the id in-band precisely so a host can tell that from a NACK. */
+        if (pressureMode === "nack") {
+          reply([NACK]);
+          return;
+        }
+        const fixture = PRESSURE_FIXTURES[pressureMode];
+        if (!fixture) {
+          // 'silent' models firmware old enough to have no such command at
+          // all — it answers nothing, and the host times out.
+          return;
+        }
+        reply([
+          ACK,
+          CMD.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE,
+          1 + fixture.coeffs.length,
+          fixture.id,
+          ...fixture.coeffs,
+        ]);
+        return;
+      }
+
       case CMD.GET_VBATT: {
         // ~3.9 V on a Shimmer3R divider, discharging: a value a battery
         // gauge can render without looking like a fault.
@@ -2416,6 +2713,19 @@ export function createMockShimmer3RTransport(opts = {}) {
         // sensor keeps its own time, and keeps drifting at `rtc.ppm`.
         rtc.devMsAtSet = Number(ticks) / 32.768;
         rtc.setAtHostMs = Date.now();
+        /* And re-seat the STREAM counter with it, on a Shimmer3R, because
+           there the two are one number: the packet timestamp is the low 24
+           bits of the counter `GET_RWC` reports. Setting the clock mid-stream
+           is allowed by the firmware, and leaving the counter where it was
+           would model a sensor whose packets disagree with its own clock —
+           which is precisely the shape a host's aligned anchor would then be
+           tested against, wrongly. On a Shimmer3 the counter is independent of
+           the clock and correctly stays put. */
+        if (hardwareVersion !== 3 && streamTimer) {
+          streamTicks = streamStartTicks();
+          streamStartMs = deviceNowMs();
+          samplesEmitted = 0;
+        }
         // What the "Clock set" status bit means: not that the clock reads
         // something, but that a host has set it since the sensor last lost
         // power (`RTC_isRwcTimeSet`).

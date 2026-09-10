@@ -1,0 +1,4 @@
+{
+  "_comment": "Checks in common/dev/verify.mjs that are known to fail, each with why. EMPTY, and worth keeping that way: every check passes. A failure NOT listed here fails CI, and a listed check that starts passing fails CI too (under VERIFY_STRICT_BASELINE, which the workflow sets), so the list shrinks as things are fixed. It describes the CI environment - ubuntu-latest, the pinned Chrome - so regenerate it from a CI run rather than from a laptop: node common/dev/verify.mjs --update-baseline. Adding a name is a decision to ship a known-broken check and needs a reason written beside it.",
+  "known": {}
+}

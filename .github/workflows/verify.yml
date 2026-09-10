@@ -1,0 +1,115 @@
+# The ShimmerCapture verification pass, on every push and pull request.
+#
+# `common/dev/verify.mjs` drives the real page in a real browser over CDP
+# against the ?mock=1 transport: ~290 checks over the connect handshake, the
+# configuration form, the sensor rules, the plot, the CSV recorder, the SD
+# browser, the self-test and the clock. It has existed for a while and nothing
+# ran it, so its failures were invisible unless somebody ran it by hand and
+# read the output — which is how a block of eleven broken checks survived, and
+# how a regression could have hidden among them.
+#
+# It gates on CHANGE, not on the total: `common/dev/verify-known-failures.json`
+# lists what is known broken and why, a failure outside that list fails the
+# build, and a listed check that starts passing ALSO fails the build so the
+# list shrinks rather than rots. See the tail of verify.mjs.
+name: Verify ShimmerCapture
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    # Both link-CRC settings, because the difference between them is diagnostic
+    # and nothing else in the pass reports it. A CRC changes more than a
+    # trailer: `_reframing` turns on, so every inbound chunk goes through the
+    # SDK's framer even over BLE, and a whole class of defect only exists on
+    # that path: eighteen checks were failing on it at once, from three
+    # separate causes, and the CRC-off run coming back clean is what said they
+    # were defects of that path rather than flaky tests. A failure in one
+    # variant and not the other says where to look.
+    #
+    # The CRC-off run does not block: the shape a user is actually on is the
+    # default, two bytes, and a red mark on the variant would stop a merge for
+    # something the product does not do. It is here to be read.
+    name: verify (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    continue-on-error: ${{ matrix.crc == '0' }}
+    strategy:
+      # Independent runs, so one failing must not cancel the other -- the
+      # comparison between them is the whole point.
+      fail-fast: false
+      matrix:
+        include:
+          - crc: "2"
+            label: link CRC on
+          - crc: "0"
+            label: link CRC off
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # Pinned rather than relying on whatever Chrome the runner image carries,
+      # so a runner-image change cannot move the browser under the pass.
+      - name: Setup Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
+      # One step for the server, the browser and the pass. Backgrounded
+      # processes are not guaranteed to outlive the step that started them, and
+      # a pass that cannot say WHY the browser did not come up is a pass
+      # nobody can fix from the log — so both get a log file, and both logs are
+      # printed when something goes wrong.
+      - name: Run the verification pass
+        env:
+          # Chrome's sandbox does not come up on the runners, and this is a
+          # throwaway container loading only localhost.
+          CHROME_FLAGS: >-
+            --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage
+            --no-first-run --no-default-browser-check
+        run: |
+          set -uo pipefail
+          CHROME='${{ steps.chrome.outputs.chrome-path }}'
+          echo "chrome: $CHROME"
+          "$CHROME" --version
+
+          # Serves the REPO ROOT, not the demo folder: the cross-demo checks
+          # walk up from the demo to the root to police which files may import
+          # the extension's private SDK copy.
+          npx --yes http-server . -p 8129 -c-1 --silent > "$RUNNER_TEMP/http.log" 2>&1 &
+          "$CHROME" $CHROME_FLAGS --remote-debugging-port=9333 \
+            --user-data-dir="$RUNNER_TEMP/chrome-verify" \
+            about:blank > "$RUNNER_TEMP/chrome.log" 2>&1 &
+
+          up() { curl -fsS -o /dev/null "$1"; }
+          for i in $(seq 1 60); do
+            if up http://localhost:8129/ShimmerCapture/ && up http://127.0.0.1:9333/json/version; then
+              ready=1; break
+            fi
+            sleep 1
+          done
+          if [ "${ready:-0}" != "1" ]; then
+            echo "::error::the static server or Chrome never came up"
+            echo "--- http-server ---"; cat "$RUNNER_TEMP/http.log" || true
+            echo "--- chrome ---";      cat "$RUNNER_TEMP/chrome.log" || true
+            exit 1
+          fi
+
+          # Strict here and only here: CI is the environment the baseline
+          # describes, so a listed check that starts passing has to fail the
+          # build. Elsewhere it is a note, or nobody could run the pass on a
+          # laptop without editing the baseline first.
+          VERIFY_CRC='${{ matrix.crc }}' VERIFY_STRICT_BASELINE=1 node common/dev/verify.mjs
+          status=$?
+          if [ "$status" != "0" ]; then
+            echo "--- chrome ---"; tail -40 "$RUNNER_TEMP/chrome.log" || true
+          fi
+          exit $status

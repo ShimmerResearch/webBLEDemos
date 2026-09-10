@@ -60,7 +60,8 @@
  * @param {"ble"|"rfcomm"|"usb"|string} [mode] the link the client is on
  * @returns {{
  *   stream: boolean, sdbt: boolean, infomem: boolean, sdlog: boolean,
- *   calib: boolean, calibration: boolean, rtc: boolean, ranges: boolean,
+ *   calib: boolean, calibration: boolean, pressureCalibration: boolean,
+ *   rtc: boolean, ranges: boolean,
  *   exg: boolean, sensors: boolean, battery: boolean, status: boolean,
  *   sdTransfer: boolean, branding: boolean, factoryTest: boolean,
  *   ledToggle: boolean, rtcRead: boolean,
@@ -102,6 +103,13 @@ export function describeShimmer3Caps(client, mode) {
        InfoMem calibration blocks read-only there — and naming a link would
        claim the reason is the protocol when it is the client. */
     calibration: has("readCalibDump") && has("writeCalibDump"),
+    /* The fitted pressure part and its factory trim
+       (GET_PRESSURE_CALIBRATION_COEFFICIENTS, 0xA7). Radio-only: the dock
+       protocol has no such command, so asking over USB would spend a timeout
+       to learn nothing. Without it PRESSURE and TEMPERATURE stream raw-only —
+       the firmware relays the chip's raw registers and leaves kPa and °C to
+       the host. */
+    pressureCalibration: has("readPressureCalibration") && mode !== "usb",
     rtc: has("setRtcTime") && has("getRtcTime"),
     ranges: has("setWrAccelRange") && has("setGyroRange"),
     exg: has("enableEMG16Bit") && has("enableECG16Bit"),
