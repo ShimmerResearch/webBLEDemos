@@ -1463,7 +1463,7 @@
       scanBtn.addEventListener("click", async () => {
         try {
           await client.connect();
-          nameEl.textContent = client.device?.name || "Shimmer3R";
+          nameEl.textContent = client.device?.name || "(name not reported)";
           configBtn.disabled = false;
           disconnBtn.disabled = false;
           window._uiLog("✅ Connected");
