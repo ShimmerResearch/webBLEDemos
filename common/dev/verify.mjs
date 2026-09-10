@@ -125,9 +125,11 @@ async function goto(url) {
 /* The link CRC the pass connects with. The page defaults to 2 bytes and every
    check below runs that way; `VERIFY_CRC=0` runs the whole pass with it off,
    which is how a failure that only happens with the CRC on is separated from
-   one that happens either way. Worth having as a switch rather than a
-   one-off probe: the difference is what identified the stray-byte defect the
-   known-failure list points at. */
+   one that happens either way. Worth having as a switch rather than a one-off
+   probe: eighteen checks were failing here, and the CRC-off run coming back
+   clean said they were defects of the CRC path rather than flaky tests --
+   three separate causes, none of them reachable with the CRC off. CI runs both
+   variants, the CRC-off one non-blocking. */
 const CRC_MODE = process.env.VERIFY_CRC ?? "2";
 
 /**
@@ -5498,33 +5500,65 @@ check(
     !cleared.gated,
   `${cleared.before.join(",")} → ${cleared.emptied.join(",")} → ${cleared.refilled.join(",")}`,
 );
-check(
-  "and it does not re-zero the time axis, which the CSV keeps counting from",
-  /* A view control must not make the plot disagree with the file about when
-     something happened: `TIMESTAMP_CAL` counts from the stream's first sample
-     whatever this button does. */
-  cleared.axisAfter === cleared.axisBefore,
-  `${cleared.axisBefore} → ${cleared.axisAfter}`,
-);
-
 const elapsed = await evaluate(`
   const sel = document.getElementById('selTimeAxis');
   sel.value = 'elapsed';
   sel.dispatchEvent(new Event('change', { bubbles: true }));
   await new Promise(r => setTimeout(r, 600));
-  const ch = Chart.getChart(document.querySelector('.plot-panel canvas'));
-  return { firstTick: ch.scales.x.ticks?.[0]?.label ?? null,
-    xTitle: ch.options.scales.x.title.text, xMin: ch.scales.x.min };
+  const ch = () => Chart.getChart(document.querySelector('.plot-panel canvas'));
+  /* Clear a SECOND time, here in Elapsed mode, because this is the only mode
+     the origin shows up in — and keeping it is the whole reason the handler
+     passes keepOrigin. In Clock mode the x values are unix seconds and the
+     axis title carries only the date, so nothing there tells the two
+     behaviours apart.
+
+     Read from the TICK LABEL, not from scales.x.min. The scale holds raw x
+     values — unix seconds — in BOTH modes, and the Elapsed view is produced
+     entirely by a ticks.callback that subtracts the origin (formatXTick in
+     common/plot.js), so the origin is invisible to the scale's own min.
+     Reading x.min here gave a check that compared two epoch timestamps and
+     could only ever report that time had moved forward. */
+  const firstTick = () => ch().scales.x.ticks?.[0]?.label ?? null;
+  const tickBeforeClear = firstTick();
+  document.getElementById('btnClearPlots').click();
+  await new Promise(r => setTimeout(r, 700));
+  return { firstTick: firstTick(), tickBeforeClear,
+    xTitle: ch().options.scales.x.title.text };
 `);
 check(
   "switching the axis to Elapsed counts seconds from the stream's first sample",
   /* Plain seconds, not a clock time, and small — the first tick is the left
      edge of the rolling window, so it is a few seconds in on a stream that
-     has been running for a few seconds, and never an epoch-sized number. */
+     has been running for a few seconds, and never an epoch-sized number.
+     Above one, too: a zero here would mean the axis had re-based itself on the
+     clear just performed, which is what the next check is about. */
   /^-?\d+(\.\d+)?$/.test(String(elapsed.firstTick)) &&
-    Math.abs(Number(elapsed.firstTick)) < 60 &&
+    Number(elapsed.firstTick) > 1 &&
+    Number(elapsed.firstTick) < 60 &&
     /Time since start/.test(elapsed.xTitle),
   `${elapsed.firstTick} — ${elapsed.xTitle}`,
+);
+check(
+  "and clearing does not re-zero it, so the plot and the CSV agree on when",
+  /* A view control must not make the plot disagree with the file about when
+     something happened: `TIMESTAMP_CAL` counts from the stream's first sample
+     whatever this button does, so the axis has to as well.
+
+     Asserted as "the labelled left edge moved forward", which is the
+     invariant: with the origin kept, the samples after a clear sit further
+     along the same axis than the window that was discarded. Re-basing the
+     origin instead puts the left edge back at zero, so this goes backwards.
+
+     Two earlier versions of this check could not fail, which is why it is
+     spelt out. The first compared the CLOCK-mode axis TITLE, which carries the
+     date and not the origin. The second compared `scales.x.min`, which is a
+     raw unix timestamp in both modes and so only ever showed that time had
+     passed. Both left the pass at 293/293 with keepOrigin flipped off, while
+     the first Elapsed tick visibly went from 2.99 to 0.00. */
+  Number(elapsed.firstTick) > Number(elapsed.tickBeforeClear) &&
+    cleared.axisAfter === cleared.axisBefore,
+  `elapsed first tick ${elapsed.tickBeforeClear} → ${elapsed.firstTick} s; ` +
+    `clock axis "${cleared.axisBefore}" kept`,
 );
 
 // ---- pressure with no coefficients stays raw, and says so
