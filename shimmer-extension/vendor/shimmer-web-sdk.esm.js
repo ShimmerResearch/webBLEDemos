@@ -8262,6 +8262,38 @@ function checkConfigBytesValid(bytes) {
 }
 
 /**
+ * How to describe a link that supplied no device name, in the reader's own terms.
+ *
+ * A client that cannot name the device still has to say something, and what it
+ * says has to be true of the link in front of it. `an unnamed ${kind} port` is
+ * not: a GATT peripheral is not a port, and neither is a loopback. Printing it
+ * anyway is the same defect as announcing "GATT connected" on an RFCOMM link —
+ * a log that misreports the mechanism costs more than one with less detail.
+ *
+ * Deliberately a `switch` with no `default`: the repo compiles under `strict`,
+ * so a new {@link ShimmerTransportKind} member leaves a path that returns
+ * `undefined` and fails to compile here. That is the point — the alternative is
+ * a template literal, which accepts any new member silently and starts printing
+ * nonsense.
+ *
+ * Not re-exported from `./index.js`, and so not part of the public API: the
+ * wording is a client-side presentation detail, not a contract.
+ */
+function unnamedLink(kind) {
+    switch (kind) {
+        case 'ble':
+            return 'an unnamed Bluetooth device';
+        case 'serial':
+            return 'an unnamed serial port';
+        case 'rfcomm':
+            return 'an unnamed RFCOMM port';
+        case 'loopback':
+        case 'mock':
+            return `an unnamed ${kind} link`;
+    }
+}
+
+/**
  * Reading a protocol off an unframed pipe: the sentinels every framer returns,
  * and the drain loop that turns a framer into message boundaries.
  *
@@ -12212,9 +12244,34 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._injectedTransport = opts.transport ?? null;
         this.emitCalibratedInertial = opts.emitCalibratedInertial ?? true;
     }
-    /** Best-effort label for `ObjectCluster`s and status messages. */
-    _deviceLabel() {
-        return this.device?.name ?? this._transport?.deviceName ?? 'Shimmer3R';
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * Read off the transport rather than off `this.device`: for a
+     * {@link WebBluetoothTransport} the two are the same string (`device` returns
+     * the same `BluetoothDevice` whose `name` `deviceName` reads), so preferring
+     * the field buys nothing and costs correctness — it is the one source that can
+     * be left over from an earlier link.
+     *
+     * An empty or whitespace name counts as none. A transport that reports `''`
+     * has told us nothing, and both callers below need to agree on that.
+     */
+    _reportedDeviceName() {
+        const name = this._transport?.deviceName?.trim();
+        return name ? name : null;
+    }
+    /**
+     * Stable, non-null identifier for {@link ObjectCluster.deviceId}, which every
+     * streamed frame carries.
+     *
+     * The generation name is the fallback because a frame must always be
+     * attributable to something — and that is precisely why it must never be
+     * printed as though it were a name the link supplied. Status text uses
+     * {@link _reportedDeviceName} instead; keeping the two apart is the whole
+     * point of there being two methods.
+     */
+    _deviceId() {
+        return this._reportedDeviceName() ?? 'Shimmer3R';
     }
     /** Build the default Web Bluetooth transport over the configured UUIDs. */
     _makeWebTransport() {
@@ -12276,6 +12333,14 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._fwVersionCache = null;
         this._deviceVersionCache = null;
         this._statusPayloadBytes = 2;
+        /* `device` describes the far end exactly as the version caches do, so it
+         * belongs in this reset. It is only ever ASSIGNED for a Web Bluetooth
+         * transport (below) and only ever cleared in disconnect(), which a caller
+         * need not call after a drop - so without this, a BLE session followed by a
+         * serial reconnect left the previous peripheral here, and its name reached
+         * both the connect log and every frame's deviceId. Clearing it also makes
+         * the field's own docblock true for injected transports. */
+        this.device = null;
         this._armDisconnectNotification();
         this._notifyUnsub = t.onNotify(this._handleNotify);
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
@@ -12297,7 +12362,10 @@ class Shimmer3RClient extends BaseShimmerClient {
         await t.connect();
         if (t instanceof WebBluetoothTransport)
             this.device = t.device;
-        this._emitStatus(`Selected: ${this._deviceLabel()}`);
+        /* The name the link reported, and NO invented one where it reported none.
+         * `_deviceId()` is not usable here - its fallback is the generation string,
+         * which every frame needs and which read as a chooser name in this line. */
+        this._emitStatus(`Selected: ${this._reportedDeviceName() ?? unnamedLink(t.kind)}`);
         if (overBle) {
             this._emitStatus('GATT connected');
             this._emitStatus('RX/TX obtained');
@@ -12743,9 +12811,8 @@ class Shimmer3RClient extends BaseShimmerClient {
      * coefficients is a **success**: it compensates on-chip, and the firmware
      * sends the id in-band precisely so a host can tell that from a NACK.
      *
-     * HARDWARE-VERIFY: no real sensor has answered this command through this SDK.
      * The reply shape is read from the firmware source and pinned by tests
-     * against a scripted device.
+     * against a scripted device, not from a captured exchange.
      *
      * @throws Error only when not connected.
      */
@@ -14679,7 +14746,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                     this._crcFailures++;
                 try {
                     let cursor = 1;
-                    const oc = new ObjectCluster(this._deviceLabel());
+                    const oc = new ObjectCluster(this._deviceId());
                     oc.crcOk = crcOk;
                     const ts = tsBytes === 2 ? u16le$4(frame, cursor) : u24le$1(frame, cursor);
                     cursor += tsBytes;
@@ -17767,9 +17834,28 @@ class Shimmer3Client extends BaseShimmerClient {
         if (this.debug)
             console.log('[Shimmer3]', ...args);
     }
-    /** Best-effort label for `ObjectCluster`s and status messages. */
-    _deviceLabel() {
-        return this._transport?.deviceName ?? 'Shimmer3';
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * An empty or whitespace name counts as none: a transport reporting `''` has
+     * told us nothing, and both callers below need to agree on that.
+     */
+    _reportedDeviceName() {
+        const name = this._transport?.deviceName?.trim();
+        return name ? name : null;
+    }
+    /**
+     * Stable, non-null identifier for {@link ObjectCluster.deviceId}, which every
+     * streamed frame carries.
+     *
+     * The generation name is the fallback because a frame must always be
+     * attributable to something — and that is precisely why it must never be
+     * printed as though it were a name the link supplied. Status text uses
+     * {@link _reportedDeviceName} instead; keeping the two apart is the whole
+     * point of there being two methods.
+     */
+    _deviceId() {
+        return this._reportedDeviceName() ?? 'Shimmer3';
     }
     /** The streaming timestamp width currently in effect. */
     get timestampFmt() {
@@ -17810,7 +17896,11 @@ class Shimmer3Client extends BaseShimmerClient {
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
         this._emitStatus('Opening RFCOMM connection…');
         await t.connect();
-        this._emitStatus(`Connected: ${this._deviceLabel()}`);
+        /* Same split as Shimmer3RClient: the name the link reported, and no
+         * invented one where it reported none. `t` rather than `this._transport`,
+         * so a disconnect() racing the await above cannot make this describe a
+         * link other than the one it just opened. */
+        this._emitStatus(`Connected: ${this._reportedDeviceName() ?? unnamedLink(t.kind)}`);
         await this._handshake();
     }
     async _handshake() {
@@ -18125,9 +18215,6 @@ class Shimmer3Client extends BaseShimmerClient {
      * anchors the stream timeline accordingly — `rwc-estimated`, carrying half
      * the round trip as its uncertainty.
      *
-     * HARDWARE-VERIFY: no real Shimmer3 has answered this command through this
-     * SDK.
-     *
      * @throws Error when not connected, while streaming, or when the firmware
      *   does not serve the command.
      */
@@ -18162,8 +18249,6 @@ class Shimmer3Client extends BaseShimmerClient {
      * The firmware stores it as an offset from its free-running counter, so the
      * stream's own timestamps do not move — but the mapping from them to wall
      * time does, which is why any existing anchor is dropped.
-     *
-     * HARDWARE-VERIFY: not exercised against a real Shimmer3.
      */
     async setRtcTime(unixMs) {
         if (!this._transport)
@@ -18236,9 +18321,6 @@ class Shimmer3Client extends BaseShimmerClient {
      *
      * **A refusal is not an error**: the channels stream raw-only and this
      * returns `null`, having said so through {@link onStatus}.
-     *
-     * HARDWARE-VERIFY: no real Shimmer3 has answered any of the three commands
-     * through this SDK.
      *
      * @throws Error only when not connected.
      */
@@ -18725,7 +18807,7 @@ class Shimmer3Client extends BaseShimmerClient {
                 try {
                     const frame = buf.subarray(0, frameBytes);
                     let cursor = 1;
-                    const oc = new ObjectCluster(this._deviceLabel());
+                    const oc = new ObjectCluster(this._deviceId());
                     const ts = tsBytes === 2 ? u16le$4(frame, cursor) : u24le$1(frame, cursor);
                     cursor += tsBytes;
                     oc.add('TIMESTAMP', ts, CHANNEL_UNITS.TICKS, 'raw');
@@ -19154,8 +19236,19 @@ class WiredShimmerClient extends BaseShimmerClient {
         if (this.debug)
             console.log('[WiredDock]', ...args);
     }
-    _deviceLabel() {
-        return this._transport?.deviceName ?? 'Shimmer(dock)';
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * This client builds no `ObjectCluster` — the dock protocol has no streaming —
+     * so there is no second caller needing a non-null identifier. The old
+     * `?? 'Shimmer(dock)'` fired on every real connect (the wired link is a
+     * `WebSerialTransport`, which reports no name), and it named a dock that need
+     * not be there: this client also drives a Shimmer3R over a direct USB-C
+     * cable, which is the same protocol and no dock at all.
+     */
+    _reportedDeviceName() {
+        const name = this._transport?.deviceName?.trim();
+        return name ? name : null;
     }
     // ---------------------------------------------------------------------------
     // Connection management
@@ -19181,7 +19274,7 @@ class WiredShimmerClient extends BaseShimmerClient {
         this._emitStatus('Opening dock UART connection…');
         await t.connect();
         this._rxBuf = new Uint8Array(0);
-        this._emitStatus(`Connected: ${this._deviceLabel()}`);
+        this._emitStatus(`Connected: ${this._reportedDeviceName() ?? unnamedLink(t.kind)}`);
     }
     async disconnect() {
         // Fail an in-flight capture BEFORE the transport goes: no further bytes are
@@ -20237,8 +20330,18 @@ class SmartDockClient extends BaseShimmerClient {
         if (this.debug)
             console.log('[SmartDock]', ...args);
     }
-    _deviceLabel() {
-        return this._transport?.deviceName ?? 'SmartDock';
+    /**
+     * The name the link reported, or `null` when it reported none. Never invented.
+     *
+     * This client builds no `ObjectCluster` — the dock protocol has no streaming —
+     * so unlike the Shimmer3/3R clients there is no second caller needing a
+     * non-null identifier, and nothing to trade off against saying so plainly.
+     * The old `?? 'SmartDock'` fired on every real connect, because the base UART
+     * arrives over a `WebSerialTransport` and Web Serial reports no name at all.
+     */
+    _reportedDeviceName() {
+        const name = this._transport?.deviceName?.trim();
+        return name ? name : null;
     }
     // ---------------------------------------------------------------------------
     // Connection management
@@ -20261,7 +20364,7 @@ class SmartDockClient extends BaseShimmerClient {
         this._emitStatus('Opening SmartDock base UART connection…');
         await t.connect();
         this._rxBuf = new Uint8Array(0);
-        this._emitStatus(`Connected: ${this._deviceLabel()}`);
+        this._emitStatus(`Connected: ${this._reportedDeviceName() ?? unnamedLink(t.kind)}`);
     }
     async disconnect() {
         try {
@@ -26699,6 +26802,20 @@ class VerisenseBleDevice extends BaseShimmerClient {
      */
     _mirrorTransportHandles() {
         const t = this._transport;
+        /* Clear first, so this MIRRORS the live transport instead of accumulating
+         * across links. Without it the branches below only ever assign: a BLE
+         * session followed by a serial (or injected) reconnect kept the previous
+         * peripheral in `device`, and the connect log and the `connected` event
+         * then reported a name belonging to a sensor that was no longer on the
+         * other end. A drop does not clear these either - `_unwireTransport()`
+         * only drops the subscriptions - and a caller need not call disconnect()
+         * after one. This is what the field comment above already promises: they
+         * stay null for a transport that cannot supply them. */
+        this.device = null;
+        this.server = null;
+        this.tx = null;
+        this.rx = null;
+        this.port = null;
         if (t instanceof WebBluetoothTransport) {
             this.device = t.device;
             this.server = t.server;
@@ -26728,8 +26845,12 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._wireTransport(transport);
         await transport.connect();
         this._mirrorTransportHandles();
-        const name = this.device?.name ?? transport.deviceName;
-        this._emitStatus(`Connected: ${name ?? 'Verisense'}`);
+        /* The name the link reported, and no invented one where it reported none:
+         * `Connected: Verisense` read as the name from the chooser and was a
+         * constant. `_makeWebBleTransport` filters on the service UUID rather than
+         * a name prefix, so a peripheral advertising no local name reaches here. */
+        const name = transport.deviceName?.trim() || null;
+        this._emitStatus(`Connected: ${name ?? unnamedLink(transport.kind)}`);
         this.emit('connected', { name: this.device?.name, id: this.device?.id });
         await this._bootstrapConfigsAfterConnect();
         return true;
