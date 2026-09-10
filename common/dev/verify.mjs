@@ -1117,6 +1117,14 @@ const rec = await evaluate(`
     bytes: document.getElementById('recBytes').textContent,
     idName: document.getElementById('idName').textContent,
     bleEnabled: !document.getElementById('btnBle').disabled,
+    /* Whether this BROWSER has Web Bluetooth at all. The BLE button is gated
+       on the capability as well as on the connection, and capability is a
+       floor the connected-state cannot lift — so on a browser without it the
+       button correctly stays disabled after a drop, and an assertion that it
+       comes back is asserting something about the host rather than about the
+       page. Headless Chrome on Linux has no Web Bluetooth; the same Chrome on
+       Windows does, which is why this passed locally and failed in CI. */
+    bleSupported: !!navigator.bluetooth,
     stopDisabled: document.getElementById('btnStreamStop').disabled,
     streamTabEnabled: !document.getElementById('tabBtnStream').disabled,
     toasts: [...document.querySelectorAll('.toast')].map(t=>t.textContent) };
@@ -1176,7 +1184,8 @@ check(
   rec.after.connPill === "disconnected" &&
     rec.after.recPill === "not recording" &&
     rec.after.idName === "–" &&
-    rec.after.bleEnabled &&
+    // Live again if and only if this browser can do BLE at all.
+    rec.after.bleEnabled === rec.after.bleSupported &&
     rec.after.stopDisabled &&
     rec.after.streamTabEnabled,
   /* Every field, not just the toasts. Six things have to be true here and the
