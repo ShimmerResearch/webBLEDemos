@@ -1099,7 +1099,18 @@ const rec = await evaluate(`
   const mid = { pill: document.getElementById('recPill').textContent,
     rows: document.getElementById('recRows').textContent };
   window.mockTransport.emitDisconnect(new Error('cable yanked (mock)'));
-  await new Promise(r=>setTimeout(r,1500));
+  /* Wait for the page to have SETTLED, rather than for a length of time. The
+     drop unwinds several things — the stream stops, the recorder closes its
+     file, the identity clears, the connect buttons come back — and a fixed
+     1.5 s was enough on a developer's laptop and not on a loaded CI runner,
+     where this failed while the behaviour was perfectly correct. The last
+     thing to land is the recording pill, because closing the file is async. */
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 50));
+    if (document.getElementById('connPill').textContent === 'disconnected'
+        && document.getElementById('recPill').textContent === 'not recording'
+        && window.__blobs.length) break;
+  }
   const after = { connPill: document.getElementById('connPill').textContent,
     recPill: document.getElementById('recPill').textContent,
     rows: document.getElementById('recRows').textContent,
