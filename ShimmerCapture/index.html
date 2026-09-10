@@ -873,6 +873,13 @@
             <button id="btnPause" type="button" data-requires="streaming">
               Pause plot
             </button>
+            <!-- Ungated, like the selectors beside it and unlike Pause: a plot
+                 with data on it outlives the stream that drew it, and tidying
+                 the screen before the next run is exactly when this is wanted.
+                 Clearing an empty plot is a no-op. The Verisense console's
+                 equivalent (`Clear Graphs`) is gated on being connected, which
+                 disables it at that moment. -->
+            <button id="btnClearPlots" type="button">Clear plots</button>
           </div>
           <div id="stats"></div>
         </div>
@@ -5526,6 +5533,26 @@
         if (plotPaused) plot.pause();
         else plot.resume();
         $("btnPause").textContent = plotPaused ? "Resume plot" : "Pause plot";
+      });
+
+      /* Drops the buffered samples and empties the panels, the same thing the
+               Verisense console's "Clear Graphs" does — its `clearAllGraphs`
+               zeroes its ring buffers and repaints each canvas.
+
+               `keepOrigin`, so the Elapsed axis keeps counting from the stream's
+               first sample rather than re-zeroing here. The recorded
+               `TIMESTAMP_CAL` column keeps counting from the real start
+               whatever this button does, and a plot that disagreed with the
+               file about when a feature happened would be worse than a gap.
+
+               Logged, because a discontinuity in a trace should be
+               distinguishable afterwards from a dropped link: on a plot alone
+               a deliberate clear and a stall look identical. Recording is
+               untouched — the CSV keeps every row, since a view control has no
+               business editing a file. */
+      $("btnClearPlots").addEventListener("click", () => {
+        plot.clear({ keepOrigin: true });
+        log.log("plots cleared (the recording, if any, is unaffected)");
       });
 
       /* NOT wrapped: showSaveFilePicker is gesture-gated, so `startRecording`

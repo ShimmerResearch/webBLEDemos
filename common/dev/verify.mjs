@@ -125,9 +125,11 @@ async function goto(url) {
 /* The link CRC the pass connects with. The page defaults to 2 bytes and every
    check below runs that way; `VERIFY_CRC=0` runs the whole pass with it off,
    which is how a failure that only happens with the CRC on is separated from
-   one that happens either way. Worth having as a switch rather than a
-   one-off probe: the difference is what identified the stray-byte defect the
-   known-failure list points at. */
+   one that happens either way. Worth having as a switch rather than a one-off
+   probe: eighteen checks were failing here, and the CRC-off run coming back
+   clean said they were defects of the CRC path rather than flaky tests --
+   three separate causes, none of them reachable with the CRC off. CI runs both
+   variants, the CRC-off one non-blocking. */
 const CRC_MODE = process.env.VERIFY_CRC ?? "2";
 
 /**
@@ -1099,13 +1101,32 @@ const rec = await evaluate(`
   const mid = { pill: document.getElementById('recPill').textContent,
     rows: document.getElementById('recRows').textContent };
   window.mockTransport.emitDisconnect(new Error('cable yanked (mock)'));
-  await new Promise(r=>setTimeout(r,1500));
+  /* Wait for the page to have SETTLED, rather than for a length of time. The
+     drop unwinds several things — the stream stops, the recorder closes its
+     file, the identity clears, the connect buttons come back — and a fixed
+     1.5 s was enough on a developer's laptop and not on a loaded CI runner,
+     where this failed while the behaviour was perfectly correct. The last
+     thing to land is the recording pill, because closing the file is async. */
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 50));
+    if (document.getElementById('connPill').textContent === 'disconnected'
+        && document.getElementById('recPill').textContent === 'not recording'
+        && window.__blobs.length) break;
+  }
   const after = { connPill: document.getElementById('connPill').textContent,
     recPill: document.getElementById('recPill').textContent,
     rows: document.getElementById('recRows').textContent,
     bytes: document.getElementById('recBytes').textContent,
     idName: document.getElementById('idName').textContent,
     bleEnabled: !document.getElementById('btnBle').disabled,
+    /* Whether this BROWSER has Web Bluetooth at all. The BLE button is gated
+       on the capability as well as on the connection, and capability is a
+       floor the connected-state cannot lift — so on a browser without it the
+       button correctly stays disabled after a drop, and an assertion that it
+       comes back is asserting something about the host rather than about the
+       page. Headless Chrome on Linux has no Web Bluetooth; the same Chrome on
+       Windows does, which is why this passed locally and failed in CI. */
+    bleSupported: !!navigator.bluetooth,
     stopDisabled: document.getElementById('btnStreamStop').disabled,
     streamTabEnabled: !document.getElementById('tabBtnStream').disabled,
     toasts: [...document.querySelectorAll('.toast')].map(t=>t.textContent) };
@@ -1165,10 +1186,15 @@ check(
   rec.after.connPill === "disconnected" &&
     rec.after.recPill === "not recording" &&
     rec.after.idName === "–" &&
-    rec.after.bleEnabled &&
+    // Live again if and only if this browser can do BLE at all.
+    rec.after.bleEnabled === rec.after.bleSupported &&
     rec.after.stopDisabled &&
     rec.after.streamTabEnabled,
-  JSON.stringify(rec.after.toasts),
+  /* Every field, not just the toasts. Six things have to be true here and the
+     detail used to name none of them, so a failure said only that something
+     about the recovery was wrong — which is no use at all when it fails on a
+     machine you cannot attach a debugger to. */
+  JSON.stringify(rec.after),
 );
 
 // ===========================================================================
@@ -5441,24 +5467,98 @@ check(
     `gyro ${JSON.stringify(calStream.calibration?.inertial?.gyro)}`,
 );
 
+const cleared = await evaluate(`
+  const pts = () => [...document.querySelectorAll('.plot-panel canvas')]
+    .map(c => Chart.getChart(c).data.datasets[0].data.length);
+  const before = pts();
+  const axisBefore = Chart.getChart(document.querySelector('.plot-panel canvas'))
+    .options.scales.x.title.text;
+  document.getElementById('btnClearPlots').click();
+  await new Promise(r => setTimeout(r, 60));
+  const emptied = pts();
+  const logged = [...document.querySelectorAll('#log .log-line')]
+    .some(l => /plots cleared/.test(l.textContent));
+  // And it fills again, so clearing did not stop the plot.
+  await new Promise(r => setTimeout(r, 700));
+  return { before, emptied, refilled: pts(), logged, axisBefore,
+    axisAfter: Chart.getChart(document.querySelector('.plot-panel canvas'))
+      .options.scales.x.title.text,
+    gated: document.getElementById('btnClearPlots').disabled };
+`);
+check(
+  "Clear plots empties every panel and says so, and the stream carries on",
+  /* The Verisense console's equivalent zeroes its ring buffers and repaints;
+     this does the same through `plot.clear`. Logged because a gap in a trace
+     should be distinguishable afterwards from a dropped link. */
+  cleared.before.every((n) => n > 20) &&
+    /* Not zero: frames keep arriving while this is measured, so a live stream
+       has a few samples back on the panel by the time it is read. The claim is
+       that the history went, not that the plot stopped. */
+    cleared.emptied.every((n, i) => n < cleared.before[i] / 10) &&
+    cleared.refilled.every((n, i) => n > cleared.emptied[i]) &&
+    cleared.logged &&
+    !cleared.gated,
+  `${cleared.before.join(",")} → ${cleared.emptied.join(",")} → ${cleared.refilled.join(",")}`,
+);
 const elapsed = await evaluate(`
   const sel = document.getElementById('selTimeAxis');
   sel.value = 'elapsed';
   sel.dispatchEvent(new Event('change', { bubbles: true }));
   await new Promise(r => setTimeout(r, 600));
-  const ch = Chart.getChart(document.querySelector('.plot-panel canvas'));
-  return { firstTick: ch.scales.x.ticks?.[0]?.label ?? null,
-    xTitle: ch.options.scales.x.title.text, xMin: ch.scales.x.min };
+  const ch = () => Chart.getChart(document.querySelector('.plot-panel canvas'));
+  /* Clear a SECOND time, here in Elapsed mode, because this is the only mode
+     the origin shows up in — and keeping it is the whole reason the handler
+     passes keepOrigin. In Clock mode the x values are unix seconds and the
+     axis title carries only the date, so nothing there tells the two
+     behaviours apart.
+
+     Read from the TICK LABEL, not from scales.x.min. The scale holds raw x
+     values — unix seconds — in BOTH modes, and the Elapsed view is produced
+     entirely by a ticks.callback that subtracts the origin (formatXTick in
+     common/plot.js), so the origin is invisible to the scale's own min.
+     Reading x.min here gave a check that compared two epoch timestamps and
+     could only ever report that time had moved forward. */
+  const firstTick = () => ch().scales.x.ticks?.[0]?.label ?? null;
+  const tickBeforeClear = firstTick();
+  document.getElementById('btnClearPlots').click();
+  await new Promise(r => setTimeout(r, 700));
+  return { firstTick: firstTick(), tickBeforeClear,
+    xTitle: ch().options.scales.x.title.text };
 `);
 check(
   "switching the axis to Elapsed counts seconds from the stream's first sample",
   /* Plain seconds, not a clock time, and small — the first tick is the left
      edge of the rolling window, so it is a few seconds in on a stream that
-     has been running for a few seconds, and never an epoch-sized number. */
+     has been running for a few seconds, and never an epoch-sized number.
+     Above one, too: a zero here would mean the axis had re-based itself on the
+     clear just performed, which is what the next check is about. */
   /^-?\d+(\.\d+)?$/.test(String(elapsed.firstTick)) &&
-    Math.abs(Number(elapsed.firstTick)) < 60 &&
+    Number(elapsed.firstTick) > 1 &&
+    Number(elapsed.firstTick) < 60 &&
     /Time since start/.test(elapsed.xTitle),
   `${elapsed.firstTick} — ${elapsed.xTitle}`,
+);
+check(
+  "and clearing does not re-zero it, so the plot and the CSV agree on when",
+  /* A view control must not make the plot disagree with the file about when
+     something happened: `TIMESTAMP_CAL` counts from the stream's first sample
+     whatever this button does, so the axis has to as well.
+
+     Asserted as "the labelled left edge moved forward", which is the
+     invariant: with the origin kept, the samples after a clear sit further
+     along the same axis than the window that was discarded. Re-basing the
+     origin instead puts the left edge back at zero, so this goes backwards.
+
+     Two earlier versions of this check could not fail, which is why it is
+     spelt out. The first compared the CLOCK-mode axis TITLE, which carries the
+     date and not the origin. The second compared `scales.x.min`, which is a
+     raw unix timestamp in both modes and so only ever showed that time had
+     passed. Both left the pass at 293/293 with keepOrigin flipped off, while
+     the first Elapsed tick visibly went from 2.99 to 0.00. */
+  Number(elapsed.firstTick) > Number(elapsed.tickBeforeClear) &&
+    cleared.axisAfter === cleared.axisBefore,
+  `elapsed first tick ${elapsed.tickBeforeClear} → ${elapsed.firstTick} s; ` +
+    `clock axis "${cleared.axisBefore}" kept`,
 );
 
 // ---- pressure with no coefficients stays raw, and says so

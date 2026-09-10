@@ -20,8 +20,32 @@ on:
 
 jobs:
   verify:
+    # Both link-CRC settings, because the difference between them is diagnostic
+    # and nothing else in the pass reports it. A CRC changes more than a
+    # trailer: `_reframing` turns on, so every inbound chunk goes through the
+    # SDK's framer even over BLE, and a whole class of defect only exists on
+    # that path: eighteen checks were failing on it at once, from three
+    # separate causes, and the CRC-off run coming back clean is what said they
+    # were defects of that path rather than flaky tests. A failure in one
+    # variant and not the other says where to look.
+    #
+    # The CRC-off run does not block: the shape a user is actually on is the
+    # default, two bytes, and a red mark on the variant would stop a merge for
+    # something the product does not do. It is here to be read.
+    name: verify (${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    continue-on-error: ${{ matrix.crc == '0' }}
+    strategy:
+      # Independent runs, so one failing must not cancel the other -- the
+      # comparison between them is the whole point.
+      fail-fast: false
+      matrix:
+        include:
+          - crc: "2"
+            label: link CRC on
+          - crc: "0"
+            label: link CRC off
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -83,7 +107,7 @@ jobs:
           # describes, so a listed check that starts passing has to fail the
           # build. Elsewhere it is a note, or nobody could run the pass on a
           # laptop without editing the baseline first.
-          VERIFY_STRICT_BASELINE=1 node common/dev/verify.mjs
+          VERIFY_CRC='${{ matrix.crc }}' VERIFY_STRICT_BASELINE=1 node common/dev/verify.mjs
           status=$?
           if [ "$status" != "0" ]; then
             echo "--- chrome ---"; tail -40 "$RUNNER_TEMP/chrome.log" || true
