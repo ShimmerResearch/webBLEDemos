@@ -1,4 +1,4 @@
-# The ShimmerCapture verification pass, on every push and pull request.
+# The ShimmerCapture verification pass, on every pull request and on main.
 #
 # `common/dev/verify.mjs` drives the real page in a real browser over CDP
 # against the ?mock=1 transport: ~290 checks over the connect handshake, the
@@ -14,9 +14,33 @@
 # list shrinks rather than rots. See the tail of verify.mjs.
 name: Verify ShimmerCapture
 
+# `pull_request` covers the work; `push` is scoped to main and is not
+# redundant with it. A pull_request run tests the PREDICTED merge of the branch
+# into main, not main as it ends up: two pull requests each green against an
+# older main, merged in sequence, can produce a main that no run ever tested.
+# There is no branch protection here forcing a branch to be up to date first,
+# so the run on main after a merge is the only thing that says main works.
+#
+# Together they are also exactly one run per push, where `push:` unscoped
+# alongside `pull_request` gave two of everything - four, once the CRC matrix
+# went in.
+#
+# A branch with no pull request open gets no run, which is why
+# workflow_dispatch is here: it can be started by hand on any ref.
 on:
-  push:
   pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# One run per ref. A second push a minute later cancels the first, because only
+# the newest commit's result is interesting. Not on main, where each run is the
+# record of a commit that is already merged and cancelling one would leave a
+# gap in exactly the history this job exists to keep.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   verify:
