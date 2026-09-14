@@ -22,8 +22,6 @@ Shimmer3R demos: `break-gyro/`, `break-emg/`, `punch-highG/`, `brick/`, `rythmga
 Verisense demo: `Verisense/`. Shared code: `common/`.
 `shimmer-extension/` is a Chrome extension source tree — loaded unpacked, not deployed with the pages.
 
-The full Verisense console moved out to `ShimmerResearch/verisense-device-console`; don't rebuild it here.
-
 ## Demo requirements
 Shimmer3R demos need firmware ≥ v1.0.22 and Chrome/Edge — Web Bluetooth for BLE, Web Serial for
 Classic Bluetooth and USB. Keep that stated on any new demo page.
