@@ -209,7 +209,7 @@ check(
   linkOrder.ids.join(" → "),
 );
 
-// --- 4. the link-speed button's new home, before anything is connected ----
+// --- 4. the throughput button's new home, before anything is connected ----
 const linkIdle = await evaluate(`
   const sdk = await import('/vendor/shimmer-web-sdk.esm.js');
   const btn = document.getElementById('btnLinkTest');
@@ -234,7 +234,7 @@ check(
   /* Twice moved: out of the SD panel, then out of the connect column. It is a
      test that takes the link exclusively, which is what the Test tab is for,
      and its result is still read by the SD panel's own estimates. */
-  "the link-speed button lives in the Test tab, not the SD panel or the connect column",
+  "the throughput button lives in the Test tab, not the SD panel or the connect column",
   linkIdle.inTestTab &&
     linkIdle.notInLinkCard &&
     linkIdle.notInSdPanel &&
@@ -905,7 +905,7 @@ check(
   `${sdDelete.before.length} → ${sdDelete.after.length} files, ${sdDelete.deleteCmds} SD_DELETE commands`,
 );
 
-// ---- the link-speed test
+// ---- the throughput test
 const sdLink = await evaluate(`
   await window.sdBrowser.measureLinkSpeed(1200);
   // The event log flushes on an animation frame, so the last lines are not
@@ -915,11 +915,11 @@ const sdLink = await evaluate(`
     on: window.mockTransport.writes.some(w => w.bytes[0] === 0xA4 && w.bytes[1] === 1),
     off: window.mockTransport.writes.some(w => w.bytes[0] === 0xA4 && w.bytes[1] === 0),
     guide: [...document.querySelectorAll('#log .log-line')].map(l => l.textContent)
-      .filter(l => /raw link speed: |as a guide|currently on this card/.test(l)) };
+      .filter(l => /raw throughput: |as a guide|currently on this card/.test(l)) };
 `);
 const linkKBps = Number(/^([\d.]+) KB\/s$/.exec(sdLink.link)?.[1]);
 check(
-  "the link-speed test runs the firmware data-rate test and reports a plausible rate",
+  "the throughput test runs the firmware data-rate test and reports a plausible rate",
   sdLink.on &&
     sdLink.off &&
     linkKBps > 100 &&
@@ -951,7 +951,7 @@ const linkBtn = await evaluate(`
     noteAfter: document.getElementById('linkTestNote').textContent };
 `);
 check(
-  "the link-speed button works from the Test tab and reports beside itself",
+  "the throughput button works from the Test tab and reports beside itself",
   linkBtn.before.inTestTab &&
     !linkBtn.before.disabled &&
     linkBtn.before.note === "" &&
@@ -965,7 +965,7 @@ check(
   "and while it runs it names itself as the thing holding the link",
   linkBtn.during.disabled &&
     /^(measuring…|[\d.]+ KB\/s …)$/.test(linkBtn.during.pill) &&
-    /link-speed test/.test(linkBtn.during.applyNote) &&
+    /throughput test/.test(linkBtn.during.applyNote) &&
     /Measuring/.test(linkBtn.during.note),
   `${linkBtn.during.pill} | ${linkBtn.during.applyNote}`,
 );
@@ -1085,7 +1085,7 @@ check(
   sdWhileStreaming.banner.slice(0, 80) + "…",
 );
 check(
-  "the link-speed test is refused while streaming, and says why rather than just greying",
+  "the throughput test is refused while streaming, and says why rather than just greying",
   sdWhileStreaming.linkTestRoleGone &&
     sdWhileStreaming.linkTest &&
     /deliberately saturates the link/.test(sdWhileStreaming.linkTestNote) &&
@@ -4260,7 +4260,7 @@ const skip = await evaluate(`
 `);
 check(
   "a sample is skipped, with the reason, while another panel holds the link",
-  /skipped/i.test(skip.status) && /link-speed/i.test(skip.status),
+  /skipped/i.test(skip.status) && /throughput/i.test(skip.status),
   skip.status.slice(0, 90),
 );
 await send("Emulation.setTimezoneOverride", { timezoneId: "" });

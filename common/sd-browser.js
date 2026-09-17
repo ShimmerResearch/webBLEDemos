@@ -308,7 +308,7 @@ export function createSdBrowser(host, opts = {}) {
     stat("capacity", "Card capacity"),
     stat("files", "Files"),
     stat("bytes", "Total size"),
-    stat("link", "Link speed"),
+    stat("link", "Link throughput"),
   );
 
   const setStat = (key, text) => {
@@ -994,7 +994,7 @@ export function createSdBrowser(host, opts = {}) {
     }
     setBusy(true);
     log.log(
-      `measuring raw link speed (${(durationMs / 1000).toFixed(0)} s, firmware data-rate test)…`,
+      `measuring raw throughput (${(durationMs / 1000).toFixed(0)} s, firmware data-rate test)…`,
     );
     try {
       const res = await client.runDataRateTest(durationMs, (bytes, ms) => {
@@ -1005,7 +1005,7 @@ export function createSdBrowser(host, opts = {}) {
       setStat("link", `${res.kBps.toFixed(1)} KB/s`);
       reportLinkSpeed(res.kBps, true);
       log.log(
-        `raw link speed: ${res.kBps.toFixed(1)} KB/s ` +
+        `raw throughput: ${res.kBps.toFixed(1)} KB/s ` +
           `(${fmtBytes(res.bytesReceived)} in ${(res.durationMs / 1000).toFixed(1)}s).`,
       );
       if (res.kBps > 0) {
@@ -1024,7 +1024,7 @@ export function createSdBrowser(host, opts = {}) {
       }
       return res;
     } catch (err) {
-      log.error(`Link speed test failed: ${err?.message ?? err}`);
+      log.error(`Throughput test failed: ${err?.message ?? err}`);
       reportLinkSpeed(null, true);
       return null;
     } finally {
