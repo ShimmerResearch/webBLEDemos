@@ -3,9 +3,11 @@
  * the built bundle) can log which build they are actually running — a stale
  * vendored copy is otherwise indistinguishable from a firmware fault.
  *
- * Kept in sync with package.json by tests/core/version.test.ts.
+ * Kept in sync with package.json by tests/core/version.test.ts, and stamped
+ * from it by the Bump step in cut-release.yml — the release bumps this file
+ * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.3.0';
+const SDK_VERSION = '0.4.1';
 
 /**
  * Container for a single decoded sensor frame.
@@ -30,6 +32,7 @@ class ObjectCluster {
         this.fields = [];
         this.raw = null;
         this.crcOk = null;
+        this.timestampValid = true;
     }
     /**
      * Append a named field to this cluster.
@@ -4151,6 +4154,23 @@ const TICKS_PER_SECOND = 32768;
 /** Ticks per millisecond — 32.768, as the firmware and the Java driver have it. */
 const TICKS_PER_MS = TICKS_PER_SECOND / 1000;
 /**
+ * How close to the top of the 24-bit range the previous sample must have been
+ * for a drop to exactly zero to be believed as a roll-over.
+ *
+ * One second. Firmware stamps a packet when the sample tick starts it and does
+ * not publish a packet it never stamped, so `0x000000` in the counter field
+ * means the record is invalid rather than that the counter reached its origin.
+ * LogAndStream v1.00.x–v1.01.003 could emit one under SD write back-pressure.
+ * A genuine wrap onto zero means the counter advanced to its very last tick, so
+ * its predecessor is within a sample or two of the maximum — a second is a
+ * generous allowance for a gap in the data, and nine orders of magnitude away
+ * from the mid-range predecessors the invalid records have.
+ *
+ * Only the 24-bit counter is judged this way. The 16-bit one's whole range is
+ * 2 s, so a stall really can cross it, and it keeps its existing behaviour.
+ */
+const INVALID_ZERO_WINDOW_TICKS = TICKS_PER_SECOND;
+/**
  * Relative drift assumed between the sensor's clock and the host's, in parts
  * per million, when an anchor is bound to a stream some time after the reading
  * that produced it.
@@ -4290,9 +4310,22 @@ class StreamTimeline {
      * @param hostMs The host clock when the packet arrived. Used only to recover
      *   wraps that went by unseen — see below — never to time the sample, which
      *   the device's own counter does far better.
+     * @returns the sample's place on the timeline, or, for a packet whose counter
+     *   field is an invalid `0x000000`, the previous sample's place with
+     *   {@link StreamStamp.invalid} set and the timeline untouched.
      */
     stamp(raw, hostMs) {
         const unwrapped = this._unwrap(raw, hostMs);
+        /* An invalid record. Every piece of timeline state holds where it is —
+           `_lastRaw` above all, so the next sample is compared against the last
+           value the firmware actually stamped and reads as the ordinary step
+           forward it is, rather than as a second wrap. `_lastHostMs` holds for the
+           same reason: the elapsed time the missed-wrap recovery works from must
+           span from that sample, not from this one. Nothing about a packet with no
+           timestamp is allowed to move the timeline, including binding an anchor
+           to it. */
+        if (unwrapped === null)
+            return this._describe(this._lastUnwrapped, true);
         this._lastRaw = ((raw % this._modulo) + this._modulo) % this._modulo;
         this._lastUnwrapped = unwrapped;
         /* How many counter boundaries this session has crossed. The unwrapped value
@@ -4306,17 +4339,35 @@ class StreamTimeline {
             this._lastHostMs = hostMs;
         if (this._pending)
             this._resolveAnchor(unwrapped, hostMs);
+        return this._describe(unwrapped, false);
+    }
+    /** Places an unwrapped tick value on the wall clock, if there is one. */
+    _describe(unwrapped, invalid) {
         const deviceMs = unwrapped / TICKS_PER_MS;
         if (!this._anchor) {
-            return { unwrappedTicks: unwrapped, deviceMs, unixMs: null, source: null };
+            return { unwrappedTicks: unwrapped, deviceMs, unixMs: null, source: null, invalid };
         }
         const unixMs = this._anchor.unixMs + (unwrapped - this._anchor.unwrappedTicks) / TICKS_PER_MS;
-        return { unwrappedTicks: unwrapped, deviceMs, unixMs, source: this._anchor.source };
+        return { unwrappedTicks: unwrapped, deviceMs, unixMs, source: this._anchor.source, invalid };
     }
+    /** @returns the unwrapped tick value, or `null` when the sample is invalid. */
     _unwrap(raw, hostMs) {
         const value = ((raw % this._modulo) + this._modulo) % this._modulo;
         if (this._lastRaw === null)
             return value;
+        /* A counter of exactly zero arriving from mid-range is not a roll-over: it
+           is a record the firmware never stamped. Read as a wrap it would put every
+           later sample in the session a clean 512 s late, which is how a customer's
+           9 minute 30 second recording imported as 43 minutes 38. The test is
+           deliberately narrow — the 24-bit counter, an exact zero, and a
+           predecessor further than {@link INVALID_ZERO_WINDOW_TICKS} from the top
+           of the range — so a genuine wrap onto zero is still accepted and the
+           16-bit counter is untouched. See the constant for why. */
+        if (this._bits === 24 &&
+            value === 0 &&
+            this._lastRaw < this._modulo - INVALID_ZERO_WINDOW_TICKS) {
+            return null;
+        }
         const half = this._modulo / 2;
         /* Forward distance from the last sample, and whether to read it as forward
            motion (crossing a wrap if it has to) or as a small step BACKWARDS —
@@ -14755,6 +14806,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                        anchored, places it on a wall clock. Both go on the frame as
                        calibrated fields so a plot and a CSV can use them like any other. */
                     const stamped = this._timeline.stamp(ts, Date.now());
+                    oc.timestampValid = !stamped.invalid;
                     oc.add('TIMESTAMP', stamped.deviceMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
                     if (stamped.unixMs !== null) {
                         oc.add(UNIX_TIMESTAMP_NAME, stamped.unixMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
@@ -15692,6 +15744,315 @@ class Shimmer3RClient extends BaseShimmerClient {
  * desktop describe the same thing with the same header.
  */
 Shimmer3RClient.UNIX_TIMESTAMP_NAME = UNIX_TIMESTAMP_NAME;
+
+const VERISENSE_HW_MAJOR_FRIENDLY_NAMES = {
+    61: 'IMU',
+    62: 'GSR+',
+    64: 'SDK',
+    68: 'Pulse+',
+};
+function getVerisenseHardwareFriendlyName(revHwMajor) {
+    return VERISENSE_HW_MAJOR_FRIENDLY_NAMES[revHwMajor] ?? null;
+}
+/**
+ * Second-generation Verisense hardware is currently defined as:
+ * - SR61.5+
+ * - SR68.9+
+ * - Any future major revision above SR68
+ */
+function isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return false;
+    if (major > 68)
+        return true;
+    if (major === 61 && minor >= 5)
+        return true;
+    if (major === 68 && minor >= 9)
+        return true;
+    return false;
+}
+function getVerisenseHardwareCapabilities(revHwMajor, revHwMinor) {
+    const secondGeneration = isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor);
+    return {
+        secondGeneration,
+        supportsMagnetometer: secondGeneration,
+    };
+}
+/**
+ * GSR-capable hardware. Mirrors the firmware's authoritative
+ * `ShimBrd_isGsrSupportedForHwVersion` (shimmer_boards.c):
+ * - SR62 (any revision)
+ * - SR61 minor >= 5
+ * - SR68 minor >= 5
+ *
+ * Deliberately NOT {@link isVerisenseSecondGenerationHardware}: that predicate
+ * requires SR68 >= 9, but GSR arrived on the SR68 at minor revision 5.
+ */
+function isVerisenseGsrSupportedHardware(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return false;
+    return major === 62 || ((major === 61 || major === 68) && minor >= 5);
+}
+/**
+ * Hardware models with a permanently-attached rechargeable LiPo battery.
+ * Mirrors the firmware's authoritative `ShimBrd_isLipoPresentForHwVersion`
+ * (shimmer_boards.c):
+ * - SR62 (any revision)
+ * - SR61 minor >= 5
+ * - SR68 minor >= 9
+ *
+ * On these boards the operational-config battery-type bit (GEN_CFG_2 bit 0,
+ * Zinc-Air/NiMH) has no effect: the firmware hard-overrides the battery type
+ * to LiPo regardless of the stored bit (`setBattType`, hal_asm_battery.c).
+ * Config editors should therefore disable the Battery Type field on these
+ * models rather than offer a choice that does nothing (DEV-809).
+ */
+function isVerisenseLipoBatteryHardware(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return false;
+    return major === 62 || (major === 61 && minor >= 5) || (major === 68 && minor >= 9);
+}
+const VERISENSE_SENSOR_SUPPORT_NONE = {
+    accel1: false,
+    gyroAccel2: false,
+    imuGen2: false,
+    gsr: false,
+    ppg: false,
+    ambientLight: false,
+    skinTemperature: false,
+    algorithmHub: false,
+    ledAutoBrightness: false,
+};
+const VERISENSE_SENSOR_SUPPORT_ALL = {
+    accel1: true,
+    gyroAccel2: true,
+    imuGen2: true,
+    gsr: true,
+    ppg: true,
+    ambientLight: true,
+    skinTemperature: true,
+    algorithmHub: true,
+    ledAutoBrightness: true,
+};
+/**
+ * Resolves which sensor blocks a given Verisense hardware revision carries,
+ * derived from the firmware Model IC matrix
+ * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
+ *
+ * Unknown / development hardware (e.g. SR64, or any unrecognised major
+ * revision) reports every block as present so consumers never hide a setting
+ * they cannot confidently rule out.
+ */
+function getVerisenseHardwareSensorSupport(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor)) {
+        return { ...VERISENSE_SENSOR_SUPPORT_ALL };
+    }
+    const gen2 = isVerisenseSecondGenerationHardware(major, minor);
+    switch (major) {
+        case 61: // Verisense IMU
+            return gen2
+                ? // SR61.5+: LSM6DSV + LIS2MDL, GSR, ambient light, 2xRGB LEDs.
+                    {
+                        ...VERISENSE_SENSOR_SUPPORT_NONE,
+                        imuGen2: true,
+                        gsr: true,
+                        ambientLight: true,
+                        ledAutoBrightness: true,
+                    }
+                : // SR61.1-4: LIS2DW12 + LSM6DS3 only.
+                    { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true };
+        case 62: // Verisense GSR+: LIS2DW12 + LSM6DS3, GSR, analog PPG.
+            return {
+                ...VERISENSE_SENSOR_SUPPORT_NONE,
+                accel1: true,
+                gyroAccel2: true,
+                gsr: true,
+                ppg: true,
+            };
+        case 63: // Verisense PPG: LIS2DW12 + LSM6DS3 + PPG.
+            return { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true, ppg: true };
+        case 68: // Verisense Pulse+
+            return gen2
+                ? // SR68.9+: full 2nd-gen stack. The LIS2DW12 (accel1) is physically
+                    // present but routed to the algorithm hub and not recorded from, so
+                    // it is treated as unsupported for operational-config purposes.
+                    {
+                        ...VERISENSE_SENSOR_SUPPORT_NONE,
+                        imuGen2: true,
+                        gsr: true,
+                        ppg: true,
+                        ambientLight: true,
+                        skinTemperature: true,
+                        algorithmHub: true,
+                        ledAutoBrightness: true,
+                    }
+                : // SR68.1-8: LIS2DW12 + PPG; GSR added from SR68.5 (Model IC matrix +
+                    // firmware ShimBrd_isGsrSupportedForHwVersion); skin temperature from
+                    // SR68.7.
+                    {
+                        ...VERISENSE_SENSOR_SUPPORT_NONE,
+                        accel1: true,
+                        ppg: true,
+                        gsr: isVerisenseGsrSupportedHardware(major, minor),
+                        skinTemperature: minor >= 7,
+                    };
+        default:
+            // SR64 (dev board) and any future/unknown major: assume everything.
+            return { ...VERISENSE_SENSOR_SUPPORT_ALL };
+    }
+}
+function getVerisenseHardwareRevision(source) {
+    if (!source)
+        return null;
+    const major = Number(source.revHwMajor);
+    const minor = Number(source.revHwMinor);
+    const internal = Number(source.revHwInternal);
+    if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(internal)) {
+        return null;
+    }
+    if (major <= 0 || major > 255 || minor < 0 || minor > 255 || internal < 0 || internal > 65535) {
+        return null;
+    }
+    return {
+        major: Math.trunc(major),
+        minor: Math.trunc(minor),
+        internal: Math.trunc(internal),
+    };
+}
+function supportsVerisenseMagnetometer(source) {
+    const hw = getVerisenseHardwareRevision(source);
+    if (!hw)
+        return false;
+    return getVerisenseHardwareCapabilities(hw.major, hw.minor).supportsMagnetometer;
+}
+function formatVerisenseHardwareRevision(revHwMajor, revHwMinor, revHwInternal = 0, opts = {}) {
+    const prefix = opts.prefix ?? 'SR';
+    const base = `${prefix}${revHwMajor}.${revHwMinor}.${revHwInternal}`;
+    if (!opts.includeFriendlyName)
+        return base;
+    const friendly = getVerisenseHardwareFriendlyName(revHwMajor);
+    return friendly ? `${base} (${friendly})` : base;
+}
+/**
+ * Battery voltage scaling for streamed ADC battery samples.
+ * Status responses already contain firmware-scaled battery values and should not use this helper.
+ */
+function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor, revHwMinor) {
+    // SR62
+    if (revHwMajor === 62)
+        return 2.0;
+    // SR61.5+, SR68.9+, and newer major revisions.
+    if (isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor)) {
+        return 2.469;
+    }
+    return 1.0;
+}
+
+/**
+ * A MAX86xxx PPG LED-test failure, tagged with a machine-readable reason.
+ *
+ * Mirrors the {@link FactoryTestError} pattern: callers switch on `reason`
+ * rather than pattern-matching a message string.
+ */
+class VerisensePpgLedTestError extends Error {
+    constructor(reason, operatorMessage, hardwarePpgSupport, cause) {
+        super(operatorMessage);
+        this.name = 'VerisensePpgLedTestError';
+        this.reason = reason;
+        this.hardwarePpgSupport = hardwarePpgSupport;
+        this.operatorMessage = operatorMessage;
+        this.cause = cause;
+    }
+}
+/** Type guard for {@link VerisensePpgLedTestError}. */
+function isVerisensePpgLedTestError(e) {
+    return e instanceof VerisensePpgLedTestError;
+}
+/**
+ * Whether an error raised by the command path is the device NACKing a debug
+ * command. Matches the three NACK opcodes (0x50 bad-header-command, 0x60
+ * bad-header-property, 0x70 generic) on the DEBUG_COMMAND property (0x9),
+ * which is how `validatePendingResponse` renders a refusal.
+ */
+function isDebugNackError(message) {
+    return /NACK command=0x(?:50|60|70) property=0x9/i.test(message);
+}
+/** Whether the error is the command path's own timeout. */
+function isTimeoutError(message) {
+    return /Request timeout/i.test(message);
+}
+/**
+ * Classify a failure of the MAX86xxx LED-test debug command (0x0E).
+ *
+ * **The NACK is ambiguous on the wire.** In the firmware's debug dispatch
+ * (`asm_payload_parse.c`) the MAX86xxx branch is guarded by
+ * `doesHwSupportPpg()`, and the `else` that catches unrecognised debug
+ * commands calls the same `sendNackGeneric()`. So after DEV-973 (commit
+ * `b98c113c3`) three different causes produce a byte-identical
+ * `NACK_GENERIC` on property `0x09`:
+ *
+ * 1. firmware too old to know debug command `0x0E`;
+ * 2. hardware with no PPG front end (`doesHwSupportPpg()` false);
+ * 3. the new one — `max86xxx_ledTest()` returned non-success, i.e. the PPG
+ *    bus is wedged or unreachable.
+ *
+ * Nothing in the reply separates them, so the only usable discriminator is
+ * the hardware revision the host already holds from the production config.
+ * Known-PPG hardware reaching a NACK means the firmware got as far as the
+ * LED test and it failed; known-no-PPG hardware means it never did.
+ *
+ * @param err     the error the command path raised
+ * @param opts.hardwarePpgSupport
+ *        `true`/`false` from {@link getVerisenseHardwareSensorSupport}, or
+ *        `null` when the hardware revision is unknown
+ */
+function classifyPpgLedTestFailure(err, opts) {
+    const { hardwarePpgSupport } = opts;
+    const message = err instanceof Error ? err.message : String(err);
+    if (isDebugNackError(message)) {
+        if (hardwarePpgSupport === false) {
+            return new VerisensePpgLedTestError('not-supported', 'PPG LED test refused: this hardware revision has no PPG front end, so the ' +
+                'firmware never ran the test. Not a unit fault.', hardwarePpgSupport, err);
+        }
+        const hardwareCaveat = hardwarePpgSupport === null
+            ? ' (hardware revision unknown — read the production config to rule out ' +
+                'a board with no PPG front end, or firmware too old to support this command)'
+            : '';
+        return new VerisensePpgLedTestError('ppg-comms', 'PPG LED test FAILED: the device refused the command — PPG comms failure ' +
+            '(wedged or unreachable PPG bus). The LEDs themselves are NOT known to be ' +
+            `dead; do not scrap this board as a dead-LED fault${hardwareCaveat}.`, hardwarePpgSupport, err);
+    }
+    if (isTimeoutError(message)) {
+        return new VerisensePpgLedTestError('no-response', `PPG LED test inconclusive: no reply from the device (${message}). This is a ` +
+            'link problem, not a verdict on the PPG LEDs.', hardwarePpgSupport, err);
+    }
+    return new VerisensePpgLedTestError('unknown', `PPG LED test failed: ${message}`, hardwarePpgSupport, err);
+}
+/**
+ * Resolve whether a parsed production config describes hardware with a PPG
+ * front end. Returns `null` when the revision cannot be established (config
+ * erased, unreadable, or non-numeric fields), which
+ * {@link classifyPpgLedTestFailure} treats as "assume a comms fault".
+ */
+function resolveHardwarePpgSupport(parsed) {
+    const major = Number(parsed?.revHwMajor);
+    const minor = Number(parsed?.revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return null;
+    // An erased production config reads back as 0xFF bytes; that is not a
+    // hardware revision, it is an unprogrammed unit.
+    if (major === 0xff || major <= 0)
+        return null;
+    return getVerisenseHardwareSensorSupport(major, minor).ppg;
+}
 
 /**
  * EEPROM brand (advertising name) record.
@@ -18814,6 +19175,7 @@ class Shimmer3Client extends BaseShimmerClient {
                     /* Unwrap the counter — every 2 s on older firmware, every 512 s on
                        newer — and place it on a wall clock when anchored. */
                     const stamped = this._timeline.stamp(ts, Date.now());
+                    oc.timestampValid = !stamped.invalid;
                     oc.add('TIMESTAMP', stamped.deviceMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
                     if (stamped.unixMs !== null) {
                         oc.add(UNIX_TIMESTAMP_NAME, stamped.unixMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
@@ -22803,217 +23165,6 @@ function parsePendingEvents(payload) {
     return out;
 }
 
-const VERISENSE_HW_MAJOR_FRIENDLY_NAMES = {
-    61: 'IMU',
-    62: 'GSR+',
-    64: 'SDK',
-    68: 'Pulse+',
-};
-function getVerisenseHardwareFriendlyName(revHwMajor) {
-    return VERISENSE_HW_MAJOR_FRIENDLY_NAMES[revHwMajor] ?? null;
-}
-/**
- * Second-generation Verisense hardware is currently defined as:
- * - SR61.5+
- * - SR68.9+
- * - Any future major revision above SR68
- */
-function isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor))
-        return false;
-    if (major > 68)
-        return true;
-    if (major === 61 && minor >= 5)
-        return true;
-    if (major === 68 && minor >= 9)
-        return true;
-    return false;
-}
-function getVerisenseHardwareCapabilities(revHwMajor, revHwMinor) {
-    const secondGeneration = isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor);
-    return {
-        secondGeneration,
-        supportsMagnetometer: secondGeneration,
-    };
-}
-/**
- * GSR-capable hardware. Mirrors the firmware's authoritative
- * `ShimBrd_isGsrSupportedForHwVersion` (shimmer_boards.c):
- * - SR62 (any revision)
- * - SR61 minor >= 5
- * - SR68 minor >= 5
- *
- * Deliberately NOT {@link isVerisenseSecondGenerationHardware}: that predicate
- * requires SR68 >= 9, but GSR arrived on the SR68 at minor revision 5.
- */
-function isVerisenseGsrSupportedHardware(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor))
-        return false;
-    return major === 62 || ((major === 61 || major === 68) && minor >= 5);
-}
-/**
- * Hardware models with a permanently-attached rechargeable LiPo battery.
- * Mirrors the firmware's authoritative `ShimBrd_isLipoPresentForHwVersion`
- * (shimmer_boards.c):
- * - SR62 (any revision)
- * - SR61 minor >= 5
- * - SR68 minor >= 9
- *
- * On these boards the operational-config battery-type bit (GEN_CFG_2 bit 0,
- * Zinc-Air/NiMH) has no effect: the firmware hard-overrides the battery type
- * to LiPo regardless of the stored bit (`setBattType`, hal_asm_battery.c).
- * Config editors should therefore disable the Battery Type field on these
- * models rather than offer a choice that does nothing (DEV-809).
- */
-function isVerisenseLipoBatteryHardware(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor))
-        return false;
-    return major === 62 || (major === 61 && minor >= 5) || (major === 68 && minor >= 9);
-}
-const VERISENSE_SENSOR_SUPPORT_NONE = {
-    accel1: false,
-    gyroAccel2: false,
-    imuGen2: false,
-    gsr: false,
-    ppg: false,
-    ambientLight: false,
-    skinTemperature: false,
-    algorithmHub: false,
-    ledAutoBrightness: false,
-};
-const VERISENSE_SENSOR_SUPPORT_ALL = {
-    accel1: true,
-    gyroAccel2: true,
-    imuGen2: true,
-    gsr: true,
-    ppg: true,
-    ambientLight: true,
-    skinTemperature: true,
-    algorithmHub: true,
-    ledAutoBrightness: true,
-};
-/**
- * Resolves which sensor blocks a given Verisense hardware revision carries,
- * derived from the firmware Model IC matrix
- * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
- *
- * Unknown / development hardware (e.g. SR64, or any unrecognised major
- * revision) reports every block as present so consumers never hide a setting
- * they cannot confidently rule out.
- */
-function getVerisenseHardwareSensorSupport(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor)) {
-        return { ...VERISENSE_SENSOR_SUPPORT_ALL };
-    }
-    const gen2 = isVerisenseSecondGenerationHardware(major, minor);
-    switch (major) {
-        case 61: // Verisense IMU
-            return gen2
-                ? // SR61.5+: LSM6DSV + LIS2MDL, GSR, ambient light, 2xRGB LEDs.
-                    {
-                        ...VERISENSE_SENSOR_SUPPORT_NONE,
-                        imuGen2: true,
-                        gsr: true,
-                        ambientLight: true,
-                        ledAutoBrightness: true,
-                    }
-                : // SR61.1-4: LIS2DW12 + LSM6DS3 only.
-                    { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true };
-        case 62: // Verisense GSR+: LIS2DW12 + LSM6DS3, GSR, analog PPG.
-            return {
-                ...VERISENSE_SENSOR_SUPPORT_NONE,
-                accel1: true,
-                gyroAccel2: true,
-                gsr: true,
-                ppg: true,
-            };
-        case 63: // Verisense PPG: LIS2DW12 + LSM6DS3 + PPG.
-            return { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true, ppg: true };
-        case 68: // Verisense Pulse+
-            return gen2
-                ? // SR68.9+: full 2nd-gen stack. The LIS2DW12 (accel1) is physically
-                    // present but routed to the algorithm hub and not recorded from, so
-                    // it is treated as unsupported for operational-config purposes.
-                    {
-                        ...VERISENSE_SENSOR_SUPPORT_NONE,
-                        imuGen2: true,
-                        gsr: true,
-                        ppg: true,
-                        ambientLight: true,
-                        skinTemperature: true,
-                        algorithmHub: true,
-                        ledAutoBrightness: true,
-                    }
-                : // SR68.1-8: LIS2DW12 + PPG; GSR added from SR68.5 (Model IC matrix +
-                    // firmware ShimBrd_isGsrSupportedForHwVersion); skin temperature from
-                    // SR68.7.
-                    {
-                        ...VERISENSE_SENSOR_SUPPORT_NONE,
-                        accel1: true,
-                        ppg: true,
-                        gsr: isVerisenseGsrSupportedHardware(major, minor),
-                        skinTemperature: minor >= 7,
-                    };
-        default:
-            // SR64 (dev board) and any future/unknown major: assume everything.
-            return { ...VERISENSE_SENSOR_SUPPORT_ALL };
-    }
-}
-function getVerisenseHardwareRevision(source) {
-    if (!source)
-        return null;
-    const major = Number(source.revHwMajor);
-    const minor = Number(source.revHwMinor);
-    const internal = Number(source.revHwInternal);
-    if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(internal)) {
-        return null;
-    }
-    if (major <= 0 || major > 255 || minor < 0 || minor > 255 || internal < 0 || internal > 65535) {
-        return null;
-    }
-    return {
-        major: Math.trunc(major),
-        minor: Math.trunc(minor),
-        internal: Math.trunc(internal),
-    };
-}
-function supportsVerisenseMagnetometer(source) {
-    const hw = getVerisenseHardwareRevision(source);
-    if (!hw)
-        return false;
-    return getVerisenseHardwareCapabilities(hw.major, hw.minor).supportsMagnetometer;
-}
-function formatVerisenseHardwareRevision(revHwMajor, revHwMinor, revHwInternal = 0, opts = {}) {
-    const prefix = opts.prefix ?? 'SR';
-    const base = `${prefix}${revHwMajor}.${revHwMinor}.${revHwInternal}`;
-    if (!opts.includeFriendlyName)
-        return base;
-    const friendly = getVerisenseHardwareFriendlyName(revHwMajor);
-    return friendly ? `${base} (${friendly})` : base;
-}
-/**
- * Battery voltage scaling for streamed ADC battery samples.
- * Status responses already contain firmware-scaled battery values and should not use this helper.
- */
-function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor, revHwMinor) {
-    // SR62
-    if (revHwMajor === 62)
-        return 2.0;
-    // SR61.5+, SR68.9+, and newer major revisions.
-    if (isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor)) {
-        return 2.469;
-    }
-    return 1.0;
-}
-
 const VERISENSE_OPERATIONAL_FIELD_SCHEMA = [
     // GEN_CFG_0
     {
@@ -26644,7 +26795,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._loggedChain = Promise.resolve();
         this._sync = null;
         this._testReportMode = false; // Flag to capture raw streaming bytes for test reports
-        this._throughputTestMode = false; // Flag to count raw bytes during a BLE throughput test
+        this._throughputTestMode = false; // Flag to count raw bytes during a throughput test
         this._bootstrapRequestTimeoutOverrideMs = null;
         // Set by disconnect() so an in-flight connectWithRetry() loop stops instead
         // of treating the resulting GATT teardown as a transient link drop.
@@ -27932,12 +28083,12 @@ class VerisenseBleDevice extends BaseShimmerClient {
         await this.sendDebugCommand(DEBUG_COMMAND_ID.ERASE_FLASH_AND_LOOKUP_TABLE, [], timeoutMs);
     }
     /**
-     * Low-level: ask the device to saturate the BLE link with dummy data for
+     * Low-level: ask the device to saturate the link with dummy data for
      * `durationMs` milliseconds (debug command 0x0B). The device ACKs immediately
      * and then blasts a fixed 244-byte buffer as fast as the link will accept it.
      *
      * This only starts the blast; it does not measure anything. Prefer
-     * {@link runBleThroughputTest}, which sends this command and measures the
+     * {@link runThroughputTest}, which sends this command and measures the
      * throughput actually received at the host.
      *
      * @param durationMs Blast duration in milliseconds (clamped to the protocol's 0..65535 range).
@@ -27950,21 +28101,24 @@ class VerisenseBleDevice extends BaseShimmerClient {
         ]);
     }
     /**
-     * Measure the maximum BLE link throughput, independent of sensor
+     * Measure the maximum throughput of the link in use, independent of sensor
      * configuration. Asks the device to blast dummy data for `durationMs`
      * (see {@link testDataTransferLoop}) and measures the goodput actually
      * received at the host.
      *
-     * The reported rate reflects device→host (notification) throughput and is
-     * governed by the negotiated PHY, connection interval, MTU and packets per
-     * connection interval — i.e. the real link, not any sensor's sample rate.
+     * Nothing here is BLE-specific: the blast is counted as it arrives on the
+     * attached transport, so this measures a Web Serial link as readily as a
+     * Web Bluetooth one. Over BLE the rate is governed by the negotiated PHY,
+     * connection interval, MTU and packets per connection interval; over serial
+     * by that link's own ceiling. Either way it is the real link that is
+     * measured, not any sensor's sample rate.
      *
      * The measurement finishes when the device falls silent for `idleMs` after
      * the blast (or when the overall safety timeout elapses).
      *
      * @returns received byte/packet counts and the computed throughput.
      */
-    async runBleThroughputTest(opts = {}) {
+    async runThroughputTest(opts = {}) {
         const durationMs = Math.max(100, Math.min(60000, Math.trunc(opts.durationMs ?? 5000)));
         const idleMs = Math.max(100, Math.min(5000, Math.trunc(opts.idleMs ?? 600)));
         const overallTimeoutMs = Math.max(durationMs + 1000, Math.trunc(opts.timeoutMs ?? durationMs + 5000));
@@ -28065,10 +28219,10 @@ class VerisenseBleDevice extends BaseShimmerClient {
             timeoutTimer = setTimeout(() => finish(), overallTimeoutMs);
             if (abortSignal) {
                 if (abortSignal.aborted) {
-                    finish(new Error('runBleThroughputTest aborted'));
+                    finish(new Error('runThroughputTest aborted'));
                     return;
                 }
-                onAbort = () => finish(new Error('runBleThroughputTest aborted'));
+                onAbort = () => finish(new Error('runThroughputTest aborted'));
                 abortSignal.addEventListener('abort', onAbort, { once: true });
             }
             // Enable raw-count mode before sending so no blast bytes are missed. The
@@ -28077,15 +28231,64 @@ class VerisenseBleDevice extends BaseShimmerClient {
             this._throughputTestMode = true;
             void this.testDataTransferLoop(durationMs).catch((e) => {
                 const msg = e instanceof Error ? e.message : String(e);
-                finish(new Error(`runBleThroughputTest failed to start: ${msg}`));
+                finish(new Error(`runThroughputTest failed to start: ${msg}`));
             });
         });
+    }
+    /**
+     * @deprecated Renamed to {@link runThroughputTest}. The old name said BLE,
+     * but the measurement counts whatever arrives on the attached transport and
+     * is used over Web Serial too. Kept so existing callers — including the
+     * consoles running an older vendored build — keep working; it forwards
+     * unchanged.
+     */
+    async runBleThroughputTest(opts = {}) {
+        return this.runThroughputTest(opts);
     }
     async ledTest(ledIndex) {
         await this.sendDebugCommand(DEBUG_COMMAND_ID.LED_TEST, [ledIndex & 0xff]);
     }
+    /**
+     * Run the MAX86xxx PPG LED test — `start` lights the PPG LEDs, `!start`
+     * turns them back off.
+     *
+     * Since DEV-973 (firmware commit `b98c113c3`) the device NACKs this command
+     * when it cannot talk to the PPG chip, where it previously ACKed
+     * unconditionally. A rejection therefore no longer means "unsupported": on
+     * hardware known to carry a MAX86xxx it means the PPG bus is wedged, and the
+     * LEDs are unlit *because the test never ran*. Callers must not present that
+     * to an operator as a dead-LED fault — see {@link classifyPpgLedTestFailure}
+     * for why the NACK cannot be disambiguated from the reply alone.
+     *
+     * @throws {@link VerisensePpgLedTestError} tagged with a `reason` — every
+     *         failure of this command is re-thrown classified.
+     */
     async max86xxxLedTest(start) {
-        await this.sendDebugCommand(DEBUG_COMMAND_ID.MAX86XXX_LED_TEST, [start ? 0x01 : 0x00]);
+        try {
+            await this.sendDebugCommand(DEBUG_COMMAND_ID.MAX86XXX_LED_TEST, [start ? 0x01 : 0x00]);
+        }
+        catch (e) {
+            throw classifyPpgLedTestFailure(e, {
+                hardwarePpgSupport: this._cachedHardwarePpgSupport(),
+            });
+        }
+    }
+    /**
+     * PPG support of the connected hardware, from the production config already
+     * cached on this client. Deliberately does not read from the device: this is
+     * called on a failure path where the unit may be in a bad state, and a
+     * second round-trip could turn one classified failure into a timeout.
+     */
+    _cachedHardwarePpgSupport() {
+        const blob = this.productionConfig;
+        if (!blob?.length || this._isErasedBlob(blob))
+            return null;
+        try {
+            return resolveHardwarePpgSupport(parseProductionConfigPayload(blob));
+        }
+        catch {
+            return null;
+        }
     }
     async startPowerProfilerTest() {
         await this.sendDebugCommand(DEBUG_COMMAND_ID.POWER_PROFILER_TEST);
@@ -31085,5 +31288,5 @@ function shimmerFactoryTestReportToCsvRows(parsed, meta = {}) {
     return factoryTestReportToCsvRows(parsed, meta);
 }
 
-export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH$1 as EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, summariseExgBanks, summariseExgCalibration, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH$1 as EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, summariseExgBanks, summariseExgCalibration, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map

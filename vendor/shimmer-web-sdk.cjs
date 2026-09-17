@@ -5,9 +5,11 @@
  * the built bundle) can log which build they are actually running — a stale
  * vendored copy is otherwise indistinguishable from a firmware fault.
  *
- * Kept in sync with package.json by tests/core/version.test.ts.
+ * Kept in sync with package.json by tests/core/version.test.ts, and stamped
+ * from it by the Bump step in cut-release.yml — the release bumps this file
+ * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.3.0';
+const SDK_VERSION = '0.4.1';
 
 /**
  * Container for a single decoded sensor frame.
@@ -32,6 +34,7 @@ class ObjectCluster {
         this.fields = [];
         this.raw = null;
         this.crcOk = null;
+        this.timestampValid = true;
     }
     /**
      * Append a named field to this cluster.
@@ -4153,6 +4156,23 @@ const TICKS_PER_SECOND = 32768;
 /** Ticks per millisecond — 32.768, as the firmware and the Java driver have it. */
 const TICKS_PER_MS = TICKS_PER_SECOND / 1000;
 /**
+ * How close to the top of the 24-bit range the previous sample must have been
+ * for a drop to exactly zero to be believed as a roll-over.
+ *
+ * One second. Firmware stamps a packet when the sample tick starts it and does
+ * not publish a packet it never stamped, so `0x000000` in the counter field
+ * means the record is invalid rather than that the counter reached its origin.
+ * LogAndStream v1.00.x–v1.01.003 could emit one under SD write back-pressure.
+ * A genuine wrap onto zero means the counter advanced to its very last tick, so
+ * its predecessor is within a sample or two of the maximum — a second is a
+ * generous allowance for a gap in the data, and nine orders of magnitude away
+ * from the mid-range predecessors the invalid records have.
+ *
+ * Only the 24-bit counter is judged this way. The 16-bit one's whole range is
+ * 2 s, so a stall really can cross it, and it keeps its existing behaviour.
+ */
+const INVALID_ZERO_WINDOW_TICKS = TICKS_PER_SECOND;
+/**
  * Relative drift assumed between the sensor's clock and the host's, in parts
  * per million, when an anchor is bound to a stream some time after the reading
  * that produced it.
@@ -4292,9 +4312,22 @@ class StreamTimeline {
      * @param hostMs The host clock when the packet arrived. Used only to recover
      *   wraps that went by unseen — see below — never to time the sample, which
      *   the device's own counter does far better.
+     * @returns the sample's place on the timeline, or, for a packet whose counter
+     *   field is an invalid `0x000000`, the previous sample's place with
+     *   {@link StreamStamp.invalid} set and the timeline untouched.
      */
     stamp(raw, hostMs) {
         const unwrapped = this._unwrap(raw, hostMs);
+        /* An invalid record. Every piece of timeline state holds where it is —
+           `_lastRaw` above all, so the next sample is compared against the last
+           value the firmware actually stamped and reads as the ordinary step
+           forward it is, rather than as a second wrap. `_lastHostMs` holds for the
+           same reason: the elapsed time the missed-wrap recovery works from must
+           span from that sample, not from this one. Nothing about a packet with no
+           timestamp is allowed to move the timeline, including binding an anchor
+           to it. */
+        if (unwrapped === null)
+            return this._describe(this._lastUnwrapped, true);
         this._lastRaw = ((raw % this._modulo) + this._modulo) % this._modulo;
         this._lastUnwrapped = unwrapped;
         /* How many counter boundaries this session has crossed. The unwrapped value
@@ -4308,17 +4341,35 @@ class StreamTimeline {
             this._lastHostMs = hostMs;
         if (this._pending)
             this._resolveAnchor(unwrapped, hostMs);
+        return this._describe(unwrapped, false);
+    }
+    /** Places an unwrapped tick value on the wall clock, if there is one. */
+    _describe(unwrapped, invalid) {
         const deviceMs = unwrapped / TICKS_PER_MS;
         if (!this._anchor) {
-            return { unwrappedTicks: unwrapped, deviceMs, unixMs: null, source: null };
+            return { unwrappedTicks: unwrapped, deviceMs, unixMs: null, source: null, invalid };
         }
         const unixMs = this._anchor.unixMs + (unwrapped - this._anchor.unwrappedTicks) / TICKS_PER_MS;
-        return { unwrappedTicks: unwrapped, deviceMs, unixMs, source: this._anchor.source };
+        return { unwrappedTicks: unwrapped, deviceMs, unixMs, source: this._anchor.source, invalid };
     }
+    /** @returns the unwrapped tick value, or `null` when the sample is invalid. */
     _unwrap(raw, hostMs) {
         const value = ((raw % this._modulo) + this._modulo) % this._modulo;
         if (this._lastRaw === null)
             return value;
+        /* A counter of exactly zero arriving from mid-range is not a roll-over: it
+           is a record the firmware never stamped. Read as a wrap it would put every
+           later sample in the session a clean 512 s late, which is how a customer's
+           9 minute 30 second recording imported as 43 minutes 38. The test is
+           deliberately narrow — the 24-bit counter, an exact zero, and a
+           predecessor further than {@link INVALID_ZERO_WINDOW_TICKS} from the top
+           of the range — so a genuine wrap onto zero is still accepted and the
+           16-bit counter is untouched. See the constant for why. */
+        if (this._bits === 24 &&
+            value === 0 &&
+            this._lastRaw < this._modulo - INVALID_ZERO_WINDOW_TICKS) {
+            return null;
+        }
         const half = this._modulo / 2;
         /* Forward distance from the last sample, and whether to read it as forward
            motion (crossing a wrap if it has to) or as a small step BACKWARDS —
@@ -14757,6 +14808,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                        anchored, places it on a wall clock. Both go on the frame as
                        calibrated fields so a plot and a CSV can use them like any other. */
                     const stamped = this._timeline.stamp(ts, Date.now());
+                    oc.timestampValid = !stamped.invalid;
                     oc.add('TIMESTAMP', stamped.deviceMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
                     if (stamped.unixMs !== null) {
                         oc.add(UNIX_TIMESTAMP_NAME, stamped.unixMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
@@ -15694,6 +15746,315 @@ class Shimmer3RClient extends BaseShimmerClient {
  * desktop describe the same thing with the same header.
  */
 Shimmer3RClient.UNIX_TIMESTAMP_NAME = UNIX_TIMESTAMP_NAME;
+
+const VERISENSE_HW_MAJOR_FRIENDLY_NAMES = {
+    61: 'IMU',
+    62: 'GSR+',
+    64: 'SDK',
+    68: 'Pulse+',
+};
+function getVerisenseHardwareFriendlyName(revHwMajor) {
+    return VERISENSE_HW_MAJOR_FRIENDLY_NAMES[revHwMajor] ?? null;
+}
+/**
+ * Second-generation Verisense hardware is currently defined as:
+ * - SR61.5+
+ * - SR68.9+
+ * - Any future major revision above SR68
+ */
+function isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return false;
+    if (major > 68)
+        return true;
+    if (major === 61 && minor >= 5)
+        return true;
+    if (major === 68 && minor >= 9)
+        return true;
+    return false;
+}
+function getVerisenseHardwareCapabilities(revHwMajor, revHwMinor) {
+    const secondGeneration = isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor);
+    return {
+        secondGeneration,
+        supportsMagnetometer: secondGeneration,
+    };
+}
+/**
+ * GSR-capable hardware. Mirrors the firmware's authoritative
+ * `ShimBrd_isGsrSupportedForHwVersion` (shimmer_boards.c):
+ * - SR62 (any revision)
+ * - SR61 minor >= 5
+ * - SR68 minor >= 5
+ *
+ * Deliberately NOT {@link isVerisenseSecondGenerationHardware}: that predicate
+ * requires SR68 >= 9, but GSR arrived on the SR68 at minor revision 5.
+ */
+function isVerisenseGsrSupportedHardware(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return false;
+    return major === 62 || ((major === 61 || major === 68) && minor >= 5);
+}
+/**
+ * Hardware models with a permanently-attached rechargeable LiPo battery.
+ * Mirrors the firmware's authoritative `ShimBrd_isLipoPresentForHwVersion`
+ * (shimmer_boards.c):
+ * - SR62 (any revision)
+ * - SR61 minor >= 5
+ * - SR68 minor >= 9
+ *
+ * On these boards the operational-config battery-type bit (GEN_CFG_2 bit 0,
+ * Zinc-Air/NiMH) has no effect: the firmware hard-overrides the battery type
+ * to LiPo regardless of the stored bit (`setBattType`, hal_asm_battery.c).
+ * Config editors should therefore disable the Battery Type field on these
+ * models rather than offer a choice that does nothing (DEV-809).
+ */
+function isVerisenseLipoBatteryHardware(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return false;
+    return major === 62 || (major === 61 && minor >= 5) || (major === 68 && minor >= 9);
+}
+const VERISENSE_SENSOR_SUPPORT_NONE = {
+    accel1: false,
+    gyroAccel2: false,
+    imuGen2: false,
+    gsr: false,
+    ppg: false,
+    ambientLight: false,
+    skinTemperature: false,
+    algorithmHub: false,
+    ledAutoBrightness: false,
+};
+const VERISENSE_SENSOR_SUPPORT_ALL = {
+    accel1: true,
+    gyroAccel2: true,
+    imuGen2: true,
+    gsr: true,
+    ppg: true,
+    ambientLight: true,
+    skinTemperature: true,
+    algorithmHub: true,
+    ledAutoBrightness: true,
+};
+/**
+ * Resolves which sensor blocks a given Verisense hardware revision carries,
+ * derived from the firmware Model IC matrix
+ * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
+ *
+ * Unknown / development hardware (e.g. SR64, or any unrecognised major
+ * revision) reports every block as present so consumers never hide a setting
+ * they cannot confidently rule out.
+ */
+function getVerisenseHardwareSensorSupport(revHwMajor, revHwMinor) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor)) {
+        return { ...VERISENSE_SENSOR_SUPPORT_ALL };
+    }
+    const gen2 = isVerisenseSecondGenerationHardware(major, minor);
+    switch (major) {
+        case 61: // Verisense IMU
+            return gen2
+                ? // SR61.5+: LSM6DSV + LIS2MDL, GSR, ambient light, 2xRGB LEDs.
+                    {
+                        ...VERISENSE_SENSOR_SUPPORT_NONE,
+                        imuGen2: true,
+                        gsr: true,
+                        ambientLight: true,
+                        ledAutoBrightness: true,
+                    }
+                : // SR61.1-4: LIS2DW12 + LSM6DS3 only.
+                    { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true };
+        case 62: // Verisense GSR+: LIS2DW12 + LSM6DS3, GSR, analog PPG.
+            return {
+                ...VERISENSE_SENSOR_SUPPORT_NONE,
+                accel1: true,
+                gyroAccel2: true,
+                gsr: true,
+                ppg: true,
+            };
+        case 63: // Verisense PPG: LIS2DW12 + LSM6DS3 + PPG.
+            return { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true, ppg: true };
+        case 68: // Verisense Pulse+
+            return gen2
+                ? // SR68.9+: full 2nd-gen stack. The LIS2DW12 (accel1) is physically
+                    // present but routed to the algorithm hub and not recorded from, so
+                    // it is treated as unsupported for operational-config purposes.
+                    {
+                        ...VERISENSE_SENSOR_SUPPORT_NONE,
+                        imuGen2: true,
+                        gsr: true,
+                        ppg: true,
+                        ambientLight: true,
+                        skinTemperature: true,
+                        algorithmHub: true,
+                        ledAutoBrightness: true,
+                    }
+                : // SR68.1-8: LIS2DW12 + PPG; GSR added from SR68.5 (Model IC matrix +
+                    // firmware ShimBrd_isGsrSupportedForHwVersion); skin temperature from
+                    // SR68.7.
+                    {
+                        ...VERISENSE_SENSOR_SUPPORT_NONE,
+                        accel1: true,
+                        ppg: true,
+                        gsr: isVerisenseGsrSupportedHardware(major, minor),
+                        skinTemperature: minor >= 7,
+                    };
+        default:
+            // SR64 (dev board) and any future/unknown major: assume everything.
+            return { ...VERISENSE_SENSOR_SUPPORT_ALL };
+    }
+}
+function getVerisenseHardwareRevision(source) {
+    if (!source)
+        return null;
+    const major = Number(source.revHwMajor);
+    const minor = Number(source.revHwMinor);
+    const internal = Number(source.revHwInternal);
+    if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(internal)) {
+        return null;
+    }
+    if (major <= 0 || major > 255 || minor < 0 || minor > 255 || internal < 0 || internal > 65535) {
+        return null;
+    }
+    return {
+        major: Math.trunc(major),
+        minor: Math.trunc(minor),
+        internal: Math.trunc(internal),
+    };
+}
+function supportsVerisenseMagnetometer(source) {
+    const hw = getVerisenseHardwareRevision(source);
+    if (!hw)
+        return false;
+    return getVerisenseHardwareCapabilities(hw.major, hw.minor).supportsMagnetometer;
+}
+function formatVerisenseHardwareRevision(revHwMajor, revHwMinor, revHwInternal = 0, opts = {}) {
+    const prefix = opts.prefix ?? 'SR';
+    const base = `${prefix}${revHwMajor}.${revHwMinor}.${revHwInternal}`;
+    if (!opts.includeFriendlyName)
+        return base;
+    const friendly = getVerisenseHardwareFriendlyName(revHwMajor);
+    return friendly ? `${base} (${friendly})` : base;
+}
+/**
+ * Battery voltage scaling for streamed ADC battery samples.
+ * Status responses already contain firmware-scaled battery values and should not use this helper.
+ */
+function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor, revHwMinor) {
+    // SR62
+    if (revHwMajor === 62)
+        return 2.0;
+    // SR61.5+, SR68.9+, and newer major revisions.
+    if (isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor)) {
+        return 2.469;
+    }
+    return 1.0;
+}
+
+/**
+ * A MAX86xxx PPG LED-test failure, tagged with a machine-readable reason.
+ *
+ * Mirrors the {@link FactoryTestError} pattern: callers switch on `reason`
+ * rather than pattern-matching a message string.
+ */
+class VerisensePpgLedTestError extends Error {
+    constructor(reason, operatorMessage, hardwarePpgSupport, cause) {
+        super(operatorMessage);
+        this.name = 'VerisensePpgLedTestError';
+        this.reason = reason;
+        this.hardwarePpgSupport = hardwarePpgSupport;
+        this.operatorMessage = operatorMessage;
+        this.cause = cause;
+    }
+}
+/** Type guard for {@link VerisensePpgLedTestError}. */
+function isVerisensePpgLedTestError(e) {
+    return e instanceof VerisensePpgLedTestError;
+}
+/**
+ * Whether an error raised by the command path is the device NACKing a debug
+ * command. Matches the three NACK opcodes (0x50 bad-header-command, 0x60
+ * bad-header-property, 0x70 generic) on the DEBUG_COMMAND property (0x9),
+ * which is how `validatePendingResponse` renders a refusal.
+ */
+function isDebugNackError(message) {
+    return /NACK command=0x(?:50|60|70) property=0x9/i.test(message);
+}
+/** Whether the error is the command path's own timeout. */
+function isTimeoutError(message) {
+    return /Request timeout/i.test(message);
+}
+/**
+ * Classify a failure of the MAX86xxx LED-test debug command (0x0E).
+ *
+ * **The NACK is ambiguous on the wire.** In the firmware's debug dispatch
+ * (`asm_payload_parse.c`) the MAX86xxx branch is guarded by
+ * `doesHwSupportPpg()`, and the `else` that catches unrecognised debug
+ * commands calls the same `sendNackGeneric()`. So after DEV-973 (commit
+ * `b98c113c3`) three different causes produce a byte-identical
+ * `NACK_GENERIC` on property `0x09`:
+ *
+ * 1. firmware too old to know debug command `0x0E`;
+ * 2. hardware with no PPG front end (`doesHwSupportPpg()` false);
+ * 3. the new one — `max86xxx_ledTest()` returned non-success, i.e. the PPG
+ *    bus is wedged or unreachable.
+ *
+ * Nothing in the reply separates them, so the only usable discriminator is
+ * the hardware revision the host already holds from the production config.
+ * Known-PPG hardware reaching a NACK means the firmware got as far as the
+ * LED test and it failed; known-no-PPG hardware means it never did.
+ *
+ * @param err     the error the command path raised
+ * @param opts.hardwarePpgSupport
+ *        `true`/`false` from {@link getVerisenseHardwareSensorSupport}, or
+ *        `null` when the hardware revision is unknown
+ */
+function classifyPpgLedTestFailure(err, opts) {
+    const { hardwarePpgSupport } = opts;
+    const message = err instanceof Error ? err.message : String(err);
+    if (isDebugNackError(message)) {
+        if (hardwarePpgSupport === false) {
+            return new VerisensePpgLedTestError('not-supported', 'PPG LED test refused: this hardware revision has no PPG front end, so the ' +
+                'firmware never ran the test. Not a unit fault.', hardwarePpgSupport, err);
+        }
+        const hardwareCaveat = hardwarePpgSupport === null
+            ? ' (hardware revision unknown — read the production config to rule out ' +
+                'a board with no PPG front end, or firmware too old to support this command)'
+            : '';
+        return new VerisensePpgLedTestError('ppg-comms', 'PPG LED test FAILED: the device refused the command — PPG comms failure ' +
+            '(wedged or unreachable PPG bus). The LEDs themselves are NOT known to be ' +
+            `dead; do not scrap this board as a dead-LED fault${hardwareCaveat}.`, hardwarePpgSupport, err);
+    }
+    if (isTimeoutError(message)) {
+        return new VerisensePpgLedTestError('no-response', `PPG LED test inconclusive: no reply from the device (${message}). This is a ` +
+            'link problem, not a verdict on the PPG LEDs.', hardwarePpgSupport, err);
+    }
+    return new VerisensePpgLedTestError('unknown', `PPG LED test failed: ${message}`, hardwarePpgSupport, err);
+}
+/**
+ * Resolve whether a parsed production config describes hardware with a PPG
+ * front end. Returns `null` when the revision cannot be established (config
+ * erased, unreadable, or non-numeric fields), which
+ * {@link classifyPpgLedTestFailure} treats as "assume a comms fault".
+ */
+function resolveHardwarePpgSupport(parsed) {
+    const major = Number(parsed?.revHwMajor);
+    const minor = Number(parsed?.revHwMinor);
+    if (!Number.isFinite(major) || !Number.isFinite(minor))
+        return null;
+    // An erased production config reads back as 0xFF bytes; that is not a
+    // hardware revision, it is an unprogrammed unit.
+    if (major === 0xff || major <= 0)
+        return null;
+    return getVerisenseHardwareSensorSupport(major, minor).ppg;
+}
 
 /**
  * EEPROM brand (advertising name) record.
@@ -18816,6 +19177,7 @@ class Shimmer3Client extends BaseShimmerClient {
                     /* Unwrap the counter — every 2 s on older firmware, every 512 s on
                        newer — and place it on a wall clock when anchored. */
                     const stamped = this._timeline.stamp(ts, Date.now());
+                    oc.timestampValid = !stamped.invalid;
                     oc.add('TIMESTAMP', stamped.deviceMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
                     if (stamped.unixMs !== null) {
                         oc.add(UNIX_TIMESTAMP_NAME, stamped.unixMs, CHANNEL_UNITS.MILLISECONDS, 'cal');
@@ -22805,217 +23167,6 @@ function parsePendingEvents(payload) {
     return out;
 }
 
-const VERISENSE_HW_MAJOR_FRIENDLY_NAMES = {
-    61: 'IMU',
-    62: 'GSR+',
-    64: 'SDK',
-    68: 'Pulse+',
-};
-function getVerisenseHardwareFriendlyName(revHwMajor) {
-    return VERISENSE_HW_MAJOR_FRIENDLY_NAMES[revHwMajor] ?? null;
-}
-/**
- * Second-generation Verisense hardware is currently defined as:
- * - SR61.5+
- * - SR68.9+
- * - Any future major revision above SR68
- */
-function isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor))
-        return false;
-    if (major > 68)
-        return true;
-    if (major === 61 && minor >= 5)
-        return true;
-    if (major === 68 && minor >= 9)
-        return true;
-    return false;
-}
-function getVerisenseHardwareCapabilities(revHwMajor, revHwMinor) {
-    const secondGeneration = isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor);
-    return {
-        secondGeneration,
-        supportsMagnetometer: secondGeneration,
-    };
-}
-/**
- * GSR-capable hardware. Mirrors the firmware's authoritative
- * `ShimBrd_isGsrSupportedForHwVersion` (shimmer_boards.c):
- * - SR62 (any revision)
- * - SR61 minor >= 5
- * - SR68 minor >= 5
- *
- * Deliberately NOT {@link isVerisenseSecondGenerationHardware}: that predicate
- * requires SR68 >= 9, but GSR arrived on the SR68 at minor revision 5.
- */
-function isVerisenseGsrSupportedHardware(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor))
-        return false;
-    return major === 62 || ((major === 61 || major === 68) && minor >= 5);
-}
-/**
- * Hardware models with a permanently-attached rechargeable LiPo battery.
- * Mirrors the firmware's authoritative `ShimBrd_isLipoPresentForHwVersion`
- * (shimmer_boards.c):
- * - SR62 (any revision)
- * - SR61 minor >= 5
- * - SR68 minor >= 9
- *
- * On these boards the operational-config battery-type bit (GEN_CFG_2 bit 0,
- * Zinc-Air/NiMH) has no effect: the firmware hard-overrides the battery type
- * to LiPo regardless of the stored bit (`setBattType`, hal_asm_battery.c).
- * Config editors should therefore disable the Battery Type field on these
- * models rather than offer a choice that does nothing (DEV-809).
- */
-function isVerisenseLipoBatteryHardware(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor))
-        return false;
-    return major === 62 || (major === 61 && minor >= 5) || (major === 68 && minor >= 9);
-}
-const VERISENSE_SENSOR_SUPPORT_NONE = {
-    accel1: false,
-    gyroAccel2: false,
-    imuGen2: false,
-    gsr: false,
-    ppg: false,
-    ambientLight: false,
-    skinTemperature: false,
-    algorithmHub: false,
-    ledAutoBrightness: false,
-};
-const VERISENSE_SENSOR_SUPPORT_ALL = {
-    accel1: true,
-    gyroAccel2: true,
-    imuGen2: true,
-    gsr: true,
-    ppg: true,
-    ambientLight: true,
-    skinTemperature: true,
-    algorithmHub: true,
-    ledAutoBrightness: true,
-};
-/**
- * Resolves which sensor blocks a given Verisense hardware revision carries,
- * derived from the firmware Model IC matrix
- * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
- *
- * Unknown / development hardware (e.g. SR64, or any unrecognised major
- * revision) reports every block as present so consumers never hide a setting
- * they cannot confidently rule out.
- */
-function getVerisenseHardwareSensorSupport(revHwMajor, revHwMinor) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    if (!Number.isFinite(major) || !Number.isFinite(minor)) {
-        return { ...VERISENSE_SENSOR_SUPPORT_ALL };
-    }
-    const gen2 = isVerisenseSecondGenerationHardware(major, minor);
-    switch (major) {
-        case 61: // Verisense IMU
-            return gen2
-                ? // SR61.5+: LSM6DSV + LIS2MDL, GSR, ambient light, 2xRGB LEDs.
-                    {
-                        ...VERISENSE_SENSOR_SUPPORT_NONE,
-                        imuGen2: true,
-                        gsr: true,
-                        ambientLight: true,
-                        ledAutoBrightness: true,
-                    }
-                : // SR61.1-4: LIS2DW12 + LSM6DS3 only.
-                    { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true };
-        case 62: // Verisense GSR+: LIS2DW12 + LSM6DS3, GSR, analog PPG.
-            return {
-                ...VERISENSE_SENSOR_SUPPORT_NONE,
-                accel1: true,
-                gyroAccel2: true,
-                gsr: true,
-                ppg: true,
-            };
-        case 63: // Verisense PPG: LIS2DW12 + LSM6DS3 + PPG.
-            return { ...VERISENSE_SENSOR_SUPPORT_NONE, accel1: true, gyroAccel2: true, ppg: true };
-        case 68: // Verisense Pulse+
-            return gen2
-                ? // SR68.9+: full 2nd-gen stack. The LIS2DW12 (accel1) is physically
-                    // present but routed to the algorithm hub and not recorded from, so
-                    // it is treated as unsupported for operational-config purposes.
-                    {
-                        ...VERISENSE_SENSOR_SUPPORT_NONE,
-                        imuGen2: true,
-                        gsr: true,
-                        ppg: true,
-                        ambientLight: true,
-                        skinTemperature: true,
-                        algorithmHub: true,
-                        ledAutoBrightness: true,
-                    }
-                : // SR68.1-8: LIS2DW12 + PPG; GSR added from SR68.5 (Model IC matrix +
-                    // firmware ShimBrd_isGsrSupportedForHwVersion); skin temperature from
-                    // SR68.7.
-                    {
-                        ...VERISENSE_SENSOR_SUPPORT_NONE,
-                        accel1: true,
-                        ppg: true,
-                        gsr: isVerisenseGsrSupportedHardware(major, minor),
-                        skinTemperature: minor >= 7,
-                    };
-        default:
-            // SR64 (dev board) and any future/unknown major: assume everything.
-            return { ...VERISENSE_SENSOR_SUPPORT_ALL };
-    }
-}
-function getVerisenseHardwareRevision(source) {
-    if (!source)
-        return null;
-    const major = Number(source.revHwMajor);
-    const minor = Number(source.revHwMinor);
-    const internal = Number(source.revHwInternal);
-    if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(internal)) {
-        return null;
-    }
-    if (major <= 0 || major > 255 || minor < 0 || minor > 255 || internal < 0 || internal > 65535) {
-        return null;
-    }
-    return {
-        major: Math.trunc(major),
-        minor: Math.trunc(minor),
-        internal: Math.trunc(internal),
-    };
-}
-function supportsVerisenseMagnetometer(source) {
-    const hw = getVerisenseHardwareRevision(source);
-    if (!hw)
-        return false;
-    return getVerisenseHardwareCapabilities(hw.major, hw.minor).supportsMagnetometer;
-}
-function formatVerisenseHardwareRevision(revHwMajor, revHwMinor, revHwInternal = 0, opts = {}) {
-    const prefix = opts.prefix ?? 'SR';
-    const base = `${prefix}${revHwMajor}.${revHwMinor}.${revHwInternal}`;
-    if (!opts.includeFriendlyName)
-        return base;
-    const friendly = getVerisenseHardwareFriendlyName(revHwMajor);
-    return friendly ? `${base} (${friendly})` : base;
-}
-/**
- * Battery voltage scaling for streamed ADC battery samples.
- * Status responses already contain firmware-scaled battery values and should not use this helper.
- */
-function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor, revHwMinor) {
-    // SR62
-    if (revHwMajor === 62)
-        return 2.0;
-    // SR61.5+, SR68.9+, and newer major revisions.
-    if (isVerisenseSecondGenerationHardware(revHwMajor, revHwMinor)) {
-        return 2.469;
-    }
-    return 1.0;
-}
-
 const VERISENSE_OPERATIONAL_FIELD_SCHEMA = [
     // GEN_CFG_0
     {
@@ -26646,7 +26797,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
         this._loggedChain = Promise.resolve();
         this._sync = null;
         this._testReportMode = false; // Flag to capture raw streaming bytes for test reports
-        this._throughputTestMode = false; // Flag to count raw bytes during a BLE throughput test
+        this._throughputTestMode = false; // Flag to count raw bytes during a throughput test
         this._bootstrapRequestTimeoutOverrideMs = null;
         // Set by disconnect() so an in-flight connectWithRetry() loop stops instead
         // of treating the resulting GATT teardown as a transient link drop.
@@ -27934,12 +28085,12 @@ class VerisenseBleDevice extends BaseShimmerClient {
         await this.sendDebugCommand(DEBUG_COMMAND_ID.ERASE_FLASH_AND_LOOKUP_TABLE, [], timeoutMs);
     }
     /**
-     * Low-level: ask the device to saturate the BLE link with dummy data for
+     * Low-level: ask the device to saturate the link with dummy data for
      * `durationMs` milliseconds (debug command 0x0B). The device ACKs immediately
      * and then blasts a fixed 244-byte buffer as fast as the link will accept it.
      *
      * This only starts the blast; it does not measure anything. Prefer
-     * {@link runBleThroughputTest}, which sends this command and measures the
+     * {@link runThroughputTest}, which sends this command and measures the
      * throughput actually received at the host.
      *
      * @param durationMs Blast duration in milliseconds (clamped to the protocol's 0..65535 range).
@@ -27952,21 +28103,24 @@ class VerisenseBleDevice extends BaseShimmerClient {
         ]);
     }
     /**
-     * Measure the maximum BLE link throughput, independent of sensor
+     * Measure the maximum throughput of the link in use, independent of sensor
      * configuration. Asks the device to blast dummy data for `durationMs`
      * (see {@link testDataTransferLoop}) and measures the goodput actually
      * received at the host.
      *
-     * The reported rate reflects device→host (notification) throughput and is
-     * governed by the negotiated PHY, connection interval, MTU and packets per
-     * connection interval — i.e. the real link, not any sensor's sample rate.
+     * Nothing here is BLE-specific: the blast is counted as it arrives on the
+     * attached transport, so this measures a Web Serial link as readily as a
+     * Web Bluetooth one. Over BLE the rate is governed by the negotiated PHY,
+     * connection interval, MTU and packets per connection interval; over serial
+     * by that link's own ceiling. Either way it is the real link that is
+     * measured, not any sensor's sample rate.
      *
      * The measurement finishes when the device falls silent for `idleMs` after
      * the blast (or when the overall safety timeout elapses).
      *
      * @returns received byte/packet counts and the computed throughput.
      */
-    async runBleThroughputTest(opts = {}) {
+    async runThroughputTest(opts = {}) {
         const durationMs = Math.max(100, Math.min(60000, Math.trunc(opts.durationMs ?? 5000)));
         const idleMs = Math.max(100, Math.min(5000, Math.trunc(opts.idleMs ?? 600)));
         const overallTimeoutMs = Math.max(durationMs + 1000, Math.trunc(opts.timeoutMs ?? durationMs + 5000));
@@ -28067,10 +28221,10 @@ class VerisenseBleDevice extends BaseShimmerClient {
             timeoutTimer = setTimeout(() => finish(), overallTimeoutMs);
             if (abortSignal) {
                 if (abortSignal.aborted) {
-                    finish(new Error('runBleThroughputTest aborted'));
+                    finish(new Error('runThroughputTest aborted'));
                     return;
                 }
-                onAbort = () => finish(new Error('runBleThroughputTest aborted'));
+                onAbort = () => finish(new Error('runThroughputTest aborted'));
                 abortSignal.addEventListener('abort', onAbort, { once: true });
             }
             // Enable raw-count mode before sending so no blast bytes are missed. The
@@ -28079,15 +28233,64 @@ class VerisenseBleDevice extends BaseShimmerClient {
             this._throughputTestMode = true;
             void this.testDataTransferLoop(durationMs).catch((e) => {
                 const msg = e instanceof Error ? e.message : String(e);
-                finish(new Error(`runBleThroughputTest failed to start: ${msg}`));
+                finish(new Error(`runThroughputTest failed to start: ${msg}`));
             });
         });
+    }
+    /**
+     * @deprecated Renamed to {@link runThroughputTest}. The old name said BLE,
+     * but the measurement counts whatever arrives on the attached transport and
+     * is used over Web Serial too. Kept so existing callers — including the
+     * consoles running an older vendored build — keep working; it forwards
+     * unchanged.
+     */
+    async runBleThroughputTest(opts = {}) {
+        return this.runThroughputTest(opts);
     }
     async ledTest(ledIndex) {
         await this.sendDebugCommand(DEBUG_COMMAND_ID.LED_TEST, [ledIndex & 0xff]);
     }
+    /**
+     * Run the MAX86xxx PPG LED test — `start` lights the PPG LEDs, `!start`
+     * turns them back off.
+     *
+     * Since DEV-973 (firmware commit `b98c113c3`) the device NACKs this command
+     * when it cannot talk to the PPG chip, where it previously ACKed
+     * unconditionally. A rejection therefore no longer means "unsupported": on
+     * hardware known to carry a MAX86xxx it means the PPG bus is wedged, and the
+     * LEDs are unlit *because the test never ran*. Callers must not present that
+     * to an operator as a dead-LED fault — see {@link classifyPpgLedTestFailure}
+     * for why the NACK cannot be disambiguated from the reply alone.
+     *
+     * @throws {@link VerisensePpgLedTestError} tagged with a `reason` — every
+     *         failure of this command is re-thrown classified.
+     */
     async max86xxxLedTest(start) {
-        await this.sendDebugCommand(DEBUG_COMMAND_ID.MAX86XXX_LED_TEST, [start ? 0x01 : 0x00]);
+        try {
+            await this.sendDebugCommand(DEBUG_COMMAND_ID.MAX86XXX_LED_TEST, [start ? 0x01 : 0x00]);
+        }
+        catch (e) {
+            throw classifyPpgLedTestFailure(e, {
+                hardwarePpgSupport: this._cachedHardwarePpgSupport(),
+            });
+        }
+    }
+    /**
+     * PPG support of the connected hardware, from the production config already
+     * cached on this client. Deliberately does not read from the device: this is
+     * called on a failure path where the unit may be in a bad state, and a
+     * second round-trip could turn one classified failure into a timeout.
+     */
+    _cachedHardwarePpgSupport() {
+        const blob = this.productionConfig;
+        if (!blob?.length || this._isErasedBlob(blob))
+            return null;
+        try {
+            return resolveHardwarePpgSupport(parseProductionConfigPayload(blob));
+        }
+        catch {
+            return null;
+        }
     }
     async startPowerProfilerTest() {
         await this.sendDebugCommand(DEBUG_COMMAND_ID.POWER_PROFILER_TEST);
@@ -31166,6 +31369,7 @@ exports.INFOMEM_SAMPLING_CLOCK_FREQ = INFOMEM_SAMPLING_CLOCK_FREQ;
 exports.INFOMEM_SIZE = INFOMEM_SIZE;
 exports.INFOMEM_VALIDITY_BYTES = INFOMEM_VALIDITY_BYTES;
 exports.INPUT_SELECTION_LABELS = INPUT_SELECTION_LABELS;
+exports.INVALID_ZERO_WINDOW_TICKS = INVALID_ZERO_WINDOW_TICKS;
 exports.LEAD_OFF_COMPARATOR_OPTIONS = LEAD_OFF_COMPARATOR_OPTIONS;
 exports.LEAD_OFF_CURRENT_LABELS = LEAD_OFF_CURRENT_LABELS;
 exports.LEAD_OFF_CURRENT_OPTIONS = LEAD_OFF_CURRENT_OPTIONS;
@@ -31371,6 +31575,7 @@ exports.VERISENSE_USB_DFU_REENUMERATION_DELAY_MS = VERISENSE_USB_DFU_REENUMERATI
 exports.VERISENSE_USB_DFU_VID = VERISENSE_USB_DFU_VID;
 exports.VOLTAGE_REFERENCE_LABELS = VOLTAGE_REFERENCE_LABELS;
 exports.VerisenseBleDevice = VerisenseBleDevice;
+exports.VerisensePpgLedTestError = VerisensePpgLedTestError;
 exports.VerisenseSerialDfu = VerisenseSerialDfu;
 exports.WIRED_DEFAULTS = WIRED_DEFAULTS;
 exports.WIRED_NEED_MORE = NEED_MORE$2;
@@ -31440,6 +31645,7 @@ exports.checkSensorRules = checkSensorRules;
 exports.classifyBaseResponse = classifyBaseResponse;
 exports.classifyFactoryTestAckPacket = classifyFactoryTestAckPacket;
 exports.classifyLiteProtocolAck = classifyLiteProtocolAck;
+exports.classifyPpgLedTestFailure = classifyPpgLedTestFailure;
 exports.classifyVerisenseDfuError = classifyVerisenseDfuError;
 exports.clearExgResolutionFlags = clearExgResolutionFlags;
 exports.compareInfoMemExcluding = compareInfoMemExcluding;
@@ -31559,6 +31765,7 @@ exports.isUsbDfuUnsupportedError = isUsbDfuUnsupportedError;
 exports.isVerisenseGsrSupportedHardware = isVerisenseGsrSupportedHardware;
 exports.isVerisenseLightDarkChannelEnabled = isVerisenseLightDarkChannelEnabled;
 exports.isVerisenseLipoBatteryHardware = isVerisenseLipoBatteryHardware;
+exports.isVerisensePpgLedTestError = isVerisensePpgLedTestError;
 exports.isVerisenseSecondGenerationHardware = isVerisenseSecondGenerationHardware;
 exports.localCivilUnixSecondsNow = localCivilUnixSecondsNow;
 exports.lsm6dsvAccelGyroRateHz = lsm6dsvAccelGyroRateHz;
@@ -31629,6 +31836,7 @@ exports.requireShimmer3FactoryTestType = requireShimmer3FactoryTestType;
 exports.requiresExpansionPower = requiresExpansionPower;
 exports.resolveChannelFormat = resolveChannelFormat;
 exports.resolveFieldIndex = resolveFieldIndex;
+exports.resolveHardwarePpgSupport = resolveHardwarePpgSupport;
 exports.resolveInfoMemLayout = resolveInfoMemLayout;
 exports.resolveVerisenseSensorRateFieldKey = resolveVerisenseSensorRateFieldKey;
 exports.respirationPhaseOptions = respirationPhaseOptions;
