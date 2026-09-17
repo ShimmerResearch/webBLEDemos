@@ -488,14 +488,16 @@ Three things that take the sensor's link exclusively for a while. (The red LED
 used to be here too; it is on **General** now, because nothing about it is a
 test.)
 
-**Link speed** free-runs the firmware's data-rate test for five seconds and
+**Throughput** free-runs the firmware's data-rate test for five seconds and
 counts what arrives, which is the only honest way to know a link's throughput:
 BLE negotiates its connection interval with the host's own Bluetooth stack, so
-two hosts and the same sensor can differ severalfold. It is Bluetooth-only —
-the dock command set has no data-rate test — and refused while the sensor is
-sensing or a transfer is running, because it saturates the link on purpose. The
-figure lands in the SD card tab's stats and drives its download estimates, so
-measuring once after connecting makes those estimates worth reading.
+two hosts and the same sensor can differ severalfold. It is named for what it
+measures rather than for a link, but on this sensor only the Bluetooth ones can
+run it — the dock command set has no data-rate test at all. It is refused
+while the sensor is sensing or a transfer is running, because it saturates the
+link on purpose. The figure lands in the
+SD card tab's stats and drives its download estimates, so measuring once after
+connecting makes those estimates worth reading.
 
 It used to sit beside the connect buttons. It is here now because it is a test
 that holds the link, which is what everything else on this tab does, and it

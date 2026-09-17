@@ -964,7 +964,7 @@
              gating machinery with them. The connect row is where the eye
              should land on the primary action. -->
         <div class="card">
-          <div class="card-title">Link speed</div>
+          <div class="card-title">Throughput test</div>
           <div class="field-hint" id="linkTestNote"></div>
           <div class="row">
             <button
@@ -973,7 +973,7 @@
               data-requires="idle"
               data-cap="linkTest"
             >
-              Measure link speed (5 s)
+              Measure throughput (5 s)
             </button>
             <span class="pill" id="linkSpeedPill">not measured</span>
           </div>
@@ -1783,7 +1783,7 @@
           $("applyNote").textContent = plan.blocked;
         } else if (linkTesting) {
           $("applyNote").textContent =
-            "Waiting for the link-speed test to finish — it saturates the link on purpose, which is the whole point of it.";
+            "Waiting for the throughput test to finish — it saturates the link on purpose, which is the whole point of it.";
         } else if (sdBusy) {
           /* Not the firmware refusing this time — the page is. One link, one
                    conversation: a configuration write in the middle of a file
@@ -3654,7 +3654,7 @@
                  three (see its setEnabled call), so leaving them unsaid greyed the
                  card out with no reason on screen. */
         if (linkTesting) {
-          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+          return "The throughput test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
         }
         if (brandBusy) {
           return "A device-naming write is using the link. A download and a name write cannot share it — wait for it to finish.";
@@ -3856,7 +3856,7 @@
           return "The sensor is sensing, and the firmware refuses every configuration command while it is. Stop the stream before reading or writing calibration.";
         }
         if (linkTesting) {
-          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+          return "The throughput test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
         }
         if (sdBusy) {
           return "An SD card transfer is using the link. A calibration write and a download cannot share it — wait for the transfer to finish.";
@@ -3902,7 +3902,7 @@
           return "The sensor is sensing, and the firmware refuses a self-test while it is — the test takes the whole sensor over for up to a minute. Stop the stream first.";
         }
         if (linkTesting) {
-          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+          return "The throughput test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
         }
         if (sdBusy) {
           return "An SD card transfer is using the link. A report printed into the middle of a block stream would interleave with it — wait for the transfer to finish.";
@@ -3974,7 +3974,7 @@
         if (!client) return "disconnected";
         if (testBusy) return "the self-test is running";
         if (streaming || sdLogging) return "the sensor is sensing";
-        if (linkTesting) return "the link-speed test is running";
+        if (linkTesting) return "the throughput test is running";
         if (sdBusy) return "an SD card transfer is using the link";
         if (brandBusy) return "a device-naming write is using the link";
         if (calibBusy) return "a calibration write is using the link";
@@ -4094,7 +4094,7 @@
           return "The sensor is sensing. New names only take effect when it restarts, and the firmware skips a restart while it is sensing so a recording can never be truncated — stop the stream before changing the names.";
         }
         if (linkTesting) {
-          return "The link-speed test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
+          return "The throughput test is running. It saturates the link on purpose — wait the few seconds for it to finish.";
         }
         if (sdBusy) {
           return "An SD card transfer is using the link. A name write and a download cannot share it — wait for the transfer to finish.";
