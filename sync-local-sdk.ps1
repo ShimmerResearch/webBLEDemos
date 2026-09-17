@@ -69,5 +69,26 @@ foreach ($name in $files) {
     }
 }
 
+# In local-repo mode the version field is provenance output, not input: stamp
+# the built SDK's package.json version back into sdk-source.json so the file
+# cannot claim a version the vendored bundles are not. It said 0.3.0 while
+# vendor/ held a 0.4.x build, because this script read sdk-source.json for its
+# sourceMode and never wrote it back - though AGENTS.md here and in the SDK
+# both say the sync scripts stamp it. verisense-device-console's copy of this
+# script has always stamped; this is that block, ported.
+# (In local-version mode the field is the user's selector, so it is left alone;
+# local-latest builds a tag that may not match the working copy's package.json,
+# so it is not stamped either.)
+if ($sourceMode -eq "local-repo") {
+    $sdkPackageJson = Get-Content (Join-Path $sdkRoot "package.json") -Raw | ConvertFrom-Json
+    $sdkVersion = $sdkPackageJson.version
+    if ($sdkVersion -and $sourceConfig.version -ne $sdkVersion) {
+        $sourceConfig | Add-Member -NotePropertyName version -NotePropertyValue $sdkVersion -Force
+        $json = ($sourceConfig | ConvertTo-Json) -replace '":  ', '": ' -replace "`r`n", "`n"
+        [System.IO.File]::WriteAllText($sdkSourceConfigPath, $json + "`n", (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "Stamped sdk-source.json version: $sdkVersion"
+    }
+}
+
 $targetList = $vendorTargets -join ", "
 Write-Host "Synced SDK artifacts from '$distDir' to [$targetList] (sourceMode=$sourceMode)."
