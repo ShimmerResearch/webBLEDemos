@@ -979,11 +979,14 @@
           </div>
           <div class="field-hint" style="margin-top: 8px">
             Streams data for five seconds and counts what arrives, which is the
-            only honest way to know a link's throughput: BLE negotiates its
-            connection interval with the host's own Bluetooth stack, so two
-            hosts and the same sensor can differ severalfold. The figure lands
-            in the SD card tab's stats and drives its download estimates, so
-            measuring once after connecting makes those estimates worth reading.
+            only honest way to know a link's throughput: on BLE the connection
+            interval is negotiated with the host's own Bluetooth stack, and on
+            Classic Bluetooth the rate follows that host's own serial buffering,
+            so two hosts and the same sensor can differ severalfold. It needs
+            one of the Bluetooth links either way — the USB-C dock command set
+            has no data-rate test at all. The figure lands in the SD card tab's
+            stats and drives its download estimates, so measuring once after
+            connecting makes those estimates worth reading.
           </div>
         </div>
 
@@ -1826,10 +1829,10 @@
        */
       function linkTestUnavailableReason() {
         if (!client) {
-          return "Connect over BLE or Classic Bluetooth to measure the link.";
+          return "Connect over Bluetooth to measure a link — BLE or Classic, whichever radio this sensor carries. The USB-C connection speaks the dock protocol, which has no data-rate test in it.";
         }
         if (mode === "usb") {
-          return "This sensor is connected over its USB-C port, which speaks the dock protocol — there is no data-rate test in that command set. Connect over BLE or Classic Bluetooth to measure a link.";
+          return "This sensor is connected over its USB-C port, which speaks the dock protocol — there is no data-rate test in that command set. Reconnect over Bluetooth to measure a link: BLE or Classic, whichever radio this sensor carries.";
         }
         if (!caps.linkTest) {
           return "This SDK build has no data-rate test. Re-vendor the SDK bundle.";
@@ -1860,7 +1863,7 @@
         $("linkTestNote").textContent = reason ?? "";
         $("btnLinkTest").title =
           reason ??
-          "Free-runs the firmware's data-rate test, which measures the pipe itself — connection interval and MTU on BLE, buffering on Classic Bluetooth — rather than the file-transfer protocol on top of it.";
+          "Free-runs the firmware's data-rate test, which measures the pipe itself rather than the file-transfer protocol on top of it.";
       }
 
       // =====================================================================
@@ -3896,7 +3899,7 @@
        */
       function testUnavailableReason() {
         if (!client) {
-          return "Connect over BLE, Classic Bluetooth or USB-C to measure the link, run the sensor's built-in self-test, or watch its clock drift against this host.";
+          return "Connect over BLE, Classic Bluetooth or USB-C to run the sensor's built-in self-test or watch its clock drift against this host.";
         }
         if (streaming || sdLogging) {
           return "The sensor is sensing, and the firmware refuses a self-test while it is — the test takes the whole sensor over for up to a minute. Stop the stream first.";
