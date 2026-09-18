@@ -244,9 +244,15 @@ check(
   `data-requires=${linkIdle.requires} data-cap=${linkIdle.cap}`,
 );
 check(
+  /* The note names Bluetooth without promising BLE: the RN42 Shimmer3 fleet has
+     no BLE radio at all (see platformSupport.ts in the SDK), so "connect over
+     BLE" is advice that cannot be followed on a classic-only sensor. It must
+     still give the dock's reason, which is the part a user cannot guess. */
   "disconnected it is refused with a reason, and the dock link genuinely cannot run it",
   linkIdle.disabled &&
-    /Connect over BLE or Classic Bluetooth/.test(linkIdle.note) &&
+    /Connect over Bluetooth/.test(linkIdle.note) &&
+    /whichever radio this sensor carries/.test(linkIdle.note) &&
+    /no data-rate test/.test(linkIdle.note) &&
     linkIdle.dockHasTest === false &&
     linkIdle.radioHasTest === true,
   linkIdle.note,
@@ -3807,8 +3813,14 @@ check(
    would buy you, so it must not be greyed out before there is anything to
    grey out -- an unreachable tab cannot tell you why it is unreachable. */
 check(
+  /* And it offers only what every link can do. It used to say all three links
+     would "measure the link", which the dock cannot: the throughput card's own
+     note carries that restriction, so the banner must not contradict it. */
   "disconnected, the tab stays open and says what a connection would offer",
-  !tabInfo.disabled && /^Connect over BLE/.test(tabInfo.banner),
+  !tabInfo.disabled &&
+    /^Connect over BLE/.test(tabInfo.banner) &&
+    /self-test/.test(tabInfo.banner) &&
+    !/measure/.test(tabInfo.banner),
   tabInfo.banner.slice(0, 60),
 );
 

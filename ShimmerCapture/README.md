@@ -16,11 +16,11 @@ is reachable from a page you can read in an afternoon.
 
 ## The three ways to connect
 
-| Link                  | Configure | Read / write the configuration image | Set the clock | Status flags | Calibration dump | Stream to the host | Log to the SD card | Browse / download the card | Set device names | Factory self-test | Clock drift | Red LED |
-| --------------------- | :-------: | :----------------------------------: | :-----------: | :----------: | :--------------: | :----------------: | :----------------: | :------------------------: | :--------------: | :---------------: | :---------: | :-----: |
-| **BLE**               |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |        yes        |     yes     |   yes   |
-| **Classic Bluetooth** |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |        yes        |     yes     |   yes   |
-| **USB-C**             |    yes    |                 yes                  |      yes      | battery only |        no        |      **no**\*      |      **no**\*      |          **no**\*          |       yes        |      yes\*\*      |     yes     | **no**  |
+| Link                  | Configure | Read / write the configuration image | Set the clock | Status flags | Calibration dump | Stream to the host | Log to the SD card | Browse / download the card | Set device names | Throughput test | Factory self-test | Clock drift | Red LED |
+| --------------------- | :-------: | :----------------------------------: | :-----------: | :----------: | :--------------: | :----------------: | :----------------: | :------------------------: | :--------------: | :-------------: | :---------------: | :---------: | :-----: |
+| **BLE**               |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |       yes       |        yes        |     yes     |   yes   |
+| **Classic Bluetooth** |    yes    |                 yes                  |      yes      |     yes      |       yes        |        yes         |        yes         |            yes             |       yes        |       yes       |        yes        |     yes     |   yes   |
+| **USB-C**             |    yes    |                 yes                  |      yes      | battery only |        no        |      **no**\*      |      **no**\*      |          **no**\*          |       yes        |  **no**\*\*\*   |      yes\*\*      |     yes     | **no**  |
 
 \* **The Shimmer3R's USB-C port speaks the dock protocol, not the Bluetooth
 one** — the firmware routes the bytes arriving on the USB serial port to the
@@ -42,6 +42,13 @@ self-test runs over all three too.
 the chip share pins and the firmware says so in the report itself. That is the
 docked test, not the board — run the self-test over Bluetooth to judge an ExG
 expansion board.
+
+\*\*\* **The throughput test is Bluetooth-only**, and for the same command-set
+reason: the dock protocol has no data-rate test in it, so there is nothing over USB-C for the
+page to call. Which Bluetooth link it runs over is the sensor's business — a
+Shimmer3R offers both, while the older RN42 Shimmer3 fleet has no BLE radio at
+all — which is why the page's own wording asks for Bluetooth rather than
+naming BLE.
 
 The two Bluetooth links reach the same command set by different routes. **BLE**
 uses Web Bluetooth and its own device picker. **Classic Bluetooth** uses Web
