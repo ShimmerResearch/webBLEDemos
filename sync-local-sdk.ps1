@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # Two targets, and the duplication is deliberate. `vendor` is the shared copy
-# every page and every module under common/ imports.
+# every page in this repository imports.
 # `shimmer-extension\vendor` belongs to the Chrome extension: only that folder
 # is packed for the store, and manifest.json lists vendor/shimmer-web-sdk.esm.js
 # as a web-accessible resource, so it cannot reach a copy outside itself. Both
