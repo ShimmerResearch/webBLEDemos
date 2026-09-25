@@ -2,7 +2,7 @@
 
 The build output of [`shimmer-web-sdk`](https://github.com/ShimmerResearch/shimmer-web-sdk),
 checked in so the GitHub Pages site works with no build step. Every page in this
-repository and every module under `common/` imports the SDK from here:
+repository imports the SDK from here:
 
 ```js
 import { Shimmer3RClient } from "../vendor/shimmer-web-sdk.esm.js";
@@ -25,6 +25,14 @@ So the rule is: **the extension owns its copy, everything else shares this one**
 and `sync-local-sdk.ps1` writes both. Writing only one leaves the extension
 shipping a different SDK from the pages next to it, which is the failure this
 note exists to prevent.
+
+## A third copy lives in another repository
+
+`shimmer-capture-web` vendors the same seven files, because Shimmer Capture
+split out of this repository and took its shared UI library with it. Nothing
+links the two copies. `C:\dev\web\sync-all-vendors.ps1` writes every
+consumer in one pass by delegating to each repository's own
+`sync-local-sdk.ps1`, and running it is what keeps them on the same build.
 
 ## Updating
 

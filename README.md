@@ -18,9 +18,9 @@ brick/               │
 rythmgame-emggyro/   │  Shimmer3R demos
 video-ppg/           │
 spell-gyro/          │
-ShimmerCapture/      │
 consensys-export/    ┘
 Verisense/           ←  Verisense demo
+ShimmerCapture/      ←  redirect stub only; the page moved to shimmer-capture-web
 shimmer-extension/   ← Shimmer3R/Verisense Chrome extension (source; load unpacked in Chrome)
 sdk-source.json      ←  Single source-of-truth for SDK source mode/version
 update-local-sdk.ps1 ←  Build + sync local SDK artifacts
@@ -28,9 +28,14 @@ sync-local-sdk.ps1   ←  Sync-only local SDK artifacts
 update-local-sdk.cmd ←  Windows CMD launcher for update script
 ```
 
-The full Verisense control console now lives in a dedicated repository:
+Two of these grew past being demos and now live in dedicated repositories:
 
 - [ShimmerResearch/verisense-device-console](https://github.com/ShimmerResearch/verisense-device-console)
+  — the full Verisense control console.
+- [ShimmerResearch/shimmer-capture-web](https://github.com/ShimmerResearch/shimmer-capture-web)
+  — Shimmer Capture, which took `common/` (the shared UI library nothing else
+  here imported) and the `verify.yml` pass with it. `ShimmerCapture/` here is a
+  redirect stub; leave it in place, published links point at it.
 
 ---
 
@@ -40,26 +45,25 @@ The full Verisense control console now lives in a dedicated repository:
 
 **Requirements:** Shimmer3R device, firmware ≥ v1.0.22, Chrome/Edge (Web Bluetooth for BLE; Web Serial for Classic Bluetooth/USB)
 
-| Demo                                                                                                           | Link                                                                                  |
-| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| Gyro breakout game                                                                                             | [break-gyro](https://shimmerresearch.github.io/webBLEDemos/break-gyro/)               |
-| EMG breakout game                                                                                              | [break-emg](https://shimmerresearch.github.io/webBLEDemos/break-emg/)                 |
-| 200 G accel punch detector                                                                                     | [punch-highG](https://shimmerresearch.github.io/webBLEDemos/punch-highG/)             |
-| EMG + Gyro rhythm game                                                                                         | [rythmgame-emggyro](https://shimmerresearch.github.io/webBLEDemos/rythmgame-emggyro/) |
-| PPG heart-rate visualiser                                                                                      | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/video-ppg/)                 |
-| Two-device gyro brick game                                                                                     | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/)                         |
-| Spell caster (gyro gestures)                                                                                   | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/)               |
-| Configure, stream, plot, record, browse the SD card, set device names, run the self-test and check clock drift | [ShimmerCapture](https://shimmerresearch.github.io/webBLEDemos/ShimmerCapture/)       |
-| Consensys trial export + Bluetooth RTC set                                                                     | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/)   |
+| Demo                                       | Link                                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------- |
+| Gyro breakout game                         | [break-gyro](https://shimmerresearch.github.io/webBLEDemos/break-gyro/)               |
+| EMG breakout game                          | [break-emg](https://shimmerresearch.github.io/webBLEDemos/break-emg/)                 |
+| 200 G accel punch detector                 | [punch-highG](https://shimmerresearch.github.io/webBLEDemos/punch-highG/)             |
+| EMG + Gyro rhythm game                     | [rythmgame-emggyro](https://shimmerresearch.github.io/webBLEDemos/rythmgame-emggyro/) |
+| PPG heart-rate visualiser                  | [video-ppg](https://shimmerresearch.github.io/webBLEDemos/video-ppg/)                 |
+| Two-device gyro brick game                 | [brick](https://shimmerresearch.github.io/webBLEDemos/brick/)                         |
+| Spell caster (gyro gestures)               | [spell-gyro](https://shimmerresearch.github.io/webBLEDemos/spell-gyro/)               |
+| Consensys trial export + Bluetooth RTC set | [consensys-export](https://shimmerresearch.github.io/webBLEDemos/consensys-export/)   |
 
 **Consensys Export** packages a logged Shimmer3/Shimmer3R trial into the Consensys import folder structure, zips it, and shares it. It also sets the device real-time clock over Bluetooth. Best on a Chromium browser (Chrome/Edge); on iPhone/iPad use the [Bluefy](https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055) app for the Bluetooth RTC feature.
 
-**Shimmer Capture** is a worked example of driving a single Shimmer3R from a browser: connect over **BLE**, **Classic Bluetooth** (a paired COM port, via Web Serial) or **USB-C**, then configure it, stream from it, plot it and record a CSV. The configuration editor is generated from the SDK's description of the InfoMem, so it covers the whole LogAndStream option set — sampling rate, every sensor's range and rate, GSR, expansion power, the SD-logging and trial settings, the sync settings — and it edits the 384-byte image in place, so the bytes no field on the page models survive a read, an edit and a write untouched. The Calibration group in that form shows each 21-byte block as the offset, sensitivity and alignment grids the Calibration tab uses, with the range the image is configured for beside them. There is a hex view of that image with save and load, a calibration-dump reader and writer (read on connect, so the tab is populated before anybody opens it), the decoded device status flags and a real-world-clock set. A **General** tab leads the strip, as in the Verisense device console: the clock, the red LED and the one-shot device commands. Note that **the Shimmer3R's USB-C port speaks the dock protocol, not the Bluetooth one**, so over USB the page configures the sensor but cannot stream from it; it says so rather than offering a button that cannot work. Append `?mock=1` to the URL to drive the whole page against a scripted sensor with no hardware on the desk. Two further tabs cover what used to be separate pages: **SD card** browses the sensor's card and pulls logged sessions off it, in the Consensys import layout — `<stamp>/<MAC id>/data/…`, the MAC being what the Consensys importer looks for — or as the card is laid out, with a live throughput readout, an abort, resume after an abort, and an option to delete a file only once its download has been verified; **Device naming** reads and writes the EEPROM record holding the Classic-Bluetooth, BLE and USB names, so a sensor advertises a customer's branding instead of the Shimmer defaults, with a restore-to-factory control and the restart a new name needs (armed over Bluetooth, walked through by hand over the dock); and **Test** runs the sensor's own factory self-test and shows the report as it prints, with the verdict words coloured, a parsed pass/fail summary and text or CSV export, measures how far the sensor's real-world clock drifts from this host's with a least-squares fit in ppm, host-clock-step detection, a plot and CSV export, and switches the sensor's red LED so you can tell which one on the bench you are talking to. The standalone `sd-download`, `eeprom-branding` and `rtc-drift-test` pages have been removed in favour of these tabs. It is an example for one device, not a replacement for **Consensys**, Shimmer's
-desktop application for configuring, streaming, recording and analysing across
-devices — the page says so on its Sensor link card. Every channel is plotted and
-recorded in engineering units, the time axis reads the local clock, and the
-Configure tab applies Consensys's own sensor-conflict and expansion-power
-rules. See the [demo README](./ShimmerCapture/README.md).
+**Shimmer Capture** — configure, stream, plot, record, browse the SD card,
+set device names, run the factory self-test and measure clock drift on a single
+Shimmer3R, over BLE, Classic Bluetooth or USB-C. It moved to its own repository:
+[shimmer-capture-web](https://github.com/ShimmerResearch/shimmer-capture-web),
+live at
+[shimmerresearch.github.io/shimmer-capture-web](https://shimmerresearch.github.io/shimmer-capture-web/).
 
 ### Verisense
 
@@ -103,12 +107,11 @@ powershell -ExecutionPolicy Bypass -File .\update-local-sdk.ps1 -SdkRepoPath "C:
 
 ### SDK source selection (single location)
 
-Every page and every module under `common/` imports the SDK from the shared
-`vendor/` directory at the repository root, e.g.
-`../vendor/shimmer-web-sdk.esm.js`. The Chrome extension keeps its own copy at
-`shimmer-extension/vendor/` because only that folder is packed for the store —
-see `vendor/README.md`. The file that controls where vendor artifacts come from
-is `sdk-source.json`:
+Every page imports the SDK from the shared `vendor/` directory at the
+repository root, e.g. `../vendor/shimmer-web-sdk.esm.js`. The Chrome extension
+keeps its own copy at `shimmer-extension/vendor/` because only that folder is
+packed for the store — see `vendor/README.md`. The file that controls where
+vendor artifacts come from is `sdk-source.json`:
 
 ```json
 {
