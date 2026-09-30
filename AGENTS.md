@@ -13,6 +13,7 @@ actually written.
 
 The same bundle is vendored again in `verisense-device-console` and in `shimmer-capture-web`.
 `C:\dev\web\sync-all-vendors.ps1` writes all three; prefer it over this repo's script alone.
+`node tools/check-vendored-sdk.mjs` checks both copies afterwards; CI (`checks.yml`) runs it.
 
 Update with the scripts, never by hand — they stamp `sdk-source.json`:
 
