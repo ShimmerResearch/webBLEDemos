@@ -30,12 +30,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
 
       # Loads both vendor copies (vendor/ and shimmer-extension/vendor/) in Node
       # and checks that every name a page imports is exported, that SDK_VERSION
@@ -49,12 +49,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "22"
 
       # The three Node checks shimmer-extension/README.md lists: DOM ids and
       # webcam assets, the conditional webcam export, and camera selection.
