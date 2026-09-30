@@ -9,7 +9,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.4.1';
+const SDK_VERSION = '0.5.0';
 
 /**
  * Container for a single decoded sensor frame.
@@ -1130,6 +1130,2300 @@ function objectClusterRow(oc, columns) {
 }
 
 /**
+ * CSV recording: turn a live stream into a file on the host.
+ *
+ * Promoted from shimmer-capture-web's `common/csv-recorder.js` (DEV-1116) so
+ * that page and verisense-device-console share one copy. Two layers:
+ *
+ * - {@link createCsvTableWriter} writes ONE file: a header row, an optional
+ *   units row, then whatever cells the caller pushes. Every consumer's
+ *   recorder is built on it.
+ * - {@link createCsvRecorder} is the {@link ObjectCluster} recorder the
+ *   capture page uses — same API and options as the page-local original.
+ *   Verisense streams go through `createVerisenseStreamRecorder`
+ *   (`devices/verisense/streamCsv.ts`), which runs one writer per sensor
+ *   stream.
+ *
+ * Cells go through {@link csvCell}, so a unit or a device name containing a
+ * comma cannot shift every following column, and rows stream to disk through
+ * the File System Access API instead of being held in memory until the user
+ * stops — a 512 Hz session with 12 channels is tens of megabytes of string,
+ * and an in-memory recording loses all of it if the tab is closed.
+ *
+ * That choice decides what happens when a write to the picked file fails
+ * mid-recording: there is no complete copy to fall back on, so the recording
+ * ENDS there rather than quietly continuing into a second, partial file. See
+ * `fail()` in {@link createCsvTableWriter}.
+ *
+ * No DOM access at import time.
+ */
+/** How often buffered rows are handed to the sink, by default. */
+const FLUSH_INTERVAL_MS = 1000;
+const encoder = new TextEncoder();
+function makeLogger(log) {
+    const logger = typeof log === 'function' ? { log } : (log ?? {});
+    return {
+        warn: (m) => (logger.warn ?? logger.log)?.(String(m)),
+        error: (m) => (logger.error ?? logger.warn ?? logger.log)?.(String(m)),
+    };
+}
+function errorText(e) {
+    return String(e?.message ?? e);
+}
+/**
+ * Save a Blob through a temporary `<a download>`. The default for in-memory
+ * recordings; needs a DOM, which it looks for only when called.
+ */
+function downloadCsvBlob(fileName, blob) {
+    const doc = globalThis.document;
+    if (!doc || typeof URL?.createObjectURL !== 'function') {
+        throw new Error('no document to download into');
+    }
+    const url = URL.createObjectURL(blob);
+    const a = doc.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    doc.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoke after a delay: some browsers invalidate the URL before the
+    // download starts if it is revoked synchronously.
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+/**
+ * Start writing one CSV file: the header (and units) rows go out at once,
+ * then every {@link CsvTableWriter.pushCells} row, flushed every
+ * `flushIntervalMs`.
+ */
+function createCsvTableWriter(opts) {
+    const { warn, error: err } = makeLogger(opts.log);
+    const fileName = opts.fileName;
+    const flushIntervalMs = opts.flushIntervalMs ?? FLUSH_INTERVAL_MS;
+    const toFile = opts.sink != null;
+    let active = true;
+    /** Rows `pushCells()` accepted. */
+    let rowsIn = 0;
+    /** Rows that actually reached the sink — what the file holds. */
+    let rowsOut = 0;
+    let bytes = 0;
+    /**
+     * Set the first time a write to the file fails, and never cleared. Once
+     * set, the recording is over — see `fail()`.
+     */
+    let failure = null;
+    /** True inside `stop()`, so a failure there is reported by return, not callback. */
+    let stopping = false;
+    let stopped = false;
+    let pending = [];
+    let lastFlushMs = 0;
+    /** The open sink, once it has resolved. */
+    let writable = null;
+    /**
+     * Set while a failure is committing or discarding the stream in the
+     * background, so `stop()` can wait for the handle to be released.
+     */
+    let dying = null;
+    /** In memory mode, the whole file. */
+    let memory = [];
+    function row(cells) {
+        return cells.map(csvCell).join(',') + '\r\n';
+    }
+    function result() {
+        return {
+            rows: rowsOut,
+            rowsDropped: Math.max(0, rowsIn - rowsOut),
+            bytes,
+            fileName,
+            complete: failure === null,
+            error: failure,
+        };
+    }
+    /**
+     * A write to the file failed. End the recording here.
+     *
+     * The tempting alternative — keep going and hand the rest to an in-memory
+     * buffer — produces TWO plausible-looking files: a truncated one where the
+     * user asked for it, and a downloaded one holding only the post-failure
+     * tail, with nothing on either saying it is a fragment. Making that
+     * download complete instead would mean retaining every row in memory for
+     * the whole session on the off chance of a failure, and not doing that is
+     * the reason this module streams at all.
+     *
+     * So: one file, short, and said out loud — in the log, through `onError`,
+     * and in what `stop()` returns.
+     */
+    function fail(e, what) {
+        if (failure)
+            return; // the first failure is the interesting one
+        failure = errorText(e);
+        active = false;
+        // Hand the stream to the cleanup below before clearing the reference, so
+        // nothing else can write to it in the meantime.
+        const orphan = writable;
+        writable = null;
+        pending = [];
+        memory = [];
+        const r = result();
+        // Release the file. Dropping the reference alone leaves the handle locked
+        // and the file EMPTY: a FileSystemWritableFileStream writes to a swap file
+        // that only reaches the real file on close(), so with neither a close()
+        // nor an abort() the user is left 0 bytes while the message below promises
+        // a short one. So commit what already landed, and fall back to abort()
+        // when even that fails - or go straight there when close() is what
+        // failed, since there is nothing left to commit through.
+        if (orphan) {
+            const discard = () => Promise.resolve(orphan.abort?.()).catch(() => { });
+            dying = what === 'close' ? discard() : Promise.resolve(orphan.close()).catch(discard);
+        }
+        err(`CSV ${what} failed: ${failure} — recording stopped. ${fileName} is ` +
+            `INCOMPLETE: ${r.rows} rows written, ${r.rowsDropped} lost.`);
+        // Inside stop() the caller is already about to read the result, so a
+        // callback would only duplicate it.
+        if (stopping)
+            return;
+        try {
+            opts.onError?.(r);
+        }
+        catch (cbError) {
+            warn(`CSV onError handler threw: ${errorText(cbError)}`);
+        }
+    }
+    /**
+     * Serialises writes. `pushCells()` is synchronous, so a flush is kicked off
+     * and chained rather than awaited; `stop()` awaits the tail. In file mode
+     * the chain starts by waiting for the sink, which is what lets rows queue
+     * behind a file that is still being opened.
+     */
+    let writeChain = toFile
+        ? Promise.resolve(opts.sink).then((s) => {
+            if (failure)
+                return;
+            writable = s;
+        }, (e) => fail(e, 'open'))
+        : Promise.resolve();
+    /**
+     * Hand everything buffered to the sink. Returns a promise, but callers on
+     * the hot path deliberately do not await it.
+     */
+    function flush() {
+        if (failure) {
+            pending = [];
+            return writeChain;
+        }
+        lastFlushMs = performance.now();
+        if (!pending.length)
+            return writeChain;
+        const chunk = pending.join('');
+        pending = [];
+        // Rows the file will hold once THIS chunk lands. Counted on success only,
+        // so a failure cannot leave `stop()` claiming rows that never arrived.
+        const rowsAfter = rowsIn;
+        if (toFile) {
+            const encoded = encoder.encode(chunk);
+            writeChain = writeChain
+                .then(async () => {
+                // Read at run time, not at chain time: the sink may have resolved
+                // since, or a failure may have taken it away.
+                const sink = writable;
+                if (!sink)
+                    return;
+                await sink.write(encoded);
+                bytes += encoded.byteLength;
+                rowsOut = rowsAfter;
+            })
+                .catch((e) => fail(e, 'write'));
+        }
+        else {
+            memory.push(chunk);
+            bytes += encoder.encode(chunk).byteLength;
+            rowsOut = rowsAfter;
+        }
+        return writeChain;
+    }
+    function pushCells(cells) {
+        if (!active)
+            return false;
+        pending.push(row(cells));
+        rowsIn++;
+        if (performance.now() - lastFlushMs >= flushIntervalMs)
+            flush();
+        return true;
+    }
+    /**
+     * Close the file (or download the buffer) and report what actually landed.
+     * Idempotent: calling it again returns the same numbers without writing.
+     *
+     * `complete` is false — and `error` set — when a write failed part way
+     * through. `rows`/`bytes` then describe the truncated file, and
+     * `rowsDropped` says how much of the capture never reached it.
+     */
+    async function stop() {
+        // A failure mid-session already cleared `active`, so this is the path a
+        // caller reaches after one. Still wait for the stream: the cleanup runs in
+        // the background from fail(), and the file is not on disk until it lands.
+        if (!active || stopped) {
+            if (dying) {
+                await dying;
+                dying = null;
+            }
+            return result();
+        }
+        active = false;
+        stopped = true;
+        stopping = true;
+        await flush();
+        if (writable) {
+            try {
+                await writable.close();
+            }
+            catch (e) {
+                fail(e, 'close');
+            }
+            writable = null;
+        }
+        else if (!toFile && memory.length) {
+            try {
+                (opts.download ?? downloadCsvBlob)(fileName, new Blob(memory, { type: 'text/csv;charset=utf-8' }));
+            }
+            catch (e) {
+                fail(e, 'download');
+            }
+        }
+        // A failure left the stream being committed or discarded in the
+        // background. Wait for it, so the result is not reported before the file
+        // is written and a caller that starts recording again immediately does
+        // not meet a lock.
+        if (dying) {
+            await dying;
+            dying = null;
+        }
+        memory = [];
+        stopping = false;
+        return result();
+    }
+    pending.push(row(opts.header));
+    if (opts.units)
+        pending.push(row(opts.units));
+    flush();
+    return {
+        pushCells,
+        stop,
+        result,
+        get active() {
+            return active;
+        },
+        get rowsAccepted() {
+            return rowsIn;
+        },
+        fileName,
+    };
+}
+// ---------------------------------------------------------------------------
+// The ObjectCluster recorder (Shimmer3 / Shimmer3R streams)
+// ---------------------------------------------------------------------------
+/** `shimmer-capture-2026-09-02_141530.csv` */
+function defaultFileName() {
+    return `shimmer-capture-${localStamp(new Date())}.csv`;
+}
+/** `2026-09-02_141530`, in local time. */
+function localStamp(d) {
+    const p2 = (n) => String(n).padStart(2, '0');
+    return (`${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}` +
+        `_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`);
+}
+/**
+ * Create a CSV recorder for {@link ObjectCluster} frames.
+ *
+ * Each row is `HostTime_ms` (optional), the raw `TIMESTAMP` tick counter, and
+ * then the data columns the page derived from the first frame — typically
+ * with `objectClusterColumns`.
+ */
+function createCsvRecorder(opts = {}) {
+    const fileNameFn = opts.fileNameFn ?? defaultFileName;
+    const preferFsa = opts.preferFileSystemAccess !== false;
+    const unitsRow = opts.unitsRow !== false;
+    const hostTimeColumn = opts.hostTimeColumn !== false;
+    const { warn } = makeLogger(opts.log);
+    let writer = null;
+    let columns = [];
+    /** `name|kind` → column index. Built once, so `push` is a single pass. */
+    let routeByKey = new Map();
+    /** Frame width the file was opened for; a change means the schema moved. */
+    let expectedFieldCount = null;
+    let widthWarned = false;
+    /** Guards the gap between `start()` being called and its picker settling. */
+    let starting = false;
+    /**
+     * Is this the tick-counter timestamp that gets its own second column?
+     *
+     * Kind, not just name: the SDK emits `TIMESTAMP` twice per frame — `raw` in
+     * ticks and `cal` in unwrapped milliseconds — and only the first is the
+     * dedicated column. Matching on the name alone dropped the calibrated one
+     * from the file and, on the row path, let it overwrite the raw cell it was
+     * mistaken for. `null` counts as raw so a frame from before the kinds were
+     * set still writes its timestamp where it always did.
+     */
+    function isRawTimestamp(f) {
+        return f.name === 'TIMESTAMP' && (f.kind ?? 'raw') === 'raw';
+    }
+    /**
+     * The RAW `TIMESTAMP` is written separately, as the second column, and is
+     * dropped from `cols` if present; a `TIMESTAMP` of any other kind is kept
+     * as an ordinary column, because `TIMESTAMP_CAL` is a different number —
+     * unwrapped milliseconds, where the raw column is a 24-bit tick counter
+     * that restarts every 512 seconds. Consensys writes both.
+     */
+    async function start(cols) {
+        if (writer?.active || starting) {
+            warn('CSV recorder already running');
+            return false;
+        }
+        columns = (cols ?? [])
+            .filter((c) => c?.name && !isRawTimestamp(c))
+            .map((c) => ({
+            name: c.name,
+            kind: c.kind ?? null,
+            unit: c.unit ?? '',
+            header: c.header ?? (c.kind ? `${c.name}_${c.kind}` : c.name),
+        }));
+        if (!columns.length) {
+            warn('CSV recorder: nothing to record (no columns)');
+            return false;
+        }
+        routeByKey = new Map(columns.map((c, i) => [`${c.name}|${c.kind ?? ''}`, i]));
+        expectedFieldCount = null;
+        widthWarned = false;
+        let fileName = fileNameFn();
+        let sink = null;
+        const picker = globalThis.showSaveFilePicker;
+        if (preferFsa && typeof picker === 'function') {
+            starting = true;
+            try {
+                const handle = await picker({
+                    suggestedName: fileName,
+                    types: [{ description: 'CSV', accept: { 'text/csv': ['.csv'] } }],
+                });
+                sink = await handle.createWritable();
+                fileName = handle.name ?? fileName;
+            }
+            catch (e) {
+                // AbortError is the user closing the picker — that is a "no", not a
+                // reason to start recording somewhere they did not ask for.
+                if (e?.name === 'AbortError')
+                    return false;
+                warn(`file picker unavailable (${errorText(e)}) — buffering in memory instead`);
+                sink = null;
+            }
+            finally {
+                starting = false;
+            }
+        }
+        const head = [];
+        if (hostTimeColumn)
+            head.push('HostTime_ms');
+        head.push('TIMESTAMP');
+        for (const c of columns)
+            head.push(c.header);
+        let units = null;
+        if (unitsRow) {
+            units = [];
+            if (hostTimeColumn)
+                units.push('ms');
+            units.push('ticks');
+            for (const c of columns)
+                units.push(c.unit ?? '');
+        }
+        writer = createCsvTableWriter({
+            fileName,
+            header: head,
+            units,
+            sink,
+            download: opts.download,
+            log: opts.log,
+            onError: opts.onError,
+        });
+        return true;
+    }
+    function push(hostMs, frame) {
+        if (!writer?.active)
+            return false;
+        const fields = frame?.fields;
+        if (!fields)
+            return false;
+        /* Rectangularity is the whole value of a CSV. If the device's schema
+         * changes mid-recording (a reconfigure, or a second stream starting) the
+         * frame width moves, and appending those rows under the old header
+         * silently misaligns every column. Refuse them and say so once — a
+         * thousand identical warnings at 512 Hz would bury the log. */
+        if (expectedFieldCount === null) {
+            expectedFieldCount = fields.length;
+        }
+        else if (fields.length !== expectedFieldCount) {
+            if (!widthWarned) {
+                widthWarned = true;
+                warn(`CSV: frame has ${fields.length} fields, file was opened for ${expectedFieldCount} — rows refused until the stream is restarted`);
+            }
+            return false;
+        }
+        const cells = new Array(columns.length + 1 + (hostTimeColumn ? 1 : 0)).fill('');
+        let at = 0;
+        if (hostTimeColumn)
+            cells[at++] = Math.round(hostMs);
+        const tsAt = at++;
+        const base = at;
+        for (const f of fields) {
+            if (isRawTimestamp(f)) {
+                cells[tsAt] = f.value;
+                continue;
+            }
+            const idx = routeByKey.get(`${f.name}|${f.kind ?? ''}`);
+            if (idx !== undefined)
+                cells[base + idx] = f.value;
+        }
+        return writer.pushCells(cells);
+    }
+    async function stop() {
+        if (!writer) {
+            return {
+                rows: 0,
+                rowsDropped: 0,
+                bytes: 0,
+                fileName: '',
+                complete: true,
+                error: null,
+            };
+        }
+        return writer.stop();
+    }
+    return {
+        start,
+        push,
+        stop,
+        get active() {
+            return !!writer?.active;
+        },
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Nordic UART Service (NUS) UUIDs used by Verisense devices
+// ---------------------------------------------------------------------------
+/** NUS primary service UUID. */
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+/** NUS TX characteristic UUID (host writes to this). */
+const NUS_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+/** NUS RX characteristic UUID (host subscribes to notifications from this). */
+const NUS_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+/** Nordic Secure DFU service UUID (buttonless DFU). */
+const NORDIC_DFU_SERVICE = '0000fe59-0000-1000-8000-00805f9b34fb';
+/** Nordic buttonless DFU control-point characteristic (without bond sharing). */
+const NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = '8ec90003-f315-4f60-9fb8-838830daea50';
+/** Nordic buttonless DFU control-point characteristic (with bond sharing). */
+const NORDIC_DFU_BUTTONLESS_WITH_BONDS = '8ec90004-f315-4f60-9fb8-838830daea50';
+/** Buttonless DFU control-point op-code that reboots the device into the bootloader. */
+const NORDIC_DFU_OP_ENTER_BOOTLOADER = 0x01;
+// ---------------------------------------------------------------------------
+// Verisense protocol command/property constants
+// ---------------------------------------------------------------------------
+/** Upper-nibble command classes used in protocol headers. */
+const ASM_COMMAND = Object.freeze({
+    READ: 0x10,
+    WRITE: 0x20,
+    RESPONSE: 0x30,
+    ACK: 0x40,
+    NACK_BAD_HEADER_COMMAND: 0x50,
+    NACK_BAD_HEADER_PROPERTY: 0x60,
+    NACK_GENERIC: 0x70,
+    ACK_NEXT_STAGE: 0x80,
+});
+/** Lower-nibble property IDs used in protocol headers. */
+const ASM_PROPERTY = Object.freeze({
+    STATUS1: 0x01,
+    DATA: 0x02,
+    PRODUCTION_CONFIGURATION: 0x03,
+    OPERATIONAL_CONFIGURATION: 0x04,
+    TIME: 0x05,
+    DFU_MODE: 0x06,
+    PENDING_EVENTS: 0x07,
+    TEST_MODE: 0x08,
+    DEBUG_COMMAND: 0x09,
+    STREAM_MODE: 0x0a,
+    DEVICE_DISCONNECT: 0x0b,
+    STATUS2: 0x0c,
+    CALIBRATION: 0x0d,
+});
+/** Stream mode payload values. */
+const STREAM_MODE = Object.freeze({
+    ENABLE: 0x01,
+    DISABLE: 0x02,
+});
+/** Test mode IDs documented by Verisense firmware. */
+const TEST_MODE_ID = Object.freeze({
+    STOP: 0x00,
+    FLASH_8MB_1: 0x01,
+    FLASH_8MB_2: 0x02,
+    FLASH_128MB_512MB: 0x03,
+    EEPROM: 0x04,
+    ACCEL1_LIS2DW12: 0x05,
+    BATTERY_VOLTAGE: 0x06,
+    USB_POWER: 0x07,
+    ACCEL2_GYRO_LSM6DS3: 0x08,
+    PPG_MAX86XXX: 0x09,
+    BIOZ_MAX30002: 0x0b,
+    ACCEL2_GYRO_LSM6DSV: 0x0c,
+    MAG_LIS2MDL: 0x0d,
+    ALL_TESTS: 0xff,
+});
+/** Debug command IDs documented by Verisense firmware. */
+const DEBUG_COMMAND_ID = Object.freeze({
+    FLASH_LOOKUP_TABLE_READ: 0x01,
+    FLASH_LOOKUP_TABLE_ERASE: 0x02,
+    RWC_SCHEDULER_READ: 0x03,
+    ERASE_128MB_512MB_FLASH: 0x04,
+    ERASE_8MB_FLASH_1: 0x05,
+    ERASE_8MB_FLASH_2: 0x06,
+    ERASE_OPERATIONAL_CONFIG: 0x07,
+    ERASE_PRODUCTION_CONFIG: 0x08,
+    CLEAR_PENDING_EVENTS: 0x09,
+    ERASE_FLASH_AND_LOOKUP_TABLE: 0x0a,
+    TEST_DATA_TRANSFER_LOOP: 0x0b,
+    LOAD_TEST_LOOKUP_TABLE: 0x0c,
+    LED_TEST: 0x0d,
+    MAX86XXX_LED_TEST: 0x0e,
+    CHECK_PAYLOAD_CRC_ERRORS: 0x0f,
+    READ_EVENT_LOG: 0x10,
+    POWER_PROFILER_TEST: 0x11,
+    READ_RECORD_BUFFER_DETAILS: 0x12,
+    SYSTEM_RESET: 0x13,
+    IC_POWER_CONSUMPTION_TEST: 0x14,
+    DELETE_ALL_BONDS: 0x15,
+    BLE_LINK_PARAMS_READ: 0x16,
+    BLE_LINK_OPTIMIZE: 0x17,
+    /** Streamed MAX32674C algorithm-hub firmware (.msbl) upload (factory). The
+     * byte after this id is a HUB_FW_UPLOAD_STAGE sub-stage. */
+    HUB_FW_UPLOAD: 0x18,
+});
+/** Sub-stages for the streamed MAX32674C hub firmware upload, carried in the
+ * payload byte immediately after DEBUG_COMMAND_ID.HUB_FW_UPLOAD. */
+const HUB_FW_UPLOAD_STAGE = Object.freeze({
+    BEGIN: 0x00,
+    PAGE_CHUNK: 0x01,
+    END: 0x02,
+    ABORT: 0x03,
+});
+/** MAX32674C .msbl image geometry (mirrors firmware flashUpdater.h). A page on
+ * the wire is PAGE_PAYLOAD + PAGE_CRC bytes; HEADER_SIZE bytes precede page 0. */
+const MSBL = Object.freeze({
+    HEADER_SIZE: 0x4c,
+    OFF_NUMPAGES: 0x44,
+    PAGE_PAYLOAD: 8192,
+    PAGE_CRC: 16,
+    PAGE_FILE_BYTES: 8208,
+});
+// ---------------------------------------------------------------------------
+// Operational config byte offsets
+// ---------------------------------------------------------------------------
+/**
+ * Byte indices into the Verisense operational config blob (`op[OP_IDX.xxx]`).
+ * Index 0 is the config version byte (must be 0x5A for a valid config).
+ */
+const OP_IDX = Object.freeze({
+    GEN_CFG_0: 1,
+    GEN_CFG_1: 2,
+    GEN_CFG_2: 3,
+    GEN_CFG_3: 4,
+    ACCEL1_CFG_0: 5,
+    ACCEL1_CFG_1: 6,
+    ACCEL1_CFG_2: 7,
+    ACCEL1_CFG_3: 8,
+    GYRO_ACCEL2_CFG_0: 10,
+    GYRO_ACCEL2_CFG_1: 11,
+    GYRO_ACCEL2_CFG_2: 12,
+    GYRO_ACCEL2_CFG_3: 13,
+    GYRO_ACCEL2_CFG_4: 14,
+    GYRO_ACCEL2_CFG_5: 15,
+    GYRO_ACCEL2_CFG_6: 16,
+    GYRO_ACCEL2_CFG_7: 17,
+    LSM6DSV_CFG_0: 18,
+    LSM6DSV_CFG_1: 19,
+    LSM6DSV_CFG_2: 20,
+    START_TIME: 21,
+    END_TIME: 25,
+    INACTIVE_TIMEOUT: 29,
+    BLE_RETRY_COUNT: 30,
+    BLE_TX_POWER: 31,
+    BLE_DATA_TRANS_WKUP_INT_HRS: 32,
+    BLE_DATA_TRANS_WKUP_TIME: 33,
+    BLE_DATA_TRANS_WKUP_DUR: 35,
+    BLE_DATA_TRANS_RETRY_INT: 36,
+    BLE_STATUS_WKUP_INT_HRS: 38,
+    BLE_STATUS_WKUP_TIME: 39,
+    BLE_STATUS_WKUP_DUR: 41,
+    BLE_STATUS_RETRY_INT: 42,
+    BLE_RTC_SYNC_WKUP_INT_HRS: 44,
+    BLE_RTC_SYNC_WKUP_TIME: 45,
+    BLE_RTC_SYNC_WKUP_DUR: 47,
+    BLE_RTC_SYNC_RETRY_INT: 48,
+    ADC_CHANNEL_SETTINGS_0: 50,
+    ADC_CHANNEL_SETTINGS_1: 51,
+    ADAPTIVE_SCHEDULER_INT: 52,
+    ADAPTIVE_SCHEDULER_FAILCOUNT_MAX: 54,
+    PPG_REC_DUR_SECS_LSB: 55,
+    PPG_REC_DUR_SECS_MSB: 56,
+    PPG_REC_INT_MINS_LSB: 57,
+    PPG_REC_INT_MINS_MSB: 58,
+    PPG_FIFO_CONFIG: 59,
+    PPG_MODE_CONFIG2: 60,
+    PPG_MA_DEFAULT: 61,
+    PPG_MA_MAX_RED_IR: 62,
+    PPG_MA_MAX_GREEN_BLUE: 63,
+    PPG_AGC_TARGET_PERCENT_OF_RANGE: 64,
+    PPG_MA_LED_PILOT: 66,
+    PPG_DAC1_CROSSTALK: 67,
+    PPG_DAC2_CROSSTALK: 68,
+    PPG_DAC3_CROSSTALK: 69,
+    PPG_DAC4_CROSSTALK: 70,
+    PROX_AGC_MODE: 71,
+    // v9 second-generation sensor settings (only present when op[OP_CONFIG_VERSION] >= 9)
+    OP_CONFIG_VERSION: 9,
+    LIGHT_GAIN_INDEX: 72,
+    LIGHT_EXPOSURE_INDEX: 73,
+    LIGHT_CONFIG: 74,
+    LIGHT_SAMPLE_RATE_INDEX: 75,
+    SKIN_TEMP_CONFIG: 76,
+    SKIN_TEMP_SAMPLE_RATE_INDEX: 77,
+    ALGO_OP_MODE: 78,
+    ALGO_REPORT_MODE_RATE: 79,
+    ALGO_CONTROL: 80,
+    ALGO_INITIAL_HR: 81,
+    LED_AUTO_BRIGHTNESS_CFG: 82,
+    LED_MAX_BRIGHTNESS: 83,
+    LED_LUX_THRESHOLD: 84,
+    // MAX32674 algorithm-suite subject parameters (bytes 86-91)
+    PERSON_HEIGHT_CM: 86, // u16 LE, cm
+    PERSON_WEIGHT_KG: 88, // u16 LE, kg
+    PERSON_AGE: 90, // u8, years
+    PERSON_GENDER: 91, // u8, 0=Male, 1=Female
+});
+/** Operational config layout version stored at OP_IDX.OP_CONFIG_VERSION (byte 9).
+ * 0 = legacy 72-byte layout; 9 = v9 layout with second-generation sensor settings. */
+const OP_CONFIG_VERSION_V9 = 9;
+/** Minimum firmware version that supports the BLE-link debug commands
+ * (read/optimize connection parameters). */
+const BLE_LINK_MIN_FW = Object.freeze({
+    major: 1,
+    minor: 4,
+    internal: 23,
+});
+/** Human-readable labels for Verisense stream-packet sensor IDs. Each ID maps to
+ * the device part(s) that produce that stream (some streams interleave several
+ * physical sensors, e.g. id 6 = LSM6DSV accel + gyro + mag). */
+const VERISENSE_STREAM_SENSOR_LABELS = Object.freeze({
+    1: 'ADC (GSR / Battery)',
+    2: 'Accel 1 (LIS2DW12)',
+    3: 'Accel 2 + Gyro (LSM6DS3)',
+    4: 'PPG (MAX86xxx)',
+    6: 'Accel 2 + Gyro + Mag (LSM6DSV + LIS2MDL)',
+    7: 'Ambient Light (VD6283)',
+    8: 'Algo Hub (MAX32674 — HR + raw PPG)',
+    9: 'Skin Temperature (MLX90632)',
+});
+
+/** Read a 16-bit unsigned integer, little-endian. */
+function u16le$4(b0, b1) {
+    return (b1 << 8) | b0;
+}
+/** Format a single byte as an uppercase `0xNN` string. */
+function formatByteAsHex(v) {
+    return `0x${(v & 0xff).toString(16).toUpperCase().padStart(2, '0')}`;
+}
+/** Format bytes as `[0xAA, 0xBB, ...]`. */
+function formatByteArrayAsHex(bytes) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
+    return `[${Array.from(u8, (b) => formatByteAsHex(Number(b))).join(', ')}]`;
+}
+/** Parse text containing hex bytes like `0x5A, 00 12` into a Uint8Array. */
+function parseHexByteString(text) {
+    const matches = String(text ?? '').match(/[0-9a-fA-F]{2}/g) ?? [];
+    if (!matches.length) {
+        throw new Error('No hex bytes found. Example: 0x5A, 0x00, 0x12');
+    }
+    return new Uint8Array(matches.map((h) => Number.parseInt(h, 16)));
+}
+/**
+ * Compare two firmware version triples. Returns a negative number if `a < b`,
+ * positive if `a > b`, and 0 if equal. Missing or non-numeric components are
+ * treated as 0.
+ */
+function compareVerisenseFirmwareVersion(a, b) {
+    const aMaj = Number(a?.major) || 0;
+    const aMin = Number(a?.minor) || 0;
+    const aInt = Number(a?.internal) || 0;
+    const bMaj = Number(b?.major) || 0;
+    const bMin = Number(b?.minor) || 0;
+    const bInt = Number(b?.internal) || 0;
+    if (aMaj !== bMaj)
+        return aMaj - bMaj;
+    if (aMin !== bMin)
+        return aMin - bMin;
+    return aInt - bInt;
+}
+/** Format a firmware version triple as `"major.minor.internal"`, or `"unknown"`
+ * when the version is null/undefined. */
+function formatVerisenseFirmwareVersion(v) {
+    if (!v)
+        return 'unknown';
+    return `${Number(v.major) || 0}.${Number(v.minor) || 0}.${Number(v.internal) || 0}`;
+}
+/** Human-readable label for a Verisense stream-packet sensor ID, with a
+ * `"Sensor 0xNN"` hex fallback for unknown IDs. */
+function getVerisenseStreamSensorLabel(sensorId) {
+    const labels = VERISENSE_STREAM_SENSOR_LABELS;
+    return labels[sensorId] ?? `Sensor 0x${Number(sensorId).toString(16).toUpperCase()}`;
+}
+const ASM_PROPERTY_BY_VALUE = new Map(Object.entries(ASM_PROPERTY).map(([name, value]) => [Number(value), name]));
+/** Label pending-event property values with both enum name and hex representation. */
+function formatPendingEventProperties(pendingProps) {
+    const list = Array.isArray(pendingProps)
+        ? pendingProps
+        : pendingProps == null
+            ? []
+            : Array.from(pendingProps);
+    return list.map((prop) => {
+        const value = Number(prop) & 0xff;
+        return {
+            value,
+            hex: formatByteAsHex(value),
+            property: ASM_PROPERTY_BY_VALUE.get(value) ?? 'UNKNOWN_PROPERTY',
+        };
+    });
+}
+/** Read a signed 16-bit integer at byte offset `off`, little-endian. */
+function i16le$1(bytes, off) {
+    const v = bytes[off] | (bytes[off + 1] << 8);
+    return v & 0x8000 ? v - 0x10000 : v;
+}
+/** Read a 24-bit unsigned integer at byte offset `off`, little-endian. */
+function u24le$1(bytes, off) {
+    return (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16)) >>> 0;
+}
+/** Read a 16-bit unsigned integer at byte offset `off`, little-endian (full-array form). */
+function u16le_at(bytes, off) {
+    return (bytes[off] | (bytes[off + 1] << 8)) >>> 0;
+}
+/** Read a 32-bit IEEE-754 float at byte offset `off`, little-endian. */
+function f32le(bytes, off) {
+    return new DataView(bytes.buffer, bytes.byteOffset + off, 4).getFloat32(0, true);
+}
+/** Return current time in milliseconds. */
+function nowMillis() {
+    return Date.now();
+}
+/**
+ * Convert a UTC unix-ms instant to the "local civil" timestamp domain used by
+ * the Verisense real-world clock: unix ms with the host's local timezone
+ * offset baked in, so that hour-of-day of the raw value equals the wall-clock
+ * hour where the base station is.
+ *
+ * This is the documented time-sync contract ("synchronises the sensor's
+ * real-world clock with the Base Station's local time" - Verisense
+ * communication protocol) and what the downstream file parser assumes: it
+ * evaluates midnight/midday CSV-split boundaries on the raw RWC value in a
+ * pinned GMT+0 calendar, and labels CSV timestamp columns
+ * "Unix_ms_plus_local_time_zone_offset".
+ *
+ * Note `getTimezoneOffset()` is evaluated at `utcMillis` itself, so the DST
+ * rule in effect at that instant is applied.
+ */
+function utcToLocalCivilMillis(utcMillis = Date.now()) {
+    return utcMillis - new Date(utcMillis).getTimezoneOffset() * 60000;
+}
+/** Current time in the Verisense local-civil RWC domain, in whole unix seconds. */
+function localCivilUnixSecondsNow() {
+    return Math.floor(utcToLocalCivilMillis() / 1000);
+}
+/**
+ * Compute CRC-16/CCITT-FALSE over `bytes`.
+ *
+ * Parameters: poly=0x1021, init=0xFFFF, xorOut=0x0000.
+ * Matches the C# `ComputeCRC` implementation used by Verisense firmware.
+ */
+function crc16_ccitt_false(bytes) {
+    let crc = 0xffff;
+    for (let i = 0; i < bytes.length; i++) {
+        crc ^= bytes[i] << 8;
+        for (let b = 0; b < 8; b++) {
+            crc = crc & 0x8000 ? (crc << 1) ^ 0x1021 : crc << 1;
+            crc &= 0xffff;
+        }
+    }
+    return crc & 0xffff;
+}
+/**
+ * Extract the CRC that was appended to a logged payload (last 2 bytes, LE).
+ */
+function getOriginalCrcLE(payload) {
+    const n = payload.length;
+    return (payload[n - 2] | (payload[n - 1] << 8)) >>> 0;
+}
+/**
+ * Compute the CRC of a logged payload, excluding the trailing 2 CRC bytes,
+ * matching the C# `ComputeCRC(payload, 0, payload.Length - 2)` call.
+ */
+function computeCrcLikeCSharp(payload) {
+    return crc16_ccitt_false(payload.subarray(0, payload.length - 2));
+}
+/**
+ * Convert any reasonable representation of an operational config to a
+ * `Uint8Array`. Throws if the input type is unrecognised.
+ */
+function normalizeOperationalConfig(payload) {
+    if (!payload)
+        return null;
+    if (payload instanceof Uint8Array)
+        return payload;
+    if (payload instanceof ArrayBuffer)
+        return new Uint8Array(payload);
+    if (Array.isArray(payload))
+        return new Uint8Array(payload);
+    if (payload.buffer instanceof ArrayBuffer) {
+        const p = payload;
+        return new Uint8Array(p.buffer, p.byteOffset ?? 0, p.byteLength ?? p.buffer.byteLength);
+    }
+    throw new Error('normalizeOperationalConfig: unsupported payload type');
+}
+/** Alias for arbitrary protocol byte payload normalization. */
+function normalizeBytePayload(payload) {
+    return normalizeOperationalConfig(payload);
+}
+/**
+ * Derive the 6-digit pairing PIN from a Verisense unique identifier.
+ *
+ * The PIN is built from digits 2, 4 and 6 (1-based) of the identifier,
+ * followed by the decimal value of the final byte padded to 3 digits.
+ */
+function computeVerisensePairingPin(uniqueId) {
+    const normalized = String(uniqueId ?? '')
+        .trim()
+        .replace(/^Verisense-/i, '');
+    if (!/^[0-9a-fA-F]{8,}$/.test(normalized)) {
+        throw new Error('computeVerisensePairingPin: uniqueId must be a hex identifier string');
+    }
+    if (normalized.length < 6) {
+        throw new Error('computeVerisensePairingPin: uniqueId must be at least 6 hex characters');
+    }
+    const prefix = `${normalized[1]}${normalized[3]}${normalized[5]}`;
+    const suffixHex = normalized.slice(-2);
+    const suffixDec = Number.parseInt(suffixHex, 16);
+    return `${prefix}${suffixDec.toString().padStart(3, '0')}`;
+}
+/** Infer charger chip family from hardware revision fields in production config. */
+function inferVerisenseChargerChipFamily(revHwMajor, revHwMinor, revHwInternal) {
+    const major = Number(revHwMajor);
+    const minor = Number(revHwMinor);
+    const internal = Number(revHwInternal);
+    if ((major === 68 && minor === 7 && internal === 1) || (major === 68 && minor === 8)) {
+        return 'LTC4123';
+    }
+    if (major === 62) {
+        return 'LM3658D';
+    }
+    if ((major === 68 && minor >= 9) || (major === 61 && minor >= 5)) {
+        return 'XC6803';
+    }
+    return 'UNKNOWN';
+}
+/** Return chip-specific charger status text for a parsed 3-bit status code. */
+function describeVerisenseChargerStatus(chipFamily, statusCode) {
+    if (statusCode === 7) {
+        return 'Not read yet';
+    }
+    if (chipFamily === 'LTC4123') {
+        if (statusCode === 0) {
+            return 'Zinc-air/reverse polarity/temp out-of-range/UVCL at start of charge cycle';
+        }
+        if (statusCode === 1) {
+            return 'Powered on/charging';
+        }
+        if (statusCode === 2) {
+            return 'Charge completed';
+        }
+        if (statusCode === 3) {
+            return 'No power/not charging';
+        }
+    }
+    if (chipFamily === 'LM3658D') {
+        if (statusCode === 0 || statusCode === 3) {
+            return 'Power-down, charging suspended or interrupted';
+        }
+        if (statusCode === 1) {
+            return 'Pre-qualification, CC/CV charging, or top-off mode';
+        }
+        if (statusCode === 2) {
+            return 'Charge completed';
+        }
+    }
+    if (chipFamily === 'XC6803') {
+        if (statusCode === 0) {
+            return 'Fault (overvoltage, overcurrent, shorted battery, etc.)';
+        }
+        if (statusCode === 1) {
+            return 'Pre-qualification, CC/CV charging, or top-off mode';
+        }
+        if (statusCode === 2) {
+            return 'Charge completed';
+        }
+        if (statusCode === 3) {
+            return 'Power-down, charging suspended or interrupted';
+        }
+        if (statusCode === 4) {
+            return 'Trickle charging';
+        }
+    }
+    return 'Unknown';
+}
+/** Format charger summary text for UIs, e.g. "XC6803: Charge completed". */
+function formatVerisenseChargerStatus(status, hw) {
+    if (status.chargerPresent == null ||
+        status.chargerStatusCode == null ||
+        !status.chargerStatusName) {
+        return '-';
+    }
+    if (!status.chargerPresent) {
+        return 'Not present';
+    }
+    const chipFamily = inferVerisenseChargerChipFamily(hw?.revHwMajor ?? Number.NaN, hw?.revHwMinor ?? Number.NaN, hw?.revHwInternal ?? Number.NaN);
+    const text = describeVerisenseChargerStatus(chipFamily, Number(status.chargerStatusCode));
+    return chipFamily === 'UNKNOWN' ? text : `${chipFamily}: ${text}`;
+}
+/** Upper bound for a plausible device timestamp (2100-01-01 UTC in unix
+ * seconds). Values beyond this are uninitialised/garbage bytes, not dates. */
+const VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS = 4102444800;
+/**
+ * Format a device-RWC timestamp (unix seconds) as raw + human-readable datetime.
+ *
+ * The device RWC lives in the "local civil" domain (unix seconds with the
+ * base station's timezone offset already baked in - see
+ * {@link utcToLocalCivilMillis}), so the value is rendered VERBATIM via the
+ * Date UTC accessors: the wall-clock time shown is exactly what the device's
+ * clock reads. Rendering with the local-time accessors would apply the
+ * browser's timezone offset a second time.
+ */
+function formatVerisenseUnixAndHuman(unixSeconds) {
+    const unix = Number(unixSeconds);
+    if (!Number.isFinite(unix)) {
+        return { unix, human: 'invalid' };
+    }
+    if (unix <= 0) {
+        return { unix, human: '1970-01-01 00:00:00 (epoch)' };
+    }
+    if (unix > VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS) {
+        return { unix, human: 'not-valid' };
+    }
+    const d = new Date(unix * 1000);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const HH = String(d.getUTCHours()).padStart(2, '0');
+    const MM = String(d.getUTCMinutes()).padStart(2, '0');
+    const SS = String(d.getUTCSeconds()).padStart(2, '0');
+    return {
+        unix,
+        human: `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`,
+    };
+}
+/** Convert parsed status payload into an object with human-readable timestamps for logs. */
+function formatStatusPayloadForLog(status) {
+    return {
+        ...status,
+        statusTimestamp: formatVerisenseUnixAndHuman(status.statusTimestampSeconds),
+        lastOkTransfer: formatVerisenseUnixAndHuman(status.lastOkTransferSeconds),
+        lastFailTransfer: formatVerisenseUnixAndHuman(status.lastFailTransferSeconds),
+    };
+}
+/** Convert parsed scheduler payload into an object with human-readable timestamps for logs. */
+function formatSchedulerPayloadForLog(parsed) {
+    const out = {
+        ...parsed,
+        adaptiveScheduler: undefined,
+        ltfRetry: undefined,
+        currentTime: formatVerisenseUnixAndHuman(parsed.currentTimeUnixSeconds),
+        pendingDataTransfer: formatVerisenseUnixAndHuman(parsed.pendingDataTransferUnixSeconds),
+        pendingStatus1: formatVerisenseUnixAndHuman(parsed.pendingStatus1UnixSeconds),
+        pendingRtcSync: formatVerisenseUnixAndHuman(parsed.pendingRtcSyncUnixSeconds),
+        pendingRetry: formatVerisenseUnixAndHuman(parsed.pendingRetryUnixSeconds),
+    };
+    if (typeof parsed.pendingStatus2UnixSeconds === 'number') {
+        out.pendingStatus2 = formatVerisenseUnixAndHuman(parsed.pendingStatus2UnixSeconds);
+    }
+    if (typeof parsed.ppgMeasurementUnixSeconds === 'number') {
+        out.ppgMeasurement = formatVerisenseUnixAndHuman(parsed.ppgMeasurementUnixSeconds);
+    }
+    if (typeof parsed.stepCounterResetUnixSeconds === 'number') {
+        out.stepCounterReset = formatVerisenseUnixAndHuman(parsed.stepCounterResetUnixSeconds);
+    }
+    if (typeof parsed.sensorInactivityUnixSeconds === 'number') {
+        out.sensorInactivity = formatVerisenseUnixAndHuman(parsed.sensorInactivityUnixSeconds);
+    }
+    if (parsed.adaptiveScheduler) {
+        out.adaptiveScheduler = {
+            ...parsed.adaptiveScheduler,
+            nextTime: formatVerisenseUnixAndHuman(parsed.adaptiveScheduler.nextUnixSeconds),
+        };
+    }
+    if (parsed.ltfRetry) {
+        out.ltfRetry = {
+            ...parsed.ltfRetry,
+            nextTime: formatVerisenseUnixAndHuman(parsed.ltfRetry.nextUnixSeconds),
+        };
+    }
+    return out;
+}
+const PROD_CONFIG_FLAG_DFU_ENABLED = 1 << 0;
+const LOG_EVENT_NAMES = {
+    0: 'NONE',
+    1: 'BATTERY_FALL',
+    2: 'BATTERY_RECOVER',
+    3: 'WRITE_TO_FLASH_SUCCESS',
+    4: 'WRITE_TO_FLASH_FAIL_GENERAL',
+    5: 'WRITE_TO_FLASH_FULL',
+    6: 'WRITE_TO_FLASH_FAIL_CHECK_ADDR_FREE',
+    7: 'WRITE_TO_FLASH_FAIL_LOW_BATT_CHECK_ADDR_FREE',
+    8: 'WRITE_TO_FLASH_FAIL_LOW_BATT_FLASH_ON',
+    9: 'WRITE_TO_FLASH_FAIL_LOW_BATT_FLASH_WRITE',
+    10: 'WRITE_TO_FLASH_FAIL_LOW_BATT_BEFORE_START',
+    11: 'USB_PLUGGED_IN_SOFT_DEVICE',
+    12: 'USB_PLUGGED_OUT_SOFT_DEVICE',
+    13: 'RECORDING_PAUSED',
+    14: 'RECORDING_RESUMED',
+    15: 'BATTERY_RECOVER_IN_BATT_CHECK_TIMER',
+    16: 'TSK_FREE_UP_FLASH',
+    17: 'FREE_UP_FLASH_FAIL_LOW_BATT',
+    18: 'PAYLOAD_PACKAGING_TASK_SET',
+    19: 'PAYLOAD_PACKAGING_FUNCTION_CALL',
+    20: 'BATTERY_VOLTAGE',
+    21: 'TSK_WRITE_LOOKUP_TBL_CHANGES_TO_EEPROM',
+    22: 'LPCOMP_ON',
+    23: 'LPCOMP_ON_ALREADY',
+    24: 'LPCOMP_OFF',
+    25: 'LPCOMP_TRIED_BUT_BATT_LOW',
+    26: 'BLE_CONNECTED',
+    27: 'BLE_DISCONNECTED',
+    28: 'TSK_WRITE_FLASH',
+    29: 'PPG_TIMER_START',
+    30: 'PAYLOAD_OVERSHOT',
+    31: 'ADVERTISING_START',
+    32: 'ADVERTISING_STOP',
+    33: 'NIMH_BATT_PPG_BLOCKED_BLE_RETRY',
+    34: 'NIMH_BATT_PPG_BLOCKED_BLE_ADAPT_SCH',
+    35: 'NIMH_BATT_PPG_BLOCKED_BLE_PENDING_EVENTS',
+    36: 'NIMH_BATT_BLE_BLOCKED_PPG',
+    37: 'USB_PORT_OPEN',
+    38: 'USB_PORT_CLOSED',
+    39: 'FIFO_INT_SAFETY_CHECK_EVENT_ACCEL1',
+    40: 'FIFO_INT_SAFETY_CHECK_EVENT_ACCEL2GYRO',
+    41: 'FIFO_INT_SAFETY_CHECK_EVENT_MAX86XXX',
+    42: 'FIFO_INT_SAFETY_CHECK_EVENT_MAX3000X',
+    43: 'FIFO_INT_SAFETY_CHECK_EVENT_ADC',
+    44: 'USB_PLUGGED_IN_PIN_HANDLER',
+    45: 'USB_PLUGGED_OUT_PIN_HANDLER',
+    46: 'BATTERY_CHARGER_STATUS_BAD_BATTERY',
+    47: 'BATTERY_CHARGER_STATUS_CHARGING',
+    48: 'BATTERY_CHARGER_STATUS_CHARGING_COMPLETE',
+    49: 'BATTERY_CHARGER_STATUS_POWER_DOWN',
+    50: 'LTC4123_RECOVERY_ATTEMPT',
+    51: 'LTC4123_RECOVERY_GAVE_UP',
+    52: 'LTC4123_CHRG_COMPLETE_OVERRIDDEN_BAD_BATT',
+    // DEV-790 USB enumeration debug events
+    53: 'USB_POWER_READY_EVT',
+    54: 'USB_USBD_ENABLE_CALLED',
+    55: 'USB_USBD_START_CALLED',
+    56: 'USB_COM_PORT_DISABLED_ON_DETECT',
+    57: 'USB_USBD_STOPPED_EVT',
+};
+const LOOKUP_STATUS_NAMES = {
+    0: 'Zero',
+    1: 'Full',
+    2: '2Del',
+    3: 'Emty',
+    4: 'Bad',
+    5: 'NUse',
+};
+function u32le_at(bytes, off) {
+    return (((bytes[off] ?? 0) |
+        ((bytes[off + 1] ?? 0) << 8) |
+        ((bytes[off + 2] ?? 0) << 16) |
+        ((bytes[off + 3] ?? 0) << 24)) >>>
+        0);
+}
+function decodeAsciiTrimFF(bytes) {
+    let end = bytes.length;
+    while (end > 0 && bytes[end - 1] === 0xff)
+        end--;
+    if (end === 0)
+        return '';
+    return new TextDecoder().decode(bytes.slice(0, end));
+}
+/** Convert unix seconds into Verisense 7-byte RTC payload (4-byte minutes + 3-byte ticks). */
+function unixSecondsToAsmRtcBytes(unixSeconds) {
+    if (!Number.isFinite(unixSeconds) || unixSeconds < 0) {
+        throw new Error('unixSecondsToAsmRtcBytes: unixSeconds must be a finite positive number');
+    }
+    const minutes = Math.floor(unixSeconds / 60);
+    const secondsInMinute = unixSeconds - minutes * 60;
+    const ticks = Math.floor(secondsInMinute * 32768);
+    return new Uint8Array([
+        minutes & 0xff,
+        (minutes >> 8) & 0xff,
+        (minutes >> 16) & 0xff,
+        (minutes >> 24) & 0xff,
+        ticks & 0xff,
+        (ticks >> 8) & 0xff,
+        (ticks >> 16) & 0xff,
+    ]);
+}
+/** Convert Verisense 7-byte RTC payload into unix seconds. */
+function asmRtcBytesToUnixSeconds(rtc7) {
+    if (rtc7.length !== 7) {
+        throw new Error('asmRtcBytesToUnixSeconds: payload must be exactly 7 bytes');
+    }
+    const minutes = u32le_at(rtc7, 0);
+    const ticks = u24le$1(rtc7, 4);
+    return minutes * 60 + ticks / 32768.0;
+}
+/** Convert Verisense 8-byte minute counter payload into unix seconds. */
+function asmRtcMinutesBytesToUnixSeconds(minutes8) {
+    if (minutes8.length !== 8) {
+        throw new Error('asmRtcMinutesBytesToUnixSeconds: payload must be exactly 8 bytes');
+    }
+    let minutes = 0n;
+    for (let i = 0; i < 8; i++) {
+        minutes |= BigInt(minutes8[i]) << BigInt(i * 8);
+    }
+    return Number(minutes) * 60;
+}
+/**
+ * Build a production configuration payload (56 bytes) from structured options.
+ * This matches the Python tooling layout used by ASM_BLE.py / ASM_Device.py.
+ */
+function buildProductionConfigPayload(opts) {
+    const mo = String(opts.manufacturingOrderNumberHex ?? '').trim();
+    const mac = String(opts.macIdHex ?? '').trim();
+    if (!/^[0-9a-fA-F]{8}$/.test(mo)) {
+        throw new Error('buildProductionConfigPayload: manufacturingOrderNumberHex must be 8 hex chars');
+    }
+    if (!/^[0-9a-fA-F]{4}$/.test(mac)) {
+        throw new Error('buildProductionConfigPayload: macIdHex must be 4 hex chars');
+    }
+    const uniqueBytes = new Uint8Array(6);
+    uniqueBytes.set(new Uint8Array(mo.match(/../g).map((h) => Number.parseInt(h, 16))), 0);
+    uniqueBytes.set(new Uint8Array(mac.match(/../g).map((h) => Number.parseInt(h, 16))), 4);
+    uniqueBytes.reverse();
+    const revHwInternal = (opts.revHwInternal ?? 0) & 0xffff;
+    const revFwInternal = (opts.revFwInternal ?? 0) & 0xffff;
+    const out = new Uint8Array(56);
+    out[0] = 0x5a;
+    out.set(uniqueBytes, 1);
+    out[7] = opts.revHwMajor & 0xff;
+    out[8] = opts.revHwMinor & 0xff;
+    out[9] = opts.revFwMajor & 0xff;
+    out[10] = opts.revFwMinor & 0xff;
+    out[11] = revFwInternal & 0xff;
+    out[12] = (revFwInternal >> 8) & 0xff;
+    out[13] = revHwInternal & 0xff;
+    out[14] = (revHwInternal >> 8) & 0xff;
+    // 0xFF is the "unset" sentinel for the passkey/advertising-name region
+    // (bytes 15..54). The configFlags byte (55) must NOT be left as 0xFF — its
+    // bit 0 is PROD_CONFIG_FLAG_DFU_ENABLED, so 0xFF reads as "DFU enabled" and
+    // disabling DFU would silently have no effect. It is set explicitly below.
+    out.fill(0xff, 15, 55);
+    const passkeyId = opts.passkeyId ?? '';
+    if (passkeyId.length > 0) {
+        if (passkeyId.length !== 2) {
+            throw new Error('buildProductionConfigPayload: passkeyId must be 2 chars when provided');
+        }
+        out.set(new TextEncoder().encode(passkeyId), 15);
+    }
+    const passkey = opts.passkey ?? '';
+    if (passkey.length > 0) {
+        if (passkey.length !== 6) {
+            throw new Error('buildProductionConfigPayload: passkey must be 6 chars when provided');
+        }
+        out.set(new TextEncoder().encode(passkey), 17);
+    }
+    const advPrefix = opts.advertisingNamePrefix ?? '';
+    if (advPrefix.length > 32) {
+        throw new Error('buildProductionConfigPayload: advertisingNamePrefix must be <= 32 chars');
+    }
+    if (advPrefix.length > 0) {
+        out.set(new TextEncoder().encode(advPrefix), 23);
+    }
+    // Always set configFlags explicitly (0x01 = DFU enabled on boot, 0x00 =
+    // disabled). Matches the firmware reference encoding in ASM_Device.py.
+    out[55] = (opts.dfuEnabled ?? true) ? PROD_CONFIG_FLAG_DFU_ENABLED : 0;
+    return out;
+}
+/** Parse production configuration with optional passkey/name/flag fields. */
+function parseProductionConfigPayloadFull(response) {
+    if (response.length < 11) {
+        throw new Error('parseProductionConfigPayloadFull: payload must be at least 11 bytes');
+    }
+    const base = parseProductionConfigPayload(response);
+    const uniqueIdentifier = [...response.slice(1, 7)]
+        .reverse()
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
+    const revHwMajor = response[7] ?? 0;
+    const revHwMinor = response[8] ?? 0;
+    const revFwMajor = response[9] ?? 0;
+    const revFwMinor = response[10] ?? 0;
+    const revFwInternal = response.length >= 13 ? u16le_at(response, 11) : 0;
+    const revHwInternal = response.length >= 15 ? u16le_at(response, 13) : 0;
+    const passkeyId = response.length >= 17 ? decodeAsciiTrimFF(response.slice(15, 17)) : '';
+    const passkey = response.length >= 23 ? decodeAsciiTrimFF(response.slice(17, 23)) : '';
+    const advertisingNamePrefix = response.length >= 55 ? decodeAsciiTrimFF(response.slice(23, 55)) : '';
+    const dfuEnabled = response.length >= 56 ? !!(response[55] & PROD_CONFIG_FLAG_DFU_ENABLED) : true;
+    return {
+        ...base,
+        manufacturingOrderNumber: uniqueIdentifier.slice(0, 8),
+        macId: uniqueIdentifier.slice(8, 12),
+        uniqueIdentifier,
+        revHwMajor,
+        revHwMinor,
+        revHwInternal,
+        revFwMajor,
+        revFwMinor,
+        revFwInternal,
+        passkeyId,
+        passkey,
+        advertisingNamePrefix,
+        dfuEnabled,
+    };
+}
+/**
+ * Parse STATUS1/STATUS2 payload into a typed object.
+ *
+ * This ports the core byte parsing from ASM_Device.parse_status while keeping
+ * the output concise and UI-friendly.
+ */
+function parseStatusPayload(response, sourceStatusProperty = 'status1') {
+    if (response.length < 24) {
+        throw new Error('parseStatusPayload: payload must be at least 24 bytes');
+    }
+    const uniqueIdentifier = [...response.slice(0, 6)]
+        .reverse()
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
+    const hasTickFields = response.length >= 56;
+    const hasExtendedCapacity = response.length >= 65;
+    const statusTimestampSeconds = hasTickFields
+        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(6, 10), ...response.slice(34, 37)]))
+        : u32le_at(response, 6) * 60;
+    const batteryMilliVolts = u16le_at(response, 10);
+    const batteryPercent = response[12] ?? 0;
+    const lastOkTransferSeconds = hasTickFields
+        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(13, 17), ...response.slice(37, 40)]))
+        : u32le_at(response, 13) * 60;
+    const lastFailTransferSeconds = hasTickFields
+        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(17, 21), ...response.slice(40, 43)]))
+        : u32le_at(response, 17) * 60;
+    const memoryFreeKb = hasExtendedCapacity
+        ? (response[21] | (response[22] << 8) | (response[23] << 16) | (response[57] << 24)) >>> 0
+        : (response[21] | (response[22] << 8) | (response[23] << 16)) >>> 0;
+    const memoryCapacityKb = hasExtendedCapacity ? u32le_at(response, 60) : null;
+    const memoryUsedKb = memoryCapacityKb == null ? null : Math.max(0, memoryCapacityKb - memoryFreeKb);
+    // Bank breakdown: FULL=syncable data, 2DEL=partially-deleted, BAD=unusable flash.
+    // Ported from ASM_Device.parse_status. Present in payloads >= 56 bytes. In the
+    // extended (fw v1.02.102+, payload >= 65 bytes) format the FULL and 2DEL totals
+    // are split: 3 low bytes at 47-49 / 50-52 plus a high byte appended at offset
+    // 58 / 59 respectively (mirroring the free-memory split to byte 57).
+    const hasBankData = response.length >= 56;
+    let memoryFullBanksKb = null;
+    let memoryTwoDelBanksKb = null;
+    let memoryBadBanksKb = null;
+    if (hasBankData) {
+        if (hasExtendedCapacity) {
+            memoryFullBanksKb =
+                (response[47] | (response[48] << 8) | (response[49] << 16) | (response[58] << 24)) >>> 0;
+            memoryTwoDelBanksKb =
+                (response[50] | (response[51] << 8) | (response[52] << 16) | (response[59] << 24)) >>> 0;
+            memoryBadBanksKb = u32le_at(response, 53); // bytes 53-56
+        }
+        else {
+            memoryFullBanksKb = (response[47] | (response[48] << 8) | (response[49] << 16)) >>> 0;
+            memoryTwoDelBanksKb = (response[50] | (response[51] << 8) | (response[52] << 16)) >>> 0;
+            memoryBadBanksKb = (response[53] | (response[54] << 8) | (response[55] << 16)) >>> 0;
+        }
+    }
+    const batteryFallCounter = response.length >= 26 ? u16le_at(response, 24) : null;
+    let statusFlags = null;
+    if (response.length >= 34) {
+        const f = response[26];
+        statusFlags = {
+            usbPluggedIn: (f & 0x01) !== 0,
+            recordingPaused: (f & 0x02) !== 0,
+            flashIsFull: (f & 0x04) !== 0,
+            powerIsGood: (f & 0x08) !== 0,
+            adaptiveSchedulerOn: (f & 0x10) !== 0,
+            dfuServiceOn: (f & 0x20) !== 0,
+            firstBoot: (f & 0x40) !== 0,
+            repeatedBatteryMeasurement: (f & 0x80) !== 0,
+        };
+    }
+    let chargerPresent = null;
+    let chargerStatusCode = null;
+    let chargerStatusName = null;
+    if (hasExtendedCapacity) {
+        const chargerStatusByte = response[64] ?? 0;
+        chargerPresent = (chargerStatusByte & 0x01) !== 0;
+        chargerStatusCode = (chargerStatusByte >> 1) & 0x07;
+        chargerStatusName =
+            chargerStatusCode === 0
+                ? 'CHARGER_STATUS_BAD_BATTERY'
+                : chargerStatusCode === 1
+                    ? 'CHARGER_STATUS_CHARGING'
+                    : chargerStatusCode === 2
+                        ? 'CHARGER_STATUS_CHARGING_COMPLETE'
+                        : chargerStatusCode === 3
+                            ? 'CHARGER_STATUS_POWER_DOWN'
+                            : chargerStatusCode === 4
+                                ? 'CHARGER_STATUS_TRICKLE_CHARGING'
+                                : chargerStatusCode === 7
+                                    ? 'CHARGER_STATUS_NOT_READ'
+                                    : 'CHARGER_STATUS_UNKNOWN';
+    }
+    // Second status-flags byte (byte 65; the byte-26 flags are full). Null
+    // (unknown) when the firmware predates it — never defaulted to false, which
+    // would wrongly steer users away from USB DFU on a capable unit.
+    const usbDfuBootloader = response.length >= 66 ? (response[65] & 0x01) !== 0 : null;
+    return {
+        uniqueIdentifier,
+        sourceStatusProperty,
+        statusTimestampSeconds,
+        batteryMilliVolts,
+        batteryPercent,
+        lastOkTransferSeconds,
+        lastFailTransferSeconds,
+        memoryFreeKb,
+        memoryCapacityKb,
+        memoryUsedKb,
+        memoryFullBanksKb,
+        memoryTwoDelBanksKb,
+        memoryBadBanksKb,
+        statusFlags,
+        batteryFallCounter,
+        chargerPresent,
+        chargerStatusCode,
+        chargerStatusName,
+        usbDfuBootloader,
+    };
+}
+/** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
+function parseSchedulerDebugPayload(payload) {
+    if (payload.length < 42) {
+        throw new Error('parseSchedulerDebugPayload: payload is too short');
+    }
+    let idx = 0;
+    const currentTimeUnixSeconds = asmRtcBytesToUnixSeconds(payload.slice(idx, idx + 7));
+    idx += 7;
+    const bleControlByte = payload[idx++] ?? 0xff;
+    const bleControlCounter = bleControlByte === 0x00
+        ? 'data-transfer'
+        : bleControlByte === 0x01
+            ? 'status1'
+            : bleControlByte === 0x02
+                ? 'rtc-sync'
+                : bleControlByte === 0x03
+                    ? 'status2'
+                    : bleControlByte === 0xff
+                        ? 'never'
+                        : 'unknown';
+    const next8 = () => {
+        const v = asmRtcMinutesBytesToUnixSeconds(payload.slice(idx, idx + 8));
+        idx += 8;
+        return v;
+    };
+    const out = {
+        currentTimeUnixSeconds,
+        bleControlCounter,
+        pendingDataTransferUnixSeconds: next8(),
+        pendingStatus1UnixSeconds: next8(),
+        pendingRtcSyncUnixSeconds: next8(),
+        pendingRetryUnixSeconds: next8(),
+        retryCount: payload[idx++] ?? 0,
+        retryOperation: (payload[idx++] ?? 0) === 1 ? 'ble-on' : 'ble-off',
+    };
+    if (payload.length >= idx + 10) {
+        out.adaptiveScheduler = {
+            nextUnixSeconds: next8(),
+            enabled: (payload[idx++] ?? 0) === 1,
+            syncFailCounter: payload[idx++] ?? 0,
+        };
+    }
+    if (payload.length >= idx + 11) {
+        const nextUnixSeconds = next8();
+        const op = payload[idx++] ?? 0;
+        out.ltfRetry = {
+            nextUnixSeconds,
+            currentOperation: op === 0
+                ? 'flash-write-retry-inactive'
+                : op === 1
+                    ? 'short-flash-write-retry'
+                    : op === 2
+                        ? 'attempt-flash-write'
+                        : op === 3
+                            ? 'long-flash-write-retry'
+                            : op === 4
+                                ? 'sensor-paused-until-usb-plug-in'
+                                : 'unknown',
+            failCounterShort: payload[idx++] ?? 0,
+            failCounterLong: payload[idx++] ?? 0,
+        };
+    }
+    if (payload.length >= idx + 8) {
+        out.pendingStatus2UnixSeconds = next8();
+    }
+    if (payload.length >= idx + 8) {
+        out.ppgMeasurementUnixSeconds = next8();
+    }
+    if (payload.length >= idx + 8) {
+        out.stepCounterResetUnixSeconds = next8();
+    }
+    if (payload.length >= idx + 8) {
+        out.sensorInactivityUnixSeconds = next8();
+    }
+    return out;
+}
+/** Decode the `optimizationResult` byte from {@link parseBleLinkDebugPayload}
+ * (see {@link VerisenseBleOptimizationResult} for the bit meanings). */
+function decodeVerisenseBleOptimizationResult(resultByte) {
+    const mask = Number(resultByte ?? 0) & 0xff;
+    return {
+        notConnected: (mask & 0x80) !== 0,
+        phyRequested: (mask & 0x01) !== 0,
+        connIntervalRequested: (mask & 0x02) !== 0,
+        dataLengthRequested: (mask & 0x04) !== 0,
+        resultMask: mask,
+    };
+}
+/** Parse debug payload from BLE link read/optimize commands. */
+function parseBleLinkDebugPayload(payload) {
+    if (payload.length < 10) {
+        throw new Error('parseBleLinkDebugPayload: payload is too short');
+    }
+    const connectionIntervalUnits = u16le_at(payload, 4);
+    return {
+        attMtu: u16le_at(payload, 0),
+        maxDataLength: u16le_at(payload, 2),
+        connectionIntervalUnits,
+        connectionIntervalMs: connectionIntervalUnits * 1.25,
+        txPhy: payload[6] ?? 0,
+        rxPhy: payload[7] ?? 0,
+        optimizationResult: payload[8] ?? 0,
+        isConnected: (payload[9] ?? 0) !== 0,
+    };
+}
+/** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
+function parsePayloadCrcErrorBankIndexes(payload) {
+    if (payload.length % 2 !== 0) {
+        throw new Error('parsePayloadCrcErrorBankIndexes: payload length must be even');
+    }
+    const out = [];
+    for (let i = 0; i < payload.length; i += 2)
+        out.push(u16le_at(payload, i));
+    return out;
+}
+/** Parse 8-byte debug event-log entries. */
+function parseEventLogPayload(payload) {
+    if (payload.length % 8 !== 0) {
+        throw new Error('parseEventLogPayload: payload length must be a multiple of 8');
+    }
+    const out = [];
+    for (let i = 0; i < payload.length; i += 8) {
+        const entry = payload.slice(i, i + 8);
+        const eventId = entry[7];
+        if (eventId === 0)
+            continue;
+        out.push({
+            index: i / 8,
+            eventId,
+            eventName: LOG_EVENT_NAMES[eventId] ?? `EVENT_${eventId}`,
+            timestampUnixSeconds: eventId === 20 ? null : asmRtcBytesToUnixSeconds(entry.slice(0, 7)),
+            batteryMilliVolts: eventId === 20 ? u24le$1(entry, 0) : null,
+        });
+    }
+    return out;
+}
+/** Parse record-buffer details payload (26-byte current layout, 19-byte legacy layout). */
+function parseRecordBufferDetailsPayload(payload) {
+    const bytesPerBuffer = payload.length % 26 === 0 ? 26 : payload.length % 19 === 0 ? 19 : 0;
+    if (!bytesPerBuffer) {
+        throw new Error('parseRecordBufferDetailsPayload: unsupported payload length');
+    }
+    const out = [];
+    for (let i = 0; i < payload.length; i += bytesPerBuffer) {
+        const row = payload.slice(i, i + bytesPerBuffer);
+        out.push({
+            bufferIndex: row[0],
+            bufferState: row[1],
+            packagedPayloadIndex: u16le_at(row, 2),
+            currentByteIndexForSensorData: u16le_at(row, 4),
+            usedBufferLength: u16le_at(row, 6),
+            fifoTicks: u16le_at(row, 8),
+            dataTimestampRwcMinutes: u32le_at(row, 10),
+            dataTimestampRwcTicks: u24le$1(row, 14),
+            temperatureData: u16le_at(row, 17),
+            dataTimestampUcClockMinutes: bytesPerBuffer >= 23 ? u32le_at(row, 19) : null,
+            dataTimestampUcClockTicks: bytesPerBuffer >= 26 ? u24le$1(row, 23) : null,
+        });
+    }
+    return out;
+}
+/**
+ * Infer the lookup-table bank count from a raw debug payload length. The payload
+ * is 3 bytes per bank, optionally prefixed with a 4-byte head/tail block.
+ * Returns 0 if the length matches neither layout.
+ */
+function inferVerisenseLookupBankCount(payloadLen) {
+    if (!Number.isFinite(payloadLen) || payloadLen <= 0)
+        return 0;
+    if (payloadLen >= 4 && (payloadLen - 4) % 3 === 0)
+        return Math.floor((payloadLen - 4) / 3);
+    if (payloadLen % 3 === 0)
+        return Math.floor(payloadLen / 3);
+    return 0;
+}
+/**
+ * Parse lookup-table debug payload entries (3 bytes per bank), with optional
+ * 4-byte tail/head prefix present in older firmware debug responses. When
+ * `totalBanks` is omitted it is inferred from the payload length via
+ * {@link inferVerisenseLookupBankCount}.
+ */
+function parseLookupTablePayload(payload, totalBanks) {
+    const bytesPerBank = 3;
+    const banks = totalBanks ?? inferVerisenseLookupBankCount(payload.length);
+    const expectedNoHeadTail = banks * bytesPerBank;
+    const expectedWithHeadTail = expectedNoHeadTail + 4;
+    let data = payload;
+    let head = null;
+    let tail = null;
+    if (payload.length === expectedWithHeadTail) {
+        tail = u16le_at(payload, 0);
+        head = u16le_at(payload, 2);
+        data = payload.slice(4);
+    }
+    else if (payload.length !== expectedNoHeadTail) {
+        throw new Error(`parseLookupTablePayload: payload length ${payload.length} does not match expected ${expectedNoHeadTail} or ${expectedWithHeadTail}`);
+    }
+    const entries = [];
+    for (let bankIndex = 0; bankIndex < banks; bankIndex++) {
+        const off = bankIndex * bytesPerBank;
+        const statusByte = data[off];
+        const pendingEepromWrite = (statusByte & 0x80) !== 0;
+        const statusCode = statusByte & 0x7f;
+        entries.push({
+            bankIndex,
+            statusCode,
+            statusName: LOOKUP_STATUS_NAMES[statusCode] ?? 'Unknown',
+            pendingEepromWrite,
+            payloadIndex: u16le_at(data, off + 1),
+        });
+    }
+    return { head, tail, entries };
+}
+/**
+ * Parse the production config response payload into a structured object.
+ */
+function parseProductionConfigPayload(response) {
+    const configHeader = response[0];
+    const asmid = [...response.slice(1, 7)]
+        .reverse()
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    const revHwMajor = response[7];
+    const revHwMinor = response[8];
+    const revFwMajor = response[9];
+    const revFwMinor = response[10];
+    const fwInternalArray = response.slice(11, 13);
+    const revFwInternal = fwInternalArray[0] | (fwInternalArray[1] << 8);
+    let revHwInternal = 0;
+    if (response.length >= 15) {
+        const hwInternalArray = response.slice(13, 15);
+        if (!isUniformByteArray(hwInternalArray, 0xff)) {
+            revHwInternal = hwInternalArray[0] | (hwInternalArray[1] << 8);
+        }
+    }
+    return {
+        hardware: `${revHwMajor}.${revHwMinor}.${revHwInternal}`,
+        firmware: `${revFwMajor}.${revFwMinor}.${revFwInternal}`,
+        asmid: asmid.toUpperCase(),
+        configHeader,
+        revHwMajor,
+        revHwMinor,
+        revHwInternal,
+        revFwMajor,
+        revFwMinor,
+        revFwInternal,
+    };
+}
+/**
+ * Firmware default passkeys by passkey ID: a production config programmed
+ * with passkey ID "01" pairs with the fixed PIN "123456". Other IDs have no
+ * fixed default (ID "00" uses the per-device derived PIN — see
+ * {@link computeVerisensePairingPin}).
+ */
+const VERISENSE_DEFAULT_PASSKEY_BY_ID = Object.freeze({
+    '01': '123456',
+});
+/** The fixed passkey for a passkey ID, or undefined when the ID has none
+ * (leave the passkey bytes unset in the production config). */
+function defaultVerisensePasskeyForId(passkeyId) {
+    return VERISENSE_DEFAULT_PASSKEY_BY_ID[String(passkeyId ?? '').trim()];
+}
+/**
+ * Build the name a Verisense sensor advertises over BLE:
+ * `<prefix>-<passkeyId>-<uniqueId>` (e.g. "Verisense-01-25112101B10F").
+ * Returns null when any part is missing — matches how apps derive the name
+ * from a parsed production config that may be blank/erased.
+ */
+function buildVerisenseAdvertisedName(parts) {
+    const prefix = String(parts.prefix ?? '').trim();
+    const passkeyId = String(parts.passkeyId ?? '').trim();
+    const uniqueId = String(parts.uniqueId ?? '').trim();
+    if (!prefix || !passkeyId || !uniqueId)
+        return null;
+    return `${prefix}-${passkeyId}-${uniqueId}`;
+}
+/**
+ * Split a Verisense advertised name back into its parts. The unique ID is the
+ * final `-`-separated token; the passkey ID the token before it; anything
+ * earlier (which may itself contain `-`) is the prefix. Returns null when the
+ * name does not have at least three tokens.
+ */
+function parseVerisenseAdvertisedName(name) {
+    const tokens = String(name ?? '')
+        .trim()
+        .split('-');
+    if (tokens.length < 3)
+        return null;
+    const uniqueId = tokens[tokens.length - 1];
+    const passkeyId = tokens[tokens.length - 2];
+    const prefix = tokens.slice(0, -2).join('-');
+    if (!prefix || !passkeyId || !uniqueId)
+        return null;
+    return { prefix, passkeyId, uniqueId };
+}
+/**
+ * The 4-hex MAC ID from a Verisense advertised name (the advertised name ends
+ * with the unique ID = manufacturing order + MAC; its last 4 hex chars are
+ * the MAC ID). Returns null when the tail is not valid hex.
+ */
+function deriveVerisenseMacIdFromName(name) {
+    const tail = (String(name ?? '')
+        .trim()
+        .split('-')
+        .pop() ?? '')
+        .replace(/[^0-9A-Fa-f]/g, '')
+        .toUpperCase()
+        .slice(-4);
+    return /^[0-9A-F]{4}$/.test(tail) ? tail : null;
+}
+/**
+ * Short device tag for file names (e.g. "…-B10F-…"): the last 4 hex chars of
+ * a device unique ID or advertised name. Returns "" when unknown so callers
+ * can omit it cleanly.
+ */
+function verisenseDeviceFileTag(idOrName) {
+    const hex = String(idOrName ?? '').replace(/[^0-9A-Fa-f]/g, '');
+    return hex.length >= 4 ? hex.slice(-4).toUpperCase() : '';
+}
+
+function pad2(n) {
+    return Math.trunc(n).toString().padStart(2, '0');
+}
+function pad5(n) {
+    return Math.trunc(n).toString().padStart(5, '0');
+}
+function dateToYyMMddHHmmss(date) {
+    const yy = pad2(date.getUTCFullYear() % 100);
+    const mm = pad2(date.getUTCMonth() + 1);
+    const dd = pad2(date.getUTCDate());
+    const hh = pad2(date.getUTCHours());
+    const min = pad2(date.getUTCMinutes());
+    const ss = pad2(date.getUTCSeconds());
+    return `${yy}${mm}${dd}_${hh}${min}${ss}`;
+}
+/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
+function buildUploadBinaryFileName(uploadDate, firstPayloadIndex) {
+    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
+        throw new Error('buildUploadBinaryFileName: firstPayloadIndex must be in range 0..65535');
+    }
+    return `${dateToYyMMddHHmmss(uploadDate)}_${pad5(firstPayloadIndex)}.bin`;
+}
+/**
+ * Ensure a nested directory path exists under a root directory handle, creating
+ * each level as needed, and return the leaf handle. Browser-only (File System
+ * Access API) — the app obtains `root` from `showDirectoryPicker()` when the
+ * user selects an output location at transfer start.
+ */
+async function ensureDirectoryPath(root, segments) {
+    let dir = root;
+    for (const seg of segments) {
+        dir = await dir.getDirectoryHandle(seg, { create: true });
+    }
+    return dir;
+}
+/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
+function buildParsedCsvFileName(startDate, dataSource, firstPayloadIndex) {
+    if (!dataSource || !String(dataSource).trim()) {
+        throw new Error('buildParsedCsvFileName: dataSource must be a non-empty string');
+    }
+    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
+        throw new Error('buildParsedCsvFileName: firstPayloadIndex must be in range 0..65535');
+    }
+    return `${dateToYyMMddHHmmss(startDate)}_${String(dataSource).trim()}_${pad5(firstPayloadIndex)}.csv`;
+}
+/** Add duplicate suffix like " (2)" before extension. */
+function applyDuplicateSuffix(fileName, duplicateIndex) {
+    if (duplicateIndex < 2) {
+        throw new Error('applyDuplicateSuffix: duplicateIndex must be >= 2');
+    }
+    const idx = fileName.lastIndexOf('.');
+    if (idx <= 0)
+        return `${fileName} (${duplicateIndex})`;
+    const stem = fileName.slice(0, idx);
+    const ext = fileName.slice(idx);
+    return `${stem} (${duplicateIndex})${ext}`;
+}
+/** Return first non-colliding duplicate name for a target file name. */
+function nextAvailableDuplicateFileName(fileName, existingNames) {
+    const existing = new Set(existingNames);
+    if (!existing.has(fileName))
+        return fileName;
+    let i = 2;
+    while (true) {
+        const candidate = applyDuplicateSuffix(fileName, i);
+        if (!existing.has(candidate))
+            return candidate;
+        i++;
+    }
+}
+/** Parse first payload index (uint16 LE) from a payload byte array. */
+function getFirstPayloadIndex(payload) {
+    if (payload.length < 2) {
+        throw new Error('getFirstPayloadIndex: payload must contain at least 2 bytes');
+    }
+    return u16le_at(payload, 0);
+}
+/**
+ * Evaluate whether parsed CSV output should roll to a new file.
+ * Rules mirror ASM-DES08 split conditions.
+ */
+function evaluateParsedFileSplit(input) {
+    const reasons = [];
+    const prev = input.prevTimestampSec;
+    const curr = input.currTimestampSec;
+    // Split when crossing 12:00am or 12:00pm boundaries.
+    const prevHalfDay = Math.floor(prev / (12 * 60 * 60));
+    const currHalfDay = Math.floor(curr / (12 * 60 * 60));
+    if (currHalfDay !== prevHalfDay)
+        reasons.push('midday-midnight-boundary');
+    if ((input.prevConfigSignature ?? null) !== (input.currConfigSignature ?? null)) {
+        reasons.push('config-change');
+    }
+    if (input.expectedDeltaSec != null) {
+        const tol = Math.max(0, input.timestampToleranceSec ?? 0);
+        const delta = curr - prev;
+        if (Math.abs(delta - input.expectedDeltaSec) > tol) {
+            reasons.push('timestamp-discontinuity');
+        }
+    }
+    if (input.powerResetDetected) {
+        reasons.push('power-reset');
+    }
+    return { shouldSplit: reasons.length > 0, reasons };
+}
+
+/**
+ * CSV recording of a live Verisense stream (DEV-1116): one file per sensor
+ * stream, in a session folder the user picks.
+ *
+ * Why one file per stream rather than one wide file: a Verisense sends one
+ * packet per SENSOR, each at that sensor's own rate — accel at 51.2 Hz, GSR at
+ * 50 Hz, skin temperature at a fraction of a hertz — and the LSM6DSV (id 6)
+ * interleaves three sub-streams (accel, gyro, mag) in one FIFO, with each
+ * decoded sample carrying exactly one of them. A single table across all of
+ * that is mostly empty cells. One file per stream keeps every file
+ * rectangular, and the device clock column lines them up.
+ *
+ * ## Timestamps
+ *
+ * A Verisense packet carries ONE measured time: the 24-bit tick in its header
+ * (32768 Hz) is the time of the packet's LAST sample. The decoder places the
+ * other samples backwards from it at the configured rate
+ * (`SensorBase.extrapolateSampleTimes`). So every row gets a timestamp,
+ * but only one row per packet was measured, and the file says which:
+ *
+ * | column          | what it is |
+ * |-----------------|------------|
+ * | `HostTime_ms`   | host `Date.now()` at packet arrival, placed back the same way; epoch ms, so it carries BLE latency jitter |
+ * | `DeviceTime_ms` | the device clock, unwrapped, in ms — interpolated on every row but the measured one. Shared by all of a session's files: this is the column that aligns them |
+ * | `PacketTick`    | the packet header's raw tick, ONLY on the row it measured (the last of the packet — for id 6, the last of each sub-stream in it); blank elsewhere |
+ *
+ * Keeping the raw tick on the measured row means anyone can see the anchors
+ * and check or redo the interpolation, rather than having to trust it.
+ *
+ * Caveat, documented rather than fixed here: each decoder unwraps the tick
+ * against a 60 s rollover (`SensorBase.TICKS_MAX_VALUE`, matching the C#
+ * `Sensor.cs`). A stream whose packets arrived more than 60 s apart would miss
+ * a wrap, and its `DeviceTime_ms` would fall a minute behind.
+ *
+ * ## Column layouts
+ *
+ * The layout for a stream is derived from its FIRST sample, the way the
+ * capture page derives its columns from the first frame: which PPG channels
+ * are enabled, and whether a GSR+ unit's ADC packet carries GSR, battery or
+ * both, are properties of the configuration, and the configuration cannot
+ * change while streaming. A later sample missing a column writes an empty
+ * cell rather than shifting the row.
+ *
+ * No DOM access at import time.
+ */
+/** The columns every Verisense stream file starts with. See the module header. */
+const VERISENSE_STREAM_CSV_TIME_COLUMNS = [
+    { header: 'HostTime_ms', unit: 'ms' },
+    { header: 'DeviceTime_ms', unit: 'ms' },
+    { header: 'PacketTick', unit: 'ticks' },
+];
+const AXES = ['X', 'Y', 'Z'];
+/** Booleans as 1/0, which every analysis tool reads as a number. */
+function flag(v) {
+    return typeof v === 'boolean' ? (v ? 1 : 0) : v;
+}
+/** The unit string a decoder put on a sample, when it put one there. */
+function unitOf(units, fallback) {
+    if (typeof units === 'string' && units)
+        return units;
+    const cal = units?.cal;
+    return typeof cal === 'string' && cal ? cal : fallback;
+}
+/** X/Y/Z raw then X/Y/Z cal for a `{raw, cal}` triple found by `pick`. */
+function tripleColumns(prefix, pick, first, calUnit, withCal = true) {
+    const unit = unitOf(pick(first)?.units, calUnit);
+    const out = AXES.map((axis, i) => ({
+        header: `${prefix}_${axis}_raw`,
+        unit: 'counts',
+        get: (s) => pick(s)?.raw?.[i],
+    }));
+    if (withCal) {
+        AXES.forEach((axis, i) => out.push({
+            header: `${prefix}_${axis}_cal`,
+            unit,
+            get: (s) => pick(s)?.cal?.[i],
+        }));
+    }
+    return out;
+}
+function field(s, ...path) {
+    let v = s;
+    for (const p of path)
+        v = v?.[p];
+    return v;
+}
+function layout(key, label, sensorId, defs) {
+    if (!defs.length)
+        return null;
+    return {
+        key,
+        label,
+        sensorId,
+        columns: defs.map(({ header, unit }) => ({ header, unit })),
+        row: (sample) => defs.map((d) => flag(d.get(sample))),
+    };
+}
+/**
+ * Which stream a decoded sample belongs to, or null for a sensor this module
+ * does not know. Only id 6 splits: its samples each carry one of accel, gyro
+ * or mag, and the key says which (the same keys the stream stats use).
+ */
+function verisenseStreamCsvKey(sensorId, sample) {
+    const s = sample;
+    switch (sensorId) {
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 7:
+        case 8:
+        case 9:
+            return String(sensorId);
+        case 6:
+            if (s?.accel)
+                return '6:accel';
+            if (s?.gyro)
+                return '6:gyro';
+            if (s?.mag)
+                return '6:mag';
+            return null;
+        default:
+            return null;
+    }
+}
+/**
+ * The file layout for the stream this sample opens, derived from the sample
+ * itself. Returns null for an unknown sensor, or a sample with nothing to
+ * write (an ADC packet with neither GSR nor battery, say).
+ */
+function verisenseStreamCsvLayout(sensorId, sample) {
+    const first = sample;
+    const key = verisenseStreamCsvKey(sensorId, first);
+    if (!key)
+        return null;
+    switch (key) {
+        case '1': {
+            // SensorADC: GSR and battery share the packet; either may be disabled.
+            const defs = [];
+            const parts = [];
+            if (first?.gsr) {
+                parts.push('GSR');
+                defs.push({ header: 'GSR_raw', unit: 'counts', get: (s) => field(s, 'gsr', 'raw') }, { header: 'GSR_adc12', unit: 'counts', get: (s) => field(s, 'gsr', 'adc12') }, { header: 'GSR_range', unit: '', get: (s) => field(s, 'gsr', 'range') }, { header: 'GSR_V', unit: 'V', get: (s) => field(s, 'gsr', 'volts') }, { header: 'GSR_kOhm', unit: 'kOhm', get: (s) => field(s, 'gsr', 'kOhms') }, { header: 'GSR_uS', unit: 'uS', get: (s) => field(s, 'gsr', 'uS') }, { header: 'GSR_connectivity', unit: '', get: (s) => field(s, 'gsr', 'connectivity') });
+            }
+            if (first?.batt) {
+                parts.push('Batt');
+                defs.push({ header: 'Batt_raw16', unit: '', get: (s) => field(s, 'batt', 'raw16') }, { header: 'Batt_adc12', unit: 'counts', get: (s) => field(s, 'batt', 'adc12') }, { header: 'Batt_mV', unit: 'mV', get: (s) => field(s, 'batt', 'mV') }, {
+                    header: 'Batt_usbPluggedIn',
+                    unit: '',
+                    get: (s) => field(s, 'batt', 'usbPluggedIn'),
+                }, {
+                    header: 'Batt_chargerStatusBits',
+                    unit: '',
+                    get: (s) => field(s, 'batt', 'chargerStatusBits'),
+                }, {
+                    header: 'Batt_chargerStatus',
+                    unit: '',
+                    get: (s) => field(s, 'batt', 'chargerStatus'),
+                });
+            }
+            return layout(key, parts.join('_') || 'ADC', sensorId, defs);
+        }
+        case '2':
+            // SensorLIS2DW12: the sample IS the triple.
+            return layout(key, 'Accel1', sensorId, tripleColumns('Accel1', (s) => s, first, 'm/s^2'));
+        case '3': {
+            // SensorLSM6DS3: accel and gyro together, either may be disabled.
+            const defs = [];
+            const parts = [];
+            if (first?.accel) {
+                parts.push('Accel2');
+                defs.push(...tripleColumns('Accel2', (s) => s?.accel, first, 'm/s^2'));
+            }
+            if (first?.gyro) {
+                parts.push('Gyro');
+                defs.push(...tripleColumns('Gyro', (s) => s?.gyro, first, 'deg/s'));
+            }
+            return layout(key, parts.join('_'), sensorId, defs);
+        }
+        case '4': {
+            // SensorPPG. 2nd gen (hub) sends three raw LED counts in the order
+            // [green, IR, red]; 1st gen sends named channels, only the enabled ones.
+            if (Array.isArray(first?.leds)) {
+                const names = ['GREEN', 'IR', 'RED'];
+                return layout(key, 'PPG', sensorId, names.map((n, i) => ({
+                    header: `PPG_${n}`,
+                    unit: 'counts',
+                    get: (s) => s?.leds?.[i],
+                })));
+            }
+            const defs = [];
+            for (const ch of ['RED', 'IR', 'GREEN', 'BLUE']) {
+                const c = first?.[ch];
+                if (!c)
+                    continue;
+                defs.push({
+                    header: `PPG_${ch}_raw`,
+                    unit: c.units?.raw || 'counts',
+                    get: (s) => field(s, ch, 'raw'),
+                }, {
+                    header: `PPG_${ch}_cal`,
+                    unit: c.units?.cal || 'scaled',
+                    get: (s) => field(s, ch, 'cal'),
+                });
+            }
+            return layout(key, 'PPG', sensorId, defs);
+        }
+        case '6:accel':
+            return layout(key, 'Accel2', sensorId, tripleColumns('Accel2', (s) => s?.accel, first, 'm/s^2'));
+        case '6:gyro':
+            return layout(key, 'Gyro', sensorId, tripleColumns('Gyro', (s) => s?.gyro, first, 'deg/s'));
+        case '6:mag':
+            return layout(key, 'Mag', sensorId, tripleColumns('Mag', (s) => s?.mag, first, 'uT'));
+        case '7':
+            // SensorVD6283. VISIBLE and DARK share a slot on the chip, so one of the
+            // two is null in every sample; both columns are kept so the file does
+            // not depend on which one the first sample had.
+            return layout(key, 'Light', sensorId, [
+                ...['RED', 'VISIBLE', 'DARK', 'BLUE', 'GREEN', 'IR', 'CLEAR'].map((ch) => ({
+                    header: `Light_${ch}`,
+                    unit: 'counts',
+                    get: (s) => s?.[ch] ?? '',
+                })),
+                { header: 'Lux', unit: 'lux', get: (s) => s?.lux },
+                { header: 'CCT', unit: 'K', get: (s) => s?.cct },
+            ]);
+        case '8':
+            // SensorMAX32674 (algorithm hub). Its accel is raw only.
+            return layout(key, 'AlgoHub', sensorId, [
+                ...tripleColumns('HubAccel', (s) => s?.accel, first, '', false),
+                { header: 'HR', unit: 'bpm', get: (s) => s?.hr },
+                { header: 'HR_confidence', unit: '%', get: (s) => s?.hrConfidence },
+                { header: 'SpO2', unit: '%', get: (s) => s?.spo2 },
+                { header: 'SpO2_confidence', unit: '%', get: (s) => s?.spo2Confidence },
+                { header: 'ActivityClass', unit: '', get: (s) => s?.activityClass },
+                { header: 'SCD_ContactState', unit: '', get: (s) => s?.scdContactState },
+            ]);
+        case '9':
+            // SensorMLX90632.
+            return layout(key, 'SkinTemp', sensorId, [
+                { header: 'Object_raw', unit: 'counts', get: (s) => field(s, 'object', 'raw') },
+                {
+                    header: 'Object_cal',
+                    unit: unitOf(field(first, 'object', 'units'), 'degC'),
+                    get: (s) => field(s, 'object', 'cal'),
+                },
+                { header: 'Ambient_raw', unit: 'counts', get: (s) => field(s, 'ambient', 'raw') },
+                {
+                    header: 'Ambient_cal',
+                    unit: unitOf(field(first, 'ambient', 'units'), 'degC'),
+                    get: (s) => field(s, 'ambient', 'cal'),
+                },
+            ]);
+        default:
+            return null;
+    }
+}
+/** Round to `dp` places, leaving non-numbers as an empty cell. */
+function rounded(v, dp) {
+    if (typeof v !== 'number' || !Number.isFinite(v))
+        return '';
+    const f = 10 ** dp;
+    return Math.round(v * f) / f;
+}
+/**
+ * The time cells for one row: see the module header. `measured` is true for
+ * the row the packet's tick belongs to.
+ */
+function timeCells(sample, tick, measured) {
+    const ts = sample?.timestamps;
+    return [
+        rounded(ts?.systemTsMillis, 0),
+        // Microsecond resolution: a tick is 30.5 µs, so this keeps the clock's
+        // own precision without the float noise of the interpolation.
+        rounded(ts?.tsMillis, 3),
+        measured ? tick : '',
+    ];
+}
+/**
+ * Create a recorder for a live Verisense stream: feed it every `data` packet,
+ * and it writes one CSV per sensor stream, each opened on that stream's first
+ * sample. A sensor that starts sending later gets its file when it starts.
+ *
+ * One failure ends the whole recording, for the reason the table writer gives:
+ * a session whose files silently stop at different points is worse than one
+ * that stops, closes everything, and says so.
+ */
+function createVerisenseStreamRecorder(opts = {}) {
+    const preferFsa = opts.preferFileSystemAccess !== false;
+    const unitsRow = opts.unitsRow !== false;
+    const logger = typeof opts.log === 'function' ? { log: opts.log } : (opts.log ?? {});
+    const warn = (m) => (logger.warn ?? logger.log)?.(m);
+    let active = false;
+    let starting = false;
+    let sessionName = '';
+    /** The session folder; null in memory mode. */
+    let dir = null;
+    const streams = new Map();
+    /** Memory mode: finished files, collected as each writer stops. */
+    let collected = [];
+    /** The first failure, and the teardown it started. */
+    let failure = null;
+    let dying = null;
+    function result(files) {
+        const firstError = failure ?? files.find((f) => f.error)?.error ?? null;
+        return {
+            sessionName,
+            toFolder: dir !== null,
+            complete: firstError === null && files.every((f) => f.complete),
+            error: firstError,
+            files,
+        };
+    }
+    function fileResult(s, r) {
+        return { ...r, key: s.layout.key, label: s.layout.label, sensorId: s.layout.sensorId };
+    }
+    async function stopAll() {
+        const list = [...streams.values()];
+        const results = await Promise.all(list.map(async (s) => fileResult(s, await s.writer.stop())));
+        if (!dir && collected.length) {
+            const files = collected;
+            collected = [];
+            try {
+                if (opts.downloadFiles)
+                    opts.downloadFiles(files);
+                else
+                    for (const f of files)
+                        downloadCsvBlob(f.fileName, f.blob);
+            }
+            catch (e) {
+                failure ?? (failure = String(e?.message ?? e));
+            }
+        }
+        return result(results);
+    }
+    /** One writer failed: end the session, closing every other file cleanly. */
+    function onWriterError() {
+        if (dying)
+            return;
+        active = false;
+        dying = stopAll().then((r) => {
+            try {
+                opts.onError?.(r);
+            }
+            catch (cbError) {
+                warn(`CSV onError handler threw: ${String(cbError)}`);
+            }
+        });
+    }
+    function open(first, sensorId, key) {
+        const l = verisenseStreamCsvLayout(sensorId, first);
+        if (!l)
+            return null;
+        const fileName = `${sessionName}_${l.label}.csv`;
+        const header = [...VERISENSE_STREAM_CSV_TIME_COLUMNS, ...l.columns].map((c) => c.header);
+        const units = unitsRow
+            ? [...VERISENSE_STREAM_CSV_TIME_COLUMNS, ...l.columns].map((c) => c.unit)
+            : null;
+        let sink = null;
+        if (dir) {
+            const folder = dir;
+            sink = folder
+                .getFileHandle(fileName, { create: true })
+                .then((h) => h.createWritable());
+        }
+        const writer = createCsvTableWriter({
+            fileName,
+            header,
+            units,
+            sink,
+            download: (name, blob) => collected.push({ fileName: name, blob }),
+            log: opts.log,
+            onError: onWriterError,
+        });
+        const s = { layout: l, writer };
+        streams.set(key, s);
+        return s;
+    }
+    async function start() {
+        if (active || starting) {
+            warn('CSV recorder already running');
+            return false;
+        }
+        sessionName = (opts.sessionNameFn ?? (() => `Verisense_${localStamp(new Date())}`))();
+        streams.clear();
+        collected = [];
+        failure = null;
+        dying = null;
+        dir = null;
+        const picker = globalThis.showDirectoryPicker;
+        if (preferFsa && typeof picker === 'function') {
+            starting = true;
+            try {
+                const root = await picker({ id: 'verisense-stream-csv', mode: 'readwrite' });
+                dir = await ensureDirectoryPath(root, [sessionName]);
+            }
+            catch (e) {
+                // AbortError is the user closing the picker — a "no", not a reason
+                // to start recording somewhere they did not ask for.
+                if (e?.name === 'AbortError')
+                    return false;
+                warn(`folder picker unavailable (${String(e?.message ?? e)}) — buffering in memory instead`);
+                dir = null;
+            }
+            finally {
+                starting = false;
+            }
+        }
+        active = true;
+        return true;
+    }
+    function push(pkt) {
+        if (!active)
+            return false;
+        const samples = pkt?.decoded;
+        if (!Array.isArray(samples) || !samples.length)
+            return false;
+        // The packet's tick measured the LAST sample of each stream in it (for id
+        // 6, the last of each sub-stream: the decoder spreads every sub-stream
+        // back from the same block end). Find those rows first.
+        const keys = samples.map((s) => verisenseStreamCsvKey(pkt.sensorId, s));
+        const lastIndex = new Map();
+        keys.forEach((k, i) => {
+            if (k)
+                lastIndex.set(k, i);
+        });
+        let wrote = false;
+        for (let i = 0; i < samples.length; i++) {
+            const key = keys[i];
+            if (!key)
+                continue;
+            const s = streams.get(key) ?? open(samples[i], pkt.sensorId, key);
+            if (!s)
+                continue;
+            const cells = [
+                ...timeCells(samples[i], pkt.tick_u24, lastIndex.get(key) === i),
+                ...s.layout.row(samples[i]),
+            ];
+            if (s.writer.pushCells(cells))
+                wrote = true;
+            if (!active)
+                break; // a failure inside pushCells ended the session
+        }
+        return wrote;
+    }
+    async function stop() {
+        if (!active) {
+            if (dying)
+                await dying;
+            return stopAll();
+        }
+        active = false;
+        return stopAll();
+    }
+    return {
+        start,
+        push,
+        stop,
+        progress: () => [...streams.values()].map((s) => ({
+            key: s.layout.key,
+            label: s.layout.label,
+            sensorId: s.layout.sensorId,
+            fileName: s.writer.fileName,
+            rows: s.writer.rowsAccepted,
+        })),
+        get active() {
+            return active;
+        },
+        get toFolder() {
+            return dir !== null;
+        },
+        get sessionName() {
+            return sessionName;
+        },
+    };
+}
+
+/**
  * Device RTC drift estimation over a live connection (DEV-844).
  *
  * Sample the device clock periodically against the host clock and fit a
@@ -2194,10 +4488,11 @@ const SHIMMER3R_CHANNEL_FORMATS = Object.freeze({
  *
  * Names follow the SD-log channel tables in `devices/sdlog/channels.ts` so the
  * streamed and logged copies of the same signal carry the same label. The one
- * exception is the BMP pair: the SD-log header names the exact part
- * (`TEMPERATURE_BMP390`, `PRESSURE_BMP280`) because it records it, whereas the
- * inquiry response does not say which sensor is fitted, so the streaming names
- * stay unqualified.
+ * exception is the BMP pair: the SD-log decoder names the exact part
+ * (`TEMPERATURE_BMP390`, `PRESSURE_BMP581`), inferred from the board identity
+ * the header records — the header itself names no part — whereas the inquiry
+ * response does not say which sensor is fitted, so the streaming names stay
+ * unqualified.
  *
  * The ADC block's Shimmer3R names are the firmware's logical indices
  * (`EXTERNAL_ADC_0`…), which is what `devices/sdlog/channels.ts` already uses.
@@ -3757,7 +6052,7 @@ function concatU8(a, b) {
     return out;
 }
 /** Read a 16-bit unsigned integer, little-endian. */
-function u16le$4(b, o) {
+function u16le$3(b, o) {
     return (b[o] | (b[o + 1] << 8)) >>> 0;
 }
 /** Read a 16-bit unsigned integer, big-endian. */
@@ -3765,7 +6060,7 @@ function u16be$2(b, o) {
     return ((b[o] << 8) | b[o + 1]) >>> 0;
 }
 /** Read a 24-bit unsigned integer, little-endian. */
-function u24le$1(b, o) {
+function u24le(b, o) {
     return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16)) >>> 0;
 }
 /** Read a 24-bit unsigned integer, big-endian. */
@@ -4173,6 +6468,51 @@ const TICKS_PER_MS = TICKS_PER_SECOND / 1000;
  */
 const INVALID_ZERO_WINDOW_TICKS = TICKS_PER_SECOND;
 /**
+ * How many sample periods behind its predecessor a value may be and still be
+ * read as a reordered packet rather than as forward motion across a wrap.
+ *
+ * A reorder swaps packets that are adjacent in time, so it spans a handful of
+ * sample periods; a dropout spans whatever the link lost. Eight periods sits
+ * orders of magnitude clear of both at any rate the hardware offers.
+ */
+const REORDER_PERIODS = 8;
+/**
+ * The largest fraction of the counter's range a reorder window may occupy.
+ *
+ * At 1 Hz on the 16-bit counter eight sample periods is four whole modulos, and
+ * a window at or above the modulo leaves no backward step large enough to be a
+ * wrap — the unwrap would stop counting them altogether.
+ */
+const MAX_WINDOW_DIVISOR = 8;
+/**
+ * The reorder window for a stream at a known sampling rate, in counter ticks.
+ *
+ * Sized in **sample periods**, not as a fraction of the counter's range. The
+ * two are easy to confuse and behave very differently: a reorder swaps adjacent
+ * packets, whereas a dropout that happens to span the wrap point is most of a
+ * modulo. Sizing the window by the modulo puts the boundary between them in the
+ * middle of ordinary dropout territory — at 2^16 every gap between 1.75 s and
+ * 2.0 s reads as a reorder and the wrap is silently lost, and 1.75 s is a gap a
+ * Bluetooth link produces on a bad afternoon. Eight sample periods shrinks that
+ * misread band to about 16 ms.
+ *
+ * `0` — the branch disabled — when the rate is not a positive finite number.
+ * Never guess: an unknown rate must not become an infinite window, which would
+ * read every backward step as a reorder and lose every wrap. That is a worse
+ * failure than no reorder detection at all, and it is how a parallel fix for
+ * this same defect reverted itself whenever the rate happened to read zero.
+ *
+ * @param samplingRateHz Samples per second. **The counter's own 32768 Hz tick
+ *   domain is what the answer is in** — pass the rate in Hz, never a rate
+ *   expressed against a TCXO sampling clock.
+ * @param modulo The counter's range, `2 ** timestampBits`.
+ */
+function reorderWindowTicks(samplingRateHz, modulo) {
+    if (samplingRateHz == null || !Number.isFinite(samplingRateHz) || samplingRateHz <= 0)
+        return 0;
+    return Math.min((REORDER_PERIODS * TICKS_PER_SECOND) / samplingRateHz, modulo / MAX_WINDOW_DIVISOR);
+}
+/**
  * Relative drift assumed between the sensor's clock and the host's, in parts
  * per million, when an anchor is bound to a stream some time after the reading
  * that produced it.
@@ -4197,6 +6537,16 @@ class StreamTimeline {
         this._lastUnwrapped = 0;
         this._lastHostMs = null;
         this._wraps = 0;
+        /**
+         * How far behind the previous sample a value may be and still be read as a
+         * reordered packet rather than as forward motion across a wrap, in ticks.
+         * Derived — see {@link _recomputeReorderWindow}.
+         */
+        this._reorderWindow = 0;
+        /** The stream's sampling rate, or `null` when it is not known. */
+        this._samplingRateHz = null;
+        /** A window set outright by the caller, overriding the derivation. */
+        this._reorderWindowOverride = null;
         this._pending = null;
         this._anchor = null;
         /**
@@ -4208,7 +6558,83 @@ class StreamTimeline {
         this._request = null;
         this._bits = opts.timestampBits ?? 24;
         this._modulo = 2 ** this._bits;
-        this._reorderWindow = this._modulo / 8;
+        this.setSamplingRateHz(opts.samplingRateHz ?? null);
+        this.setReorderWindowTicks(opts.reorderWindowTicks ?? null);
+    }
+    /**
+     * Tell the timeline the stream's sampling rate, so that it can size the
+     * reorder window in sample periods.
+     *
+     * `null` — or anything that is not a positive finite number — means "not
+     * known", and the window falls back to an eighth of the modulo, which is what
+     * this class has always used. That fallback is a compromise this SDK can
+     * afford and a file importer cannot: on a live link the host-clock recovery
+     * in {@link _unwrap} is a second witness, whereas an SD file has no clock to
+     * appeal to and the other Shimmer host APIs therefore disable the branch
+     * outright when the rate is unknown. Pass the rate and the question does not
+     * arise: the derived window is better in every case.
+     *
+     * Cheap and idempotent. Both clients call it once per stream, from the rate
+     * the inquiry reported; calling it mid-stream is allowed and the next sample
+     * is judged by the new window.
+     */
+    setSamplingRateHz(samplingRateHz) {
+        this._samplingRateHz =
+            samplingRateHz !== null && Number.isFinite(samplingRateHz) && samplingRateHz > 0
+                ? samplingRateHz
+                : null;
+        this._recomputeReorderWindow();
+    }
+    /**
+     * Set the reorder window outright, in ticks, or `null` to go back to deriving
+     * it from the sampling rate. `0` disables the branch.
+     *
+     * Clamped to an eighth of the counter's range, as a derived window is — see
+     * {@link _recomputeReorderWindow}. {@link reorderWindowTicks} reports what is
+     * actually in force.
+     */
+    setReorderWindowTicks(ticks) {
+        this._reorderWindowOverride =
+            ticks !== null && Number.isFinite(ticks) && ticks >= 0 ? ticks : null;
+        this._recomputeReorderWindow();
+    }
+    /** The reorder window in force, in counter ticks. */
+    get reorderWindowTicks() {
+        return this._reorderWindow;
+    }
+    /**
+     * True when the window in force is a reorder-scale one — derived from a known
+     * rate, or set outright by the caller — rather than the rate-unknown
+     * fallback.
+     *
+     * It decides whether a reorder is allowed to overrule the invalid-zero test
+     * (see {@link _unwrap}). A window of a few sample periods can: a zero that
+     * close to an origin really is ambiguous, and the cost of choosing wrong is
+     * about 16 ms. An eighth of the modulo cannot: it is 64 s on the 24-bit
+     * counter, and reading an unstamped record as a packet 64 s late would place
+     * it 64 s early and call it valid, which is worse than either answer the rule
+     * is choosing between.
+     */
+    get _windowIsReorderScale() {
+        return this._reorderWindowOverride !== null || this._samplingRateHz !== null;
+    }
+    /** Explicit window, else the rate-derived one, else the legacy fallback. */
+    _recomputeReorderWindow() {
+        if (this._reorderWindowOverride !== null) {
+            /* Clamped like a derived window, and for the same reason: a window at or
+               above the modulo leaves no backward step large enough to be a wrap, so
+               the unwrap stops counting them and a recording quietly runs short. That
+               must not be expressible, whether the number came from a rate or from a
+               caller. Clamped here rather than in the setter because
+               {@link setTimestampBits} can change the modulo afterwards. */
+            this._reorderWindow = Math.min(this._reorderWindowOverride, this._modulo / MAX_WINDOW_DIVISOR);
+        }
+        else if (this._samplingRateHz !== null) {
+            this._reorderWindow = reorderWindowTicks(this._samplingRateHz, this._modulo);
+        }
+        else {
+            this._reorderWindow = this._modulo / MAX_WINDOW_DIVISOR;
+        }
     }
     /** The counter width this timeline is unwrapping. */
     get timestampBits() {
@@ -4227,7 +6653,10 @@ class StreamTimeline {
             return;
         this._bits = bits;
         this._modulo = 2 ** bits;
-        this._reorderWindow = this._modulo / 8;
+        /* The window is clamped against the modulo and may be derived from it, so
+           it has to be recomputed here. The sampling rate is not a property of the
+           counter width and is deliberately kept. */
+        this._recomputeReorderWindow();
         this.reset();
     }
     /**
@@ -4357,6 +6786,25 @@ class StreamTimeline {
         const value = ((raw % this._modulo) + this._modulo) % this._modulo;
         if (this._lastRaw === null)
             return value;
+        /* Everything below is decided on the MODULAR forward distance from the last
+           sample — never by comparing candidate unwrapped values, which looks
+           equivalent and is not. A packet arriving late from just before a wrap
+           boundary has an unwrapped candidate ABOVE its predecessor, so a
+           comparison accepts it as forward motion of nearly a whole modulo, and
+           then reads the next real sample as a second wrap: `[2^24 - 10, 5,
+           2^24 - 10, 70]` lands at 33554502, two modulos out, from one out-of-order
+           packet. The modular distance sees it for what it is.
+    
+           A duplicate (`forward === 0`) holds the timeline exactly where it is, and
+           falls out of the arithmetic below without a branch of its own.
+    
+           Forward motion is the DEFAULT. That is what keeps a wrap preceded by a
+           long dropout classified as a wrap: however much was lost, the counter
+           still rolled over. A rule that defaults the other way — "a backward step
+           is corrupt unless it clears some threshold" — fails exactly there. */
+        const forward = (value - this._lastRaw + this._modulo) % this._modulo;
+        const backwards = this._modulo - forward;
+        const reordered = forward !== 0 && backwards <= this._reorderWindow;
         /* A counter of exactly zero arriving from mid-range is not a roll-over: it
            is a record the firmware never stamped. Read as a wrap it would put every
            later sample in the session a clean 512 s late, which is how a customer's
@@ -4364,35 +6812,20 @@ class StreamTimeline {
            deliberately narrow — the 24-bit counter, an exact zero, and a
            predecessor further than {@link INVALID_ZERO_WINDOW_TICKS} from the top
            of the range — so a genuine wrap onto zero is still accepted and the
-           16-bit counter is untouched. See the constant for why. */
-        if (this._bits === 24 &&
+           16-bit counter is untouched. See the constant for why.
+    
+           A reorder comes first, so a zero within a window of an origin is placed
+           rather than rejected: that is the order every Shimmer host API uses. It
+           only applies to a reorder-scale window — see
+           {@link _windowIsReorderScale}. */
+        if (!(reordered && this._windowIsReorderScale) &&
+            this._bits === 24 &&
             value === 0 &&
             this._lastRaw < this._modulo - INVALID_ZERO_WINDOW_TICKS) {
             return null;
         }
         const half = this._modulo / 2;
-        /* Forward distance from the last sample, and whether to read it as forward
-           motion (crossing a wrap if it has to) or as a small step BACKWARDS —
-           a duplicated or reordered packet. Without the backwards case one
-           out-of-order packet adds a whole modulo, 512 s on a Shimmer3R, for the
-           rest of the session.
-    
-           The threshold is the REORDER WINDOW, not half the modulo. Half looks
-           like the natural split and is wrong on the 16-bit counter: its whole
-           modulo is 2 s, so a genuine forward gap of more than a second — which a
-           single missed Bluetooth window produces — reads as a step backwards, and
-           the sample lands almost a modulo early. What actually distinguishes the
-           two is magnitude: a reorder swaps packets that are adjacent in time, so
-           it is a handful of sample periods, while a gap is whatever the link
-           dropped. An eighth of the modulo is 64 s on the 24-bit counter and
-           0.25 s on the 16-bit one — far larger than any reorder, far smaller than
-           a gap worth recovering. A duplicate (`forward === 0`) is unaffected
-           either way. */
-        const forward = (value - this._lastRaw + this._modulo) % this._modulo;
-        const backwards = this._modulo - forward;
-        let unwrapped = backwards <= this._reorderWindow && forward !== 0
-            ? this._lastUnwrapped - backwards
-            : this._lastUnwrapped + forward;
+        let unwrapped = reordered ? this._lastUnwrapped - backwards : this._lastUnwrapped + forward;
         /* The rule above cannot see a wrap that went by entirely — more than a
            whole modulo of samples missed, which is 512 s on a 24-bit counter but
            only 2 s on the 16-bit one older Shimmer3 firmware uses. The host clock
@@ -4517,6 +6950,7 @@ class StreamTimeline {
             skewMs: this._anchor?.skewMs ?? null,
             wraps: this._wraps,
             timestampBits: this._bits,
+            reorderWindowTicks: this._reorderWindow,
         };
     }
     /** True once wall-clock time is available. */
@@ -4578,9 +7012,14 @@ function calibrateGsrDataToResistanceFromAmplifierEq(gsrUncalibratedData, range)
  * any range can measure — the circuit cannot report below it whatever range it
  * switched to, but the upper end depends on which range that was, and the
  * per-sample range bits have already been used to pick the resistor. This
- * matches `SensorGSR.nudgeGsrResistance` (:415-421); an earlier version of this
- * function returned an auto-range value unclamped, which let the amplifier
- * equation report a few hundred ohms of skin resistance near full scale.
+ * matches `SensorGSR.nudgeGsrResistance` (:415-421).
+ *
+ * The auto-range floor never changes a real reading: range 0 at full scale
+ * already decodes to 8.04 kΩ. The only values under 8 kΩ are the negative ones
+ * that a code below the amplifier's reference produces, which is an open
+ * circuit, and the floor used to report those as 125 µS. `calibrateGsrSample`
+ * now decodes such a code as open before it gets here (DEV-1070), so the floor
+ * is only a backstop.
  *
  * @param gsrResistanceKOhms Calibrated resistance in kΩ.
  * @param gsrRangeSetting    Range 0–3 (fixed) or 4 (auto).
@@ -4639,7 +7078,7 @@ function getOversamplingRatioADS1292R(samplingRate) {
 /** Unsigned 16-bit, most-significant byte first (BMP180). */
 const u16be$1 = (b, o) => (b[o] << 8) | b[o + 1];
 /** Unsigned 16-bit, least-significant byte first (BMP280, BMP390). */
-const u16le$3 = (b, o) => b[o] | (b[o + 1] << 8);
+const u16le$2 = (b, o) => b[o] | (b[o + 1] << 8);
 /** Sign-extend an unsigned 16-bit value to a signed one. */
 const s16 = (v) => (v & 0x8000 ? v - 0x10000 : v);
 /** Sign-extend an unsigned 8-bit value to a signed one. */
@@ -4647,15 +7086,22 @@ const s8 = (v) => (v & 0x80 ? v - 0x100 : v);
 /** Signed 16-bit, most-significant byte first (BMP180). */
 const i16be$1 = (b, o) => s16(u16be$1(b, o));
 /** Signed 16-bit, least-significant byte first (BMP280, BMP390). */
-const i16le$1 = (b, o) => s16(u16le$3(b, o));
+const i16le = (b, o) => s16(u16le$2(b, o));
 /**
  * Sign-extend an unsigned 24-bit value to a signed one.
  *
  * The BMP581 streams its temperature as 24-bit two's complement — the Bosch
  * driver does this same extension before scaling
  * (`Shimmer_Driver/BMP5/BMP5_SensorAPI/bmp5.c:684-693`).
+ *
+ * Masks to 24 bits first, as the Java driver's `CalibDetailsBmp581.signExtend24`
+ * does, so a value that is already signed — `-1` from a decoder that extended
+ * it itself — comes back unchanged rather than shifted down by 2^24.
  */
-const s24 = (v) => (v & 0x800000 ? v - 0x1000000 : v);
+const s24 = (v) => {
+    const u = v & 0xffffff;
+    return u & 0x800000 ? u - 0x1000000 : u;
+};
 
 /**
  * BMP180 — coefficient parsing and Bosch's integer compensation, in floating
@@ -4764,18 +7210,18 @@ function parseBmp280Coefficients(bytes) {
     if (bytes.length < 24)
         return null;
     return {
-        digT1: u16le$3(bytes, 0),
-        digT2: i16le$1(bytes, 2),
-        digT3: i16le$1(bytes, 4),
-        digP1: u16le$3(bytes, 6),
-        digP2: i16le$1(bytes, 8),
-        digP3: i16le$1(bytes, 10),
-        digP4: i16le$1(bytes, 12),
-        digP5: i16le$1(bytes, 14),
-        digP6: i16le$1(bytes, 16),
-        digP7: i16le$1(bytes, 18),
-        digP8: i16le$1(bytes, 20),
-        digP9: i16le$1(bytes, 22),
+        digT1: u16le$2(bytes, 0),
+        digT2: i16le(bytes, 2),
+        digT3: i16le(bytes, 4),
+        digP1: u16le$2(bytes, 6),
+        digP2: i16le(bytes, 8),
+        digP3: i16le(bytes, 10),
+        digP4: i16le(bytes, 12),
+        digP5: i16le(bytes, 14),
+        digP6: i16le(bytes, 16),
+        digP7: i16le(bytes, 18),
+        digP8: i16le(bytes, 20),
+        digP9: i16le(bytes, 22),
     };
 }
 /**
@@ -4851,19 +7297,19 @@ function parseBmp390Coefficients(bytes) {
         return null;
     return {
         // 1 / 2^8 — dividing by 0.00390625 is multiplying by 256.
-        parT1: u16le$3(bytes, 0) / 0.00390625,
-        parT2: u16le$3(bytes, 2) / 1073741824,
+        parT1: u16le$2(bytes, 0) / 0.00390625,
+        parT2: u16le$2(bytes, 2) / 1073741824,
         parT3: s8(bytes[4]) / 281474976710656,
-        parP1: (i16le$1(bytes, 5) - 16384) / 1048576,
-        parP2: (i16le$1(bytes, 7) - 16384) / 536870912,
+        parP1: (i16le(bytes, 5) - 16384) / 1048576,
+        parP2: (i16le(bytes, 7) - 16384) / 536870912,
         parP3: s8(bytes[9]) / 4294967296,
         parP4: s8(bytes[10]) / 137438953472,
         // 1 / 2^3
-        parP5: u16le$3(bytes, 11) / 0.125,
-        parP6: u16le$3(bytes, 13) / 64,
+        parP5: u16le$2(bytes, 11) / 0.125,
+        parP6: u16le$2(bytes, 13) / 64,
         parP7: s8(bytes[15]) / 256,
         parP8: s8(bytes[16]) / 32768,
-        parP9: i16le$1(bytes, 17) / 281474976710656,
+        parP9: i16le(bytes, 17) / 281474976710656,
         parP10: s8(bytes[19]) / 281474976710656,
         parP11: s8(bytes[20]) / 36893488147419103232,
     };
@@ -4915,8 +7361,9 @@ function compensateBmp390(rawPressure, rawTemperature, c) {
  * Scale factors and signedness are the Bosch driver's
  * (`Shimmer_Driver/BMP5/BMP5_SensorAPI/bmp5.c:682-720`): pressure is an
  * **unsigned** 24-bit value over 64 for pascals, temperature a **signed**
- * 24-bit value over 65536 for degrees Celsius. The Java driver agrees
- * (`CalibDetailsBmp581.java:26-31`).
+ * 24-bit value over 65536 for degrees Celsius. The Java driver used the
+ * temperature unsigned until DEV-1102, so Consensys exports read ~255 °C for
+ * anything below 0 °C; it now sign-extends in `CalibDetailsBmp581.signExtend24`.
  */
 /**
  * Scale one BMP581 sample.
@@ -5014,12 +7461,16 @@ function gsrRangeForSample(rawSample, gsrRangeSetting) {
  */
 function calibrateGsrSample(rawSample, gsrRangeSetting) {
     const range = gsrRangeForSample(rawSample, gsrRangeSetting);
-    let adc12 = rawSample & 0x0fff;
-    // On the largest range the amplifier is non-linear below this count, and the
-    // firmware's own conversion floors it rather than extrapolating.
-    if (range === 3 && adc12 < GSR_UNCAL_LIMIT_RANGE3)
-        adc12 = GSR_UNCAL_LIMIT_RANGE3;
-    const resistanceKOhms = nudgeGsrResistance(calibrateGsrDataToResistanceFromAmplifierEq(adc12, range), gsrRangeSetting);
+    const adc12 = rawSample & 0x0fff;
+    // Below this count the amplifier output is at or under its 0.5 V reference,
+    // which no skin resistance can produce, so the electrodes are open. Range 3
+    // has long decoded such a count at the limit. The lower ranges see them too,
+    // as auto-range climbs through them after the electrodes come off, and now
+    // decode them the same way, as range 3 at the limit (DEV-1070). `range` still
+    // reports the resistor that was in circuit.
+    const resistanceKOhms = nudgeGsrResistance(adc12 < GSR_UNCAL_LIMIT_RANGE3
+        ? calibrateGsrDataToResistanceFromAmplifierEq(GSR_UNCAL_LIMIT_RANGE3, 3)
+        : calibrateGsrDataToResistanceFromAmplifierEq(adc12, range), gsrRangeSetting);
     return {
         range,
         resistanceKOhms,
@@ -5938,6 +8389,461 @@ function parsePressureCalibrationResponse(payload) {
 }
 
 /**
+ * Firmware/hardware-conditional InfoMem byte-layout resolution for Shimmer3
+ * and Shimmer3R.
+ *
+ * Ported verbatim from the Java driver:
+ *   com.shimmerresearch.driver.shimmer2r3.ConfigByteLayoutShimmer3
+ *     (field initialisers + the constructor @324-412 that mutates offsets and
+ *      the InfoMem address base by firmware version / hardware id)
+ *   com.shimmerresearch.driver.ConfigByteLayout (address defaults @36-40,
+ *     checkConfigBytesValid @90)
+ *   com.shimmerresearch.driverUtilities.UtilShimmer#compareVersions (@580-629)
+ *   com.shimmerresearch.driverUtilities.ShimmerVerObject
+ *     (#isSupportedMpl @390, #isSupportedEightByteDerivedSensors @472)
+ *   com.shimmerresearch.driver.ShimmerDevice#isSupportedSdLogSync (@2091)
+ *
+ * Everything here is pure so it can be unit-tested with byte fixtures.
+ */
+// ---------------------------------------------------------------------------
+// HW / FW id constants (ShimmerVerDetails.java)
+// ---------------------------------------------------------------------------
+/** Hardware version codes (`ShimmerVerDetails.HW_ID`). */
+const HW_ID$1 = Object.freeze({
+    SHIMMER_3: 3,
+    SHIMMER_3R: 10,
+});
+/** Firmware identifier codes (`ShimmerVerDetails.FW_ID`). */
+const FW_ID$1 = Object.freeze({
+    BTSTREAM: 1,
+    SDLOG: 2,
+    LOGANDSTREAM: 3,
+    GQ_802154: 9,
+    SHIMMER4_SDK_STOCK: 12,
+    STROKARE: 15,
+});
+/** `ShimmerVerDetails.ANY_VERSION` — wildcard for a version-field comparison. */
+const ANY_VERSION = -1;
+// ---------------------------------------------------------------------------
+// InfoMem geometry
+// ---------------------------------------------------------------------------
+/** Total InfoMem config length used by Shimmer3/3R (D+C+B pages). */
+const INFOMEM_SIZE = 384;
+/** One InfoMem page (D/C/B) = 128 bytes; also the UART transfer chunk size. */
+const INFOMEM_PAGE_SIZE = 128;
+/** Number of validity sentinel bytes checked at the start of the InfoMem. */
+const INFOMEM_VALIDITY_BYTES = 6;
+/** Legacy MSP430 absolute page addresses (`ConfigByteLayout` defaults). */
+const INFOMEM_ADDR_LEGACY = Object.freeze({ D: 0x1800, C: 0x1880, B: 0x1900 });
+/** 0-based flat page addresses used by newer firmware / all Shimmer3R. */
+const INFOMEM_ADDR_FLAT = Object.freeze({ D: 0, C: 128, B: 256 });
+// ---------------------------------------------------------------------------
+// Version comparison (UtilShimmer#compareVersions)
+// ---------------------------------------------------------------------------
+/**
+ * True when the context firmware matches `fwId` (or `fwId` is
+ * {@link ANY_VERSION}) AND the context version is >= the given threshold.
+ * Major/minor use strict `>`, internal uses `>=`, exactly as
+ * `UtilShimmer.compareVersions` (UtilShimmer.java:582-629). Passing
+ * {@link ANY_VERSION} for the version fields makes the version test always pass
+ * (any real version is `> -1`), matching the Java `ANY_VERSION` idiom.
+ */
+function fwCompare(ctx, fwId, major, minor, internal) {
+    if (fwId !== ANY_VERSION && ctx.firmwareId !== fwId)
+        return false;
+    const { major: a, minor: b, internal: c } = ctx.firmwareVersion;
+    return a > major || (a === major && b > minor) || (a === major && b === minor && c >= internal);
+}
+const isShimmer3R = (ctx) => ctx.hardwareVersion === HW_ID$1.SHIMMER_3R;
+// ---------------------------------------------------------------------------
+// Feature predicates that gate which InfoMem fields are meaningful
+// ---------------------------------------------------------------------------
+/**
+ * `ShimmerVerObject#isSupportedMpl` (@390): Shimmer3 + SDLog in the half-open
+ * window [0.7.0, 0.8.0). No supported/target device runs this, so enabled-
+ * sensor bytes 3-4 (bits 24-39) are effectively never populated.
+ */
+function isSupportedMpl(ctx) {
+    return (ctx.hardwareVersion === HW_ID$1.SHIMMER_3 &&
+        fwCompare(ctx, FW_ID$1.SDLOG, 0, 7, 0) &&
+        !fwCompare(ctx, FW_ID$1.SDLOG, 0, 8, 0));
+}
+/**
+ * `ShimmerVerObject#isSupportedEightByteDerivedSensors` (@472): SDLog>=0.13.1,
+ * LogAndStream>=0.7.1, GQ_802154>=0.3.2, Shimmer4>=0.0.23, or StroKare (any).
+ */
+function isSupportedEightByteDerivedSensors(ctx) {
+    return (fwCompare(ctx, FW_ID$1.SDLOG, 0, 13, 1) ||
+        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 7, 1) ||
+        fwCompare(ctx, FW_ID$1.GQ_802154, 0, 3, 2) ||
+        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, 0, 0, 23) ||
+        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION));
+}
+/**
+ * `ShimmerDevice#isSupportedSdLogSync` (@2091): SDLog (any), Shimmer3R+
+ * LogAndStream (any), Shimmer3+LogAndStream>=0.16.11, or StroKare. Gates the
+ * trial id / number-of-Shimmers, sync bits, sync-node list.
+ */
+function isSupportedSdLogSync(ctx) {
+    if (ctx.firmwareId === FW_ID$1.SDLOG)
+        return true;
+    if (ctx.firmwareId === FW_ID$1.STROKARE)
+        return true;
+    if (isShimmer3R(ctx) && ctx.firmwareId === FW_ID$1.LOGANDSTREAM)
+        return true;
+    if (ctx.hardwareVersion === HW_ID$1.SHIMMER_3 &&
+        ctx.firmwareId === FW_ID$1.LOGANDSTREAM &&
+        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 16, 11)) {
+        return true;
+    }
+    return false;
+}
+/**
+ * SDLog / LogAndStream / StroKare firmware — the family that stores the
+ * experiment-config bytes (button-start, disable-BT, TCXO) and honours the
+ * device-write MAC-0xFF + config-file-creation-flag semantics
+ * (ShimmerObject.java:5035,5054,5278,5312,5320).
+ */
+function isSdLoggingFirmware(ctx) {
+    return (ctx.firmwareId === FW_ID$1.SDLOG ||
+        ctx.firmwareId === FW_ID$1.LOGANDSTREAM ||
+        ctx.firmwareId === FW_ID$1.STROKARE);
+}
+/*
+ * MPL (MPU9150 DMP / sensor-fusion) InfoMem regions and bit fields are
+ * DELIBERATELY NOT MODELLED and must never appear in host UI:
+ *
+ *   `idxMPLAccelCalibration` = 128+5, `idxMPLMagCalibration` = 128+26,
+ *   `idxMPLGyroCalibration`  = 128+47, plus every `bitShiftMPL*` /
+ *   `bitShiftMPU9150DMP|LPF|MotCalCfg|MPLSamplingRate|MagSamplingRate` field
+ *   (ConfigByteLayoutShimmer3.java:226-248) written into ConfigSetupByte4/5/6
+ *   by `SensorMPU9X50.configBytesGenerate` (@905-931).
+ *
+ * They are MPU9150-DMP-only: `ShimmerVerObject#isSupportedMpl` restricts them
+ * to Shimmer3 + SDLog in [0.7.0, 0.8.0), which no supported/target device runs.
+ * The product decision is that these settings are never surfaced; their bytes
+ * must simply SURVIVE round-trip, which the read-modify-write generate path
+ * guarantees (anything not explicitly written keeps its base value).
+ *
+ * Note that on every supported firmware the MPL blocks are physically the same
+ * bytes as the Shimmer3R alt-IMU calibration blocks (MPL accel 133 ==
+ * ADXL371 alt-accel calib, MPL mag 154 == LIS3MDL alt-mag calib), and the
+ * firmware header marks the MPL gyro region as `unusedIdx175To186[12]`
+ * (shimmer_config.h) — i.e. the MPL region was reclaimed, further confirming
+ * it should not be modelled as MPL.
+ */
+// Field constant lengths / bit positions shared by parse + generate.
+const EXG_BANK_LENGTH = 10;
+const NAME_LENGTH = 12;
+const CONFIG_TIME_LENGTH = 4;
+const MAC_LENGTH = 6;
+const MAX_SYNC_NODES = 21;
+/**
+ * MAC values reported by a device whose InfoMem has never been provisioned
+ * (erased flash reads back all-FF; a zeroed page reads back all-zero). Neither
+ * is a real address, so a client should reject rather than surface them.
+ */
+const INVALID_MAC_IDS = Object.freeze(['FFFFFFFFFFFF', '000000000000']);
+/** One 21-byte kinematic calibration block (`lengthGeneralCalibrationBytes`). */
+const GENERAL_CALIBRATION_LENGTH = 21;
+/**
+ * Bit positions within the InfoMem config-setup bytes. Every entry cites its
+ * `ConfigByteLayoutShimmer3` declaration; where the Java DECLARATION comment
+ * ("//Config ByteN") disagrees with the byte the Java code actually indexes, or
+ * with the firmware `gConfigBytes` struct, the firmware wins and the
+ * disagreement is called out inline.
+ */
+const BIT_SHIFT = Object.freeze({
+    // ---- ConfigSetupByte0 (idx 6) — firmware `gConfigBytes` idx 6 bitfield.
+    /** WR-accel sampling rate. `bitShiftLSM303DLHCAccelSamplingRate` (@124); FW `wrAccelRate` bits 4-7. */
+    WR_ACCEL_RATE: 4,
+    /** WR-accel range. `bitShiftLSM303DLHCAccelRange` (@126); FW `wrAccelRange` bits 2-3. */
+    WR_ACCEL_RANGE: 2,
+    /** WR-accel low-power mode (LSB). `bitShiftLSM303DLHCAccelLPM` (@129); FW `wrAccelLpModeLsb` bit 1. */
+    WR_ACCEL_LPM: 1,
+    /** WR-accel high-resolution mode. `bitShiftLSM303DLHCAccelHRM` (@132); FW `wrAccelHrMode` bit 0. */
+    WR_ACCEL_HRM: 0,
+    // ---- ConfigSetupByte1 (idx 7) — whole byte.
+    /** IMU (MPU9x50 / LSM6DSV) accel+gyro rate. `bitShiftMPU9150AccelGyroSamplingRate` (@139); FW `gyroRate`. */
+    IMU_RATE: 0,
+    // ---- ConfigSetupByte2 (idx 8).
+    /** Mag range. `bitShiftLSM303DLHCMagRange` (@143); FW `magRange` (S3) / `altMagRange` (S3R) bits 5-7. */
+    MAG_RANGE: 5,
+    /** Mag sampling rate. `bitShiftLSM303DLHCMagSamplingRate` (@145); FW `magRate` bits 2-4. */
+    MAG_RATE: 2,
+    /** Gyro range, LOW 2 bits. `bitShiftMPU9150GyroRange` (@147); FW `gyroRangeLsb` bits 0-1. */
+    GYRO_RANGE_LSB: 0,
+    // ---- ConfigSetupByte3 (idx 9).
+    /** Alt-accel range (S3 MPU9x50) / LN-accel range (S3R LSM6DSV). `bitShiftMPU9150AccelRange` (@150); FW bits 6-7. */
+    ALT_ACCEL_RANGE: 6,
+    /** Pressure oversampling, LOW 2 bits. `bitShiftBMPX80PressureResolution` (@152); FW `pressureOversamplingRatioLsb` bits 4-5. */
+    PRESSURE_OVERSAMPLING_LSB: 4,
+    GSR_RANGE: 1,
+    EXP_POWER: 0,
+    // ---- ConfigSetupByte4 (idx 130 on every supported firmware).
+    /**
+     * Alt-accel (ADXL371) sampling rate. `bitShiftADXL371AltAccelSamplingRate`
+     * (@161) used with `idxConfigSetupByte4` in SensorADXL371.java:356/370;
+     * FW `altAccelRate` bits 6-7 of idx 130. Java and firmware AGREE.
+     */
+    ALT_ACCEL_RATE: 6,
+    /**
+     * Gyro range MSB (3rd bit). `bitShiftLSM6DSVGyroRangeMSB` (@163) used with
+     * `idxConfigSetupByte4` in SensorLSM6DSV.java:980/1015; FW `gyroRangeMsb`
+     * bit 2 of idx 130. Java and firmware AGREE.
+     */
+    GYRO_RANGE_MSB: 2,
+    /**
+     * Pressure oversampling MSB (3rd bit). Java declares this as
+     * `bitShiftBMP390PressureResolution` under a "//Config Byte0" comment
+     * (@134-135) — that comment is WRONG: both SensorBMP390.java:499 and
+     * SensorBMP581.java:380 index `idxConfigSetupByte4`, and the firmware struct
+     * has `pressureOversamplingRatioMsb` as bit 0 of idx 130. FIRMWARE WINS →
+     * ConfigSetupByte4 bit 0, not ConfigSetupByte0.
+     */
+    PRESSURE_OVERSAMPLING_MSB: 0,
+    /**
+     * WR-accel low-power-mode MSB — FIRMWARE-ONLY (`wrAccelLpModeMsb`, bit 1 of
+     * idx 130). The Java driver has no equivalent field and never writes it, so
+     * the codec does not model it either; the bit survives round-trip untouched.
+     */
+    WR_ACCEL_LPM_MSB: 1,
+    // ---- ConfigSetupByte5 (idx 131 on every supported firmware).
+    /**
+     * Alt-mag (LIS3MDL) sampling rate. Java declares
+     * `bitShiftLIS3MDLAltMagSamplingRate` (@158) under a "//Config Byte4"
+     * comment — that comment is WRONG: SensorLIS3MDL.java:809/831 index
+     * `idxConfigSetupByte5`, and the firmware struct has `altMagRate` as bits
+     * 0-5 of idx 131. FIRMWARE WINS → ConfigSetupByte5 bits 0-5.
+     */
+    ALT_MAG_RATE: 0,
+    /**
+     * `bitShiftLIS2MDLMagRateMSB` (@167). NOT MODELLED: every use in
+     * SensorLIS2MDL.java (@581 generate, @602 parse) is COMMENTED OUT, and the
+     * firmware struct has idx 131 bits 6-7 as `unusedByte131Bit6/7` with no mag
+     * MSB anywhere. LIS2MDL mag rate is the plain 3-bit ConfigSetupByte2 field.
+     * Kept here only so the constant table is complete against the Java source;
+     * writing it would corrupt `altMagRate` bits 3-5.
+     */
+    LIS2MDL_MAG_RATE_MSB_UNUSED: 3,
+    // ---- SD / trial bits (idx 217/218/230).
+    BUTTON_START: 5,
+    DISABLE_BLUETOOTH: 3,
+    SYNC_WHEN_LOGGING: 2,
+    MASTER_SHIMMER: 1,
+    SINGLE_TOUCH: 7,
+    TCXO: 4,
+    SD_CFG_FILE_WRITE_FLAG: 0,
+});
+const MASK = Object.freeze({
+    // ConfigSetupByte0
+    WR_ACCEL_RATE: 0x0f, // maskLSM303DLHCAccelSamplingRate @125
+    WR_ACCEL_RANGE: 0x03, // maskLSM303DLHCAccelRange @127
+    WR_ACCEL_LPM: 0x01, // maskLSM303DLHCAccelLPM @130
+    WR_ACCEL_HRM: 0x01, // maskLSM303DLHCAccelHRM @133
+    // ConfigSetupByte1
+    IMU_RATE: 0xff, // maskMPU9150AccelGyroSamplingRate @140
+    // ConfigSetupByte2
+    MAG_RANGE: 0x07, // maskLSM303DLHCMagRange @144
+    MAG_RATE: 0x07, // maskLSM303DLHCMagSamplingRate @146
+    GYRO_RANGE_LSB: 0x03, // maskMPU9150GyroRange @148
+    // ConfigSetupByte3
+    ALT_ACCEL_RANGE: 0x03, // maskMPU9150AccelRange @151
+    PRESSURE_OVERSAMPLING_LSB: 0x03, // maskBMPX80PressureResolution @153
+    GSR_RANGE: 0x07,
+    EXP_POWER: 0x01,
+    // ConfigSetupByte4
+    ALT_ACCEL_RATE: 0x03, // maskADXL371AltAccelSamplingRate @162
+    GYRO_RANGE_MSB: 0x01, // maskLSM6DSVGyroRangeMSB @164
+    PRESSURE_OVERSAMPLING_MSB: 0x01, // maskBMP390PressureResolution @136
+    WR_ACCEL_LPM_MSB: 0x01, // firmware-only, not written
+    // ConfigSetupByte5
+    ALT_MAG_RATE: 0x3f, // maskLIS3MDLAltMagSamplingRate @159
+    LIS2MDL_MAG_RATE_MSB_UNUSED: 0x07, // maskLIS2MDLMagRateMSB @166 (never written)
+    // Shared
+    ONE_BIT: 0x01,
+    DERIVED_BYTE: 0xff,
+    SD_CFG_FILE_WRITE_FLAG: 0x01,
+});
+/**
+ * Composite (split across two bytes) field widths. The low part lives in
+ * ConfigSetupByte2/3 and the high bit in ConfigSetupByte4; the high bit is only
+ * written on Shimmer3R, where the LSM6DSV / BMP390-BMP581 need the extra range.
+ */
+const COMPOSITE_MSB_SHIFT = 2;
+/** Config-time bytes are big-endian: byte0 = MSB (shift 24) … byte3 = LSB. */
+const CONFIG_TIME_BIT_SHIFTS = [24, 16, 8, 0];
+/**
+ * Resolve the InfoMem layout for a firmware/hardware context, applying the
+ * same ordered constructor branches as `ConfigByteLayoutShimmer3` (oldest →
+ * newest). Returns a frozen, fully-derived {@link InfoMemLayout}.
+ */
+function resolveInfoMemLayout(ctx) {
+    const r = isShimmer3R(ctx);
+    // ---- Base (default) initialiser values (ConfigByteLayoutShimmer3 @34-109).
+    const layout = {
+        // Page addresses — legacy default; branch 4 may remap to flat 0-based.
+        addrD: INFOMEM_ADDR_LEGACY.D,
+        addrC: INFOMEM_ADDR_LEGACY.C,
+        addrB: INFOMEM_ADDR_LEGACY.B,
+        flatAddressing: false,
+        idxSamplingRate: 0,
+        idxBufferSize: 2,
+        idxSensors0: 3,
+        idxSensors1: 4,
+        idxSensors2: 5,
+        idxConfigSetupByte0: 6,
+        idxConfigSetupByte1: 7,
+        idxConfigSetupByte2: 8,
+        idxConfigSetupByte3: 9,
+        idxExg1: 10,
+        idxExg2: 20,
+        idxBtCommBaudRate: 30,
+        // Kinematic calibration blocks — defaults (@95-99); branch 2 remaps all six.
+        idxAnalogAccelCalibration: 31,
+        idxMPU9150GyroCalibration: 52,
+        idxLSM303DLHCMagCalibration: 73,
+        idxLSM303DLHCAccelCalibration: 94,
+        idxADXL371AltAccelCalibration: 256,
+        idxLIS3MDLAltMagCalibration: 285,
+        // Derived-sensor offsets default to 0 ("not present").
+        idxDerivedSensors0: 0,
+        idxDerivedSensors1: 0,
+        idxDerivedSensors2: 0,
+        idxDerivedSensors3: 0,
+        idxDerivedSensors4: 0,
+        idxDerivedSensors5: 0,
+        idxDerivedSensors6: 0,
+        idxDerivedSensors7: 0,
+        // C page (128 + X).
+        idxSensors3: 128 + 2,
+        idxSensors4: 128 + 3,
+        // Defaults (@113-117): ConfigSetupByte4/5 sit BELOW Sensors3/4; branch 1
+        // swaps them so Sensors3/4 land at 128/129 and ConfigSetupByte4/5 at
+        // 130/131. ConfigSetupByte6 is 128+4 in both cases.
+        idxConfigSetupByte4: 128 + 0,
+        idxConfigSetupByte5: 128 + 1,
+        idxConfigSetupByte6: 128 + 4, // 132
+        idxSDShimmerName: 128 + 59, // 187
+        idxSDEXPIDName: 128 + 71, // 199
+        idxSDConfigTime0: 128 + 83, // 211
+        idxSDConfigTime1: 128 + 84, // 212
+        idxSDConfigTime2: 128 + 85, // 213
+        idxSDConfigTime3: 128 + 86, // 214
+        idxSDMyTrialID: 128 + 87, // 215
+        idxSDNumOfShimmers: 128 + 88, // 216
+        idxSDExperimentConfig0: 128 + 89, // 217
+        idxSDExperimentConfig1: 128 + 90, // 218
+        idxSDBTInterval: 128 + 91, // 219
+        idxEstimatedExpLengthMsb: 128 + 92, // 220
+        idxEstimatedExpLengthLsb: 128 + 93, // 221
+        idxMaxExpLengthMsb: 128 + 94, // 222
+        idxMaxExpLengthLsb: 128 + 95, // 223
+        idxMacAddress: 128 + 96, // 224
+        idxSDConfigDelayFlag: 128 + 102, // 230
+        idxBtFactoryReset: 0,
+        // B page. Java `idxNode0` = 128+128 = 256 with `maxNumOfExperimentNodes`
+        // = 21 (→ 256..381). The firmware header's NV_* defines look different
+        // (NV_CENTER = 256, NV_NODE0 = 262) but its `gConfigBytes` struct lays out
+        // `syncNodeAddr1[6]`…`syncNodeAddr21[6]` starting at 256 with
+        // NV_NUM_BYTES_SYNC_CENTER_NODE_ADDRS = 126 = 21*6, so the struct AGREES
+        // with Java: slot 0 (the "center") is simply the first of the 21 slots.
+        idxNode0: 128 + 128, // 256
+        lengthGeneralCalibrationBytes: GENERAL_CALIBRATION_LENGTH,
+        supportsMpl: isSupportedMpl(ctx),
+        supportsEightByteDerived: isSupportedEightByteDerivedSensors(ctx),
+        supportsSdLogSync: isSupportedSdLogSync(ctx),
+        isSdLoggingFirmware: isSdLoggingFirmware(ctx),
+        isShimmer3R: r,
+    };
+    // ---- Branch 1 (@330-343): 3R | SDLog>=0.8.42 | LogAndStream>=0.3.4 | Shimmer4 | StroKare
+    // Relocates Sensors3/4 to 128/129 (ConfigSetupByte4/5 shift to 130/131) and
+    // seeds DerivedSensors0-2 at 115-117 (overridden by branch 2 below).
+    if (r ||
+        fwCompare(ctx, FW_ID$1.SDLOG, 0, 8, 42) ||
+        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 3, 4) ||
+        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
+        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
+        layout.idxSensors3 = 128 + 0;
+        layout.idxSensors4 = 128 + 1;
+        layout.idxConfigSetupByte4 = 128 + 2; // 130 — matches FW NV_CONFIG_SETUP_BYTE4
+        layout.idxConfigSetupByte5 = 128 + 3; // 131 — matches FW NV_CONFIG_SETUP_BYTE5
+        layout.idxConfigSetupByte6 = 128 + 4; // 132 — matches FW NV_CONFIG_SETUP_BYTE6
+        layout.idxDerivedSensors0 = 115;
+        layout.idxDerivedSensors1 = 116;
+        layout.idxDerivedSensors2 = 117;
+    }
+    // ---- Branch 2 (@345-360): 3R | SDLog>=0.8.68 | LogAndStream>=0.3.17 | BtStream>=0.6.0 | Shimmer4 | StroKare
+    // Moves DerivedSensors0-2 into InfoMem D at 31-33 (and the calibration blocks,
+    // which this codec does not surface).
+    if (r ||
+        fwCompare(ctx, FW_ID$1.SDLOG, 0, 8, 68) ||
+        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 3, 17) ||
+        fwCompare(ctx, FW_ID$1.BTSTREAM, 0, 6, 0) ||
+        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
+        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
+        layout.idxDerivedSensors0 = 31;
+        layout.idxDerivedSensors1 = 32;
+        layout.idxDerivedSensors2 = 33;
+        // Calibration blocks shift up by 3 to make room for DerivedSensors0-2, and
+        // the two alt-IMU blocks move from their (bogus, InfoMem-B-colliding)
+        // defaults into InfoMem C. All six match the firmware NV_* map exactly:
+        // NV_LN_ACCEL_CALIBRATION 34, NV_GYRO_CALIBRATION 55, NV_MAG_CALIBRATION
+        // 76, NV_WR_ACCEL_CALIBRATION 97, NV_ALT_ACCEL_CALIBRATION 128+5 = 133,
+        // NV_ALT_MAG_CALIBRATION 128+26 = 154.
+        layout.idxAnalogAccelCalibration = 34;
+        layout.idxMPU9150GyroCalibration = 55;
+        layout.idxLSM303DLHCMagCalibration = 76;
+        layout.idxLSM303DLHCAccelCalibration = 97;
+        layout.idxADXL371AltAccelCalibration = 133;
+        layout.idxLIS3MDLAltMagCalibration = 154;
+    }
+    // ---- Branch 4 — ADDRESS-BASE REMAP (@370-381): 3R | SDLog>=0.11.5 |
+    // LogAndStream>=0.5.16 | BtStream>=0.7.4 | Shimmer4 | StroKare.
+    // HARDWARE-VERIFY: the page address the device firmware expects on the wire
+    // (legacy MSP430 0x1800/0x1880/0x1900 vs. flat 0/128/256) is only confirmable
+    // against real hardware of each firmware generation.
+    if (r ||
+        fwCompare(ctx, FW_ID$1.SDLOG, 0, 11, 5) ||
+        fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 5, 16) ||
+        fwCompare(ctx, FW_ID$1.BTSTREAM, 0, 7, 4) ||
+        fwCompare(ctx, FW_ID$1.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
+        fwCompare(ctx, FW_ID$1.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
+        layout.addrD = INFOMEM_ADDR_FLAT.D;
+        layout.addrC = INFOMEM_ADDR_FLAT.C;
+        layout.addrB = INFOMEM_ADDR_FLAT.B;
+        layout.flatAddressing = true;
+    }
+    // ---- Branch 5 (@383-390): 3R | isSupportedEightByteDerivedSensors.
+    if (r || layout.supportsEightByteDerived) {
+        layout.idxDerivedSensors3 = 118;
+        layout.idxDerivedSensors4 = 119;
+        layout.idxDerivedSensors5 = 120;
+        layout.idxDerivedSensors6 = 121;
+        layout.idxDerivedSensors7 = 122;
+    }
+    // ---- Branch 7 (@398-401): 3R | LogAndStream>=0.8.1.
+    if (r || fwCompare(ctx, FW_ID$1.LOGANDSTREAM, 0, 8, 1)) {
+        layout.idxBtFactoryReset = 128 + 103; // 231
+    }
+    return Object.freeze(layout);
+}
+/**
+ * The "first 6 bytes all 0xFF ⇒ unconfigured/invalid" check
+ * (ConfigByteLayout.checkConfigBytesValid @90). Returns true when the InfoMem
+ * holds a real configuration.
+ */
+function checkConfigBytesValid(bytes) {
+    if (bytes.length < INFOMEM_VALIDITY_BYTES)
+        return false;
+    for (let i = 0; i < INFOMEM_VALIDITY_BYTES; i++) {
+        if (bytes[i] !== 0xff)
+            return true;
+    }
+    return false;
+}
+
+/**
  * What a Shimmer says about itself when asked: which Bluetooth module it
  * carries, and which board it is.
  *
@@ -6013,6 +8919,24 @@ function isShimmerSrBoardValid(board) {
     if (boardId === 0xff && boardRev === 0xff && specialRev === 0xff)
         return false;
     return true;
+}
+/**
+ * True when `board` is `SR<boardId>` at revision `rev`-`specialRev` or later:
+ * the rev is compared first, and the special rev only breaks a tie. Port of
+ * the firmware's `ShimBrd_isBoardSrNumberGte()`
+ * (`Boards/shimmer_boards.c:325-335`).
+ *
+ * A board with a different id is never "at least" anything, whatever its
+ * revision — revision numbers are per board id and mean nothing across them.
+ * Nor is an unprogrammed page: the firmware refuses an id of 0x00 or 0xFF
+ * before comparing, because all-0xFF would pass every `>=`.
+ */
+function isShimmerSrBoardAtLeast(board, boardId, rev, specialRev) {
+    if (!board || board.boardId === 0x00 || board.boardId === 0xff)
+        return false;
+    if (board.boardId !== boardId)
+        return false;
+    return board.boardRev > rev || (board.boardRev === rev && board.specialRev >= specialRev);
 }
 /**
  * Describe a sensor's hardware for display: platform, board name and SR code.
@@ -6158,6 +9082,67 @@ function parseBluetoothModuleVersion(raw) {
         version: null,
         label: trimmed.length ? trimmed : 'not reported',
     };
+}
+
+/**
+ * Which pressure part a Shimmer3R carries, when the sensor will not say.
+ *
+ * The in-band answer is the 0xA7 reply's sensor id (see `./types.ts`), but two
+ * places have no such reply to read. An SD-log file carries no sensor id at
+ * all — for a BMP581 the firmware simply leaves the header's calibration
+ * region unwritten (`SDCard/shimmer_sd_header.c:209-215`) — and a
+ * LogAndStream_Shimmer3R v1.01.006 NACKs 0xA7 on a BMP581. Both fall back to
+ * the rule the firmware itself uses when the chip id cannot be read: the
+ * board's SR number.
+ */
+/** The first firmware that drives a BMP581: LogAndStream_Shimmer3R v1.01.006. */
+const BMP581_MIN_FIRMWARE = Object.freeze({ major: 1, minor: 1, internal: 6 });
+/**
+ * `ShimBrd_isBmp581PresentPerSrNumber()` (`Boards/shimmer_boards.c:337-355`),
+ * one row per term. SR48 needs two rows: its rev-7 development build carries
+ * the BMP581 from 7.2, production went back to the BMP390 at 8.0 and 8.1, and
+ * picked it up again at 8.2 — so a single `>= 7.2` would wrongly claim 8.0 and
+ * 8.1.
+ */
+const BMP581_BOARD_RULES = Object.freeze([
+    { boardId: 31, from: [11, 2] }, // SHIMMER3_IMU
+    { boardId: 38, from: [4, 2] }, // EXP_BRD_PROTO3_DELUXE
+    { boardId: 47, from: [8, 2] }, // EXP_BRD_EXG_UNIFIED
+    { boardId: 48, from: [7, 2], before: [8, 0] }, // EXP_BRD_GSR_UNIFIED, rev 7
+    { boardId: 48, from: [8, 2] }, // EXP_BRD_GSR_UNIFIED, rev 8 on
+    { boardId: 49, from: [4, 2] }, // EXP_BRD_BR_AMP_UNIFIED
+]);
+/**
+ * True when a sensor should be assumed to carry a BMP581 rather than a BMP390.
+ *
+ * All three must hold:
+ * - the hardware is a Shimmer3R — the firmware rule is Shimmer3R-only, and a
+ *   daughter card can be moved onto a Shimmer3 host;
+ * - the firmware is LogAndStream {@link BMP581_MIN_FIRMWARE} or later — older
+ *   firmware has no BMP581 support, so its data is never BMP581 output;
+ * - the board's SR number is in one of the windows in the firmware's
+ *   `ShimBrd_isBmp581PresentPerSrNumber()`, where `>=` compares the rev first
+ *   and then the special rev.
+ *
+ * The hardware and SR-number checks mirror the firmware exactly; the firmware
+ * version check is the host's own addition, as it is in the Java driver
+ * (`ShimmerObject.isSupportedBmp581`). Prefer the 0xA7 sensor id whenever the
+ * sensor gives one: this is the fallback for when it cannot.
+ */
+function isBmp581PresentPerSrNumber(ctx) {
+    if (ctx.hardwareVersion !== HW_ID$1.SHIMMER_3R)
+        return false;
+    if (ctx.firmwareId !== FW_ID$1.LOGANDSTREAM)
+        return false;
+    const v = ctx.firmwareVersion;
+    const min = BMP581_MIN_FIRMWARE;
+    const fwOk = v.major > min.major ||
+        (v.major === min.major &&
+            (v.minor > min.minor || (v.minor === min.minor && v.internal >= min.internal)));
+    if (!fwOk)
+        return false;
+    return BMP581_BOARD_RULES.some((r) => isShimmerSrBoardAtLeast(ctx.board, r.boardId, r.from[0], r.from[1]) &&
+        !(r.before && isShimmerSrBoardAtLeast(ctx.board, r.boardId, r.before[0], r.before[1])));
 }
 
 /**
@@ -7567,7 +10552,7 @@ function interpretShimmer3InquiryResponse(u8, timestampFmt = 'u24', onProblem) {
         throw new Error(`Inquiry response truncated: ${u8.length} bytes, need ${headerEnd + declaredChannels} ` +
             `for the ${declaredChannels} channels it declares.`);
     }
-    const adcRaw = u16le$4(u8, base + 0);
+    const adcRaw = u16le$3(u8, base + 0);
     const samplingRateHz = SHIMMER3_SAMPLING_CLOCK_FREQ / adcRaw;
     // 4-byte little-endian config word (Java: bufferInquiry[2..5]).
     const configByte0 = ((u8[base + 2] | (u8[base + 3] << 8) | (u8[base + 4] << 16) | (u8[base + 5] << 24)) >>> 0) >>>
@@ -7619,7 +10604,7 @@ function parseShimmer3DeviceVersionResponse(u8) {
  * Firmware identifier (type) values, from
  * com.shimmerresearch.driverUtilities.ShimmerVerDetails.FW_ID.
  */
-const FW_ID$1 = Object.freeze({
+const FW_ID = Object.freeze({
     BTSTREAM: 1,
     SDLOG: 2,
     LOGANDSTREAM: 3,
@@ -7655,11 +10640,11 @@ function parseShimmer3FwVersionResponse(u8) {
 function shimmer3UsesThreeByteTimestamp(v) {
     const atLeast = (maj, min, int) => v.major > maj || (v.major === maj && (v.minor > min || (v.minor === min && v.internal >= int)));
     switch (v.firmwareIdentifier) {
-        case FW_ID$1.LOGANDSTREAM:
+        case FW_ID.LOGANDSTREAM:
             return atLeast(0, 5, 4);
-        case FW_ID$1.BTSTREAM:
+        case FW_ID.BTSTREAM:
             return atLeast(0, 7, 3);
-        case FW_ID$1.SDLOG:
+        case FW_ID.SDLOG:
             return atLeast(0, 11, 5);
         default:
             return true; // unknown/newer firmware type — default to modern u24
@@ -7669,7 +10654,7 @@ function shimmer3UsesThreeByteTimestamp(v) {
  * Hardware-version codes the firmware-version-code ladder below keys off
  * (`ShimmerVerDetails.HW_ID`).
  */
-const HW_ID$1 = Object.freeze({
+const HW_ID = Object.freeze({
     SHIMMER_2R: 2,
     SHIMMER_3: 3,
     SHIMMER_3R: 10,
@@ -7703,32 +10688,32 @@ function deriveShimmer3FirmwareVersionCode(fw, hardwareVersion) {
             return false;
         return (major > tMaj || (major === tMaj && (minor > tMin || (minor === tMin && internal >= tInt))));
     };
-    const L = FW_ID$1.LOGANDSTREAM;
-    const B = FW_ID$1.BTSTREAM;
-    const S = FW_ID$1.SDLOG;
-    if (ge(HW_ID$1.SHIMMER_3, L, 0, 16, 6))
+    const L = FW_ID.LOGANDSTREAM;
+    const B = FW_ID.BTSTREAM;
+    const S = FW_ID.SDLOG;
+    if (ge(HW_ID.SHIMMER_3, L, 0, 16, 6))
         return 9;
-    if (ge(HW_ID$1.SHIMMER_3R, L, 0, 0, 1) ||
-        ge(HW_ID$1.SHIMMER_3, L, 0, 13, 7) ||
-        ge(HW_ID$1.SHIMMER_3, S, 0, 20, 1)) {
+    if (ge(HW_ID.SHIMMER_3R, L, 0, 0, 1) ||
+        ge(HW_ID.SHIMMER_3, L, 0, 13, 7) ||
+        ge(HW_ID.SHIMMER_3, S, 0, 20, 1)) {
         return 8;
     }
-    if (ge(HW_ID$1.SHIMMER_3, L, 0, 6, 5))
+    if (ge(HW_ID.SHIMMER_3, L, 0, 6, 5))
         return 7;
-    if (ge(HW_ID$1.SHIMMER_3, B, 0, 7, 3) ||
-        ge(HW_ID$1.SHIMMER_3, L, 0, 5, 4) ||
-        ge(HW_ID$1.SHIMMER_3, S, 0, 11, 5)) {
+    if (ge(HW_ID.SHIMMER_3, B, 0, 7, 3) ||
+        ge(HW_ID.SHIMMER_3, L, 0, 5, 4) ||
+        ge(HW_ID.SHIMMER_3, S, 0, 11, 5)) {
         return 6;
     }
-    if (ge(HW_ID$1.SHIMMER_3, B, 0, 5, 0) || ge(HW_ID$1.SHIMMER_3, L, 0, 3, 0))
+    if (ge(HW_ID.SHIMMER_3, B, 0, 5, 0) || ge(HW_ID.SHIMMER_3, L, 0, 3, 0))
         return 5;
-    if (ge(HW_ID$1.SHIMMER_3, B, 0, 4, 0) || ge(HW_ID$1.SHIMMER_3, L, 0, 2, 0))
+    if (ge(HW_ID.SHIMMER_3, B, 0, 4, 0) || ge(HW_ID.SHIMMER_3, L, 0, 2, 0))
         return 4;
-    if (ge(HW_ID$1.SHIMMER_3, B, 0, 3, 0) || ge(HW_ID$1.SHIMMER_3, L, 0, 1, 0))
+    if (ge(HW_ID.SHIMMER_3, B, 0, 3, 0) || ge(HW_ID.SHIMMER_3, L, 0, 1, 0))
         return 3;
-    if (ge(HW_ID$1.SHIMMER_3, B, 0, 2, 0))
+    if (ge(HW_ID.SHIMMER_3, B, 0, 2, 0))
         return 2;
-    if (ge(HW_ID$1.SHIMMER_2R, B, 1, 2, 0) || ge(HW_ID$1.SHIMMER_3, B, 0, 1, 0))
+    if (ge(HW_ID.SHIMMER_2R, B, 1, 2, 0) || ge(HW_ID.SHIMMER_3, B, 0, 1, 0))
         return 1;
     return -1;
 }
@@ -7857,461 +10842,6 @@ function shimmer3ControlMessageLength(buf) {
     if (payload === undefined)
         return RESYNC$1;
     return 1 + payload;
-}
-
-/**
- * Firmware/hardware-conditional InfoMem byte-layout resolution for Shimmer3
- * and Shimmer3R.
- *
- * Ported verbatim from the Java driver:
- *   com.shimmerresearch.driver.shimmer2r3.ConfigByteLayoutShimmer3
- *     (field initialisers + the constructor @324-412 that mutates offsets and
- *      the InfoMem address base by firmware version / hardware id)
- *   com.shimmerresearch.driver.ConfigByteLayout (address defaults @36-40,
- *     checkConfigBytesValid @90)
- *   com.shimmerresearch.driverUtilities.UtilShimmer#compareVersions (@580-629)
- *   com.shimmerresearch.driverUtilities.ShimmerVerObject
- *     (#isSupportedMpl @390, #isSupportedEightByteDerivedSensors @472)
- *   com.shimmerresearch.driver.ShimmerDevice#isSupportedSdLogSync (@2091)
- *
- * Everything here is pure so it can be unit-tested with byte fixtures.
- */
-// ---------------------------------------------------------------------------
-// HW / FW id constants (ShimmerVerDetails.java)
-// ---------------------------------------------------------------------------
-/** Hardware version codes (`ShimmerVerDetails.HW_ID`). */
-const HW_ID = Object.freeze({
-    SHIMMER_3: 3,
-    SHIMMER_3R: 10,
-});
-/** Firmware identifier codes (`ShimmerVerDetails.FW_ID`). */
-const FW_ID = Object.freeze({
-    BTSTREAM: 1,
-    SDLOG: 2,
-    LOGANDSTREAM: 3,
-    GQ_802154: 9,
-    SHIMMER4_SDK_STOCK: 12,
-    STROKARE: 15,
-});
-/** `ShimmerVerDetails.ANY_VERSION` — wildcard for a version-field comparison. */
-const ANY_VERSION = -1;
-// ---------------------------------------------------------------------------
-// InfoMem geometry
-// ---------------------------------------------------------------------------
-/** Total InfoMem config length used by Shimmer3/3R (D+C+B pages). */
-const INFOMEM_SIZE = 384;
-/** One InfoMem page (D/C/B) = 128 bytes; also the UART transfer chunk size. */
-const INFOMEM_PAGE_SIZE = 128;
-/** Number of validity sentinel bytes checked at the start of the InfoMem. */
-const INFOMEM_VALIDITY_BYTES = 6;
-/** Legacy MSP430 absolute page addresses (`ConfigByteLayout` defaults). */
-const INFOMEM_ADDR_LEGACY = Object.freeze({ D: 0x1800, C: 0x1880, B: 0x1900 });
-/** 0-based flat page addresses used by newer firmware / all Shimmer3R. */
-const INFOMEM_ADDR_FLAT = Object.freeze({ D: 0, C: 128, B: 256 });
-// ---------------------------------------------------------------------------
-// Version comparison (UtilShimmer#compareVersions)
-// ---------------------------------------------------------------------------
-/**
- * True when the context firmware matches `fwId` (or `fwId` is
- * {@link ANY_VERSION}) AND the context version is >= the given threshold.
- * Major/minor use strict `>`, internal uses `>=`, exactly as
- * `UtilShimmer.compareVersions` (UtilShimmer.java:582-629). Passing
- * {@link ANY_VERSION} for the version fields makes the version test always pass
- * (any real version is `> -1`), matching the Java `ANY_VERSION` idiom.
- */
-function fwCompare(ctx, fwId, major, minor, internal) {
-    if (fwId !== ANY_VERSION && ctx.firmwareId !== fwId)
-        return false;
-    const { major: a, minor: b, internal: c } = ctx.firmwareVersion;
-    return a > major || (a === major && b > minor) || (a === major && b === minor && c >= internal);
-}
-const isShimmer3R = (ctx) => ctx.hardwareVersion === HW_ID.SHIMMER_3R;
-// ---------------------------------------------------------------------------
-// Feature predicates that gate which InfoMem fields are meaningful
-// ---------------------------------------------------------------------------
-/**
- * `ShimmerVerObject#isSupportedMpl` (@390): Shimmer3 + SDLog in the half-open
- * window [0.7.0, 0.8.0). No supported/target device runs this, so enabled-
- * sensor bytes 3-4 (bits 24-39) are effectively never populated.
- */
-function isSupportedMpl(ctx) {
-    return (ctx.hardwareVersion === HW_ID.SHIMMER_3 &&
-        fwCompare(ctx, FW_ID.SDLOG, 0, 7, 0) &&
-        !fwCompare(ctx, FW_ID.SDLOG, 0, 8, 0));
-}
-/**
- * `ShimmerVerObject#isSupportedEightByteDerivedSensors` (@472): SDLog>=0.13.1,
- * LogAndStream>=0.7.1, GQ_802154>=0.3.2, Shimmer4>=0.0.23, or StroKare (any).
- */
-function isSupportedEightByteDerivedSensors(ctx) {
-    return (fwCompare(ctx, FW_ID.SDLOG, 0, 13, 1) ||
-        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 7, 1) ||
-        fwCompare(ctx, FW_ID.GQ_802154, 0, 3, 2) ||
-        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, 0, 0, 23) ||
-        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION));
-}
-/**
- * `ShimmerDevice#isSupportedSdLogSync` (@2091): SDLog (any), Shimmer3R+
- * LogAndStream (any), Shimmer3+LogAndStream>=0.16.11, or StroKare. Gates the
- * trial id / number-of-Shimmers, sync bits, sync-node list.
- */
-function isSupportedSdLogSync(ctx) {
-    if (ctx.firmwareId === FW_ID.SDLOG)
-        return true;
-    if (ctx.firmwareId === FW_ID.STROKARE)
-        return true;
-    if (isShimmer3R(ctx) && ctx.firmwareId === FW_ID.LOGANDSTREAM)
-        return true;
-    if (ctx.hardwareVersion === HW_ID.SHIMMER_3 &&
-        ctx.firmwareId === FW_ID.LOGANDSTREAM &&
-        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 16, 11)) {
-        return true;
-    }
-    return false;
-}
-/**
- * SDLog / LogAndStream / StroKare firmware — the family that stores the
- * experiment-config bytes (button-start, disable-BT, TCXO) and honours the
- * device-write MAC-0xFF + config-file-creation-flag semantics
- * (ShimmerObject.java:5035,5054,5278,5312,5320).
- */
-function isSdLoggingFirmware(ctx) {
-    return (ctx.firmwareId === FW_ID.SDLOG ||
-        ctx.firmwareId === FW_ID.LOGANDSTREAM ||
-        ctx.firmwareId === FW_ID.STROKARE);
-}
-/*
- * MPL (MPU9150 DMP / sensor-fusion) InfoMem regions and bit fields are
- * DELIBERATELY NOT MODELLED and must never appear in host UI:
- *
- *   `idxMPLAccelCalibration` = 128+5, `idxMPLMagCalibration` = 128+26,
- *   `idxMPLGyroCalibration`  = 128+47, plus every `bitShiftMPL*` /
- *   `bitShiftMPU9150DMP|LPF|MotCalCfg|MPLSamplingRate|MagSamplingRate` field
- *   (ConfigByteLayoutShimmer3.java:226-248) written into ConfigSetupByte4/5/6
- *   by `SensorMPU9X50.configBytesGenerate` (@905-931).
- *
- * They are MPU9150-DMP-only: `ShimmerVerObject#isSupportedMpl` restricts them
- * to Shimmer3 + SDLog in [0.7.0, 0.8.0), which no supported/target device runs.
- * The product decision is that these settings are never surfaced; their bytes
- * must simply SURVIVE round-trip, which the read-modify-write generate path
- * guarantees (anything not explicitly written keeps its base value).
- *
- * Note that on every supported firmware the MPL blocks are physically the same
- * bytes as the Shimmer3R alt-IMU calibration blocks (MPL accel 133 ==
- * ADXL371 alt-accel calib, MPL mag 154 == LIS3MDL alt-mag calib), and the
- * firmware header marks the MPL gyro region as `unusedIdx175To186[12]`
- * (shimmer_config.h) — i.e. the MPL region was reclaimed, further confirming
- * it should not be modelled as MPL.
- */
-// Field constant lengths / bit positions shared by parse + generate.
-const EXG_BANK_LENGTH = 10;
-const NAME_LENGTH = 12;
-const CONFIG_TIME_LENGTH = 4;
-const MAC_LENGTH = 6;
-const MAX_SYNC_NODES = 21;
-/**
- * MAC values reported by a device whose InfoMem has never been provisioned
- * (erased flash reads back all-FF; a zeroed page reads back all-zero). Neither
- * is a real address, so a client should reject rather than surface them.
- */
-const INVALID_MAC_IDS = Object.freeze(['FFFFFFFFFFFF', '000000000000']);
-/** One 21-byte kinematic calibration block (`lengthGeneralCalibrationBytes`). */
-const GENERAL_CALIBRATION_LENGTH = 21;
-/**
- * Bit positions within the InfoMem config-setup bytes. Every entry cites its
- * `ConfigByteLayoutShimmer3` declaration; where the Java DECLARATION comment
- * ("//Config ByteN") disagrees with the byte the Java code actually indexes, or
- * with the firmware `gConfigBytes` struct, the firmware wins and the
- * disagreement is called out inline.
- */
-const BIT_SHIFT = Object.freeze({
-    // ---- ConfigSetupByte0 (idx 6) — firmware `gConfigBytes` idx 6 bitfield.
-    /** WR-accel sampling rate. `bitShiftLSM303DLHCAccelSamplingRate` (@124); FW `wrAccelRate` bits 4-7. */
-    WR_ACCEL_RATE: 4,
-    /** WR-accel range. `bitShiftLSM303DLHCAccelRange` (@126); FW `wrAccelRange` bits 2-3. */
-    WR_ACCEL_RANGE: 2,
-    /** WR-accel low-power mode (LSB). `bitShiftLSM303DLHCAccelLPM` (@129); FW `wrAccelLpModeLsb` bit 1. */
-    WR_ACCEL_LPM: 1,
-    /** WR-accel high-resolution mode. `bitShiftLSM303DLHCAccelHRM` (@132); FW `wrAccelHrMode` bit 0. */
-    WR_ACCEL_HRM: 0,
-    // ---- ConfigSetupByte1 (idx 7) — whole byte.
-    /** IMU (MPU9x50 / LSM6DSV) accel+gyro rate. `bitShiftMPU9150AccelGyroSamplingRate` (@139); FW `gyroRate`. */
-    IMU_RATE: 0,
-    // ---- ConfigSetupByte2 (idx 8).
-    /** Mag range. `bitShiftLSM303DLHCMagRange` (@143); FW `magRange` (S3) / `altMagRange` (S3R) bits 5-7. */
-    MAG_RANGE: 5,
-    /** Mag sampling rate. `bitShiftLSM303DLHCMagSamplingRate` (@145); FW `magRate` bits 2-4. */
-    MAG_RATE: 2,
-    /** Gyro range, LOW 2 bits. `bitShiftMPU9150GyroRange` (@147); FW `gyroRangeLsb` bits 0-1. */
-    GYRO_RANGE_LSB: 0,
-    // ---- ConfigSetupByte3 (idx 9).
-    /** Alt-accel range (S3 MPU9x50) / LN-accel range (S3R LSM6DSV). `bitShiftMPU9150AccelRange` (@150); FW bits 6-7. */
-    ALT_ACCEL_RANGE: 6,
-    /** Pressure oversampling, LOW 2 bits. `bitShiftBMPX80PressureResolution` (@152); FW `pressureOversamplingRatioLsb` bits 4-5. */
-    PRESSURE_OVERSAMPLING_LSB: 4,
-    GSR_RANGE: 1,
-    EXP_POWER: 0,
-    // ---- ConfigSetupByte4 (idx 130 on every supported firmware).
-    /**
-     * Alt-accel (ADXL371) sampling rate. `bitShiftADXL371AltAccelSamplingRate`
-     * (@161) used with `idxConfigSetupByte4` in SensorADXL371.java:356/370;
-     * FW `altAccelRate` bits 6-7 of idx 130. Java and firmware AGREE.
-     */
-    ALT_ACCEL_RATE: 6,
-    /**
-     * Gyro range MSB (3rd bit). `bitShiftLSM6DSVGyroRangeMSB` (@163) used with
-     * `idxConfigSetupByte4` in SensorLSM6DSV.java:980/1015; FW `gyroRangeMsb`
-     * bit 2 of idx 130. Java and firmware AGREE.
-     */
-    GYRO_RANGE_MSB: 2,
-    /**
-     * Pressure oversampling MSB (3rd bit). Java declares this as
-     * `bitShiftBMP390PressureResolution` under a "//Config Byte0" comment
-     * (@134-135) — that comment is WRONG: both SensorBMP390.java:499 and
-     * SensorBMP581.java:380 index `idxConfigSetupByte4`, and the firmware struct
-     * has `pressureOversamplingRatioMsb` as bit 0 of idx 130. FIRMWARE WINS →
-     * ConfigSetupByte4 bit 0, not ConfigSetupByte0.
-     */
-    PRESSURE_OVERSAMPLING_MSB: 0,
-    /**
-     * WR-accel low-power-mode MSB — FIRMWARE-ONLY (`wrAccelLpModeMsb`, bit 1 of
-     * idx 130). The Java driver has no equivalent field and never writes it, so
-     * the codec does not model it either; the bit survives round-trip untouched.
-     */
-    WR_ACCEL_LPM_MSB: 1,
-    // ---- ConfigSetupByte5 (idx 131 on every supported firmware).
-    /**
-     * Alt-mag (LIS3MDL) sampling rate. Java declares
-     * `bitShiftLIS3MDLAltMagSamplingRate` (@158) under a "//Config Byte4"
-     * comment — that comment is WRONG: SensorLIS3MDL.java:809/831 index
-     * `idxConfigSetupByte5`, and the firmware struct has `altMagRate` as bits
-     * 0-5 of idx 131. FIRMWARE WINS → ConfigSetupByte5 bits 0-5.
-     */
-    ALT_MAG_RATE: 0,
-    /**
-     * `bitShiftLIS2MDLMagRateMSB` (@167). NOT MODELLED: every use in
-     * SensorLIS2MDL.java (@581 generate, @602 parse) is COMMENTED OUT, and the
-     * firmware struct has idx 131 bits 6-7 as `unusedByte131Bit6/7` with no mag
-     * MSB anywhere. LIS2MDL mag rate is the plain 3-bit ConfigSetupByte2 field.
-     * Kept here only so the constant table is complete against the Java source;
-     * writing it would corrupt `altMagRate` bits 3-5.
-     */
-    LIS2MDL_MAG_RATE_MSB_UNUSED: 3,
-    // ---- SD / trial bits (idx 217/218/230).
-    BUTTON_START: 5,
-    DISABLE_BLUETOOTH: 3,
-    SYNC_WHEN_LOGGING: 2,
-    MASTER_SHIMMER: 1,
-    SINGLE_TOUCH: 7,
-    TCXO: 4,
-    SD_CFG_FILE_WRITE_FLAG: 0,
-});
-const MASK = Object.freeze({
-    // ConfigSetupByte0
-    WR_ACCEL_RATE: 0x0f, // maskLSM303DLHCAccelSamplingRate @125
-    WR_ACCEL_RANGE: 0x03, // maskLSM303DLHCAccelRange @127
-    WR_ACCEL_LPM: 0x01, // maskLSM303DLHCAccelLPM @130
-    WR_ACCEL_HRM: 0x01, // maskLSM303DLHCAccelHRM @133
-    // ConfigSetupByte1
-    IMU_RATE: 0xff, // maskMPU9150AccelGyroSamplingRate @140
-    // ConfigSetupByte2
-    MAG_RANGE: 0x07, // maskLSM303DLHCMagRange @144
-    MAG_RATE: 0x07, // maskLSM303DLHCMagSamplingRate @146
-    GYRO_RANGE_LSB: 0x03, // maskMPU9150GyroRange @148
-    // ConfigSetupByte3
-    ALT_ACCEL_RANGE: 0x03, // maskMPU9150AccelRange @151
-    PRESSURE_OVERSAMPLING_LSB: 0x03, // maskBMPX80PressureResolution @153
-    GSR_RANGE: 0x07,
-    EXP_POWER: 0x01,
-    // ConfigSetupByte4
-    ALT_ACCEL_RATE: 0x03, // maskADXL371AltAccelSamplingRate @162
-    GYRO_RANGE_MSB: 0x01, // maskLSM6DSVGyroRangeMSB @164
-    PRESSURE_OVERSAMPLING_MSB: 0x01, // maskBMP390PressureResolution @136
-    WR_ACCEL_LPM_MSB: 0x01, // firmware-only, not written
-    // ConfigSetupByte5
-    ALT_MAG_RATE: 0x3f, // maskLIS3MDLAltMagSamplingRate @159
-    LIS2MDL_MAG_RATE_MSB_UNUSED: 0x07, // maskLIS2MDLMagRateMSB @166 (never written)
-    // Shared
-    ONE_BIT: 0x01,
-    DERIVED_BYTE: 0xff,
-    SD_CFG_FILE_WRITE_FLAG: 0x01,
-});
-/**
- * Composite (split across two bytes) field widths. The low part lives in
- * ConfigSetupByte2/3 and the high bit in ConfigSetupByte4; the high bit is only
- * written on Shimmer3R, where the LSM6DSV / BMP390-BMP581 need the extra range.
- */
-const COMPOSITE_MSB_SHIFT = 2;
-/** Config-time bytes are big-endian: byte0 = MSB (shift 24) … byte3 = LSB. */
-const CONFIG_TIME_BIT_SHIFTS = [24, 16, 8, 0];
-/**
- * Resolve the InfoMem layout for a firmware/hardware context, applying the
- * same ordered constructor branches as `ConfigByteLayoutShimmer3` (oldest →
- * newest). Returns a frozen, fully-derived {@link InfoMemLayout}.
- */
-function resolveInfoMemLayout(ctx) {
-    const r = isShimmer3R(ctx);
-    // ---- Base (default) initialiser values (ConfigByteLayoutShimmer3 @34-109).
-    const layout = {
-        // Page addresses — legacy default; branch 4 may remap to flat 0-based.
-        addrD: INFOMEM_ADDR_LEGACY.D,
-        addrC: INFOMEM_ADDR_LEGACY.C,
-        addrB: INFOMEM_ADDR_LEGACY.B,
-        flatAddressing: false,
-        idxSamplingRate: 0,
-        idxBufferSize: 2,
-        idxSensors0: 3,
-        idxSensors1: 4,
-        idxSensors2: 5,
-        idxConfigSetupByte0: 6,
-        idxConfigSetupByte1: 7,
-        idxConfigSetupByte2: 8,
-        idxConfigSetupByte3: 9,
-        idxExg1: 10,
-        idxExg2: 20,
-        idxBtCommBaudRate: 30,
-        // Kinematic calibration blocks — defaults (@95-99); branch 2 remaps all six.
-        idxAnalogAccelCalibration: 31,
-        idxMPU9150GyroCalibration: 52,
-        idxLSM303DLHCMagCalibration: 73,
-        idxLSM303DLHCAccelCalibration: 94,
-        idxADXL371AltAccelCalibration: 256,
-        idxLIS3MDLAltMagCalibration: 285,
-        // Derived-sensor offsets default to 0 ("not present").
-        idxDerivedSensors0: 0,
-        idxDerivedSensors1: 0,
-        idxDerivedSensors2: 0,
-        idxDerivedSensors3: 0,
-        idxDerivedSensors4: 0,
-        idxDerivedSensors5: 0,
-        idxDerivedSensors6: 0,
-        idxDerivedSensors7: 0,
-        // C page (128 + X).
-        idxSensors3: 128 + 2,
-        idxSensors4: 128 + 3,
-        // Defaults (@113-117): ConfigSetupByte4/5 sit BELOW Sensors3/4; branch 1
-        // swaps them so Sensors3/4 land at 128/129 and ConfigSetupByte4/5 at
-        // 130/131. ConfigSetupByte6 is 128+4 in both cases.
-        idxConfigSetupByte4: 128 + 0,
-        idxConfigSetupByte5: 128 + 1,
-        idxConfigSetupByte6: 128 + 4, // 132
-        idxSDShimmerName: 128 + 59, // 187
-        idxSDEXPIDName: 128 + 71, // 199
-        idxSDConfigTime0: 128 + 83, // 211
-        idxSDConfigTime1: 128 + 84, // 212
-        idxSDConfigTime2: 128 + 85, // 213
-        idxSDConfigTime3: 128 + 86, // 214
-        idxSDMyTrialID: 128 + 87, // 215
-        idxSDNumOfShimmers: 128 + 88, // 216
-        idxSDExperimentConfig0: 128 + 89, // 217
-        idxSDExperimentConfig1: 128 + 90, // 218
-        idxSDBTInterval: 128 + 91, // 219
-        idxEstimatedExpLengthMsb: 128 + 92, // 220
-        idxEstimatedExpLengthLsb: 128 + 93, // 221
-        idxMaxExpLengthMsb: 128 + 94, // 222
-        idxMaxExpLengthLsb: 128 + 95, // 223
-        idxMacAddress: 128 + 96, // 224
-        idxSDConfigDelayFlag: 128 + 102, // 230
-        idxBtFactoryReset: 0,
-        // B page. Java `idxNode0` = 128+128 = 256 with `maxNumOfExperimentNodes`
-        // = 21 (→ 256..381). The firmware header's NV_* defines look different
-        // (NV_CENTER = 256, NV_NODE0 = 262) but its `gConfigBytes` struct lays out
-        // `syncNodeAddr1[6]`…`syncNodeAddr21[6]` starting at 256 with
-        // NV_NUM_BYTES_SYNC_CENTER_NODE_ADDRS = 126 = 21*6, so the struct AGREES
-        // with Java: slot 0 (the "center") is simply the first of the 21 slots.
-        idxNode0: 128 + 128, // 256
-        lengthGeneralCalibrationBytes: GENERAL_CALIBRATION_LENGTH,
-        supportsMpl: isSupportedMpl(ctx),
-        supportsEightByteDerived: isSupportedEightByteDerivedSensors(ctx),
-        supportsSdLogSync: isSupportedSdLogSync(ctx),
-        isSdLoggingFirmware: isSdLoggingFirmware(ctx),
-        isShimmer3R: r,
-    };
-    // ---- Branch 1 (@330-343): 3R | SDLog>=0.8.42 | LogAndStream>=0.3.4 | Shimmer4 | StroKare
-    // Relocates Sensors3/4 to 128/129 (ConfigSetupByte4/5 shift to 130/131) and
-    // seeds DerivedSensors0-2 at 115-117 (overridden by branch 2 below).
-    if (r ||
-        fwCompare(ctx, FW_ID.SDLOG, 0, 8, 42) ||
-        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 3, 4) ||
-        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
-        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
-        layout.idxSensors3 = 128 + 0;
-        layout.idxSensors4 = 128 + 1;
-        layout.idxConfigSetupByte4 = 128 + 2; // 130 — matches FW NV_CONFIG_SETUP_BYTE4
-        layout.idxConfigSetupByte5 = 128 + 3; // 131 — matches FW NV_CONFIG_SETUP_BYTE5
-        layout.idxConfigSetupByte6 = 128 + 4; // 132 — matches FW NV_CONFIG_SETUP_BYTE6
-        layout.idxDerivedSensors0 = 115;
-        layout.idxDerivedSensors1 = 116;
-        layout.idxDerivedSensors2 = 117;
-    }
-    // ---- Branch 2 (@345-360): 3R | SDLog>=0.8.68 | LogAndStream>=0.3.17 | BtStream>=0.6.0 | Shimmer4 | StroKare
-    // Moves DerivedSensors0-2 into InfoMem D at 31-33 (and the calibration blocks,
-    // which this codec does not surface).
-    if (r ||
-        fwCompare(ctx, FW_ID.SDLOG, 0, 8, 68) ||
-        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 3, 17) ||
-        fwCompare(ctx, FW_ID.BTSTREAM, 0, 6, 0) ||
-        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
-        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
-        layout.idxDerivedSensors0 = 31;
-        layout.idxDerivedSensors1 = 32;
-        layout.idxDerivedSensors2 = 33;
-        // Calibration blocks shift up by 3 to make room for DerivedSensors0-2, and
-        // the two alt-IMU blocks move from their (bogus, InfoMem-B-colliding)
-        // defaults into InfoMem C. All six match the firmware NV_* map exactly:
-        // NV_LN_ACCEL_CALIBRATION 34, NV_GYRO_CALIBRATION 55, NV_MAG_CALIBRATION
-        // 76, NV_WR_ACCEL_CALIBRATION 97, NV_ALT_ACCEL_CALIBRATION 128+5 = 133,
-        // NV_ALT_MAG_CALIBRATION 128+26 = 154.
-        layout.idxAnalogAccelCalibration = 34;
-        layout.idxMPU9150GyroCalibration = 55;
-        layout.idxLSM303DLHCMagCalibration = 76;
-        layout.idxLSM303DLHCAccelCalibration = 97;
-        layout.idxADXL371AltAccelCalibration = 133;
-        layout.idxLIS3MDLAltMagCalibration = 154;
-    }
-    // ---- Branch 4 — ADDRESS-BASE REMAP (@370-381): 3R | SDLog>=0.11.5 |
-    // LogAndStream>=0.5.16 | BtStream>=0.7.4 | Shimmer4 | StroKare.
-    // HARDWARE-VERIFY: the page address the device firmware expects on the wire
-    // (legacy MSP430 0x1800/0x1880/0x1900 vs. flat 0/128/256) is only confirmable
-    // against real hardware of each firmware generation.
-    if (r ||
-        fwCompare(ctx, FW_ID.SDLOG, 0, 11, 5) ||
-        fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 5, 16) ||
-        fwCompare(ctx, FW_ID.BTSTREAM, 0, 7, 4) ||
-        fwCompare(ctx, FW_ID.SHIMMER4_SDK_STOCK, ANY_VERSION, ANY_VERSION, ANY_VERSION) ||
-        fwCompare(ctx, FW_ID.STROKARE, ANY_VERSION, ANY_VERSION, ANY_VERSION)) {
-        layout.addrD = INFOMEM_ADDR_FLAT.D;
-        layout.addrC = INFOMEM_ADDR_FLAT.C;
-        layout.addrB = INFOMEM_ADDR_FLAT.B;
-        layout.flatAddressing = true;
-    }
-    // ---- Branch 5 (@383-390): 3R | isSupportedEightByteDerivedSensors.
-    if (r || layout.supportsEightByteDerived) {
-        layout.idxDerivedSensors3 = 118;
-        layout.idxDerivedSensors4 = 119;
-        layout.idxDerivedSensors5 = 120;
-        layout.idxDerivedSensors6 = 121;
-        layout.idxDerivedSensors7 = 122;
-    }
-    // ---- Branch 7 (@398-401): 3R | LogAndStream>=0.8.1.
-    if (r || fwCompare(ctx, FW_ID.LOGANDSTREAM, 0, 8, 1)) {
-        layout.idxBtFactoryReset = 128 + 103; // 231
-    }
-    return Object.freeze(layout);
-}
-/**
- * The "first 6 bytes all 0xFF ⇒ unconfigured/invalid" check
- * (ConfigByteLayout.checkConfigBytesValid @90). Returns true when the InfoMem
- * holds a real configuration.
- */
-function checkConfigBytesValid(bytes) {
-    if (bytes.length < INFOMEM_VALIDITY_BYTES)
-        return false;
-    for (let i = 0; i < INFOMEM_VALIDITY_BYTES; i++) {
-        if (bytes[i] !== 0xff)
-            return true;
-    }
-    return false;
 }
 
 /**
@@ -11362,9 +13892,9 @@ const SR_CODE_SHIMMER3 = 31;
  *   the LSM303DLHC/MPU9150 option tables are the older, narrower ones)
  */
 function inferShimmer3Generation(ctx, expansionBoard) {
-    if (ctx.hardwareVersion === HW_ID.SHIMMER_3R)
+    if (ctx.hardwareVersion === HW_ID$1.SHIMMER_3R)
         return 'shimmer3r';
-    if (ctx.hardwareVersion !== HW_ID.SHIMMER_3 || expansionBoard === undefined) {
+    if (ctx.hardwareVersion !== HW_ID$1.SHIMMER_3 || expansionBoard === undefined) {
         return 'shimmer3-old-imu';
     }
     const { boardId, boardRev } = expansionBoard;
@@ -13888,7 +16418,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             exg2: current.exg2,
             enabledSensors: this.enabledSensors,
             samplingRateHz: this.samplingRateHz,
-            hardwareVersion: HW_ID.SHIMMER_3R,
+            hardwareVersion: HW_ID$1.SHIMMER_3R,
         }, preset, resolution);
         await this.writeExgConfig(result.exg1, result.exg2);
         // Enabled sensors last; setSensors re-inquires and refreshes the schema.
@@ -14046,7 +16576,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
         // +2: the u16 length field counts the bytes AFTER itself
         // (`ShimCalib_ramWrite`, Calibration/shimmer_calibration.c:346-349).
-        const total = u16le$4(head, 0) + 2;
+        const total = u16le$3(head, 0) + 2;
         if (total <= 2 || total > MAX_CALIB_DUMP_BYTES) {
             throw new Error(`Calibration dump reports an implausible length (${total} bytes); ` +
                 `expected 3..${MAX_CALIB_DUMP_BYTES}. The device's calibration memory ` +
@@ -14407,7 +16937,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             throw new Error(`Inquiry response truncated: ${u8.length} bytes, need ${headerEnd + numCh} ` +
                 `for the ${numCh} channels it declares.`);
         }
-        const adcRaw = u16le$4(u8, base + 0);
+        const adcRaw = u16le$3(u8, base + 0);
         const samplingRateHz = 32768 / adcRaw;
         this.samplingRateHz = samplingRateHz;
         const cfg = BigInt(u8[base + 2]) |
@@ -14520,6 +17050,13 @@ class Shimmer3RClient extends BaseShimmerClient {
            sawtooths for its whole length. `Shimmer3Client` has always done this;
            this client had the same option and did not. */
         this._timeline.setTimestampBits(this.forceTimestampFmt === 'u16' ? 16 : 24);
+        /* And the rate, which sizes the reorder window: eight sample periods is
+           what separates a pair of packets delivered out of order from a dropout
+           that happens to span the counter's wrap point. Without it the window
+           falls back to an eighth of the modulo, which on the 16-bit counter is
+           0.25 s and reads an ordinary 1.8 s gap as a reorder. Zero means the
+           inquiry has not run, and `null` says so rather than passing it on. */
+        this._timeline.setSamplingRateHz(this.samplingRateHz > 0 ? this.samplingRateHz : null);
         this._timeline.reset();
         if (!this.anchorStreamClock || this._timeline.hasAnchorRequest)
             return;
@@ -14739,8 +17276,8 @@ class Shimmer3RClient extends BaseShimmerClient {
             if (buf[0] === preamble && buf[wireBytes] === preamble) {
                 let ts1, ts2;
                 try {
-                    ts1 = tsBytes === 2 ? u16le$4(buf, 1) : u24le$1(buf, 1);
-                    ts2 = tsBytes === 2 ? u16le$4(buf, wireBytes + 1) : u24le$1(buf, wireBytes + 1);
+                    ts1 = tsBytes === 2 ? u16le$3(buf, 1) : u24le(buf, 1);
+                    ts2 = tsBytes === 2 ? u16le$3(buf, wireBytes + 1) : u24le(buf, wireBytes + 1);
                 }
                 catch {
                     buf = buf.subarray(1);
@@ -14801,7 +17338,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                     let cursor = 1;
                     const oc = new ObjectCluster(this._deviceId());
                     oc.crcOk = crcOk;
-                    const ts = tsBytes === 2 ? u16le$4(frame, cursor) : u24le$1(frame, cursor);
+                    const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le(frame, cursor);
                     cursor += tsBytes;
                     oc.add('TIMESTAMP', ts, CHANNEL_UNITS.TICKS, 'raw');
                     /* The raw counter wraps every 512 s; the timeline unwraps it and, when
@@ -14820,16 +17357,16 @@ class Shimmer3RClient extends BaseShimmerClient {
                         let v;
                         switch (f.fmt) {
                             case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be$2(frame, cursor)) : sign16(u16le$4(frame, cursor));
+                                v = f.endian === 'be' ? sign16(u16be$2(frame, cursor)) : sign16(u16le$3(frame, cursor));
                                 break;
                             case 'u16':
-                                v = f.endian === 'be' ? u16be$2(frame, cursor) : u16le$4(frame, cursor);
+                                v = f.endian === 'be' ? u16be$2(frame, cursor) : u16le$3(frame, cursor);
                                 break;
                             case 'i24':
-                                v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
+                                v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le(frame, cursor));
                                 break;
                             case 'u24':
-                                v = f.endian === 'be' ? u24be(frame, cursor) : u24le$1(frame, cursor);
+                                v = f.endian === 'be' ? u24be(frame, cursor) : u24le(frame, cursor);
                                 break;
                             case 'i12*': {
                                 const msb = frame[cursor] & 0xff;
@@ -14842,7 +17379,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                                 v = frame[cursor];
                                 break;
                             default:
-                                v = u16le$4(frame, cursor);
+                                v = u16le$3(frame, cursor);
                         }
                         cursor += f.sizeBytes;
                         oc.add(f.name, v, CHANNEL_UNITS.NO_UNITS, 'raw');
@@ -15063,7 +17600,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         // A Shimmer3's firmware omits the usbPluggedIn status byte, so the framer
         // has to stop waiting for a byte that is never coming — and, worse, stop
         // swallowing the ACK that follows the status instead.
-        this._statusPayloadBytes = this._deviceVersionCache.hardwareVersion === HW_ID.SHIMMER_3 ? 1 : 2;
+        this._statusPayloadBytes = this._deviceVersionCache.hardwareVersion === HW_ID$1.SHIMMER_3 ? 1 : 2;
         return this._deviceVersionCache;
     }
     // ---------------------------------------------------------------------------
@@ -16270,1347 +18807,6 @@ function buildBlankBrandRecord() {
     return new Uint8Array(BRAND_RECORD_SIZE).fill(0xff);
 }
 
-// ---------------------------------------------------------------------------
-// Nordic UART Service (NUS) UUIDs used by Verisense devices
-// ---------------------------------------------------------------------------
-/** NUS primary service UUID. */
-const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
-/** NUS TX characteristic UUID (host writes to this). */
-const NUS_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
-/** NUS RX characteristic UUID (host subscribes to notifications from this). */
-const NUS_RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-/** Nordic Secure DFU service UUID (buttonless DFU). */
-const NORDIC_DFU_SERVICE = '0000fe59-0000-1000-8000-00805f9b34fb';
-/** Nordic buttonless DFU control-point characteristic (without bond sharing). */
-const NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = '8ec90003-f315-4f60-9fb8-838830daea50';
-/** Nordic buttonless DFU control-point characteristic (with bond sharing). */
-const NORDIC_DFU_BUTTONLESS_WITH_BONDS = '8ec90004-f315-4f60-9fb8-838830daea50';
-/** Buttonless DFU control-point op-code that reboots the device into the bootloader. */
-const NORDIC_DFU_OP_ENTER_BOOTLOADER = 0x01;
-// ---------------------------------------------------------------------------
-// Verisense protocol command/property constants
-// ---------------------------------------------------------------------------
-/** Upper-nibble command classes used in protocol headers. */
-const ASM_COMMAND = Object.freeze({
-    READ: 0x10,
-    WRITE: 0x20,
-    RESPONSE: 0x30,
-    ACK: 0x40,
-    NACK_BAD_HEADER_COMMAND: 0x50,
-    NACK_BAD_HEADER_PROPERTY: 0x60,
-    NACK_GENERIC: 0x70,
-    ACK_NEXT_STAGE: 0x80,
-});
-/** Lower-nibble property IDs used in protocol headers. */
-const ASM_PROPERTY = Object.freeze({
-    STATUS1: 0x01,
-    DATA: 0x02,
-    PRODUCTION_CONFIGURATION: 0x03,
-    OPERATIONAL_CONFIGURATION: 0x04,
-    TIME: 0x05,
-    DFU_MODE: 0x06,
-    PENDING_EVENTS: 0x07,
-    TEST_MODE: 0x08,
-    DEBUG_COMMAND: 0x09,
-    STREAM_MODE: 0x0a,
-    DEVICE_DISCONNECT: 0x0b,
-    STATUS2: 0x0c,
-    CALIBRATION: 0x0d,
-});
-/** Stream mode payload values. */
-const STREAM_MODE = Object.freeze({
-    ENABLE: 0x01,
-    DISABLE: 0x02,
-});
-/** Test mode IDs documented by Verisense firmware. */
-const TEST_MODE_ID = Object.freeze({
-    STOP: 0x00,
-    FLASH_8MB_1: 0x01,
-    FLASH_8MB_2: 0x02,
-    FLASH_128MB_512MB: 0x03,
-    EEPROM: 0x04,
-    ACCEL1_LIS2DW12: 0x05,
-    BATTERY_VOLTAGE: 0x06,
-    USB_POWER: 0x07,
-    ACCEL2_GYRO_LSM6DS3: 0x08,
-    PPG_MAX86XXX: 0x09,
-    BIOZ_MAX30002: 0x0b,
-    ACCEL2_GYRO_LSM6DSV: 0x0c,
-    MAG_LIS2MDL: 0x0d,
-    ALL_TESTS: 0xff,
-});
-/** Debug command IDs documented by Verisense firmware. */
-const DEBUG_COMMAND_ID = Object.freeze({
-    FLASH_LOOKUP_TABLE_READ: 0x01,
-    FLASH_LOOKUP_TABLE_ERASE: 0x02,
-    RWC_SCHEDULER_READ: 0x03,
-    ERASE_128MB_512MB_FLASH: 0x04,
-    ERASE_8MB_FLASH_1: 0x05,
-    ERASE_8MB_FLASH_2: 0x06,
-    ERASE_OPERATIONAL_CONFIG: 0x07,
-    ERASE_PRODUCTION_CONFIG: 0x08,
-    CLEAR_PENDING_EVENTS: 0x09,
-    ERASE_FLASH_AND_LOOKUP_TABLE: 0x0a,
-    TEST_DATA_TRANSFER_LOOP: 0x0b,
-    LOAD_TEST_LOOKUP_TABLE: 0x0c,
-    LED_TEST: 0x0d,
-    MAX86XXX_LED_TEST: 0x0e,
-    CHECK_PAYLOAD_CRC_ERRORS: 0x0f,
-    READ_EVENT_LOG: 0x10,
-    POWER_PROFILER_TEST: 0x11,
-    READ_RECORD_BUFFER_DETAILS: 0x12,
-    SYSTEM_RESET: 0x13,
-    IC_POWER_CONSUMPTION_TEST: 0x14,
-    DELETE_ALL_BONDS: 0x15,
-    BLE_LINK_PARAMS_READ: 0x16,
-    BLE_LINK_OPTIMIZE: 0x17,
-    /** Streamed MAX32674C algorithm-hub firmware (.msbl) upload (factory). The
-     * byte after this id is a HUB_FW_UPLOAD_STAGE sub-stage. */
-    HUB_FW_UPLOAD: 0x18,
-});
-/** Sub-stages for the streamed MAX32674C hub firmware upload, carried in the
- * payload byte immediately after DEBUG_COMMAND_ID.HUB_FW_UPLOAD. */
-const HUB_FW_UPLOAD_STAGE = Object.freeze({
-    BEGIN: 0x00,
-    PAGE_CHUNK: 0x01,
-    END: 0x02,
-    ABORT: 0x03,
-});
-/** MAX32674C .msbl image geometry (mirrors firmware flashUpdater.h). A page on
- * the wire is PAGE_PAYLOAD + PAGE_CRC bytes; HEADER_SIZE bytes precede page 0. */
-const MSBL = Object.freeze({
-    HEADER_SIZE: 0x4c,
-    OFF_NUMPAGES: 0x44,
-    PAGE_PAYLOAD: 8192,
-    PAGE_CRC: 16,
-    PAGE_FILE_BYTES: 8208,
-});
-// ---------------------------------------------------------------------------
-// Operational config byte offsets
-// ---------------------------------------------------------------------------
-/**
- * Byte indices into the Verisense operational config blob (`op[OP_IDX.xxx]`).
- * Index 0 is the config version byte (must be 0x5A for a valid config).
- */
-const OP_IDX = Object.freeze({
-    GEN_CFG_0: 1,
-    GEN_CFG_1: 2,
-    GEN_CFG_2: 3,
-    GEN_CFG_3: 4,
-    ACCEL1_CFG_0: 5,
-    ACCEL1_CFG_1: 6,
-    ACCEL1_CFG_2: 7,
-    ACCEL1_CFG_3: 8,
-    GYRO_ACCEL2_CFG_0: 10,
-    GYRO_ACCEL2_CFG_1: 11,
-    GYRO_ACCEL2_CFG_2: 12,
-    GYRO_ACCEL2_CFG_3: 13,
-    GYRO_ACCEL2_CFG_4: 14,
-    GYRO_ACCEL2_CFG_5: 15,
-    GYRO_ACCEL2_CFG_6: 16,
-    GYRO_ACCEL2_CFG_7: 17,
-    LSM6DSV_CFG_0: 18,
-    LSM6DSV_CFG_1: 19,
-    LSM6DSV_CFG_2: 20,
-    START_TIME: 21,
-    END_TIME: 25,
-    INACTIVE_TIMEOUT: 29,
-    BLE_RETRY_COUNT: 30,
-    BLE_TX_POWER: 31,
-    BLE_DATA_TRANS_WKUP_INT_HRS: 32,
-    BLE_DATA_TRANS_WKUP_TIME: 33,
-    BLE_DATA_TRANS_WKUP_DUR: 35,
-    BLE_DATA_TRANS_RETRY_INT: 36,
-    BLE_STATUS_WKUP_INT_HRS: 38,
-    BLE_STATUS_WKUP_TIME: 39,
-    BLE_STATUS_WKUP_DUR: 41,
-    BLE_STATUS_RETRY_INT: 42,
-    BLE_RTC_SYNC_WKUP_INT_HRS: 44,
-    BLE_RTC_SYNC_WKUP_TIME: 45,
-    BLE_RTC_SYNC_WKUP_DUR: 47,
-    BLE_RTC_SYNC_RETRY_INT: 48,
-    ADC_CHANNEL_SETTINGS_0: 50,
-    ADC_CHANNEL_SETTINGS_1: 51,
-    ADAPTIVE_SCHEDULER_INT: 52,
-    ADAPTIVE_SCHEDULER_FAILCOUNT_MAX: 54,
-    PPG_REC_DUR_SECS_LSB: 55,
-    PPG_REC_DUR_SECS_MSB: 56,
-    PPG_REC_INT_MINS_LSB: 57,
-    PPG_REC_INT_MINS_MSB: 58,
-    PPG_FIFO_CONFIG: 59,
-    PPG_MODE_CONFIG2: 60,
-    PPG_MA_DEFAULT: 61,
-    PPG_MA_MAX_RED_IR: 62,
-    PPG_MA_MAX_GREEN_BLUE: 63,
-    PPG_AGC_TARGET_PERCENT_OF_RANGE: 64,
-    PPG_MA_LED_PILOT: 66,
-    PPG_DAC1_CROSSTALK: 67,
-    PPG_DAC2_CROSSTALK: 68,
-    PPG_DAC3_CROSSTALK: 69,
-    PPG_DAC4_CROSSTALK: 70,
-    PROX_AGC_MODE: 71,
-    // v9 second-generation sensor settings (only present when op[OP_CONFIG_VERSION] >= 9)
-    OP_CONFIG_VERSION: 9,
-    LIGHT_GAIN_INDEX: 72,
-    LIGHT_EXPOSURE_INDEX: 73,
-    LIGHT_CONFIG: 74,
-    LIGHT_SAMPLE_RATE_INDEX: 75,
-    SKIN_TEMP_CONFIG: 76,
-    SKIN_TEMP_SAMPLE_RATE_INDEX: 77,
-    ALGO_OP_MODE: 78,
-    ALGO_REPORT_MODE_RATE: 79,
-    ALGO_CONTROL: 80,
-    ALGO_INITIAL_HR: 81,
-    LED_AUTO_BRIGHTNESS_CFG: 82,
-    LED_MAX_BRIGHTNESS: 83,
-    LED_LUX_THRESHOLD: 84,
-    // MAX32674 algorithm-suite subject parameters (bytes 86-91)
-    PERSON_HEIGHT_CM: 86, // u16 LE, cm
-    PERSON_WEIGHT_KG: 88, // u16 LE, kg
-    PERSON_AGE: 90, // u8, years
-    PERSON_GENDER: 91, // u8, 0=Male, 1=Female
-});
-/** Operational config layout version stored at OP_IDX.OP_CONFIG_VERSION (byte 9).
- * 0 = legacy 72-byte layout; 9 = v9 layout with second-generation sensor settings. */
-const OP_CONFIG_VERSION_V9 = 9;
-/** Minimum firmware version that supports the BLE-link debug commands
- * (read/optimize connection parameters). */
-const BLE_LINK_MIN_FW = Object.freeze({
-    major: 1,
-    minor: 4,
-    internal: 23,
-});
-/** Human-readable labels for Verisense stream-packet sensor IDs. Each ID maps to
- * the device part(s) that produce that stream (some streams interleave several
- * physical sensors, e.g. id 6 = LSM6DSV accel + gyro + mag). */
-const VERISENSE_STREAM_SENSOR_LABELS = Object.freeze({
-    1: 'ADC (GSR / Battery)',
-    2: 'Accel 1 (LIS2DW12)',
-    3: 'Accel 2 + Gyro (LSM6DS3)',
-    4: 'PPG (MAX86xxx)',
-    6: 'Accel 2 + Gyro + Mag (LSM6DSV + LIS2MDL)',
-    7: 'Ambient Light (VD6283)',
-    8: 'Algo Hub (MAX32674 — HR + raw PPG)',
-    9: 'Skin Temperature (MLX90632)',
-});
-
-/** Read a 16-bit unsigned integer, little-endian. */
-function u16le$2(b0, b1) {
-    return (b1 << 8) | b0;
-}
-/** Format a single byte as an uppercase `0xNN` string. */
-function formatByteAsHex(v) {
-    return `0x${(v & 0xff).toString(16).toUpperCase().padStart(2, '0')}`;
-}
-/** Format bytes as `[0xAA, 0xBB, ...]`. */
-function formatByteArrayAsHex(bytes) {
-    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes ?? []);
-    return `[${Array.from(u8, (b) => formatByteAsHex(Number(b))).join(', ')}]`;
-}
-/** Parse text containing hex bytes like `0x5A, 00 12` into a Uint8Array. */
-function parseHexByteString(text) {
-    const matches = String(text ?? '').match(/[0-9a-fA-F]{2}/g) ?? [];
-    if (!matches.length) {
-        throw new Error('No hex bytes found. Example: 0x5A, 0x00, 0x12');
-    }
-    return new Uint8Array(matches.map((h) => Number.parseInt(h, 16)));
-}
-/**
- * Compare two firmware version triples. Returns a negative number if `a < b`,
- * positive if `a > b`, and 0 if equal. Missing or non-numeric components are
- * treated as 0.
- */
-function compareVerisenseFirmwareVersion(a, b) {
-    const aMaj = Number(a?.major) || 0;
-    const aMin = Number(a?.minor) || 0;
-    const aInt = Number(a?.internal) || 0;
-    const bMaj = Number(b?.major) || 0;
-    const bMin = Number(b?.minor) || 0;
-    const bInt = Number(b?.internal) || 0;
-    if (aMaj !== bMaj)
-        return aMaj - bMaj;
-    if (aMin !== bMin)
-        return aMin - bMin;
-    return aInt - bInt;
-}
-/** Format a firmware version triple as `"major.minor.internal"`, or `"unknown"`
- * when the version is null/undefined. */
-function formatVerisenseFirmwareVersion(v) {
-    if (!v)
-        return 'unknown';
-    return `${Number(v.major) || 0}.${Number(v.minor) || 0}.${Number(v.internal) || 0}`;
-}
-/** Human-readable label for a Verisense stream-packet sensor ID, with a
- * `"Sensor 0xNN"` hex fallback for unknown IDs. */
-function getVerisenseStreamSensorLabel(sensorId) {
-    const labels = VERISENSE_STREAM_SENSOR_LABELS;
-    return labels[sensorId] ?? `Sensor 0x${Number(sensorId).toString(16).toUpperCase()}`;
-}
-const ASM_PROPERTY_BY_VALUE = new Map(Object.entries(ASM_PROPERTY).map(([name, value]) => [Number(value), name]));
-/** Label pending-event property values with both enum name and hex representation. */
-function formatPendingEventProperties(pendingProps) {
-    const list = Array.isArray(pendingProps)
-        ? pendingProps
-        : pendingProps == null
-            ? []
-            : Array.from(pendingProps);
-    return list.map((prop) => {
-        const value = Number(prop) & 0xff;
-        return {
-            value,
-            hex: formatByteAsHex(value),
-            property: ASM_PROPERTY_BY_VALUE.get(value) ?? 'UNKNOWN_PROPERTY',
-        };
-    });
-}
-/** Read a signed 16-bit integer at byte offset `off`, little-endian. */
-function i16le(bytes, off) {
-    const v = bytes[off] | (bytes[off + 1] << 8);
-    return v & 0x8000 ? v - 0x10000 : v;
-}
-/** Read a 24-bit unsigned integer at byte offset `off`, little-endian. */
-function u24le(bytes, off) {
-    return (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16)) >>> 0;
-}
-/** Read a 16-bit unsigned integer at byte offset `off`, little-endian (full-array form). */
-function u16le_at(bytes, off) {
-    return (bytes[off] | (bytes[off + 1] << 8)) >>> 0;
-}
-/** Read a 32-bit IEEE-754 float at byte offset `off`, little-endian. */
-function f32le(bytes, off) {
-    return new DataView(bytes.buffer, bytes.byteOffset + off, 4).getFloat32(0, true);
-}
-/** Return current time in milliseconds. */
-function nowMillis() {
-    return Date.now();
-}
-/**
- * Convert a UTC unix-ms instant to the "local civil" timestamp domain used by
- * the Verisense real-world clock: unix ms with the host's local timezone
- * offset baked in, so that hour-of-day of the raw value equals the wall-clock
- * hour where the base station is.
- *
- * This is the documented time-sync contract ("synchronises the sensor's
- * real-world clock with the Base Station's local time" - Verisense
- * communication protocol) and what the downstream file parser assumes: it
- * evaluates midnight/midday CSV-split boundaries on the raw RWC value in a
- * pinned GMT+0 calendar, and labels CSV timestamp columns
- * "Unix_ms_plus_local_time_zone_offset".
- *
- * Note `getTimezoneOffset()` is evaluated at `utcMillis` itself, so the DST
- * rule in effect at that instant is applied.
- */
-function utcToLocalCivilMillis(utcMillis = Date.now()) {
-    return utcMillis - new Date(utcMillis).getTimezoneOffset() * 60000;
-}
-/** Current time in the Verisense local-civil RWC domain, in whole unix seconds. */
-function localCivilUnixSecondsNow() {
-    return Math.floor(utcToLocalCivilMillis() / 1000);
-}
-/**
- * Compute CRC-16/CCITT-FALSE over `bytes`.
- *
- * Parameters: poly=0x1021, init=0xFFFF, xorOut=0x0000.
- * Matches the C# `ComputeCRC` implementation used by Verisense firmware.
- */
-function crc16_ccitt_false(bytes) {
-    let crc = 0xffff;
-    for (let i = 0; i < bytes.length; i++) {
-        crc ^= bytes[i] << 8;
-        for (let b = 0; b < 8; b++) {
-            crc = crc & 0x8000 ? (crc << 1) ^ 0x1021 : crc << 1;
-            crc &= 0xffff;
-        }
-    }
-    return crc & 0xffff;
-}
-/**
- * Extract the CRC that was appended to a logged payload (last 2 bytes, LE).
- */
-function getOriginalCrcLE(payload) {
-    const n = payload.length;
-    return (payload[n - 2] | (payload[n - 1] << 8)) >>> 0;
-}
-/**
- * Compute the CRC of a logged payload, excluding the trailing 2 CRC bytes,
- * matching the C# `ComputeCRC(payload, 0, payload.Length - 2)` call.
- */
-function computeCrcLikeCSharp(payload) {
-    return crc16_ccitt_false(payload.subarray(0, payload.length - 2));
-}
-/**
- * Convert any reasonable representation of an operational config to a
- * `Uint8Array`. Throws if the input type is unrecognised.
- */
-function normalizeOperationalConfig(payload) {
-    if (!payload)
-        return null;
-    if (payload instanceof Uint8Array)
-        return payload;
-    if (payload instanceof ArrayBuffer)
-        return new Uint8Array(payload);
-    if (Array.isArray(payload))
-        return new Uint8Array(payload);
-    if (payload.buffer instanceof ArrayBuffer) {
-        const p = payload;
-        return new Uint8Array(p.buffer, p.byteOffset ?? 0, p.byteLength ?? p.buffer.byteLength);
-    }
-    throw new Error('normalizeOperationalConfig: unsupported payload type');
-}
-/** Alias for arbitrary protocol byte payload normalization. */
-function normalizeBytePayload(payload) {
-    return normalizeOperationalConfig(payload);
-}
-/**
- * Derive the 6-digit pairing PIN from a Verisense unique identifier.
- *
- * The PIN is built from digits 2, 4 and 6 (1-based) of the identifier,
- * followed by the decimal value of the final byte padded to 3 digits.
- */
-function computeVerisensePairingPin(uniqueId) {
-    const normalized = String(uniqueId ?? '')
-        .trim()
-        .replace(/^Verisense-/i, '');
-    if (!/^[0-9a-fA-F]{8,}$/.test(normalized)) {
-        throw new Error('computeVerisensePairingPin: uniqueId must be a hex identifier string');
-    }
-    if (normalized.length < 6) {
-        throw new Error('computeVerisensePairingPin: uniqueId must be at least 6 hex characters');
-    }
-    const prefix = `${normalized[1]}${normalized[3]}${normalized[5]}`;
-    const suffixHex = normalized.slice(-2);
-    const suffixDec = Number.parseInt(suffixHex, 16);
-    return `${prefix}${suffixDec.toString().padStart(3, '0')}`;
-}
-/** Infer charger chip family from hardware revision fields in production config. */
-function inferVerisenseChargerChipFamily(revHwMajor, revHwMinor, revHwInternal) {
-    const major = Number(revHwMajor);
-    const minor = Number(revHwMinor);
-    const internal = Number(revHwInternal);
-    if ((major === 68 && minor === 7 && internal === 1) || (major === 68 && minor === 8)) {
-        return 'LTC4123';
-    }
-    if (major === 62) {
-        return 'LM3658D';
-    }
-    if ((major === 68 && minor >= 9) || (major === 61 && minor >= 5)) {
-        return 'XC6803';
-    }
-    return 'UNKNOWN';
-}
-/** Return chip-specific charger status text for a parsed 3-bit status code. */
-function describeVerisenseChargerStatus(chipFamily, statusCode) {
-    if (statusCode === 7) {
-        return 'Not read yet';
-    }
-    if (chipFamily === 'LTC4123') {
-        if (statusCode === 0) {
-            return 'Zinc-air/reverse polarity/temp out-of-range/UVCL at start of charge cycle';
-        }
-        if (statusCode === 1) {
-            return 'Powered on/charging';
-        }
-        if (statusCode === 2) {
-            return 'Charge completed';
-        }
-        if (statusCode === 3) {
-            return 'No power/not charging';
-        }
-    }
-    if (chipFamily === 'LM3658D') {
-        if (statusCode === 0 || statusCode === 3) {
-            return 'Power-down, charging suspended or interrupted';
-        }
-        if (statusCode === 1) {
-            return 'Pre-qualification, CC/CV charging, or top-off mode';
-        }
-        if (statusCode === 2) {
-            return 'Charge completed';
-        }
-    }
-    if (chipFamily === 'XC6803') {
-        if (statusCode === 0) {
-            return 'Fault (overvoltage, overcurrent, shorted battery, etc.)';
-        }
-        if (statusCode === 1) {
-            return 'Pre-qualification, CC/CV charging, or top-off mode';
-        }
-        if (statusCode === 2) {
-            return 'Charge completed';
-        }
-        if (statusCode === 3) {
-            return 'Power-down, charging suspended or interrupted';
-        }
-        if (statusCode === 4) {
-            return 'Trickle charging';
-        }
-    }
-    return 'Unknown';
-}
-/** Format charger summary text for UIs, e.g. "XC6803: Charge completed". */
-function formatVerisenseChargerStatus(status, hw) {
-    if (status.chargerPresent == null ||
-        status.chargerStatusCode == null ||
-        !status.chargerStatusName) {
-        return '-';
-    }
-    if (!status.chargerPresent) {
-        return 'Not present';
-    }
-    const chipFamily = inferVerisenseChargerChipFamily(hw?.revHwMajor ?? Number.NaN, hw?.revHwMinor ?? Number.NaN, hw?.revHwInternal ?? Number.NaN);
-    const text = describeVerisenseChargerStatus(chipFamily, Number(status.chargerStatusCode));
-    return chipFamily === 'UNKNOWN' ? text : `${chipFamily}: ${text}`;
-}
-/** Upper bound for a plausible device timestamp (2100-01-01 UTC in unix
- * seconds). Values beyond this are uninitialised/garbage bytes, not dates. */
-const VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS = 4102444800;
-/**
- * Format a device-RWC timestamp (unix seconds) as raw + human-readable datetime.
- *
- * The device RWC lives in the "local civil" domain (unix seconds with the
- * base station's timezone offset already baked in - see
- * {@link utcToLocalCivilMillis}), so the value is rendered VERBATIM via the
- * Date UTC accessors: the wall-clock time shown is exactly what the device's
- * clock reads. Rendering with the local-time accessors would apply the
- * browser's timezone offset a second time.
- */
-function formatVerisenseUnixAndHuman(unixSeconds) {
-    const unix = Number(unixSeconds);
-    if (!Number.isFinite(unix)) {
-        return { unix, human: 'invalid' };
-    }
-    if (unix <= 0) {
-        return { unix, human: '1970-01-01 00:00:00 (epoch)' };
-    }
-    if (unix > VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS) {
-        return { unix, human: 'not-valid' };
-    }
-    const d = new Date(unix * 1000);
-    const yyyy = d.getUTCFullYear();
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    const HH = String(d.getUTCHours()).padStart(2, '0');
-    const MM = String(d.getUTCMinutes()).padStart(2, '0');
-    const SS = String(d.getUTCSeconds()).padStart(2, '0');
-    return {
-        unix,
-        human: `${yyyy}-${mm}-${dd} ${HH}:${MM}:${SS}`,
-    };
-}
-/** Convert parsed status payload into an object with human-readable timestamps for logs. */
-function formatStatusPayloadForLog(status) {
-    return {
-        ...status,
-        statusTimestamp: formatVerisenseUnixAndHuman(status.statusTimestampSeconds),
-        lastOkTransfer: formatVerisenseUnixAndHuman(status.lastOkTransferSeconds),
-        lastFailTransfer: formatVerisenseUnixAndHuman(status.lastFailTransferSeconds),
-    };
-}
-/** Convert parsed scheduler payload into an object with human-readable timestamps for logs. */
-function formatSchedulerPayloadForLog(parsed) {
-    const out = {
-        ...parsed,
-        adaptiveScheduler: undefined,
-        ltfRetry: undefined,
-        currentTime: formatVerisenseUnixAndHuman(parsed.currentTimeUnixSeconds),
-        pendingDataTransfer: formatVerisenseUnixAndHuman(parsed.pendingDataTransferUnixSeconds),
-        pendingStatus1: formatVerisenseUnixAndHuman(parsed.pendingStatus1UnixSeconds),
-        pendingRtcSync: formatVerisenseUnixAndHuman(parsed.pendingRtcSyncUnixSeconds),
-        pendingRetry: formatVerisenseUnixAndHuman(parsed.pendingRetryUnixSeconds),
-    };
-    if (typeof parsed.pendingStatus2UnixSeconds === 'number') {
-        out.pendingStatus2 = formatVerisenseUnixAndHuman(parsed.pendingStatus2UnixSeconds);
-    }
-    if (typeof parsed.ppgMeasurementUnixSeconds === 'number') {
-        out.ppgMeasurement = formatVerisenseUnixAndHuman(parsed.ppgMeasurementUnixSeconds);
-    }
-    if (typeof parsed.stepCounterResetUnixSeconds === 'number') {
-        out.stepCounterReset = formatVerisenseUnixAndHuman(parsed.stepCounterResetUnixSeconds);
-    }
-    if (typeof parsed.sensorInactivityUnixSeconds === 'number') {
-        out.sensorInactivity = formatVerisenseUnixAndHuman(parsed.sensorInactivityUnixSeconds);
-    }
-    if (parsed.adaptiveScheduler) {
-        out.adaptiveScheduler = {
-            ...parsed.adaptiveScheduler,
-            nextTime: formatVerisenseUnixAndHuman(parsed.adaptiveScheduler.nextUnixSeconds),
-        };
-    }
-    if (parsed.ltfRetry) {
-        out.ltfRetry = {
-            ...parsed.ltfRetry,
-            nextTime: formatVerisenseUnixAndHuman(parsed.ltfRetry.nextUnixSeconds),
-        };
-    }
-    return out;
-}
-const PROD_CONFIG_FLAG_DFU_ENABLED = 1 << 0;
-const LOG_EVENT_NAMES = {
-    0: 'NONE',
-    1: 'BATTERY_FALL',
-    2: 'BATTERY_RECOVER',
-    3: 'WRITE_TO_FLASH_SUCCESS',
-    4: 'WRITE_TO_FLASH_FAIL_GENERAL',
-    5: 'WRITE_TO_FLASH_FULL',
-    6: 'WRITE_TO_FLASH_FAIL_CHECK_ADDR_FREE',
-    7: 'WRITE_TO_FLASH_FAIL_LOW_BATT_CHECK_ADDR_FREE',
-    8: 'WRITE_TO_FLASH_FAIL_LOW_BATT_FLASH_ON',
-    9: 'WRITE_TO_FLASH_FAIL_LOW_BATT_FLASH_WRITE',
-    10: 'WRITE_TO_FLASH_FAIL_LOW_BATT_BEFORE_START',
-    11: 'USB_PLUGGED_IN_SOFT_DEVICE',
-    12: 'USB_PLUGGED_OUT_SOFT_DEVICE',
-    13: 'RECORDING_PAUSED',
-    14: 'RECORDING_RESUMED',
-    15: 'BATTERY_RECOVER_IN_BATT_CHECK_TIMER',
-    16: 'TSK_FREE_UP_FLASH',
-    17: 'FREE_UP_FLASH_FAIL_LOW_BATT',
-    18: 'PAYLOAD_PACKAGING_TASK_SET',
-    19: 'PAYLOAD_PACKAGING_FUNCTION_CALL',
-    20: 'BATTERY_VOLTAGE',
-    21: 'TSK_WRITE_LOOKUP_TBL_CHANGES_TO_EEPROM',
-    22: 'LPCOMP_ON',
-    23: 'LPCOMP_ON_ALREADY',
-    24: 'LPCOMP_OFF',
-    25: 'LPCOMP_TRIED_BUT_BATT_LOW',
-    26: 'BLE_CONNECTED',
-    27: 'BLE_DISCONNECTED',
-    28: 'TSK_WRITE_FLASH',
-    29: 'PPG_TIMER_START',
-    30: 'PAYLOAD_OVERSHOT',
-    31: 'ADVERTISING_START',
-    32: 'ADVERTISING_STOP',
-    33: 'NIMH_BATT_PPG_BLOCKED_BLE_RETRY',
-    34: 'NIMH_BATT_PPG_BLOCKED_BLE_ADAPT_SCH',
-    35: 'NIMH_BATT_PPG_BLOCKED_BLE_PENDING_EVENTS',
-    36: 'NIMH_BATT_BLE_BLOCKED_PPG',
-    37: 'USB_PORT_OPEN',
-    38: 'USB_PORT_CLOSED',
-    39: 'FIFO_INT_SAFETY_CHECK_EVENT_ACCEL1',
-    40: 'FIFO_INT_SAFETY_CHECK_EVENT_ACCEL2GYRO',
-    41: 'FIFO_INT_SAFETY_CHECK_EVENT_MAX86XXX',
-    42: 'FIFO_INT_SAFETY_CHECK_EVENT_MAX3000X',
-    43: 'FIFO_INT_SAFETY_CHECK_EVENT_ADC',
-    44: 'USB_PLUGGED_IN_PIN_HANDLER',
-    45: 'USB_PLUGGED_OUT_PIN_HANDLER',
-    46: 'BATTERY_CHARGER_STATUS_BAD_BATTERY',
-    47: 'BATTERY_CHARGER_STATUS_CHARGING',
-    48: 'BATTERY_CHARGER_STATUS_CHARGING_COMPLETE',
-    49: 'BATTERY_CHARGER_STATUS_POWER_DOWN',
-    50: 'LTC4123_RECOVERY_ATTEMPT',
-    51: 'LTC4123_RECOVERY_GAVE_UP',
-    52: 'LTC4123_CHRG_COMPLETE_OVERRIDDEN_BAD_BATT',
-    // DEV-790 USB enumeration debug events
-    53: 'USB_POWER_READY_EVT',
-    54: 'USB_USBD_ENABLE_CALLED',
-    55: 'USB_USBD_START_CALLED',
-    56: 'USB_COM_PORT_DISABLED_ON_DETECT',
-    57: 'USB_USBD_STOPPED_EVT',
-};
-const LOOKUP_STATUS_NAMES = {
-    0: 'Zero',
-    1: 'Full',
-    2: '2Del',
-    3: 'Emty',
-    4: 'Bad',
-    5: 'NUse',
-};
-function u32le_at(bytes, off) {
-    return (((bytes[off] ?? 0) |
-        ((bytes[off + 1] ?? 0) << 8) |
-        ((bytes[off + 2] ?? 0) << 16) |
-        ((bytes[off + 3] ?? 0) << 24)) >>>
-        0);
-}
-function decodeAsciiTrimFF(bytes) {
-    let end = bytes.length;
-    while (end > 0 && bytes[end - 1] === 0xff)
-        end--;
-    if (end === 0)
-        return '';
-    return new TextDecoder().decode(bytes.slice(0, end));
-}
-/** Convert unix seconds into Verisense 7-byte RTC payload (4-byte minutes + 3-byte ticks). */
-function unixSecondsToAsmRtcBytes(unixSeconds) {
-    if (!Number.isFinite(unixSeconds) || unixSeconds < 0) {
-        throw new Error('unixSecondsToAsmRtcBytes: unixSeconds must be a finite positive number');
-    }
-    const minutes = Math.floor(unixSeconds / 60);
-    const secondsInMinute = unixSeconds - minutes * 60;
-    const ticks = Math.floor(secondsInMinute * 32768);
-    return new Uint8Array([
-        minutes & 0xff,
-        (minutes >> 8) & 0xff,
-        (minutes >> 16) & 0xff,
-        (minutes >> 24) & 0xff,
-        ticks & 0xff,
-        (ticks >> 8) & 0xff,
-        (ticks >> 16) & 0xff,
-    ]);
-}
-/** Convert Verisense 7-byte RTC payload into unix seconds. */
-function asmRtcBytesToUnixSeconds(rtc7) {
-    if (rtc7.length !== 7) {
-        throw new Error('asmRtcBytesToUnixSeconds: payload must be exactly 7 bytes');
-    }
-    const minutes = u32le_at(rtc7, 0);
-    const ticks = u24le(rtc7, 4);
-    return minutes * 60 + ticks / 32768.0;
-}
-/** Convert Verisense 8-byte minute counter payload into unix seconds. */
-function asmRtcMinutesBytesToUnixSeconds(minutes8) {
-    if (minutes8.length !== 8) {
-        throw new Error('asmRtcMinutesBytesToUnixSeconds: payload must be exactly 8 bytes');
-    }
-    let minutes = 0n;
-    for (let i = 0; i < 8; i++) {
-        minutes |= BigInt(minutes8[i]) << BigInt(i * 8);
-    }
-    return Number(minutes) * 60;
-}
-/**
- * Build a production configuration payload (56 bytes) from structured options.
- * This matches the Python tooling layout used by ASM_BLE.py / ASM_Device.py.
- */
-function buildProductionConfigPayload(opts) {
-    const mo = String(opts.manufacturingOrderNumberHex ?? '').trim();
-    const mac = String(opts.macIdHex ?? '').trim();
-    if (!/^[0-9a-fA-F]{8}$/.test(mo)) {
-        throw new Error('buildProductionConfigPayload: manufacturingOrderNumberHex must be 8 hex chars');
-    }
-    if (!/^[0-9a-fA-F]{4}$/.test(mac)) {
-        throw new Error('buildProductionConfigPayload: macIdHex must be 4 hex chars');
-    }
-    const uniqueBytes = new Uint8Array(6);
-    uniqueBytes.set(new Uint8Array(mo.match(/../g).map((h) => Number.parseInt(h, 16))), 0);
-    uniqueBytes.set(new Uint8Array(mac.match(/../g).map((h) => Number.parseInt(h, 16))), 4);
-    uniqueBytes.reverse();
-    const revHwInternal = (opts.revHwInternal ?? 0) & 0xffff;
-    const revFwInternal = (opts.revFwInternal ?? 0) & 0xffff;
-    const out = new Uint8Array(56);
-    out[0] = 0x5a;
-    out.set(uniqueBytes, 1);
-    out[7] = opts.revHwMajor & 0xff;
-    out[8] = opts.revHwMinor & 0xff;
-    out[9] = opts.revFwMajor & 0xff;
-    out[10] = opts.revFwMinor & 0xff;
-    out[11] = revFwInternal & 0xff;
-    out[12] = (revFwInternal >> 8) & 0xff;
-    out[13] = revHwInternal & 0xff;
-    out[14] = (revHwInternal >> 8) & 0xff;
-    // 0xFF is the "unset" sentinel for the passkey/advertising-name region
-    // (bytes 15..54). The configFlags byte (55) must NOT be left as 0xFF — its
-    // bit 0 is PROD_CONFIG_FLAG_DFU_ENABLED, so 0xFF reads as "DFU enabled" and
-    // disabling DFU would silently have no effect. It is set explicitly below.
-    out.fill(0xff, 15, 55);
-    const passkeyId = opts.passkeyId ?? '';
-    if (passkeyId.length > 0) {
-        if (passkeyId.length !== 2) {
-            throw new Error('buildProductionConfigPayload: passkeyId must be 2 chars when provided');
-        }
-        out.set(new TextEncoder().encode(passkeyId), 15);
-    }
-    const passkey = opts.passkey ?? '';
-    if (passkey.length > 0) {
-        if (passkey.length !== 6) {
-            throw new Error('buildProductionConfigPayload: passkey must be 6 chars when provided');
-        }
-        out.set(new TextEncoder().encode(passkey), 17);
-    }
-    const advPrefix = opts.advertisingNamePrefix ?? '';
-    if (advPrefix.length > 32) {
-        throw new Error('buildProductionConfigPayload: advertisingNamePrefix must be <= 32 chars');
-    }
-    if (advPrefix.length > 0) {
-        out.set(new TextEncoder().encode(advPrefix), 23);
-    }
-    // Always set configFlags explicitly (0x01 = DFU enabled on boot, 0x00 =
-    // disabled). Matches the firmware reference encoding in ASM_Device.py.
-    out[55] = (opts.dfuEnabled ?? true) ? PROD_CONFIG_FLAG_DFU_ENABLED : 0;
-    return out;
-}
-/** Parse production configuration with optional passkey/name/flag fields. */
-function parseProductionConfigPayloadFull(response) {
-    if (response.length < 11) {
-        throw new Error('parseProductionConfigPayloadFull: payload must be at least 11 bytes');
-    }
-    const base = parseProductionConfigPayload(response);
-    const uniqueIdentifier = [...response.slice(1, 7)]
-        .reverse()
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('')
-        .toUpperCase();
-    const revHwMajor = response[7] ?? 0;
-    const revHwMinor = response[8] ?? 0;
-    const revFwMajor = response[9] ?? 0;
-    const revFwMinor = response[10] ?? 0;
-    const revFwInternal = response.length >= 13 ? u16le_at(response, 11) : 0;
-    const revHwInternal = response.length >= 15 ? u16le_at(response, 13) : 0;
-    const passkeyId = response.length >= 17 ? decodeAsciiTrimFF(response.slice(15, 17)) : '';
-    const passkey = response.length >= 23 ? decodeAsciiTrimFF(response.slice(17, 23)) : '';
-    const advertisingNamePrefix = response.length >= 55 ? decodeAsciiTrimFF(response.slice(23, 55)) : '';
-    const dfuEnabled = response.length >= 56 ? !!(response[55] & PROD_CONFIG_FLAG_DFU_ENABLED) : true;
-    return {
-        ...base,
-        manufacturingOrderNumber: uniqueIdentifier.slice(0, 8),
-        macId: uniqueIdentifier.slice(8, 12),
-        uniqueIdentifier,
-        revHwMajor,
-        revHwMinor,
-        revHwInternal,
-        revFwMajor,
-        revFwMinor,
-        revFwInternal,
-        passkeyId,
-        passkey,
-        advertisingNamePrefix,
-        dfuEnabled,
-    };
-}
-/**
- * Parse STATUS1/STATUS2 payload into a typed object.
- *
- * This ports the core byte parsing from ASM_Device.parse_status while keeping
- * the output concise and UI-friendly.
- */
-function parseStatusPayload(response, sourceStatusProperty = 'status1') {
-    if (response.length < 24) {
-        throw new Error('parseStatusPayload: payload must be at least 24 bytes');
-    }
-    const uniqueIdentifier = [...response.slice(0, 6)]
-        .reverse()
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('')
-        .toUpperCase();
-    const hasTickFields = response.length >= 56;
-    const hasExtendedCapacity = response.length >= 65;
-    const statusTimestampSeconds = hasTickFields
-        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(6, 10), ...response.slice(34, 37)]))
-        : u32le_at(response, 6) * 60;
-    const batteryMilliVolts = u16le_at(response, 10);
-    const batteryPercent = response[12] ?? 0;
-    const lastOkTransferSeconds = hasTickFields
-        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(13, 17), ...response.slice(37, 40)]))
-        : u32le_at(response, 13) * 60;
-    const lastFailTransferSeconds = hasTickFields
-        ? asmRtcBytesToUnixSeconds(new Uint8Array([...response.slice(17, 21), ...response.slice(40, 43)]))
-        : u32le_at(response, 17) * 60;
-    const memoryFreeKb = hasExtendedCapacity
-        ? (response[21] | (response[22] << 8) | (response[23] << 16) | (response[57] << 24)) >>> 0
-        : (response[21] | (response[22] << 8) | (response[23] << 16)) >>> 0;
-    const memoryCapacityKb = hasExtendedCapacity ? u32le_at(response, 60) : null;
-    const memoryUsedKb = memoryCapacityKb == null ? null : Math.max(0, memoryCapacityKb - memoryFreeKb);
-    // Bank breakdown: FULL=syncable data, 2DEL=partially-deleted, BAD=unusable flash.
-    // Ported from ASM_Device.parse_status. Present in payloads >= 56 bytes. In the
-    // extended (fw v1.02.102+, payload >= 65 bytes) format the FULL and 2DEL totals
-    // are split: 3 low bytes at 47-49 / 50-52 plus a high byte appended at offset
-    // 58 / 59 respectively (mirroring the free-memory split to byte 57).
-    const hasBankData = response.length >= 56;
-    let memoryFullBanksKb = null;
-    let memoryTwoDelBanksKb = null;
-    let memoryBadBanksKb = null;
-    if (hasBankData) {
-        if (hasExtendedCapacity) {
-            memoryFullBanksKb =
-                (response[47] | (response[48] << 8) | (response[49] << 16) | (response[58] << 24)) >>> 0;
-            memoryTwoDelBanksKb =
-                (response[50] | (response[51] << 8) | (response[52] << 16) | (response[59] << 24)) >>> 0;
-            memoryBadBanksKb = u32le_at(response, 53); // bytes 53-56
-        }
-        else {
-            memoryFullBanksKb = (response[47] | (response[48] << 8) | (response[49] << 16)) >>> 0;
-            memoryTwoDelBanksKb = (response[50] | (response[51] << 8) | (response[52] << 16)) >>> 0;
-            memoryBadBanksKb = (response[53] | (response[54] << 8) | (response[55] << 16)) >>> 0;
-        }
-    }
-    const batteryFallCounter = response.length >= 26 ? u16le_at(response, 24) : null;
-    let statusFlags = null;
-    if (response.length >= 34) {
-        const f = response[26];
-        statusFlags = {
-            usbPluggedIn: (f & 0x01) !== 0,
-            recordingPaused: (f & 0x02) !== 0,
-            flashIsFull: (f & 0x04) !== 0,
-            powerIsGood: (f & 0x08) !== 0,
-            adaptiveSchedulerOn: (f & 0x10) !== 0,
-            dfuServiceOn: (f & 0x20) !== 0,
-            firstBoot: (f & 0x40) !== 0,
-            repeatedBatteryMeasurement: (f & 0x80) !== 0,
-        };
-    }
-    let chargerPresent = null;
-    let chargerStatusCode = null;
-    let chargerStatusName = null;
-    if (hasExtendedCapacity) {
-        const chargerStatusByte = response[64] ?? 0;
-        chargerPresent = (chargerStatusByte & 0x01) !== 0;
-        chargerStatusCode = (chargerStatusByte >> 1) & 0x07;
-        chargerStatusName =
-            chargerStatusCode === 0
-                ? 'CHARGER_STATUS_BAD_BATTERY'
-                : chargerStatusCode === 1
-                    ? 'CHARGER_STATUS_CHARGING'
-                    : chargerStatusCode === 2
-                        ? 'CHARGER_STATUS_CHARGING_COMPLETE'
-                        : chargerStatusCode === 3
-                            ? 'CHARGER_STATUS_POWER_DOWN'
-                            : chargerStatusCode === 4
-                                ? 'CHARGER_STATUS_TRICKLE_CHARGING'
-                                : chargerStatusCode === 7
-                                    ? 'CHARGER_STATUS_NOT_READ'
-                                    : 'CHARGER_STATUS_UNKNOWN';
-    }
-    // Second status-flags byte (byte 65; the byte-26 flags are full). Null
-    // (unknown) when the firmware predates it — never defaulted to false, which
-    // would wrongly steer users away from USB DFU on a capable unit.
-    const usbDfuBootloader = response.length >= 66 ? (response[65] & 0x01) !== 0 : null;
-    return {
-        uniqueIdentifier,
-        sourceStatusProperty,
-        statusTimestampSeconds,
-        batteryMilliVolts,
-        batteryPercent,
-        lastOkTransferSeconds,
-        lastFailTransferSeconds,
-        memoryFreeKb,
-        memoryCapacityKb,
-        memoryUsedKb,
-        memoryFullBanksKb,
-        memoryTwoDelBanksKb,
-        memoryBadBanksKb,
-        statusFlags,
-        batteryFallCounter,
-        chargerPresent,
-        chargerStatusCode,
-        chargerStatusName,
-        usbDfuBootloader,
-    };
-}
-/** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
-function parseSchedulerDebugPayload(payload) {
-    if (payload.length < 42) {
-        throw new Error('parseSchedulerDebugPayload: payload is too short');
-    }
-    let idx = 0;
-    const currentTimeUnixSeconds = asmRtcBytesToUnixSeconds(payload.slice(idx, idx + 7));
-    idx += 7;
-    const bleControlByte = payload[idx++] ?? 0xff;
-    const bleControlCounter = bleControlByte === 0x00
-        ? 'data-transfer'
-        : bleControlByte === 0x01
-            ? 'status1'
-            : bleControlByte === 0x02
-                ? 'rtc-sync'
-                : bleControlByte === 0x03
-                    ? 'status2'
-                    : bleControlByte === 0xff
-                        ? 'never'
-                        : 'unknown';
-    const next8 = () => {
-        const v = asmRtcMinutesBytesToUnixSeconds(payload.slice(idx, idx + 8));
-        idx += 8;
-        return v;
-    };
-    const out = {
-        currentTimeUnixSeconds,
-        bleControlCounter,
-        pendingDataTransferUnixSeconds: next8(),
-        pendingStatus1UnixSeconds: next8(),
-        pendingRtcSyncUnixSeconds: next8(),
-        pendingRetryUnixSeconds: next8(),
-        retryCount: payload[idx++] ?? 0,
-        retryOperation: (payload[idx++] ?? 0) === 1 ? 'ble-on' : 'ble-off',
-    };
-    if (payload.length >= idx + 10) {
-        out.adaptiveScheduler = {
-            nextUnixSeconds: next8(),
-            enabled: (payload[idx++] ?? 0) === 1,
-            syncFailCounter: payload[idx++] ?? 0,
-        };
-    }
-    if (payload.length >= idx + 11) {
-        const nextUnixSeconds = next8();
-        const op = payload[idx++] ?? 0;
-        out.ltfRetry = {
-            nextUnixSeconds,
-            currentOperation: op === 0
-                ? 'flash-write-retry-inactive'
-                : op === 1
-                    ? 'short-flash-write-retry'
-                    : op === 2
-                        ? 'attempt-flash-write'
-                        : op === 3
-                            ? 'long-flash-write-retry'
-                            : op === 4
-                                ? 'sensor-paused-until-usb-plug-in'
-                                : 'unknown',
-            failCounterShort: payload[idx++] ?? 0,
-            failCounterLong: payload[idx++] ?? 0,
-        };
-    }
-    if (payload.length >= idx + 8) {
-        out.pendingStatus2UnixSeconds = next8();
-    }
-    if (payload.length >= idx + 8) {
-        out.ppgMeasurementUnixSeconds = next8();
-    }
-    if (payload.length >= idx + 8) {
-        out.stepCounterResetUnixSeconds = next8();
-    }
-    if (payload.length >= idx + 8) {
-        out.sensorInactivityUnixSeconds = next8();
-    }
-    return out;
-}
-/** Decode the `optimizationResult` byte from {@link parseBleLinkDebugPayload}
- * (see {@link VerisenseBleOptimizationResult} for the bit meanings). */
-function decodeVerisenseBleOptimizationResult(resultByte) {
-    const mask = Number(resultByte ?? 0) & 0xff;
-    return {
-        notConnected: (mask & 0x80) !== 0,
-        phyRequested: (mask & 0x01) !== 0,
-        connIntervalRequested: (mask & 0x02) !== 0,
-        dataLengthRequested: (mask & 0x04) !== 0,
-        resultMask: mask,
-    };
-}
-/** Parse debug payload from BLE link read/optimize commands. */
-function parseBleLinkDebugPayload(payload) {
-    if (payload.length < 10) {
-        throw new Error('parseBleLinkDebugPayload: payload is too short');
-    }
-    const connectionIntervalUnits = u16le_at(payload, 4);
-    return {
-        attMtu: u16le_at(payload, 0),
-        maxDataLength: u16le_at(payload, 2),
-        connectionIntervalUnits,
-        connectionIntervalMs: connectionIntervalUnits * 1.25,
-        txPhy: payload[6] ?? 0,
-        rxPhy: payload[7] ?? 0,
-        optimizationResult: payload[8] ?? 0,
-        isConnected: (payload[9] ?? 0) !== 0,
-    };
-}
-/** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
-function parsePayloadCrcErrorBankIndexes(payload) {
-    if (payload.length % 2 !== 0) {
-        throw new Error('parsePayloadCrcErrorBankIndexes: payload length must be even');
-    }
-    const out = [];
-    for (let i = 0; i < payload.length; i += 2)
-        out.push(u16le_at(payload, i));
-    return out;
-}
-/** Parse 8-byte debug event-log entries. */
-function parseEventLogPayload(payload) {
-    if (payload.length % 8 !== 0) {
-        throw new Error('parseEventLogPayload: payload length must be a multiple of 8');
-    }
-    const out = [];
-    for (let i = 0; i < payload.length; i += 8) {
-        const entry = payload.slice(i, i + 8);
-        const eventId = entry[7];
-        if (eventId === 0)
-            continue;
-        out.push({
-            index: i / 8,
-            eventId,
-            eventName: LOG_EVENT_NAMES[eventId] ?? `EVENT_${eventId}`,
-            timestampUnixSeconds: eventId === 20 ? null : asmRtcBytesToUnixSeconds(entry.slice(0, 7)),
-            batteryMilliVolts: eventId === 20 ? u24le(entry, 0) : null,
-        });
-    }
-    return out;
-}
-/** Parse record-buffer details payload (26-byte current layout, 19-byte legacy layout). */
-function parseRecordBufferDetailsPayload(payload) {
-    const bytesPerBuffer = payload.length % 26 === 0 ? 26 : payload.length % 19 === 0 ? 19 : 0;
-    if (!bytesPerBuffer) {
-        throw new Error('parseRecordBufferDetailsPayload: unsupported payload length');
-    }
-    const out = [];
-    for (let i = 0; i < payload.length; i += bytesPerBuffer) {
-        const row = payload.slice(i, i + bytesPerBuffer);
-        out.push({
-            bufferIndex: row[0],
-            bufferState: row[1],
-            packagedPayloadIndex: u16le_at(row, 2),
-            currentByteIndexForSensorData: u16le_at(row, 4),
-            usedBufferLength: u16le_at(row, 6),
-            fifoTicks: u16le_at(row, 8),
-            dataTimestampRwcMinutes: u32le_at(row, 10),
-            dataTimestampRwcTicks: u24le(row, 14),
-            temperatureData: u16le_at(row, 17),
-            dataTimestampUcClockMinutes: bytesPerBuffer >= 23 ? u32le_at(row, 19) : null,
-            dataTimestampUcClockTicks: bytesPerBuffer >= 26 ? u24le(row, 23) : null,
-        });
-    }
-    return out;
-}
-/**
- * Infer the lookup-table bank count from a raw debug payload length. The payload
- * is 3 bytes per bank, optionally prefixed with a 4-byte head/tail block.
- * Returns 0 if the length matches neither layout.
- */
-function inferVerisenseLookupBankCount(payloadLen) {
-    if (!Number.isFinite(payloadLen) || payloadLen <= 0)
-        return 0;
-    if (payloadLen >= 4 && (payloadLen - 4) % 3 === 0)
-        return Math.floor((payloadLen - 4) / 3);
-    if (payloadLen % 3 === 0)
-        return Math.floor(payloadLen / 3);
-    return 0;
-}
-/**
- * Parse lookup-table debug payload entries (3 bytes per bank), with optional
- * 4-byte tail/head prefix present in older firmware debug responses. When
- * `totalBanks` is omitted it is inferred from the payload length via
- * {@link inferVerisenseLookupBankCount}.
- */
-function parseLookupTablePayload(payload, totalBanks) {
-    const bytesPerBank = 3;
-    const banks = totalBanks ?? inferVerisenseLookupBankCount(payload.length);
-    const expectedNoHeadTail = banks * bytesPerBank;
-    const expectedWithHeadTail = expectedNoHeadTail + 4;
-    let data = payload;
-    let head = null;
-    let tail = null;
-    if (payload.length === expectedWithHeadTail) {
-        tail = u16le_at(payload, 0);
-        head = u16le_at(payload, 2);
-        data = payload.slice(4);
-    }
-    else if (payload.length !== expectedNoHeadTail) {
-        throw new Error(`parseLookupTablePayload: payload length ${payload.length} does not match expected ${expectedNoHeadTail} or ${expectedWithHeadTail}`);
-    }
-    const entries = [];
-    for (let bankIndex = 0; bankIndex < banks; bankIndex++) {
-        const off = bankIndex * bytesPerBank;
-        const statusByte = data[off];
-        const pendingEepromWrite = (statusByte & 0x80) !== 0;
-        const statusCode = statusByte & 0x7f;
-        entries.push({
-            bankIndex,
-            statusCode,
-            statusName: LOOKUP_STATUS_NAMES[statusCode] ?? 'Unknown',
-            pendingEepromWrite,
-            payloadIndex: u16le_at(data, off + 1),
-        });
-    }
-    return { head, tail, entries };
-}
-/**
- * Parse the production config response payload into a structured object.
- */
-function parseProductionConfigPayload(response) {
-    const configHeader = response[0];
-    const asmid = [...response.slice(1, 7)]
-        .reverse()
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('');
-    const revHwMajor = response[7];
-    const revHwMinor = response[8];
-    const revFwMajor = response[9];
-    const revFwMinor = response[10];
-    const fwInternalArray = response.slice(11, 13);
-    const revFwInternal = fwInternalArray[0] | (fwInternalArray[1] << 8);
-    let revHwInternal = 0;
-    if (response.length >= 15) {
-        const hwInternalArray = response.slice(13, 15);
-        if (!isUniformByteArray(hwInternalArray, 0xff)) {
-            revHwInternal = hwInternalArray[0] | (hwInternalArray[1] << 8);
-        }
-    }
-    return {
-        hardware: `${revHwMajor}.${revHwMinor}.${revHwInternal}`,
-        firmware: `${revFwMajor}.${revFwMinor}.${revFwInternal}`,
-        asmid: asmid.toUpperCase(),
-        configHeader,
-        revHwMajor,
-        revHwMinor,
-        revHwInternal,
-        revFwMajor,
-        revFwMinor,
-        revFwInternal,
-    };
-}
-/**
- * Firmware default passkeys by passkey ID: a production config programmed
- * with passkey ID "01" pairs with the fixed PIN "123456". Other IDs have no
- * fixed default (ID "00" uses the per-device derived PIN — see
- * {@link computeVerisensePairingPin}).
- */
-const VERISENSE_DEFAULT_PASSKEY_BY_ID = Object.freeze({
-    '01': '123456',
-});
-/** The fixed passkey for a passkey ID, or undefined when the ID has none
- * (leave the passkey bytes unset in the production config). */
-function defaultVerisensePasskeyForId(passkeyId) {
-    return VERISENSE_DEFAULT_PASSKEY_BY_ID[String(passkeyId ?? '').trim()];
-}
-/**
- * Build the name a Verisense sensor advertises over BLE:
- * `<prefix>-<passkeyId>-<uniqueId>` (e.g. "Verisense-01-25112101B10F").
- * Returns null when any part is missing — matches how apps derive the name
- * from a parsed production config that may be blank/erased.
- */
-function buildVerisenseAdvertisedName(parts) {
-    const prefix = String(parts.prefix ?? '').trim();
-    const passkeyId = String(parts.passkeyId ?? '').trim();
-    const uniqueId = String(parts.uniqueId ?? '').trim();
-    if (!prefix || !passkeyId || !uniqueId)
-        return null;
-    return `${prefix}-${passkeyId}-${uniqueId}`;
-}
-/**
- * Split a Verisense advertised name back into its parts. The unique ID is the
- * final `-`-separated token; the passkey ID the token before it; anything
- * earlier (which may itself contain `-`) is the prefix. Returns null when the
- * name does not have at least three tokens.
- */
-function parseVerisenseAdvertisedName(name) {
-    const tokens = String(name ?? '')
-        .trim()
-        .split('-');
-    if (tokens.length < 3)
-        return null;
-    const uniqueId = tokens[tokens.length - 1];
-    const passkeyId = tokens[tokens.length - 2];
-    const prefix = tokens.slice(0, -2).join('-');
-    if (!prefix || !passkeyId || !uniqueId)
-        return null;
-    return { prefix, passkeyId, uniqueId };
-}
-/**
- * The 4-hex MAC ID from a Verisense advertised name (the advertised name ends
- * with the unique ID = manufacturing order + MAC; its last 4 hex chars are
- * the MAC ID). Returns null when the tail is not valid hex.
- */
-function deriveVerisenseMacIdFromName(name) {
-    const tail = (String(name ?? '')
-        .trim()
-        .split('-')
-        .pop() ?? '')
-        .replace(/[^0-9A-Fa-f]/g, '')
-        .toUpperCase()
-        .slice(-4);
-    return /^[0-9A-F]{4}$/.test(tail) ? tail : null;
-}
-/**
- * Short device tag for file names (e.g. "…-B10F-…"): the last 4 hex chars of
- * a device unique ID or advertised name. Returns "" when unknown so callers
- * can omit it cleanly.
- */
-function verisenseDeviceFileTag(idOrName) {
-    const hex = String(idOrName ?? '').replace(/[^0-9A-Fa-f]/g, '');
-    return hex.length >= 4 ? hex.slice(-4).toUpperCase() : '';
-}
-
-function pad2(n) {
-    return Math.trunc(n).toString().padStart(2, '0');
-}
-function pad5(n) {
-    return Math.trunc(n).toString().padStart(5, '0');
-}
-function dateToYyMMddHHmmss(date) {
-    const yy = pad2(date.getUTCFullYear() % 100);
-    const mm = pad2(date.getUTCMonth() + 1);
-    const dd = pad2(date.getUTCDate());
-    const hh = pad2(date.getUTCHours());
-    const min = pad2(date.getUTCMinutes());
-    const ss = pad2(date.getUTCSeconds());
-    return `${yy}${mm}${dd}_${hh}${min}${ss}`;
-}
-/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
-function buildUploadBinaryFileName(uploadDate, firstPayloadIndex) {
-    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
-        throw new Error('buildUploadBinaryFileName: firstPayloadIndex must be in range 0..65535');
-    }
-    return `${dateToYyMMddHHmmss(uploadDate)}_${pad5(firstPayloadIndex)}.bin`;
-}
-/**
- * Ensure a nested directory path exists under a root directory handle, creating
- * each level as needed, and return the leaf handle. Browser-only (File System
- * Access API) — the app obtains `root` from `showDirectoryPicker()` when the
- * user selects an output location at transfer start.
- */
-async function ensureDirectoryPath(root, segments) {
-    let dir = root;
-    for (const seg of segments) {
-        dir = await dir.getDirectoryHandle(seg, { create: true });
-    }
-    return dir;
-}
-/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
-function buildParsedCsvFileName(startDate, dataSource, firstPayloadIndex) {
-    if (!dataSource || !String(dataSource).trim()) {
-        throw new Error('buildParsedCsvFileName: dataSource must be a non-empty string');
-    }
-    if (!Number.isFinite(firstPayloadIndex) || firstPayloadIndex < 0 || firstPayloadIndex > 0xffff) {
-        throw new Error('buildParsedCsvFileName: firstPayloadIndex must be in range 0..65535');
-    }
-    return `${dateToYyMMddHHmmss(startDate)}_${String(dataSource).trim()}_${pad5(firstPayloadIndex)}.csv`;
-}
-/** Add duplicate suffix like " (2)" before extension. */
-function applyDuplicateSuffix(fileName, duplicateIndex) {
-    if (duplicateIndex < 2) {
-        throw new Error('applyDuplicateSuffix: duplicateIndex must be >= 2');
-    }
-    const idx = fileName.lastIndexOf('.');
-    if (idx <= 0)
-        return `${fileName} (${duplicateIndex})`;
-    const stem = fileName.slice(0, idx);
-    const ext = fileName.slice(idx);
-    return `${stem} (${duplicateIndex})${ext}`;
-}
-/** Return first non-colliding duplicate name for a target file name. */
-function nextAvailableDuplicateFileName(fileName, existingNames) {
-    const existing = new Set(existingNames);
-    if (!existing.has(fileName))
-        return fileName;
-    let i = 2;
-    while (true) {
-        const candidate = applyDuplicateSuffix(fileName, i);
-        if (!existing.has(candidate))
-            return candidate;
-        i++;
-    }
-}
-/** Parse first payload index (uint16 LE) from a payload byte array. */
-function getFirstPayloadIndex(payload) {
-    if (payload.length < 2) {
-        throw new Error('getFirstPayloadIndex: payload must contain at least 2 bytes');
-    }
-    return u16le_at(payload, 0);
-}
-/**
- * Evaluate whether parsed CSV output should roll to a new file.
- * Rules mirror ASM-DES08 split conditions.
- */
-function evaluateParsedFileSplit(input) {
-    const reasons = [];
-    const prev = input.prevTimestampSec;
-    const curr = input.currTimestampSec;
-    // Split when crossing 12:00am or 12:00pm boundaries.
-    const prevHalfDay = Math.floor(prev / (12 * 60 * 60));
-    const currHalfDay = Math.floor(curr / (12 * 60 * 60));
-    if (currHalfDay !== prevHalfDay)
-        reasons.push('midday-midnight-boundary');
-    if ((input.prevConfigSignature ?? null) !== (input.currConfigSignature ?? null)) {
-        reasons.push('config-change');
-    }
-    if (input.expectedDeltaSec != null) {
-        const tol = Math.max(0, input.timestampToleranceSec ?? 0);
-        const delta = curr - prev;
-        if (Math.abs(delta - input.expectedDeltaSec) > tol) {
-            reasons.push('timestamp-discontinuity');
-        }
-    }
-    if (input.powerResetDetected) {
-        reasons.push('power-reset');
-    }
-    return { shouldSplit: reasons.length > 0, reasons };
-}
-
 /**
  * Public types for the Shimmer3 / Shimmer3R binary SD-log decoder.
  */
@@ -18651,6 +19847,13 @@ class Shimmer3Client extends BaseShimmerClient {
         // The width is a firmware property the handshake has established by now:
         // 16 bits, wrapping every 2 s, on anything older than LogAndStream 0.5.4.
         this._timeline.setTimestampBits(this._timestampFmt === 'u16' ? 16 : 24);
+        /* And the rate, which sizes the reorder window: eight sample periods is
+           what separates a pair of packets delivered out of order from a dropout
+           that happens to span the counter's wrap point. Without it the window
+           falls back to an eighth of the modulo, which on the 16-bit counter is
+           0.25 s and reads an ordinary 1.8 s gap as a reorder. Zero means the
+           inquiry has not run, and `null` says so rather than passing it on. */
+        this._timeline.setSamplingRateHz(this.samplingRateHz > 0 ? this.samplingRateHz : null);
         this._timeline.reset();
         if (!this.anchorStreamClock || this._timeline.hasAnchorRequest)
             return;
@@ -19171,7 +20374,7 @@ class Shimmer3Client extends BaseShimmerClient {
                     const frame = buf.subarray(0, frameBytes);
                     let cursor = 1;
                     const oc = new ObjectCluster(this._deviceId());
-                    const ts = tsBytes === 2 ? u16le$4(frame, cursor) : u24le$1(frame, cursor);
+                    const ts = tsBytes === 2 ? u16le$3(frame, cursor) : u24le(frame, cursor);
                     cursor += tsBytes;
                     oc.add('TIMESTAMP', ts, CHANNEL_UNITS.TICKS, 'raw');
                     /* Unwrap the counter — every 2 s on older firmware, every 512 s on
@@ -19186,16 +20389,16 @@ class Shimmer3Client extends BaseShimmerClient {
                         let v;
                         switch (f.fmt) {
                             case 'i16':
-                                v = f.endian === 'be' ? sign16(u16be$2(frame, cursor)) : sign16(u16le$4(frame, cursor));
+                                v = f.endian === 'be' ? sign16(u16be$2(frame, cursor)) : sign16(u16le$3(frame, cursor));
                                 break;
                             case 'u16':
-                                v = f.endian === 'be' ? u16be$2(frame, cursor) : u16le$4(frame, cursor);
+                                v = f.endian === 'be' ? u16be$2(frame, cursor) : u16le$3(frame, cursor);
                                 break;
                             case 'i24':
-                                v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le$1(frame, cursor));
+                                v = f.endian === 'be' ? sign24(u24be(frame, cursor)) : sign24(u24le(frame, cursor));
                                 break;
                             case 'u24':
-                                v = f.endian === 'be' ? u24be(frame, cursor) : u24le$1(frame, cursor);
+                                v = f.endian === 'be' ? u24be(frame, cursor) : u24le(frame, cursor);
                                 break;
                             case 'i12*': {
                                 const raw12 = ((frame[cursor] & 0xff) << 4) | ((frame[cursor + 1] & 0xff) >> 4);
@@ -19206,7 +20409,7 @@ class Shimmer3Client extends BaseShimmerClient {
                                 v = frame[cursor];
                                 break;
                             default:
-                                v = u16le$4(frame, cursor);
+                                v = u16le$3(frame, cursor);
                         }
                         cursor += f.sizeBytes;
                         oc.add(f.name, v, CHANNEL_UNITS.NO_UNITS, 'raw');
@@ -20412,8 +21615,49 @@ const SMARTDOCK_BASE_CMD = Object.freeze({
 const SMARTDOCK_DEFAULTS = Object.freeze({
     RESPONSE_TIMEOUT_MS: 1000,
     SLOT_CHANGE_TIMEOUT_MS: 10000,
+    /**
+     * Settle after a WITHOUT-SD slot change, before the per-Shimmer UART is
+     * usable (`SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD`, AbstractDock.java:96).
+     *
+     * The unqualified name is kept for compatibility; the qualified aliases
+     * below say which of the Java's three delays this actually is.
+     */
     SLOT_CHANGEOVER_DELAY_MS: 1500,
+    /** The same value, named for what it is. */
+    SLOT_CHANGEOVER_DELAY_WITHOUT_SD_MS: 1500,
+    /**
+     * Settle after a WITH-SD slot change, which has to wait for the host to
+     * mount the card as well as for the dock to re-route
+     * (`SLOT_CHANGEOVER_DELAY_WITH_SD_CARD_WIN`, AbstractDock.java:94).
+     *
+     * More than three times the without-SD delay, and the Java carries the note
+     * "2017-05-17 was 3000" against it — it had to be raised in the field.
+     */
+    SLOT_CHANGEOVER_DELAY_WITH_SD_WIN_MS: 5000,
+    /** As above on macOS/Linux (AbstractDock.java:95, selected by `getSDMountDelay()`). */
+    SLOT_CHANGEOVER_DELAY_WITH_SD_UNIX_MS: 6000,
     CMD_RETRY_ATTEMPTS: 2,
+    /**
+     * Attempts at the FIRST per-Shimmer read after a slot change
+     * (`READ_MAC_RETRY_ATTEMPTS`, AbstractDock.java:92, used by
+     * `readMacId()` at :1151-1165, which throws only on the last attempt).
+     *
+     * The settle delay above is **not** treated as sufficient on its own by the
+     * Java driver: it expects the first read after a re-route to fail sometimes
+     * and retries it. Observed here too — a Base 6 slot answered `BAD_CMD` to a
+     * `READ VER` immediately after a slot change and answered correctly on the
+     * next attempt.
+     */
+    READ_RETRY_ATTEMPTS: 2,
+    /**
+     * Wait between writing a docked Shimmer's configuration and reading it back
+     * (`SHIMMER_CONFIG_WRITE_READ_DELAY`, AbstractDock.java:90, applied at
+     * BasicDock.java:1039 between an InfoMem write and the re-read).
+     *
+     * A read-back issued immediately after a config write is not guaranteed to
+     * see the write.
+     */
+    CONFIG_WRITE_READ_DELAY_MS: 500,
 });
 /**
  * Base hardware IDs from the version response's hardware-version field
@@ -21901,6 +23145,25 @@ const gsrChannel = () => ({
     dataType: 'u16',
     sizeBytes: 2,
 });
+/** `'TEMPERATURE_BMP581'` — emitted calibrated, in °C. */
+const SDLOG_BMP581_TEMPERATURE_NAME = 'TEMPERATURE_BMP581';
+/** `'PRESSURE_BMP581'` — emitted calibrated, in kPa. */
+const SDLOG_BMP581_PRESSURE_NAME = 'PRESSURE_BMP581';
+/**
+ * The BMP581 pair, on the wire exactly as the BMP390's (`0x1A`/`0x1B`, 3 bytes
+ * each, little-endian) but emitted calibrated: the part compensates on-chip,
+ * so a fixed scale is all that stands between its registers and kPa / °C, and
+ * there is no coefficient block to be missing. The BMP390 pair stays raw — its
+ * compensation needs the header's 21-byte trim block, which this decoder does
+ * not yet apply.
+ */
+const bmp581Channel = (name, unit) => ({
+    name,
+    unit,
+    calibrated: true,
+    dataType: 'u24',
+    sizeBytes: 3,
+});
 /**
  * Build the Shimmer3 (256-byte header) channel list from the enabled-sensors
  * value. The order and datatypes replicate the "modern Shimmer3" branch of
@@ -22055,6 +23318,7 @@ const SHIMMER3R_SIGNAL_ID_TABLE = Object.freeze({
     0x17: uncal('ALT_MAG_X', 'i16'),
     0x18: uncal('ALT_MAG_Y', 'i16'),
     0x19: uncal('ALT_MAG_Z', 'i16'),
+    // BMP390. A BMP581 board gets bmp581Channel instead (buildShimmer3RSdLogChannels).
     0x1a: uncal('TEMPERATURE_BMP390', 'u24'),
     0x1b: uncal('PRESSURE_BMP390', 'u24'),
     0x1c: gsrChannel(),
@@ -22076,11 +23340,24 @@ const SHIMMER3R_SIGNAL_ID_TABLE = Object.freeze({
  * channel table stored in the header (byte 314 = nChannels, bytes 315.. =
  * signal IDs). Unknown IDs fall back to a `u12` channel named after the ID,
  * matching the Java catch-all (ShimmerObject.java:3579-3583).
+ *
+ * @param bmp581 True when `0x1A`/`0x1B` are a BMP581 rather than a BMP390. The
+ *   header carries no sensor id, so the caller decides from the board's SR
+ *   number (`isBmp581PresentPerSrNumber`), as the Java driver does
+ *   (ShimmerObject.java:3470-3497, `isSupportedBmp581()`).
  */
-function buildShimmer3RSdLogChannels(signalIds) {
+function buildShimmer3RSdLogChannels(signalIds, bmp581 = false) {
     const ch = [];
     for (let i = 0; i < signalIds.length; i++) {
         const id = signalIds[i];
+        if (bmp581 && id === 0x1a) {
+            ch.push(bmp581Channel(SDLOG_BMP581_TEMPERATURE_NAME, CHANNEL_UNITS.DEGREES_CELSIUS));
+            continue;
+        }
+        if (bmp581 && id === 0x1b) {
+            ch.push(bmp581Channel(SDLOG_BMP581_PRESSURE_NAME, CHANNEL_UNITS.KPASCAL));
+            continue;
+        }
         const spec = SHIMMER3R_SIGNAL_ID_TABLE[id];
         ch.push(spec ? { ...spec } : uncal(String(id), 'u12'));
     }
@@ -22399,7 +23676,22 @@ function parseSdLog(bytes) {
         if (315 + nChannels > headerLengthBytes) {
             throw new SdLogFormatError('BAD_HEADER', `Shimmer3R channel table overruns the header (nChannels=${nChannels}).`);
         }
-        channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels));
+        // The header names no pressure part, and a BMP581 leaves the calibration
+        // region unwritten rather than marking it (SDCard/shimmer_sd_header.c:209-215),
+        // so the board's SR number decides, as the firmware's own fallback does.
+        // HARDWARE-VERIFY: pinned by synthetic headers only; no SD file from a
+        // BMP581 unit has been decoded and checked against a Consensys export yet.
+        const bmp581 = isBmp581PresentPerSrNumber({
+            hardwareVersion,
+            firmwareId,
+            firmwareVersion: fwVersion,
+            board: expansionBoard && {
+                boardId: expansionBoard.id,
+                boardRev: expansionBoard.rev,
+                specialRev: expansionBoard.revSpecial,
+            },
+        });
+        channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels), bmp581);
     }
     else {
         channels = buildShimmer3SdLogChannels(enabledSensors, newImu);
@@ -22459,6 +23751,74 @@ function parseSdLog(bytes) {
  */
 function parseSdLogHeader(bytes) {
     return parseSdLog(bytes).header;
+}
+
+/**
+ * Places the first record of an SD data file at the time it was actually
+ * sampled (DEV-1095). Port of the Java driver's
+ * `driverUtilities/SdTimestampAnchor` — keep the two in step.
+ *
+ * A file's timeline is its header's initial timestamp plus the elapsed ticks of
+ * its records. Subtracting the first record's raw timestamp pins that record to
+ * the header time, which is only right if the header holds the first record's
+ * time. LogAndStream does not write that: the header carries the RTC at the
+ * moment the file was *created* (`sdFileSyncTs`), and records buffered when the
+ * file opened were sampled before it. File 000 is created after sampling starts
+ * (SD power-up, directory, header), so its first records predate the header by
+ * roughly 160 ms more than at a mid-stream split — a permanent step back at the
+ * 000 → 001 boundary.
+ *
+ * A record's 3-byte timestamp is the low 24 bits of the same 32768 Hz counter
+ * as the header's initial timestamp, so the first record's full counter value
+ * is the header value moved by the signed, wrap-corrected distance between the
+ * two low parts. Exact whenever the header lies within 256 s (half the counter
+ * period) of the first record, whichever moment the firmware chose for it.
+ *
+ * Counter domain: apply this before adding the RTC difference, which on
+ * Shimmer3 is an arbitrary offset to real time.
+ *
+ * Verified on Shimmer3R: the raw 000/001 files of a 1024 Hz recording put each
+ * first packet 162.72 ms and 3.94 ms before its header, and anchored this way
+ * the 000 → 001 split is exactly one sample period (tests/sdlog/anchor.test.ts).
+ *
+ * HARDWARE-VERIFY: Shimmer3 (MSP430) is not yet verified. Its RTC difference
+ * is an offset from the free-running counter to real time rather than the
+ * counter's high bytes, so confirm on a Shimmer3 session's raw 000/001 files
+ * that the first packet's low 24 bits share the header's counter domain and
+ * that its splits close to one sample period.
+ */
+/** 2^24: modulo of the 3-byte tick counter (512 s at 32768 Hz). */
+const TICKS_MAX_3_BYTE = 2 ** 24;
+/**
+ * Largest header-to-first-record distance read as a lead time: 10 s at
+ * 32768 Hz. The real lead is well under a second, so a larger distance means
+ * the header does not describe this counter.
+ */
+const SDLOG_MAX_LEAD_TICKS = 10 * 32768;
+const floorMod = (a, m) => ((a % m) + m) % m;
+/**
+ * Signed distance from the header's low bits to the first record's raw
+ * timestamp, folded into `[-maxTicks/2, maxTicks/2)`: positive when the record
+ * was sampled after the header was written, negative when before.
+ */
+function signedLeadTicks(initialTicks, firstRawTicks, maxTicks) {
+    const half = maxTicks / 2;
+    const low = floorMod(initialTicks, maxTicks);
+    return floorMod(firstRawTicks - low + half, maxTicks) - half;
+}
+/**
+ * The value to subtract from `initialTicks + unwrapped` so each record lands on
+ * its own counter time. Falls back to the first record's raw timestamp — the
+ * previous behaviour, pinning it to the header — for a 2-byte counter, an
+ * initial timestamp of zero, or a distance beyond {@link SDLOG_MAX_LEAD_TICKS}.
+ */
+function firstTsOffsetFromInitialTsTicks(initialTicks, firstRawTicks, maxTicks) {
+    if (maxTicks !== TICKS_MAX_3_BYTE || initialTicks === 0)
+        return firstRawTicks;
+    const lead = signedLeadTicks(initialTicks, firstRawTicks, maxTicks);
+    if (Math.abs(lead) > SDLOG_MAX_LEAD_TICKS)
+        return firstRawTicks;
+    return firstRawTicks - lead;
 }
 
 /**
@@ -22622,6 +23982,29 @@ function calibrateTriple(x, y, z, cal) {
 function calibrateGsr(raw, gsrRangeSetting) {
     return calibrateGsrSample(raw, gsrRangeSetting).conductanceUSiemens;
 }
+/**
+ * Locate the BMP581 pair, or null when the file has neither channel — which is
+ * every file whose board the SR rule gives a BMP390, because only
+ * `buildShimmer3RSdLogChannels` names these.
+ */
+function findBmp581(channels) {
+    const pressure = channels.findIndex((c) => c.name === SDLOG_BMP581_PRESSURE_NAME);
+    const temperature = channels.findIndex((c) => c.name === SDLOG_BMP581_TEMPERATURE_NAME);
+    return pressure < 0 && temperature < 0 ? null : { pressure, temperature };
+}
+/**
+ * Replace the BMP581 pair's raw values in place with kPa and °C, through the
+ * same `compensateBmp581` the streaming path dispatches to. Each output is a
+ * fixed scale of its own register, so a file that somehow carries only one of
+ * the two still converts it correctly.
+ */
+function applyBmp581(values, idx) {
+    const out = compensateBmp581(idx.pressure < 0 ? 0 : values[idx.pressure], idx.temperature < 0 ? 0 : values[idx.temperature]);
+    if (idx.pressure >= 0)
+        values[idx.pressure] = out.pressureKPa;
+    if (idx.temperature >= 0)
+        values[idx.temperature] = out.temperatureC;
+}
 function decodeRecordsFromFile(bytes, parsed, out, budget) {
     const { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz } = parsed;
     // Build the inertial calibration plan once per file. This also flips the
@@ -22630,6 +24013,7 @@ function decodeRecordsFromFile(bytes, parsed, out, budget) {
     // calibrated. LN accel, WR accel, gyro, mag (+ Shimmer3R alt accel/mag).
     const calibPlan = buildSdLogCalibPlan(header, channels);
     header.calibration = calibPlan.info;
+    const bmp581 = findBmp581(channels);
     const packetSize = header.packetSizeBytes;
     const tsBytes = header.timestampBytes;
     const maxTicks = 2 ** (8 * tsBytes);
@@ -22640,13 +24024,12 @@ function decodeRecordsFromFile(bytes, parsed, out, budget) {
     // restart from cycle 0 with their own header initial timestamp.
     let cycle = 0;
     let lastUnwrapped = 0;
-    // ShimmerObject#parseTimestampShimmer3 subtracts the FIRST packet's raw
-    // timestamp before adding the header's initial timestamp: on modern
-    // firmware the 5-byte initial timestamp is the full clock at the first
-    // packet, whose low bytes are that packet's raw timestamp — without the
-    // subtraction those low bytes would be double-counted
-    // (mFirstTsOffsetFromInitialTsTicks in the Java driver).
-    let firstRawTicks = null;
+    // Subtracted, with the header's initial timestamp added, from each unwrapped
+    // timestamp (mFirstTsOffsetFromInitialTsTicks in the Java driver). The header
+    // holds the RTC when the file was created, not the first packet's time, so
+    // the offset re-anchors the file on the first packet's own counter value —
+    // see ./anchor.ts (DEV-1095).
+    let firstTsOffsetTicks = null;
     let pos = header.headerLengthBytes;
     let samplesInBlock = 0;
     while (budget.remaining > 0) {
@@ -22673,21 +24056,25 @@ function decodeRecordsFromFile(bytes, parsed, out, budget) {
             unwrapped = rawTs + maxTicks * cycle;
         }
         lastUnwrapped = unwrapped;
-        if (firstRawTicks === null)
-            firstRawTicks = rawTs;
+        if (firstTsOffsetTicks === null) {
+            firstTsOffsetTicks = firstTsOffsetFromInitialTsTicks(initialTicks, rawTs, maxTicks);
+        }
         const values = new Array(channels.length);
         for (let c = 0; c < channels.length; c++) {
             const spec = channels[c];
             const raw = decodeSdLogValue(bytes, p, spec.dataType);
             // GSR is calibrated inline (amplifier equation). Inertial channels are
             // marked calibrated by the plan but keep their raw value here and are
-            // calibrated together (per triple) by applyCalibPlan below.
+            // calibrated together (per triple) by applyCalibPlan below, and the
+            // BMP581 pair likewise by applyBmp581.
             values[c] = spec.name === 'GSR' && spec.calibrated ? calibrateGsr(raw, header.gsrRange) : raw;
             p += spec.sizeBytes;
         }
         if (calibPlan.entries.length)
             applyCalibPlan(values, calibPlan.entries);
-        const absoluteTicks = initialTicks + unwrapped - firstRawTicks;
+        if (bmp581)
+            applyBmp581(values, bmp581);
+        const absoluteTicks = initialTicks + unwrapped - firstTsOffsetTicks;
         out.push({
             // Device-clock timestamp always divides by the 32768 Hz RTC clock
             // (ShimmerObject#getRtcClockFreq); only the wall-clock (RTC) conversion
@@ -23138,7 +24525,7 @@ function parseMessage(msg) {
     if (msg.length < 3)
         throw new Error('Invalid Verisense message: header is incomplete');
     const header = msg[0];
-    const payloadLength = u16le$2(msg[1], msg[2]);
+    const payloadLength = u16le$4(msg[1], msg[2]);
     if (msg.length !== payloadLength + 3) {
         throw new Error(`Invalid Verisense message: length=${payloadLength}, actualPayload=${Math.max(0, msg.length - 3)}`);
     }
@@ -24822,6 +26209,10 @@ const GEN_CFG_0_USB_EN_MASK = 1 << 3;
  * in the SDK means any consuming application is protected — a device can't be
  * stranded by a third-party tool writing 0/0.
  *
+ * On firmware older than {@link VERISENSE_BLUETOOTH_OFF_MIN_FW} this is not
+ * enough: there, Bluetooth off takes USB with it. See
+ * {@link enforceVerisenseBluetoothOffFirmwareGuard}.
+ *
  * Mutates `op` in place. Returns `true` if a correction was applied.
  */
 function enforceVerisenseCommsChannelInterlock(op) {
@@ -24832,6 +26223,53 @@ function enforceVerisenseCommsChannelInterlock(op) {
     if (!bothDisabled)
         return false;
     op[OP_IDX.GEN_CFG_0] = genCfg0 | GEN_CFG_0_BLUETOOTH_EN_MASK | GEN_CFG_0_USB_EN_MASK;
+    return true;
+}
+/**
+ * The first firmware on which `BLUETOOTH_EN = 0` leaves USB working (DEV-1096).
+ *
+ * ASM_Production handles USB events only while its SoftDevice is on, and before
+ * this version it started the SoftDevice only for Bluetooth. With Bluetooth off,
+ * USB therefore never enumerated either, and a write that turned Bluetooth off
+ * over USB stopped USB at once. The sensor was left with no way back in but SWD.
+ * {@link enforceVerisenseCommsChannelInterlock} cannot catch that, because USB
+ * is still enabled in the config.
+ */
+const VERISENSE_BLUETOOTH_OFF_MIN_FW = {
+    major: 2,
+    minor: 1,
+    internal: 3,
+};
+/** Whether the given firmware can run with Bluetooth disabled. Firmware whose
+ * version is unknown cannot be assumed to. */
+function supportsVerisenseBluetoothOff(fw) {
+    if (!fw)
+        return false;
+    return compareVerisenseFirmwareVersion(fw, VERISENSE_BLUETOOTH_OFF_MIN_FW) >= 0;
+}
+/** Whether an operational-config buffer has Bluetooth enabled (`BLUETOOTH_EN`). */
+function isVerisenseBluetoothEnabled(op) {
+    if (!op || op.length <= OP_IDX.GEN_CFG_0)
+        return false;
+    return (op[OP_IDX.GEN_CFG_0] & GEN_CFG_0_BLUETOOTH_EN_MASK) !== 0;
+}
+/**
+ * Keep Bluetooth enabled in an operational-config buffer bound for firmware that
+ * cannot run without it: older than {@link VERISENSE_BLUETOOTH_OFF_MIN_FW}, or of
+ * unknown version.
+ *
+ * That includes firmware older than V2.00.007, which ignores `BLUETOOTH_EN`. The
+ * bit still stays in the sensor's EEPROM, and an update to V2.00.007 - V2.01.002
+ * would then strand the sensor.
+ *
+ * Mutates `op` in place. Returns `true` if a correction was applied.
+ */
+function enforceVerisenseBluetoothOffFirmwareGuard(op, fw) {
+    if (!op || op.length <= OP_IDX.GEN_CFG_0)
+        return false;
+    if (isVerisenseBluetoothEnabled(op) || supportsVerisenseBluetoothOff(fw))
+        return false;
+    op[OP_IDX.GEN_CFG_0] |= GEN_CFG_0_BLUETOOTH_EN_MASK;
     return true;
 }
 const VERISENSE_SENSOR_ENABLE_FIELDS = [
@@ -25484,7 +26922,17 @@ class SensorADC extends SensorBase {
     constructor() {
         super();
         this.LIMIT_MIN_VALID_USIEMENS = 0.03;
-        this.GSR_UNCAL_LIMIT_RANGE3_SR68 = 1134;
+        /**
+         * Range-3 codes below this are raised to it before calibration so that an
+         * open circuit reads as open, which only works if the limit is above the
+         * amplifier reference. 1138 is the first code above 0.5 V at the gen-2 1.8 V
+         * full scale (0.5 V = code 1137.5), so it also clears the 0.4986 V this decode
+         * divides by (code 1134.3). The Java driver divides by 0.5 V, and 1138 is
+         * correct under both. It was 1134, the last code below 0.4986 V: that decoded
+         * to a negative resistance, nudged to 8 kΩ, so an open circuit read 125 µS
+         * (DEV-1067).
+         */
+        this.GSR_UNCAL_LIMIT_RANGE3_SR68 = 1138;
         this.GSR_UNCAL_LIMIT_RANGE3_SR62 = 683;
         this.SHIMMER3_REF_KOHMS = [40.2, 287.0, 1000.0, 3300.0];
         this.SR68_REF_KOHMS = [21.0, 150.0, 562.0, 1740.0];
@@ -25528,7 +26976,7 @@ class SensorADC extends SensorBase {
      * resistors, 0.5 V GSR reference and range-3 uncal limit 683. Every other
      * GSR-capable board (SR61 >= 5, SR68 >= 5 — firmware
      * `ShimBrd_isGsrSupportedForHwVersion`) carries the second-generation DC
-     * front end: 1.8 V reference, 21/150/562/1740 kΩ, 0.4986 V, limit 1134.
+     * front end: 1.8 V reference, 21/150/562/1740 kΩ, 0.4986 V, limit 1138.
      *
      * Mirrors the firmware's `selectFeedbackResistorsFromHwVersion` (hal_gsr.c),
      * which keys the choice on the major revision alone (SR62 vs everything
@@ -25605,14 +27053,66 @@ class SensorADC extends SensorBase {
         }
         return rFeedback / (volts / gsrRefVoltage - 1.0);
     }
+    /** The front end's range-3 open-circuit limit: the first code above its amplifier reference. */
+    gsrUncalLimitRange3() {
+        return this.usesSr62GsrFrontEnd()
+            ? this.GSR_UNCAL_LIMIT_RANGE3_SR62
+            : this.GSR_UNCAL_LIMIT_RANGE3_SR68;
+    }
+    /**
+     * `calibrateGsrToKOhmsUsingAmplifierEq`, reading an open circuit as open on
+     * every range (DEV-1070).
+     *
+     * The equation has no positive solution at or below the amplifier's
+     * reference: no skin resistance can pull the output under it, so a code there
+     * means the electrodes are open. Range 3 has long raised such a code to its
+     * open-circuit limit, so that an open circuit decodes as hundreds of MΩ.
+     * Ranges 0-2 did not, and in auto-range they see these codes too: when the
+     * electrodes come off, the device climbs one range at a time and repeats the
+     * sample that triggered each switch through the 80 ms settling time, tagged
+     * with the range it was measured on. The equation gave those samples a
+     * negative resistance, which the nudge floored at 8 kΩ: 125 µS and
+     * `'Connected'` for an open circuit.
+     *
+     * So a code below the limit decodes as range 3 at the limit, whatever range
+     * it was measured on, and an open circuit reads the same on every range as the
+     * settled range 3 does. Codes at or above the limit decode on their own range,
+     * as before. The test compares codes, so it holds under both this decode's
+     * 0.4986 V and the Java driver's 0.5 V.
+     *
+     * @param adc12 The 12-bit code.
+     * @param range The resistor in circuit, 0-3.
+     */
+    calibrateGsrToKOhmsWithOpenCircuitLimit(adc12, range) {
+        const limit = this.gsrUncalLimitRange3();
+        if (adc12 < limit) {
+            return this.calibrateGsrToKOhmsUsingAmplifierEq(this.calibrateAdcToVolts(limit), 3);
+        }
+        return this.calibrateGsrToKOhmsUsingAmplifierEq(this.calibrateAdcToVolts(adc12), range);
+    }
+    /**
+     * Clamp a decoded resistance to what the circuit can measure. A fixed range
+     * clamps both ends, to that range's window. Auto-range only floors it at
+     * 8 kΩ, the smallest resistance any range can measure, and leaves the top
+     * open, as the Java driver's `SensorGSR.nudgeGsrResistance` and the C#
+     * `SensorGSR.NudgeGSRResistance` do (ASM-2156).
+     *
+     * `connectivity` depends on that open top. An open circuit on range 3
+     * decodes to about 536 MΩ on gen-2 hardware (0.0019 µS), far below the
+     * 0.03 µS threshold, but auto-range used to be capped at 4.7 MΩ too, which is
+     * 0.213 µS, so `connectivity` could never say `'Disconnected'` (DEV-1068).
+     * That cap was the first fix proposed under ASM-2156, withdrawn there for
+     * this reason.
+     */
     nudgeGsrResistance(kOhms) {
         const limitsByRange = {
             0: [8.0, 63.0],
             1: [63.0, 220.0],
             2: [220.0, 680.0],
             3: [680.0, 4700.0],
-            4: [8.0, 4700.0],
         };
+        if (this.gsrRangeSetting === 4)
+            return Math.max(kOhms, limitsByRange[0][0]);
         const lim = limitsByRange[this.gsrRangeSetting] ?? [8.0, 4700.0];
         return Math.min(Math.max(kOhms, lim[0]), lim[1]);
     }
@@ -25639,27 +27139,25 @@ class SensorADC extends SensorBase {
             let gsr = null;
             const gsrStart = this.battEnabled && this.gsrEnabled ? 2 : 0;
             if (this.gsrEnabled) {
-                const gsrraw = i16le(sensorPayloadBytes, base + gsrStart);
+                const gsrraw = i16le$1(sensorPayloadBytes, base + gsrStart);
                 let adc12 = gsrraw & 0x0fff;
                 let currentRange = this.gsrRangeSetting;
                 if (currentRange === 4)
                     currentRange = (gsrraw >> 14) & 0x03;
                 if (currentRange === 3) {
-                    const limit = this.usesSr62GsrFrontEnd()
-                        ? this.GSR_UNCAL_LIMIT_RANGE3_SR62
-                        : this.GSR_UNCAL_LIMIT_RANGE3_SR68;
+                    const limit = this.gsrUncalLimitRange3();
                     if (adc12 < limit)
                         adc12 = limit;
                 }
                 const volts = this.calibrateAdcToVolts(adc12);
-                let kOhms = this.calibrateGsrToKOhmsUsingAmplifierEq(volts, currentRange);
+                let kOhms = this.calibrateGsrToKOhmsWithOpenCircuitLimit(adc12, currentRange);
                 kOhms = this.nudgeGsrResistance(kOhms);
                 const uS = this.kOhmToUSiemens(kOhms);
                 const connectivity = uS > this.LIMIT_MIN_VALID_USIEMENS ? 'Connected' : 'Disconnected';
                 gsr = { raw: gsrraw, adc12, range: currentRange, volts, kOhms, uS, connectivity };
             }
             if (this.battEnabled) {
-                const raw16 = i16le(sensorPayloadBytes, base) & 0xffff;
+                const raw16 = i16le$1(sensorPayloadBytes, base) & 0xffff;
                 const adc12 = raw16 & 0x0fff;
                 const usbPluggedIn = ((raw16 >> 15) & 0x01) === 1;
                 const chargerStatusBits = (raw16 >> 13) & 0x03;
@@ -25805,9 +27303,9 @@ class SensorLIS2DW12 extends SensorBase {
         for (let i = 0; i < n; i++) {
             const off = i * BYTES_PER_SAMPLE;
             const raw = [
-                i16le(sensorPayloadBytes, off + 0),
-                i16le(sensorPayloadBytes, off + 2),
-                i16le(sensorPayloadBytes, off + 4),
+                i16le$1(sensorPayloadBytes, off + 0),
+                i16le$1(sensorPayloadBytes, off + 2),
+                i16le$1(sensorPayloadBytes, off + 4),
             ];
             const cal = this._calibrate(raw);
             out.push({ raw, cal, units: { cal: 'm/s^2' } });
@@ -25946,28 +27444,28 @@ class SensorLSM6DS3 extends SensorBase {
             let accRaw = null;
             if (this.gyroEnabled && this.accEnabled) {
                 gyroRaw = [
-                    i16le(sensorPayloadBytes, base + 0),
-                    i16le(sensorPayloadBytes, base + 2),
-                    i16le(sensorPayloadBytes, base + 4),
+                    i16le$1(sensorPayloadBytes, base + 0),
+                    i16le$1(sensorPayloadBytes, base + 2),
+                    i16le$1(sensorPayloadBytes, base + 4),
                 ];
                 accRaw = [
-                    i16le(sensorPayloadBytes, base + 6),
-                    i16le(sensorPayloadBytes, base + 8),
-                    i16le(sensorPayloadBytes, base + 10),
+                    i16le$1(sensorPayloadBytes, base + 6),
+                    i16le$1(sensorPayloadBytes, base + 8),
+                    i16le$1(sensorPayloadBytes, base + 10),
                 ];
             }
             else if (this.gyroEnabled) {
                 gyroRaw = [
-                    i16le(sensorPayloadBytes, base + 0),
-                    i16le(sensorPayloadBytes, base + 2),
-                    i16le(sensorPayloadBytes, base + 4),
+                    i16le$1(sensorPayloadBytes, base + 0),
+                    i16le$1(sensorPayloadBytes, base + 2),
+                    i16le$1(sensorPayloadBytes, base + 4),
                 ];
             }
             else if (this.accEnabled) {
                 accRaw = [
-                    i16le(sensorPayloadBytes, base + 0),
-                    i16le(sensorPayloadBytes, base + 2),
-                    i16le(sensorPayloadBytes, base + 4),
+                    i16le$1(sensorPayloadBytes, base + 0),
+                    i16le$1(sensorPayloadBytes, base + 2),
+                    i16le$1(sensorPayloadBytes, base + 4),
                 ];
             }
             let accCal = null;
@@ -26179,9 +27677,9 @@ class SensorLSM6DSV extends SensorBase {
             const tagCnt = sensorPayloadBytes[offset];
             const tag = (tagCnt >> 3) & 0x1f;
             const cnt = (tagCnt >> 1) & 0x03;
-            const x = i16le(sensorPayloadBytes, offset + 1);
-            const y = i16le(sensorPayloadBytes, offset + 3);
-            const z = i16le(sensorPayloadBytes, offset + 5);
+            const x = i16le$1(sensorPayloadBytes, offset + 1);
+            const y = i16le$1(sensorPayloadBytes, offset + 3);
+            const z = i16le$1(sensorPayloadBytes, offset + 5);
             const raw = [x, y, z];
             let accel = null;
             let gyro = null;
@@ -26421,9 +27919,9 @@ class SensorPPG extends SensorBase {
             const base = i * bytesPerSample;
             out.push({
                 leds: [
-                    u24le(sensorPayloadBytes, base + 0), // green (LED1)
-                    u24le(sensorPayloadBytes, base + 3), // IR (LED2)
-                    u24le(sensorPayloadBytes, base + 6), // red (LED3)
+                    u24le$1(sensorPayloadBytes, base + 0), // green (LED1)
+                    u24le$1(sensorPayloadBytes, base + 3), // IR (LED2)
+                    u24le$1(sensorPayloadBytes, base + 6), // red (LED3)
                 ],
             });
         }
@@ -26556,15 +28054,15 @@ class SensorVD6283 extends SensorBase {
         const out = [];
         for (let i = 0; i < n; i++) {
             const base = i * SensorVD6283.BYTES_PER_SAMPLE;
-            const RED = u24le(sensorPayloadBytes, base + 0);
+            const RED = u24le$1(sensorPayloadBytes, base + 0);
             // Slot 1 is visible-or-dark depending on the configured dark-channel bit.
-            const slot1 = u24le(sensorPayloadBytes, base + 3);
+            const slot1 = u24le$1(sensorPayloadBytes, base + 3);
             const VISIBLE = this.darkEnabled ? null : slot1;
             const DARK = this.darkEnabled ? slot1 : null;
-            const BLUE = u24le(sensorPayloadBytes, base + 6);
-            const GREEN = u24le(sensorPayloadBytes, base + 9);
-            const IR = u24le(sensorPayloadBytes, base + 12);
-            const CLEAR = u24le(sensorPayloadBytes, base + 15);
+            const BLUE = u24le$1(sensorPayloadBytes, base + 6);
+            const GREEN = u24le$1(sensorPayloadBytes, base + 9);
+            const IR = u24le$1(sensorPayloadBytes, base + 12);
+            const CLEAR = u24le$1(sensorPayloadBytes, base + 15);
             // lux/CCT derive from RED/GREEN/BLUE, so the dark-channel selection (which
             // only affects slot 1) leaves them valid in either mode.
             const { lux, cct } = this.computeLuxCct(RED, GREEN, BLUE);
@@ -26619,9 +28117,9 @@ class SensorMAX32674 extends SensorBase {
             out.push({
                 accel: {
                     raw: [
-                        i16le(sensorPayloadBytes, base + 0),
-                        i16le(sensorPayloadBytes, base + 2),
-                        i16le(sensorPayloadBytes, base + 4),
+                        i16le$1(sensorPayloadBytes, base + 0),
+                        i16le$1(sensorPayloadBytes, base + 2),
+                        i16le$1(sensorPayloadBytes, base + 4),
                     ],
                 },
                 hr: u16le$1(sensorPayloadBytes, base + 6),
@@ -26664,8 +28162,8 @@ class SensorMLX90632 extends SensorBase {
         const out = [];
         for (let i = 0; i < n; i++) {
             const base = i * SensorMLX90632.BYTES_PER_SAMPLE;
-            const objRaw = i16le(sensorPayloadBytes, base + 0);
-            const ambRaw = i16le(sensorPayloadBytes, base + 2);
+            const objRaw = i16le$1(sensorPayloadBytes, base + 0);
+            const ambRaw = i16le$1(sensorPayloadBytes, base + 2);
             out.push({
                 object: { raw: objRaw, cal: objRaw / 100, units: 'degC' },
                 ambient: { raw: ambRaw, cal: ambRaw / 100, units: 'degC' },
@@ -27496,6 +28994,11 @@ class VerisenseBleDevice extends BaseShimmerClient {
         // (normalizeBytePayload returns the input reference for a Uint8Array).
         const corrected = new Uint8Array(payload);
         enforceVerisenseCommsChannelInterlock(corrected);
+        // Nor Bluetooth off on firmware that loses USB with it (DEV-1096). The
+        // version is looked up only for a write that turns Bluetooth off.
+        if (!isVerisenseBluetoothEnabled(corrected)) {
+            enforceVerisenseBluetoothOffFirmwareGuard(corrected, await this._reportedFirmwareVersion());
+        }
         await this.writeProperty(ASM_PROPERTY.OPERATIONAL_CONFIGURATION, corrected);
     }
     async writeTime(rtc7) {
@@ -28553,6 +30056,41 @@ class VerisenseBleDevice extends BaseShimmerClient {
     _isUninitializedBlob(payload) {
         return this._isErasedBlob(payload) || this._isZeroBlob(payload);
     }
+    /**
+     * The firmware version the sensor reported in the production config last read,
+     * or null when that holds none: nothing read yet, a config that is erased or
+     * blank, or a major version of 0xFF. No release has one: it is the erased
+     * EEPROM value, and the sentinel a production config is written with before
+     * the firmware fills its own version in.
+     */
+    getReportedFirmwareVersion() {
+        const blob = this.productionConfig;
+        if (!blob?.length || this._isUninitializedBlob(blob))
+            return null;
+        const parsed = parseProductionConfigPayload(blob);
+        const fw = {
+            major: Number(parsed.revFwMajor),
+            minor: Number(parsed.revFwMinor),
+            internal: Number(parsed.revFwInternal),
+        };
+        if (!Number.isFinite(fw.major) || !Number.isFinite(fw.minor) || !Number.isFinite(fw.internal)) {
+            return null;
+        }
+        return fw.major === 0xff ? null : fw;
+    }
+    /** {@link getReportedFirmwareVersion}, reading the production config from the
+     * sensor first if none is cached. Null, too, when that read fails. */
+    async _reportedFirmwareVersion() {
+        if (!this.productionConfig?.length) {
+            try {
+                await this.readProductionConfigFromDevice();
+            }
+            catch {
+                return null;
+            }
+        }
+        return this.getReportedFirmwareVersion();
+    }
     async readProductionConfigFromDevice() {
         const rsp = await this.readProductionConfig();
         const prod = normalizeOperationalConfig(rsp?.payload);
@@ -28987,7 +30525,7 @@ class VerisenseBleDevice extends BaseShimmerClient {
             crcOk = true;
         }
         const sensorId = body[0];
-        const tick = u24le(body, 1);
+        const tick = u24le$1(body, 1);
         const sensorPayload = body.slice(4);
         const sensor = this.sensors[sensorId];
         const systemTsLastSampleMillis = nowMillis();
@@ -31298,6 +32836,7 @@ exports.BASE_HARDWARE_IDS = BASE_HARDWARE_IDS;
 exports.BATTERY_DIVIDER_RATIO = BATTERY_DIVIDER_RATIO;
 exports.BLE_LINK_MIN_FW = BLE_LINK_MIN_FW;
 exports.BLUETOOTH_MODULE_VERSIONS = BLUETOOTH_MODULE_VERSIONS;
+exports.BMP581_MIN_FIRMWARE = BMP581_MIN_FIRMWARE;
 exports.BRAND_BLE_MAX_CHARS = BRAND_BLE_MAX_CHARS;
 exports.BRAND_BLE_MAX_CHARS_SHIMMER3 = BRAND_BLE_MAX_CHARS_SHIMMER3;
 exports.BRAND_BT_CLASSIC_MAX_CHARS = BRAND_BT_CLASSIC_MAX_CHARS;
@@ -31345,7 +32884,7 @@ exports.FACTORY_TEST_ACK_TIMEOUT_MS = FACTORY_TEST_ACK_TIMEOUT_MS;
 exports.FACTORY_TEST_DRAIN_IDLE_MS = FACTORY_TEST_DRAIN_IDLE_MS;
 exports.FACTORY_TEST_IDLE_FLOOR_MS = FACTORY_TEST_IDLE_FLOOR_MS;
 exports.FACTORY_TEST_NACK_MESSAGE = FACTORY_TEST_NACK_MESSAGE;
-exports.FW_ID = FW_ID$1;
+exports.FW_ID = FW_ID;
 exports.FactoryTestError = FactoryTestError;
 exports.GAIN_LABELS = GAIN_LABELS;
 exports.GAIN_OPTIONS = GAIN_OPTIONS;
@@ -31359,9 +32898,9 @@ exports.INFOMEM_ADDR_FLAT = INFOMEM_ADDR_FLAT;
 exports.INFOMEM_ADDR_LEGACY = INFOMEM_ADDR_LEGACY;
 exports.INFOMEM_ANY_VERSION = ANY_VERSION;
 exports.INFOMEM_BIT_SHIFT = BIT_SHIFT;
-exports.INFOMEM_FW_ID = FW_ID;
+exports.INFOMEM_FW_ID = FW_ID$1;
 exports.INFOMEM_GENERAL_CALIBRATION_LENGTH = GENERAL_CALIBRATION_LENGTH;
-exports.INFOMEM_HW_ID = HW_ID;
+exports.INFOMEM_HW_ID = HW_ID$1;
 exports.INFOMEM_MASK = MASK;
 exports.INFOMEM_MAX_SYNC_NODES = MAX_SYNC_NODES;
 exports.INFOMEM_PAGE_SIZE = INFOMEM_PAGE_SIZE;
@@ -31379,6 +32918,7 @@ exports.LEAD_OFF_FREQUENCY_LABELS = LEAD_OFF_FREQUENCY_LABELS;
 exports.LSM6DSV_ODR = LSM6DSV_ODR;
 exports.LoopbackTransport = LoopbackTransport;
 exports.MAX_CALIB_DUMP_BYTES = MAX_CALIB_DUMP_BYTES;
+exports.MAX_WINDOW_DIVISOR = MAX_WINDOW_DIVISOR;
 exports.NEED_MORE = NEED_MORE;
 exports.NEW_IMU_EXP_REV = NEW_IMU_EXP_REV;
 exports.NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS;
@@ -31400,6 +32940,7 @@ exports.PRESSURE_NAME = PRESSURE_NAME;
 exports.PRESSURE_SENSOR_ID = PRESSURE_SENSOR_ID;
 exports.PRESSURE_SENSOR_ID_BY_KIND = PRESSURE_SENSOR_ID_BY_KIND;
 exports.REFERENCE_ELECTRODE_OPTIONS = REFERENCE_ELECTRODE_OPTIONS;
+exports.REORDER_PERIODS = REORDER_PERIODS;
 exports.RESPIRATION_CONTROL_LABELS = RESPIRATION_CONTROL_LABELS;
 exports.RESPIRATION_FREQUENCY_LABELS = RESPIRATION_FREQUENCY_LABELS;
 exports.RESPIRATION_FREQUENCY_OPTIONS = RESPIRATION_FREQUENCY_OPTIONS;
@@ -31545,6 +33086,7 @@ exports.UnknownExgKnobError = UnknownExgKnobError;
 exports.VERISENSE_BLE_SCHEDULE_DEFAULTS = VERISENSE_BLE_SCHEDULE_DEFAULTS;
 exports.VERISENSE_BLE_SCHEDULE_RANGES = VERISENSE_BLE_SCHEDULE_RANGES;
 exports.VERISENSE_BLE_SYNC_SCHEDULES = VERISENSE_BLE_SYNC_SCHEDULES;
+exports.VERISENSE_BLUETOOTH_OFF_MIN_FW = VERISENSE_BLUETOOTH_OFF_MIN_FW;
 exports.VERISENSE_CALIBRATION_MIN_FW = VERISENSE_CALIBRATION_MIN_FW;
 exports.VERISENSE_DEFAULT_PASSKEY_BY_ID = VERISENSE_DEFAULT_PASSKEY_BY_ID;
 exports.VERISENSE_DFU_BOOTLOADER_NAME_PREFIX = VERISENSE_DFU_BOOTLOADER_NAME_PREFIX;
@@ -31568,6 +33110,7 @@ exports.VERISENSE_SENSOR_ENABLE_FIELDS = VERISENSE_SENSOR_ENABLE_FIELDS;
 exports.VERISENSE_SENSOR_RATE_DEFAULT_GROUPS = VERISENSE_SENSOR_RATE_DEFAULT_GROUPS;
 exports.VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS = VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS;
 exports.VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS = VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS;
+exports.VERISENSE_STREAM_CSV_TIME_COLUMNS = VERISENSE_STREAM_CSV_TIME_COLUMNS;
 exports.VERISENSE_STREAM_SENSOR_LABELS = VERISENSE_STREAM_SENSOR_LABELS;
 exports.VERISENSE_USB_DFU_PID = VERISENSE_USB_DFU_PID;
 exports.VERISENSE_USB_DFU_PORT_FILTERS = VERISENSE_USB_DFU_PORT_FILTERS;
@@ -31662,6 +33205,9 @@ exports.crc16_ccitt_false = crc16_ccitt_false;
 exports.crc32 = crc32;
 exports.crcTrailerBytes = crcTrailerBytes;
 exports.createBlankVerisenseOperationalConfig = createBlankVerisenseOperationalConfig;
+exports.createCsvRecorder = createCsvRecorder;
+exports.createCsvTableWriter = createCsvTableWriter;
+exports.createVerisenseStreamRecorder = createVerisenseStreamRecorder;
 exports.csvCell = csvCell;
 exports.csvRow = csvRow;
 exports.decodeExgRegisters = decodeExgRegisters;
@@ -31687,10 +33233,12 @@ exports.detectExgPreset = detectExgPreset;
 exports.detectFactoryTestReportFamily = detectFactoryTestReportFamily;
 exports.deviceWriteDivergentRanges = deviceWriteDivergentRanges;
 exports.divisorToSamplingRate = divisorToSamplingRate;
+exports.downloadCsvBlob = downloadCsvBlob;
 exports.downloadSdTree = downloadSdTree;
 exports.drainByteStream = drainByteStream;
 exports.encodeExgRegisters = encodeExgRegisters;
 exports.encodeSdPath = encodeSdPath;
+exports.enforceVerisenseBluetoothOffFirmwareGuard = enforceVerisenseBluetoothOffFirmwareGuard;
 exports.enforceVerisenseCommsChannelInterlock = enforceVerisenseCommsChannelInterlock;
 exports.ensureDirectoryPath = ensureDirectoryPath;
 exports.enumerateSdTree = enumerateSdTree;
@@ -31747,6 +33295,7 @@ exports.infoMemFieldsFor = infoMemFieldsFor;
 exports.interpretShimmer3InquiryResponse = interpretShimmer3InquiryResponse;
 exports.isAckCommand = isAckCommand;
 exports.isBadResponse = isBadResponse;
+exports.isBmp581PresentPerSrNumber = isBmp581PresentPerSrNumber;
 exports.isCrcMode = isCrcMode;
 exports.isExgRespirationEnabled = isExgRespirationEnabled;
 exports.isGenerationSensitiveChannel = isGenerationSensitiveChannel;
@@ -31755,6 +33304,7 @@ exports.isNewImuSensors = isNewImuSensors;
 exports.isRoutineVerisenseDfuLogMessage = isRoutineVerisenseDfuLogMessage;
 exports.isSafeFirmwareArchiveName = isSafeFirmwareArchiveName;
 exports.isSdLoggingFirmware = isSdLoggingFirmware;
+exports.isShimmerSrBoardAtLeast = isShimmerSrBoardAtLeast;
 exports.isShimmerSrBoardValid = isShimmerSrBoardValid;
 exports.isSupportedEightByteDerivedSensors = isSupportedEightByteDerivedSensors;
 exports.isSupportedMpl = isSupportedMpl;
@@ -31762,6 +33312,7 @@ exports.isSupportedRtcConfigViaUart = isSupportedRtcConfigViaUart;
 exports.isSupportedSdLogSync = isSupportedSdLogSync;
 exports.isUniformByteArray = isUniformByteArray;
 exports.isUsbDfuUnsupportedError = isUsbDfuUnsupportedError;
+exports.isVerisenseBluetoothEnabled = isVerisenseBluetoothEnabled;
 exports.isVerisenseGsrSupportedHardware = isVerisenseGsrSupportedHardware;
 exports.isVerisenseLightDarkChannelEnabled = isVerisenseLightDarkChannelEnabled;
 exports.isVerisenseLipoBatteryHardware = isVerisenseLipoBatteryHardware;
@@ -31832,6 +33383,7 @@ exports.readExgField = readExgField;
 exports.readExgKnobs = readExgKnobs;
 exports.readInfoMemFieldValue = readInfoMemFieldValue;
 exports.readVerisenseOperationalFieldValue = readVerisenseOperationalFieldValue;
+exports.reorderWindowTicks = reorderWindowTicks;
 exports.requireShimmer3FactoryTestType = requireShimmer3FactoryTestType;
 exports.requiresExpansionPower = requiresExpansionPower;
 exports.resolveChannelFormat = resolveChannelFormat;
@@ -31870,6 +33422,7 @@ exports.shouldOverrideCalibration = shouldOverrideCalibration;
 exports.slipEncode = slipEncode;
 exports.summariseExgBanks = summariseExgBanks;
 exports.summariseExgCalibration = summariseExgCalibration;
+exports.supportsVerisenseBluetoothOff = supportsVerisenseBluetoothOff;
 exports.supportsVerisenseCalibration = supportsVerisenseCalibration;
 exports.supportsVerisenseMagnetometer = supportsVerisenseMagnetometer;
 exports.transportAdvice = transportAdvice;
@@ -31884,6 +33437,8 @@ exports.verifyCrc = verifyCrc;
 exports.verisenseDeviceFileTag = verisenseDeviceFileTag;
 exports.verisenseDfuAttemptLabel = verisenseDfuAttemptLabel;
 exports.verisenseFactoryTestReportToCsvRows = verisenseFactoryTestReportToCsvRows;
+exports.verisenseStreamCsvKey = verisenseStreamCsvKey;
+exports.verisenseStreamCsvLayout = verisenseStreamCsvLayout;
 exports.wiredPacketLength = wiredPacketLength;
 exports.writeInfoMemFieldValue = writeInfoMemFieldValue;
 exports.writeVerisenseOperationalFieldValue = writeVerisenseOperationalFieldValue;

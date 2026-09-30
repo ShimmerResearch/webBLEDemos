@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-declare const SDK_VERSION = "0.4.1";
+declare const SDK_VERSION = "0.5.0";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
@@ -897,114 +897,1792 @@ declare function objectClusterColumns(oc: ObjectCluster, opts?: ObjectClusterCol
 declare function objectClusterRow(oc: ObjectCluster, columns: readonly ObjectClusterColumn[]): (number | null)[];
 
 /**
- * Device RTC drift estimation over a live connection (DEV-844).
+ * CSV recording: turn a live stream into a file on the host.
  *
- * Sample the device clock periodically against the host clock and fit a
- * least-squares slope of (device − host) offset vs host time: the
- * dimensionless slope × 1e6 is directly the crystal error in ppm, giving a
- * usable estimate in hours instead of waiting days between connections.
- * Device time resolves to 1/32768 s, so per-sample noise is just transport
- * round-trip jitter (~tens of ms); the fit averages it out. Host timestamps
- * should be taken at the midpoint of the read round-trip, bounding transport
- * latency to ±rtt/2.
+ * Promoted from shimmer-capture-web's `common/csv-recorder.js` (DEV-1116) so
+ * that page and verisense-device-console share one copy. Two layers:
  *
- * Host clock steps (NTP corrections) are a measurement hazard: the wall
- * clock jumping mid-series pollutes the least-squares slope while looking
- * like device drift (seen live on DEV-844: a −1.4 s Windows NTP step bent
- * the fit from 1020 to 1077 ppm). Each sample therefore also records a
- * monotonic timestamp (`performance.now()`): wall-vs-monotonic divergence
- * between samples attributes a jump to the HOST, which resets the fit
- * baseline instead of counting as a device step.
+ * - {@link createCsvTableWriter} writes ONE file: a header row, an optional
+ *   units row, then whatever cells the caller pushes. Every consumer's
+ *   recorder is built on it.
+ * - {@link createCsvRecorder} is the {@link ObjectCluster} recorder the
+ *   capture page uses — same API and options as the page-local original.
+ *   Verisense streams go through `createVerisenseStreamRecorder`
+ *   (`devices/verisense/streamCsv.ts`), which runs one writer per sensor
+ *   stream.
  *
- * This class is pure bookkeeping — the caller owns the sampling timer, the
- * device read, and any UI. Feed it one {@link RtcDriftSampleInput} per read.
+ * Cells go through {@link csvCell}, so a unit or a device name containing a
+ * comma cannot shift every following column, and rows stream to disk through
+ * the File System Access API instead of being held in memory until the user
+ * stops — a 512 Hz session with 12 channels is tens of megabytes of string,
+ * and an in-memory recording loses all of it if the tab is closed.
+ *
+ * That choice decides what happens when a write to the picked file fails
+ * mid-recording: there is no complete copy to fall back on, so the recording
+ * ENDS there rather than quietly continuing into a second, partial file. See
+ * `fail()` in {@link createCsvTableWriter}.
+ *
+ * No DOM access at import time.
  */
-interface RtcDriftSampleInput {
-    /** Host wall-clock unix seconds at the midpoint of the device-time read. */
-    hostSec: number;
-    /** Device clock in unix seconds, as read from the device. */
-    devSec: number;
-    /** Read round-trip in ms (kept per sample so outliers are explainable). */
-    rttMs: number;
-    /** Host monotonic clock (e.g. `performance.now()`) in ms at the read. */
-    perfMs: number;
-}
-interface RtcDriftSample extends RtcDriftSampleInput {
-    /** Device-minus-host clock offset in seconds. */
-    offsetSec: number;
-}
-/** What {@link RtcDriftMonitor.addSample} concluded about a new sample. */
-type RtcDriftSampleEvent = {
-    kind: 'sample';
-    sample: RtcDriftSample;
-}
-/** The HOST wall clock stepped (NTP): the fit baseline was reset and the
- * series restarted from this sample. */
- | {
-    kind: 'host-step';
-    sample: RtcDriftSample;
-    hostStepSec: number;
-}
-/** The DEVICE clock stepped between samples. */
- | {
-    kind: 'device-step';
-    sample: RtcDriftSample;
-    deltaSec: number;
+
+/** A logger, or a single function every message goes to. */
+type CsvRecorderLog = ((message: string) => void) | {
+    log?: (message: string) => void;
+    warn?: (message: string) => void;
+    error?: (message: string) => void;
 };
-interface RtcDriftMonitorOptions {
-    /** Offset jump treated as a device clock step (default 1 s). */
-    deviceStepThresholdSeconds?: number;
-    /** Wall-vs-monotonic divergence treated as a host clock step (default 0.5 s). */
-    hostStepThresholdSeconds?: number;
+/**
+ * Where a file's bytes go. `FileSystemWritableFileStream` satisfies this, and
+ * so does anything a test wants to put in its place.
+ */
+interface CsvByteSink {
+    write(data: Uint8Array<ArrayBuffer>): Promise<void> | void;
+    close(): Promise<void> | void;
+    abort?(reason?: unknown): Promise<void> | void;
 }
-declare class RtcDriftMonitor {
-    readonly samples: RtcDriftSample[];
-    /** Device clock steps detected across the whole run (survives rebaselines). */
-    deviceSteps: number;
-    /** Host (NTP) clock steps detected; each one rebaselines the fit. */
-    hostSteps: number;
-    private readonly deviceStepThresholdSeconds;
-    private readonly hostStepThresholdSeconds;
-    constructor(options?: RtcDriftMonitorOptions);
-    /** Drop all samples and step counts (e.g. when starting a new run). */
-    reset(): void;
-    /**
-     * Drop the samples but keep the step counters. Call when the device time is
-     * written: a time write moves the offset baseline, so every prior sample is
-     * invalid and the fit must not straddle the discontinuity.
-     */
-    rebaseline(): void;
-    /**
-     * Record one device-time reading. Attributes any offset jump before
-     * recording it: wall-clock elapsed minus monotonic elapsed isolates host
-     * clock steps (NTP) from device steps. A host step resets the fit baseline
-     * (the fit must not straddle the discontinuity); a device step is counted
-     * and kept in-series.
-     */
-    addSample(input: RtcDriftSampleInput): RtcDriftSampleEvent;
-    /**
-     * Least-squares slope of offset vs host time, in ppm (offset and time are
-     * both in seconds, so the dimensionless slope × 1e6 is directly ppm).
-     * Null until two samples spanning a non-zero interval exist.
-     */
-    ppmFit(): number | null;
-    /** Elapsed span of the current sample series in minutes (0 when empty). */
-    elapsedMinutes(): number;
-    /**
-     * CSV rows of the current series, matching the DEV-844 export format: a
-     * header row (host ISO time, host/device unix seconds, offset, rtt,
-     * monotonic seconds) followed by one row per sample.
-     *
-     * Optional `metadata` is emitted as `# key: value` comment lines BEFORE the
-     * header (so the header is no longer row 0 when metadata is supplied), so a
-     * saved file records what it came from (device, transport, the fit result,
-     * etc.) - the S3R drift tool established this preamble and the console
-     * adopts it. Each value has newlines collapsed so every entry stays a single
-     * comment line; a caller can read the fit via
-     * {@link ppmFit}/{@link deviceSteps}/{@link hostSteps} to build the map.
-     */
-    toCsvRows(metadata?: Record<string, string | number>): string[];
+/** What a finished (or abandoned) file holds. */
+interface CsvFileResult {
+    /** Rows that actually reached the file — what it holds. */
+    rows: number;
+    /** Rows the recorder accepted that never reached it. Non-zero only on failure. */
+    rowsDropped: number;
+    bytes: number;
+    fileName: string;
+    /** False when a write failed part way through; `rows`/`bytes` then describe the short file. */
+    complete: boolean;
+    error: string | null;
 }
+/** Hand a finished in-memory file to the user. */
+type CsvDownload = (fileName: string, blob: Blob) => void;
+/**
+ * Save a Blob through a temporary `<a download>`. The default for in-memory
+ * recordings; needs a DOM, which it looks for only when called.
+ */
+declare function downloadCsvBlob(fileName: string, blob: Blob): void;
+/** Options for {@link createCsvTableWriter}. */
+interface CsvTableWriterOptions {
+    /** Shown in results and log lines; also the download name in memory mode. */
+    fileName: string;
+    /** The heading row, written first. */
+    header: readonly unknown[];
+    /** A second heading row of units. Omit or pass null for none. */
+    units?: readonly unknown[] | null;
+    /**
+     * Where the bytes go. A promise is allowed — rows queue until it settles,
+     * so a file can be opened asynchronously without dropping the rows that
+     * arrive meanwhile; a rejection ends the recording like a failed write.
+     * Omit, or pass null, to buffer in memory and hand the file to `download`
+     * on `stop()`.
+     */
+    sink?: CsvByteSink | Promise<CsvByteSink> | null;
+    /** Memory mode only: receives the finished file. Defaults to {@link downloadCsvBlob}. */
+    download?: CsvDownload;
+    /** How often buffered rows are handed to the sink. */
+    flushIntervalMs?: number;
+    log?: CsvRecorderLog;
+    /**
+     * Called once, from the writer's own timeline, when a write fails and the
+     * recording is abandoned. Receives what `stop()` would return. `active` is
+     * already false by then; the page should repaint and say so somewhere the
+     * user will see it (the log line this module writes is not enough on its
+     * own). Not called for a failure discovered inside `stop()` — the caller
+     * already has the result in hand.
+     */
+    onError?: (result: CsvFileResult & {
+        complete: false;
+        error: string;
+    }) => void;
+}
+/** One CSV file being written. See {@link createCsvTableWriter}. */
+interface CsvTableWriter {
+    /** Append one row. Returns false once the writer is no longer active. */
+    pushCells(cells: readonly unknown[]): boolean;
+    /** Close the file (or download the buffer) and report what actually landed. Idempotent. */
+    stop(): Promise<CsvFileResult>;
+    /** What the file holds so far. */
+    result(): CsvFileResult;
+    readonly active: boolean;
+    /** Rows accepted so far — the live counter a page shows while recording. */
+    readonly rowsAccepted: number;
+    readonly fileName: string;
+}
+/**
+ * Start writing one CSV file: the header (and units) rows go out at once,
+ * then every {@link CsvTableWriter.pushCells} row, flushed every
+ * `flushIntervalMs`.
+ */
+declare function createCsvTableWriter(opts: CsvTableWriterOptions): CsvTableWriter;
+/** One data column of a {@link createCsvRecorder} file. */
+interface CsvRecorderColumn {
+    name: string;
+    kind?: FieldKind;
+    unit?: string | null;
+    header?: string;
+}
+/** A frame as {@link createCsvRecorder} reads it — an ObjectCluster fits. */
+interface CsvRecorderFrame {
+    fields: readonly {
+        name: string;
+        value: unknown;
+        kind: FieldKind;
+    }[];
+}
+/** Options for {@link createCsvRecorder}. */
+interface CsvRecorderOptions {
+    /** Names the file; called once per `start()`, so a name can carry the device id or a trial name. */
+    fileNameFn?: () => string;
+    /**
+     * Stream to a file the user picks (default). Set false, or run in a browser
+     * without `showSaveFilePicker`, to buffer in memory and download on `stop()`.
+     */
+    preferFileSystemAccess?: boolean;
+    /** Emit a second header row of units (default true). */
+    unitsRow?: boolean;
+    /** Emit a leading `HostTime_ms` (default true). */
+    hostTimeColumn?: boolean;
+    log?: CsvRecorderLog;
+    /** See {@link CsvTableWriterOptions.onError}. */
+    onError?: CsvTableWriterOptions['onError'];
+    /** Memory mode only: receives the finished file. Defaults to {@link downloadCsvBlob}. */
+    download?: CsvDownload;
+}
+/** A {@link createCsvRecorder} instance. */
+interface CsvRecorder {
+    /**
+     * Open a file and write the header. Must be called from a user gesture
+     * when `preferFileSystemAccess` is on. Resolves false if the user
+     * cancelled the picker, or there was nothing to record.
+     */
+    start(columns: readonly CsvRecorderColumn[]): Promise<boolean>;
+    /** Append one frame. Returns false when the row was refused. */
+    push(hostMs: number, frame: CsvRecorderFrame): boolean;
+    stop(): Promise<CsvFileResult>;
+    readonly active: boolean;
+}
+/**
+ * Create a CSV recorder for {@link ObjectCluster} frames.
+ *
+ * Each row is `HostTime_ms` (optional), the raw `TIMESTAMP` tick counter, and
+ * then the data columns the page derived from the first frame — typically
+ * with `objectClusterColumns`.
+ */
+declare function createCsvRecorder(opts?: CsvRecorderOptions): CsvRecorder;
+
+/** NUS primary service UUID. */
+declare const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+/** NUS TX characteristic UUID (host writes to this). */
+declare const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+/** NUS RX characteristic UUID (host subscribes to notifications from this). */
+declare const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+/** Nordic Secure DFU service UUID (buttonless DFU). */
+declare const NORDIC_DFU_SERVICE = "0000fe59-0000-1000-8000-00805f9b34fb";
+/** Nordic buttonless DFU control-point characteristic (without bond sharing). */
+declare const NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = "8ec90003-f315-4f60-9fb8-838830daea50";
+/** Nordic buttonless DFU control-point characteristic (with bond sharing). */
+declare const NORDIC_DFU_BUTTONLESS_WITH_BONDS = "8ec90004-f315-4f60-9fb8-838830daea50";
+/** Buttonless DFU control-point op-code that reboots the device into the bootloader. */
+declare const NORDIC_DFU_OP_ENTER_BOOTLOADER = 1;
+/** Upper-nibble command classes used in protocol headers. */
+declare const ASM_COMMAND: Readonly<{
+    readonly READ: 16;
+    readonly WRITE: 32;
+    readonly RESPONSE: 48;
+    readonly ACK: 64;
+    readonly NACK_BAD_HEADER_COMMAND: 80;
+    readonly NACK_BAD_HEADER_PROPERTY: 96;
+    readonly NACK_GENERIC: 112;
+    readonly ACK_NEXT_STAGE: 128;
+}>;
+type AsmCommand = (typeof ASM_COMMAND)[keyof typeof ASM_COMMAND];
+/** Lower-nibble property IDs used in protocol headers. */
+declare const ASM_PROPERTY: Readonly<{
+    readonly STATUS1: 1;
+    readonly DATA: 2;
+    readonly PRODUCTION_CONFIGURATION: 3;
+    readonly OPERATIONAL_CONFIGURATION: 4;
+    readonly TIME: 5;
+    readonly DFU_MODE: 6;
+    readonly PENDING_EVENTS: 7;
+    readonly TEST_MODE: 8;
+    readonly DEBUG_COMMAND: 9;
+    readonly STREAM_MODE: 10;
+    readonly DEVICE_DISCONNECT: 11;
+    readonly STATUS2: 12;
+    readonly CALIBRATION: 13;
+}>;
+type AsmProperty = (typeof ASM_PROPERTY)[keyof typeof ASM_PROPERTY];
+/** Stream mode payload values. */
+declare const STREAM_MODE: Readonly<{
+    readonly ENABLE: 1;
+    readonly DISABLE: 2;
+}>;
+/** Test mode IDs documented by Verisense firmware. */
+declare const TEST_MODE_ID: Readonly<{
+    readonly STOP: 0;
+    readonly FLASH_8MB_1: 1;
+    readonly FLASH_8MB_2: 2;
+    readonly FLASH_128MB_512MB: 3;
+    readonly EEPROM: 4;
+    readonly ACCEL1_LIS2DW12: 5;
+    readonly BATTERY_VOLTAGE: 6;
+    readonly USB_POWER: 7;
+    readonly ACCEL2_GYRO_LSM6DS3: 8;
+    readonly PPG_MAX86XXX: 9;
+    readonly BIOZ_MAX30002: 11;
+    readonly ACCEL2_GYRO_LSM6DSV: 12;
+    readonly MAG_LIS2MDL: 13;
+    readonly ALL_TESTS: 255;
+}>;
+type TestModeId = (typeof TEST_MODE_ID)[keyof typeof TEST_MODE_ID];
+/** Debug command IDs documented by Verisense firmware. */
+declare const DEBUG_COMMAND_ID: Readonly<{
+    readonly FLASH_LOOKUP_TABLE_READ: 1;
+    readonly FLASH_LOOKUP_TABLE_ERASE: 2;
+    readonly RWC_SCHEDULER_READ: 3;
+    readonly ERASE_128MB_512MB_FLASH: 4;
+    readonly ERASE_8MB_FLASH_1: 5;
+    readonly ERASE_8MB_FLASH_2: 6;
+    readonly ERASE_OPERATIONAL_CONFIG: 7;
+    readonly ERASE_PRODUCTION_CONFIG: 8;
+    readonly CLEAR_PENDING_EVENTS: 9;
+    readonly ERASE_FLASH_AND_LOOKUP_TABLE: 10;
+    readonly TEST_DATA_TRANSFER_LOOP: 11;
+    readonly LOAD_TEST_LOOKUP_TABLE: 12;
+    readonly LED_TEST: 13;
+    readonly MAX86XXX_LED_TEST: 14;
+    readonly CHECK_PAYLOAD_CRC_ERRORS: 15;
+    readonly READ_EVENT_LOG: 16;
+    readonly POWER_PROFILER_TEST: 17;
+    readonly READ_RECORD_BUFFER_DETAILS: 18;
+    readonly SYSTEM_RESET: 19;
+    readonly IC_POWER_CONSUMPTION_TEST: 20;
+    readonly DELETE_ALL_BONDS: 21;
+    readonly BLE_LINK_PARAMS_READ: 22;
+    readonly BLE_LINK_OPTIMIZE: 23;
+    /** Streamed MAX32674C algorithm-hub firmware (.msbl) upload (factory). The
+     * byte after this id is a HUB_FW_UPLOAD_STAGE sub-stage. */
+    readonly HUB_FW_UPLOAD: 24;
+}>;
+type DebugCommandId = (typeof DEBUG_COMMAND_ID)[keyof typeof DEBUG_COMMAND_ID];
+/**
+ * Byte indices into the Verisense operational config blob (`op[OP_IDX.xxx]`).
+ * Index 0 is the config version byte (must be 0x5A for a valid config).
+ */
+declare const OP_IDX: Readonly<{
+    readonly GEN_CFG_0: 1;
+    readonly GEN_CFG_1: 2;
+    readonly GEN_CFG_2: 3;
+    readonly GEN_CFG_3: 4;
+    readonly ACCEL1_CFG_0: 5;
+    readonly ACCEL1_CFG_1: 6;
+    readonly ACCEL1_CFG_2: 7;
+    readonly ACCEL1_CFG_3: 8;
+    readonly GYRO_ACCEL2_CFG_0: 10;
+    readonly GYRO_ACCEL2_CFG_1: 11;
+    readonly GYRO_ACCEL2_CFG_2: 12;
+    readonly GYRO_ACCEL2_CFG_3: 13;
+    readonly GYRO_ACCEL2_CFG_4: 14;
+    readonly GYRO_ACCEL2_CFG_5: 15;
+    readonly GYRO_ACCEL2_CFG_6: 16;
+    readonly GYRO_ACCEL2_CFG_7: 17;
+    readonly LSM6DSV_CFG_0: 18;
+    readonly LSM6DSV_CFG_1: 19;
+    readonly LSM6DSV_CFG_2: 20;
+    readonly START_TIME: 21;
+    readonly END_TIME: 25;
+    readonly INACTIVE_TIMEOUT: 29;
+    readonly BLE_RETRY_COUNT: 30;
+    readonly BLE_TX_POWER: 31;
+    readonly BLE_DATA_TRANS_WKUP_INT_HRS: 32;
+    readonly BLE_DATA_TRANS_WKUP_TIME: 33;
+    readonly BLE_DATA_TRANS_WKUP_DUR: 35;
+    readonly BLE_DATA_TRANS_RETRY_INT: 36;
+    readonly BLE_STATUS_WKUP_INT_HRS: 38;
+    readonly BLE_STATUS_WKUP_TIME: 39;
+    readonly BLE_STATUS_WKUP_DUR: 41;
+    readonly BLE_STATUS_RETRY_INT: 42;
+    readonly BLE_RTC_SYNC_WKUP_INT_HRS: 44;
+    readonly BLE_RTC_SYNC_WKUP_TIME: 45;
+    readonly BLE_RTC_SYNC_WKUP_DUR: 47;
+    readonly BLE_RTC_SYNC_RETRY_INT: 48;
+    readonly ADC_CHANNEL_SETTINGS_0: 50;
+    readonly ADC_CHANNEL_SETTINGS_1: 51;
+    readonly ADAPTIVE_SCHEDULER_INT: 52;
+    readonly ADAPTIVE_SCHEDULER_FAILCOUNT_MAX: 54;
+    readonly PPG_REC_DUR_SECS_LSB: 55;
+    readonly PPG_REC_DUR_SECS_MSB: 56;
+    readonly PPG_REC_INT_MINS_LSB: 57;
+    readonly PPG_REC_INT_MINS_MSB: 58;
+    readonly PPG_FIFO_CONFIG: 59;
+    readonly PPG_MODE_CONFIG2: 60;
+    readonly PPG_MA_DEFAULT: 61;
+    readonly PPG_MA_MAX_RED_IR: 62;
+    readonly PPG_MA_MAX_GREEN_BLUE: 63;
+    readonly PPG_AGC_TARGET_PERCENT_OF_RANGE: 64;
+    readonly PPG_MA_LED_PILOT: 66;
+    readonly PPG_DAC1_CROSSTALK: 67;
+    readonly PPG_DAC2_CROSSTALK: 68;
+    readonly PPG_DAC3_CROSSTALK: 69;
+    readonly PPG_DAC4_CROSSTALK: 70;
+    readonly PROX_AGC_MODE: 71;
+    readonly OP_CONFIG_VERSION: 9;
+    readonly LIGHT_GAIN_INDEX: 72;
+    readonly LIGHT_EXPOSURE_INDEX: 73;
+    readonly LIGHT_CONFIG: 74;
+    readonly LIGHT_SAMPLE_RATE_INDEX: 75;
+    readonly SKIN_TEMP_CONFIG: 76;
+    readonly SKIN_TEMP_SAMPLE_RATE_INDEX: 77;
+    readonly ALGO_OP_MODE: 78;
+    readonly ALGO_REPORT_MODE_RATE: 79;
+    readonly ALGO_CONTROL: 80;
+    readonly ALGO_INITIAL_HR: 81;
+    readonly LED_AUTO_BRIGHTNESS_CFG: 82;
+    readonly LED_MAX_BRIGHTNESS: 83;
+    readonly LED_LUX_THRESHOLD: 84;
+    readonly PERSON_HEIGHT_CM: 86;
+    readonly PERSON_WEIGHT_KG: 88;
+    readonly PERSON_AGE: 90;
+    readonly PERSON_GENDER: 91;
+}>;
+type OpIdx = keyof typeof OP_IDX;
+/** Minimum firmware version that supports the BLE-link debug commands
+ * (read/optimize connection parameters). */
+declare const BLE_LINK_MIN_FW: Readonly<{
+    major: 1;
+    minor: 4;
+    internal: 23;
+}>;
+/** Human-readable labels for Verisense stream-packet sensor IDs. Each ID maps to
+ * the device part(s) that produce that stream (some streams interleave several
+ * physical sensors, e.g. id 6 = LSM6DSV accel + gyro + mag). */
+declare const VERISENSE_STREAM_SENSOR_LABELS: Readonly<{
+    readonly 1: "ADC (GSR / Battery)";
+    readonly 2: "Accel 1 (LIS2DW12)";
+    readonly 3: "Accel 2 + Gyro (LSM6DS3)";
+    readonly 4: "PPG (MAX86xxx)";
+    readonly 6: "Accel 2 + Gyro + Mag (LSM6DSV + LIS2MDL)";
+    readonly 7: "Ambient Light (VD6283)";
+    readonly 8: "Algo Hub (MAX32674 — HR + raw PPG)";
+    readonly 9: "Skin Temperature (MLX90632)";
+}>;
+
+interface VerisenseMessage {
+    header: number;
+    command: AsmCommand;
+    property: AsmProperty;
+    payloadLength: number;
+    payload: Uint8Array;
+}
+/** Build a protocol header byte from command/property nibbles. */
+declare function buildHeader(command: AsmCommand, property: AsmProperty): number;
+/** Decode a protocol header byte into command/property fields. */
+declare function parseHeader(header: number): {
+    command: AsmCommand;
+    property: AsmProperty;
+};
+/** Build a complete protocol message (header + 16-bit LE payload length + payload bytes). */
+declare function buildMessage(command: AsmCommand, property: AsmProperty, payloadBytes?: Uint8Array | number[]): Uint8Array;
+/** Parse a complete protocol message into structured fields. */
+declare function parseMessage(msg: Uint8Array): VerisenseMessage;
+declare function isAckCommand(command: AsmCommand): boolean;
+declare function isNackCommand(command: AsmCommand): boolean;
+/** Convert a pending-events payload (property IDs) into a typed array. */
+declare function parsePendingEvents(payload: Uint8Array): AsmProperty[];
+
+/** Format a single byte as an uppercase `0xNN` string. */
+declare function formatByteAsHex(v: number): string;
+/** Format bytes as `[0xAA, 0xBB, ...]`. */
+declare function formatByteArrayAsHex(bytes: ArrayLike<number> | ArrayBuffer | null | undefined): string;
+/** Parse text containing hex bytes like `0x5A, 00 12` into a Uint8Array. */
+declare function parseHexByteString(text: string): Uint8Array;
+/** A Verisense firmware version triple (major.minor.internal). */
+interface VerisenseFirmwareVersion {
+    major: number;
+    minor: number;
+    internal: number;
+}
+/**
+ * Compare two firmware version triples. Returns a negative number if `a < b`,
+ * positive if `a > b`, and 0 if equal. Missing or non-numeric components are
+ * treated as 0.
+ */
+declare function compareVerisenseFirmwareVersion(a: Partial<VerisenseFirmwareVersion> | null | undefined, b: Partial<VerisenseFirmwareVersion> | null | undefined): number;
+/** Format a firmware version triple as `"major.minor.internal"`, or `"unknown"`
+ * when the version is null/undefined. */
+declare function formatVerisenseFirmwareVersion(v: Partial<VerisenseFirmwareVersion> | null | undefined): string;
+/** Human-readable label for a Verisense stream-packet sensor ID, with a
+ * `"Sensor 0xNN"` hex fallback for unknown IDs. */
+declare function getVerisenseStreamSensorLabel(sensorId: number): string;
+interface PendingEventPropertyLabel {
+    value: number;
+    hex: string;
+    property: string;
+}
+/** Label pending-event property values with both enum name and hex representation. */
+declare function formatPendingEventProperties(pendingProps: ArrayLike<number> | null | undefined): PendingEventPropertyLabel[];
+/**
+ * Convert a UTC unix-ms instant to the "local civil" timestamp domain used by
+ * the Verisense real-world clock: unix ms with the host's local timezone
+ * offset baked in, so that hour-of-day of the raw value equals the wall-clock
+ * hour where the base station is.
+ *
+ * This is the documented time-sync contract ("synchronises the sensor's
+ * real-world clock with the Base Station's local time" - Verisense
+ * communication protocol) and what the downstream file parser assumes: it
+ * evaluates midnight/midday CSV-split boundaries on the raw RWC value in a
+ * pinned GMT+0 calendar, and labels CSV timestamp columns
+ * "Unix_ms_plus_local_time_zone_offset".
+ *
+ * Note `getTimezoneOffset()` is evaluated at `utcMillis` itself, so the DST
+ * rule in effect at that instant is applied.
+ */
+declare function utcToLocalCivilMillis(utcMillis?: number): number;
+/** Current time in the Verisense local-civil RWC domain, in whole unix seconds. */
+declare function localCivilUnixSecondsNow(): number;
+/**
+ * Compute CRC-16/CCITT-FALSE over `bytes`.
+ *
+ * Parameters: poly=0x1021, init=0xFFFF, xorOut=0x0000.
+ * Matches the C# `ComputeCRC` implementation used by Verisense firmware.
+ */
+declare function crc16_ccitt_false(bytes: Uint8Array): number;
+/**
+ * Convert any reasonable representation of an operational config to a
+ * `Uint8Array`. Throws if the input type is unrecognised.
+ */
+declare function normalizeOperationalConfig(payload: Uint8Array | ArrayBuffer | number[] | {
+    buffer: ArrayBuffer;
+    byteOffset?: number;
+    byteLength?: number;
+} | null | undefined): Uint8Array | null;
+/** Alias for arbitrary protocol byte payload normalization. */
+declare function normalizeBytePayload(payload: Uint8Array | ArrayBuffer | number[] | {
+    buffer: ArrayBuffer;
+    byteOffset?: number;
+    byteLength?: number;
+} | null | undefined): Uint8Array | null;
+/**
+ * Derive the 6-digit pairing PIN from a Verisense unique identifier.
+ *
+ * The PIN is built from digits 2, 4 and 6 (1-based) of the identifier,
+ * followed by the decimal value of the final byte padded to 3 digits.
+ */
+declare function computeVerisensePairingPin(uniqueId: string): string;
+interface ProductionConfig {
+    hardware: string;
+    firmware: string;
+    asmid: string;
+    configHeader: number;
+    revHwMajor?: number;
+    revHwMinor?: number;
+    revHwInternal?: number;
+    revFwMajor?: number;
+    revFwMinor?: number;
+    revFwInternal?: number;
+}
+interface ProductionConfigBuildOptions {
+    manufacturingOrderNumberHex: string;
+    macIdHex: string;
+    revHwMajor: number;
+    revHwMinor: number;
+    revFwMajor: number;
+    revFwMinor: number;
+    revFwInternal?: number;
+    revHwInternal?: number;
+    passkeyId?: string;
+    passkey?: string;
+    advertisingNamePrefix?: string;
+    dfuEnabled?: boolean;
+}
+interface ProductionConfigFull extends ProductionConfig {
+    manufacturingOrderNumber: string;
+    macId: string;
+    uniqueIdentifier: string;
+    revHwMajor: number;
+    revHwMinor: number;
+    revHwInternal: number;
+    revFwMajor: number;
+    revFwMinor: number;
+    revFwInternal: number;
+    passkeyId: string;
+    passkey: string;
+    advertisingNamePrefix: string;
+    dfuEnabled: boolean;
+}
+interface VerisenseStatusFlags {
+    usbPluggedIn: boolean;
+    recordingPaused: boolean;
+    flashIsFull: boolean;
+    powerIsGood: boolean;
+    adaptiveSchedulerOn: boolean;
+    dfuServiceOn: boolean;
+    firstBoot: boolean;
+    repeatedBatteryMeasurement: boolean;
+}
+interface VerisenseStatusPayload {
+    uniqueIdentifier: string;
+    sourceStatusProperty: 'status1' | 'status2';
+    statusTimestampSeconds: number;
+    batteryMilliVolts: number;
+    batteryPercent: number;
+    lastOkTransferSeconds: number;
+    lastFailTransferSeconds: number;
+    memoryFreeKb: number;
+    memoryCapacityKb: number | null;
+    memoryUsedKb: number | null;
+    /** kB of FULL (ready-to-sync) flash banks. Only populated for payloads >= 57 bytes. */
+    memoryFullBanksKb: number | null;
+    /** kB of 2DEL (partially-deleted) flash banks. Only populated for payloads >= 57 bytes. */
+    memoryTwoDelBanksKb: number | null;
+    /** kB of BAD flash banks. Only populated for payloads >= 57 bytes. */
+    memoryBadBanksKb: number | null;
+    statusFlags: VerisenseStatusFlags | null;
+    batteryFallCounter: number | null;
+    /** Byte 64 bit0 (charger chip present). Null for legacy payloads (<65 bytes). */
+    chargerPresent: boolean | null;
+    /** Byte 64 bits1..3 (BatteryChargerStatus_t). Null for legacy payloads (<65 bytes). */
+    chargerStatusCode: number | null;
+    /** Decoded charger status enum label from chargerStatusCode. */
+    chargerStatusName: 'CHARGER_STATUS_BAD_BATTERY' | 'CHARGER_STATUS_CHARGING' | 'CHARGER_STATUS_CHARGING_COMPLETE' | 'CHARGER_STATUS_POWER_DOWN' | 'CHARGER_STATUS_TRICKLE_CHARGING' | 'CHARGER_STATUS_NOT_READ' | 'CHARGER_STATUS_UNKNOWN' | null;
+    /**
+     * Byte 65 bit0 (second status-flags byte — byte 26's flags are full): the
+     * installed bootloader's DFU mode has the USB CDC transport (settings page
+     * reports bootloader version >= 3), so USB DFU is available on this unit.
+     * Null when the firmware predates the field (payload < 66 bytes) — treat
+     * as unknown, not as unsupported.
+     */
+    usbDfuBootloader: boolean | null;
+}
+interface VerisenseUnixAndHumanTimestamp {
+    unix: number;
+    human: string;
+}
+interface VerisenseStatusPayloadForLog extends VerisenseStatusPayload {
+    statusTimestamp: VerisenseUnixAndHumanTimestamp;
+    lastOkTransfer: VerisenseUnixAndHumanTimestamp;
+    lastFailTransfer: VerisenseUnixAndHumanTimestamp;
+}
+type VerisenseChargerChipFamily = 'LM3658D' | 'LTC4123' | 'XC6803' | 'UNKNOWN';
+/** Infer charger chip family from hardware revision fields in production config. */
+declare function inferVerisenseChargerChipFamily(revHwMajor: number, revHwMinor: number, revHwInternal: number): VerisenseChargerChipFamily;
+/** Return chip-specific charger status text for a parsed 3-bit status code. */
+declare function describeVerisenseChargerStatus(chipFamily: VerisenseChargerChipFamily, statusCode: number): string;
+/** Format charger summary text for UIs, e.g. "XC6803: Charge completed". */
+declare function formatVerisenseChargerStatus(status: Pick<VerisenseStatusPayload, 'chargerPresent' | 'chargerStatusCode' | 'chargerStatusName'>, hw?: {
+    revHwMajor?: number;
+    revHwMinor?: number;
+    revHwInternal?: number;
+}): string;
+interface VerisenseSchedulerDebugPayload {
+    currentTimeUnixSeconds: number;
+    bleControlCounter: 'data-transfer' | 'status1' | 'rtc-sync' | 'status2' | 'never' | 'unknown';
+    pendingDataTransferUnixSeconds: number;
+    pendingStatus1UnixSeconds: number;
+    pendingRtcSyncUnixSeconds: number;
+    pendingRetryUnixSeconds: number;
+    retryCount: number;
+    retryOperation: 'ble-off' | 'ble-on' | 'unknown';
+    adaptiveScheduler?: {
+        nextUnixSeconds: number;
+        enabled: boolean;
+        syncFailCounter: number;
+    };
+    ltfRetry?: {
+        nextUnixSeconds: number;
+        currentOperation: 'flash-write-retry-inactive' | 'short-flash-write-retry' | 'attempt-flash-write' | 'long-flash-write-retry' | 'sensor-paused-until-usb-plug-in' | 'unknown';
+        failCounterShort: number;
+        failCounterLong: number;
+    };
+    pendingStatus2UnixSeconds?: number;
+    ppgMeasurementUnixSeconds?: number;
+    stepCounterResetUnixSeconds?: number;
+    sensorInactivityUnixSeconds?: number;
+}
+interface VerisenseSchedulerDebugPayloadForLog extends VerisenseSchedulerDebugPayload {
+    currentTime: VerisenseUnixAndHumanTimestamp;
+    pendingDataTransfer: VerisenseUnixAndHumanTimestamp;
+    pendingStatus1: VerisenseUnixAndHumanTimestamp;
+    pendingRtcSync: VerisenseUnixAndHumanTimestamp;
+    pendingRetry: VerisenseUnixAndHumanTimestamp;
+    pendingStatus2?: VerisenseUnixAndHumanTimestamp;
+    ppgMeasurement?: VerisenseUnixAndHumanTimestamp;
+    stepCounterReset?: VerisenseUnixAndHumanTimestamp;
+    sensorInactivity?: VerisenseUnixAndHumanTimestamp;
+    adaptiveScheduler?: VerisenseSchedulerDebugPayload['adaptiveScheduler'] & {
+        nextTime: VerisenseUnixAndHumanTimestamp;
+    };
+    ltfRetry?: VerisenseSchedulerDebugPayload['ltfRetry'] & {
+        nextTime: VerisenseUnixAndHumanTimestamp;
+    };
+}
+interface VerisenseBleLinkDebugPayload {
+    attMtu: number;
+    maxDataLength: number;
+    connectionIntervalUnits: number;
+    connectionIntervalMs: number;
+    txPhy: number;
+    rxPhy: number;
+    optimizationResult: number;
+    isConnected: boolean;
+}
+interface VerisenseEventLogEntry {
+    index: number;
+    eventId: number;
+    eventName: string;
+    timestampUnixSeconds: number | null;
+    batteryMilliVolts: number | null;
+}
+/** Upper bound for a plausible device timestamp (2100-01-01 UTC in unix
+ * seconds). Values beyond this are uninitialised/garbage bytes, not dates. */
+declare const VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS = 4102444800;
+/**
+ * Format a device-RWC timestamp (unix seconds) as raw + human-readable datetime.
+ *
+ * The device RWC lives in the "local civil" domain (unix seconds with the
+ * base station's timezone offset already baked in - see
+ * {@link utcToLocalCivilMillis}), so the value is rendered VERBATIM via the
+ * Date UTC accessors: the wall-clock time shown is exactly what the device's
+ * clock reads. Rendering with the local-time accessors would apply the
+ * browser's timezone offset a second time.
+ */
+declare function formatVerisenseUnixAndHuman(unixSeconds: number): VerisenseUnixAndHumanTimestamp;
+/** Convert parsed status payload into an object with human-readable timestamps for logs. */
+declare function formatStatusPayloadForLog(status: VerisenseStatusPayload): VerisenseStatusPayloadForLog;
+/** Convert parsed scheduler payload into an object with human-readable timestamps for logs. */
+declare function formatSchedulerPayloadForLog(parsed: VerisenseSchedulerDebugPayload): VerisenseSchedulerDebugPayloadForLog;
+interface VerisenseRecordBufferDetails {
+    bufferIndex: number;
+    bufferState: number;
+    packagedPayloadIndex: number;
+    currentByteIndexForSensorData: number;
+    usedBufferLength: number;
+    fifoTicks: number;
+    dataTimestampRwcMinutes: number;
+    dataTimestampRwcTicks: number;
+    temperatureData: number;
+    dataTimestampUcClockMinutes: number | null;
+    dataTimestampUcClockTicks: number | null;
+}
+interface VerisenseLookupTableEntry {
+    bankIndex: number;
+    statusCode: number;
+    statusName: 'Full' | '2Del' | 'Emty' | 'Bad' | 'NUse' | 'Zero' | 'Unknown';
+    pendingEepromWrite: boolean;
+    payloadIndex: number;
+}
+interface VerisenseLookupTablePayload {
+    head: number | null;
+    tail: number | null;
+    entries: VerisenseLookupTableEntry[];
+}
+/** Convert unix seconds into Verisense 7-byte RTC payload (4-byte minutes + 3-byte ticks). */
+declare function unixSecondsToAsmRtcBytes(unixSeconds: number): Uint8Array;
+/** Convert Verisense 7-byte RTC payload into unix seconds. */
+declare function asmRtcBytesToUnixSeconds(rtc7: Uint8Array): number;
+/** Convert Verisense 8-byte minute counter payload into unix seconds. */
+declare function asmRtcMinutesBytesToUnixSeconds(minutes8: Uint8Array): number;
+/**
+ * Build a production configuration payload (56 bytes) from structured options.
+ * This matches the Python tooling layout used by ASM_BLE.py / ASM_Device.py.
+ */
+declare function buildProductionConfigPayload(opts: ProductionConfigBuildOptions): Uint8Array;
+/** Parse production configuration with optional passkey/name/flag fields. */
+declare function parseProductionConfigPayloadFull(response: Uint8Array): ProductionConfigFull;
+/**
+ * Parse STATUS1/STATUS2 payload into a typed object.
+ *
+ * This ports the core byte parsing from ASM_Device.parse_status while keeping
+ * the output concise and UI-friendly.
+ */
+declare function parseStatusPayload(response: Uint8Array, sourceStatusProperty?: 'status1' | 'status2'): VerisenseStatusPayload;
+/** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
+declare function parseSchedulerDebugPayload(payload: Uint8Array): VerisenseSchedulerDebugPayload;
+/** Decoded view of the BLE-link `optimizationResult` byte returned by the
+ * optimize debug command: bit 7 = device reports "not connected" (the other
+ * bits are then meaningless), bit 0 = a PHY change was requested, bit 1 = a
+ * connection-interval change was requested, bit 2 = a data-length change was
+ * requested. */
+interface VerisenseBleOptimizationResult {
+    notConnected: boolean;
+    phyRequested: boolean;
+    connIntervalRequested: boolean;
+    dataLengthRequested: boolean;
+    resultMask: number;
+}
+/** Decode the `optimizationResult` byte from {@link parseBleLinkDebugPayload}
+ * (see {@link VerisenseBleOptimizationResult} for the bit meanings). */
+declare function decodeVerisenseBleOptimizationResult(resultByte: number): VerisenseBleOptimizationResult;
+/** Parse debug payload from BLE link read/optimize commands. */
+declare function parseBleLinkDebugPayload(payload: Uint8Array): VerisenseBleLinkDebugPayload;
+/** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
+declare function parsePayloadCrcErrorBankIndexes(payload: Uint8Array): number[];
+/** Parse 8-byte debug event-log entries. */
+declare function parseEventLogPayload(payload: Uint8Array): VerisenseEventLogEntry[];
+/** Parse record-buffer details payload (26-byte current layout, 19-byte legacy layout). */
+declare function parseRecordBufferDetailsPayload(payload: Uint8Array): VerisenseRecordBufferDetails[];
+/**
+ * Infer the lookup-table bank count from a raw debug payload length. The payload
+ * is 3 bytes per bank, optionally prefixed with a 4-byte head/tail block.
+ * Returns 0 if the length matches neither layout.
+ */
+declare function inferVerisenseLookupBankCount(payloadLen: number): number;
+/**
+ * Parse lookup-table debug payload entries (3 bytes per bank), with optional
+ * 4-byte tail/head prefix present in older firmware debug responses. When
+ * `totalBanks` is omitted it is inferred from the payload length via
+ * {@link inferVerisenseLookupBankCount}.
+ */
+declare function parseLookupTablePayload(payload: Uint8Array, totalBanks?: number): VerisenseLookupTablePayload;
+/**
+ * Parse the production config response payload into a structured object.
+ */
+declare function parseProductionConfigPayload(response: Uint8Array): ProductionConfig;
+/**
+ * Firmware default passkeys by passkey ID: a production config programmed
+ * with passkey ID "01" pairs with the fixed PIN "123456". Other IDs have no
+ * fixed default (ID "00" uses the per-device derived PIN — see
+ * {@link computeVerisensePairingPin}).
+ */
+declare const VERISENSE_DEFAULT_PASSKEY_BY_ID: Readonly<Record<string, string>>;
+/** The fixed passkey for a passkey ID, or undefined when the ID has none
+ * (leave the passkey bytes unset in the production config). */
+declare function defaultVerisensePasskeyForId(passkeyId: string | null | undefined): string | undefined;
+/** Component parts of a Verisense advertised BLE name. */
+interface VerisenseAdvertisedNameParts {
+    /** Name prefix from the production config (normally "Verisense"). */
+    prefix: string;
+    /** 2-char passkey ID from the production config. */
+    passkeyId: string;
+    /** 12-hex unique identifier (8-hex manufacturing order + 4-hex MAC ID). */
+    uniqueId: string;
+}
+/**
+ * Build the name a Verisense sensor advertises over BLE:
+ * `<prefix>-<passkeyId>-<uniqueId>` (e.g. "Verisense-01-25112101B10F").
+ * Returns null when any part is missing — matches how apps derive the name
+ * from a parsed production config that may be blank/erased.
+ */
+declare function buildVerisenseAdvertisedName(parts: Partial<VerisenseAdvertisedNameParts>): string | null;
+/**
+ * Split a Verisense advertised name back into its parts. The unique ID is the
+ * final `-`-separated token; the passkey ID the token before it; anything
+ * earlier (which may itself contain `-`) is the prefix. Returns null when the
+ * name does not have at least three tokens.
+ */
+declare function parseVerisenseAdvertisedName(name: string | null | undefined): VerisenseAdvertisedNameParts | null;
+/**
+ * The 4-hex MAC ID from a Verisense advertised name (the advertised name ends
+ * with the unique ID = manufacturing order + MAC; its last 4 hex chars are
+ * the MAC ID). Returns null when the tail is not valid hex.
+ */
+declare function deriveVerisenseMacIdFromName(name: string | null | undefined): string | null;
+/**
+ * Short device tag for file names (e.g. "…-B10F-…"): the last 4 hex chars of
+ * a device unique ID or advertised name. Returns "" when unknown so callers
+ * can omit it cleanly.
+ */
+declare function verisenseDeviceFileTag(idOrName: string | null | undefined): string;
+
+type ParsedSplitReason = 'midday-midnight-boundary' | 'config-change' | 'timestamp-discontinuity' | 'power-reset';
+interface EvaluateParsedSplitInput {
+    prevTimestampSec: number;
+    currTimestampSec: number;
+    expectedDeltaSec?: number;
+    timestampToleranceSec?: number;
+    prevConfigSignature?: string | null;
+    currConfigSignature?: string | null;
+    powerResetDetected?: boolean;
+}
+/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
+declare function buildUploadBinaryFileName(uploadDate: Date, firstPayloadIndex: number): string;
+/**
+ * Ensure a nested directory path exists under a root directory handle, creating
+ * each level as needed, and return the leaf handle. Browser-only (File System
+ * Access API) — the app obtains `root` from `showDirectoryPicker()` when the
+ * user selects an output location at transfer start.
+ */
+declare function ensureDirectoryPath(root: FileSystemDirectoryHandle, segments: string[]): Promise<FileSystemDirectoryHandle>;
+/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
+declare function buildParsedCsvFileName(startDate: Date, dataSource: string, firstPayloadIndex: number): string;
+/** Add duplicate suffix like " (2)" before extension. */
+declare function applyDuplicateSuffix(fileName: string, duplicateIndex: number): string;
+/** Return first non-colliding duplicate name for a target file name. */
+declare function nextAvailableDuplicateFileName(fileName: string, existingNames: Iterable<string>): string;
+/** Parse first payload index (uint16 LE) from a payload byte array. */
+declare function getFirstPayloadIndex(payload: Uint8Array): number;
+/**
+ * Evaluate whether parsed CSV output should roll to a new file.
+ * Rules mirror ASM-DES08 split conditions.
+ */
+declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
+    shouldSplit: boolean;
+    reasons: ParsedSplitReason[];
+};
+
+type VerisenseHardwareFriendlyName = 'IMU' | 'GSR+' | 'SDK' | 'Pulse+';
+interface VerisenseHardwareCapabilities {
+    readonly secondGeneration: boolean;
+    readonly supportsMagnetometer: boolean;
+}
+interface VerisenseHardwareRevision {
+    readonly major: number;
+    readonly minor: number;
+    readonly internal: number;
+}
+interface VerisenseHardwareRevisionSource {
+    readonly revHwMajor?: number | null;
+    readonly revHwMinor?: number | null;
+    readonly revHwInternal?: number | null;
+}
+declare const VERISENSE_HW_MAJOR_FRIENDLY_NAMES: Readonly<Record<number, VerisenseHardwareFriendlyName>>;
+declare function getVerisenseHardwareFriendlyName(revHwMajor: number): VerisenseHardwareFriendlyName | null;
+/**
+ * Second-generation Verisense hardware is currently defined as:
+ * - SR61.5+
+ * - SR68.9+
+ * - Any future major revision above SR68
+ */
+declare function isVerisenseSecondGenerationHardware(revHwMajor: number, revHwMinor: number): boolean;
+declare function getVerisenseHardwareCapabilities(revHwMajor: number, revHwMinor: number): VerisenseHardwareCapabilities;
+/**
+ * GSR-capable hardware. Mirrors the firmware's authoritative
+ * `ShimBrd_isGsrSupportedForHwVersion` (shimmer_boards.c):
+ * - SR62 (any revision)
+ * - SR61 minor >= 5
+ * - SR68 minor >= 5
+ *
+ * Deliberately NOT {@link isVerisenseSecondGenerationHardware}: that predicate
+ * requires SR68 >= 9, but GSR arrived on the SR68 at minor revision 5.
+ */
+declare function isVerisenseGsrSupportedHardware(revHwMajor: number, revHwMinor: number): boolean;
+/**
+ * Hardware models with a permanently-attached rechargeable LiPo battery.
+ * Mirrors the firmware's authoritative `ShimBrd_isLipoPresentForHwVersion`
+ * (shimmer_boards.c):
+ * - SR62 (any revision)
+ * - SR61 minor >= 5
+ * - SR68 minor >= 9
+ *
+ * On these boards the operational-config battery-type bit (GEN_CFG_2 bit 0,
+ * Zinc-Air/NiMH) has no effect: the firmware hard-overrides the battery type
+ * to LiPo regardless of the stored bit (`setBattType`, hal_asm_battery.c).
+ * Config editors should therefore disable the Battery Type field on these
+ * models rather than offer a choice that does nothing (DEV-809).
+ */
+declare function isVerisenseLipoBatteryHardware(revHwMajor: number, revHwMinor: number): boolean;
+/**
+ * Which physical sensor blocks a Verisense board carries. Each flag lines up
+ * with an operational-config field group (see
+ * `getVerisenseSupportedOperationalFieldGroupIds`), so callers can decide which
+ * config groups are meaningful for the connected hardware.
+ *
+ * Derived from the firmware Model IC matrix
+ * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
+ */
+interface VerisenseHardwareSensorSupport {
+    /** 1st-gen low-power accel, LIS2DW12 (`accel1` group). */
+    readonly accel1: boolean;
+    /** 1st-gen gyro + accel2, LSM6DS3 (`gyro_accel2` group). */
+    readonly gyroAccel2: boolean;
+    /** 2nd-gen IMU + magnetometer, LSM6DSV + LIS2MDL (`lsm6dsv` group). */
+    readonly imuGen2: boolean;
+    /** Galvanic skin response front-end (`adc_gsr` group). */
+    readonly gsr: boolean;
+    /** Photoplethysmography front-end (`ppg` group). */
+    readonly ppg: boolean;
+    /** Ambient light sensor, VD6283 (`light` group). */
+    readonly ambientLight: boolean;
+    /** Skin temperature sensor, MLX90632 (`skin_temp` group). */
+    readonly skinTemperature: boolean;
+    /** Algorithm hub, MAX32674 (`algo` group). */
+    readonly algorithmHub: boolean;
+    /** 2xRGB status LEDs with auto-brightness (`led` group). */
+    readonly ledAutoBrightness: boolean;
+}
+/**
+ * Resolves which sensor blocks a given Verisense hardware revision carries,
+ * derived from the firmware Model IC matrix
+ * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
+ *
+ * Unknown / development hardware (e.g. SR64, or any unrecognised major
+ * revision) reports every block as present so consumers never hide a setting
+ * they cannot confidently rule out.
+ */
+declare function getVerisenseHardwareSensorSupport(revHwMajor: number, revHwMinor: number): VerisenseHardwareSensorSupport;
+declare function getVerisenseHardwareRevision(source: VerisenseHardwareRevisionSource | null | undefined): VerisenseHardwareRevision | null;
+declare function supportsVerisenseMagnetometer(source: VerisenseHardwareRevisionSource | null | undefined): boolean;
+declare function formatVerisenseHardwareRevision(revHwMajor: number, revHwMinor: number, revHwInternal?: number, opts?: {
+    prefix?: string;
+    includeFriendlyName?: boolean;
+}): string;
+/**
+ * Battery voltage scaling for streamed ADC battery samples.
+ * Status responses already contain firmware-scaled battery values and should not use this helper.
+ */
+declare function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor: number, revHwMinor: number): number;
+
+type VerisenseOperationalFieldKind = 'bit' | 'u8' | 'u16' | 'u32' | 'inactiveResume' | 'inactiveMinutes';
+type VerisenseOperationalFieldOption = readonly [number, string];
+interface VerisenseOperationalFieldDefinition {
+    readonly key: string;
+    readonly label: string;
+    readonly desc: string;
+    readonly kind: VerisenseOperationalFieldKind;
+    readonly index: number;
+    readonly shift?: number;
+    readonly width?: number;
+    readonly min?: number;
+    readonly max?: number;
+    readonly options?: readonly VerisenseOperationalFieldOption[];
+}
+declare const VERISENSE_OPERATIONAL_FIELD_SCHEMA: ({
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 1;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 2;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 3;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 4;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 5;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 6;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 7;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 8;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 8;
+    shift: number;
+    width: number;
+    min: number;
+    max: number;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 11;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 11;
+    shift: number;
+    width: number;
+    min: number;
+    max: number;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 12;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 13;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 14;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 15;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 16;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 17;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 17;
+    shift: number;
+    width: number;
+    min: number;
+    max: number;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 18;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 19;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 20;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 29;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 31;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 50;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 51;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 59;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 60;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: number;
+    min: number;
+    max: number;
+    shift?: undefined;
+    width?: undefined;
+    options?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 71;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 72;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 73;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 74;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 75;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 76;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 78;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 79;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 79;
+    shift: number;
+    width: number;
+    options?: undefined;
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 80;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 82;
+    shift: number;
+    width: number;
+    options: (string | number)[][];
+    min?: undefined;
+    max?: undefined;
+} | {
+    key: string;
+    label: string;
+    desc: string;
+    kind: string;
+    index: 91;
+    min: number;
+    max: number;
+    options: (string | number)[][];
+    shift?: undefined;
+    width?: undefined;
+})[];
+declare const VERISENSE_OP_CONFIG_BYTE_SIZE = 92;
+type VerisenseOperationalField = VerisenseOperationalFieldDefinition;
+declare function createBlankVerisenseOperationalConfig(byteSize?: number): Uint8Array;
+declare function readVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField): number;
+declare function writeVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField, rawValue: unknown): void;
+declare function setVerisenseOperationalBitRange(op: Uint8Array, index: number, shift: number, width: number, rawValue: unknown): void;
+/**
+ * Enforce the USB/Bluetooth comms-channel interlock on an operational-config
+ * buffer.
+ *
+ * A Verisense must never be configured with BOTH Bluetooth and USB disabled, or
+ * it becomes unreachable for reconfiguration (the radio is the only wireless way
+ * back in, and disabling USB removes the wired fallback). If a config has both
+ * `BLUETOOTH_EN` and `USB_EN` cleared, this forces BOTH back on.
+ *
+ * This mirrors the firmware safeguard (`enforceCommsChannelInterlock` in
+ * `ASM_Production/main.c`, applied on config write and parse). Enforcing it here
+ * in the SDK means any consuming application is protected — a device can't be
+ * stranded by a third-party tool writing 0/0.
+ *
+ * On firmware older than {@link VERISENSE_BLUETOOTH_OFF_MIN_FW} this is not
+ * enough: there, Bluetooth off takes USB with it. See
+ * {@link enforceVerisenseBluetoothOffFirmwareGuard}.
+ *
+ * Mutates `op` in place. Returns `true` if a correction was applied.
+ */
+declare function enforceVerisenseCommsChannelInterlock(op: Uint8Array): boolean;
+/**
+ * The first firmware on which `BLUETOOTH_EN = 0` leaves USB working (DEV-1096).
+ *
+ * ASM_Production handles USB events only while its SoftDevice is on, and before
+ * this version it started the SoftDevice only for Bluetooth. With Bluetooth off,
+ * USB therefore never enumerated either, and a write that turned Bluetooth off
+ * over USB stopped USB at once. The sensor was left with no way back in but SWD.
+ * {@link enforceVerisenseCommsChannelInterlock} cannot catch that, because USB
+ * is still enabled in the config.
+ */
+declare const VERISENSE_BLUETOOTH_OFF_MIN_FW: VerisenseFirmwareVersion;
+/** Whether the given firmware can run with Bluetooth disabled. Firmware whose
+ * version is unknown cannot be assumed to. */
+declare function supportsVerisenseBluetoothOff(fw: Partial<VerisenseFirmwareVersion> | null | undefined): boolean;
+/** Whether an operational-config buffer has Bluetooth enabled (`BLUETOOTH_EN`). */
+declare function isVerisenseBluetoothEnabled(op: Uint8Array | null | undefined): boolean;
+/**
+ * Keep Bluetooth enabled in an operational-config buffer bound for firmware that
+ * cannot run without it: older than {@link VERISENSE_BLUETOOTH_OFF_MIN_FW}, or of
+ * unknown version.
+ *
+ * That includes firmware older than V2.00.007, which ignores `BLUETOOTH_EN`. The
+ * bit still stays in the sensor's EEPROM, and an update to V2.00.007 - V2.01.002
+ * would then strand the sensor.
+ *
+ * Mutates `op` in place. Returns `true` if a correction was applied.
+ */
+declare function enforceVerisenseBluetoothOffFirmwareGuard(op: Uint8Array, fw: Partial<VerisenseFirmwareVersion> | null | undefined): boolean;
+interface VerisenseOperationalSensorEnableField {
+    readonly key: string;
+    readonly index: number;
+    readonly shift: number;
+}
+declare const VERISENSE_SENSOR_ENABLE_FIELDS: readonly VerisenseOperationalSensorEnableField[];
+interface VerisenseOperationalFieldSubgroupDefinition {
+    readonly id: string;
+    readonly title: string;
+    readonly keys: readonly string[];
+}
+interface VerisenseOperationalFieldGroupDefinition {
+    readonly id: string;
+    readonly title: string;
+    readonly openByDefault: boolean;
+    readonly keys: readonly string[];
+    /**
+     * Optional presentational partition of {@link keys} into labelled subpanels
+     * rendered inside the group. Purely for layout: group membership, hardware
+     * support detection and field resolution all continue to use {@link keys}.
+     * Subgroups need not be exhaustive — any key in {@link keys} not covered by a
+     * subgroup is rendered above the subpanels, so nothing is ever hidden.
+     */
+    readonly subgroups?: readonly VerisenseOperationalFieldSubgroupDefinition[];
+}
+declare const VERISENSE_OPERATIONAL_FIELD_GROUPS: readonly VerisenseOperationalFieldGroupDefinition[];
+declare const VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID = "gen";
+/**
+ * Maps each hardware-gated operational-config group id to the sensor block that
+ * gates it (see {@link VerisenseHardwareSensorSupport}). Group ids absent from
+ * this map (e.g. `gen`, `ble_wake`) configure behaviour that applies to
+ * every board and are always considered supported.
+ */
+declare const VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR: Readonly<Record<string, keyof VerisenseHardwareSensorSupport>>;
+/**
+ * Returns the set of operational-config group ids (from
+ * {@link VERISENSE_OPERATIONAL_FIELD_GROUPS}) whose underlying sensor is present
+ * on the given hardware revision. A group is supported when it is not gated by a
+ * sensor block, or when its gating sensor is present.
+ *
+ * Returns `null` when the hardware revision is unknown so callers can fall back
+ * to showing every group.
+ */
+declare function getVerisenseSupportedOperationalFieldGroupIds(source: VerisenseHardwareRevisionSource | null | undefined): ReadonlySet<string> | null;
+/** LIGHT_CONFIG bit 1 is the VD6283 dark-channel select: when set, the shared
+ * visible/clear slot carries the dark (covered-photodiode) baseline instead of
+ * the visible reading. Returns false for empty/nullish config. */
+declare function isVerisenseLightDarkChannelEnabled(op: Uint8Array | null | undefined): boolean;
+/**
+ * Pad an operational config authored at a legacy/shorter length onto a blank
+ * full-size (v9, {@link VERISENSE_OP_CONFIG_BYTE_SIZE}-byte) image so the
+ * working config is always canonical size — otherwise trailing v9 fields
+ * (e.g. the person-parameter bytes) would be absent. Configs already at or
+ * beyond full size are returned as-is.
+ */
+declare function padVerisenseOperationalConfig(bytes: Uint8Array | ArrayLike<number>): Uint8Array;
+/** Which IMU generation an op-config field key targets: 'ds3' = first-gen
+ * LSM6DS3, 'dsv' = second-gen LSM6DSV (+LIS2MDL mag). */
+type VerisenseImuGeneration = 'ds3' | 'dsv';
+interface VerisenseSensorRateDefaultField {
+    /** Field key in {@link VERISENSE_OPERATIONAL_FIELD_SCHEMA}, when the field
+     * is the same on both IMU generations. */
+    readonly key?: string;
+    /** Generation-specific field keys (accel2/gyro ODR live in different
+     * fields on LSM6DS3 vs LSM6DSV configs). */
+    readonly keyByGen?: Readonly<Record<VerisenseImuGeneration, string>>;
+    /** Default rate/mode code to seed when the sensor is enabled. */
+    readonly on: number;
+    /** Power-down code to write when every enable in the group is off. */
+    readonly off: number;
+}
+interface VerisenseSensorRateDefaultGroup {
+    /** Sensor-enable field keys (see {@link VERISENSE_SENSOR_ENABLE_FIELDS})
+     * that share the rate/mode field(s) below. */
+    readonly enableKeys: readonly string[];
+    readonly fields: readonly VerisenseSensorRateDefaultField[];
+}
+/**
+ * Firmware default rate/mode codes per sensor group, for config editors that
+ * auto-seed a rate when a sensor is first enabled and power it down when all
+ * of its enables are cleared. Editors should only seed the `on` default when
+ * the field currently holds the `off` (power-down) code, so a user-chosen
+ * rate is never clobbered. Sensors whose rate field has no power-down value
+ * (magnetometer LIS2MDL_ODR, PPG_SR) are omitted — their enable bit / channel
+ * toggles are the on/off control. Default ODR codes mirror the standard
+ * customer template (Accel1 = 50 Hz, ADC = 128 Hz).
+ */
+declare const VERISENSE_SENSOR_RATE_DEFAULT_GROUPS: readonly VerisenseSensorRateDefaultGroup[];
+/** Resolve a rate-default field to its concrete schema key for the given IMU
+ * generation, or null when the field has no key for that generation. */
+declare function resolveVerisenseSensorRateFieldKey(field: VerisenseSensorRateDefaultField, generation: VerisenseImuGeneration): string | null;
+/** One of the three firmware BLE wake/sync schedules and its four op-config
+ * field keys (see the BLE Wake Schedule field group). */
+interface VerisenseBleSyncSchedule {
+    readonly id: 'data' | 'status' | 'rtcSync';
+    /** Field-group subgroup id used by the operational field schema. */
+    readonly subgroupId: string;
+    readonly intervalKey: string;
+    readonly timeKey: string;
+    readonly durKey: string;
+    readonly retryKey: string;
+}
+/**
+ * The three firmware sync schedules (data transfer, status, RTC sync), each
+ * with wake-interval-hours / wake-time / active-duration / retry-interval
+ * fields. Interval semantics (from firmware `hal_rtc.c`): 0 = off, 24 = once
+ * daily at the wake time, 1-23 = every N hours. Wake time is
+ * minutes-since-midnight (device local time), duration is minutes 0-255,
+ * retry interval is minutes 0-1439. The number of connection attempts per
+ * window is the separate global `BLE_CONNECTION_TRIES_PER_DAY` field.
+ */
+declare const VERISENSE_BLE_SYNC_SCHEDULES: readonly VerisenseBleSyncSchedule[];
+/** Value ranges for the BLE sync-schedule fields (clamp editor input to
+ * these before writing). */
+declare const VERISENSE_BLE_SCHEDULE_RANGES: Readonly<{
+    intervalHours: Readonly<{
+        min: 0;
+        max: 24;
+    }>;
+    timeMins: Readonly<{
+        min: 0;
+        max: 1439;
+    }>;
+    durMin: Readonly<{
+        min: 0;
+        max: 255;
+    }>;
+    retryIntMin: Readonly<{
+        min: 0;
+        max: 1439;
+    }>;
+}>;
+/**
+ * Canonical schedule defaults: 01:00 daily, 10-minute window, 15-minute
+ * retry, 5 connection attempts per wake. Also the "reset" values applied
+ * when the pending-events scheduler is disabled, so a disabled config lands
+ * in a clean known state.
+ */
+declare const VERISENSE_BLE_SCHEDULE_DEFAULTS: Readonly<{
+    intervalHours: 24;
+    timeMins: 60;
+    durMin: 10;
+    retryIntMin: 15;
+    connectionTries: 5;
+}>;
+/** Format minutes-since-midnight as `"HH:MM"`, or null when out of range.
+ * Fractional input is rounded to the nearest whole minute first, so the
+ * minutes component always stays in 0–59. */
+declare function minutesSinceMidnightToHHMM(mins: number | null | undefined): string | null;
+/** Parse `"HH:MM"` (or `"H:MM"`) into minutes-since-midnight, or null when
+ * malformed / out of range. */
+declare function hhmmToMinutesSinceMidnight(text: string | null | undefined): number | null;
+/** Boolean sensor enables used to predict which stream sensor IDs a config
+ * will produce (see {@link expectedVerisenseStreamSensorIds}). */
+interface VerisenseStreamSensorEnables {
+    gsr?: boolean;
+    vbatt?: boolean;
+    vprog?: boolean;
+    accel1?: boolean;
+    accel2?: boolean;
+    gyro?: boolean;
+    mag?: boolean;
+    ppg?: boolean;
+    ambientLight?: boolean;
+    skinTemp?: boolean;
+    algoHub?: boolean;
+}
+/**
+ * The stream-packet sensor IDs a device will emit for a given set of sensor
+ * enables (see `VERISENSE_STREAM_SENSOR_LABELS` for the ID meanings). The
+ * IMU block splits by hardware generation: first-gen streams accel2+gyro as
+ * ID 3 (LSM6DS3); second-gen streams accel2+gyro+mag as ID 6 (LSM6DSV +
+ * LIS2MDL). Any enabled PPG channel produces the single PPG stream (ID 4).
+ */
+declare function expectedVerisenseStreamSensorIds(enables: VerisenseStreamSensorEnables, opts: {
+    secondGeneration: boolean;
+}): Set<number>;
+/** {@link expectedVerisenseStreamSensorIds} computed straight from op-config
+ * bytes via the sensor-enable bit schema. */
+declare function expectedVerisenseStreamSensorIdsFromConfig(op: Uint8Array | null | undefined, opts: {
+    secondGeneration: boolean;
+}): Set<number>;
+
+/**
+ * Verisense sensor-calibration TLV codec.
+ *
+ * Mirrors the firmware `asm_calibration.{c,h}` byte format. A calibration "blob"
+ * is a self-describing block of per-sensor calibration that the device persists,
+ * exposes over the `CALIBRATION` command, and stamps into every logged payload
+ * header via a CRC-16 version tag.
+ *
+ * Layout (all little-endian):
+ *
+ *   Global header (12 bytes)
+ *     0  u16  totalLen          (= blob.length - 2)
+ *     2  u8   calibFormatVersion
+ *     3  u8   hwVerMajor
+ *     4  u8   hwVerMinor
+ *     5  u8   fwVerMajor
+ *     6  u8   fwVerMinor
+ *     7  u16  fwVerPatch
+ *     9  u8   sensorBlockCount
+ *    10  u16  reserved
+ *
+ *   Per-sensor block (12-byte header + payload)
+ *     0  u16  sensorId          (calibration-domain id, see {@link CalibSensorId})
+ *     2  u8   range/quality     (bits[5:0] full-scale index; bits[7:6] calib quality)
+ *     3  u8   dataLen
+ *     4  u8[8] ts               (0 = default/seeded; RTC time = real per-unit cal)
+ *    12  payload[dataLen]
+ *
+ *   IMU payload (60 bytes, float32): bias[3] · sens[3] · align[9] (row-major 3x3)
+ *
+ * Calibration math (ASM-DES04 §8): output = K·R·physical + b, so the host
+ * recovers physical = R⁻¹·K⁻¹·(raw − b). K is the diagonal sensitivity, R the
+ * rotation into the common ASM axes, b the offset bias.
+ */
+/**
+ * Blob layout version. v2 is byte-for-byte identical in layout to v1 — the
+ * firmware bumped it purely to force already-deployed gen-2 units to re-seed
+ * with the corrected LSM6DSV/LIS2MDL alignment (its load path checks neither a
+ * CRC nor the FW version, so nothing else would).
+ *
+ * `parseCalibrationBlob` accepts any version and reports what it read;
+ * `serializeCalibrationBlob` preserves `input.formatVersion` when present and
+ * only falls back to this constant. That matters when writing to a device: a
+ * blob stamped with the wrong version is rejected at the device's next boot and
+ * silently replaced by the seeded defaults.
+ */
+declare const SC_CALIB_FORMAT_VERSION = 2;
+declare const SC_GLOBAL_HEADER_BYTES = 12;
+declare const SC_DATA_LEN_IMU = 60;
+/**
+ * The per-block `range` byte packs the full-scale index in bits [5:0] and a 2-bit
+ * calibration-quality indicator in bits [7:6]. Lookups/comparisons must use only
+ * the index (`range & SC_CAL_RANGE_MASK`). Quality has no producer yet (always 0),
+ * so it is reserved without growing the blob or bumping the format version.
+ */
+declare const SC_CAL_RANGE_MASK = 63;
+declare const SC_CAL_QUALITY_SHIFT = 6;
+declare const SC_CAL_QUALITY_MASK = 3;
+/** Calibration-quality indicator (ST MotionAC / Android sensor-accuracy convention). */
+declare const CalibQuality: {
+    readonly UNKNOWN: 0;
+    readonly POOR: 1;
+    readonly OK: 2;
+    readonly GOOD: 3;
+};
+type CalibQuality = (typeof CalibQuality)[keyof typeof CalibQuality];
+/**
+ * Calibration-domain sensor IDs. Distinct from the data-stream sensor IDs
+ * (1=ADC, 2=LIS2DW12, 3=LSM6DS3, 4=PPG, 6=LSM6DSV, 7=VD6283, 8=MAX32674,
+ * 9=MLX90632). These reuse the Shimmer3 `SC_SENSOR_*` values where they exist,
+ * so accel/gyro/mag can each carry their own calibration even though one
+ * data-stream id (6) covers all three.
+ *
+ * Data-stream → calibration mapping: 6 → {37, 38, 42}, 2 → {39}, 3 → {40, 41}.
+ */
+declare const CalibSensorId: {
+    readonly LSM6DSV_ACCEL: 37;
+    readonly LSM6DSV_GYRO: 38;
+    readonly LIS2DW12_ACCEL: 39;
+    /** 1st-gen LSM6DS3 accel (data-stream id 3). */
+    readonly LSM6DS3_ACCEL: 40;
+    /** 1st-gen LSM6DS3 gyro (data-stream id 3). */
+    readonly LSM6DS3_GYRO: 41;
+    readonly LIS2MDL_MAG: 42;
+};
+type CalibSensorId = (typeof CalibSensorId)[keyof typeof CalibSensorId];
+/** Per-unit IMU calibration: offset bias, diagonal sensitivity, and 3x3 rotation. */
+interface ImuCalibration {
+    /** Offset bias `b`, per axis (sensor LSB). */
+    bias: [number, number, number];
+    /** Diagonal sensitivity `K`, per axis (LSB per physical unit). */
+    sens: [number, number, number];
+    /** Rotation `R`, row-major 3x3 (length 9), mapping sensor axes to ASM axes. */
+    align: number[];
+}
+interface CalibrationBlock {
+    sensorId: number;
+    /** Full-scale index (the low 6 bits of the wire `range` byte). */
+    range: number;
+    /** Calibration quality, bits [7:6] of the wire `range` byte (0 = unknown today). */
+    quality: number;
+    dataLen: number;
+    /** 8-byte calibration timestamp; all-zero means default/seeded. */
+    ts: Uint8Array;
+    isDefault: boolean;
+    payload: Uint8Array;
+    /** Decoded IMU calibration when the block is a 60-byte IMU payload. */
+    imu?: ImuCalibration;
+}
+interface CalibrationSet {
+    formatVersion: number;
+    hwVerMajor: number;
+    hwVerMinor: number;
+    fwVerMajor: number;
+    fwVerMinor: number;
+    fwVerPatch: number;
+    reserved: number;
+    blocks: CalibrationBlock[];
+    /** CRC-16/CCITT-FALSE over the whole blob — equals the payload-header version tag. */
+    crc16: number;
+    /** Find the IMU calibration for a calibration-domain sensor id + range, else null. */
+    getImu(sensorId: number, range: number): ImuCalibration | null;
+}
+/** Parse a calibration blob into a typed, indexable {@link CalibrationSet}. */
+declare function parseCalibrationBlob(blob: Uint8Array): CalibrationSet;
+interface CalibrationBlockInput {
+    sensorId: number;
+    /** Full-scale index (only the low 6 bits are used). */
+    range: number;
+    /** Calibration quality (0-3); defaults to 0 (unknown). Packed into range byte bits [7:6]. */
+    quality?: number;
+    /** 8-byte timestamp; defaults to all-zero (a "default/seeded" marker). */
+    ts?: Uint8Array | null;
+    imu?: ImuCalibration;
+    /** Raw payload override (used when `imu` is not supplied). */
+    payload?: Uint8Array;
+}
+interface CalibrationSetInput {
+    formatVersion?: number;
+    hwVerMajor: number;
+    hwVerMinor: number;
+    fwVerMajor: number;
+    fwVerMinor: number;
+    fwVerPatch: number;
+    reserved?: number;
+    blocks: CalibrationBlockInput[];
+}
+/** Serialize a calibration set into a blob (inverse of {@link parseCalibrationBlob}). */
+declare function serializeCalibrationBlob(input: CalibrationSetInput): Uint8Array;
+/** CRC-16/CCITT-FALSE over a serialized blob — the value stamped into payload headers. */
+declare function calibrationBlobCrc(blob: Uint8Array): number;
+/**
+ * Apply IMU calibration to a raw tri-axial sample.
+ *
+ *   physical = align · (K⁻¹ · (raw − bias))
+ *
+ * `bias` (b) is subtracted and `sens` (K, diagonal) divided per axis, then the
+ * `align` matrix (row-major 3x3) is applied directly to rotate the sensor frame
+ * into the common ASM frame. With identity `align` and zero `bias` this reduces
+ * to `raw / sens`.
+ *
+ * Convention note: `align` is the directly-applied sensor-frame → ASM-frame
+ * matrix (= R⁻¹ in ASM-DES04 §8's `output = K·R·physical + b` notation). This
+ * matches the cloud calibration CSV `rotation_*` columns one-to-one — the CSV
+ * stores the same applied matrix, row-major — so the sensor-calibration parser
+ * maps blob → CSV with NO transpose. (Confirmed against a LIS2DW12 sample CSV:
+ * offset→bias, sensitivity→sens, rotation→align.)
+ */
+declare function applyImuCalibration(raw: readonly [number, number, number], cal: ImuCalibration): [number, number, number];
 
 /**
  * Device-agnostic live stream statistics: throughput, packet rate and
@@ -1149,6 +2827,1040 @@ declare class StreamStatsTracker {
     private windowThroughput;
     /** Produce a snapshot of all statistics as of `nowMillis`. */
     snapshot(nowMillis: number): StreamStatsSnapshot;
+}
+
+/**
+ * Abstract base class for all Verisense sensor decoders.
+ *
+ * Provides:
+ * - Timestamp unwrapping (handles the 1-minute rollover at 32768 ticks/s).
+ * - System-time offset tracking for plotting calibrated wall-clock timestamps.
+ * - Per-sample time extrapolation based on sampling rate and last-sample tick.
+ */
+declare abstract class SensorBase {
+    /** Verisense clock frequency in ticks per second. */
+    static readonly CLOCK_FREQ = 32768;
+    /** 1-minute rollover at 32768 ticks/s (matches C# Sensor.cs). */
+    static readonly TICKS_MAX_VALUE: number;
+    protected lastTicksUnwrapped: number;
+    protected cycle: number;
+    /** (system time) − (shimmer time) at first sample, in milliseconds. */
+    systemOffsetFirstTime: number | null;
+    /** Sampling rate in Hz (used for per-sample time extrapolation). */
+    samplingRateHz: number | null;
+    /** Whether this sensor is enabled in the operational config. */
+    enabled: boolean;
+    /**
+     * Per-device calibration read from the sensor, or null when none is available
+     * (decoders then fall back to nominal full-scale/datasheet scaling). Set via
+     * {@link applyCalibration}; subclasses read it in their calibrate routines.
+     */
+    protected calibration: CalibrationSet | null;
+    /** Supply (or clear) the device calibration set used by this decoder. */
+    applyCalibration(set: CalibrationSet | null): void;
+    /** Reset all timestamp state (call on (re)connect or when streaming restarts). */
+    resetTimestamps(): void;
+    /**
+     * Unwrap a rolling 24-bit tick counter to a monotonically increasing value.
+     */
+    unwrapTicks(ticks: number): number;
+    /** Convert unwrapped ticks to milliseconds. */
+    ticksToMillis(unwrappedTicks: number): number;
+    /**
+     * Compute the calibrated shimmer timestamp for the *last* sample in a burst,
+     * and store the first-seen system-offset for later plotting.
+     *
+     * @param lastSampleTicksU24  24-bit tick counter from the packet header.
+     * @param systemMillis        `Date.now()` at the time of packet receipt.
+     */
+    getTimestampUnwrappedMillis(lastSampleTicksU24: number, systemMillis: number): {
+        shimmerMillis: number;
+        systemOffsetFirstTime: number;
+    };
+    /**
+     * Extrapolate the timestamp for sample `i` of `numSamples` in a burst,
+     * given the timestamp of the *last* sample and the sampling rate.
+     *
+     * @returns Object with `tsMillis`, `systemTsMillis`, and `systemTsPlotMillis`.
+     */
+    extrapolateSampleTimes(opts: {
+        numSamples: number;
+        i: number;
+        samplingRateHz?: number | null;
+        tsLastSampleMillis: number;
+        systemTsLastSampleMillis: number;
+        systemOffsetFirstTime?: number | null;
+    }): {
+        tsMillis: number;
+        systemTsMillis: number;
+        systemTsPlotMillis: number;
+    };
+    /**
+     * Compute per-sample timestamps for a whole decoded burst.
+     *
+     * The base implementation treats every decoded sample as one evenly-spaced
+     * time step at `samplingRateHz` (correct when each decoded sample is a single
+     * combined time step). Sensors whose decoded array *interleaves* multiple
+     * streams at different cadences (e.g. the LSM6DSV tagged FIFO, which mixes
+     * accel / gyro / mag entries) override this to timestamp each stream on its
+     * own rate — otherwise the shared rate spreads each stream's samples too far
+     * back and consecutive blocks overlap on the time axis.
+     */
+    computeSampleTimestamps(decodedSamples: unknown[], block: {
+        tsLastSampleMillis: number;
+        systemTsLastSampleMillis: number;
+        systemOffsetFirstTime?: number | null;
+    }): Array<{
+        tsMillis: number;
+        systemTsMillis: number;
+        systemTsPlotMillis: number;
+    }>;
+    /**
+     * Turn a decoded + timestamped burst into one or more stream contributions
+     * for live throughput / packet-loss tracking. The default treats the sensor
+     * as a single stream; sensors whose decoded array interleaves several
+     * sub-streams at different cadences (e.g. the LSM6DSV tagged FIFO) override
+     * this to report one contribution per sub-stream so loss is tracked
+     * independently.
+     */
+    getStreamContributions(samplesWithTime: Array<{
+        timestamps?: {
+            tsMillis: number;
+        };
+    }>, sensorId: number): StreamContribution[];
+    /** Parse a raw sensor payload byte array into decoded samples. */
+    abstract parsePayload(sensorPayloadBytes: Uint8Array): unknown[];
+    /** Apply the Verisense operational config blob to update decoder settings. */
+    abstract applyOperationalConfig(op: Uint8Array): void;
+}
+
+interface ADCGSRSample {
+    raw: number;
+    /** The 12-bit code. On range 3 a code below the open-circuit limit is raised to it. */
+    adc12: number;
+    /** The resistor in circuit when the sample was taken, 0-3. */
+    range: number;
+    volts: number;
+    /**
+     * Skin resistance. A fixed range clamps it to that range's window; auto-range
+     * only floors it at 8 kΩ, so it can exceed 4.7 MΩ: an open circuit reads
+     * hundreds of MΩ or more (DEV-1068). A code below the open-circuit limit
+     * decodes as range 3 at the limit whatever `range` says (DEV-1070).
+     */
+    kOhms: number;
+    uS: number;
+    /**
+     * `'Disconnected'` at or below `LIMIT_MIN_VALID_USIEMENS` (0.03 µS). Only
+     * auto-range can get there: a fixed range pins the resistance to its own
+     * window, and the top of range 3, 4.7 MΩ, is 0.213 µS. The Java driver and
+     * the C# API behave the same way.
+     */
+    connectivity: 'Connected' | 'Disconnected';
+}
+interface ADCBatterySample {
+    /** Full 16-bit packed ADC/flags word from payload. */
+    raw16: number;
+    /** 12-bit ADC value extracted from `raw16`. */
+    adc12: number;
+    mV: number;
+    usbPluggedIn: boolean;
+    chargerStatusBits: number;
+    chargerStatus: string;
+}
+interface ADCPayloadSample {
+    gsr: ADCGSRSample | null;
+    batt: ADCBatterySample | null;
+}
+type HardwareIdentifier = 'VERISENSE_PULSE_PLUS' | 'VERISENSE_GSR_PLUS' | string;
+/**
+ * Decoder for grouped ADC channels (Verisense sensor id = 1).
+ *
+ * Includes GSR plus battery/ADC channels carried in the same packet source.
+ * Implements C# `SensorGSR.cs` including:
+ * - Per-hardware reference resistor selection (SR68 vs Shimmer3 resistors).
+ * - Auto-range decoding from the raw ADC value's upper bits.
+ * - Range-3 clamping threshold that differs by hardware.
+ * - Conductance (uS) output with connectivity detection.
+ */
+declare class SensorADC extends SensorBase {
+    readonly LIMIT_MIN_VALID_USIEMENS = 0.03;
+    /**
+     * Range-3 codes below this are raised to it before calibration so that an
+     * open circuit reads as open, which only works if the limit is above the
+     * amplifier reference. 1138 is the first code above 0.5 V at the gen-2 1.8 V
+     * full scale (0.5 V = code 1137.5), so it also clears the 0.4986 V this decode
+     * divides by (code 1134.3). The Java driver divides by 0.5 V, and 1138 is
+     * correct under both. It was 1134, the last code below 0.4986 V: that decoded
+     * to a negative resistance, nudged to 8 kΩ, so an open circuit read 125 µS
+     * (DEV-1067).
+     */
+    readonly GSR_UNCAL_LIMIT_RANGE3_SR68 = 1138;
+    readonly GSR_UNCAL_LIMIT_RANGE3_SR62 = 683;
+    private readonly SHIMMER3_REF_KOHMS;
+    private readonly SR68_REF_KOHMS;
+    /**
+     * ADC sample-rate code → divisor of the 32768 Hz clock. Mirrors the firmware
+     * `samplingRateInTicksArray` (hal_adc.c): the sampling timer fires every
+     * `divisor` ticks, producing one sample set per fire, so the streamed output
+     * rate = 32768 / divisor. Oversampling uses SAADC burst mode and therefore
+     * does NOT divide the output rate. Index 0 = "Off".
+     */
+    private static readonly ADC_RATE_DIVISORS;
+    gsrEnabled: boolean;
+    battEnabled: boolean;
+    /** GSR range 0-3 (fixed) or 4 (auto-range). */
+    gsrRangeSetting: number;
+    hardwareIdentifier: HardwareIdentifier;
+    hwRevisionMajor: number | null;
+    hwRevisionMinor: number | null;
+    hwRevisionInternal: number | null;
+    gsrRateSettingRaw: number;
+    gsrRangeSettingRaw: number;
+    gsrOversamplingRateSettingRaw: number;
+    constructor();
+    setHardwareIdentifier(idStr: HardwareIdentifier): void;
+    setHardwareRevision(revHwMajor: number, revHwMinor: number, revHwInternal?: number): void;
+    setGsrRangeSetting(v: number): void;
+    private getBatteryVoltageMultiplier;
+    /**
+     * Whether this board uses the SR62 (Verisense GSR+) Shimmer3-style analog
+     * front end: 3.0 V SAADC reference, 40.2/287/1000/3300 kΩ GSR feedback
+     * resistors, 0.5 V GSR reference and range-3 uncal limit 683. Every other
+     * GSR-capable board (SR61 >= 5, SR68 >= 5 — firmware
+     * `ShimBrd_isGsrSupportedForHwVersion`) carries the second-generation DC
+     * front end: 1.8 V reference, 21/150/562/1740 kΩ, 0.4986 V, limit 1138.
+     *
+     * Mirrors the firmware's `selectFeedbackResistorsFromHwVersion` (hal_gsr.c),
+     * which keys the choice on the major revision alone (SR62 vs everything
+     * else). Prefers the production-config hardware revision; falls back to the
+     * caller-supplied hardware identifier when no revision has been read yet.
+     * Previously this was keyed only on the `VERISENSE_PULSE_PLUS` identifier
+     * string, so an SR61-5/6 presenting its true identity decoded ~1.91× high
+     * (DEV-874).
+     */
+    private usesSr62GsrFrontEnd;
+    setEnabled(arg1: boolean | {
+        gsr?: boolean;
+        batt?: boolean;
+    }, opConfigBytes?: Uint8Array | null): Uint8Array | Record<string, boolean>;
+    private _patchEnabled;
+    patchGsrRange(rangeCfg: number, op: Uint8Array): Uint8Array;
+    patchGsrSamplingRate(rateCfg: number, op: Uint8Array): Uint8Array;
+    patchGsrOversampling(overCfg: number, op: Uint8Array): Uint8Array;
+    calibrateAdcToVolts(uncal12bit: number): number;
+    calibrateGsrToKOhmsUsingAmplifierEq(volts: number, range: number): number;
+    /** The front end's range-3 open-circuit limit: the first code above its amplifier reference. */
+    private gsrUncalLimitRange3;
+    /**
+     * `calibrateGsrToKOhmsUsingAmplifierEq`, reading an open circuit as open on
+     * every range (DEV-1070).
+     *
+     * The equation has no positive solution at or below the amplifier's
+     * reference: no skin resistance can pull the output under it, so a code there
+     * means the electrodes are open. Range 3 has long raised such a code to its
+     * open-circuit limit, so that an open circuit decodes as hundreds of MΩ.
+     * Ranges 0-2 did not, and in auto-range they see these codes too: when the
+     * electrodes come off, the device climbs one range at a time and repeats the
+     * sample that triggered each switch through the 80 ms settling time, tagged
+     * with the range it was measured on. The equation gave those samples a
+     * negative resistance, which the nudge floored at 8 kΩ: 125 µS and
+     * `'Connected'` for an open circuit.
+     *
+     * So a code below the limit decodes as range 3 at the limit, whatever range
+     * it was measured on, and an open circuit reads the same on every range as the
+     * settled range 3 does. Codes at or above the limit decode on their own range,
+     * as before. The test compares codes, so it holds under both this decode's
+     * 0.4986 V and the Java driver's 0.5 V.
+     *
+     * @param adc12 The 12-bit code.
+     * @param range The resistor in circuit, 0-3.
+     */
+    calibrateGsrToKOhmsWithOpenCircuitLimit(adc12: number, range: number): number;
+    /**
+     * Clamp a decoded resistance to what the circuit can measure. A fixed range
+     * clamps both ends, to that range's window. Auto-range only floors it at
+     * 8 kΩ, the smallest resistance any range can measure, and leaves the top
+     * open, as the Java driver's `SensorGSR.nudgeGsrResistance` and the C#
+     * `SensorGSR.NudgeGSRResistance` do (ASM-2156).
+     *
+     * `connectivity` depends on that open top. An open circuit on range 3
+     * decodes to about 536 MΩ on gen-2 hardware (0.0019 µS), far below the
+     * 0.03 µS threshold, but auto-range used to be capped at 4.7 MΩ too, which is
+     * 0.213 µS, so `connectivity` could never say `'Disconnected'` (DEV-1068).
+     * That cap was the first fix proposed under ASM-2156, withdrawn there for
+     * this reason.
+     */
+    nudgeGsrResistance(kOhms: number): number;
+    kOhmToUSiemens(kOhms: number): number;
+    /**
+     * Convert the 6-bit ADC sample-rate code to the streamed output rate in Hz,
+     * or null for "Off"/unknown codes. Used for per-sample timestamp spacing.
+     */
+    decodeAdcSampleRateHz(rateCode: number): number | null;
+    parsePayload(sensorPayloadBytes: Uint8Array): ADCPayloadSample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+type AccelRange$1 = '2G' | '4G' | '8G' | '16G';
+interface LIS2DW12Sample {
+    raw: [number, number, number];
+    cal: [number, number, number];
+    units: {
+        cal: string;
+    };
+}
+/**
+ * Decoder for the LIS2DW12 low-power accelerometer (Verisense sensor id = 2).
+ *
+ * Sensitivity values are given in raw-LSB / (m/s²) per axis — matching
+ * the C# `SensorLIS2DW12.cs` implementation.
+ */
+declare class SensorLIS2DW12 extends SensorBase {
+    offset: [number, number, number];
+    align: [[number, number, number], [number, number, number], [number, number, number]];
+    private readonly sensitivityByRange;
+    range: AccelRange$1;
+    /** Numeric full-scale index (0=2G..3=16G) used to select the device calibration block. */
+    private rangeIndex;
+    constructor();
+    setRange(rangeStr: AccelRange$1): void;
+    setEnabled(enabled: boolean, opConfigBytes?: Uint8Array | null): Uint8Array | boolean;
+    setAccelEnabled(enabled: boolean, opConfigBytes?: Uint8Array | null): Uint8Array | boolean;
+    patchAccelRange(rangeCfg: number, op: Uint8Array): Uint8Array;
+    patchAccelSamplingRate(rateCfg: number, op: Uint8Array): Uint8Array;
+    private _calibrate;
+    parsePayload(sensorPayloadBytes: Uint8Array): LIS2DW12Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+type AccelRange = '2G' | '4G' | '8G' | '16G';
+type GyroRange = '250DPS' | '500DPS' | '1000DPS' | '2000DPS';
+interface LSM6DS3Sample {
+    accel: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+    gyro: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+}
+/**
+ * Decoder for the LSM6DS3 combined accelerometer + gyroscope (Verisense sensor id = 3).
+ *
+ * Sensitivity values mirror the C# `SensorLSM6DS3.cs` implementation.
+ */
+declare class SensorLSM6DS3 extends SensorBase {
+    offset: [number, number, number];
+    align: [[number, number, number], [number, number, number], [number, number, number]];
+    private readonly accSensByRange;
+    private readonly gyroSensByRange;
+    accRange: AccelRange;
+    gyroRange: GyroRange;
+    accEnabled: boolean;
+    gyroEnabled: boolean;
+    constructor();
+    setAccelEnabled(v: boolean): void;
+    setGyroEnabled(v: boolean): void;
+    setAccelRange(r: AccelRange): void;
+    setGyroRange(r: GyroRange): void;
+    private _applyAlignAndOffset;
+    private static readonly ACC_RANGE_CODE;
+    private static readonly GYRO_RANGE_CODE;
+    private _calibrateAccel;
+    private _calibrateGyro;
+    parsePayload(sensorPayloadBytes: Uint8Array): LSM6DS3Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+interface LSM6DSVSample {
+    tag: number;
+    cnt: number;
+    accel: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+    gyro: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+    mag: {
+        raw: [number, number, number];
+        cal: [number, number, number];
+        units: string;
+    } | null;
+}
+declare class SensorLSM6DSV extends SensorBase {
+    private static readonly TAG_GYRO;
+    private static readonly TAG_ACCEL;
+    private static readonly TAG_SENSORHUB_SLAVE0;
+    accEnabled: boolean;
+    gyroEnabled: boolean;
+    magEnabled: boolean;
+    private accelFsG;
+    private gyroFsDps;
+    private fsXlCode;
+    private fsGCode;
+    accelHz: number;
+    gyroHz: number;
+    magHz: number;
+    constructor();
+    private decodeAccelFsG;
+    private decodeGyroFsDps;
+    private decodeOdrHz;
+    private decodeMagOutputRateHz;
+    private calibrateAccel;
+    private calibrateGyro;
+    private calibrateMag;
+    parsePayload(sensorPayloadBytes: Uint8Array): LSM6DSVSample[];
+    applyOperationalConfig(op: Uint8Array): void;
+    /**
+     * Timestamp each stream (accel / gyro / mag) so all three cover the same block
+     * time window. The tagged FIFO interleaves the streams, so the generic
+     * global-index spacing spreads each stream by (#interleaved-streams)x too far
+     * back and makes consecutive blocks overlap on the time axis.
+     *
+     * Each stream's effective rate is derived from *this block*: the block's
+     * covered duration is taken from a directly-sampled reference stream (accel,
+     * else gyro) at its known ODR, and every stream is then spread evenly over
+     * that same duration by its own sample count. This is important for the mag
+     * (LIS2MDL), which is read via the LSM6DSV sensor hub — its entries land in
+     * the FIFO at the hub batch rate, NOT the LIS2MDL ODR, so a fixed mag ODR
+     * would mis-spread it (the zig-zag). Deriving the rate from the block keeps it
+     * aligned regardless of the hub rate.
+     */
+    computeSampleTimestamps(decodedSamples: unknown[], block: {
+        tsLastSampleMillis: number;
+        systemTsLastSampleMillis: number;
+        systemOffsetFirstTime?: number | null;
+    }): Array<{
+        tsMillis: number;
+        systemTsMillis: number;
+        systemTsPlotMillis: number;
+    }>;
+    /**
+     * Report up to three independent sub-streams (accel / gyro / mag) so loss is
+     * tracked per stream. Each sub-stream's expected rate is its configured rate
+     * (ODR for accel/gyro, output rate for mag); loss is measured against that, so
+     * the mag's hub-trigger bound — or any rate the firmware/link can't keep up
+     * with — surfaces as loss when a configured rate exceeds what's delivered.
+     */
+    getStreamContributions(samplesWithTime: Array<{
+        timestamps?: {
+            tsMillis: number;
+        };
+    }>, sensorId: number): StreamContribution[];
+}
+
+interface PPGChannelSample {
+    raw: number;
+    cal: number;
+    units: {
+        raw: string;
+        cal: string;
+    };
+}
+interface PPGSample {
+    RED?: PPGChannelSample;
+    IR?: PPGChannelSample;
+    GREEN?: PPGChannelSample;
+    BLUE?: PPGChannelSample;
+    /**
+     * 2nd-generation hub PPG: 3 raw MAX86176 LED channel counts (24-bit), in the
+     * order [green, IR, red] (LED1=green, LED2=IR, LED3=red per the board's LED
+     * driver wiring). The MAX86176 is reached only via the MAX32674 algorithm hub
+     * and measures these 3 LEDs on photodiode PD1 (its PD2 copies are not
+     * forwarded).
+     */
+    leds?: [number, number, number];
+}
+type PPGChannel = 'RED' | 'IR' | 'GREEN' | 'BLUE';
+/**
+ * Decoder for the PPG sensor (Verisense sensor id = 4).
+ *
+ * Calibration constants mirror C# `SensorPPG.cs`.
+ */
+declare class SensorPPG extends SensorBase {
+    red: boolean;
+    ir: boolean;
+    green: boolean;
+    blue: boolean;
+    /**
+     * 2nd-gen hub mode: PPG arrives via the MAX32674 hub as a fixed block of 6 raw
+     * MAX86176 LED channels (6 x u24), independent of the RED/IR/GREEN/BLUE enable
+     * bits. Set from the connected device's hardware generation (see
+     * VerisenseClient). When false, the 1st-gen named-channel layout is used.
+     */
+    hubMode: boolean;
+    private readonly adcLsb;
+    private readonly adcBitShift;
+    adcResolutionIndex: number;
+    /** PPG_SR code → base sampling rate in Hz (op byte PPG_MODE_CONFIG2 bits 4:2). */
+    private readonly PPG_SR_HZ;
+    /** SMP_AVE code → FIFO sample-averaging factor (op byte PPG_FIFO_CONFIG bits 7:5). */
+    private readonly SMP_AVE_FACTOR;
+    constructor();
+    setChannels(channels: Partial<Record<PPGChannel, boolean>>): void;
+    setHubMode(enabled: boolean): void;
+    setAdcResolutionIndex(i: number): void;
+    calibrateValue(uncalValue: number): number;
+    /**
+     * 2nd-gen hub PPG block: N samples x (3 x u24 LED channels = green, IR, red),
+     * no count prefix (sample count derived from the block length, matching the
+     * firmware packer).
+     */
+    private parseHubPayload;
+    parsePayload(sensorPayloadBytes: Uint8Array): PPGSample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+/** Per-channel raw ambient-light counts (24-bit) plus the derived illuminance
+ * (lux) and correlated colour temperature (CCT, Kelvin). Channel order matches
+ * the firmware VD6283 AlsResults block: RED, VISIBLE, BLUE, GREEN, IR, CLEAR.
+ *
+ * The second slot is shared: the VD6283 routes EITHER the visible/clear reading
+ * OR the dark (covered-photodiode) baseline onto it, selected by the op-config
+ * dark-channel bit. They are mutually exclusive, so exactly one of `VISIBLE` /
+ * `DARK` is a number per sample and the other is `null`. */
+interface VD6283Sample {
+    RED: number;
+    /** Visible/clear channel count, or `null` when the dark channel is enabled
+     * (the chip then routes the dark baseline onto this slot — see `DARK`). */
+    VISIBLE: number | null;
+    BLUE: number;
+    GREEN: number;
+    IR: number;
+    CLEAR: number;
+    /** Dark/covered-photodiode baseline count, or `null` when the dark channel is
+     * disabled (the slot then carries the visible reading — see `VISIBLE`). */
+    DARK: number | null;
+    /** Illuminance in lux (XYZ Y component; clamped to >= 0). */
+    lux: number;
+    /** Correlated colour temperature in Kelvin (0 if undefined). */
+    cct: number;
+}
+/**
+ * Decoder for the VD6283TX45 ambient light sensor (Verisense sensor id = 7).
+ *
+ * Data block payload = N samples x 18 bytes (6 channels x 24-bit LE counts).
+ * In addition to the raw channel counts, each sample carries the derived lux
+ * and CCT, computed from the RED/GREEN/BLUE channels with the configured gain
+ * and exposure (ported from firmware App_vd6283tx.c).
+ */
+declare class SensorVD6283 extends SensorBase {
+    static readonly NUM_CHANNELS = 6;
+    static readonly BYTES_PER_SAMPLE = 18;
+    private exposureUs;
+    private gain8p8;
+    /** Op-config dark-channel bit (LIGHT_CONFIG bit 1): when set the shared second
+     * slot carries the dark baseline (`DARK`) instead of the visible reading. */
+    private darkEnabled;
+    constructor();
+    /** Normalise a raw channel count for the XYZ transform (gain + exposure). */
+    private normalizeForXyz;
+    /** Compute illuminance (lux) and CCT (K) from RED/GREEN/BLUE counts. */
+    private computeLuxCct;
+    parsePayload(sensorPayloadBytes: Uint8Array): VD6283Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+/**
+ * One algorithm-hub sample: accel + WHRM algorithm output. The raw MAX86176 PPG
+ * is no longer carried here - it streams separately under the PPG sensor id (4),
+ * see SensorPPG hub mode.
+ */
+interface MAX32674Sample {
+    accel: {
+        raw: [number, number, number];
+    };
+    /** Heart rate (bpm) and confidence (0-100). */
+    hr: number;
+    hrConfidence: number;
+    /** SpO2 (%) and confidence; 0 until SpO2 mode is enabled. */
+    spo2: number;
+    spo2Confidence: number;
+    activityClass: number;
+    scdContactState: number;
+}
+/**
+ * Decoder for the MAX32674 algorithm hub (Verisense sensor id = 8).
+ *
+ * Data block payload = [sampleCount:1] then sampleCount x 14 bytes:
+ *   accel x,y,z : 3 x i16 (6) | hr u16 (2) | hr_conf u8 (1) |
+ *   spo2 u16 (2) | spo2_conf u8 (1) | activity u8 (1) | scd_contact u8 (1)
+ *
+ * Raw PPG is reported separately under the PPG sensor id (4).
+ */
+declare class SensorMAX32674 extends SensorBase {
+    static readonly BYTES_PER_SAMPLE = 14;
+    constructor();
+    parsePayload(sensorPayloadBytes: Uint8Array): MAX32674Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+/** One skin-temperature sample. Object = skin temperature, ambient = sensor
+ * ambient, both in degrees Celsius. */
+interface MLX90632Sample {
+    object: {
+        raw: number;
+        cal: number;
+        units: string;
+    };
+    ambient: {
+        raw: number;
+        cal: number;
+        units: string;
+    };
+}
+/**
+ * Decoder for the MLX90632 skin temperature sensor (Verisense sensor id = 9).
+ *
+ * Data block payload = N samples x 4 bytes: object int16 then ambient int16,
+ * each in centi-degrees Celsius (value / 100 = degrees C).
+ */
+declare class SensorMLX90632 extends SensorBase {
+    static readonly BYTES_PER_SAMPLE = 4;
+    constructor();
+    parsePayload(sensorPayloadBytes: Uint8Array): MLX90632Sample[];
+    applyOperationalConfig(op: Uint8Array): void;
+}
+
+type TransportKind = 'ble' | 'serial' | null;
+type DeviceMode = 'idle' | 'streaming' | 'command' | 'logged';
+interface SensorMap {
+    1: SensorADC;
+    2: SensorLIS2DW12;
+    3: SensorLSM6DS3;
+    4: SensorPPG;
+    6: SensorLSM6DSV;
+    7: SensorVD6283;
+    8: SensorMAX32674;
+    9: SensorMLX90632;
+}
+interface StreamPacket {
+    sensorId: number;
+    tick_u24: number;
+    decoded: unknown[] | null;
+    rawPayload: Uint8Array;
+    crcOk: boolean | null;
+}
+interface LoggedTransferProgressInfo {
+    payloadIndex: number;
+    bytesWritten: number;
+    crcOk: boolean;
+}
+interface TransferLoggedDataOptions {
+    fileHandle?: FileSystemFileHandle | null;
+    timeoutMs?: number;
+    maxNack?: number;
+    maxCrcNack?: number;
+    onProgress?: ((info: LoggedTransferProgressInfo) => void) | null;
+}
+interface TransferLoggedDataResult {
+    ok: boolean;
+    bytesWritten: number;
+    payloadIndex?: number;
+    blob?: Blob;
+}
+interface RunHardwareTestReportOptions {
+    timeoutMs?: number;
+    marker?: string;
+    endMarker?: string;
+    completionIdleMs?: number;
+    factoryTestType?: number;
+    signal?: AbortSignal | null;
+    onChunk?: ((chunk: string, aggregate: string) => void) | null;
+}
+interface VerisenseClientOptions {
+    hardwareIdentifier?: string;
+    /**
+     * Streaming frames carry a 2-byte CRC-16 trailer. When `true` (default) the
+     * trailer is used to lock onto frame boundaries — the parser accepts a frame
+     * only when its CRC validates, so a flaky link that drops bytes recovers
+     * cleanly instead of emitting misaligned packets — and is then stripped before
+     * decoding. Set to `false` only for legacy firmware that streams without a CRC
+     * trailer (falls back to length-only framing).
+     */
+    stripStreamCrc?: boolean;
+    debug?: boolean;
+    /**
+     * Inject a transport (byte pipe) instead of the default web ones. Lets
+     * non-browser runtimes (React Native, Bluetooth Classic) or tests drive the
+     * client. When omitted, `connect()` builds a Web Bluetooth transport and
+     * `connectSerial()` a Web Serial transport, so browser usage is unchanged.
+     */
+    transport?: ShimmerTransport;
+}
+interface ThroughputTestOptions {
+    /** How long the device should saturate the link, in milliseconds. Clamped to [100, 60000]. Default 5000. */
+    durationMs?: number;
+    /**
+     * Finish the measurement once no data has been received for this many
+     * milliseconds (the device falls silent when the blast ends). Default 600.
+     */
+    idleMs?: number;
+    /** Overall safety timeout, in milliseconds. Defaults to `durationMs + 5000`. */
+    timeoutMs?: number;
+    /** Abort the test early. */
+    signal?: AbortSignal | null;
+    /** Called on every received chunk with the running result so far. */
+    onProgress?: ((partial: ThroughputTestResult) => void) | null;
+}
+interface ThroughputTestResult {
+    /** Total bytes received from the device during the measurement window. */
+    bytesReceived: number;
+    /** Number of chunks received — BLE notifications, or serial reads. */
+    packetsReceived: number;
+    /** Duration requested of the device, in milliseconds. */
+    durationRequestedMs: number;
+    /** Measured window from first to last received byte, in milliseconds. */
+    elapsedMs: number;
+    /** Received goodput in bytes per second. */
+    throughputBytesPerSec: number;
+    /** Received goodput in kilobytes per second (bytes/sec ÷ 1000). */
+    throughputKBps: number;
+    /** Received goodput in kilobits per second (bytes/sec × 8 ÷ 1000). */
+    throughputKbps: number;
+}
+/** @deprecated Renamed to {@link ThroughputTestOptions}: the test is not BLE-specific. */
+type BleThroughputTestOptions = ThroughputTestOptions;
+/** @deprecated Renamed to {@link ThroughputTestResult}: the test is not BLE-specific. */
+type BleThroughputTestResult = ThroughputTestResult;
+type VerisenseConnectRetryReason = 'request-timeout' | 'gatt-disconnected' | 'unexpected-response-property';
+interface VerisenseConnectWithRetryOptions {
+    device?: BluetoothDevice | null;
+    filters?: BluetoothLEScanFilter[];
+    optionalServices?: BluetoothServiceUUID[];
+    bootstrapTimeoutMs?: number;
+    pairingBootstrapTimeoutMs?: number;
+    maxRetries?: number;
+    retrySettleMs?: number;
+    retryOnUnexpectedProperty?: boolean;
+    onRetry?: ((info: VerisenseConnectRetryInfo) => void) | null;
+}
+interface VerisenseConnectRetryInfo {
+    attempt: number;
+    maxRetries: number;
+    bootstrapTimeoutMs: number;
+    nextBootstrapTimeoutMs?: number;
+    reason: VerisenseConnectRetryReason;
+    error: string;
+}
+interface VerisenseCommandResponse {
+    header: number;
+    command: AsmCommand;
+    property: AsmProperty;
+    payload: Uint8Array;
+}
+type BleLinkAutoOptimizeStopReason = 'stabilized' | 'timeout' | 'aborted' | 'unsupported' | 'not-ble';
+interface BleLinkAutoOptimizeOptions {
+    pollIntervalMs?: number;
+    stableReadCount?: number;
+    maxDurationMs?: number;
+    settleMode?: 'target-and-stability' | 'stability';
+    minSettleTimeMs?: number;
+    forceOptimizeAttempts?: number;
+    targetConnectionIntervalUnits?: number;
+    targetPhy?: number;
+    minDataLength?: number;
+    signal?: AbortSignal | null;
+    onSample?: ((sample: BleLinkAutoOptimizeSample) => void) | null;
+}
+interface BleLinkAutoOptimizeSample {
+    source: 'read' | 'optimize';
+    iteration: number;
+    stableCount: number;
+    parsed: VerisenseBleLinkDebugPayload;
+    signature: string;
+    optimizedEnough: boolean;
+}
+interface BleLinkAutoOptimizeResult {
+    reason: BleLinkAutoOptimizeStopReason;
+    iterations: number;
+    optimizeAttempts: number;
+    stableCount: number;
+    lastParsed: VerisenseBleLinkDebugPayload | null;
+    durationMs: number;
+}
+
+/**
+ * CSV recording of a live Verisense stream (DEV-1116): one file per sensor
+ * stream, in a session folder the user picks.
+ *
+ * Why one file per stream rather than one wide file: a Verisense sends one
+ * packet per SENSOR, each at that sensor's own rate — accel at 51.2 Hz, GSR at
+ * 50 Hz, skin temperature at a fraction of a hertz — and the LSM6DSV (id 6)
+ * interleaves three sub-streams (accel, gyro, mag) in one FIFO, with each
+ * decoded sample carrying exactly one of them. A single table across all of
+ * that is mostly empty cells. One file per stream keeps every file
+ * rectangular, and the device clock column lines them up.
+ *
+ * ## Timestamps
+ *
+ * A Verisense packet carries ONE measured time: the 24-bit tick in its header
+ * (32768 Hz) is the time of the packet's LAST sample. The decoder places the
+ * other samples backwards from it at the configured rate
+ * (`SensorBase.extrapolateSampleTimes`). So every row gets a timestamp,
+ * but only one row per packet was measured, and the file says which:
+ *
+ * | column          | what it is |
+ * |-----------------|------------|
+ * | `HostTime_ms`   | host `Date.now()` at packet arrival, placed back the same way; epoch ms, so it carries BLE latency jitter |
+ * | `DeviceTime_ms` | the device clock, unwrapped, in ms — interpolated on every row but the measured one. Shared by all of a session's files: this is the column that aligns them |
+ * | `PacketTick`    | the packet header's raw tick, ONLY on the row it measured (the last of the packet — for id 6, the last of each sub-stream in it); blank elsewhere |
+ *
+ * Keeping the raw tick on the measured row means anyone can see the anchors
+ * and check or redo the interpolation, rather than having to trust it.
+ *
+ * Caveat, documented rather than fixed here: each decoder unwraps the tick
+ * against a 60 s rollover (`SensorBase.TICKS_MAX_VALUE`, matching the C#
+ * `Sensor.cs`). A stream whose packets arrived more than 60 s apart would miss
+ * a wrap, and its `DeviceTime_ms` would fall a minute behind.
+ *
+ * ## Column layouts
+ *
+ * The layout for a stream is derived from its FIRST sample, the way the
+ * capture page derives its columns from the first frame: which PPG channels
+ * are enabled, and whether a GSR+ unit's ADC packet carries GSR, battery or
+ * both, are properties of the configuration, and the configuration cannot
+ * change while streaming. A later sample missing a column writes an empty
+ * cell rather than shifting the row.
+ *
+ * No DOM access at import time.
+ */
+
+/** One data column of a Verisense stream file. */
+interface VerisenseStreamCsvColumn {
+    header: string;
+    unit: string;
+}
+/** How one Verisense stream is written. See {@link verisenseStreamCsvLayout}. */
+interface VerisenseStreamCsvLayout {
+    /** Stream key, matching the stream-stats keys: `'2'`, `'6:accel'`, … */
+    key: string;
+    /** Short name used in the file name: `Accel1`, `GSR_Batt`, `Mag`, … */
+    label: string;
+    sensorId: number;
+    /** The data columns, after the {@link VERISENSE_STREAM_CSV_TIME_COLUMNS}. */
+    columns: readonly VerisenseStreamCsvColumn[];
+    /** Project one decoded sample onto `columns`. */
+    row(sample: unknown): unknown[];
+}
+/** The columns every Verisense stream file starts with. See the module header. */
+declare const VERISENSE_STREAM_CSV_TIME_COLUMNS: readonly VerisenseStreamCsvColumn[];
+/**
+ * Which stream a decoded sample belongs to, or null for a sensor this module
+ * does not know. Only id 6 splits: its samples each carry one of accel, gyro
+ * or mag, and the key says which (the same keys the stream stats use).
+ */
+declare function verisenseStreamCsvKey(sensorId: number, sample: unknown): string | null;
+/**
+ * The file layout for the stream this sample opens, derived from the sample
+ * itself. Returns null for an unknown sensor, or a sample with nothing to
+ * write (an ADC packet with neither GSR nor battery, say).
+ */
+declare function verisenseStreamCsvLayout(sensorId: number, sample: unknown): VerisenseStreamCsvLayout | null;
+/** A finished file in memory mode, as handed to `downloadFiles`. */
+interface VerisenseStreamCsvFile {
+    fileName: string;
+    blob: Blob;
+}
+/** One stream's file in a {@link VerisenseStreamRecordingResult}. */
+interface VerisenseStreamFileResult extends CsvFileResult {
+    key: string;
+    label: string;
+    sensorId: number;
+}
+/** What `stop()` returns, and what `onError` receives. */
+interface VerisenseStreamRecordingResult {
+    /** The session name: the folder in the picked directory, and every file's prefix. */
+    sessionName: string;
+    /** False when the files went to memory and were downloaded instead. */
+    toFolder: boolean;
+    /** False when any file is short. */
+    complete: boolean;
+    /** The first failure, when there was one. */
+    error: string | null;
+    files: VerisenseStreamFileResult[];
+}
+/** Live progress of one stream's file, for a page to show while recording. */
+interface VerisenseStreamFileProgress {
+    key: string;
+    label: string;
+    sensorId: number;
+    fileName: string;
+    rows: number;
+}
+/** Options for {@link createVerisenseStreamRecorder}. */
+interface VerisenseStreamRecorderOptions {
+    /**
+     * Names the session — the folder created in the picked directory, and the
+     * prefix of every file in it. Called once per `start()`. Defaults to
+     * `Verisense_2026-09-30_141530`.
+     */
+    sessionNameFn?: () => string;
+    /**
+     * Stream the files into a folder the user picks (default). Set false, or
+     * run in a browser without `showDirectoryPicker`, to buffer in memory and
+     * hand the files to `downloadFiles` on `stop()`.
+     */
+    preferFileSystemAccess?: boolean;
+    /** Emit a second header row of units (default true). */
+    unitsRow?: boolean;
+    log?: CsvRecorderLog;
+    /**
+     * Called once when a write fails and the recording is abandoned — every
+     * other file is closed first, so the result is final. `active` is already
+     * false. Not called for a failure discovered inside `stop()`.
+     */
+    onError?: (result: VerisenseStreamRecordingResult) => void;
+    /**
+     * Memory mode only: receives every finished file at once, so a page can
+     * bundle them. Defaults to downloading each one.
+     */
+    downloadFiles?: (files: VerisenseStreamCsvFile[]) => void;
+}
+/** A {@link createVerisenseStreamRecorder} instance. */
+interface VerisenseStreamRecorder {
+    /**
+     * Pick a folder and create the session in it. Must be called straight from
+     * a user gesture: `showDirectoryPicker` is gesture-gated. Resolves false if
+     * the user cancelled the picker.
+     */
+    start(): Promise<boolean>;
+    /** Append a `data` packet. Returns false when nothing was recorded from it. */
+    push(pkt: StreamPacket): boolean;
+    stop(): Promise<VerisenseStreamRecordingResult>;
+    /** One entry per stream that has opened a file so far. */
+    progress(): VerisenseStreamFileProgress[];
+    readonly active: boolean;
+    readonly sessionName: string;
+    /** True once `start()` has a folder to write into; false while buffering in memory. */
+    readonly toFolder: boolean;
+}
+/**
+ * Create a recorder for a live Verisense stream: feed it every `data` packet,
+ * and it writes one CSV per sensor stream, each opened on that stream's first
+ * sample. A sensor that starts sending later gets its file when it starts.
+ *
+ * One failure ends the whole recording, for the reason the table writer gives:
+ * a session whose files silently stop at different points is worse than one
+ * that stops, closes everything, and says so.
+ */
+declare function createVerisenseStreamRecorder(opts?: VerisenseStreamRecorderOptions): VerisenseStreamRecorder;
+
+/**
+ * Device RTC drift estimation over a live connection (DEV-844).
+ *
+ * Sample the device clock periodically against the host clock and fit a
+ * least-squares slope of (device − host) offset vs host time: the
+ * dimensionless slope × 1e6 is directly the crystal error in ppm, giving a
+ * usable estimate in hours instead of waiting days between connections.
+ * Device time resolves to 1/32768 s, so per-sample noise is just transport
+ * round-trip jitter (~tens of ms); the fit averages it out. Host timestamps
+ * should be taken at the midpoint of the read round-trip, bounding transport
+ * latency to ±rtt/2.
+ *
+ * Host clock steps (NTP corrections) are a measurement hazard: the wall
+ * clock jumping mid-series pollutes the least-squares slope while looking
+ * like device drift (seen live on DEV-844: a −1.4 s Windows NTP step bent
+ * the fit from 1020 to 1077 ppm). Each sample therefore also records a
+ * monotonic timestamp (`performance.now()`): wall-vs-monotonic divergence
+ * between samples attributes a jump to the HOST, which resets the fit
+ * baseline instead of counting as a device step.
+ *
+ * This class is pure bookkeeping — the caller owns the sampling timer, the
+ * device read, and any UI. Feed it one {@link RtcDriftSampleInput} per read.
+ */
+interface RtcDriftSampleInput {
+    /** Host wall-clock unix seconds at the midpoint of the device-time read. */
+    hostSec: number;
+    /** Device clock in unix seconds, as read from the device. */
+    devSec: number;
+    /** Read round-trip in ms (kept per sample so outliers are explainable). */
+    rttMs: number;
+    /** Host monotonic clock (e.g. `performance.now()`) in ms at the read. */
+    perfMs: number;
+}
+interface RtcDriftSample extends RtcDriftSampleInput {
+    /** Device-minus-host clock offset in seconds. */
+    offsetSec: number;
+}
+/** What {@link RtcDriftMonitor.addSample} concluded about a new sample. */
+type RtcDriftSampleEvent = {
+    kind: 'sample';
+    sample: RtcDriftSample;
+}
+/** The HOST wall clock stepped (NTP): the fit baseline was reset and the
+ * series restarted from this sample. */
+ | {
+    kind: 'host-step';
+    sample: RtcDriftSample;
+    hostStepSec: number;
+}
+/** The DEVICE clock stepped between samples. */
+ | {
+    kind: 'device-step';
+    sample: RtcDriftSample;
+    deltaSec: number;
+};
+interface RtcDriftMonitorOptions {
+    /** Offset jump treated as a device clock step (default 1 s). */
+    deviceStepThresholdSeconds?: number;
+    /** Wall-vs-monotonic divergence treated as a host clock step (default 0.5 s). */
+    hostStepThresholdSeconds?: number;
+}
+declare class RtcDriftMonitor {
+    readonly samples: RtcDriftSample[];
+    /** Device clock steps detected across the whole run (survives rebaselines). */
+    deviceSteps: number;
+    /** Host (NTP) clock steps detected; each one rebaselines the fit. */
+    hostSteps: number;
+    private readonly deviceStepThresholdSeconds;
+    private readonly hostStepThresholdSeconds;
+    constructor(options?: RtcDriftMonitorOptions);
+    /** Drop all samples and step counts (e.g. when starting a new run). */
+    reset(): void;
+    /**
+     * Drop the samples but keep the step counters. Call when the device time is
+     * written: a time write moves the offset baseline, so every prior sample is
+     * invalid and the fit must not straddle the discontinuity.
+     */
+    rebaseline(): void;
+    /**
+     * Record one device-time reading. Attributes any offset jump before
+     * recording it: wall-clock elapsed minus monotonic elapsed isolates host
+     * clock steps (NTP) from device steps. A host step resets the fit baseline
+     * (the fit must not straddle the discontinuity); a device step is counted
+     * and kept in-series.
+     */
+    addSample(input: RtcDriftSampleInput): RtcDriftSampleEvent;
+    /**
+     * Least-squares slope of offset vs host time, in ppm (offset and time are
+     * both in seconds, so the dimensionless slope × 1e6 is directly ppm).
+     * Null until two samples spanning a non-zero interval exist.
+     */
+    ppmFit(): number | null;
+    /** Elapsed span of the current sample series in minutes (0 when empty). */
+    elapsedMinutes(): number;
+    /**
+     * CSV rows of the current series, matching the DEV-844 export format: a
+     * header row (host ISO time, host/device unix seconds, offset, rtt,
+     * monotonic seconds) followed by one row per sample.
+     *
+     * Optional `metadata` is emitted as `# key: value` comment lines BEFORE the
+     * header (so the header is no longer row 0 when metadata is supplied), so a
+     * saved file records what it came from (device, transport, the fit result,
+     * etc.) - the S3R drift tool established this preamble and the console
+     * adopts it. Each value has newlines collapsed so every entry stays a single
+     * comment line; a caller can read the fit via
+     * {@link ppmFit}/{@link deviceSteps}/{@link hostSteps} to build the map.
+     */
+    toCsvRows(metadata?: Record<string, string | number>): string[];
 }
 
 /**
@@ -1592,10 +4304,11 @@ declare const CHANNEL_FORMATS: Readonly<Record<number, ChannelFormat>>;
  *
  * Names follow the SD-log channel tables in `devices/sdlog/channels.ts` so the
  * streamed and logged copies of the same signal carry the same label. The one
- * exception is the BMP pair: the SD-log header names the exact part
- * (`TEMPERATURE_BMP390`, `PRESSURE_BMP280`) because it records it, whereas the
- * inquiry response does not say which sensor is fitted, so the streaming names
- * stay unqualified.
+ * exception is the BMP pair: the SD-log decoder names the exact part
+ * (`TEMPERATURE_BMP390`, `PRESSURE_BMP581`), inferred from the board identity
+ * the header records — the header itself names no part — whereas the inquiry
+ * response does not say which sensor is fitted, so the streaming names stay
+ * unqualified.
  *
  * The ADC block's Shimmer3R names are the firmware's logical indices
  * (`EXTERNAL_ADC_0`…), which is what `devices/sdlog/channels.ts` already uses.
@@ -2897,6 +5610,47 @@ declare const TICKS_PER_MS: number;
  * 2 s, so a stall really can cross it, and it keeps its existing behaviour.
  */
 declare const INVALID_ZERO_WINDOW_TICKS = 32768;
+/**
+ * How many sample periods behind its predecessor a value may be and still be
+ * read as a reordered packet rather than as forward motion across a wrap.
+ *
+ * A reorder swaps packets that are adjacent in time, so it spans a handful of
+ * sample periods; a dropout spans whatever the link lost. Eight periods sits
+ * orders of magnitude clear of both at any rate the hardware offers.
+ */
+declare const REORDER_PERIODS = 8;
+/**
+ * The largest fraction of the counter's range a reorder window may occupy.
+ *
+ * At 1 Hz on the 16-bit counter eight sample periods is four whole modulos, and
+ * a window at or above the modulo leaves no backward step large enough to be a
+ * wrap — the unwrap would stop counting them altogether.
+ */
+declare const MAX_WINDOW_DIVISOR = 8;
+/**
+ * The reorder window for a stream at a known sampling rate, in counter ticks.
+ *
+ * Sized in **sample periods**, not as a fraction of the counter's range. The
+ * two are easy to confuse and behave very differently: a reorder swaps adjacent
+ * packets, whereas a dropout that happens to span the wrap point is most of a
+ * modulo. Sizing the window by the modulo puts the boundary between them in the
+ * middle of ordinary dropout territory — at 2^16 every gap between 1.75 s and
+ * 2.0 s reads as a reorder and the wrap is silently lost, and 1.75 s is a gap a
+ * Bluetooth link produces on a bad afternoon. Eight sample periods shrinks that
+ * misread band to about 16 ms.
+ *
+ * `0` — the branch disabled — when the rate is not a positive finite number.
+ * Never guess: an unknown rate must not become an infinite window, which would
+ * read every backward step as a reorder and lose every wrap. That is a worse
+ * failure than no reorder detection at all, and it is how a parallel fix for
+ * this same defect reverted itself whenever the rate happened to read zero.
+ *
+ * @param samplingRateHz Samples per second. **The counter's own 32768 Hz tick
+ *   domain is what the answer is in** — pass the rate in Hz, never a rate
+ *   expressed against a TCXO sampling clock.
+ * @param modulo The counter's range, `2 ** timestampBits`.
+ */
+declare function reorderWindowTicks(samplingRateHz: number | null | undefined, modulo: number): number;
 /** Where a timeline's wall-clock time came from. See the module docblock. */
 type TimelineSource = 'rwc-aligned' | 'rwc-estimated' | 'host';
 /** How wide the device's sample counter is. */
@@ -2974,11 +5728,34 @@ interface TimelineState {
     wraps: number;
     /** The counter width in use. */
     timestampBits: TimestampBits;
+    /**
+     * The reorder window in force, in counter ticks — how far behind its
+     * predecessor a sample may be and still be placed where it was taken rather
+     * than read as a wrap.
+     *
+     * Reported so a host can see that its sampling rate reached the timeline.
+     * See {@link reorderWindowTicks} and
+     * {@link StreamTimeline.setSamplingRateHz}.
+     */
+    reorderWindowTicks: number;
 }
 /** Options for {@link StreamTimeline}. */
 interface StreamTimelineOptions {
     /** Counter width. Default 24. */
     timestampBits?: TimestampBits;
+    /**
+     * The stream's sampling rate, which sizes the reorder window. Omit, or pass
+     * `null`, when it is not known yet — a client normally learns it from an
+     * inquiry and calls {@link StreamTimeline.setSamplingRateHz} later.
+     */
+    samplingRateHz?: number | null;
+    /**
+     * The reorder window outright, in ticks, overriding the rate. For a caller
+     * that knows better than the derivation — and for the shared conformance
+     * vectors, which specify the window rather than the rate so that every host
+     * API runs them identically.
+     */
+    reorderWindowTicks?: number | null;
 }
 /**
  * Unwraps a device sample counter and, once anchored, reports wall-clock time
@@ -2997,10 +5774,14 @@ declare class StreamTimeline {
     private _wraps;
     /**
      * How far behind the previous sample a value may be and still be read as a
-     * reordered packet rather than as forward motion across a wrap. An eighth of
-     * the modulo; see {@link _unwrap} for why not half.
+     * reordered packet rather than as forward motion across a wrap, in ticks.
+     * Derived — see {@link _recomputeReorderWindow}.
      */
     private _reorderWindow;
+    /** The stream's sampling rate, or `null` when it is not known. */
+    private _samplingRateHz;
+    /** A window set outright by the caller, overriding the derivation. */
+    private _reorderWindowOverride;
     private _pending;
     private _anchor;
     /**
@@ -3011,6 +5792,51 @@ declare class StreamTimeline {
      */
     private _request;
     constructor(opts?: StreamTimelineOptions);
+    /**
+     * Tell the timeline the stream's sampling rate, so that it can size the
+     * reorder window in sample periods.
+     *
+     * `null` — or anything that is not a positive finite number — means "not
+     * known", and the window falls back to an eighth of the modulo, which is what
+     * this class has always used. That fallback is a compromise this SDK can
+     * afford and a file importer cannot: on a live link the host-clock recovery
+     * in {@link _unwrap} is a second witness, whereas an SD file has no clock to
+     * appeal to and the other Shimmer host APIs therefore disable the branch
+     * outright when the rate is unknown. Pass the rate and the question does not
+     * arise: the derived window is better in every case.
+     *
+     * Cheap and idempotent. Both clients call it once per stream, from the rate
+     * the inquiry reported; calling it mid-stream is allowed and the next sample
+     * is judged by the new window.
+     */
+    setSamplingRateHz(samplingRateHz: number | null): void;
+    /**
+     * Set the reorder window outright, in ticks, or `null` to go back to deriving
+     * it from the sampling rate. `0` disables the branch.
+     *
+     * Clamped to an eighth of the counter's range, as a derived window is — see
+     * {@link _recomputeReorderWindow}. {@link reorderWindowTicks} reports what is
+     * actually in force.
+     */
+    setReorderWindowTicks(ticks: number | null): void;
+    /** The reorder window in force, in counter ticks. */
+    get reorderWindowTicks(): number;
+    /**
+     * True when the window in force is a reorder-scale one — derived from a known
+     * rate, or set outright by the caller — rather than the rate-unknown
+     * fallback.
+     *
+     * It decides whether a reorder is allowed to overrule the invalid-zero test
+     * (see {@link _unwrap}). A window of a few sample periods can: a zero that
+     * close to an origin really is ambiguous, and the cost of choosing wrong is
+     * about 16 ms. An eighth of the modulo cannot: it is 64 s on the 24-bit
+     * counter, and reading an unstamped record as a packet 64 s late would place
+     * it 64 s early and call it valid, which is worse than either answer the rule
+     * is choosing between.
+     */
+    private get _windowIsReorderScale();
+    /** Explicit window, else the rate-derived one, else the legacy fallback. */
+    private _recomputeReorderWindow;
     /** The counter width this timeline is unwrapping. */
     get timestampBits(): TimestampBits;
     /**
@@ -3685,8 +6511,9 @@ declare function compensateBmp390(rawPressure: number, rawTemperature: number, c
  * Scale factors and signedness are the Bosch driver's
  * (`Shimmer_Driver/BMP5/BMP5_SensorAPI/bmp5.c:682-720`): pressure is an
  * **unsigned** 24-bit value over 64 for pascals, temperature a **signed**
- * 24-bit value over 65536 for degrees Celsius. The Java driver agrees
- * (`CalibDetailsBmp581.java:26-31`).
+ * 24-bit value over 65536 for degrees Celsius. The Java driver used the
+ * temperature unsigned until DEV-1102, so Consensys exports read ~255 °C for
+ * anything below 0 °C; it now sign-extends in `CalibDetailsBmp581.signExtend24`.
  */
 
 /**
@@ -3733,6 +6560,232 @@ declare function parsePressureCalibrationResponse(payload: Uint8Array): Pressure
  *   than carrying a number derived from zeros.
  */
 declare function compensatePressure(calibration: PressureCalibration | null, rawPressure: number, rawTemperature: number, oversampling?: number): CompensatedPressure | null;
+
+/**
+ * What a Shimmer says about itself when asked: which Bluetooth module it
+ * carries, and which board it is.
+ *
+ * The VALUES are the same whichever way a host reaches the sensor: one set of
+ * SR codes, one set of module version strings, arriving over BLE, classic
+ * Bluetooth and the dock alike. That is why the tables and the formatting live
+ * here rather than inside a client.
+ *
+ * Two clients read them today — `Shimmer3RClient` and `WiredShimmerClient`.
+ * `Shimmer3Client`, the classic-Bluetooth-only client, does not: it has no
+ * identity reads of its own yet. Nothing here is Shimmer3R-specific, so it is
+ * a matter of adding the two reads rather than of extending this module.
+ */
+/** Shimmer platform, from the hardware id the sensor reports. */
+declare const SHIMMER_PLATFORM_NAMES: Readonly<Record<number, string>>;
+/**
+ * SR code → board name, from the Java driver's `mMapOfShimmerHardware`
+ * (`ShimmerVerDetails.java:136-169`), whose codes match the firmware's own
+ * `SR_BOARD_CODES` enum (`Boards/shimmer_boards.h:26-43`) exactly.
+ *
+ * These are NOT Shimmer3-only. A Shimmer3R reports the same codes for the
+ * same sensor configurations — the firmware tests for them without regard to
+ * platform, and in one place explicitly pairs `HW_ID_SHIMMER3R` with
+ * `EXP_BRD_EXG_UNIFIED` (`Boards/shimmer_boards.c:136-137`).
+ *
+ * Codes 56-59 and 61-68 (ShimmerGQ, Shimmer4, ECGmd and the Verisense family)
+ * are in the Java map but omitted here: they are other product lines, this SDK
+ * addresses them through their own clients, and a Shimmer3-family sensor
+ * reporting one of them would be a fault worth showing raw rather than naming.
+ */
+declare const SHIMMER_SR_BOARD_NAMES: Readonly<Record<number, string>>;
+/** The three bytes at the start of the daughter-card id page. */
+interface ShimmerSrBoard {
+    boardId: number;
+    boardRev: number;
+    specialRev: number;
+}
+/**
+ * `SR48-3-0` — the form Shimmer's own product documentation and labels use.
+ *
+ * The Java driver's `getBoardVerString()` (`ExpansionBoardDetails.java:100-102`)
+ * joins the same three numbers with dots instead. Hyphens are used here
+ * because that is what is printed on the boards.
+ */
+declare function formatShimmerSrCode(board: ShimmerSrBoard): string;
+/**
+ * True when the daughter-card id page holds a real board rather than one of
+ * the two "nothing here" patterns — all zeroes (never written) or all 0xFF
+ * (erased). Port of `isExpansionBoardValid()`
+ * (`ExpansionBoardDetails.java:104-111`).
+ */
+declare function isShimmerSrBoardValid(board: ShimmerSrBoard | null | undefined): board is ShimmerSrBoard;
+/**
+ * True when `board` is `SR<boardId>` at revision `rev`-`specialRev` or later:
+ * the rev is compared first, and the special rev only breaks a tie. Port of
+ * the firmware's `ShimBrd_isBoardSrNumberGte()`
+ * (`Boards/shimmer_boards.c:325-335`).
+ *
+ * A board with a different id is never "at least" anything, whatever its
+ * revision — revision numbers are per board id and mean nothing across them.
+ * Nor is an unprogrammed page: the firmware refuses an id of 0x00 or 0xFF
+ * before comparing, because all-0xFF would pass every `>=`.
+ */
+declare function isShimmerSrBoardAtLeast(board: ShimmerSrBoard | null | undefined, boardId: number, rev: number, specialRev: number): boolean;
+/** A sensor's board identity, ready to render. */
+interface ShimmerHardwareDescription {
+    /** `'Shimmer3'` / `'Shimmer3R'`, or null when the hardware id is unknown. */
+    platform: string | null;
+    /** `'GSR+'`, or null when the SR code is not in {@link SHIMMER_SR_BOARD_NAMES}. */
+    boardName: string | null;
+    /** `'SR48-3-0'`, or null when no valid board was read. */
+    srCode: string | null;
+    /**
+     * Everything known, as one line: `'Shimmer3R GSR+ (SR48-3-0)'`. Degrades a
+     * piece at a time — an unnamed SR code gives `'Shimmer3R (SR52-1-0)'`, no
+     * board at all gives `'Shimmer3R'`, a hardware id outside
+     * {@link SHIMMER_PLATFORM_NAMES} gives `'hardware id 7 GSR+ (SR48-3-0)'`, a
+     * board with no platform gives `'GSR+ (SR48-3-0)'`, and nothing known at all
+     * gives `'unknown hardware'`.
+     */
+    label: string;
+}
+/**
+ * Describe a sensor's hardware for display: platform, board name and SR code.
+ *
+ * Every part is optional because every part can be missing in practice — an
+ * older firmware that does not answer the hardware-version command, a board
+ * whose id page was never written, an SR code newer than this table.
+ */
+declare function describeShimmerHardware(hardwareVersion: number | null | undefined, board?: ShimmerSrBoard | null): ShimmerHardwareDescription;
+/** Which module answered the version query. */
+type BluetoothModuleFamily = 'rn41' | 'rn42' | 'rn4678' | 'cyw20820' | 'unknown';
+/**
+ * One row of the known-module table: the substring to look for, and what to
+ * call the module when it is found.
+ */
+interface BluetoothModuleVersionEntry {
+    /** Substring searched for in the module's own reply. */
+    match: string;
+    family: BluetoothModuleFamily;
+    model: string;
+    version: string;
+}
+/**
+ * The Bluetooth module replies the Shimmer3 firmware is known to capture,
+ * ported from the Java driver's `BT_MODULE_VERSION` enum
+ * (`BluetoothModuleVersionDetails.java:15-39`) — its middle column is the
+ * substring, its third column the user-facing name.
+ *
+ * Two of the Java names disagree with the reply they are matched against and
+ * are corrected here, because a host that shows a version the module did not
+ * report is worse than one that shows none:
+ *
+ * - `RN4678 V1.13.5` was labelled `v1.15.5`
+ * - `RN4678 V1.22` was labelled `v1.23`, the same as the entry below it
+ *
+ * HARDWARE-VERIFY: transcribed from the Java table, not from modules of each
+ * revision. The substrings are what matter and they come from the modules'
+ * own datasheet-documented replies, but only RN4678 v1.23 and the CYW20820
+ * have been seen by this SDK.
+ */
+declare const BLUETOOTH_MODULE_VERSIONS: readonly BluetoothModuleVersionEntry[];
+/** Extra fields the CYW20820 reports alongside its application version. */
+interface Cyw20820VersionDetails {
+    /** Stack build, as the firmware prints it: `0x00000000`. */
+    stack: string;
+    /** EZ-Serial protocol version: `0x0000`. */
+    protocol: string;
+    /** Module hardware revision: `0x00`. */
+    hardware: string;
+}
+/** A parsed answer to the Bluetooth-module version query. */
+interface BluetoothModuleVersion {
+    /** Exactly what the sensor reported, control characters and all. */
+    raw: string;
+    family: BluetoothModuleFamily;
+    /** `'RN4678'` / `'CYW20820'`, or null when the reply is not recognised. */
+    model: string | null;
+    /** `'1.23'` / `'1.4.18.18'`, or null when the reply is not recognised. */
+    version: string | null;
+    /**
+     * What to show a user. A recognised module gives `'RN4678 v1.23'`; an
+     * unrecognised non-empty reply gives the reply itself, trimmed, because it
+     * is more informative than "unknown"; an empty reply gives
+     * `'not reported'`.
+     */
+    label: string;
+    /** Present only for the CYW20820. */
+    details?: Cyw20820VersionDetails;
+}
+/**
+ * Parse the reply to `GET_BT_VERSION_STR_COMMAND` (0xA1).
+ *
+ * The reply is whatever the Bluetooth module said when the firmware asked it,
+ * passed through unaltered apart from the RN4678's trailing `CMD>` prompt,
+ * which the firmware strips (`Comms/shimmer_bt_uart.c:442-458`). So there is
+ * no single grammar: an RN module answers with a Roving Networks / Microchip
+ * banner, and a Shimmer3R answers with a line the Shimmer firmware composes
+ * itself from the CYW20820's binary version record.
+ *
+ * Never throws, and the signature says so: `null` and `undefined` are accepted
+ * because this parses a payload read off a device, and the SDK is consumed from
+ * plain JavaScript as well as TypeScript. A caller should not need a cast to
+ * hand it whatever a read actually produced.
+ *
+ * An unrecognised reply is returned with `family: 'unknown'` and
+ * the raw text as its label — the Java equivalent has a bug here that returns
+ * an empty name instead (its `NOT_READ` row carries an empty comparison
+ * string, which `String.contains` matches against every input, so an
+ * unrecognised module is reported as "not read"). What the module actually
+ * said is the most useful thing a host can show.
+ */
+declare function parseBluetoothModuleVersion(raw: string | Uint8Array | null | undefined): BluetoothModuleVersion;
+
+/**
+ * Which pressure part a Shimmer3R carries, when the sensor will not say.
+ *
+ * The in-band answer is the 0xA7 reply's sensor id (see `./types.ts`), but two
+ * places have no such reply to read. An SD-log file carries no sensor id at
+ * all — for a BMP581 the firmware simply leaves the header's calibration
+ * region unwritten (`SDCard/shimmer_sd_header.c:209-215`) — and a
+ * LogAndStream_Shimmer3R v1.01.006 NACKs 0xA7 on a BMP581. Both fall back to
+ * the rule the firmware itself uses when the chip id cannot be read: the
+ * board's SR number.
+ */
+
+/** The first firmware that drives a BMP581: LogAndStream_Shimmer3R v1.01.006. */
+declare const BMP581_MIN_FIRMWARE: Readonly<{
+    readonly major: 1;
+    readonly minor: 1;
+    readonly internal: 6;
+}>;
+/** What {@link isBmp581PresentPerSrNumber} needs to know about the sensor. */
+interface Bmp581DetectionContext {
+    /** Hardware id: 10 for a Shimmer3R. */
+    hardwareVersion: number;
+    /** Firmware id: 3 for LogAndStream. */
+    firmwareId: number;
+    firmwareVersion: {
+        major: number;
+        minor: number;
+        internal: number;
+    };
+    /** The daughter-card id page, or null when it was not read or not stored. */
+    board: ShimmerSrBoard | null | undefined;
+}
+/**
+ * True when a sensor should be assumed to carry a BMP581 rather than a BMP390.
+ *
+ * All three must hold:
+ * - the hardware is a Shimmer3R — the firmware rule is Shimmer3R-only, and a
+ *   daughter card can be moved onto a Shimmer3 host;
+ * - the firmware is LogAndStream {@link BMP581_MIN_FIRMWARE} or later — older
+ *   firmware has no BMP581 support, so its data is never BMP581 output;
+ * - the board's SR number is in one of the windows in the firmware's
+ *   `ShimBrd_isBmp581PresentPerSrNumber()`, where `>=` compares the rev first
+ *   and then the special rev.
+ *
+ * The hardware and SR-number checks mirror the firmware exactly; the firmware
+ * version check is the host's own addition, as it is in the Java driver
+ * (`ShimmerObject.isSupportedBmp581`). Prefer the 0xA7 sensor id whenever the
+ * sensor gives one: this is the fallback for when it cannot.
+ */
+declare function isBmp581PresentPerSrNumber(ctx: Bmp581DetectionContext): boolean;
 
 /**
  * Decoded STATUS_RESPONSE payload: what the sensor is doing right now.
@@ -4347,169 +7400,6 @@ declare function parseExpansionBoard(payload: Uint8Array): ExpansionBoardInfo | 
  * legitimate packet into report content.
  */
 declare function classifyFactoryTestAckPacket(buf: Uint8Array): AckVerdict;
-
-/**
- * What a Shimmer says about itself when asked: which Bluetooth module it
- * carries, and which board it is.
- *
- * The VALUES are the same whichever way a host reaches the sensor: one set of
- * SR codes, one set of module version strings, arriving over BLE, classic
- * Bluetooth and the dock alike. That is why the tables and the formatting live
- * here rather than inside a client.
- *
- * Two clients read them today — `Shimmer3RClient` and `WiredShimmerClient`.
- * `Shimmer3Client`, the classic-Bluetooth-only client, does not: it has no
- * identity reads of its own yet. Nothing here is Shimmer3R-specific, so it is
- * a matter of adding the two reads rather than of extending this module.
- */
-/** Shimmer platform, from the hardware id the sensor reports. */
-declare const SHIMMER_PLATFORM_NAMES: Readonly<Record<number, string>>;
-/**
- * SR code → board name, from the Java driver's `mMapOfShimmerHardware`
- * (`ShimmerVerDetails.java:136-169`), whose codes match the firmware's own
- * `SR_BOARD_CODES` enum (`Boards/shimmer_boards.h:26-43`) exactly.
- *
- * These are NOT Shimmer3-only. A Shimmer3R reports the same codes for the
- * same sensor configurations — the firmware tests for them without regard to
- * platform, and in one place explicitly pairs `HW_ID_SHIMMER3R` with
- * `EXP_BRD_EXG_UNIFIED` (`Boards/shimmer_boards.c:136-137`).
- *
- * Codes 56-59 and 61-68 (ShimmerGQ, Shimmer4, ECGmd and the Verisense family)
- * are in the Java map but omitted here: they are other product lines, this SDK
- * addresses them through their own clients, and a Shimmer3-family sensor
- * reporting one of them would be a fault worth showing raw rather than naming.
- */
-declare const SHIMMER_SR_BOARD_NAMES: Readonly<Record<number, string>>;
-/** The three bytes at the start of the daughter-card id page. */
-interface ShimmerSrBoard {
-    boardId: number;
-    boardRev: number;
-    specialRev: number;
-}
-/**
- * `SR48-3-0` — the form Shimmer's own product documentation and labels use.
- *
- * The Java driver's `getBoardVerString()` (`ExpansionBoardDetails.java:100-102`)
- * joins the same three numbers with dots instead. Hyphens are used here
- * because that is what is printed on the boards.
- */
-declare function formatShimmerSrCode(board: ShimmerSrBoard): string;
-/**
- * True when the daughter-card id page holds a real board rather than one of
- * the two "nothing here" patterns — all zeroes (never written) or all 0xFF
- * (erased). Port of `isExpansionBoardValid()`
- * (`ExpansionBoardDetails.java:104-111`).
- */
-declare function isShimmerSrBoardValid(board: ShimmerSrBoard | null | undefined): board is ShimmerSrBoard;
-/** A sensor's board identity, ready to render. */
-interface ShimmerHardwareDescription {
-    /** `'Shimmer3'` / `'Shimmer3R'`, or null when the hardware id is unknown. */
-    platform: string | null;
-    /** `'GSR+'`, or null when the SR code is not in {@link SHIMMER_SR_BOARD_NAMES}. */
-    boardName: string | null;
-    /** `'SR48-3-0'`, or null when no valid board was read. */
-    srCode: string | null;
-    /**
-     * Everything known, as one line: `'Shimmer3R GSR+ (SR48-3-0)'`. Degrades a
-     * piece at a time — an unnamed SR code gives `'Shimmer3R (SR52-1-0)'`, no
-     * board at all gives `'Shimmer3R'`, a hardware id outside
-     * {@link SHIMMER_PLATFORM_NAMES} gives `'hardware id 7 GSR+ (SR48-3-0)'`, a
-     * board with no platform gives `'GSR+ (SR48-3-0)'`, and nothing known at all
-     * gives `'unknown hardware'`.
-     */
-    label: string;
-}
-/**
- * Describe a sensor's hardware for display: platform, board name and SR code.
- *
- * Every part is optional because every part can be missing in practice — an
- * older firmware that does not answer the hardware-version command, a board
- * whose id page was never written, an SR code newer than this table.
- */
-declare function describeShimmerHardware(hardwareVersion: number | null | undefined, board?: ShimmerSrBoard | null): ShimmerHardwareDescription;
-/** Which module answered the version query. */
-type BluetoothModuleFamily = 'rn41' | 'rn42' | 'rn4678' | 'cyw20820' | 'unknown';
-/**
- * One row of the known-module table: the substring to look for, and what to
- * call the module when it is found.
- */
-interface BluetoothModuleVersionEntry {
-    /** Substring searched for in the module's own reply. */
-    match: string;
-    family: BluetoothModuleFamily;
-    model: string;
-    version: string;
-}
-/**
- * The Bluetooth module replies the Shimmer3 firmware is known to capture,
- * ported from the Java driver's `BT_MODULE_VERSION` enum
- * (`BluetoothModuleVersionDetails.java:15-39`) — its middle column is the
- * substring, its third column the user-facing name.
- *
- * Two of the Java names disagree with the reply they are matched against and
- * are corrected here, because a host that shows a version the module did not
- * report is worse than one that shows none:
- *
- * - `RN4678 V1.13.5` was labelled `v1.15.5`
- * - `RN4678 V1.22` was labelled `v1.23`, the same as the entry below it
- *
- * HARDWARE-VERIFY: transcribed from the Java table, not from modules of each
- * revision. The substrings are what matter and they come from the modules'
- * own datasheet-documented replies, but only RN4678 v1.23 and the CYW20820
- * have been seen by this SDK.
- */
-declare const BLUETOOTH_MODULE_VERSIONS: readonly BluetoothModuleVersionEntry[];
-/** Extra fields the CYW20820 reports alongside its application version. */
-interface Cyw20820VersionDetails {
-    /** Stack build, as the firmware prints it: `0x00000000`. */
-    stack: string;
-    /** EZ-Serial protocol version: `0x0000`. */
-    protocol: string;
-    /** Module hardware revision: `0x00`. */
-    hardware: string;
-}
-/** A parsed answer to the Bluetooth-module version query. */
-interface BluetoothModuleVersion {
-    /** Exactly what the sensor reported, control characters and all. */
-    raw: string;
-    family: BluetoothModuleFamily;
-    /** `'RN4678'` / `'CYW20820'`, or null when the reply is not recognised. */
-    model: string | null;
-    /** `'1.23'` / `'1.4.18.18'`, or null when the reply is not recognised. */
-    version: string | null;
-    /**
-     * What to show a user. A recognised module gives `'RN4678 v1.23'`; an
-     * unrecognised non-empty reply gives the reply itself, trimmed, because it
-     * is more informative than "unknown"; an empty reply gives
-     * `'not reported'`.
-     */
-    label: string;
-    /** Present only for the CYW20820. */
-    details?: Cyw20820VersionDetails;
-}
-/**
- * Parse the reply to `GET_BT_VERSION_STR_COMMAND` (0xA1).
- *
- * The reply is whatever the Bluetooth module said when the firmware asked it,
- * passed through unaltered apart from the RN4678's trailing `CMD>` prompt,
- * which the firmware strips (`Comms/shimmer_bt_uart.c:442-458`). So there is
- * no single grammar: an RN module answers with a Roving Networks / Microchip
- * banner, and a Shimmer3R answers with a line the Shimmer firmware composes
- * itself from the CYW20820's binary version record.
- *
- * Never throws, and the signature says so: `null` and `undefined` are accepted
- * because this parses a payload read off a device, and the SDK is consumed from
- * plain JavaScript as well as TypeScript. A caller should not need a cast to
- * hand it whatever a read actually produced.
- *
- * An unrecognised reply is returned with `family: 'unknown'` and
- * the raw text as its label — the Java equivalent has a bug here that returns
- * an empty name instead (its `NOT_READ` row carries an empty comparison
- * string, which `String.contains` matches against every input, so an
- * unrecognised module is reported as "not read"). What the module actually
- * said is the most useful thing a host can show.
- */
-declare function parseBluetoothModuleVersion(raw: string | Uint8Array | null | undefined): BluetoothModuleVersion;
 
 /**
  * Pure protocol helpers for the Classic Bluetooth (RFCOMM/SPP) Shimmer3.
@@ -8202,9 +11092,14 @@ declare function calibrateGsrDataToResistanceFromAmplifierEq(gsrUncalibratedData
  * any range can measure — the circuit cannot report below it whatever range it
  * switched to, but the upper end depends on which range that was, and the
  * per-sample range bits have already been used to pick the resistor. This
- * matches `SensorGSR.nudgeGsrResistance` (:415-421); an earlier version of this
- * function returned an auto-range value unclamped, which let the amplifier
- * equation report a few hundred ohms of skin resistance near full scale.
+ * matches `SensorGSR.nudgeGsrResistance` (:415-421).
+ *
+ * The auto-range floor never changes a real reading: range 0 at full scale
+ * already decodes to 8.04 kΩ. The only values under 8 kΩ are the negative ones
+ * that a code below the amplifier's reference produces, which is an open
+ * circuit, and the floor used to report those as 125 µS. `calibrateGsrSample`
+ * now decodes such a code as open before it gets here (DEV-1070), so the floor
+ * is only a backstop.
  *
  * @param gsrResistanceKOhms Calibrated resistance in kΩ.
  * @param gsrRangeSetting    Range 0–3 (fixed) or 4 (auto).
@@ -8688,42 +11583,6 @@ declare function downloadSdTree(client: Shimmer3RClient, destRoot: FileSystemDir
 declare function deleteDownloadedFromCard(client: Shimmer3RClient, filePaths: string[], dirPaths?: string[], opts?: {
     signal?: AbortSignal;
 }): Promise<string[]>;
-
-type ParsedSplitReason = 'midday-midnight-boundary' | 'config-change' | 'timestamp-discontinuity' | 'power-reset';
-interface EvaluateParsedSplitInput {
-    prevTimestampSec: number;
-    currTimestampSec: number;
-    expectedDeltaSec?: number;
-    timestampToleranceSec?: number;
-    prevConfigSignature?: string | null;
-    currConfigSignature?: string | null;
-    powerResetDetected?: boolean;
-}
-/** Build a binary upload file name: yyMMdd_HHmmss_00000.bin */
-declare function buildUploadBinaryFileName(uploadDate: Date, firstPayloadIndex: number): string;
-/**
- * Ensure a nested directory path exists under a root directory handle, creating
- * each level as needed, and return the leaf handle. Browser-only (File System
- * Access API) — the app obtains `root` from `showDirectoryPicker()` when the
- * user selects an output location at transfer start.
- */
-declare function ensureDirectoryPath(root: FileSystemDirectoryHandle, segments: string[]): Promise<FileSystemDirectoryHandle>;
-/** Build parsed CSV file name: yyMMdd_HHmmss_DataSource_00000.csv */
-declare function buildParsedCsvFileName(startDate: Date, dataSource: string, firstPayloadIndex: number): string;
-/** Add duplicate suffix like " (2)" before extension. */
-declare function applyDuplicateSuffix(fileName: string, duplicateIndex: number): string;
-/** Return first non-colliding duplicate name for a target file name. */
-declare function nextAvailableDuplicateFileName(fileName: string, existingNames: Iterable<string>): string;
-/** Parse first payload index (uint16 LE) from a payload byte array. */
-declare function getFirstPayloadIndex(payload: Uint8Array): number;
-/**
- * Evaluate whether parsed CSV output should roll to a new file.
- * Rules mirror ASM-DES08 split conditions.
- */
-declare function evaluateParsedFileSplit(input: EvaluateParsedSplitInput): {
-    shouldSplit: boolean;
-    reasons: ParsedSplitReason[];
-};
 
 /**
  * Classic-Bluetooth (RFCOMM/SPP) Shimmer3 constants.
@@ -9798,8 +12657,49 @@ declare const SMARTDOCK_BASE_CMD: Readonly<{
 declare const SMARTDOCK_DEFAULTS: Readonly<{
     RESPONSE_TIMEOUT_MS: 1000;
     SLOT_CHANGE_TIMEOUT_MS: 10000;
+    /**
+     * Settle after a WITHOUT-SD slot change, before the per-Shimmer UART is
+     * usable (`SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD`, AbstractDock.java:96).
+     *
+     * The unqualified name is kept for compatibility; the qualified aliases
+     * below say which of the Java's three delays this actually is.
+     */
     SLOT_CHANGEOVER_DELAY_MS: 1500;
+    /** The same value, named for what it is. */
+    SLOT_CHANGEOVER_DELAY_WITHOUT_SD_MS: 1500;
+    /**
+     * Settle after a WITH-SD slot change, which has to wait for the host to
+     * mount the card as well as for the dock to re-route
+     * (`SLOT_CHANGEOVER_DELAY_WITH_SD_CARD_WIN`, AbstractDock.java:94).
+     *
+     * More than three times the without-SD delay, and the Java carries the note
+     * "2017-05-17 was 3000" against it — it had to be raised in the field.
+     */
+    SLOT_CHANGEOVER_DELAY_WITH_SD_WIN_MS: 5000;
+    /** As above on macOS/Linux (AbstractDock.java:95, selected by `getSDMountDelay()`). */
+    SLOT_CHANGEOVER_DELAY_WITH_SD_UNIX_MS: 6000;
     CMD_RETRY_ATTEMPTS: 2;
+    /**
+     * Attempts at the FIRST per-Shimmer read after a slot change
+     * (`READ_MAC_RETRY_ATTEMPTS`, AbstractDock.java:92, used by
+     * `readMacId()` at :1151-1165, which throws only on the last attempt).
+     *
+     * The settle delay above is **not** treated as sufficient on its own by the
+     * Java driver: it expects the first read after a re-route to fail sometimes
+     * and retries it. Observed here too — a Base 6 slot answered `BAD_CMD` to a
+     * `READ VER` immediately after a slot change and answered correctly on the
+     * next attempt.
+     */
+    READ_RETRY_ATTEMPTS: 2;
+    /**
+     * Wait between writing a docked Shimmer's configuration and reading it back
+     * (`SHIMMER_CONFIG_WRITE_READ_DELAY`, AbstractDock.java:90, applied at
+     * BasicDock.java:1039 between an InfoMem write and the re-read).
+     *
+     * A read-back issued immediately after a config write is not guaranteed to
+     * see the write.
+     */
+    CONFIG_WRITE_READ_DELAY_MS: 500;
 }>;
 /**
  * Base hardware IDs from the version response's hardware-version field
@@ -10223,7 +13123,11 @@ declare const GSR_RANGE_NAME = "GSR_RANGE";
 interface CalibratedGsr {
     /** The resistor actually in circuit for this sample, 0-3. */
     range: number;
-    /** Skin resistance in kΩ, clamped to what the range can measure. */
+    /**
+     * Skin resistance in kΩ, clamped to what the range can measure. An open
+     * circuit decodes as range 3 at its limit on every range, about 4.5 GΩ before
+     * a fixed range clamps it to the top of its window.
+     */
     resistanceKOhms: number;
     /** Skin conductance in µS. */
     conductanceUSiemens: number;
@@ -10700,7 +13604,8 @@ interface SdLogCalibrationBytes {
     /**
      * Pressure/temperature block — header offset 160, 22 bytes, plus header
      * bytes 222-223 appended (24 bytes total) when the device carries a
-     * BMP280/BMP390 (new-IMU boards and every Shimmer3R).
+     * BMP280/BMP390 (new-IMU boards and every Shimmer3R). A BMP581 has no trim
+     * block and the firmware leaves this region unwritten (0xFF) for one.
      */
     pressure: Uint8Array;
     /** Shimmer3R alternative (high-g) accel block — header offset 256, 21 bytes. */
@@ -10836,11 +13741,12 @@ declare class SdLogFormatError extends Error {
 /** One decoded sample. `values` aligns 1:1 with `SdLogHeader.channels`. */
 interface SdLogRecord {
     /**
-     * Device-clock time in milliseconds:
-     * (initialTimestampTicks + unwrapped ticks - first packet's raw ticks)
-     * / 32768 * 1000, exactly as the Java driver computes the SD calibrated
-     * timestamp (parseTimestampShimmer3 with mFirstTsOffsetFromInitialTsTicks).
-     * On modern firmware this equals the device's full 40-bit clock in ms.
+     * Device-clock time in milliseconds: the record's own 40-bit counter value
+     * / 32768 * 1000. The first packet's full value is rebuilt from the header's
+     * initial timestamp (the RTC at file creation) and the packet's 24-bit raw
+     * timestamp, and later packets advance by their unwrapped ticks — as the
+     * Java driver computes the SD calibrated timestamp (parseTimestampShimmer3
+     * with mFirstTsOffsetFromInitialTsTicks; DEV-1095).
      */
     timestampMs: number;
     /**
@@ -10992,2247 +13898,6 @@ declare function parseSdTrialFolderName(folder: string): {
     trialName: string;
     configTime: string;
 };
-
-/** NUS primary service UUID. */
-declare const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-/** NUS TX characteristic UUID (host writes to this). */
-declare const NUS_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
-/** NUS RX characteristic UUID (host subscribes to notifications from this). */
-declare const NUS_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
-/** Nordic Secure DFU service UUID (buttonless DFU). */
-declare const NORDIC_DFU_SERVICE = "0000fe59-0000-1000-8000-00805f9b34fb";
-/** Nordic buttonless DFU control-point characteristic (without bond sharing). */
-declare const NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS = "8ec90003-f315-4f60-9fb8-838830daea50";
-/** Nordic buttonless DFU control-point characteristic (with bond sharing). */
-declare const NORDIC_DFU_BUTTONLESS_WITH_BONDS = "8ec90004-f315-4f60-9fb8-838830daea50";
-/** Buttonless DFU control-point op-code that reboots the device into the bootloader. */
-declare const NORDIC_DFU_OP_ENTER_BOOTLOADER = 1;
-/** Upper-nibble command classes used in protocol headers. */
-declare const ASM_COMMAND: Readonly<{
-    readonly READ: 16;
-    readonly WRITE: 32;
-    readonly RESPONSE: 48;
-    readonly ACK: 64;
-    readonly NACK_BAD_HEADER_COMMAND: 80;
-    readonly NACK_BAD_HEADER_PROPERTY: 96;
-    readonly NACK_GENERIC: 112;
-    readonly ACK_NEXT_STAGE: 128;
-}>;
-type AsmCommand = (typeof ASM_COMMAND)[keyof typeof ASM_COMMAND];
-/** Lower-nibble property IDs used in protocol headers. */
-declare const ASM_PROPERTY: Readonly<{
-    readonly STATUS1: 1;
-    readonly DATA: 2;
-    readonly PRODUCTION_CONFIGURATION: 3;
-    readonly OPERATIONAL_CONFIGURATION: 4;
-    readonly TIME: 5;
-    readonly DFU_MODE: 6;
-    readonly PENDING_EVENTS: 7;
-    readonly TEST_MODE: 8;
-    readonly DEBUG_COMMAND: 9;
-    readonly STREAM_MODE: 10;
-    readonly DEVICE_DISCONNECT: 11;
-    readonly STATUS2: 12;
-    readonly CALIBRATION: 13;
-}>;
-type AsmProperty = (typeof ASM_PROPERTY)[keyof typeof ASM_PROPERTY];
-/** Stream mode payload values. */
-declare const STREAM_MODE: Readonly<{
-    readonly ENABLE: 1;
-    readonly DISABLE: 2;
-}>;
-/** Test mode IDs documented by Verisense firmware. */
-declare const TEST_MODE_ID: Readonly<{
-    readonly STOP: 0;
-    readonly FLASH_8MB_1: 1;
-    readonly FLASH_8MB_2: 2;
-    readonly FLASH_128MB_512MB: 3;
-    readonly EEPROM: 4;
-    readonly ACCEL1_LIS2DW12: 5;
-    readonly BATTERY_VOLTAGE: 6;
-    readonly USB_POWER: 7;
-    readonly ACCEL2_GYRO_LSM6DS3: 8;
-    readonly PPG_MAX86XXX: 9;
-    readonly BIOZ_MAX30002: 11;
-    readonly ACCEL2_GYRO_LSM6DSV: 12;
-    readonly MAG_LIS2MDL: 13;
-    readonly ALL_TESTS: 255;
-}>;
-type TestModeId = (typeof TEST_MODE_ID)[keyof typeof TEST_MODE_ID];
-/** Debug command IDs documented by Verisense firmware. */
-declare const DEBUG_COMMAND_ID: Readonly<{
-    readonly FLASH_LOOKUP_TABLE_READ: 1;
-    readonly FLASH_LOOKUP_TABLE_ERASE: 2;
-    readonly RWC_SCHEDULER_READ: 3;
-    readonly ERASE_128MB_512MB_FLASH: 4;
-    readonly ERASE_8MB_FLASH_1: 5;
-    readonly ERASE_8MB_FLASH_2: 6;
-    readonly ERASE_OPERATIONAL_CONFIG: 7;
-    readonly ERASE_PRODUCTION_CONFIG: 8;
-    readonly CLEAR_PENDING_EVENTS: 9;
-    readonly ERASE_FLASH_AND_LOOKUP_TABLE: 10;
-    readonly TEST_DATA_TRANSFER_LOOP: 11;
-    readonly LOAD_TEST_LOOKUP_TABLE: 12;
-    readonly LED_TEST: 13;
-    readonly MAX86XXX_LED_TEST: 14;
-    readonly CHECK_PAYLOAD_CRC_ERRORS: 15;
-    readonly READ_EVENT_LOG: 16;
-    readonly POWER_PROFILER_TEST: 17;
-    readonly READ_RECORD_BUFFER_DETAILS: 18;
-    readonly SYSTEM_RESET: 19;
-    readonly IC_POWER_CONSUMPTION_TEST: 20;
-    readonly DELETE_ALL_BONDS: 21;
-    readonly BLE_LINK_PARAMS_READ: 22;
-    readonly BLE_LINK_OPTIMIZE: 23;
-    /** Streamed MAX32674C algorithm-hub firmware (.msbl) upload (factory). The
-     * byte after this id is a HUB_FW_UPLOAD_STAGE sub-stage. */
-    readonly HUB_FW_UPLOAD: 24;
-}>;
-type DebugCommandId = (typeof DEBUG_COMMAND_ID)[keyof typeof DEBUG_COMMAND_ID];
-/**
- * Byte indices into the Verisense operational config blob (`op[OP_IDX.xxx]`).
- * Index 0 is the config version byte (must be 0x5A for a valid config).
- */
-declare const OP_IDX: Readonly<{
-    readonly GEN_CFG_0: 1;
-    readonly GEN_CFG_1: 2;
-    readonly GEN_CFG_2: 3;
-    readonly GEN_CFG_3: 4;
-    readonly ACCEL1_CFG_0: 5;
-    readonly ACCEL1_CFG_1: 6;
-    readonly ACCEL1_CFG_2: 7;
-    readonly ACCEL1_CFG_3: 8;
-    readonly GYRO_ACCEL2_CFG_0: 10;
-    readonly GYRO_ACCEL2_CFG_1: 11;
-    readonly GYRO_ACCEL2_CFG_2: 12;
-    readonly GYRO_ACCEL2_CFG_3: 13;
-    readonly GYRO_ACCEL2_CFG_4: 14;
-    readonly GYRO_ACCEL2_CFG_5: 15;
-    readonly GYRO_ACCEL2_CFG_6: 16;
-    readonly GYRO_ACCEL2_CFG_7: 17;
-    readonly LSM6DSV_CFG_0: 18;
-    readonly LSM6DSV_CFG_1: 19;
-    readonly LSM6DSV_CFG_2: 20;
-    readonly START_TIME: 21;
-    readonly END_TIME: 25;
-    readonly INACTIVE_TIMEOUT: 29;
-    readonly BLE_RETRY_COUNT: 30;
-    readonly BLE_TX_POWER: 31;
-    readonly BLE_DATA_TRANS_WKUP_INT_HRS: 32;
-    readonly BLE_DATA_TRANS_WKUP_TIME: 33;
-    readonly BLE_DATA_TRANS_WKUP_DUR: 35;
-    readonly BLE_DATA_TRANS_RETRY_INT: 36;
-    readonly BLE_STATUS_WKUP_INT_HRS: 38;
-    readonly BLE_STATUS_WKUP_TIME: 39;
-    readonly BLE_STATUS_WKUP_DUR: 41;
-    readonly BLE_STATUS_RETRY_INT: 42;
-    readonly BLE_RTC_SYNC_WKUP_INT_HRS: 44;
-    readonly BLE_RTC_SYNC_WKUP_TIME: 45;
-    readonly BLE_RTC_SYNC_WKUP_DUR: 47;
-    readonly BLE_RTC_SYNC_RETRY_INT: 48;
-    readonly ADC_CHANNEL_SETTINGS_0: 50;
-    readonly ADC_CHANNEL_SETTINGS_1: 51;
-    readonly ADAPTIVE_SCHEDULER_INT: 52;
-    readonly ADAPTIVE_SCHEDULER_FAILCOUNT_MAX: 54;
-    readonly PPG_REC_DUR_SECS_LSB: 55;
-    readonly PPG_REC_DUR_SECS_MSB: 56;
-    readonly PPG_REC_INT_MINS_LSB: 57;
-    readonly PPG_REC_INT_MINS_MSB: 58;
-    readonly PPG_FIFO_CONFIG: 59;
-    readonly PPG_MODE_CONFIG2: 60;
-    readonly PPG_MA_DEFAULT: 61;
-    readonly PPG_MA_MAX_RED_IR: 62;
-    readonly PPG_MA_MAX_GREEN_BLUE: 63;
-    readonly PPG_AGC_TARGET_PERCENT_OF_RANGE: 64;
-    readonly PPG_MA_LED_PILOT: 66;
-    readonly PPG_DAC1_CROSSTALK: 67;
-    readonly PPG_DAC2_CROSSTALK: 68;
-    readonly PPG_DAC3_CROSSTALK: 69;
-    readonly PPG_DAC4_CROSSTALK: 70;
-    readonly PROX_AGC_MODE: 71;
-    readonly OP_CONFIG_VERSION: 9;
-    readonly LIGHT_GAIN_INDEX: 72;
-    readonly LIGHT_EXPOSURE_INDEX: 73;
-    readonly LIGHT_CONFIG: 74;
-    readonly LIGHT_SAMPLE_RATE_INDEX: 75;
-    readonly SKIN_TEMP_CONFIG: 76;
-    readonly SKIN_TEMP_SAMPLE_RATE_INDEX: 77;
-    readonly ALGO_OP_MODE: 78;
-    readonly ALGO_REPORT_MODE_RATE: 79;
-    readonly ALGO_CONTROL: 80;
-    readonly ALGO_INITIAL_HR: 81;
-    readonly LED_AUTO_BRIGHTNESS_CFG: 82;
-    readonly LED_MAX_BRIGHTNESS: 83;
-    readonly LED_LUX_THRESHOLD: 84;
-    readonly PERSON_HEIGHT_CM: 86;
-    readonly PERSON_WEIGHT_KG: 88;
-    readonly PERSON_AGE: 90;
-    readonly PERSON_GENDER: 91;
-}>;
-type OpIdx = keyof typeof OP_IDX;
-/** Minimum firmware version that supports the BLE-link debug commands
- * (read/optimize connection parameters). */
-declare const BLE_LINK_MIN_FW: Readonly<{
-    major: 1;
-    minor: 4;
-    internal: 23;
-}>;
-/** Human-readable labels for Verisense stream-packet sensor IDs. Each ID maps to
- * the device part(s) that produce that stream (some streams interleave several
- * physical sensors, e.g. id 6 = LSM6DSV accel + gyro + mag). */
-declare const VERISENSE_STREAM_SENSOR_LABELS: Readonly<{
-    readonly 1: "ADC (GSR / Battery)";
-    readonly 2: "Accel 1 (LIS2DW12)";
-    readonly 3: "Accel 2 + Gyro (LSM6DS3)";
-    readonly 4: "PPG (MAX86xxx)";
-    readonly 6: "Accel 2 + Gyro + Mag (LSM6DSV + LIS2MDL)";
-    readonly 7: "Ambient Light (VD6283)";
-    readonly 8: "Algo Hub (MAX32674 — HR + raw PPG)";
-    readonly 9: "Skin Temperature (MLX90632)";
-}>;
-
-/**
- * Verisense sensor-calibration TLV codec.
- *
- * Mirrors the firmware `asm_calibration.{c,h}` byte format. A calibration "blob"
- * is a self-describing block of per-sensor calibration that the device persists,
- * exposes over the `CALIBRATION` command, and stamps into every logged payload
- * header via a CRC-16 version tag.
- *
- * Layout (all little-endian):
- *
- *   Global header (12 bytes)
- *     0  u16  totalLen          (= blob.length - 2)
- *     2  u8   calibFormatVersion
- *     3  u8   hwVerMajor
- *     4  u8   hwVerMinor
- *     5  u8   fwVerMajor
- *     6  u8   fwVerMinor
- *     7  u16  fwVerPatch
- *     9  u8   sensorBlockCount
- *    10  u16  reserved
- *
- *   Per-sensor block (12-byte header + payload)
- *     0  u16  sensorId          (calibration-domain id, see {@link CalibSensorId})
- *     2  u8   range/quality     (bits[5:0] full-scale index; bits[7:6] calib quality)
- *     3  u8   dataLen
- *     4  u8[8] ts               (0 = default/seeded; RTC time = real per-unit cal)
- *    12  payload[dataLen]
- *
- *   IMU payload (60 bytes, float32): bias[3] · sens[3] · align[9] (row-major 3x3)
- *
- * Calibration math (ASM-DES04 §8): output = K·R·physical + b, so the host
- * recovers physical = R⁻¹·K⁻¹·(raw − b). K is the diagonal sensitivity, R the
- * rotation into the common ASM axes, b the offset bias.
- */
-/**
- * Blob layout version. v2 is byte-for-byte identical in layout to v1 — the
- * firmware bumped it purely to force already-deployed gen-2 units to re-seed
- * with the corrected LSM6DSV/LIS2MDL alignment (its load path checks neither a
- * CRC nor the FW version, so nothing else would).
- *
- * `parseCalibrationBlob` accepts any version and reports what it read;
- * `serializeCalibrationBlob` preserves `input.formatVersion` when present and
- * only falls back to this constant. That matters when writing to a device: a
- * blob stamped with the wrong version is rejected at the device's next boot and
- * silently replaced by the seeded defaults.
- */
-declare const SC_CALIB_FORMAT_VERSION = 2;
-declare const SC_GLOBAL_HEADER_BYTES = 12;
-declare const SC_DATA_LEN_IMU = 60;
-/**
- * The per-block `range` byte packs the full-scale index in bits [5:0] and a 2-bit
- * calibration-quality indicator in bits [7:6]. Lookups/comparisons must use only
- * the index (`range & SC_CAL_RANGE_MASK`). Quality has no producer yet (always 0),
- * so it is reserved without growing the blob or bumping the format version.
- */
-declare const SC_CAL_RANGE_MASK = 63;
-declare const SC_CAL_QUALITY_SHIFT = 6;
-declare const SC_CAL_QUALITY_MASK = 3;
-/** Calibration-quality indicator (ST MotionAC / Android sensor-accuracy convention). */
-declare const CalibQuality: {
-    readonly UNKNOWN: 0;
-    readonly POOR: 1;
-    readonly OK: 2;
-    readonly GOOD: 3;
-};
-type CalibQuality = (typeof CalibQuality)[keyof typeof CalibQuality];
-/**
- * Calibration-domain sensor IDs. Distinct from the data-stream sensor IDs
- * (1=ADC, 2=LIS2DW12, 3=LSM6DS3, 4=PPG, 6=LSM6DSV, 7=VD6283, 8=MAX32674,
- * 9=MLX90632). These reuse the Shimmer3 `SC_SENSOR_*` values where they exist,
- * so accel/gyro/mag can each carry their own calibration even though one
- * data-stream id (6) covers all three.
- *
- * Data-stream → calibration mapping: 6 → {37, 38, 42}, 2 → {39}, 3 → {40, 41}.
- */
-declare const CalibSensorId: {
-    readonly LSM6DSV_ACCEL: 37;
-    readonly LSM6DSV_GYRO: 38;
-    readonly LIS2DW12_ACCEL: 39;
-    /** 1st-gen LSM6DS3 accel (data-stream id 3). */
-    readonly LSM6DS3_ACCEL: 40;
-    /** 1st-gen LSM6DS3 gyro (data-stream id 3). */
-    readonly LSM6DS3_GYRO: 41;
-    readonly LIS2MDL_MAG: 42;
-};
-type CalibSensorId = (typeof CalibSensorId)[keyof typeof CalibSensorId];
-/** Per-unit IMU calibration: offset bias, diagonal sensitivity, and 3x3 rotation. */
-interface ImuCalibration {
-    /** Offset bias `b`, per axis (sensor LSB). */
-    bias: [number, number, number];
-    /** Diagonal sensitivity `K`, per axis (LSB per physical unit). */
-    sens: [number, number, number];
-    /** Rotation `R`, row-major 3x3 (length 9), mapping sensor axes to ASM axes. */
-    align: number[];
-}
-interface CalibrationBlock {
-    sensorId: number;
-    /** Full-scale index (the low 6 bits of the wire `range` byte). */
-    range: number;
-    /** Calibration quality, bits [7:6] of the wire `range` byte (0 = unknown today). */
-    quality: number;
-    dataLen: number;
-    /** 8-byte calibration timestamp; all-zero means default/seeded. */
-    ts: Uint8Array;
-    isDefault: boolean;
-    payload: Uint8Array;
-    /** Decoded IMU calibration when the block is a 60-byte IMU payload. */
-    imu?: ImuCalibration;
-}
-interface CalibrationSet {
-    formatVersion: number;
-    hwVerMajor: number;
-    hwVerMinor: number;
-    fwVerMajor: number;
-    fwVerMinor: number;
-    fwVerPatch: number;
-    reserved: number;
-    blocks: CalibrationBlock[];
-    /** CRC-16/CCITT-FALSE over the whole blob — equals the payload-header version tag. */
-    crc16: number;
-    /** Find the IMU calibration for a calibration-domain sensor id + range, else null. */
-    getImu(sensorId: number, range: number): ImuCalibration | null;
-}
-/** Parse a calibration blob into a typed, indexable {@link CalibrationSet}. */
-declare function parseCalibrationBlob(blob: Uint8Array): CalibrationSet;
-interface CalibrationBlockInput {
-    sensorId: number;
-    /** Full-scale index (only the low 6 bits are used). */
-    range: number;
-    /** Calibration quality (0-3); defaults to 0 (unknown). Packed into range byte bits [7:6]. */
-    quality?: number;
-    /** 8-byte timestamp; defaults to all-zero (a "default/seeded" marker). */
-    ts?: Uint8Array | null;
-    imu?: ImuCalibration;
-    /** Raw payload override (used when `imu` is not supplied). */
-    payload?: Uint8Array;
-}
-interface CalibrationSetInput {
-    formatVersion?: number;
-    hwVerMajor: number;
-    hwVerMinor: number;
-    fwVerMajor: number;
-    fwVerMinor: number;
-    fwVerPatch: number;
-    reserved?: number;
-    blocks: CalibrationBlockInput[];
-}
-/** Serialize a calibration set into a blob (inverse of {@link parseCalibrationBlob}). */
-declare function serializeCalibrationBlob(input: CalibrationSetInput): Uint8Array;
-/** CRC-16/CCITT-FALSE over a serialized blob — the value stamped into payload headers. */
-declare function calibrationBlobCrc(blob: Uint8Array): number;
-/**
- * Apply IMU calibration to a raw tri-axial sample.
- *
- *   physical = align · (K⁻¹ · (raw − bias))
- *
- * `bias` (b) is subtracted and `sens` (K, diagonal) divided per axis, then the
- * `align` matrix (row-major 3x3) is applied directly to rotate the sensor frame
- * into the common ASM frame. With identity `align` and zero `bias` this reduces
- * to `raw / sens`.
- *
- * Convention note: `align` is the directly-applied sensor-frame → ASM-frame
- * matrix (= R⁻¹ in ASM-DES04 §8's `output = K·R·physical + b` notation). This
- * matches the cloud calibration CSV `rotation_*` columns one-to-one — the CSV
- * stores the same applied matrix, row-major — so the sensor-calibration parser
- * maps blob → CSV with NO transpose. (Confirmed against a LIS2DW12 sample CSV:
- * offset→bias, sensitivity→sens, rotation→align.)
- */
-declare function applyImuCalibration(raw: readonly [number, number, number], cal: ImuCalibration): [number, number, number];
-
-interface VerisenseMessage {
-    header: number;
-    command: AsmCommand;
-    property: AsmProperty;
-    payloadLength: number;
-    payload: Uint8Array;
-}
-/** Build a protocol header byte from command/property nibbles. */
-declare function buildHeader(command: AsmCommand, property: AsmProperty): number;
-/** Decode a protocol header byte into command/property fields. */
-declare function parseHeader(header: number): {
-    command: AsmCommand;
-    property: AsmProperty;
-};
-/** Build a complete protocol message (header + 16-bit LE payload length + payload bytes). */
-declare function buildMessage(command: AsmCommand, property: AsmProperty, payloadBytes?: Uint8Array | number[]): Uint8Array;
-/** Parse a complete protocol message into structured fields. */
-declare function parseMessage(msg: Uint8Array): VerisenseMessage;
-declare function isAckCommand(command: AsmCommand): boolean;
-declare function isNackCommand(command: AsmCommand): boolean;
-/** Convert a pending-events payload (property IDs) into a typed array. */
-declare function parsePendingEvents(payload: Uint8Array): AsmProperty[];
-
-/** Format a single byte as an uppercase `0xNN` string. */
-declare function formatByteAsHex(v: number): string;
-/** Format bytes as `[0xAA, 0xBB, ...]`. */
-declare function formatByteArrayAsHex(bytes: ArrayLike<number> | ArrayBuffer | null | undefined): string;
-/** Parse text containing hex bytes like `0x5A, 00 12` into a Uint8Array. */
-declare function parseHexByteString(text: string): Uint8Array;
-/** A Verisense firmware version triple (major.minor.internal). */
-interface VerisenseFirmwareVersion {
-    major: number;
-    minor: number;
-    internal: number;
-}
-/**
- * Compare two firmware version triples. Returns a negative number if `a < b`,
- * positive if `a > b`, and 0 if equal. Missing or non-numeric components are
- * treated as 0.
- */
-declare function compareVerisenseFirmwareVersion(a: Partial<VerisenseFirmwareVersion> | null | undefined, b: Partial<VerisenseFirmwareVersion> | null | undefined): number;
-/** Format a firmware version triple as `"major.minor.internal"`, or `"unknown"`
- * when the version is null/undefined. */
-declare function formatVerisenseFirmwareVersion(v: Partial<VerisenseFirmwareVersion> | null | undefined): string;
-/** Human-readable label for a Verisense stream-packet sensor ID, with a
- * `"Sensor 0xNN"` hex fallback for unknown IDs. */
-declare function getVerisenseStreamSensorLabel(sensorId: number): string;
-interface PendingEventPropertyLabel {
-    value: number;
-    hex: string;
-    property: string;
-}
-/** Label pending-event property values with both enum name and hex representation. */
-declare function formatPendingEventProperties(pendingProps: ArrayLike<number> | null | undefined): PendingEventPropertyLabel[];
-/**
- * Convert a UTC unix-ms instant to the "local civil" timestamp domain used by
- * the Verisense real-world clock: unix ms with the host's local timezone
- * offset baked in, so that hour-of-day of the raw value equals the wall-clock
- * hour where the base station is.
- *
- * This is the documented time-sync contract ("synchronises the sensor's
- * real-world clock with the Base Station's local time" - Verisense
- * communication protocol) and what the downstream file parser assumes: it
- * evaluates midnight/midday CSV-split boundaries on the raw RWC value in a
- * pinned GMT+0 calendar, and labels CSV timestamp columns
- * "Unix_ms_plus_local_time_zone_offset".
- *
- * Note `getTimezoneOffset()` is evaluated at `utcMillis` itself, so the DST
- * rule in effect at that instant is applied.
- */
-declare function utcToLocalCivilMillis(utcMillis?: number): number;
-/** Current time in the Verisense local-civil RWC domain, in whole unix seconds. */
-declare function localCivilUnixSecondsNow(): number;
-/**
- * Compute CRC-16/CCITT-FALSE over `bytes`.
- *
- * Parameters: poly=0x1021, init=0xFFFF, xorOut=0x0000.
- * Matches the C# `ComputeCRC` implementation used by Verisense firmware.
- */
-declare function crc16_ccitt_false(bytes: Uint8Array): number;
-/**
- * Convert any reasonable representation of an operational config to a
- * `Uint8Array`. Throws if the input type is unrecognised.
- */
-declare function normalizeOperationalConfig(payload: Uint8Array | ArrayBuffer | number[] | {
-    buffer: ArrayBuffer;
-    byteOffset?: number;
-    byteLength?: number;
-} | null | undefined): Uint8Array | null;
-/** Alias for arbitrary protocol byte payload normalization. */
-declare function normalizeBytePayload(payload: Uint8Array | ArrayBuffer | number[] | {
-    buffer: ArrayBuffer;
-    byteOffset?: number;
-    byteLength?: number;
-} | null | undefined): Uint8Array | null;
-/**
- * Derive the 6-digit pairing PIN from a Verisense unique identifier.
- *
- * The PIN is built from digits 2, 4 and 6 (1-based) of the identifier,
- * followed by the decimal value of the final byte padded to 3 digits.
- */
-declare function computeVerisensePairingPin(uniqueId: string): string;
-interface ProductionConfig {
-    hardware: string;
-    firmware: string;
-    asmid: string;
-    configHeader: number;
-    revHwMajor?: number;
-    revHwMinor?: number;
-    revHwInternal?: number;
-    revFwMajor?: number;
-    revFwMinor?: number;
-    revFwInternal?: number;
-}
-interface ProductionConfigBuildOptions {
-    manufacturingOrderNumberHex: string;
-    macIdHex: string;
-    revHwMajor: number;
-    revHwMinor: number;
-    revFwMajor: number;
-    revFwMinor: number;
-    revFwInternal?: number;
-    revHwInternal?: number;
-    passkeyId?: string;
-    passkey?: string;
-    advertisingNamePrefix?: string;
-    dfuEnabled?: boolean;
-}
-interface ProductionConfigFull extends ProductionConfig {
-    manufacturingOrderNumber: string;
-    macId: string;
-    uniqueIdentifier: string;
-    revHwMajor: number;
-    revHwMinor: number;
-    revHwInternal: number;
-    revFwMajor: number;
-    revFwMinor: number;
-    revFwInternal: number;
-    passkeyId: string;
-    passkey: string;
-    advertisingNamePrefix: string;
-    dfuEnabled: boolean;
-}
-interface VerisenseStatusFlags {
-    usbPluggedIn: boolean;
-    recordingPaused: boolean;
-    flashIsFull: boolean;
-    powerIsGood: boolean;
-    adaptiveSchedulerOn: boolean;
-    dfuServiceOn: boolean;
-    firstBoot: boolean;
-    repeatedBatteryMeasurement: boolean;
-}
-interface VerisenseStatusPayload {
-    uniqueIdentifier: string;
-    sourceStatusProperty: 'status1' | 'status2';
-    statusTimestampSeconds: number;
-    batteryMilliVolts: number;
-    batteryPercent: number;
-    lastOkTransferSeconds: number;
-    lastFailTransferSeconds: number;
-    memoryFreeKb: number;
-    memoryCapacityKb: number | null;
-    memoryUsedKb: number | null;
-    /** kB of FULL (ready-to-sync) flash banks. Only populated for payloads >= 57 bytes. */
-    memoryFullBanksKb: number | null;
-    /** kB of 2DEL (partially-deleted) flash banks. Only populated for payloads >= 57 bytes. */
-    memoryTwoDelBanksKb: number | null;
-    /** kB of BAD flash banks. Only populated for payloads >= 57 bytes. */
-    memoryBadBanksKb: number | null;
-    statusFlags: VerisenseStatusFlags | null;
-    batteryFallCounter: number | null;
-    /** Byte 64 bit0 (charger chip present). Null for legacy payloads (<65 bytes). */
-    chargerPresent: boolean | null;
-    /** Byte 64 bits1..3 (BatteryChargerStatus_t). Null for legacy payloads (<65 bytes). */
-    chargerStatusCode: number | null;
-    /** Decoded charger status enum label from chargerStatusCode. */
-    chargerStatusName: 'CHARGER_STATUS_BAD_BATTERY' | 'CHARGER_STATUS_CHARGING' | 'CHARGER_STATUS_CHARGING_COMPLETE' | 'CHARGER_STATUS_POWER_DOWN' | 'CHARGER_STATUS_TRICKLE_CHARGING' | 'CHARGER_STATUS_NOT_READ' | 'CHARGER_STATUS_UNKNOWN' | null;
-    /**
-     * Byte 65 bit0 (second status-flags byte — byte 26's flags are full): the
-     * installed bootloader's DFU mode has the USB CDC transport (settings page
-     * reports bootloader version >= 3), so USB DFU is available on this unit.
-     * Null when the firmware predates the field (payload < 66 bytes) — treat
-     * as unknown, not as unsupported.
-     */
-    usbDfuBootloader: boolean | null;
-}
-interface VerisenseUnixAndHumanTimestamp {
-    unix: number;
-    human: string;
-}
-interface VerisenseStatusPayloadForLog extends VerisenseStatusPayload {
-    statusTimestamp: VerisenseUnixAndHumanTimestamp;
-    lastOkTransfer: VerisenseUnixAndHumanTimestamp;
-    lastFailTransfer: VerisenseUnixAndHumanTimestamp;
-}
-type VerisenseChargerChipFamily = 'LM3658D' | 'LTC4123' | 'XC6803' | 'UNKNOWN';
-/** Infer charger chip family from hardware revision fields in production config. */
-declare function inferVerisenseChargerChipFamily(revHwMajor: number, revHwMinor: number, revHwInternal: number): VerisenseChargerChipFamily;
-/** Return chip-specific charger status text for a parsed 3-bit status code. */
-declare function describeVerisenseChargerStatus(chipFamily: VerisenseChargerChipFamily, statusCode: number): string;
-/** Format charger summary text for UIs, e.g. "XC6803: Charge completed". */
-declare function formatVerisenseChargerStatus(status: Pick<VerisenseStatusPayload, 'chargerPresent' | 'chargerStatusCode' | 'chargerStatusName'>, hw?: {
-    revHwMajor?: number;
-    revHwMinor?: number;
-    revHwInternal?: number;
-}): string;
-interface VerisenseSchedulerDebugPayload {
-    currentTimeUnixSeconds: number;
-    bleControlCounter: 'data-transfer' | 'status1' | 'rtc-sync' | 'status2' | 'never' | 'unknown';
-    pendingDataTransferUnixSeconds: number;
-    pendingStatus1UnixSeconds: number;
-    pendingRtcSyncUnixSeconds: number;
-    pendingRetryUnixSeconds: number;
-    retryCount: number;
-    retryOperation: 'ble-off' | 'ble-on' | 'unknown';
-    adaptiveScheduler?: {
-        nextUnixSeconds: number;
-        enabled: boolean;
-        syncFailCounter: number;
-    };
-    ltfRetry?: {
-        nextUnixSeconds: number;
-        currentOperation: 'flash-write-retry-inactive' | 'short-flash-write-retry' | 'attempt-flash-write' | 'long-flash-write-retry' | 'sensor-paused-until-usb-plug-in' | 'unknown';
-        failCounterShort: number;
-        failCounterLong: number;
-    };
-    pendingStatus2UnixSeconds?: number;
-    ppgMeasurementUnixSeconds?: number;
-    stepCounterResetUnixSeconds?: number;
-    sensorInactivityUnixSeconds?: number;
-}
-interface VerisenseSchedulerDebugPayloadForLog extends VerisenseSchedulerDebugPayload {
-    currentTime: VerisenseUnixAndHumanTimestamp;
-    pendingDataTransfer: VerisenseUnixAndHumanTimestamp;
-    pendingStatus1: VerisenseUnixAndHumanTimestamp;
-    pendingRtcSync: VerisenseUnixAndHumanTimestamp;
-    pendingRetry: VerisenseUnixAndHumanTimestamp;
-    pendingStatus2?: VerisenseUnixAndHumanTimestamp;
-    ppgMeasurement?: VerisenseUnixAndHumanTimestamp;
-    stepCounterReset?: VerisenseUnixAndHumanTimestamp;
-    sensorInactivity?: VerisenseUnixAndHumanTimestamp;
-    adaptiveScheduler?: VerisenseSchedulerDebugPayload['adaptiveScheduler'] & {
-        nextTime: VerisenseUnixAndHumanTimestamp;
-    };
-    ltfRetry?: VerisenseSchedulerDebugPayload['ltfRetry'] & {
-        nextTime: VerisenseUnixAndHumanTimestamp;
-    };
-}
-interface VerisenseBleLinkDebugPayload {
-    attMtu: number;
-    maxDataLength: number;
-    connectionIntervalUnits: number;
-    connectionIntervalMs: number;
-    txPhy: number;
-    rxPhy: number;
-    optimizationResult: number;
-    isConnected: boolean;
-}
-interface VerisenseEventLogEntry {
-    index: number;
-    eventId: number;
-    eventName: string;
-    timestampUnixSeconds: number | null;
-    batteryMilliVolts: number | null;
-}
-/** Upper bound for a plausible device timestamp (2100-01-01 UTC in unix
- * seconds). Values beyond this are uninitialised/garbage bytes, not dates. */
-declare const VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS = 4102444800;
-/**
- * Format a device-RWC timestamp (unix seconds) as raw + human-readable datetime.
- *
- * The device RWC lives in the "local civil" domain (unix seconds with the
- * base station's timezone offset already baked in - see
- * {@link utcToLocalCivilMillis}), so the value is rendered VERBATIM via the
- * Date UTC accessors: the wall-clock time shown is exactly what the device's
- * clock reads. Rendering with the local-time accessors would apply the
- * browser's timezone offset a second time.
- */
-declare function formatVerisenseUnixAndHuman(unixSeconds: number): VerisenseUnixAndHumanTimestamp;
-/** Convert parsed status payload into an object with human-readable timestamps for logs. */
-declare function formatStatusPayloadForLog(status: VerisenseStatusPayload): VerisenseStatusPayloadForLog;
-/** Convert parsed scheduler payload into an object with human-readable timestamps for logs. */
-declare function formatSchedulerPayloadForLog(parsed: VerisenseSchedulerDebugPayload): VerisenseSchedulerDebugPayloadForLog;
-interface VerisenseRecordBufferDetails {
-    bufferIndex: number;
-    bufferState: number;
-    packagedPayloadIndex: number;
-    currentByteIndexForSensorData: number;
-    usedBufferLength: number;
-    fifoTicks: number;
-    dataTimestampRwcMinutes: number;
-    dataTimestampRwcTicks: number;
-    temperatureData: number;
-    dataTimestampUcClockMinutes: number | null;
-    dataTimestampUcClockTicks: number | null;
-}
-interface VerisenseLookupTableEntry {
-    bankIndex: number;
-    statusCode: number;
-    statusName: 'Full' | '2Del' | 'Emty' | 'Bad' | 'NUse' | 'Zero' | 'Unknown';
-    pendingEepromWrite: boolean;
-    payloadIndex: number;
-}
-interface VerisenseLookupTablePayload {
-    head: number | null;
-    tail: number | null;
-    entries: VerisenseLookupTableEntry[];
-}
-/** Convert unix seconds into Verisense 7-byte RTC payload (4-byte minutes + 3-byte ticks). */
-declare function unixSecondsToAsmRtcBytes(unixSeconds: number): Uint8Array;
-/** Convert Verisense 7-byte RTC payload into unix seconds. */
-declare function asmRtcBytesToUnixSeconds(rtc7: Uint8Array): number;
-/** Convert Verisense 8-byte minute counter payload into unix seconds. */
-declare function asmRtcMinutesBytesToUnixSeconds(minutes8: Uint8Array): number;
-/**
- * Build a production configuration payload (56 bytes) from structured options.
- * This matches the Python tooling layout used by ASM_BLE.py / ASM_Device.py.
- */
-declare function buildProductionConfigPayload(opts: ProductionConfigBuildOptions): Uint8Array;
-/** Parse production configuration with optional passkey/name/flag fields. */
-declare function parseProductionConfigPayloadFull(response: Uint8Array): ProductionConfigFull;
-/**
- * Parse STATUS1/STATUS2 payload into a typed object.
- *
- * This ports the core byte parsing from ASM_Device.parse_status while keeping
- * the output concise and UI-friendly.
- */
-declare function parseStatusPayload(response: Uint8Array, sourceStatusProperty?: 'status1' | 'status2'): VerisenseStatusPayload;
-/** Parse scheduler debug response payload from DEBUG_COMMAND_ID.RWC_SCHEDULER_READ. */
-declare function parseSchedulerDebugPayload(payload: Uint8Array): VerisenseSchedulerDebugPayload;
-/** Decoded view of the BLE-link `optimizationResult` byte returned by the
- * optimize debug command: bit 7 = device reports "not connected" (the other
- * bits are then meaningless), bit 0 = a PHY change was requested, bit 1 = a
- * connection-interval change was requested, bit 2 = a data-length change was
- * requested. */
-interface VerisenseBleOptimizationResult {
-    notConnected: boolean;
-    phyRequested: boolean;
-    connIntervalRequested: boolean;
-    dataLengthRequested: boolean;
-    resultMask: number;
-}
-/** Decode the `optimizationResult` byte from {@link parseBleLinkDebugPayload}
- * (see {@link VerisenseBleOptimizationResult} for the bit meanings). */
-declare function decodeVerisenseBleOptimizationResult(resultByte: number): VerisenseBleOptimizationResult;
-/** Parse debug payload from BLE link read/optimize commands. */
-declare function parseBleLinkDebugPayload(payload: Uint8Array): VerisenseBleLinkDebugPayload;
-/** Parse debug payload listing bank indexes with bad CRC (2-byte LE entries). */
-declare function parsePayloadCrcErrorBankIndexes(payload: Uint8Array): number[];
-/** Parse 8-byte debug event-log entries. */
-declare function parseEventLogPayload(payload: Uint8Array): VerisenseEventLogEntry[];
-/** Parse record-buffer details payload (26-byte current layout, 19-byte legacy layout). */
-declare function parseRecordBufferDetailsPayload(payload: Uint8Array): VerisenseRecordBufferDetails[];
-/**
- * Infer the lookup-table bank count from a raw debug payload length. The payload
- * is 3 bytes per bank, optionally prefixed with a 4-byte head/tail block.
- * Returns 0 if the length matches neither layout.
- */
-declare function inferVerisenseLookupBankCount(payloadLen: number): number;
-/**
- * Parse lookup-table debug payload entries (3 bytes per bank), with optional
- * 4-byte tail/head prefix present in older firmware debug responses. When
- * `totalBanks` is omitted it is inferred from the payload length via
- * {@link inferVerisenseLookupBankCount}.
- */
-declare function parseLookupTablePayload(payload: Uint8Array, totalBanks?: number): VerisenseLookupTablePayload;
-/**
- * Parse the production config response payload into a structured object.
- */
-declare function parseProductionConfigPayload(response: Uint8Array): ProductionConfig;
-/**
- * Firmware default passkeys by passkey ID: a production config programmed
- * with passkey ID "01" pairs with the fixed PIN "123456". Other IDs have no
- * fixed default (ID "00" uses the per-device derived PIN — see
- * {@link computeVerisensePairingPin}).
- */
-declare const VERISENSE_DEFAULT_PASSKEY_BY_ID: Readonly<Record<string, string>>;
-/** The fixed passkey for a passkey ID, or undefined when the ID has none
- * (leave the passkey bytes unset in the production config). */
-declare function defaultVerisensePasskeyForId(passkeyId: string | null | undefined): string | undefined;
-/** Component parts of a Verisense advertised BLE name. */
-interface VerisenseAdvertisedNameParts {
-    /** Name prefix from the production config (normally "Verisense"). */
-    prefix: string;
-    /** 2-char passkey ID from the production config. */
-    passkeyId: string;
-    /** 12-hex unique identifier (8-hex manufacturing order + 4-hex MAC ID). */
-    uniqueId: string;
-}
-/**
- * Build the name a Verisense sensor advertises over BLE:
- * `<prefix>-<passkeyId>-<uniqueId>` (e.g. "Verisense-01-25112101B10F").
- * Returns null when any part is missing — matches how apps derive the name
- * from a parsed production config that may be blank/erased.
- */
-declare function buildVerisenseAdvertisedName(parts: Partial<VerisenseAdvertisedNameParts>): string | null;
-/**
- * Split a Verisense advertised name back into its parts. The unique ID is the
- * final `-`-separated token; the passkey ID the token before it; anything
- * earlier (which may itself contain `-`) is the prefix. Returns null when the
- * name does not have at least three tokens.
- */
-declare function parseVerisenseAdvertisedName(name: string | null | undefined): VerisenseAdvertisedNameParts | null;
-/**
- * The 4-hex MAC ID from a Verisense advertised name (the advertised name ends
- * with the unique ID = manufacturing order + MAC; its last 4 hex chars are
- * the MAC ID). Returns null when the tail is not valid hex.
- */
-declare function deriveVerisenseMacIdFromName(name: string | null | undefined): string | null;
-/**
- * Short device tag for file names (e.g. "…-B10F-…"): the last 4 hex chars of
- * a device unique ID or advertised name. Returns "" when unknown so callers
- * can omit it cleanly.
- */
-declare function verisenseDeviceFileTag(idOrName: string | null | undefined): string;
-
-type VerisenseHardwareFriendlyName = 'IMU' | 'GSR+' | 'SDK' | 'Pulse+';
-interface VerisenseHardwareCapabilities {
-    readonly secondGeneration: boolean;
-    readonly supportsMagnetometer: boolean;
-}
-interface VerisenseHardwareRevision {
-    readonly major: number;
-    readonly minor: number;
-    readonly internal: number;
-}
-interface VerisenseHardwareRevisionSource {
-    readonly revHwMajor?: number | null;
-    readonly revHwMinor?: number | null;
-    readonly revHwInternal?: number | null;
-}
-declare const VERISENSE_HW_MAJOR_FRIENDLY_NAMES: Readonly<Record<number, VerisenseHardwareFriendlyName>>;
-declare function getVerisenseHardwareFriendlyName(revHwMajor: number): VerisenseHardwareFriendlyName | null;
-/**
- * Second-generation Verisense hardware is currently defined as:
- * - SR61.5+
- * - SR68.9+
- * - Any future major revision above SR68
- */
-declare function isVerisenseSecondGenerationHardware(revHwMajor: number, revHwMinor: number): boolean;
-declare function getVerisenseHardwareCapabilities(revHwMajor: number, revHwMinor: number): VerisenseHardwareCapabilities;
-/**
- * GSR-capable hardware. Mirrors the firmware's authoritative
- * `ShimBrd_isGsrSupportedForHwVersion` (shimmer_boards.c):
- * - SR62 (any revision)
- * - SR61 minor >= 5
- * - SR68 minor >= 5
- *
- * Deliberately NOT {@link isVerisenseSecondGenerationHardware}: that predicate
- * requires SR68 >= 9, but GSR arrived on the SR68 at minor revision 5.
- */
-declare function isVerisenseGsrSupportedHardware(revHwMajor: number, revHwMinor: number): boolean;
-/**
- * Hardware models with a permanently-attached rechargeable LiPo battery.
- * Mirrors the firmware's authoritative `ShimBrd_isLipoPresentForHwVersion`
- * (shimmer_boards.c):
- * - SR62 (any revision)
- * - SR61 minor >= 5
- * - SR68 minor >= 9
- *
- * On these boards the operational-config battery-type bit (GEN_CFG_2 bit 0,
- * Zinc-Air/NiMH) has no effect: the firmware hard-overrides the battery type
- * to LiPo regardless of the stored bit (`setBattType`, hal_asm_battery.c).
- * Config editors should therefore disable the Battery Type field on these
- * models rather than offer a choice that does nothing (DEV-809).
- */
-declare function isVerisenseLipoBatteryHardware(revHwMajor: number, revHwMinor: number): boolean;
-/**
- * Which physical sensor blocks a Verisense board carries. Each flag lines up
- * with an operational-config field group (see
- * `getVerisenseSupportedOperationalFieldGroupIds`), so callers can decide which
- * config groups are meaningful for the connected hardware.
- *
- * Derived from the firmware Model IC matrix
- * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
- */
-interface VerisenseHardwareSensorSupport {
-    /** 1st-gen low-power accel, LIS2DW12 (`accel1` group). */
-    readonly accel1: boolean;
-    /** 1st-gen gyro + accel2, LSM6DS3 (`gyro_accel2` group). */
-    readonly gyroAccel2: boolean;
-    /** 2nd-gen IMU + magnetometer, LSM6DSV + LIS2MDL (`lsm6dsv` group). */
-    readonly imuGen2: boolean;
-    /** Galvanic skin response front-end (`adc_gsr` group). */
-    readonly gsr: boolean;
-    /** Photoplethysmography front-end (`ppg` group). */
-    readonly ppg: boolean;
-    /** Ambient light sensor, VD6283 (`light` group). */
-    readonly ambientLight: boolean;
-    /** Skin temperature sensor, MLX90632 (`skin_temp` group). */
-    readonly skinTemperature: boolean;
-    /** Algorithm hub, MAX32674 (`algo` group). */
-    readonly algorithmHub: boolean;
-    /** 2xRGB status LEDs with auto-brightness (`led` group). */
-    readonly ledAutoBrightness: boolean;
-}
-/**
- * Resolves which sensor blocks a given Verisense hardware revision carries,
- * derived from the firmware Model IC matrix
- * (verisense-firmware/docs/VERISENSE_MODEL_IC_MATRIX.md).
- *
- * Unknown / development hardware (e.g. SR64, or any unrecognised major
- * revision) reports every block as present so consumers never hide a setting
- * they cannot confidently rule out.
- */
-declare function getVerisenseHardwareSensorSupport(revHwMajor: number, revHwMinor: number): VerisenseHardwareSensorSupport;
-declare function getVerisenseHardwareRevision(source: VerisenseHardwareRevisionSource | null | undefined): VerisenseHardwareRevision | null;
-declare function supportsVerisenseMagnetometer(source: VerisenseHardwareRevisionSource | null | undefined): boolean;
-declare function formatVerisenseHardwareRevision(revHwMajor: number, revHwMinor: number, revHwInternal?: number, opts?: {
-    prefix?: string;
-    includeFriendlyName?: boolean;
-}): string;
-/**
- * Battery voltage scaling for streamed ADC battery samples.
- * Status responses already contain firmware-scaled battery values and should not use this helper.
- */
-declare function getVerisenseStreamingBatteryVoltageMultiplier(revHwMajor: number, revHwMinor: number): number;
-
-type VerisenseOperationalFieldKind = 'bit' | 'u8' | 'u16' | 'u32' | 'inactiveResume' | 'inactiveMinutes';
-type VerisenseOperationalFieldOption = readonly [number, string];
-interface VerisenseOperationalFieldDefinition {
-    readonly key: string;
-    readonly label: string;
-    readonly desc: string;
-    readonly kind: VerisenseOperationalFieldKind;
-    readonly index: number;
-    readonly shift?: number;
-    readonly width?: number;
-    readonly min?: number;
-    readonly max?: number;
-    readonly options?: readonly VerisenseOperationalFieldOption[];
-}
-declare const VERISENSE_OPERATIONAL_FIELD_SCHEMA: ({
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 1;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 2;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 3;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 4;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 5;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 6;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 7;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 8;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 8;
-    shift: number;
-    width: number;
-    min: number;
-    max: number;
-    options?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 11;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 11;
-    shift: number;
-    width: number;
-    min: number;
-    max: number;
-    options?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 12;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 13;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 14;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 15;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 16;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 17;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 17;
-    shift: number;
-    width: number;
-    min: number;
-    max: number;
-    options?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 18;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 19;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 20;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 29;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 31;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 50;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 51;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 59;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 60;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: number;
-    min: number;
-    max: number;
-    shift?: undefined;
-    width?: undefined;
-    options?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 71;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 72;
-    min: number;
-    max: number;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 73;
-    min: number;
-    max: number;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 74;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 75;
-    min: number;
-    max: number;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 76;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 78;
-    min: number;
-    max: number;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 79;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 79;
-    shift: number;
-    width: number;
-    options?: undefined;
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 80;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 82;
-    shift: number;
-    width: number;
-    options: (string | number)[][];
-    min?: undefined;
-    max?: undefined;
-} | {
-    key: string;
-    label: string;
-    desc: string;
-    kind: string;
-    index: 91;
-    min: number;
-    max: number;
-    options: (string | number)[][];
-    shift?: undefined;
-    width?: undefined;
-})[];
-declare const VERISENSE_OP_CONFIG_BYTE_SIZE = 92;
-type VerisenseOperationalField = VerisenseOperationalFieldDefinition;
-declare function createBlankVerisenseOperationalConfig(byteSize?: number): Uint8Array;
-declare function readVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField): number;
-declare function writeVerisenseOperationalFieldValue(op: Uint8Array, field: VerisenseOperationalField, rawValue: unknown): void;
-declare function setVerisenseOperationalBitRange(op: Uint8Array, index: number, shift: number, width: number, rawValue: unknown): void;
-/**
- * Enforce the USB/Bluetooth comms-channel interlock on an operational-config
- * buffer.
- *
- * A Verisense must never be configured with BOTH Bluetooth and USB disabled, or
- * it becomes unreachable for reconfiguration (the radio is the only wireless way
- * back in, and disabling USB removes the wired fallback). If a config has both
- * `BLUETOOTH_EN` and `USB_EN` cleared, this forces BOTH back on.
- *
- * This mirrors the firmware safeguard (`enforceCommsChannelInterlock` in
- * `ASM_Production/main.c`, applied on config write and parse). Enforcing it here
- * in the SDK means any consuming application is protected — a device can't be
- * stranded by a third-party tool writing 0/0.
- *
- * Mutates `op` in place. Returns `true` if a correction was applied.
- */
-declare function enforceVerisenseCommsChannelInterlock(op: Uint8Array): boolean;
-interface VerisenseOperationalSensorEnableField {
-    readonly key: string;
-    readonly index: number;
-    readonly shift: number;
-}
-declare const VERISENSE_SENSOR_ENABLE_FIELDS: readonly VerisenseOperationalSensorEnableField[];
-interface VerisenseOperationalFieldSubgroupDefinition {
-    readonly id: string;
-    readonly title: string;
-    readonly keys: readonly string[];
-}
-interface VerisenseOperationalFieldGroupDefinition {
-    readonly id: string;
-    readonly title: string;
-    readonly openByDefault: boolean;
-    readonly keys: readonly string[];
-    /**
-     * Optional presentational partition of {@link keys} into labelled subpanels
-     * rendered inside the group. Purely for layout: group membership, hardware
-     * support detection and field resolution all continue to use {@link keys}.
-     * Subgroups need not be exhaustive — any key in {@link keys} not covered by a
-     * subgroup is rendered above the subpanels, so nothing is ever hidden.
-     */
-    readonly subgroups?: readonly VerisenseOperationalFieldSubgroupDefinition[];
-}
-declare const VERISENSE_OPERATIONAL_FIELD_GROUPS: readonly VerisenseOperationalFieldGroupDefinition[];
-declare const VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID = "gen";
-/**
- * Maps each hardware-gated operational-config group id to the sensor block that
- * gates it (see {@link VerisenseHardwareSensorSupport}). Group ids absent from
- * this map (e.g. `gen`, `ble_wake`) configure behaviour that applies to
- * every board and are always considered supported.
- */
-declare const VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR: Readonly<Record<string, keyof VerisenseHardwareSensorSupport>>;
-/**
- * Returns the set of operational-config group ids (from
- * {@link VERISENSE_OPERATIONAL_FIELD_GROUPS}) whose underlying sensor is present
- * on the given hardware revision. A group is supported when it is not gated by a
- * sensor block, or when its gating sensor is present.
- *
- * Returns `null` when the hardware revision is unknown so callers can fall back
- * to showing every group.
- */
-declare function getVerisenseSupportedOperationalFieldGroupIds(source: VerisenseHardwareRevisionSource | null | undefined): ReadonlySet<string> | null;
-/** LIGHT_CONFIG bit 1 is the VD6283 dark-channel select: when set, the shared
- * visible/clear slot carries the dark (covered-photodiode) baseline instead of
- * the visible reading. Returns false for empty/nullish config. */
-declare function isVerisenseLightDarkChannelEnabled(op: Uint8Array | null | undefined): boolean;
-/**
- * Pad an operational config authored at a legacy/shorter length onto a blank
- * full-size (v9, {@link VERISENSE_OP_CONFIG_BYTE_SIZE}-byte) image so the
- * working config is always canonical size — otherwise trailing v9 fields
- * (e.g. the person-parameter bytes) would be absent. Configs already at or
- * beyond full size are returned as-is.
- */
-declare function padVerisenseOperationalConfig(bytes: Uint8Array | ArrayLike<number>): Uint8Array;
-/** Which IMU generation an op-config field key targets: 'ds3' = first-gen
- * LSM6DS3, 'dsv' = second-gen LSM6DSV (+LIS2MDL mag). */
-type VerisenseImuGeneration = 'ds3' | 'dsv';
-interface VerisenseSensorRateDefaultField {
-    /** Field key in {@link VERISENSE_OPERATIONAL_FIELD_SCHEMA}, when the field
-     * is the same on both IMU generations. */
-    readonly key?: string;
-    /** Generation-specific field keys (accel2/gyro ODR live in different
-     * fields on LSM6DS3 vs LSM6DSV configs). */
-    readonly keyByGen?: Readonly<Record<VerisenseImuGeneration, string>>;
-    /** Default rate/mode code to seed when the sensor is enabled. */
-    readonly on: number;
-    /** Power-down code to write when every enable in the group is off. */
-    readonly off: number;
-}
-interface VerisenseSensorRateDefaultGroup {
-    /** Sensor-enable field keys (see {@link VERISENSE_SENSOR_ENABLE_FIELDS})
-     * that share the rate/mode field(s) below. */
-    readonly enableKeys: readonly string[];
-    readonly fields: readonly VerisenseSensorRateDefaultField[];
-}
-/**
- * Firmware default rate/mode codes per sensor group, for config editors that
- * auto-seed a rate when a sensor is first enabled and power it down when all
- * of its enables are cleared. Editors should only seed the `on` default when
- * the field currently holds the `off` (power-down) code, so a user-chosen
- * rate is never clobbered. Sensors whose rate field has no power-down value
- * (magnetometer LIS2MDL_ODR, PPG_SR) are omitted — their enable bit / channel
- * toggles are the on/off control. Default ODR codes mirror the standard
- * customer template (Accel1 = 50 Hz, ADC = 128 Hz).
- */
-declare const VERISENSE_SENSOR_RATE_DEFAULT_GROUPS: readonly VerisenseSensorRateDefaultGroup[];
-/** Resolve a rate-default field to its concrete schema key for the given IMU
- * generation, or null when the field has no key for that generation. */
-declare function resolveVerisenseSensorRateFieldKey(field: VerisenseSensorRateDefaultField, generation: VerisenseImuGeneration): string | null;
-/** One of the three firmware BLE wake/sync schedules and its four op-config
- * field keys (see the BLE Wake Schedule field group). */
-interface VerisenseBleSyncSchedule {
-    readonly id: 'data' | 'status' | 'rtcSync';
-    /** Field-group subgroup id used by the operational field schema. */
-    readonly subgroupId: string;
-    readonly intervalKey: string;
-    readonly timeKey: string;
-    readonly durKey: string;
-    readonly retryKey: string;
-}
-/**
- * The three firmware sync schedules (data transfer, status, RTC sync), each
- * with wake-interval-hours / wake-time / active-duration / retry-interval
- * fields. Interval semantics (from firmware `hal_rtc.c`): 0 = off, 24 = once
- * daily at the wake time, 1-23 = every N hours. Wake time is
- * minutes-since-midnight (device local time), duration is minutes 0-255,
- * retry interval is minutes 0-1439. The number of connection attempts per
- * window is the separate global `BLE_CONNECTION_TRIES_PER_DAY` field.
- */
-declare const VERISENSE_BLE_SYNC_SCHEDULES: readonly VerisenseBleSyncSchedule[];
-/** Value ranges for the BLE sync-schedule fields (clamp editor input to
- * these before writing). */
-declare const VERISENSE_BLE_SCHEDULE_RANGES: Readonly<{
-    intervalHours: Readonly<{
-        min: 0;
-        max: 24;
-    }>;
-    timeMins: Readonly<{
-        min: 0;
-        max: 1439;
-    }>;
-    durMin: Readonly<{
-        min: 0;
-        max: 255;
-    }>;
-    retryIntMin: Readonly<{
-        min: 0;
-        max: 1439;
-    }>;
-}>;
-/**
- * Canonical schedule defaults: 01:00 daily, 10-minute window, 15-minute
- * retry, 5 connection attempts per wake. Also the "reset" values applied
- * when the pending-events scheduler is disabled, so a disabled config lands
- * in a clean known state.
- */
-declare const VERISENSE_BLE_SCHEDULE_DEFAULTS: Readonly<{
-    intervalHours: 24;
-    timeMins: 60;
-    durMin: 10;
-    retryIntMin: 15;
-    connectionTries: 5;
-}>;
-/** Format minutes-since-midnight as `"HH:MM"`, or null when out of range.
- * Fractional input is rounded to the nearest whole minute first, so the
- * minutes component always stays in 0–59. */
-declare function minutesSinceMidnightToHHMM(mins: number | null | undefined): string | null;
-/** Parse `"HH:MM"` (or `"H:MM"`) into minutes-since-midnight, or null when
- * malformed / out of range. */
-declare function hhmmToMinutesSinceMidnight(text: string | null | undefined): number | null;
-/** Boolean sensor enables used to predict which stream sensor IDs a config
- * will produce (see {@link expectedVerisenseStreamSensorIds}). */
-interface VerisenseStreamSensorEnables {
-    gsr?: boolean;
-    vbatt?: boolean;
-    vprog?: boolean;
-    accel1?: boolean;
-    accel2?: boolean;
-    gyro?: boolean;
-    mag?: boolean;
-    ppg?: boolean;
-    ambientLight?: boolean;
-    skinTemp?: boolean;
-    algoHub?: boolean;
-}
-/**
- * The stream-packet sensor IDs a device will emit for a given set of sensor
- * enables (see `VERISENSE_STREAM_SENSOR_LABELS` for the ID meanings). The
- * IMU block splits by hardware generation: first-gen streams accel2+gyro as
- * ID 3 (LSM6DS3); second-gen streams accel2+gyro+mag as ID 6 (LSM6DSV +
- * LIS2MDL). Any enabled PPG channel produces the single PPG stream (ID 4).
- */
-declare function expectedVerisenseStreamSensorIds(enables: VerisenseStreamSensorEnables, opts: {
-    secondGeneration: boolean;
-}): Set<number>;
-/** {@link expectedVerisenseStreamSensorIds} computed straight from op-config
- * bytes via the sensor-enable bit schema. */
-declare function expectedVerisenseStreamSensorIdsFromConfig(op: Uint8Array | null | undefined, opts: {
-    secondGeneration: boolean;
-}): Set<number>;
-
-/**
- * Abstract base class for all Verisense sensor decoders.
- *
- * Provides:
- * - Timestamp unwrapping (handles the 1-minute rollover at 32768 ticks/s).
- * - System-time offset tracking for plotting calibrated wall-clock timestamps.
- * - Per-sample time extrapolation based on sampling rate and last-sample tick.
- */
-declare abstract class SensorBase {
-    /** Verisense clock frequency in ticks per second. */
-    static readonly CLOCK_FREQ = 32768;
-    /** 1-minute rollover at 32768 ticks/s (matches C# Sensor.cs). */
-    static readonly TICKS_MAX_VALUE: number;
-    protected lastTicksUnwrapped: number;
-    protected cycle: number;
-    /** (system time) − (shimmer time) at first sample, in milliseconds. */
-    systemOffsetFirstTime: number | null;
-    /** Sampling rate in Hz (used for per-sample time extrapolation). */
-    samplingRateHz: number | null;
-    /** Whether this sensor is enabled in the operational config. */
-    enabled: boolean;
-    /**
-     * Per-device calibration read from the sensor, or null when none is available
-     * (decoders then fall back to nominal full-scale/datasheet scaling). Set via
-     * {@link applyCalibration}; subclasses read it in their calibrate routines.
-     */
-    protected calibration: CalibrationSet | null;
-    /** Supply (or clear) the device calibration set used by this decoder. */
-    applyCalibration(set: CalibrationSet | null): void;
-    /** Reset all timestamp state (call on (re)connect or when streaming restarts). */
-    resetTimestamps(): void;
-    /**
-     * Unwrap a rolling 24-bit tick counter to a monotonically increasing value.
-     */
-    unwrapTicks(ticks: number): number;
-    /** Convert unwrapped ticks to milliseconds. */
-    ticksToMillis(unwrappedTicks: number): number;
-    /**
-     * Compute the calibrated shimmer timestamp for the *last* sample in a burst,
-     * and store the first-seen system-offset for later plotting.
-     *
-     * @param lastSampleTicksU24  24-bit tick counter from the packet header.
-     * @param systemMillis        `Date.now()` at the time of packet receipt.
-     */
-    getTimestampUnwrappedMillis(lastSampleTicksU24: number, systemMillis: number): {
-        shimmerMillis: number;
-        systemOffsetFirstTime: number;
-    };
-    /**
-     * Extrapolate the timestamp for sample `i` of `numSamples` in a burst,
-     * given the timestamp of the *last* sample and the sampling rate.
-     *
-     * @returns Object with `tsMillis`, `systemTsMillis`, and `systemTsPlotMillis`.
-     */
-    extrapolateSampleTimes(opts: {
-        numSamples: number;
-        i: number;
-        samplingRateHz?: number | null;
-        tsLastSampleMillis: number;
-        systemTsLastSampleMillis: number;
-        systemOffsetFirstTime?: number | null;
-    }): {
-        tsMillis: number;
-        systemTsMillis: number;
-        systemTsPlotMillis: number;
-    };
-    /**
-     * Compute per-sample timestamps for a whole decoded burst.
-     *
-     * The base implementation treats every decoded sample as one evenly-spaced
-     * time step at `samplingRateHz` (correct when each decoded sample is a single
-     * combined time step). Sensors whose decoded array *interleaves* multiple
-     * streams at different cadences (e.g. the LSM6DSV tagged FIFO, which mixes
-     * accel / gyro / mag entries) override this to timestamp each stream on its
-     * own rate — otherwise the shared rate spreads each stream's samples too far
-     * back and consecutive blocks overlap on the time axis.
-     */
-    computeSampleTimestamps(decodedSamples: unknown[], block: {
-        tsLastSampleMillis: number;
-        systemTsLastSampleMillis: number;
-        systemOffsetFirstTime?: number | null;
-    }): Array<{
-        tsMillis: number;
-        systemTsMillis: number;
-        systemTsPlotMillis: number;
-    }>;
-    /**
-     * Turn a decoded + timestamped burst into one or more stream contributions
-     * for live throughput / packet-loss tracking. The default treats the sensor
-     * as a single stream; sensors whose decoded array interleaves several
-     * sub-streams at different cadences (e.g. the LSM6DSV tagged FIFO) override
-     * this to report one contribution per sub-stream so loss is tracked
-     * independently.
-     */
-    getStreamContributions(samplesWithTime: Array<{
-        timestamps?: {
-            tsMillis: number;
-        };
-    }>, sensorId: number): StreamContribution[];
-    /** Parse a raw sensor payload byte array into decoded samples. */
-    abstract parsePayload(sensorPayloadBytes: Uint8Array): unknown[];
-    /** Apply the Verisense operational config blob to update decoder settings. */
-    abstract applyOperationalConfig(op: Uint8Array): void;
-}
-
-interface ADCGSRSample {
-    raw: number;
-    adc12: number;
-    range: number;
-    volts: number;
-    kOhms: number;
-    uS: number;
-    connectivity: 'Connected' | 'Disconnected';
-}
-interface ADCBatterySample {
-    /** Full 16-bit packed ADC/flags word from payload. */
-    raw16: number;
-    /** 12-bit ADC value extracted from `raw16`. */
-    adc12: number;
-    mV: number;
-    usbPluggedIn: boolean;
-    chargerStatusBits: number;
-    chargerStatus: string;
-}
-interface ADCPayloadSample {
-    gsr: ADCGSRSample | null;
-    batt: ADCBatterySample | null;
-}
-type HardwareIdentifier = 'VERISENSE_PULSE_PLUS' | 'VERISENSE_GSR_PLUS' | string;
-/**
- * Decoder for grouped ADC channels (Verisense sensor id = 1).
- *
- * Includes GSR plus battery/ADC channels carried in the same packet source.
- * Implements C# `SensorGSR.cs` including:
- * - Per-hardware reference resistor selection (SR68 vs Shimmer3 resistors).
- * - Auto-range decoding from the raw ADC value's upper bits.
- * - Range-3 clamping threshold that differs by hardware.
- * - Conductance (uS) output with connectivity detection.
- */
-declare class SensorADC extends SensorBase {
-    readonly LIMIT_MIN_VALID_USIEMENS = 0.03;
-    readonly GSR_UNCAL_LIMIT_RANGE3_SR68 = 1134;
-    readonly GSR_UNCAL_LIMIT_RANGE3_SR62 = 683;
-    private readonly SHIMMER3_REF_KOHMS;
-    private readonly SR68_REF_KOHMS;
-    /**
-     * ADC sample-rate code → divisor of the 32768 Hz clock. Mirrors the firmware
-     * `samplingRateInTicksArray` (hal_adc.c): the sampling timer fires every
-     * `divisor` ticks, producing one sample set per fire, so the streamed output
-     * rate = 32768 / divisor. Oversampling uses SAADC burst mode and therefore
-     * does NOT divide the output rate. Index 0 = "Off".
-     */
-    private static readonly ADC_RATE_DIVISORS;
-    gsrEnabled: boolean;
-    battEnabled: boolean;
-    /** GSR range 0-3 (fixed) or 4 (auto-range). */
-    gsrRangeSetting: number;
-    hardwareIdentifier: HardwareIdentifier;
-    hwRevisionMajor: number | null;
-    hwRevisionMinor: number | null;
-    hwRevisionInternal: number | null;
-    gsrRateSettingRaw: number;
-    gsrRangeSettingRaw: number;
-    gsrOversamplingRateSettingRaw: number;
-    constructor();
-    setHardwareIdentifier(idStr: HardwareIdentifier): void;
-    setHardwareRevision(revHwMajor: number, revHwMinor: number, revHwInternal?: number): void;
-    setGsrRangeSetting(v: number): void;
-    private getBatteryVoltageMultiplier;
-    /**
-     * Whether this board uses the SR62 (Verisense GSR+) Shimmer3-style analog
-     * front end: 3.0 V SAADC reference, 40.2/287/1000/3300 kΩ GSR feedback
-     * resistors, 0.5 V GSR reference and range-3 uncal limit 683. Every other
-     * GSR-capable board (SR61 >= 5, SR68 >= 5 — firmware
-     * `ShimBrd_isGsrSupportedForHwVersion`) carries the second-generation DC
-     * front end: 1.8 V reference, 21/150/562/1740 kΩ, 0.4986 V, limit 1134.
-     *
-     * Mirrors the firmware's `selectFeedbackResistorsFromHwVersion` (hal_gsr.c),
-     * which keys the choice on the major revision alone (SR62 vs everything
-     * else). Prefers the production-config hardware revision; falls back to the
-     * caller-supplied hardware identifier when no revision has been read yet.
-     * Previously this was keyed only on the `VERISENSE_PULSE_PLUS` identifier
-     * string, so an SR61-5/6 presenting its true identity decoded ~1.91× high
-     * (DEV-874).
-     */
-    private usesSr62GsrFrontEnd;
-    setEnabled(arg1: boolean | {
-        gsr?: boolean;
-        batt?: boolean;
-    }, opConfigBytes?: Uint8Array | null): Uint8Array | Record<string, boolean>;
-    private _patchEnabled;
-    patchGsrRange(rangeCfg: number, op: Uint8Array): Uint8Array;
-    patchGsrSamplingRate(rateCfg: number, op: Uint8Array): Uint8Array;
-    patchGsrOversampling(overCfg: number, op: Uint8Array): Uint8Array;
-    calibrateAdcToVolts(uncal12bit: number): number;
-    calibrateGsrToKOhmsUsingAmplifierEq(volts: number, range: number): number;
-    nudgeGsrResistance(kOhms: number): number;
-    kOhmToUSiemens(kOhms: number): number;
-    /**
-     * Convert the 6-bit ADC sample-rate code to the streamed output rate in Hz,
-     * or null for "Off"/unknown codes. Used for per-sample timestamp spacing.
-     */
-    decodeAdcSampleRateHz(rateCode: number): number | null;
-    parsePayload(sensorPayloadBytes: Uint8Array): ADCPayloadSample[];
-    applyOperationalConfig(op: Uint8Array): void;
-}
-
-type AccelRange$1 = '2G' | '4G' | '8G' | '16G';
-interface LIS2DW12Sample {
-    raw: [number, number, number];
-    cal: [number, number, number];
-    units: {
-        cal: string;
-    };
-}
-/**
- * Decoder for the LIS2DW12 low-power accelerometer (Verisense sensor id = 2).
- *
- * Sensitivity values are given in raw-LSB / (m/s²) per axis — matching
- * the C# `SensorLIS2DW12.cs` implementation.
- */
-declare class SensorLIS2DW12 extends SensorBase {
-    offset: [number, number, number];
-    align: [[number, number, number], [number, number, number], [number, number, number]];
-    private readonly sensitivityByRange;
-    range: AccelRange$1;
-    /** Numeric full-scale index (0=2G..3=16G) used to select the device calibration block. */
-    private rangeIndex;
-    constructor();
-    setRange(rangeStr: AccelRange$1): void;
-    setEnabled(enabled: boolean, opConfigBytes?: Uint8Array | null): Uint8Array | boolean;
-    setAccelEnabled(enabled: boolean, opConfigBytes?: Uint8Array | null): Uint8Array | boolean;
-    patchAccelRange(rangeCfg: number, op: Uint8Array): Uint8Array;
-    patchAccelSamplingRate(rateCfg: number, op: Uint8Array): Uint8Array;
-    private _calibrate;
-    parsePayload(sensorPayloadBytes: Uint8Array): LIS2DW12Sample[];
-    applyOperationalConfig(op: Uint8Array): void;
-}
-
-type AccelRange = '2G' | '4G' | '8G' | '16G';
-type GyroRange = '250DPS' | '500DPS' | '1000DPS' | '2000DPS';
-interface LSM6DS3Sample {
-    accel: {
-        raw: [number, number, number];
-        cal: [number, number, number];
-        units: string;
-    } | null;
-    gyro: {
-        raw: [number, number, number];
-        cal: [number, number, number];
-        units: string;
-    } | null;
-}
-/**
- * Decoder for the LSM6DS3 combined accelerometer + gyroscope (Verisense sensor id = 3).
- *
- * Sensitivity values mirror the C# `SensorLSM6DS3.cs` implementation.
- */
-declare class SensorLSM6DS3 extends SensorBase {
-    offset: [number, number, number];
-    align: [[number, number, number], [number, number, number], [number, number, number]];
-    private readonly accSensByRange;
-    private readonly gyroSensByRange;
-    accRange: AccelRange;
-    gyroRange: GyroRange;
-    accEnabled: boolean;
-    gyroEnabled: boolean;
-    constructor();
-    setAccelEnabled(v: boolean): void;
-    setGyroEnabled(v: boolean): void;
-    setAccelRange(r: AccelRange): void;
-    setGyroRange(r: GyroRange): void;
-    private _applyAlignAndOffset;
-    private static readonly ACC_RANGE_CODE;
-    private static readonly GYRO_RANGE_CODE;
-    private _calibrateAccel;
-    private _calibrateGyro;
-    parsePayload(sensorPayloadBytes: Uint8Array): LSM6DS3Sample[];
-    applyOperationalConfig(op: Uint8Array): void;
-}
-
-interface LSM6DSVSample {
-    tag: number;
-    cnt: number;
-    accel: {
-        raw: [number, number, number];
-        cal: [number, number, number];
-        units: string;
-    } | null;
-    gyro: {
-        raw: [number, number, number];
-        cal: [number, number, number];
-        units: string;
-    } | null;
-    mag: {
-        raw: [number, number, number];
-        cal: [number, number, number];
-        units: string;
-    } | null;
-}
-declare class SensorLSM6DSV extends SensorBase {
-    private static readonly TAG_GYRO;
-    private static readonly TAG_ACCEL;
-    private static readonly TAG_SENSORHUB_SLAVE0;
-    accEnabled: boolean;
-    gyroEnabled: boolean;
-    magEnabled: boolean;
-    private accelFsG;
-    private gyroFsDps;
-    private fsXlCode;
-    private fsGCode;
-    accelHz: number;
-    gyroHz: number;
-    magHz: number;
-    constructor();
-    private decodeAccelFsG;
-    private decodeGyroFsDps;
-    private decodeOdrHz;
-    private decodeMagOutputRateHz;
-    private calibrateAccel;
-    private calibrateGyro;
-    private calibrateMag;
-    parsePayload(sensorPayloadBytes: Uint8Array): LSM6DSVSample[];
-    applyOperationalConfig(op: Uint8Array): void;
-    /**
-     * Timestamp each stream (accel / gyro / mag) so all three cover the same block
-     * time window. The tagged FIFO interleaves the streams, so the generic
-     * global-index spacing spreads each stream by (#interleaved-streams)x too far
-     * back and makes consecutive blocks overlap on the time axis.
-     *
-     * Each stream's effective rate is derived from *this block*: the block's
-     * covered duration is taken from a directly-sampled reference stream (accel,
-     * else gyro) at its known ODR, and every stream is then spread evenly over
-     * that same duration by its own sample count. This is important for the mag
-     * (LIS2MDL), which is read via the LSM6DSV sensor hub — its entries land in
-     * the FIFO at the hub batch rate, NOT the LIS2MDL ODR, so a fixed mag ODR
-     * would mis-spread it (the zig-zag). Deriving the rate from the block keeps it
-     * aligned regardless of the hub rate.
-     */
-    computeSampleTimestamps(decodedSamples: unknown[], block: {
-        tsLastSampleMillis: number;
-        systemTsLastSampleMillis: number;
-        systemOffsetFirstTime?: number | null;
-    }): Array<{
-        tsMillis: number;
-        systemTsMillis: number;
-        systemTsPlotMillis: number;
-    }>;
-    /**
-     * Report up to three independent sub-streams (accel / gyro / mag) so loss is
-     * tracked per stream. Each sub-stream's expected rate is its configured rate
-     * (ODR for accel/gyro, output rate for mag); loss is measured against that, so
-     * the mag's hub-trigger bound — or any rate the firmware/link can't keep up
-     * with — surfaces as loss when a configured rate exceeds what's delivered.
-     */
-    getStreamContributions(samplesWithTime: Array<{
-        timestamps?: {
-            tsMillis: number;
-        };
-    }>, sensorId: number): StreamContribution[];
-}
-
-interface PPGChannelSample {
-    raw: number;
-    cal: number;
-    units: {
-        raw: string;
-        cal: string;
-    };
-}
-interface PPGSample {
-    RED?: PPGChannelSample;
-    IR?: PPGChannelSample;
-    GREEN?: PPGChannelSample;
-    BLUE?: PPGChannelSample;
-    /**
-     * 2nd-generation hub PPG: 3 raw MAX86176 LED channel counts (24-bit), in the
-     * order [green, IR, red] (LED1=green, LED2=IR, LED3=red per the board's LED
-     * driver wiring). The MAX86176 is reached only via the MAX32674 algorithm hub
-     * and measures these 3 LEDs on photodiode PD1 (its PD2 copies are not
-     * forwarded).
-     */
-    leds?: [number, number, number];
-}
-type PPGChannel = 'RED' | 'IR' | 'GREEN' | 'BLUE';
-/**
- * Decoder for the PPG sensor (Verisense sensor id = 4).
- *
- * Calibration constants mirror C# `SensorPPG.cs`.
- */
-declare class SensorPPG extends SensorBase {
-    red: boolean;
-    ir: boolean;
-    green: boolean;
-    blue: boolean;
-    /**
-     * 2nd-gen hub mode: PPG arrives via the MAX32674 hub as a fixed block of 6 raw
-     * MAX86176 LED channels (6 x u24), independent of the RED/IR/GREEN/BLUE enable
-     * bits. Set from the connected device's hardware generation (see
-     * VerisenseClient). When false, the 1st-gen named-channel layout is used.
-     */
-    hubMode: boolean;
-    private readonly adcLsb;
-    private readonly adcBitShift;
-    adcResolutionIndex: number;
-    /** PPG_SR code → base sampling rate in Hz (op byte PPG_MODE_CONFIG2 bits 4:2). */
-    private readonly PPG_SR_HZ;
-    /** SMP_AVE code → FIFO sample-averaging factor (op byte PPG_FIFO_CONFIG bits 7:5). */
-    private readonly SMP_AVE_FACTOR;
-    constructor();
-    setChannels(channels: Partial<Record<PPGChannel, boolean>>): void;
-    setHubMode(enabled: boolean): void;
-    setAdcResolutionIndex(i: number): void;
-    calibrateValue(uncalValue: number): number;
-    /**
-     * 2nd-gen hub PPG block: N samples x (3 x u24 LED channels = green, IR, red),
-     * no count prefix (sample count derived from the block length, matching the
-     * firmware packer).
-     */
-    private parseHubPayload;
-    parsePayload(sensorPayloadBytes: Uint8Array): PPGSample[];
-    applyOperationalConfig(op: Uint8Array): void;
-}
-
-/** Per-channel raw ambient-light counts (24-bit) plus the derived illuminance
- * (lux) and correlated colour temperature (CCT, Kelvin). Channel order matches
- * the firmware VD6283 AlsResults block: RED, VISIBLE, BLUE, GREEN, IR, CLEAR.
- *
- * The second slot is shared: the VD6283 routes EITHER the visible/clear reading
- * OR the dark (covered-photodiode) baseline onto it, selected by the op-config
- * dark-channel bit. They are mutually exclusive, so exactly one of `VISIBLE` /
- * `DARK` is a number per sample and the other is `null`. */
-interface VD6283Sample {
-    RED: number;
-    /** Visible/clear channel count, or `null` when the dark channel is enabled
-     * (the chip then routes the dark baseline onto this slot — see `DARK`). */
-    VISIBLE: number | null;
-    BLUE: number;
-    GREEN: number;
-    IR: number;
-    CLEAR: number;
-    /** Dark/covered-photodiode baseline count, or `null` when the dark channel is
-     * disabled (the slot then carries the visible reading — see `VISIBLE`). */
-    DARK: number | null;
-    /** Illuminance in lux (XYZ Y component; clamped to >= 0). */
-    lux: number;
-    /** Correlated colour temperature in Kelvin (0 if undefined). */
-    cct: number;
-}
-/**
- * Decoder for the VD6283TX45 ambient light sensor (Verisense sensor id = 7).
- *
- * Data block payload = N samples x 18 bytes (6 channels x 24-bit LE counts).
- * In addition to the raw channel counts, each sample carries the derived lux
- * and CCT, computed from the RED/GREEN/BLUE channels with the configured gain
- * and exposure (ported from firmware App_vd6283tx.c).
- */
-declare class SensorVD6283 extends SensorBase {
-    static readonly NUM_CHANNELS = 6;
-    static readonly BYTES_PER_SAMPLE = 18;
-    private exposureUs;
-    private gain8p8;
-    /** Op-config dark-channel bit (LIGHT_CONFIG bit 1): when set the shared second
-     * slot carries the dark baseline (`DARK`) instead of the visible reading. */
-    private darkEnabled;
-    constructor();
-    /** Normalise a raw channel count for the XYZ transform (gain + exposure). */
-    private normalizeForXyz;
-    /** Compute illuminance (lux) and CCT (K) from RED/GREEN/BLUE counts. */
-    private computeLuxCct;
-    parsePayload(sensorPayloadBytes: Uint8Array): VD6283Sample[];
-    applyOperationalConfig(op: Uint8Array): void;
-}
-
-/**
- * One algorithm-hub sample: accel + WHRM algorithm output. The raw MAX86176 PPG
- * is no longer carried here - it streams separately under the PPG sensor id (4),
- * see SensorPPG hub mode.
- */
-interface MAX32674Sample {
-    accel: {
-        raw: [number, number, number];
-    };
-    /** Heart rate (bpm) and confidence (0-100). */
-    hr: number;
-    hrConfidence: number;
-    /** SpO2 (%) and confidence; 0 until SpO2 mode is enabled. */
-    spo2: number;
-    spo2Confidence: number;
-    activityClass: number;
-    scdContactState: number;
-}
-/**
- * Decoder for the MAX32674 algorithm hub (Verisense sensor id = 8).
- *
- * Data block payload = [sampleCount:1] then sampleCount x 14 bytes:
- *   accel x,y,z : 3 x i16 (6) | hr u16 (2) | hr_conf u8 (1) |
- *   spo2 u16 (2) | spo2_conf u8 (1) | activity u8 (1) | scd_contact u8 (1)
- *
- * Raw PPG is reported separately under the PPG sensor id (4).
- */
-declare class SensorMAX32674 extends SensorBase {
-    static readonly BYTES_PER_SAMPLE = 14;
-    constructor();
-    parsePayload(sensorPayloadBytes: Uint8Array): MAX32674Sample[];
-    applyOperationalConfig(op: Uint8Array): void;
-}
-
-/** One skin-temperature sample. Object = skin temperature, ambient = sensor
- * ambient, both in degrees Celsius. */
-interface MLX90632Sample {
-    object: {
-        raw: number;
-        cal: number;
-        units: string;
-    };
-    ambient: {
-        raw: number;
-        cal: number;
-        units: string;
-    };
-}
-/**
- * Decoder for the MLX90632 skin temperature sensor (Verisense sensor id = 9).
- *
- * Data block payload = N samples x 4 bytes: object int16 then ambient int16,
- * each in centi-degrees Celsius (value / 100 = degrees C).
- */
-declare class SensorMLX90632 extends SensorBase {
-    static readonly BYTES_PER_SAMPLE = 4;
-    constructor();
-    parsePayload(sensorPayloadBytes: Uint8Array): MLX90632Sample[];
-    applyOperationalConfig(op: Uint8Array): void;
-}
-
-type TransportKind = 'ble' | 'serial' | null;
-type DeviceMode = 'idle' | 'streaming' | 'command' | 'logged';
-interface SensorMap {
-    1: SensorADC;
-    2: SensorLIS2DW12;
-    3: SensorLSM6DS3;
-    4: SensorPPG;
-    6: SensorLSM6DSV;
-    7: SensorVD6283;
-    8: SensorMAX32674;
-    9: SensorMLX90632;
-}
-interface StreamPacket {
-    sensorId: number;
-    tick_u24: number;
-    decoded: unknown[] | null;
-    rawPayload: Uint8Array;
-    crcOk: boolean | null;
-}
-interface LoggedTransferProgressInfo {
-    payloadIndex: number;
-    bytesWritten: number;
-    crcOk: boolean;
-}
-interface TransferLoggedDataOptions {
-    fileHandle?: FileSystemFileHandle | null;
-    timeoutMs?: number;
-    maxNack?: number;
-    maxCrcNack?: number;
-    onProgress?: ((info: LoggedTransferProgressInfo) => void) | null;
-}
-interface TransferLoggedDataResult {
-    ok: boolean;
-    bytesWritten: number;
-    payloadIndex?: number;
-    blob?: Blob;
-}
-interface RunHardwareTestReportOptions {
-    timeoutMs?: number;
-    marker?: string;
-    endMarker?: string;
-    completionIdleMs?: number;
-    factoryTestType?: number;
-    signal?: AbortSignal | null;
-    onChunk?: ((chunk: string, aggregate: string) => void) | null;
-}
-interface VerisenseClientOptions {
-    hardwareIdentifier?: string;
-    /**
-     * Streaming frames carry a 2-byte CRC-16 trailer. When `true` (default) the
-     * trailer is used to lock onto frame boundaries — the parser accepts a frame
-     * only when its CRC validates, so a flaky link that drops bytes recovers
-     * cleanly instead of emitting misaligned packets — and is then stripped before
-     * decoding. Set to `false` only for legacy firmware that streams without a CRC
-     * trailer (falls back to length-only framing).
-     */
-    stripStreamCrc?: boolean;
-    debug?: boolean;
-    /**
-     * Inject a transport (byte pipe) instead of the default web ones. Lets
-     * non-browser runtimes (React Native, Bluetooth Classic) or tests drive the
-     * client. When omitted, `connect()` builds a Web Bluetooth transport and
-     * `connectSerial()` a Web Serial transport, so browser usage is unchanged.
-     */
-    transport?: ShimmerTransport;
-}
-interface ThroughputTestOptions {
-    /** How long the device should saturate the link, in milliseconds. Clamped to [100, 60000]. Default 5000. */
-    durationMs?: number;
-    /**
-     * Finish the measurement once no data has been received for this many
-     * milliseconds (the device falls silent when the blast ends). Default 600.
-     */
-    idleMs?: number;
-    /** Overall safety timeout, in milliseconds. Defaults to `durationMs + 5000`. */
-    timeoutMs?: number;
-    /** Abort the test early. */
-    signal?: AbortSignal | null;
-    /** Called on every received chunk with the running result so far. */
-    onProgress?: ((partial: ThroughputTestResult) => void) | null;
-}
-interface ThroughputTestResult {
-    /** Total bytes received from the device during the measurement window. */
-    bytesReceived: number;
-    /** Number of chunks received — BLE notifications, or serial reads. */
-    packetsReceived: number;
-    /** Duration requested of the device, in milliseconds. */
-    durationRequestedMs: number;
-    /** Measured window from first to last received byte, in milliseconds. */
-    elapsedMs: number;
-    /** Received goodput in bytes per second. */
-    throughputBytesPerSec: number;
-    /** Received goodput in kilobytes per second (bytes/sec ÷ 1000). */
-    throughputKBps: number;
-    /** Received goodput in kilobits per second (bytes/sec × 8 ÷ 1000). */
-    throughputKbps: number;
-}
-/** @deprecated Renamed to {@link ThroughputTestOptions}: the test is not BLE-specific. */
-type BleThroughputTestOptions = ThroughputTestOptions;
-/** @deprecated Renamed to {@link ThroughputTestResult}: the test is not BLE-specific. */
-type BleThroughputTestResult = ThroughputTestResult;
-type VerisenseConnectRetryReason = 'request-timeout' | 'gatt-disconnected' | 'unexpected-response-property';
-interface VerisenseConnectWithRetryOptions {
-    device?: BluetoothDevice | null;
-    filters?: BluetoothLEScanFilter[];
-    optionalServices?: BluetoothServiceUUID[];
-    bootstrapTimeoutMs?: number;
-    pairingBootstrapTimeoutMs?: number;
-    maxRetries?: number;
-    retrySettleMs?: number;
-    retryOnUnexpectedProperty?: boolean;
-    onRetry?: ((info: VerisenseConnectRetryInfo) => void) | null;
-}
-interface VerisenseConnectRetryInfo {
-    attempt: number;
-    maxRetries: number;
-    bootstrapTimeoutMs: number;
-    nextBootstrapTimeoutMs?: number;
-    reason: VerisenseConnectRetryReason;
-    error: string;
-}
-interface VerisenseCommandResponse {
-    header: number;
-    command: AsmCommand;
-    property: AsmProperty;
-    payload: Uint8Array;
-}
-type BleLinkAutoOptimizeStopReason = 'stabilized' | 'timeout' | 'aborted' | 'unsupported' | 'not-ble';
-interface BleLinkAutoOptimizeOptions {
-    pollIntervalMs?: number;
-    stableReadCount?: number;
-    maxDurationMs?: number;
-    settleMode?: 'target-and-stability' | 'stability';
-    minSettleTimeMs?: number;
-    forceOptimizeAttempts?: number;
-    targetConnectionIntervalUnits?: number;
-    targetPhy?: number;
-    minDataLength?: number;
-    signal?: AbortSignal | null;
-    onSample?: ((sample: BleLinkAutoOptimizeSample) => void) | null;
-}
-interface BleLinkAutoOptimizeSample {
-    source: 'read' | 'optimize';
-    iteration: number;
-    stableCount: number;
-    parsed: VerisenseBleLinkDebugPayload;
-    signature: string;
-    optimizedEnough: boolean;
-}
-interface BleLinkAutoOptimizeResult {
-    reason: BleLinkAutoOptimizeStopReason;
-    iterations: number;
-    optimizeAttempts: number;
-    stableCount: number;
-    lastParsed: VerisenseBleLinkDebugPayload | null;
-    durationMs: number;
-}
 
 /**
  * Web Bluetooth client for the Verisense sensor platform.
@@ -13613,6 +14278,17 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
     private _isErasedBlob;
     private _isZeroBlob;
     private _isUninitializedBlob;
+    /**
+     * The firmware version the sensor reported in the production config last read,
+     * or null when that holds none: nothing read yet, a config that is erased or
+     * blank, or a major version of 0xFF. No release has one: it is the erased
+     * EEPROM value, and the sentinel a production config is written with before
+     * the firmware fills its own version in.
+     */
+    getReportedFirmwareVersion(): VerisenseFirmwareVersion | null;
+    /** {@link getReportedFirmwareVersion}, reading the production config from the
+     * sensor first if none is cached. Null, too, when that read fails. */
+    private _reportedFirmwareVersion;
     readProductionConfigFromDevice(): Promise<ProductionConfig>;
     readOpConfigFromDevice(): Promise<Uint8Array>;
     /**
@@ -14496,5 +15172,5 @@ declare function parseShimmerFactoryTestReport(text: string): ShimmerFactoryTest
  */
 declare function shimmerFactoryTestReportToCsvRows(parsed: ShimmerFactoryTestReportParsed, meta?: Record<string, string | number | boolean | null>): string[];
 
-export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, summariseExgBanks, summariseExgCalibration, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
-export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AckVerdict, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BluetoothModuleFamily, BluetoothModuleVersion, BluetoothModuleVersionEntry, Bmp180Coefficients, Bmp280Coefficients, Bmp390Coefficients, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibratedGsr, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChannelUnit, ChargingStatus, CompensatedPressure, CrcMode, Cyw20820VersionDetails, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, DrainOptions, DrainResult, DrainVerdict, DropReason, DumpCalibrationsByGroup, EvaluateParsedSplitInput, ExgApplyInput, ExgApplyResult, ExgBanks, ExgCalibrationSource, ExgCalibrationSummary, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgSampleResolution, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FactoryTestClassifier, FactoryTestFailureReason, FactoryTestGrammar, FactoryTestLineContext, FactoryTestLineRule, FactoryTestMetricValue, FactoryTestOverall, FactoryTestReportFamily, FactoryTestReportParsedBase, FactoryTestResult, FactoryTestRunOptions, FactoryTestState, FactoryTestVerdict, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, ImuRateCoverage, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, MessageLengthFn, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, PressureCalibration, PressureCoefficients, PressureSensorKind, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorAvailability, SensorBitmapShimmer3Key, SensorField, SensorGate, SensorMap, SensorRuleChange, SensorRuleCheck, SensorRuleDescription, SensorRuleKey, SensorRuleState, SensorRuleViolation, SensorStreamStats, SensorToggleResult, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FactoryTestType, Shimmer3FactoryTestTypeInfo, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerFactoryTestIoStatus, ShimmerFactoryTestMcuInfo, ShimmerFactoryTestModelInfo, ShimmerFactoryTestReportFamily, ShimmerFactoryTestReportParsed, ShimmerGeneration, ShimmerHardwareDescription, ShimmerSrBoard, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamCalibrationInfo, StreamCalibrationSource, StreamCalibrationState, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStamp, StreamStatsSnapshot, StreamTimelineOptions, TestModeId, ThroughputTestOptions, ThroughputTestResult, TimelineSource, TimelineState, TimestampBits, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisensePpgLedTestFailureReason, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
+export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_TRIAL_NAME, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID$1 as FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LSM6DSV_ODR, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, appendCrc, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, downloadCsvBlob, downloadSdTree, drainByteStream, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, hasSensorBit, hhmmToMinutesSinceMidnight, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, interpretShimmer3InquiryResponse, isAckCommand, isBadResponse, isBmp581PresentPerSrNumber, isCrcMode, isExgRespirationEnabled, isGenerationSensitiveChannel, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, localCivilUnixSecondsNow, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nextAvailableDuplicateFileName, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventLogPayload, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCrc16, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3SensorLabel, shimmer3SupportsExg, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, wiredPacketLength, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export type { ADCBatterySample, ADCGSRSample, ADCPayloadSample, AckVerdict, ApplicableExgPreset, AsmCommand, AsmProperty, Availability, BleLinkAutoOptimizeOptions, BleLinkAutoOptimizeResult, BleLinkAutoOptimizeSample, BleLinkAutoOptimizeStopReason, BleThroughputTestOptions, BleThroughputTestResult, BluetoothModuleFamily, BluetoothModuleVersion, BluetoothModuleVersionEntry, Bmp180Coefficients, Bmp280Coefficients, Bmp390Coefficients, Bmp581DetectionContext, BrandRecord, BrandRecordFields, BuildStreamSchemaOptions, CalibDump, CalibDumpRecord, CalibDumpVersion, CalibReadSource, CalibratedGsr, CalibrationBlock, CalibrationBlockInput, CalibrationSet, CalibrationSetInput, ChannelFormat, ChannelUnit, ChargingStatus, CompensatedPressure, CrcMode, CsvByteSink, CsvDownload, CsvFileResult, CsvRecorder, CsvRecorderColumn, CsvRecorderFrame, CsvRecorderLog, CsvRecorderOptions, CsvTableWriter, CsvTableWriterOptions, Cyw20820VersionDetails, DebugCommandId, DecodedExgRegisters, DeviceKind, DeviceMode, DeviceWriteDivergentRanges, DiscoveredDevice, DownloadSdTreeOptions, DrainOptions, DrainResult, DrainVerdict, DropReason, DumpCalibrationsByGroup, EvaluateParsedSplitInput, ExgApplyInput, ExgApplyResult, ExgBanks, ExgCalibrationSource, ExgCalibrationSummary, ExgChannelSettings, ExgChipIndex, ExgFieldName, ExgFieldValue, ExgGainValue, ExgKnobEdit, ExgKnobField, ExgKnobOption, ExgLeadOffSettings, ExgPreset, ExgResolution, ExgRespirationSettings, ExgRldSettings, ExgSampleResolution, ExgStatusBits, ExgTestSignalSettings, ExpansionBoardInfo, FactoryTestClassifier, FactoryTestFailureReason, FactoryTestGrammar, FactoryTestLineContext, FactoryTestLineRule, FactoryTestMetricValue, FactoryTestOverall, FactoryTestReportFamily, FactoryTestReportParsedBase, FactoryTestResult, FactoryTestRunOptions, FactoryTestState, FactoryTestVerdict, FieldKind, GenerateInfoMemOptions, GroupDefaults, IShimmerClient, ImuCalibration, ImuFamily, ImuRateCoverage, InertialCalibration, InertialGroup, InfoMemCalibrationBlocks, InfoMemContext, InfoMemDeviceConfig, InfoMemFieldDefinition, InfoMemFieldGroup, InfoMemFieldKind, InfoMemFieldOption, InfoMemFieldSubgroup, InfoMemImuConfig, InfoMemLayout, InfoMemSdConfig, KinematicCalibration, LIS2DW12Sample, LSM6DS3Sample, LSM6DSVSample, LoopbackTransportOptions, LoopbackWrite, MAX32674Sample, MLX90632Sample, MessageLengthFn, NavigatorLike, ObjectClusterColumn, ObjectClusterColumnOptions, OpIdx, Opcode, PPGChannelSample, PPGSample, ParseKinematicOptions, ParsedSplitReason, PendingEventPropertyLabel, PlatformSupport, PressureCalibration, PressureCoefficients, PressureSensorKind, ProductionConfig, ProductionConfigBuildOptions, ProductionConfigFull, RtcDriftMonitorOptions, RtcDriftSample, RtcDriftSampleEvent, RtcDriftSampleInput, RunHardwareTestReportOptions, SdCardSpace, SdDataFrame, SdDestinationLayout, SdDirEntry, SdExtractResult, SdFileStat, SdListDirPage, SdLogCalibrationBytes, SdLogChannel, SdLogChannelCalibrationInfo, SdLogChannelSpec, SdLogDataType, SdLogDecodeOptions, SdLogDecodeResult, SdLogExpansionBoard, SdLogFormatErrorCode, SdLogHeader, SdLogImuRanges, SdLogRecord, SdMessage, SdOneShotResponse, SdRemoteFile, SdRemoteTree, SdStatusFrame, SdTransferProgress, SdTransferSummary, SecureDfuLike, SensorAvailability, SensorBitmapShimmer3Key, SensorField, SensorGate, SensorMap, SensorRuleChange, SensorRuleCheck, SensorRuleDescription, SensorRuleKey, SensorRuleState, SensorRuleViolation, SensorStreamStats, SensorToggleResult, SerialDfuTransportLike, Shimmer3ChannelField, Shimmer3ClientOptions, Shimmer3DeviceStatus, Shimmer3DeviceVersion, Shimmer3FactoryTestType, Shimmer3FactoryTestTypeInfo, Shimmer3FwVersion, Shimmer3Generation, Shimmer3InquiryResult, Shimmer3RClientOptions, Shimmer3RFramingOptions, Shimmer3SensorLabel, Shimmer3SensorOption, Shimmer3StreamSchema, ShimmerClientOptions, ShimmerFactoryTestIoStatus, ShimmerFactoryTestMcuInfo, ShimmerFactoryTestModelInfo, ShimmerFactoryTestReportFamily, ShimmerFactoryTestReportParsed, ShimmerGeneration, ShimmerHardwareDescription, ShimmerSrBoard, ShimmerTransport, ShimmerTransportKind, SlotOccupancy, SmartDockActiveSlot, SmartDockClientOptions, SmartDockConnectionType, SmartDockHardwareType, SmartDockInfo, SmartDockResponseKind, SmartDockVersionInfo, StreamCalibrationInfo, StreamCalibrationSource, StreamCalibrationState, StreamContribution, StreamLossStats, StreamPacket, StreamSchemaBase, StreamSchemaField, StreamStamp, StreamStatsSnapshot, StreamTimelineOptions, TestModeId, ThroughputTestOptions, ThroughputTestResult, TimelineSource, TimelineState, TimestampBits, TimestampFmt, TransferLoggedDataOptions, TransferLoggedDataResult, TransportCapabilities, TransportKind, TransportNeed, TransportScanner, TransportWriteOptions, UartComponent, UartComponentProperty, UartPacketCmd, UartPermission, UartRxPacket, Unsubscribe, VD6283Sample, VerisenseAdvertisedNameParts, VerisenseBleLinkDebugPayload, VerisenseBleOptimizationResult, VerisenseBleSyncSchedule, VerisenseCalibrationAvailability, VerisenseCalibrationRange, VerisenseCalibrationSensor, VerisenseChargerChipFamily, VerisenseClientOptions, VerisenseCommandResponse, VerisenseConnectRetryInfo, VerisenseConnectWithRetryOptions, VerisenseDfuErrorCategory, VerisenseDfuErrorInfo, VerisenseDfuFlowOptions, VerisenseDfuImage, VerisenseDfuPackage, VerisenseDfuRetryInfo, VerisenseEventLogEntry, VerisenseFactoryTestMcuInfo, VerisenseFactoryTestMetricValue, VerisenseFactoryTestModelInfo, VerisenseFactoryTestOverall, VerisenseFactoryTestReportParsed, VerisenseFactoryTestResult, VerisenseFactoryTestVerdict, VerisenseFirmwareVersion, VerisenseHardwareCapabilities, VerisenseHardwareRevision, VerisenseHardwareRevisionSource, VerisenseHardwareSensorSupport, VerisenseImuGeneration, VerisenseLookupTableEntry, VerisenseLookupTablePayload, VerisenseMessage, VerisenseOperationalField, VerisenseOperationalFieldDefinition, VerisenseOperationalFieldGroupDefinition, VerisenseOperationalFieldKind, VerisenseOperationalFieldOption, VerisenseOperationalSensorEnableField, VerisensePpgLedTestFailureReason, VerisenseRecordBufferDetails, VerisenseSchedulerDebugPayload, VerisenseSchedulerDebugPayloadForLog, VerisenseSensorRateDefaultField, VerisenseSensorRateDefaultGroup, VerisenseSerialDfuOptions, VerisenseSerialDfuProgress, VerisenseStatusPayload, VerisenseStatusPayloadForLog, VerisenseStreamCsvColumn, VerisenseStreamCsvFile, VerisenseStreamCsvLayout, VerisenseStreamFileProgress, VerisenseStreamFileResult, VerisenseStreamRecorder, VerisenseStreamRecorderOptions, VerisenseStreamRecordingResult, VerisenseStreamSensorEnables, VerisenseUnixAndHumanTimestamp, WebBluetoothTransportOptions, WebSerialTransportOptions, WiredBatteryStatus, WiredIdentity, WiredShimmerClientOptions, WiredVersionInfo };
