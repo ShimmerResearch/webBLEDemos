@@ -26,6 +26,7 @@ sdk-source.json      ←  Single source-of-truth for SDK source mode/version
 update-local-sdk.ps1 ←  Build + sync local SDK artifacts
 sync-local-sdk.ps1   ←  Sync-only local SDK artifacts
 update-local-sdk.cmd ←  Windows CMD launcher for update script
+tools/               ←  check-vendored-sdk.mjs, the Node check CI runs on the vendored SDK
 ```
 
 Two of these grew past being demos and now live in dedicated repositories:
@@ -181,6 +182,11 @@ powershell -ExecutionPolicy Bypass -File .\build-local-sdk.ps1
 cd ../webBLEDemos
 powershell -ExecutionPolicy Bypass -File .\sync-local-sdk.ps1
 ```
+
+Then check the result with `node tools/check-vendored-sdk.mjs`. It loads both vendor copies in
+Node and checks that every name a page imports is still exported, that `SDK_VERSION` matches
+`sdk-source.json`, and that `vendor/` and `shimmer-extension/vendor/` are byte-identical. The
+`Checks` workflow runs it, and the extension's own Node tests, on every pull request.
 
 ### 2) Run a demo on localhost (required for BLE)
 

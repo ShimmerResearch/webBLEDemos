@@ -1,0 +1,66 @@
+# Checks that need no browser and no device, on every pull request and on main.
+#
+# The demos have no build, and html-format.yml only rewrites HTML, so until
+# this workflow nothing on a pull request looked at the JavaScript. verify.yml
+# went with Shimmer Capture when it moved to its own repository, and the
+# extension's own tests were documented in shimmer-extension/README.md but run
+# by nobody.
+name: Checks
+
+# `pull_request` tests the predicted merge; `push` to main tests main as it
+# ends up, since two pull requests each green against an older main can merge
+# into a main no run ever saw. workflow_dispatch runs it by hand on any ref.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  vendored-sdk:
+    name: Vendored SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # Loads both vendor copies (vendor/ and shimmer-extension/vendor/) in Node
+      # and checks that every name a page imports is exported, that SDK_VERSION
+      # matches sdk-source.json, and that the two copies are byte-identical. See
+      # the script's header.
+      - name: Check the vendored shimmer-web-sdk bundle
+        run: node tools/check-vendored-sdk.mjs
+
+  extension-tests:
+    name: Extension tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # The three Node checks shimmer-extension/README.md lists: DOM ids and
+      # webcam assets, the conditional webcam export, and camera selection.
+      - name: Run the extension's Node tests
+        working-directory: shimmer-extension
+        run: |
+          node tests/static-check.mjs
+          node tests/export-check.mjs
+          node tests/webcam-camera-check.mjs
