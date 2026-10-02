@@ -10802,7 +10802,12 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * (`a5 ff` is a valid aborted tail), so the candidate `0xFF` has to sit where
      * test data could not have put one. Test packets are `0xA5` followed by a
      * little-endian counter that steps by one per packet. So the last complete
-     * packet predicts every byte of the one after it:
+     * packet predicts every byte of the one after it, once the packet alignment
+     * is known. Two complete packets in sequence fix it. One does not, since
+     * `0xA5` also occurs inside counters, and a packet misread from there can
+     * predict a `0xFF` at the candidate. A misaligned pair cannot step by exactly
+     * one: the counter's low byte, which changes every packet, lands in a higher
+     * byte of the misread value.
      *
      * - **The candidate starts a packet** (the stream ended on a packet boundary).
      *   Only `0xA5` can be data there, so it is the ACK.
