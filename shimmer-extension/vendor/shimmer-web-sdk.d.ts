@@ -9352,8 +9352,22 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * and could deliver test bytes to onStreamFrame as samples. A reframed link -
      * classic, or BLE with a link CRC on - was never affected, because there the
      * framer hands over whole 0xA5 test packets.
+     *
+     * It belongs to the link the test started on: {@link _resetLinkProtocolState}
+     * clears it, so a reconnect is never diverted by a test from the old link.
      */
     private _dataRateTestActive;
+    /**
+     * When the last byte was diverted to a data-rate test. The test hands the
+     * link back only once this has gone quiet: see {@link runDataRateTest}.
+     */
+    private _dataRateTestLastRxAt;
+    /**
+     * Bumped by every {@link _resetLinkProtocolState}, so work that outlives a
+     * link - a data-rate test waiting out its duration - can tell the link it
+     * started on is gone.
+     */
+    private _linkGeneration;
     /** Candidate alignments the timestamp check has rejected since the last lock. */
     private _streamAlignRejects;
     /** Frames whose CRC failed since streaming last started. */
