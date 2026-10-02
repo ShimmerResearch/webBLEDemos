@@ -10628,6 +10628,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _parseBySchema;
     private _write;
     private _writeExpectingAck;
+    /**
+     * @param link the link generation the command was written on, from the
+     *   caller: read here instead, after an awaited write, it could already be
+     *   the next link's.
+     */
     private _waitForAck;
     private _waitForResponse;
     /**
