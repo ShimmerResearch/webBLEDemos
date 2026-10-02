@@ -15648,7 +15648,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             buf.length >= INQUIRY_RSP_HEADER_BYTES + buf[INQUIRY_RSP_NUM_CHANNELS_OFFSET];
         if (isComplete(acc))
             return acc;
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
                 off();
                 /* Reject rather than parse what did arrive: a truncated inquiry
@@ -15679,6 +15679,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 reject(this._linkResetError('the inquiry response'));
             });
         });
+        return this._settledOnLink(settled, link, 'the inquiry response');
     }
     // ---------------------------------------------------------------------------
     // InfoMem
@@ -15715,16 +15716,16 @@ class Shimmer3RClient extends BaseShimmerClient {
     /**
      * Accumulate temp-plane chunks onto `acc` until it holds at least `n` bytes.
      *
-     * Resolves synchronously when it already does, so the common case costs
-     * nothing. Registers no handler in that case either, which matters: the
-     * caller carries straight on into its own handler with no gap in between,
-     * and chunks arrive as transport tasks rather than microtasks, so nothing
-     * can slip through the join.
+     * Resolves at once when it already does, so the common case costs nothing.
+     * Registers no handler in that case either, which matters: the caller
+     * carries straight on into its own handler with no gap in between, and
+     * chunks arrive as transport tasks rather than microtasks, so nothing can
+     * slip through the join.
      */
     _awaitAtLeastBytes(acc, n, timeoutMs, timeoutMessage, link = this._linkGeneration) {
         if (acc.length >= n)
-            return Promise.resolve(acc);
-        return new Promise((resolve, reject) => {
+            return this._settledOnLink(Promise.resolve(acc), link, 'the rest of a response');
+        const settled = new Promise((resolve, reject) => {
             let buf = acc;
             const t = setTimeout(() => {
                 off();
@@ -15745,6 +15746,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 reject(this._linkResetError('the rest of a response'));
             });
         });
+        return this._settledOnLink(settled, link, 'the rest of a response');
     }
     async _readLengthPrefixedResponse(cmd, respOpcode, expectedLen, label, headerBytes = 1, ackTimeoutMs = 1500, responseTimeoutMs = 2000, expectedOffset) {
         // Before the write, so a reset at any later await is seen (see _waitForAck)
@@ -15814,7 +15816,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
         /* Response is fragmented — collect the continuation chunks, which carry
          * raw payload bytes with no opcode of their own. */
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
                 off();
                 reject(new Error(`${label} returned ${dataOf(acc).length} of ${want} bytes (response truncated).`));
@@ -15841,6 +15843,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 reject(this._linkResetError(`the rest of the ${label} response`));
             });
         });
+        return this._settledOnLink(settled, link, `the rest of the ${label} response`);
     }
     async readInfoMem(address, length) {
         if (!this._transport)
@@ -17649,7 +17652,7 @@ class Shimmer3RClient extends BaseShimmerClient {
      *   the next link's.
      */
     _waitForAck(timeoutMs = 1000, link = this._linkGeneration) {
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
                 off();
                 reject(new Error('ACK timeout'));
@@ -17694,6 +17697,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 reject(this._linkResetError('the ACK'));
             });
         });
+        return this._settledOnLink(settled, link, 'the ACK');
     }
     /** @param link as for {@link Shimmer3RClient._waitForAck}: read before the command's write. */
     _waitForResponse(expectedOpcode, timeoutMs = 1500, link = this._linkGeneration) {
@@ -17704,9 +17708,9 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (this._lastAckRemainder && this._lastAckRemainder[0] === expectedOpcode) {
             const rem = this._lastAckRemainder;
             this._lastAckRemainder = null;
-            return Promise.resolve(rem);
+            return this._settledOnLink(Promise.resolve(rem), link, 'the response');
         }
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
                 off();
                 reject(new Error('Response timeout'));
@@ -17730,6 +17734,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 reject(this._linkResetError('the response'));
             });
         });
+        return this._settledOnLink(settled, link, 'the response');
     }
     /**
      * Await an instream response — one of the messages the firmware answers
@@ -17759,9 +17764,9 @@ class Shimmer3RClient extends BaseShimmerClient {
         const rem = this._lastAckRemainder;
         if (rem && matches(rem)) {
             this._lastAckRemainder = null;
-            return Promise.resolve(rem);
+            return this._settledOnLink(Promise.resolve(rem), link, `instream response 0x${hex2$1(subOpcode)}`);
         }
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
                 off();
                 reject(new Error(`Instream response 0x${hex2$1(subOpcode)} timeout`));
@@ -17781,6 +17786,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 reject(this._linkResetError(`instream response 0x${hex2$1(subOpcode)}`));
             });
         });
+        return this._settledOnLink(settled, link, `instream response 0x${hex2$1(subOpcode)}`);
     }
     /**
      * What a waiter fails with when its link is reset under it: a command
@@ -17789,6 +17795,21 @@ class Shimmer3RClient extends BaseShimmerClient {
      */
     _linkResetError(what) {
         return new Error(`The link was reset while waiting for ${what}`);
+    }
+    /**
+     * `p`, but failed instead if the link `link` has been reset by the time its
+     * result would reach the caller. A waiter settles, and leaves
+     * {@link _linkWaiters}, inside the notification that completes it; when the
+     * transport then reports the link down in that same turn, before any
+     * continuation has run, the reset cannot see it. Its result would then reach
+     * its caller after the next link had begun - a coalesced firmware-version
+     * reply refilled the version cache that connect() had just cleared.
+     */
+    async _settledOnLink(p, link, what) {
+        const value = await p;
+        if (this._linkGeneration !== link)
+            throw this._linkResetError(what);
+        return value;
     }
     /**
      * Register `handler` on the temp plane for the link `link`. When that link
@@ -18478,9 +18499,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             // so refuse deterministically — callers are expected to sequence
             throw new SdTransferError('another SD command is already in flight', SD_STATUS.BUSY);
         }
+        const link = this._linkGeneration;
         this._sdAcquire();
         try {
-            return await new Promise((resolve, reject) => {
+            const settled = new Promise((resolve, reject) => {
                 /* Cleared only while it is still this command's slot. A link reset
                  * rejects this command and empties the slot, but cannot cancel its
                  * write: one that fails after the next link's SD command has taken the
@@ -18519,6 +18541,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                     reject(e);
                 });
             });
+            return await this._settledOnLink(settled, link, 'the SD response');
         }
         finally {
             this._sdRelease();
@@ -18608,9 +18631,10 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
         const blockLen = opts.blockPayloadLen ?? SD_BLOCK_PAYLOAD_DEFAULT;
         const stallTimeoutMs = opts.stallTimeoutMs ?? 6000;
+        const link = this._linkGeneration;
         this._sdAcquire();
         try {
-            return await new Promise((resolve, reject) => {
+            const settled = new Promise((resolve, reject) => {
                 let session = null;
                 let expectedSeq = 0;
                 let bytesReceived = 0;
@@ -18701,6 +18725,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 })
                     .catch((e) => fail(e instanceof Error ? e : new Error(String(e))));
             });
+            return await this._settledOnLink(settled, link, 'SD data');
         }
         finally {
             this._sdRelease();

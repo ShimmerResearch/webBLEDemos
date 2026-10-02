@@ -9897,11 +9897,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     /**
      * Accumulate temp-plane chunks onto `acc` until it holds at least `n` bytes.
      *
-     * Resolves synchronously when it already does, so the common case costs
-     * nothing. Registers no handler in that case either, which matters: the
-     * caller carries straight on into its own handler with no gap in between,
-     * and chunks arrive as transport tasks rather than microtasks, so nothing
-     * can slip through the join.
+     * Resolves at once when it already does, so the common case costs nothing.
+     * Registers no handler in that case either, which matters: the caller
+     * carries straight on into its own handler with no gap in between, and
+     * chunks arrive as transport tasks rather than microtasks, so nothing can
+     * slip through the join.
      */
     private _awaitAtLeastBytes;
     private _readLengthPrefixedResponse;
@@ -10673,6 +10673,16 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * commands. See {@link _onLinkTemp}.
      */
     private _linkResetError;
+    /**
+     * `p`, but failed instead if the link `link` has been reset by the time its
+     * result would reach the caller. A waiter settles, and leaves
+     * {@link _linkWaiters}, inside the notification that completes it; when the
+     * transport then reports the link down in that same turn, before any
+     * continuation has run, the reset cannot see it. Its result would then reach
+     * its caller after the next link had begun - a coalesced firmware-version
+     * reply refilled the version cache that connect() had just cleared.
+     */
+    private _settledOnLink;
     /**
      * Register `handler` on the temp plane for the link `link`. When that link
      * is reset, {@link _resetLinkProtocolState} removes the handler and calls
