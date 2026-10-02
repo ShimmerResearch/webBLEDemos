@@ -13,7 +13,7 @@
      * from it by the Bump step in cut-release.yml — the release bumps this file
      * as well as package.json, so a published bundle reports its own version.
      */
-    const SDK_VERSION = '0.5.1';
+    const SDK_VERSION = '0.5.2';
 
     /**
      * Container for a single decoded sensor frame.
@@ -9092,12 +9092,13 @@
      * Which pressure part a Shimmer3R carries, when the sensor will not say.
      *
      * The in-band answer is the 0xA7 reply's sensor id (see `./types.ts`), but two
-     * places have no such reply to read. An SD-log file carries no sensor id at
-     * all — for a BMP581 the firmware simply leaves the header's calibration
-     * region unwritten (`SDCard/shimmer_sd_header.c:209-215`) — and a
-     * LogAndStream_Shimmer3R v1.01.006 NACKs 0xA7 on a BMP581. Both fall back to
-     * the rule the firmware itself uses when the chip id cannot be read: the
-     * board's SR number.
+     * places have no such reply to read. An SD-log file from before
+     * LogAndStream_Shimmer3R v1.01.018 carries no sensor id at all — for a BMP581
+     * the firmware simply leaves the header's calibration region unwritten
+     * (`SDCard/shimmer_sd_header.c:209-215`); later files record it in header byte
+     * 224 (DEV-1123, `sdlog/header.ts`) — and a LogAndStream_Shimmer3R v1.01.006
+     * NACKs 0xA7 on a BMP581. Both fall back to the rule the firmware itself uses
+     * when the chip id cannot be read: the board's SR number.
      */
     /** The first firmware that drives a BMP581: LogAndStream_Shimmer3R v1.01.006. */
     const BMP581_MIN_FIRMWARE = Object.freeze({ major: 1, minor: 1, internal: 6 });
@@ -14282,6 +14283,13 @@
      * that is where nothing else is checking.
      */
     const STREAM_MAX_FRAME_TICKS = 32768;
+    /**
+     * How long the link must stay quiet after a data-rate test's stop, with 0xFF
+     * as its last byte, before that byte is taken as the stop ACK. The ACK follows
+     * the last test byte within milliseconds (bench: 22 ms after the stop, classic
+     * SPP), so this only has to outlast the gap between two arrivals.
+     */
+    const DATA_RATE_STOP_ACK_QUIET_MS = 50;
     // ---------------------------------------------------------------------------
     // Stray-ACK tolerance
     // ---------------------------------------------------------------------------
@@ -14420,10 +14428,19 @@
              */
             this._dataRateTestActive = false;
             /**
-             * When the last byte was diverted to a data-rate test. The test hands the
-             * link back only once this has gone quiet: see {@link runDataRateTest}.
+             * When the last byte arrived while a data-rate test owned the link. The test
+             * hands the link back only once this has gone quiet: see
+             * {@link runDataRateTest}. Kept at the transport entry,
+             * {@link _handleNotify}, so it sees every byte, including those a reframing
+             * accumulator is still holding.
              */
             this._dataRateTestLastRxAt = 0;
+            /**
+             * The last byte received while a data-rate test owned the link, or -1. After
+             * the stop, a quiet link whose last byte is 0xFF has delivered the stop ACK:
+             * see {@link _stopDataRateTest}.
+             */
+            this._dataRateTestLastByte = -1;
             /**
              * Bumped by every {@link _resetLinkProtocolState}, so work that outlives a
              * link - a data-rate test waiting out its duration - can tell the link it
@@ -14596,6 +14613,10 @@
             };
             this._handleNotify = (chunk) => {
                 let bytes = chunk;
+                if (this._dataRateTestActive && bytes.length > 0) {
+                    this._dataRateTestLastRxAt = Date.now();
+                    this._dataRateTestLastByte = bytes[bytes.length - 1];
+                }
                 if (this._factoryTest) {
                     const rest = this._factoryTest.feed(bytes);
                     if (!rest || rest.length === 0)
@@ -14613,7 +14634,6 @@
                 // A data-rate test owns the link: see _dataRateTestActive.
                 if (this._dataRateTestActive &&
                     !(chunk[0] === OPCODES.ACK_COMMAND_PROCESSED && (this._expectingAck ?? 0) > 0)) {
-                    this._dataRateTestLastRxAt = Date.now();
                     this._emitTemp(chunk);
                     return;
                 }
@@ -14671,7 +14691,6 @@
                             /* Test packets behind the start ACK, or behind a counter byte taken
                              * for the stop ACK. Test traffic, never a status push, whatever its
                              * first byte. */
-                            this._dataRateTestLastRxAt = Date.now();
                             this._emitTemp(this._lastAckRemainder);
                         }
                         else {
@@ -17810,6 +17829,7 @@
             const linkGone = () => new Error('The link was reset during the data-rate test');
             this._dataRateTestActive = true;
             this._dataRateTestLastRxAt = Date.now();
+            this._dataRateTestLastByte = -1;
             try {
                 await this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 1]), 2000);
                 if (this._linkGeneration !== link)
@@ -17840,12 +17860,7 @@
                  * back: the reset already cleared the flag, and the buffers now belong to
                  * the new link. */
                 if (this._linkGeneration === link) {
-                    try {
-                        await this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 0]), 2000);
-                    }
-                    catch {
-                        /* the stop ACK can be indistinguishable from residual test bytes */
-                    }
+                    await this._stopDataRateTest(link);
                     /* Hand the link back only once test traffic has stopped arriving, not
                      * at the ACK. Which 0xFF ended the wait above cannot be trusted: a
                      * counter byte of 0xFF can begin a notification, and the real ACK need
@@ -17875,6 +17890,52 @@
                     }
                 }
             }
+        }
+        /**
+         * Stop a data-rate test and wait for the stop's ACK, which the normal ACK
+         * path often cannot see.
+         *
+         * Stopping aborts the firmware's transfer in flight, so the stream usually
+         * ends part-way through a 5-byte test packet, and the ACK follows straight
+         * after. A reframing link then takes the ACK as that packet's next byte -
+         * bench, Shimmer3R over classic SPP: the stream ended `a5 26 d4 00 ff`, framed
+         * as one test packet - and on BLE it can arrive at the end of a notification
+         * rather than the start. Either way the wait timed out, and every classic
+         * speed test took 2 s longer than it needed to.
+         *
+         * The ACK is always the last byte, though, and a test stream never ends in
+         * 0xFF on its own: every packet's last byte is the top byte of its counter,
+         * 0x00. So once the link has gone quiet after the stop and its last byte was
+         * 0xFF, that byte was the ACK, and the wait is completed the way the ACK path
+         * would have completed it. A stop ACK that never comes - the module holding
+         * it back - still waits out the timeout.
+         *
+         * HARDWARE-VERIFY: run on a Shimmer3R over classic SPP (transparent bridge,
+         * module v1.4.16.16). The BLE case - the ACK ending a notification - has run
+         * only against the loopback tests.
+         */
+        async _stopDataRateTest(link) {
+            const stopSentAt = Date.now();
+            let settled = false;
+            const ack = this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 0]), 2000).then(() => undefined, () => undefined);
+            void ack.then(() => {
+                settled = true;
+            });
+            while (!settled && this._linkGeneration === link) {
+                await new Promise((r) => setTimeout(r, 20));
+                if (!settled &&
+                    this._expectingAck > 0 &&
+                    this._dataRateTestLastRxAt > stopSentAt &&
+                    this._dataRateTestLastByte === OPCODES.ACK_COMMAND_PROCESSED &&
+                    Date.now() - this._dataRateTestLastRxAt >= DATA_RATE_STOP_ACK_QUIET_MS) {
+                    this._log('Data-rate test: the stop ACK ended the stream inside a test packet; taking it');
+                    this._expectingAck = Math.max(0, this._expectingAck - 1);
+                    this._lastAckRemainder = null;
+                    this._emitTemp(new Uint8Array([OPCODES.ACK_COMMAND_PROCESSED]));
+                    break;
+                }
+            }
+            await ack;
         }
         // ---------------------------------------------------------------------------
         // Factory self-test (SET_FACTORY_TEST 0xA8) and the red-LED override
@@ -23154,6 +23215,32 @@
         GSR_UNIFIED: 48,
         BR_AMP_UNIFIED: 49,
     });
+    /**
+     * SD header byte 224, `SDH_PRESSURE_SENSOR_ID` (log-and-stream-common
+     * `SDCard/shimmer_sd_header.h`; DEV-1123): the pressure part the firmware
+     * found. Bits 0-6 are the sensor id, numbered as the 0xA7 reply's
+     * (`PRESSURE_SENSOR_ID`); bit 7 means the id was inferred from the board's SR
+     * number because the chip-id check was inconclusive. The firmware pre-fills
+     * the header with 0xFF, so older files read `NOT_RECORDED` here.
+     */
+    const SDLOG_PRESSURE_SENSOR_ID = Object.freeze({
+        OFFSET: 224,
+        ID_MASK: 0x7f,
+        INFERRED_BIT: 0x80,
+        /** No pressure sensor fitted (Shimmer3 only). */
+        NONE: 0xfe,
+        /** Not recorded: the firmware predates the field. */
+        NOT_RECORDED: 0xff,
+    });
+    /**
+     * First LogAndStream version that writes {@link SDLOG_PRESSURE_SENSOR_ID},
+     * per hardware id. Shimmer3 and Shimmer3R version numbers overlap, so the
+     * gate has to know which hardware it is looking at.
+     */
+    const SDLOG_PRESSURE_SENSOR_ID_MIN_FIRMWARE = Object.freeze({
+        [SDLOG_HW_ID.SHIMMER_3]: Object.freeze({ major: 1, minor: 1, internal: 6 }),
+        [SDLOG_HW_ID.SHIMMER_3R]: Object.freeze({ major: 1, minor: 1, internal: 18 }),
+    });
 
     /**
      * SD-log channel tables and raw datatype decoding.
@@ -23263,6 +23350,12 @@
         sizeBytes: 3,
     });
     /**
+     * Suffix naming the pressure pair after its part (`_BMP280`), or none for an
+     * unrecognised part or one the header says is not fitted: those emit the
+     * part-neutral `PRESSURE`/`TEMPERATURE`, raw (DEV-1123).
+     */
+    const pressureNameSuffix = (pressure) => pressure === 'unknown' || pressure === 'none' ? '' : `_${pressure.toUpperCase()}`;
+    /**
      * Build the Shimmer3 (256-byte header) channel list from the enabled-sensors
      * value. The order and datatypes replicate the "modern Shimmer3" branch of
      * ShimmerSDLog#interpretdatapacketformat (ShimmerSDLog.java lines 817-1271)
@@ -23272,8 +23365,10 @@
      * @param newImuSensors  True when the expansion-board bytes identify a
      *   new-IMU board (LSM303AHTR/MPU9250/BMP280 generation) — flips the mag
      *   channels to little-endian X, Y, Z and renames the BMP channels.
+     * @param pressure The pressure part, when the header records one (byte 224);
+     *   it names the pair instead of `newImuSensors`. Either way the pair is raw.
      */
-    function buildShimmer3SdLogChannels(enabledSensors, newImuSensors) {
+    function buildShimmer3SdLogChannels(enabledSensors, newImuSensors, pressure) {
         const has = (mask) => hasSensorBit(enabledSensors, mask);
         const ch = [];
         if (has(SDLogHeaderBitmask.ACCEL_LN)) {
@@ -23326,9 +23421,9 @@
             ch.push(uncal('MAG_MPU_X', 'i16'), uncal('MAG_MPU_Y', 'i16'), uncal('MAG_MPU_Z', 'i16'));
         }
         if (has(SDLogHeaderBitmask.BMPX80)) {
-            const suffix = newImuSensors ? 'BMP280' : 'BMP180';
-            ch.push(uncal(`TEMPERATURE_${suffix}`, 'u16r'));
-            ch.push(uncal(`PRESSURE_${suffix}`, 'u24r'));
+            const suffix = pressureNameSuffix(pressure ?? (newImuSensors ? 'bmp280' : 'bmp180'));
+            ch.push(uncal(`TEMPERATURE${suffix}`, 'u16r'));
+            ch.push(uncal(`PRESSURE${suffix}`, 'u24r'));
         }
         if (has(SDLogHeaderBitmask.EXG1_24BIT)) {
             ch.push(uncal('Exg1_Status', 'u8'), uncal('Exg1_CH1_24Bit', 'i24r'), uncal('Exg1_CH2_24Bit', 'i24r'));
@@ -23416,7 +23511,7 @@
         0x17: uncal('ALT_MAG_X', 'i16'),
         0x18: uncal('ALT_MAG_Y', 'i16'),
         0x19: uncal('ALT_MAG_Z', 'i16'),
-        // BMP390. A BMP581 board gets bmp581Channel instead (buildShimmer3RSdLogChannels).
+        // BMP390. Any other part is named by buildShimmer3RSdLogChannels instead.
         0x1a: uncal('TEMPERATURE_BMP390', 'u24'),
         0x1b: uncal('PRESSURE_BMP390', 'u24'),
         0x1c: gsrChannel(),
@@ -23439,21 +23534,28 @@
      * signal IDs). Unknown IDs fall back to a `u12` channel named after the ID,
      * matching the Java catch-all (ShimmerObject.java:3579-3583).
      *
-     * @param bmp581 True when `0x1A`/`0x1B` are a BMP581 rather than a BMP390. The
-     *   header carries no sensor id, so the caller decides from the board's SR
-     *   number (`isBmp581PresentPerSrNumber`), as the Java driver does
-     *   (ShimmerObject.java:3470-3497, `isSupportedBmp581()`).
+     * @param pressure The part behind `0x1A`/`0x1B`. Header byte 224 names it on
+     *   newer firmware (DEV-1123); otherwise the caller decides between a BMP390
+     *   and a BMP581 from the board's SR number (`isBmp581PresentPerSrNumber`), as
+     *   the Java driver does (ShimmerObject.java:3470-3497, `isSupportedBmp581()`).
+     *   Only a BMP581 pair is emitted calibrated; any other part's is raw, and an
+     *   unknown or absent part's is the part-neutral `PRESSURE`/`TEMPERATURE`.
      */
-    function buildShimmer3RSdLogChannels(signalIds, bmp581 = false) {
+    function buildShimmer3RSdLogChannels(signalIds, pressure = 'bmp390') {
         const ch = [];
         for (let i = 0; i < signalIds.length; i++) {
             const id = signalIds[i];
-            if (bmp581 && id === 0x1a) {
+            if (pressure === 'bmp581' && id === 0x1a) {
                 ch.push(bmp581Channel(SDLOG_BMP581_TEMPERATURE_NAME, CHANNEL_UNITS.DEGREES_CELSIUS));
                 continue;
             }
-            if (bmp581 && id === 0x1b) {
+            if (pressure === 'bmp581' && id === 0x1b) {
                 ch.push(bmp581Channel(SDLOG_BMP581_PRESSURE_NAME, CHANNEL_UNITS.KPASCAL));
+                continue;
+            }
+            if (pressure !== 'bmp390' && (id === 0x1a || id === 0x1b)) {
+                const kind = id === 0x1a ? 'TEMPERATURE' : 'PRESSURE';
+                ch.push(uncal(`${kind}${pressureNameSuffix(pressure)}`, 'u24'));
                 continue;
             }
             const spec = SHIMMER3R_SIGNAL_ID_TABLE[id];
@@ -23620,6 +23722,38 @@
         const lnAccel = hw === SDLOG_HW_ID.SHIMMER_3R ? (setup3 >> 6) & 0x03 : 0;
         return { lnAccel, wrAccel, gyro, mag, altAccel: 0, altMag: 0 };
     }
+    /**
+     * Read the pressure part from header byte 224 (`SDH_PRESSURE_SENSOR_ID`,
+     * DEV-1123), or `sensor: null` when the header does not record one. The byte
+     * is trusted only from LogAndStream firmware at or above the per-hardware
+     * {@link SDLOG_PRESSURE_SENSOR_ID_MIN_FIRMWARE}: older firmware leaves it at
+     * the 0xFF pre-fill, which reads as "not recorded" here too.
+     *
+     * HARDWARE-VERIFY: byte layout and version gates taken from the firmware
+     * change (log-and-stream-common `SDCard/shimmer_sd_header.h`) only; no SD file
+     * carrying the field, from either a Shimmer3 or a Shimmer3R, has been decoded.
+     */
+    function readPressureSensorField(bytes, hw, fwId, v) {
+        const notRecorded = { sensor: null, id: null, inferred: false };
+        const min = SDLOG_PRESSURE_SENSOR_ID_MIN_FIRMWARE[hw];
+        if (fwId !== SDLOG_FW_ID.LOGANDSTREAM ||
+            !min ||
+            !atLeast(v, min.major, min.minor, min.internal)) {
+            return notRecorded;
+        }
+        const raw = bytes[SDLOG_PRESSURE_SENSOR_ID.OFFSET];
+        if (raw === SDLOG_PRESSURE_SENSOR_ID.NOT_RECORDED)
+            return notRecorded;
+        if (raw === SDLOG_PRESSURE_SENSOR_ID.NONE)
+            return { sensor: 'none', id: null, inferred: false };
+        const id = raw & SDLOG_PRESSURE_SENSOR_ID.ID_MASK;
+        return {
+            // 0x04-0x7D are reserved for future parts; 0x7E-0x7F are never allocated.
+            sensor: PRESSURE_SENSOR_ID[id] ?? 'unknown',
+            id,
+            inferred: (raw & SDLOG_PRESSURE_SENSOR_ID.INFERRED_BIT) !== 0,
+        };
+    }
     function macFromBytes(b) {
         let s = '';
         for (let i = 24; i <= 29; i++)
@@ -23752,11 +23886,58 @@
             ? { id: bytes[214], rev: bytes[215], revSpecial: bytes[216] }
             : null;
         const newImu = isNewImuSensors(hardwareVersion, expansionBoard);
+        // Which pressure part is fitted. Until header byte 224 the header named
+        // none, so the board decides: on a Shimmer3 its expansion-board revision
+        // (new-IMU boards carry a BMP280), on a Shimmer3R its SR number, as the
+        // firmware's own fallback does — a BMP581 leaves the calibration region
+        // unwritten rather than marking it (SDCard/shimmer_sd_header.c:209-215).
+        // Byte 224, when the header records it, overrides that rule.
+        // HARDWARE-VERIFY: the SR-number path is pinned by synthetic headers only; no
+        // SD file from a BMP581 unit has been decoded and checked against a Consensys
+        // export yet.
+        const warnings = [];
+        const pressureField = readPressureSensorField(bytes, hardwareVersion, firmwareId, fwVersion);
+        let ruleSensor;
+        let ruleSource;
+        if (hardwareVersion === SDLOG_HW_ID.SHIMMER_3R) {
+            const board = expansionBoard && {
+                boardId: expansionBoard.id,
+                boardRev: expansionBoard.rev,
+                specialRev: expansionBoard.revSpecial,
+            };
+            const srBmp581 = isBmp581PresentPerSrNumber({
+                hardwareVersion,
+                firmwareId,
+                firmwareVersion: fwVersion,
+                board,
+            });
+            ruleSensor = srBmp581 ? 'bmp581' : 'bmp390';
+            ruleSource = board ? `the board's SR number (${formatShimmerSrCode(board)})` : 'the board';
+        }
+        else {
+            ruleSensor = newImu ? 'bmp280' : 'bmp180';
+            ruleSource = "the expansion board's revision";
+        }
+        const named = pressureField.sensor;
+        const pressureSensor = named ?? ruleSensor;
+        if (named === 'unknown') {
+            warnings.push(`Header names an unrecognised pressure sensor (id 0x${(pressureField.id ?? 0).toString(16).padStart(2, '0')}); pressure and temperature are left uncalibrated.`);
+        }
+        else if (named !== null && named !== 'none' && named !== ruleSensor) {
+            warnings.push(`Header names a ${named.toUpperCase()} pressure sensor, but ${ruleSource} implies a ${ruleSensor.toUpperCase()}; decoding as the header's ${named.toUpperCase()}.`);
+        }
+        if (pressureField.inferred) {
+            warnings.push("The pressure sensor was inferred from the board's SR number, not confirmed by chip id.");
+        }
         // Calibration parameter blocks (kept raw — see SdLogCalibrationBytes).
-        const pressureLen = newImu ? 24 : 22;
+        // BMP280/BMP390 trim runs on into bytes 222-223; a BMP180's stops at 22.
+        const longPressureTrim = pressureSensor === 'bmp280' ||
+            pressureSensor === 'bmp390' ||
+            (pressureSensor !== 'bmp180' && newImu);
+        const pressureLen = longPressureTrim ? 24 : 22;
         const pressure = new Uint8Array(pressureLen);
         pressure.set(bytes.slice(160, 182), 0);
-        if (newImu)
+        if (longPressureTrim)
             pressure.set(bytes.slice(222, 224), 22); // BMP280/BMP390 extra bytes
         const calibrationBytes = {
             wrAccel: bytes.slice(76, 97),
@@ -23774,28 +23955,17 @@
             if (315 + nChannels > headerLengthBytes) {
                 throw new SdLogFormatError('BAD_HEADER', `Shimmer3R channel table overruns the header (nChannels=${nChannels}).`);
             }
-            // The header names no pressure part, and a BMP581 leaves the calibration
-            // region unwritten rather than marking it (SDCard/shimmer_sd_header.c:209-215),
-            // so the board's SR number decides, as the firmware's own fallback does.
-            // HARDWARE-VERIFY: pinned by synthetic headers only; no SD file from a
-            // BMP581 unit has been decoded and checked against a Consensys export yet.
-            const bmp581 = isBmp581PresentPerSrNumber({
-                hardwareVersion,
-                firmwareId,
-                firmwareVersion: fwVersion,
-                board: expansionBoard && {
-                    boardId: expansionBoard.id,
-                    boardRev: expansionBoard.rev,
-                    specialRev: expansionBoard.revSpecial,
-                },
-            });
-            channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels), bmp581);
+            channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels), pressureSensor);
         }
         else {
-            channels = buildShimmer3SdLogChannels(enabledSensors, newImu);
+            channels = buildShimmer3SdLogChannels(enabledSensors, newImu, pressureSensor);
         }
         if (channels.length === 0) {
             throw new SdLogFormatError('BAD_HEADER', 'Header enables no data channels.');
+        }
+        if (pressureSensor === 'none' &&
+            channels.some((c) => c.name === 'PRESSURE' || c.name === 'TEMPERATURE')) {
+            warnings.push('Header says no pressure sensor is fitted, but pressure channels are enabled; they are left uncalibrated.');
         }
         const timestampBytes = sdTimestampBytes(hardwareVersion, firmwareId, fwVersion);
         const packetSizeBytes = timestampBytes + channels.reduce((sum, c) => sum + c.sizeBytes, 0);
@@ -23840,6 +24010,10 @@
             calibration: [],
             exg1,
             exg2,
+            pressureSensor: pressureField.sensor,
+            pressureSensorId: pressureField.id,
+            pressureSensorInferred: pressureField.inferred,
+            warnings,
         };
         return { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz };
     }
@@ -24081,13 +24255,16 @@
         return calibrateGsrSample(raw, gsrRangeSetting).conductanceUSiemens;
     }
     /**
-     * Locate the BMP581 pair, or null when the file has neither channel — which is
-     * every file whose board the SR rule gives a BMP390, because only
-     * `buildShimmer3RSdLogChannels` names these.
+     * Locate the calibrated BMP581 pair, or null when the file has neither channel
+     * — which is every file not decided as a Shimmer3R BMP581, because only
+     * `buildShimmer3RSdLogChannels` emits these calibrated. Every other pressure
+     * pair, including an unknown part's or one the header says is not fitted
+     * (DEV-1123), stays raw.
      */
     function findBmp581(channels) {
-        const pressure = channels.findIndex((c) => c.name === SDLOG_BMP581_PRESSURE_NAME);
-        const temperature = channels.findIndex((c) => c.name === SDLOG_BMP581_TEMPERATURE_NAME);
+        const find = (name) => channels.findIndex((c) => c.name === name && c.calibrated);
+        const pressure = find(SDLOG_BMP581_PRESSURE_NAME);
+        const temperature = find(SDLOG_BMP581_TEMPERATURE_NAME);
         return pressure < 0 && temperature < 0 ? null : { pressure, temperature };
     }
     /**
