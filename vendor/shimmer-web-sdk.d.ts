@@ -10636,6 +10636,14 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _plausibleFrameDelta;
     private _parseBySchema;
     private _write;
+    /**
+     * {@link _write} on the link `link`, failing at once if that link is reset
+     * before the write settles. A transport can hold a write as its link goes
+     * down, and one that settled only when the old transport let go resumed its
+     * caller's cleanup against whatever link had replaced it by then: a held
+     * START_STREAMING ended the next link's stream.
+     */
+    private _writeOnLink;
     private _writeExpectingAck;
     /**
      * @param link the link generation the command was written on, from the

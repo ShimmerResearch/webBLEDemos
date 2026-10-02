@@ -15531,6 +15531,7 @@ class Shimmer3RClient extends BaseShimmerClient {
     async readPressureCalibration(timeoutMs = 2000) {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
+        const link = this._linkGeneration;
         try {
             const payload = await this._readLengthPrefixedResponse(new Uint8Array([OPCODES.GET_PRESSURE_CALIBRATION_COEFFICIENTS_COMMAND]), OPCODES.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE, 'declared', 'Pressure calibration read', 1, 1500, timeoutMs);
             const calibration = parsePressureCalibrationResponse(payload);
@@ -15544,6 +15545,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             return calibration;
         }
         catch (err) {
+            /* A reset under the read says nothing about the firmware, and the
+             * calibration held now, if any, is the next device's. */
+            if (this._linkGeneration !== link)
+                return null;
             this._pressureCalibration = null;
             this._emitStatus('This firmware does not serve GET_PRESSURE_CALIBRATION_COEFFICIENTS (0xA7), so ' +
                 `PRESSURE and TEMPERATURE stream raw-only (${err.message}).`);
@@ -16904,6 +16909,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._emitStatus('Starting stream without schema (not recommended).');
         this._prepareStreamTimeline();
         this._emitStatus('START_STREAM → waiting for ACK…');
+        const link = this._linkGeneration;
         this._beginStreamPlane();
         try {
             const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_STREAMING_COMMAND]), 1500);
@@ -16918,7 +16924,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             }
         }
         catch (e) {
-            this._endStreamPlane();
+            // Not across a link reset, which closed this plane already: the stream
+            // plane is the next link's now
+            if (this._linkGeneration === link)
+                this._endStreamPlane();
             throw e;
         }
         this._emitStatus('START_STREAM ACK received; frames should follow');
@@ -16990,8 +16999,9 @@ class Shimmer3RClient extends BaseShimmerClient {
      */
     async stopStreaming() {
         this._emitStatus('STOP_STREAM → sending (no ACK wait)…');
+        const link = this._linkGeneration;
         try {
-            await this._write(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]));
+            await this._writeOnLink(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]), link);
             this._emitStatus('STOP_STREAM command sent (skipped ACK wait).');
         }
         catch (err) {
@@ -17003,8 +17013,9 @@ class Shimmer3RClient extends BaseShimmerClient {
            DATA_PACKET is still appended to `_rxBuf` while not streaming. So frames
            already in flight when the stop was sent get parsed with alignment still
            claimed, skipping acquisition entirely and accepting whatever offset they
-           happen to land on. */
-        this._endStreamPlane();
+           happen to land on. Not across a link reset, as in startStreaming. */
+        if (this._linkGeneration === link)
+            this._endStreamPlane();
         this._emitStatus('Streaming stopped.');
     }
     /** Start streaming AND SD card logging simultaneously. */
@@ -17013,6 +17024,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._emitStatus('Starting stream without schema (not recommended).');
         this._prepareStreamTimeline();
         this._emitStatus('START_BT_STREAM_SD_LOGGING → waiting for ACK…');
+        const link = this._linkGeneration;
         this._beginStreamPlane();
         try {
             const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_SDBT_COMMAND]), 1500);
@@ -17027,7 +17039,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             }
         }
         catch (e) {
-            this._endStreamPlane();
+            // Not across a link reset, which closed this plane already: the stream
+            // plane is the next link's now
+            if (this._linkGeneration === link)
+                this._endStreamPlane();
             throw e;
         }
         this._emitStatus('START_BT_STREAM_SD_LOGGING ACK received; frames should follow');
@@ -17039,13 +17054,15 @@ class Shimmer3RClient extends BaseShimmerClient {
      */
     async stopStreamingAndLogging() {
         this._emitStatus('STOP_BT_STREAM_SD_LOGGING → sending…');
+        const link = this._linkGeneration;
         try {
-            await this._write(new Uint8Array([OPCODES.STOP_SDBT_COMMAND]));
+            await this._writeOnLink(new Uint8Array([OPCODES.STOP_SDBT_COMMAND]), link);
         }
         catch (err) {
             this._emitStatus(`STOP_BT_STREAM_SD_LOGGING write failed: ${err.message}`);
         }
-        this._endStreamPlane();
+        if (this._linkGeneration === link)
+            this._endStreamPlane();
         this._emitStatus('Streaming + logging stopped.');
     }
     // ---------------------------------------------------------------------------
@@ -17587,19 +17604,37 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._log('Write', u8);
         await this._transport.write(u8);
     }
+    /**
+     * {@link _write} on the link `link`, failing at once if that link is reset
+     * before the write settles. A transport can hold a write as its link goes
+     * down, and one that settled only when the old transport let go resumed its
+     * caller's cleanup against whatever link had replaced it by then: a held
+     * START_STREAMING ended the next link's stream.
+     */
+    _writeOnLink(u8, link) {
+        const gone = () => new Error('The link was reset while the command was being sent');
+        if (link !== this._linkGeneration)
+            return Promise.reject(gone());
+        return new Promise((resolve, reject) => {
+            const onReset = () => reject(gone());
+            this._linkWaiters.add(onReset);
+            this._write(u8).then(() => {
+                this._linkWaiters.delete(onReset);
+                resolve();
+            }, (e) => {
+                this._linkWaiters.delete(onReset);
+                reject(e);
+            });
+        });
+    }
     async _writeExpectingAck(u8, ackTimeoutMs = 1000) {
         const link = this._linkGeneration;
         this._expectingAck++;
         try {
-            await this._write(u8);
             /* The write is asynchronous, and the link can be reset while it is
-             * pending. The command then went to a link that is gone, and no ACK for
-             * it is coming on the next one - a waiter registered now would see the
-             * next link's generation, pass as current, and take that link's ACK and
-             * reply. */
-            if (this._linkGeneration !== link) {
-                throw new Error('The link was reset while the command was being sent');
-            }
+             * pending: the command then went to a link that is gone, and no ACK for
+             * it is coming on the next one. */
+            await this._writeOnLink(u8, link);
             return await this._waitForAck(ackTimeoutMs, link);
         }
         catch (e) {
