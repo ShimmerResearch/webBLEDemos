@@ -14444,6 +14444,13 @@
              */
             this._dataRateTestLastRxAt = 0;
             /**
+             * Chunks received while a data-rate test owned the link. The stop's ACK wait
+             * asks whether this has moved since the stop went out, rather than comparing
+             * arrival times: `Date.now()` counts whole milliseconds, and the ACK can land
+             * in the one the stop was sent in.
+             */
+            this._dataRateTestRxCount = 0;
+            /**
              * The last {@link DATA_RATE_TAIL_BYTES} raw bytes received while a data-rate
              * test owned the link, CRC trailers included. Enough to see the stream's last
              * test packets and the stop's ACK packet behind them: see
@@ -14456,6 +14463,8 @@
              * started on is gone.
              */
             this._linkGeneration = 0;
+            /** How to fail each waiter registered by {@link _onLinkTemp}, until it settles. */
+            this._linkWaiters = new Set();
             /** Candidate alignments the timestamp check has rejected since the last lock. */
             this._streamAlignRejects = 0;
             /** Frames whose CRC failed since streaming last started. */
@@ -14624,6 +14633,7 @@
                 let bytes = chunk;
                 if (this._dataRateTestActive && bytes.length > 0) {
                     this._dataRateTestLastRxAt = Date.now();
+                    this._dataRateTestRxCount++;
                     const tail = this._dataRateTestTail;
                     for (let i = Math.max(0, bytes.length - DATA_RATE_TAIL_BYTES); i < bytes.length; i++) {
                         tail.push(bytes[i]);
@@ -15155,8 +15165,8 @@
             this._dataRateTestActive = false;
             /* ACK accounting is per link as well. A command pending when the link went
              * has no ACK coming on the next one, and a count or remainder left over
-             * from it would be taken as the next link's: its waiter gives up instead
-             * (see _waitForAck), and the count starts again from zero. */
+             * from it would be taken as the next link's: the count starts again from
+             * zero, and the command's waiter is failed below. */
             this._expectingAck = 0;
             this._lastAckRemainder = null;
             /* And the count of status reads in flight: one stranded on the old link
@@ -15171,6 +15181,15 @@
             this._sdWindowFail?.(this._linkResetError('SD data'));
             this._sdRx = new Uint8Array(0);
             this._linkGeneration++;
+            /* Last, every waiter on the temp plane (see _onLinkTemp). Each was
+             * registered for the old link, and the reply it is waiting for is not
+             * coming on this one. Left to fail at the next link's traffic, or at their
+             * own timeouts, they kept `_temps` non-empty, which runFactoryTest reads as
+             * a command still in flight. */
+            const waiters = [...this._linkWaiters];
+            this._linkWaiters.clear();
+            for (const fail of waiters)
+                fail();
         }
         /**
          * Forget everything read off the device about how to calibrate it.
@@ -15632,7 +15651,7 @@
                 return acc;
             return new Promise((resolve, reject) => {
                 const t = setTimeout(() => {
-                    this._offTemp(handler);
+                    off();
                     /* Reject rather than parse what did arrive: a truncated inquiry
                      * response is indistinguishable from a valid one describing fewer
                      * channels, and guessing wrong costs the whole streaming session. */
@@ -15644,12 +15663,6 @@
                 const handler = (chunk) => {
                     if (!chunk || chunk.length === 0)
                         return;
-                    if (this._linkGeneration !== link) {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        reject(this._linkResetError('the inquiry response'));
-                        return;
-                    }
                     /* Every chunk from here is continuation payload — deliberately NOT
                      * filtering a lone 0xFF as a stray ACK, because a channel id can be
                      * 0xFF and dropping it would misalign every later channel. This
@@ -15658,11 +15671,14 @@
                     acc = concatU8(acc, chunk);
                     if (isComplete(acc)) {
                         clearTimeout(t);
-                        this._offTemp(handler);
+                        off();
                         resolve(acc);
                     }
                 };
-                this._onTemp(handler);
+                const off = this._onLinkTemp(link, handler, () => {
+                    clearTimeout(t);
+                    reject(this._linkResetError('the inquiry response'));
+                });
             });
         }
         // ---------------------------------------------------------------------------
@@ -15712,26 +15728,23 @@
             return new Promise((resolve, reject) => {
                 let buf = acc;
                 const t = setTimeout(() => {
-                    this._offTemp(handler);
+                    off();
                     reject(new Error(timeoutMessage));
                 }, timeoutMs);
                 const handler = (chunk) => {
                     if (!chunk || chunk.length === 0)
                         return;
-                    if (this._linkGeneration !== link) {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        reject(this._linkResetError('the rest of a response'));
-                        return;
-                    }
                     buf = concatU8(buf, chunk);
                     if (buf.length >= n) {
                         clearTimeout(t);
-                        this._offTemp(handler);
+                        off();
                         resolve(buf);
                     }
                 };
-                this._onTemp(handler);
+                const off = this._onLinkTemp(link, handler, () => {
+                    clearTimeout(t);
+                    reject(this._linkResetError('the rest of a response'));
+                });
             });
         }
         async _readLengthPrefixedResponse(cmd, respOpcode, expectedLen, label, headerBytes = 1, ackTimeoutMs = 1500, responseTimeoutMs = 2000, expectedOffset) {
@@ -15804,18 +15817,12 @@
              * raw payload bytes with no opcode of their own. */
             return new Promise((resolve, reject) => {
                 const t = setTimeout(() => {
-                    this._offTemp(handler);
+                    off();
                     reject(new Error(`${label} returned ${dataOf(acc).length} of ${want} bytes (response truncated).`));
                 }, responseTimeoutMs);
                 const handler = (chunk) => {
                     if (!chunk || chunk.length === 0)
                         return;
-                    if (this._linkGeneration !== link) {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        reject(this._linkResetError(`the rest of the ${label} response`));
-                        return;
-                    }
                     /* Every chunk from here is continuation payload — deliberately NOT
                      * filtering a lone 0xFF as a stray ACK, because a payload byte can be
                      * 0xFF and dropping it would silently corrupt the record. The ACK for
@@ -15826,11 +15833,14 @@
                     const data = dataOf(acc);
                     if (data.length >= want) {
                         clearTimeout(t);
-                        this._offTemp(handler);
+                        off();
                         resolve(data.slice(0, want));
                     }
                 };
-                this._onTemp(handler);
+                const off = this._onLinkTemp(link, handler, () => {
+                    clearTimeout(t);
+                    reject(this._linkResetError(`the rest of the ${label} response`));
+                });
             });
         }
         async readInfoMem(address, length) {
@@ -17612,23 +17622,12 @@
         _waitForAck(timeoutMs = 1000, link = this._linkGeneration) {
             return new Promise((resolve, reject) => {
                 const t = setTimeout(() => {
-                    this._offTemp(handler);
+                    off();
                     reject(new Error('ACK timeout'));
                 }, timeoutMs);
                 const handler = (chunk) => {
                     if (!chunk || chunk.length === 0)
                         return;
-                    /* Left over from a link that has since been reset. Everything arriving
-                     * now is the next link's, and taking it - its ACK, and with it the
-                     * response coalesced behind, which the remainder hand-off below gives
-                     * to whichever waiter runs first - starved that link's own waiter:
-                     * a readFwVersion straight after a reconnect timed out. */
-                    if (this._linkGeneration !== link) {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        reject(this._linkResetError('the ACK'));
-                        return;
-                    }
                     // A NACK is the firmware's answer, so stop waiting for one that is not
                     // coming. Several commands are refused outright while the device is
                     // sensing (`ShimBt_isCmdBlockedWhileSensing`), and "NACK received" says
@@ -17638,13 +17637,13 @@
                     // one, and stream bytes never reach the control fan-out at all.
                     if (chunk[0] === OPCODES.NACK_COMMAND_PROCESSED) {
                         clearTimeout(t);
-                        this._offTemp(handler);
+                        off();
                         reject(new Error('NACK received'));
                         return;
                     }
                     if (chunk.length === 1 && chunk[0] === OPCODES.ACK_COMMAND_PROCESSED) {
                         clearTimeout(t);
-                        this._offTemp(handler);
+                        off();
                         const rem = this._lastAckRemainder;
                         this._lastAckRemainder = null;
                         resolve(rem ?? null);
@@ -17652,15 +17651,27 @@
                     }
                     if (chunk[0] === OPCODES.ACK_COMMAND_PROCESSED && chunk.length > 1) {
                         clearTimeout(t);
-                        this._offTemp(handler);
+                        off();
                         resolve(chunk.slice(1));
                     }
                 };
-                this._onTemp(handler);
+                /* Bound to its link. A waiter left over from a link since reset used to
+                 * take the next link's ACK - and with it the response coalesced behind,
+                 * which the remainder hand-off above gives to whichever waiter runs
+                 * first - and starve that link's own waiter: a readFwVersion straight
+                 * after a reconnect timed out. */
+                const off = this._onLinkTemp(link, handler, () => {
+                    clearTimeout(t);
+                    reject(this._linkResetError('the ACK'));
+                });
             });
         }
         /** @param link as for {@link Shimmer3RClient._waitForAck}: read before the command's write. */
         _waitForResponse(expectedOpcode, timeoutMs = 1500, link = this._linkGeneration) {
+            // On a link already gone, before the next link's remainder can be taken
+            if (link !== this._linkGeneration) {
+                return Promise.reject(this._linkResetError('the response'));
+            }
             if (this._lastAckRemainder && this._lastAckRemainder[0] === expectedOpcode) {
                 const rem = this._lastAckRemainder;
                 this._lastAckRemainder = null;
@@ -17668,20 +17679,12 @@
             }
             return new Promise((resolve, reject) => {
                 const t = setTimeout(() => {
-                    this._offTemp(handler);
+                    off();
                     reject(new Error('Response timeout'));
                 }, timeoutMs);
                 const handler = (chunk) => {
                     if (!chunk || chunk.length === 0)
                         return;
-                    // A waiter from a link since reset: the reply arriving now answers the
-                    // next link's command, not this one (see _waitForAck)
-                    if (this._linkGeneration !== link) {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        reject(this._linkResetError('the response'));
-                        return;
-                    }
                     // The expected opcode first, so a reply is never mistaken for framing;
                     // then the same message with a stray ACK stepped over. Resolving with
                     // the stripped buffer is what lets every caller keep reading its reply
@@ -17689,11 +17692,14 @@
                     const msg = chunk[0] === expectedOpcode ? chunk : withoutLeadingAck(chunk);
                     if (msg[0] === expectedOpcode) {
                         clearTimeout(t);
-                        this._offTemp(handler);
+                        off();
                         resolve(msg);
                     }
                 };
-                this._onTemp(handler);
+                const off = this._onLinkTemp(link, handler, () => {
+                    clearTimeout(t);
+                    reject(this._linkResetError('the response'));
+                });
             });
         }
         /**
@@ -17713,6 +17719,10 @@
             const matches = (c) => c.length >= 2 + payloadLen && c[0] === OPCODES.INSTREAM_CMD_RESPONSE && c[1] === subOpcode;
             /** The instream message a chunk carries, past any stray ACK in front. */
             const message = (c) => c[0] === OPCODES.INSTREAM_CMD_RESPONSE ? c : withoutLeadingAck(c);
+            // On a link already gone, before the next link's remainder can be taken
+            if (link !== this._linkGeneration) {
+                return Promise.reject(this._linkResetError(`instream response 0x${hex2$1(subOpcode)}`));
+            }
             // BLE packs [0xFF][0x8A][0x71]… into a single notification, so the reply may
             // already be sitting in the ACK's remainder — the same synchronous hand-over
             // `_waitForResponse` performs for a plain opcode. Without this the message
@@ -17724,36 +17734,56 @@
             }
             return new Promise((resolve, reject) => {
                 const t = setTimeout(() => {
-                    this._offTemp(handler);
+                    off();
                     reject(new Error(`Instream response 0x${hex2$1(subOpcode)} timeout`));
                 }, timeoutMs);
                 const handler = (chunk) => {
                     if (!chunk)
                         return;
-                    if (this._linkGeneration !== link) {
-                        clearTimeout(t);
-                        this._offTemp(handler);
-                        reject(this._linkResetError(`instream response 0x${hex2$1(subOpcode)}`));
-                        return;
-                    }
                     const msg = message(chunk);
                     if (!matches(msg))
                         return;
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     resolve(msg);
                 };
-                this._onTemp(handler);
+                const off = this._onLinkTemp(link, handler, () => {
+                    clearTimeout(t);
+                    reject(this._linkResetError(`instream response 0x${hex2$1(subOpcode)}`));
+                });
             });
         }
         /**
-         * What a waiter fails with when its link is reset under it. Every waiter on
-         * the temp plane notes the link it was registered on and, on a later link's
-         * traffic, gives up with this instead of taking it: a command stranded by a
-         * drop must not acknowledge, or answer, the next link's commands.
+         * What a waiter fails with when its link is reset under it: a command
+         * stranded by a drop must not acknowledge, or answer, the next link's
+         * commands. See {@link _onLinkTemp}.
          */
         _linkResetError(what) {
             return new Error(`The link was reset while waiting for ${what}`);
+        }
+        /**
+         * Register `handler` on the temp plane for the link `link`. When that link
+         * is reset, {@link _resetLinkProtocolState} removes the handler and calls
+         * `fail`, which must clear the waiter's timer and reject it. A waiter whose
+         * link has already gone fails at once.
+         *
+         * @returns the waiter's own unregister, for its other settle paths.
+         */
+        _onLinkTemp(link, handler, fail) {
+            if (link !== this._linkGeneration) {
+                fail();
+                return () => undefined;
+            }
+            const onReset = () => {
+                this._offTemp(handler);
+                fail();
+            };
+            this._onTemp(handler);
+            this._linkWaiters.add(onReset);
+            return () => {
+                this._offTemp(handler);
+                this._linkWaiters.delete(onReset);
+            };
         }
         _onTemp(fn) {
             this._temps.add(fn);
@@ -17941,11 +17971,12 @@
                 if (counting)
                     bytes += chunk.length;
             };
-            this._onTemp(counter);
+            const link = this._linkGeneration;
+            // A reset removes it at once; the loop below then sees the generation move
+            const offCounter = this._onLinkTemp(link, counter, () => undefined);
             // Before the start command: bytes a previous test left behind (a classic
             // link can hold its last chunk until the host next sends) must not reach
             // the stream parser either.
-            const link = this._linkGeneration;
             const linkGone = () => new Error('The link was reset during the data-rate test');
             this._dataRateTestActive = true;
             this._dataRateTestLastRxAt = Date.now();
@@ -17975,7 +18006,7 @@
                 };
             }
             finally {
-                this._offTemp(counter);
+                offCounter();
                 /* On a link that has since been reset there is nothing to stop or hand
                  * back: the reset already cleared the flag, and the buffers now belong to
                  * the new link. */
@@ -18036,7 +18067,7 @@
          * tests.
          */
         async _stopDataRateTest(link) {
-            const stopSentAt = Date.now();
+            const rxAtStop = this._dataRateTestRxCount;
             let settled = false;
             const ack = this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 0]), 2000).then(() => undefined, () => undefined);
             void ack.then(() => {
@@ -18046,7 +18077,7 @@
                 await new Promise((r) => setTimeout(r, 20));
                 if (!settled &&
                     this._expectingAck > 0 &&
-                    this._dataRateTestLastRxAt > stopSentAt &&
+                    this._dataRateTestRxCount > rxAtStop &&
                     Date.now() - this._dataRateTestLastRxAt >= DATA_RATE_STOP_ACK_QUIET_MS &&
                     this._dataRateStopAckEndsStream()) {
                     this._log('Data-rate test: the stop ACK ended the stream inside a test packet; taking it');

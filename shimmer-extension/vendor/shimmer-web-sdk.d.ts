@@ -9367,6 +9367,13 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _dataRateTestLastRxAt;
     /**
+     * Chunks received while a data-rate test owned the link. The stop's ACK wait
+     * asks whether this has moved since the stop went out, rather than comparing
+     * arrival times: `Date.now()` counts whole milliseconds, and the ACK can land
+     * in the one the stop was sent in.
+     */
+    private _dataRateTestRxCount;
+    /**
      * The last {@link DATA_RATE_TAIL_BYTES} raw bytes received while a data-rate
      * test owned the link, CRC trailers included. Enough to see the stream's last
      * test packets and the stop's ACK packet behind them: see
@@ -9379,6 +9386,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * started on is gone.
      */
     private _linkGeneration;
+    /** How to fail each waiter registered by {@link _onLinkTemp}, until it settles. */
+    private readonly _linkWaiters;
     /** Candidate alignments the timestamp check has rejected since the last lock. */
     private _streamAlignRejects;
     /** Frames whose CRC failed since streaming last started. */
@@ -10651,12 +10660,20 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _waitForInstreamResponse;
     /**
-     * What a waiter fails with when its link is reset under it. Every waiter on
-     * the temp plane notes the link it was registered on and, on a later link's
-     * traffic, gives up with this instead of taking it: a command stranded by a
-     * drop must not acknowledge, or answer, the next link's commands.
+     * What a waiter fails with when its link is reset under it: a command
+     * stranded by a drop must not acknowledge, or answer, the next link's
+     * commands. See {@link _onLinkTemp}.
      */
     private _linkResetError;
+    /**
+     * Register `handler` on the temp plane for the link `link`. When that link
+     * is reset, {@link _resetLinkProtocolState} removes the handler and calls
+     * `fail`, which must clear the waiter's timer and reject it. A waiter whose
+     * link has already gone fails at once.
+     *
+     * @returns the waiter's own unregister, for its other settle paths.
+     */
+    private _onLinkTemp;
     private _onTemp;
     private _offTemp;
     private _emitTemp;
