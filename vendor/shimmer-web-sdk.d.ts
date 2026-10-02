@@ -9367,11 +9367,12 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _dataRateTestLastRxAt;
     /**
-     * The last byte received while a data-rate test owned the link, or -1. After
-     * the stop, a quiet link whose last byte is 0xFF has delivered the stop ACK:
-     * see {@link _stopDataRateTest}.
+     * The last {@link DATA_RATE_TAIL_BYTES} raw bytes received while a data-rate
+     * test owned the link, CRC trailers included. Enough to see the stream's last
+     * test packets and the stop's ACK packet behind them: see
+     * {@link _dataRateStopAckEndsStream}.
      */
-    private _dataRateTestLastByte;
+    private _dataRateTestTail;
     /**
      * Bumped by every {@link _resetLinkProtocolState}, so work that outlives a
      * link - a data-rate test waiting out its duration - can tell the link it
@@ -10737,18 +10738,45 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * rather than the start. Either way the wait timed out, and every classic
      * speed test took 2 s longer than it needed to.
      *
-     * The ACK is always the last byte, though, and a test stream never ends in
-     * 0xFF on its own: every packet's last byte is the top byte of its counter,
-     * 0x00. So once the link has gone quiet after the stop and its last byte was
-     * 0xFF, that byte was the ACK, and the wait is completed the way the ACK path
-     * would have completed it. A stop ACK that never comes - the module holding
-     * it back - still waits out the timeout.
+     * The ACK packet is always the last thing on the link, though. So once the
+     * link has gone quiet after the stop, and the stream's structure shows its
+     * end is the ACK packet rather than test data
+     * ({@link _dataRateStopAckEndsStream}), the wait is completed the way the ACK
+     * path would have completed it. When the structure cannot tell - or no ACK
+     * comes, a module holding it back - the wait still runs to its timeout.
      *
      * HARDWARE-VERIFY: run on a Shimmer3R over classic SPP (transparent bridge,
-     * module v1.4.16.16). The BLE case - the ACK ending a notification - has run
-     * only against the loopback tests.
+     * module v1.4.16.16), with the link CRC off, one-byte and two-byte. The BLE
+     * case - the ACK ending a notification - has run only against the loopback
+     * tests.
      */
     private _stopDataRateTest;
+    /**
+     * Whether the data-rate test stream, as received, ends in the stop's ACK
+     * packet rather than in test data.
+     *
+     * The stream's last bytes have to be exactly the ACK packet this link's CRC
+     * mode sends: `0xFF`, then its CRC when one is on. Test packets carry no CRC,
+     * so with a CRC on the last raw byte is the ACK's CRC, not `0xFF`.
+     *
+     * That alone is not proof. A cut packet's counter bytes can also be `0xFF`
+     * (`a5 ff` is a valid aborted tail), so the candidate `0xFF` has to sit where
+     * test data could not have put one. Test packets are `0xA5` followed by a
+     * little-endian counter that steps by one per packet. So the last complete
+     * packet predicts every byte of the one after it:
+     *
+     * - **The candidate starts a packet** (the stream ended on a packet boundary).
+     *   Only `0xA5` can be data there, so it is the ACK.
+     * - **The candidate falls inside a cut packet.** The cut packet's received
+     *   bytes must be the predicted counter's, and the candidate is the ACK only
+     *   when the predicted byte at its position is not `0xFF`. When it is, data
+     *   and ACK look alike, and this returns false: the wait then runs out its
+     *   timeout, as it always did.
+     *
+     * Anything that does not fit this structure - garbage, or too few packets to
+     * check against - also returns false.
+     */
+    private _dataRateStopAckEndsStream;
     /**
      * What the factory-test runner is doing: `idle` when the link is free,
      * `running` while the report is being captured, `draining` while a cancelled
