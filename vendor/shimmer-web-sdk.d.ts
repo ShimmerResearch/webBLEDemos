@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-declare const SDK_VERSION = "0.5.0";
+declare const SDK_VERSION = "0.5.1";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
@@ -9338,6 +9338,22 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * request lives in {@link _desiredCrcMode} and is re-established on connect.
      */
     private _crcMode;
+    /**
+     * True while {@link runDataRateTest} owns the link. Every received chunk then
+     * goes to the test's byte counter and nowhere else, except an ACK that a
+     * command is waiting for, which still takes the normal path so the start and
+     * stop ACKs are recognised.
+     *
+     * Without this, a framed transport (BLE) delivered the test stream exactly as
+     * the module cut it into notifications, and since the counter's high bytes
+     * are 0x00 most notifications started with the DATA_PACKET opcode. Once a
+     * stream schema existed they were handed to the stream aligner: it flooded
+     * "Frame timing does not match" (about 130 times in a 5 s test on the bench)
+     * and could deliver test bytes to onStreamFrame as samples. A reframed link -
+     * classic, or BLE with a link CRC on - was never affected, because there the
+     * framer hands over whole 0xA5 test packets.
+     */
+    private _dataRateTestActive;
     /** Candidate alignments the timestamp check has rejected since the last lock. */
     private _streamAlignRejects;
     /** Frames whose CRC failed since streaming last started. */
