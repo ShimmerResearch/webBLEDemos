@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.5.1';
+const SDK_VERSION = '0.5.2';
 
 /**
  * Container for a single decoded sensor frame.
@@ -9086,12 +9086,13 @@ function parseBluetoothModuleVersion(raw) {
  * Which pressure part a Shimmer3R carries, when the sensor will not say.
  *
  * The in-band answer is the 0xA7 reply's sensor id (see `./types.ts`), but two
- * places have no such reply to read. An SD-log file carries no sensor id at
- * all — for a BMP581 the firmware simply leaves the header's calibration
- * region unwritten (`SDCard/shimmer_sd_header.c:209-215`) — and a
- * LogAndStream_Shimmer3R v1.01.006 NACKs 0xA7 on a BMP581. Both fall back to
- * the rule the firmware itself uses when the chip id cannot be read: the
- * board's SR number.
+ * places have no such reply to read. An SD-log file from before
+ * LogAndStream_Shimmer3R v1.01.018 carries no sensor id at all — for a BMP581
+ * the firmware simply leaves the header's calibration region unwritten
+ * (`SDCard/shimmer_sd_header.c:209-215`); later files record it in header byte
+ * 224 (DEV-1123, `sdlog/header.ts`) — and a LogAndStream_Shimmer3R v1.01.006
+ * NACKs 0xA7 on a BMP581. Both fall back to the rule the firmware itself uses
+ * when the chip id cannot be read: the board's SR number.
  */
 /** The first firmware that drives a BMP581: LogAndStream_Shimmer3R v1.01.006. */
 const BMP581_MIN_FIRMWARE = Object.freeze({ major: 1, minor: 1, internal: 6 });
@@ -14276,6 +14277,21 @@ const STREAM_ALIGN_MAX_REJECTS = 256;
  * that is where nothing else is checking.
  */
 const STREAM_MAX_FRAME_TICKS = 32768;
+/**
+ * How long the link must stay quiet after a data-rate test's stop before its
+ * end is checked for the stop's ACK packet - `0xFF`, plus the CRC trailer when a
+ * link CRC is on - in a position the stream's structure rules out as test data
+ * (see `_dataRateStopAckEndsStream`). The ACK follows the last test byte within
+ * milliseconds (bench: 22 ms after the stop, classic SPP), so this only has to
+ * outlast the gap between two arrivals.
+ */
+const DATA_RATE_STOP_ACK_QUIET_MS = 50;
+/**
+ * Raw bytes kept from the end of a data-rate test stream: the stop's ACK packet
+ * (up to 3 bytes with a 2-byte CRC), a cut packet (up to 4) and the two
+ * complete packets before it (10) that fix the alignment, with room to spare.
+ */
+const DATA_RATE_TAIL_BYTES = 24;
 // ---------------------------------------------------------------------------
 // Stray-ACK tolerance
 // ---------------------------------------------------------------------------
@@ -14414,16 +14430,35 @@ class Shimmer3RClient extends BaseShimmerClient {
          */
         this._dataRateTestActive = false;
         /**
-         * When the last byte was diverted to a data-rate test. The test hands the
-         * link back only once this has gone quiet: see {@link runDataRateTest}.
+         * When the last byte arrived while a data-rate test owned the link. The test
+         * hands the link back only once this has gone quiet: see
+         * {@link runDataRateTest}. Kept at the transport entry,
+         * {@link _handleNotify}, so it sees every byte, including those a reframing
+         * accumulator is still holding.
          */
         this._dataRateTestLastRxAt = 0;
+        /**
+         * Chunks received while a data-rate test owned the link. The stop's ACK wait
+         * asks whether this has moved since the stop went out, rather than comparing
+         * arrival times: `Date.now()` counts whole milliseconds, and the ACK can land
+         * in the one the stop was sent in.
+         */
+        this._dataRateTestRxCount = 0;
+        /**
+         * The last {@link DATA_RATE_TAIL_BYTES} raw bytes received while a data-rate
+         * test owned the link, CRC trailers included. Enough to see the stream's last
+         * test packets and the stop's ACK packet behind them: see
+         * {@link _dataRateStopAckEndsStream}.
+         */
+        this._dataRateTestTail = [];
         /**
          * Bumped by every {@link _resetLinkProtocolState}, so work that outlives a
          * link - a data-rate test waiting out its duration - can tell the link it
          * started on is gone.
          */
         this._linkGeneration = 0;
+        /** How to fail each waiter registered by {@link _onLinkTemp}, until it settles. */
+        this._linkWaiters = new Set();
         /** Candidate alignments the timestamp check has rejected since the last lock. */
         this._streamAlignRejects = 0;
         /** Frames whose CRC failed since streaming last started. */
@@ -14590,6 +14625,16 @@ class Shimmer3RClient extends BaseShimmerClient {
         };
         this._handleNotify = (chunk) => {
             let bytes = chunk;
+            if (this._dataRateTestActive && bytes.length > 0) {
+                this._dataRateTestLastRxAt = Date.now();
+                this._dataRateTestRxCount++;
+                const tail = this._dataRateTestTail;
+                for (let i = Math.max(0, bytes.length - DATA_RATE_TAIL_BYTES); i < bytes.length; i++) {
+                    tail.push(bytes[i]);
+                }
+                if (tail.length > DATA_RATE_TAIL_BYTES)
+                    tail.splice(0, tail.length - DATA_RATE_TAIL_BYTES);
+            }
             if (this._factoryTest) {
                 const rest = this._factoryTest.feed(bytes);
                 if (!rest || rest.length === 0)
@@ -14607,7 +14652,6 @@ class Shimmer3RClient extends BaseShimmerClient {
             // A data-rate test owns the link: see _dataRateTestActive.
             if (this._dataRateTestActive &&
                 !(chunk[0] === OPCODES.ACK_COMMAND_PROCESSED && (this._expectingAck ?? 0) > 0)) {
-                this._dataRateTestLastRxAt = Date.now();
                 this._emitTemp(chunk);
                 return;
             }
@@ -14665,7 +14709,6 @@ class Shimmer3RClient extends BaseShimmerClient {
                         /* Test packets behind the start ACK, or behind a counter byte taken
                          * for the stop ACK. Test traffic, never a status push, whatever its
                          * first byte. */
-                        this._dataRateTestLastRxAt = Date.now();
                         this._emitTemp(this._lastAckRemainder);
                     }
                     else {
@@ -14821,6 +14864,8 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._sdUsers = 0;
         this._sdHandlerAttached = false;
         this._sdExpect = null;
+        /** Fails the SD read window in flight, if there is one: see _resetLinkProtocolState. */
+        this._sdWindowFail = null;
         this._sdFrameListener = null;
         this._sdCrcErrorListener = null;
         this._sdKnownSession = null;
@@ -14966,6 +15011,11 @@ class Shimmer3RClient extends BaseShimmerClient {
          * both the connect log and every frame's deviceId. Clearing it also makes
          * the field's own docblock true for injected transports. */
         this.device = null;
+        /* So do the previous transport's subscriptions. After a drop nothing else
+         * removes them, and a late notification or disconnect event from that
+         * transport would be taken as this link's. */
+        this._notifyUnsub?.();
+        this._disconnectUnsub?.();
         this._armDisconnectNotification();
         this._notifyUnsub = t.onNotify(this._handleNotify);
         this._disconnectUnsub = t.onDisconnect(this._handleTransportDisconnect);
@@ -15107,7 +15157,33 @@ class Shimmer3RClient extends BaseShimmerClient {
          * stream data included - to it would hide that link from everything else.
          * runDataRateTest sees the generation move and gives up. */
         this._dataRateTestActive = false;
+        /* ACK accounting is per link as well. A command pending when the link went
+         * has no ACK coming on the next one, and a count or remainder left over
+         * from it would be taken as the next link's: the count starts again from
+         * zero, and the command's waiter is failed below. */
+        this._expectingAck = 0;
+        this._lastAckRemainder = null;
+        /* And the count of status reads in flight: one stranded on the old link
+         * would keep the next link's status pushes from being reported. */
+        this._statusReadsInFlight = 0;
+        /* So is SD work. A command or read window in flight was answering the old
+         * link: fail it now, rather than let the next link's replies complete it or
+         * leave its slot refusing every new SD command until it timed out. */
+        const sdExpect = this._sdExpect;
+        this._sdExpect = null;
+        sdExpect?.reject(this._linkResetError('the SD response'));
+        this._sdWindowFail?.(this._linkResetError('SD data'));
+        this._sdRx = new Uint8Array(0);
         this._linkGeneration++;
+        /* Last, every waiter on the temp plane (see _onLinkTemp). Each was
+         * registered for the old link, and the reply it is waiting for is not
+         * coming on this one. Left to fail at the next link's traffic, or at their
+         * own timeouts, they kept `_temps` non-empty, which runFactoryTest reads as
+         * a command still in flight. */
+        const waiters = [...this._linkWaiters];
+        this._linkWaiters.clear();
+        for (const fail of waiters)
+            fail();
     }
     /**
      * Forget everything read off the device about how to calibrate it.
@@ -15453,6 +15529,7 @@ class Shimmer3RClient extends BaseShimmerClient {
     async readPressureCalibration(timeoutMs = 2000) {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
+        const link = this._linkGeneration;
         try {
             const payload = await this._readLengthPrefixedResponse(new Uint8Array([OPCODES.GET_PRESSURE_CALIBRATION_COEFFICIENTS_COMMAND]), OPCODES.PRESSURE_CALIBRATION_COEFFICIENTS_RESPONSE, 'declared', 'Pressure calibration read', 1, 1500, timeoutMs);
             const calibration = parsePressureCalibrationResponse(payload);
@@ -15466,6 +15543,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             return calibration;
         }
         catch (err) {
+            /* A reset under the read says nothing about the firmware, and the
+             * calibration held now, if any, is the next device's. */
+            if (this._linkGeneration !== link)
+                return null;
             this._pressureCalibration = null;
             this._emitStatus('This firmware does not serve GET_PRESSURE_CALIBRATION_COEFFICIENTS (0xA7), so ' +
                 `PRESSURE and TEMPERATURE stream raw-only (${err.message}).`);
@@ -15534,8 +15615,9 @@ class Shimmer3RClient extends BaseShimmerClient {
     /** Send INQUIRY_CMD and parse the response to build the stream schema. */
     async inquiry() {
         this._emitStatus('INQUIRY_CMD → waiting for ACK then RSP…');
+        const link = this._linkGeneration;
         const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.INQUIRY_COMMAND]), 1500);
-        const rsp = await this._readInquiryResponse(remainder, 2000);
+        const rsp = await this._readInquiryResponse(remainder, 2000, link);
         this._emitStatus(`Inquiry RSP (${rsp.length} bytes)`);
         const info = this._interpretInquiryResponseShimmer3R(rsp);
         this.onInquiry?.(info);
@@ -15558,17 +15640,17 @@ class Shimmer3RClient extends BaseShimmerClient {
      * @param seed the post-ACK remainder, when the module packed the start of the
      *   response in behind its own ACK; otherwise the response is awaited
      */
-    async _readInquiryResponse(seed, timeoutMs) {
+    async _readInquiryResponse(seed, timeoutMs, link = this._linkGeneration) {
         let acc = seed && seed[0] === OPCODES.INQUIRY_RESPONSE
             ? seed
-            : await this._waitForResponse(OPCODES.INQUIRY_RESPONSE, timeoutMs);
+            : await this._waitForResponse(OPCODES.INQUIRY_RESPONSE, timeoutMs, link);
         const isComplete = (buf) => buf.length >= INQUIRY_RSP_HEADER_BYTES &&
             buf.length >= INQUIRY_RSP_HEADER_BYTES + buf[INQUIRY_RSP_NUM_CHANNELS_OFFSET];
         if (isComplete(acc))
             return acc;
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
-                this._offTemp(handler);
+                off();
                 /* Reject rather than parse what did arrive: a truncated inquiry
                  * response is indistinguishable from a valid one describing fewer
                  * channels, and guessing wrong costs the whole streaming session. */
@@ -15588,12 +15670,16 @@ class Shimmer3RClient extends BaseShimmerClient {
                 acc = concatU8(acc, chunk);
                 if (isComplete(acc)) {
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     resolve(acc);
                 }
             };
-            this._onTemp(handler);
+            const off = this._onLinkTemp(link, handler, () => {
+                clearTimeout(t);
+                reject(this._linkResetError('the inquiry response'));
+            });
         });
+        return this._settledOnLink(settled, link, 'the inquiry response');
     }
     // ---------------------------------------------------------------------------
     // InfoMem
@@ -15630,19 +15716,19 @@ class Shimmer3RClient extends BaseShimmerClient {
     /**
      * Accumulate temp-plane chunks onto `acc` until it holds at least `n` bytes.
      *
-     * Resolves synchronously when it already does, so the common case costs
-     * nothing. Registers no handler in that case either, which matters: the
-     * caller carries straight on into its own handler with no gap in between,
-     * and chunks arrive as transport tasks rather than microtasks, so nothing
-     * can slip through the join.
+     * Resolves at once when it already does, so the common case costs nothing.
+     * Registers no handler in that case either, which matters: the caller
+     * carries straight on into its own handler with no gap in between, and
+     * chunks arrive as transport tasks rather than microtasks, so nothing can
+     * slip through the join.
      */
-    _awaitAtLeastBytes(acc, n, timeoutMs, timeoutMessage) {
+    _awaitAtLeastBytes(acc, n, timeoutMs, timeoutMessage, link = this._linkGeneration) {
         if (acc.length >= n)
-            return Promise.resolve(acc);
-        return new Promise((resolve, reject) => {
+            return this._settledOnLink(Promise.resolve(acc), link, 'the rest of a response');
+        const settled = new Promise((resolve, reject) => {
             let buf = acc;
             const t = setTimeout(() => {
-                this._offTemp(handler);
+                off();
                 reject(new Error(timeoutMessage));
             }, timeoutMs);
             const handler = (chunk) => {
@@ -15651,18 +15737,24 @@ class Shimmer3RClient extends BaseShimmerClient {
                 buf = concatU8(buf, chunk);
                 if (buf.length >= n) {
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     resolve(buf);
                 }
             };
-            this._onTemp(handler);
+            const off = this._onLinkTemp(link, handler, () => {
+                clearTimeout(t);
+                reject(this._linkResetError('the rest of a response'));
+            });
         });
+        return this._settledOnLink(settled, link, 'the rest of a response');
     }
     async _readLengthPrefixedResponse(cmd, respOpcode, expectedLen, label, headerBytes = 1, ackTimeoutMs = 1500, responseTimeoutMs = 2000, expectedOffset) {
+        // Before the write, so a reset at any later await is seen (see _waitForAck)
+        const link = this._linkGeneration;
         const remainder = await this._writeExpectingAck(cmd, ackTimeoutMs);
         const first = remainder && remainder[0] === respOpcode
             ? remainder
-            : await this._waitForResponse(respOpcode, responseTimeoutMs);
+            : await this._waitForResponse(respOpcode, responseTimeoutMs, link);
         /* Bytes after the response opcode. */
         let acc = first[0] === respOpcode ? first.subarray(1) : first;
         /* `'declared'` is for the responses whose length the host cannot know in
@@ -15680,7 +15772,7 @@ class Shimmer3RClient extends BaseShimmerClient {
              * perfectly well once the length is known. Throwing here instead made
              * that case fail outright, so wait for the byte and only give up if it
              * never comes. */
-            acc = await this._awaitAtLeastBytes(acc, 1, responseTimeoutMs, `${label} response carried no length byte.`);
+            acc = await this._awaitAtLeastBytes(acc, 1, responseTimeoutMs, `${label} response carried no length byte.`, link);
             want = acc[0];
             /* Checked against the same cap the byte-stream framer uses, and for the
              * same reason: a length beyond what the firmware can produce means the
@@ -15724,9 +15816,9 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
         /* Response is fragmented — collect the continuation chunks, which carry
          * raw payload bytes with no opcode of their own. */
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
-                this._offTemp(handler);
+                off();
                 reject(new Error(`${label} returned ${dataOf(acc).length} of ${want} bytes (response truncated).`));
             }, responseTimeoutMs);
             const handler = (chunk) => {
@@ -15742,12 +15834,16 @@ class Shimmer3RClient extends BaseShimmerClient {
                 const data = dataOf(acc);
                 if (data.length >= want) {
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     resolve(data.slice(0, want));
                 }
             };
-            this._onTemp(handler);
+            const off = this._onLinkTemp(link, handler, () => {
+                clearTimeout(t);
+                reject(this._linkResetError(`the rest of the ${label} response`));
+            });
         });
+        return this._settledOnLink(settled, link, `the rest of the ${label} response`);
     }
     async readInfoMem(address, length) {
         if (!this._transport)
@@ -16266,10 +16362,11 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
         const hostBeforeMs = Date.now();
+        const link = this._linkGeneration;
         const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_RWC_COMMAND]), 1500);
         const rsp = remainder && remainder[0] === OPCODES.RWC_RESPONSE
             ? remainder
-            : await this._waitForResponse(OPCODES.RWC_RESPONSE, 2000);
+            : await this._waitForResponse(OPCODES.RWC_RESPONSE, 2000, link);
         // Response is [RWC_RSP][8 bytes LSB-first]. Deliberately opcode-framed
         // ONLY (the firmware always opcode-frames the RWC response, and both paths
         // above select on the opcode): an opcode-less 8-byte chunk could be an
@@ -16580,10 +16677,11 @@ class Shimmer3RClient extends BaseShimmerClient {
         return done;
     }
     async _readOneCalibration(group, getOpcode, respOpcode, timeoutMs) {
+        const link = this._linkGeneration;
         const remainder = await this._writeExpectingAck(new Uint8Array([getOpcode]), timeoutMs);
         const rsp = remainder && remainder[0] === respOpcode
             ? remainder
-            : await this._waitForResponse(respOpcode, timeoutMs);
+            : await this._waitForResponse(respOpcode, timeoutMs, link);
         if (rsp.length < 22)
             return null; // opcode + 21-byte block
         const block = rsp.subarray(1, 22);
@@ -16812,6 +16910,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._emitStatus('Starting stream without schema (not recommended).');
         this._prepareStreamTimeline();
         this._emitStatus('START_STREAM → waiting for ACK…');
+        const link = this._linkGeneration;
         this._beginStreamPlane();
         try {
             const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_STREAMING_COMMAND]), 1500);
@@ -16826,7 +16925,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             }
         }
         catch (e) {
-            this._endStreamPlane();
+            // Not across a link reset, which closed this plane already: the stream
+            // plane is the next link's now
+            if (this._linkGeneration === link)
+                this._endStreamPlane();
             throw e;
         }
         this._emitStatus('START_STREAM ACK received; frames should follow');
@@ -16898,8 +17000,9 @@ class Shimmer3RClient extends BaseShimmerClient {
      */
     async stopStreaming() {
         this._emitStatus('STOP_STREAM → sending (no ACK wait)…');
+        const link = this._linkGeneration;
         try {
-            await this._write(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]));
+            await this._writeOnLink(new Uint8Array([OPCODES.STOP_STREAMING_COMMAND]), link);
             this._emitStatus('STOP_STREAM command sent (skipped ACK wait).');
         }
         catch (err) {
@@ -16911,8 +17014,9 @@ class Shimmer3RClient extends BaseShimmerClient {
            DATA_PACKET is still appended to `_rxBuf` while not streaming. So frames
            already in flight when the stop was sent get parsed with alignment still
            claimed, skipping acquisition entirely and accepting whatever offset they
-           happen to land on. */
-        this._endStreamPlane();
+           happen to land on. Not across a link reset, as in startStreaming. */
+        if (this._linkGeneration === link)
+            this._endStreamPlane();
         this._emitStatus('Streaming stopped.');
     }
     /** Start streaming AND SD card logging simultaneously. */
@@ -16921,6 +17025,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             this._emitStatus('Starting stream without schema (not recommended).');
         this._prepareStreamTimeline();
         this._emitStatus('START_BT_STREAM_SD_LOGGING → waiting for ACK…');
+        const link = this._linkGeneration;
         this._beginStreamPlane();
         try {
             const remainder = await this._writeExpectingAck(new Uint8Array([OPCODES.START_SDBT_COMMAND]), 1500);
@@ -16935,7 +17040,10 @@ class Shimmer3RClient extends BaseShimmerClient {
             }
         }
         catch (e) {
-            this._endStreamPlane();
+            // Not across a link reset, which closed this plane already: the stream
+            // plane is the next link's now
+            if (this._linkGeneration === link)
+                this._endStreamPlane();
             throw e;
         }
         this._emitStatus('START_BT_STREAM_SD_LOGGING ACK received; frames should follow');
@@ -16947,13 +17055,15 @@ class Shimmer3RClient extends BaseShimmerClient {
      */
     async stopStreamingAndLogging() {
         this._emitStatus('STOP_BT_STREAM_SD_LOGGING → sending…');
+        const link = this._linkGeneration;
         try {
-            await this._write(new Uint8Array([OPCODES.STOP_SDBT_COMMAND]));
+            await this._writeOnLink(new Uint8Array([OPCODES.STOP_SDBT_COMMAND]), link);
         }
         catch (err) {
             this._emitStatus(`STOP_BT_STREAM_SD_LOGGING write failed: ${err.message}`);
         }
-        this._endStreamPlane();
+        if (this._linkGeneration === link)
+            this._endStreamPlane();
         this._emitStatus('Streaming + logging stopped.');
     }
     // ---------------------------------------------------------------------------
@@ -17495,21 +17605,56 @@ class Shimmer3RClient extends BaseShimmerClient {
         this._log('Write', u8);
         await this._transport.write(u8);
     }
+    /**
+     * {@link _write} on the link `link`, failing at once if that link is reset
+     * before the write settles. A transport can hold a write as its link goes
+     * down, and one that settled only when the old transport let go resumed its
+     * caller's cleanup against whatever link had replaced it by then: a held
+     * START_STREAMING ended the next link's stream.
+     */
+    _writeOnLink(u8, link) {
+        const gone = () => new Error('The link was reset while the command was being sent');
+        if (link !== this._linkGeneration)
+            return Promise.reject(gone());
+        return new Promise((resolve, reject) => {
+            const onReset = () => reject(gone());
+            this._linkWaiters.add(onReset);
+            this._write(u8).then(() => {
+                this._linkWaiters.delete(onReset);
+                resolve();
+            }, (e) => {
+                this._linkWaiters.delete(onReset);
+                reject(e);
+            });
+        });
+    }
     async _writeExpectingAck(u8, ackTimeoutMs = 1000) {
+        const link = this._linkGeneration;
         this._expectingAck++;
         try {
-            await this._write(u8);
-            return await this._waitForAck(ackTimeoutMs);
+            /* The write is asynchronous, and the link can be reset while it is
+             * pending: the command then went to a link that is gone, and no ACK for
+             * it is coming on the next one. */
+            await this._writeOnLink(u8, link);
+            return await this._waitForAck(ackTimeoutMs, link);
         }
         catch (e) {
-            this._expectingAck = Math.max(0, this._expectingAck - 1);
+            // Not across a link reset, which has already zeroed the count: what is
+            // counted now belongs to the next link's commands
+            if (this._linkGeneration === link)
+                this._expectingAck = Math.max(0, this._expectingAck - 1);
             throw e;
         }
     }
-    _waitForAck(timeoutMs = 1000) {
-        return new Promise((resolve, reject) => {
+    /**
+     * @param link the link generation the command was written on, from the
+     *   caller: read here instead, after an awaited write, it could already be
+     *   the next link's.
+     */
+    _waitForAck(timeoutMs = 1000, link = this._linkGeneration) {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
-                this._offTemp(handler);
+                off();
                 reject(new Error('ACK timeout'));
             }, timeoutMs);
             const handler = (chunk) => {
@@ -17524,13 +17669,13 @@ class Shimmer3RClient extends BaseShimmerClient {
                 // one, and stream bytes never reach the control fan-out at all.
                 if (chunk[0] === OPCODES.NACK_COMMAND_PROCESSED) {
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     reject(new Error('NACK received'));
                     return;
                 }
                 if (chunk.length === 1 && chunk[0] === OPCODES.ACK_COMMAND_PROCESSED) {
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     const rem = this._lastAckRemainder;
                     this._lastAckRemainder = null;
                     resolve(rem ?? null);
@@ -17538,22 +17683,36 @@ class Shimmer3RClient extends BaseShimmerClient {
                 }
                 if (chunk[0] === OPCODES.ACK_COMMAND_PROCESSED && chunk.length > 1) {
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     resolve(chunk.slice(1));
                 }
             };
-            this._onTemp(handler);
+            /* Bound to its link. A waiter left over from a link since reset used to
+             * take the next link's ACK - and with it the response coalesced behind,
+             * which the remainder hand-off above gives to whichever waiter runs
+             * first - and starve that link's own waiter: a readFwVersion straight
+             * after a reconnect timed out. */
+            const off = this._onLinkTemp(link, handler, () => {
+                clearTimeout(t);
+                reject(this._linkResetError('the ACK'));
+            });
         });
+        return this._settledOnLink(settled, link, 'the ACK');
     }
-    _waitForResponse(expectedOpcode, timeoutMs = 1500) {
+    /** @param link as for {@link Shimmer3RClient._waitForAck}: read before the command's write. */
+    _waitForResponse(expectedOpcode, timeoutMs = 1500, link = this._linkGeneration) {
+        // On a link already gone, before the next link's remainder can be taken
+        if (link !== this._linkGeneration) {
+            return Promise.reject(this._linkResetError('the response'));
+        }
         if (this._lastAckRemainder && this._lastAckRemainder[0] === expectedOpcode) {
             const rem = this._lastAckRemainder;
             this._lastAckRemainder = null;
-            return Promise.resolve(rem);
+            return this._settledOnLink(Promise.resolve(rem), link, 'the response');
         }
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
-                this._offTemp(handler);
+                off();
                 reject(new Error('Response timeout'));
             }, timeoutMs);
             const handler = (chunk) => {
@@ -17566,12 +17725,16 @@ class Shimmer3RClient extends BaseShimmerClient {
                 const msg = chunk[0] === expectedOpcode ? chunk : withoutLeadingAck(chunk);
                 if (msg[0] === expectedOpcode) {
                     clearTimeout(t);
-                    this._offTemp(handler);
+                    off();
                     resolve(msg);
                 }
             };
-            this._onTemp(handler);
+            const off = this._onLinkTemp(link, handler, () => {
+                clearTimeout(t);
+                reject(this._linkResetError('the response'));
+            });
         });
+        return this._settledOnLink(settled, link, 'the response');
     }
     /**
      * Await an instream response — one of the messages the firmware answers
@@ -17584,11 +17747,16 @@ class Shimmer3RClient extends BaseShimmerClient {
      *   exact length: a Shimmer3 sends one status byte where a Shimmer3R sends
      *   two, and a caller that has not yet asked which it is talking to must not
      *   time out on the shorter answer.
+     * @param link as for {@link Shimmer3RClient._waitForAck}: read before the command's write.
      */
-    _waitForInstreamResponse(subOpcode, payloadLen, timeoutMs = 1500) {
+    _waitForInstreamResponse(subOpcode, payloadLen, timeoutMs = 1500, link = this._linkGeneration) {
         const matches = (c) => c.length >= 2 + payloadLen && c[0] === OPCODES.INSTREAM_CMD_RESPONSE && c[1] === subOpcode;
         /** The instream message a chunk carries, past any stray ACK in front. */
         const message = (c) => c[0] === OPCODES.INSTREAM_CMD_RESPONSE ? c : withoutLeadingAck(c);
+        // On a link already gone, before the next link's remainder can be taken
+        if (link !== this._linkGeneration) {
+            return Promise.reject(this._linkResetError(`instream response 0x${hex2$1(subOpcode)}`));
+        }
         // BLE packs [0xFF][0x8A][0x71]… into a single notification, so the reply may
         // already be sitting in the ACK's remainder — the same synchronous hand-over
         // `_waitForResponse` performs for a plain opcode. Without this the message
@@ -17596,11 +17764,11 @@ class Shimmer3RClient extends BaseShimmerClient {
         const rem = this._lastAckRemainder;
         if (rem && matches(rem)) {
             this._lastAckRemainder = null;
-            return Promise.resolve(rem);
+            return this._settledOnLink(Promise.resolve(rem), link, `instream response 0x${hex2$1(subOpcode)}`);
         }
-        return new Promise((resolve, reject) => {
+        const settled = new Promise((resolve, reject) => {
             const t = setTimeout(() => {
-                this._offTemp(handler);
+                off();
                 reject(new Error(`Instream response 0x${hex2$1(subOpcode)} timeout`));
             }, timeoutMs);
             const handler = (chunk) => {
@@ -17610,11 +17778,62 @@ class Shimmer3RClient extends BaseShimmerClient {
                 if (!matches(msg))
                     return;
                 clearTimeout(t);
-                this._offTemp(handler);
+                off();
                 resolve(msg);
             };
-            this._onTemp(handler);
+            const off = this._onLinkTemp(link, handler, () => {
+                clearTimeout(t);
+                reject(this._linkResetError(`instream response 0x${hex2$1(subOpcode)}`));
+            });
         });
+        return this._settledOnLink(settled, link, `instream response 0x${hex2$1(subOpcode)}`);
+    }
+    /**
+     * What a waiter fails with when its link is reset under it: a command
+     * stranded by a drop must not acknowledge, or answer, the next link's
+     * commands. See {@link _onLinkTemp}.
+     */
+    _linkResetError(what) {
+        return new Error(`The link was reset while waiting for ${what}`);
+    }
+    /**
+     * `p`, but failed instead if the link `link` has been reset by the time its
+     * result would reach the caller. A waiter settles, and leaves
+     * {@link _linkWaiters}, inside the notification that completes it; when the
+     * transport then reports the link down in that same turn, before any
+     * continuation has run, the reset cannot see it. Its result would then reach
+     * its caller after the next link had begun - a coalesced firmware-version
+     * reply refilled the version cache that connect() had just cleared.
+     */
+    async _settledOnLink(p, link, what) {
+        const value = await p;
+        if (this._linkGeneration !== link)
+            throw this._linkResetError(what);
+        return value;
+    }
+    /**
+     * Register `handler` on the temp plane for the link `link`. When that link
+     * is reset, {@link _resetLinkProtocolState} removes the handler and calls
+     * `fail`, which must clear the waiter's timer and reject it. A waiter whose
+     * link has already gone fails at once.
+     *
+     * @returns the waiter's own unregister, for its other settle paths.
+     */
+    _onLinkTemp(link, handler, fail) {
+        if (link !== this._linkGeneration) {
+            fail();
+            return () => undefined;
+        }
+        const onReset = () => {
+            this._offTemp(handler);
+            fail();
+        };
+        this._onTemp(handler);
+        this._linkWaiters.add(onReset);
+        return () => {
+            this._offTemp(handler);
+            this._linkWaiters.delete(onReset);
+        };
     }
     _onTemp(fn) {
         this._temps.add(fn);
@@ -17641,10 +17860,11 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
         const cmd = new Uint8Array([OPCODES.GET_DEVICE_VERSION_COMMAND]);
+        const link = this._linkGeneration;
         const ackRemainder = await this._writeExpectingAck(cmd, 1500);
         const rsp = ackRemainder && ackRemainder[0] === OPCODES.DEVICE_VERSION_RESPONSE
             ? ackRemainder
-            : await this._waitForResponse(OPCODES.DEVICE_VERSION_RESPONSE, 1500);
+            : await this._waitForResponse(OPCODES.DEVICE_VERSION_RESPONSE, 1500, link);
         if (rsp.length < 2)
             throw new Error('short DEVICE_VERSION_RESPONSE');
         this._deviceVersionCache = parseShimmer3DeviceVersionResponse(rsp);
@@ -17683,6 +17903,7 @@ class Shimmer3RClient extends BaseShimmerClient {
         // Claimed before the write, not after the ACK: the reply can arrive while
         // this method is still between awaits, and it must not be mistaken for an
         // unsolicited push in that window.
+        const link = this._linkGeneration;
         this._statusReadsInFlight++;
         try {
             this._emitStatus('GET_STATUS → waiting for ACK then RSP…');
@@ -17696,7 +17917,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 ackRemainder[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
                 ackRemainder[1] === OPCODES.STATUS_RESPONSE
                 ? ackRemainder
-                : await this._waitForInstreamResponse(OPCODES.STATUS_RESPONSE, need, 1500);
+                : await this._waitForInstreamResponse(OPCODES.STATUS_RESPONSE, need, 1500, link);
             const status = parseShimmer3StatusBytes(rsp.subarray(2, 2 + this._statusPayloadBytes));
             this._emitStatus(`Status: docked=${status.docked} sensing=${status.sensing} ` +
                 `logging=${status.sdLogging} streaming=${status.streaming} ` +
@@ -17704,7 +17925,9 @@ class Shimmer3RClient extends BaseShimmerClient {
             return status;
         }
         finally {
-            this._statusReadsInFlight--;
+            // Not across a link reset, which has already zeroed the count
+            if (this._linkGeneration === link)
+                this._statusReadsInFlight--;
         }
     }
     /**
@@ -17722,13 +17945,14 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
         this._emitStatus('GET_VBATT → waiting for ACK then RSP…');
+        const link = this._linkGeneration;
         const ackRemainder = await this._writeExpectingAck(new Uint8Array([OPCODES.GET_VBATT_COMMAND]), 1500);
         const rsp = ackRemainder &&
             ackRemainder.length >= 5 &&
             ackRemainder[0] === OPCODES.INSTREAM_CMD_RESPONSE &&
             ackRemainder[1] === OPCODES.VBATT_RESPONSE
             ? ackRemainder
-            : await this._waitForInstreamResponse(OPCODES.VBATT_RESPONSE, 3, 1500);
+            : await this._waitForInstreamResponse(OPCODES.VBATT_RESPONSE, 3, 1500, link);
         const batt = parseBatteryStatus(rsp.subarray(2, 5));
         const pct = batt.percentage === null ? 'n/a' : `${batt.percentage.toFixed(1)}%`;
         this._emitStatus(`Battery: ${batt.voltage.toFixed(3)} V (${pct}), charger ${batt.chargingStatus}`);
@@ -17741,10 +17965,11 @@ class Shimmer3RClient extends BaseShimmerClient {
         if (!this._transport)
             throw new Error('Not connected (RX missing)');
         const cmd = new Uint8Array([OPCODES.GET_FW_VERSION_COMMAND]);
+        const link = this._linkGeneration;
         const ackRemainder = await this._writeExpectingAck(cmd, 1500);
         const rsp = ackRemainder && ackRemainder[0] === OPCODES.FW_VERSION_RESPONSE
             ? ackRemainder
-            : await this._waitForResponse(OPCODES.FW_VERSION_RESPONSE, 1500);
+            : await this._waitForResponse(OPCODES.FW_VERSION_RESPONSE, 1500, link);
         if (rsp.length < 7)
             throw new Error('short FW_VERSION_RESPONSE');
         this._fwVersionCache = {
@@ -17796,14 +18021,16 @@ class Shimmer3RClient extends BaseShimmerClient {
             if (counting)
                 bytes += chunk.length;
         };
-        this._onTemp(counter);
+        const link = this._linkGeneration;
+        // A reset removes it at once; the loop below then sees the generation move
+        const offCounter = this._onLinkTemp(link, counter, () => undefined);
         // Before the start command: bytes a previous test left behind (a classic
         // link can hold its last chunk until the host next sends) must not reach
         // the stream parser either.
-        const link = this._linkGeneration;
         const linkGone = () => new Error('The link was reset during the data-rate test');
         this._dataRateTestActive = true;
         this._dataRateTestLastRxAt = Date.now();
+        this._dataRateTestTail = [];
         try {
             await this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 1]), 2000);
             if (this._linkGeneration !== link)
@@ -17829,17 +18056,12 @@ class Shimmer3RClient extends BaseShimmerClient {
             };
         }
         finally {
-            this._offTemp(counter);
+            offCounter();
             /* On a link that has since been reset there is nothing to stop or hand
              * back: the reset already cleared the flag, and the buffers now belong to
              * the new link. */
             if (this._linkGeneration === link) {
-                try {
-                    await this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 0]), 2000);
-                }
-                catch {
-                    /* the stop ACK can be indistinguishable from residual test bytes */
-                }
+                await this._stopDataRateTest(link);
                 /* Hand the link back only once test traffic has stopped arriving, not
                  * at the ACK. Which 0xFF ended the wait above cannot be trusted: a
                  * counter byte of 0xFF can begin a notification, and the real ACK need
@@ -17869,6 +18091,132 @@ class Shimmer3RClient extends BaseShimmerClient {
                 }
             }
         }
+    }
+    /**
+     * Stop a data-rate test and wait for the stop's ACK, which the normal ACK
+     * path often cannot see.
+     *
+     * Stopping aborts the firmware's transfer in flight, so the stream usually
+     * ends part-way through a 5-byte test packet, and the ACK follows straight
+     * after. A reframing link then takes the ACK as that packet's next byte -
+     * bench, Shimmer3R over classic SPP: the stream ended `a5 26 d4 00 ff`, framed
+     * as one test packet - and on BLE it can arrive at the end of a notification
+     * rather than the start. Either way the wait timed out, and every classic
+     * speed test took 2 s longer than it needed to.
+     *
+     * The ACK packet is always the last thing on the link, though. So once the
+     * link has gone quiet after the stop, and the stream's structure shows its
+     * end is the ACK packet rather than test data
+     * ({@link _dataRateStopAckEndsStream}), the wait is completed the way the ACK
+     * path would have completed it. When the structure cannot tell - or no ACK
+     * comes, a module holding it back - the wait still runs to its timeout.
+     *
+     * HARDWARE-VERIFY: run on a Shimmer3R over classic SPP (transparent bridge,
+     * module v1.4.16.16), with the link CRC off, one-byte and two-byte. The BLE
+     * case - the ACK ending a notification - has run only against the loopback
+     * tests.
+     */
+    async _stopDataRateTest(link) {
+        const rxAtStop = this._dataRateTestRxCount;
+        let settled = false;
+        const ack = this._writeExpectingAck(new Uint8Array([OPCODES.SET_DATA_RATE_TEST, 0]), 2000).then(() => undefined, () => undefined);
+        void ack.then(() => {
+            settled = true;
+        });
+        while (!settled && this._linkGeneration === link) {
+            await new Promise((r) => setTimeout(r, 20));
+            if (!settled &&
+                this._expectingAck > 0 &&
+                this._dataRateTestRxCount > rxAtStop &&
+                Date.now() - this._dataRateTestLastRxAt >= DATA_RATE_STOP_ACK_QUIET_MS &&
+                this._dataRateStopAckEndsStream()) {
+                this._log('Data-rate test: the stop ACK ended the stream inside a test packet; taking it');
+                this._expectingAck = Math.max(0, this._expectingAck - 1);
+                this._lastAckRemainder = null;
+                this._emitTemp(new Uint8Array([OPCODES.ACK_COMMAND_PROCESSED]));
+                break;
+            }
+        }
+        await ack;
+    }
+    /**
+     * Whether the data-rate test stream, as received, ends in the stop's ACK
+     * packet rather than in test data.
+     *
+     * The stream's last bytes have to be exactly the ACK packet this link's CRC
+     * mode sends: `0xFF`, then its CRC when one is on. Test packets carry no CRC,
+     * so with a CRC on the last raw byte is the ACK's CRC, not `0xFF`.
+     *
+     * That alone is not proof. A cut packet's counter bytes can also be `0xFF`
+     * (`a5 ff` is a valid aborted tail), so the candidate `0xFF` has to sit where
+     * test data could not have put one. Test packets are `0xA5` followed by a
+     * little-endian counter that steps by one per packet. So the last complete
+     * packet predicts every byte of the one after it, once the packet alignment
+     * is known. Two complete packets in sequence fix it. One does not, since
+     * `0xA5` also occurs inside counters, and a packet misread from there can
+     * predict a `0xFF` at the candidate. A misaligned pair cannot step by exactly
+     * one: the counter's low byte, which changes every packet, lands in a higher
+     * byte of the misread value.
+     *
+     * - **The candidate starts a packet** (the stream ended on a packet boundary).
+     *   Only `0xA5` can be data there, so it is the ACK.
+     * - **The candidate falls inside a cut packet.** The cut packet's received
+     *   bytes must be the predicted counter's, and the candidate is the ACK only
+     *   when the predicted byte at its position is not `0xFF`. When it is, data
+     *   and ACK look alike, and this returns false: the wait then runs out its
+     *   timeout, as it always did.
+     *
+     * Anything that does not fit this structure - garbage, or too few packets to
+     * check against - also returns false.
+     */
+    _dataRateStopAckEndsStream() {
+        const t = this._dataRateTestTail;
+        const ackPacket = appendCrc(new Uint8Array([OPCODES.ACK_COMMAND_PROCESSED]), this._crcMode);
+        const ack = t.length - ackPacket.length; // where the candidate ACK byte sits
+        if (ack < 0)
+            return false;
+        for (let i = 0; i < ackPacket.length; i++) {
+            if (t[ack + i] !== ackPacket[i])
+                return false;
+        }
+        const TP = OPCODES.DATA_RATE_TEST_RESPONSE;
+        const counterAt = (i) => i >= 0 && i + 4 < ack && t[i] === TP
+            ? (t[i + 1] | (t[i + 2] << 8) | (t[i + 3] << 16) | (t[i + 4] << 24)) >>> 0
+            : null;
+        const byteOf = (c, k) => (c >>> (8 * k)) & 0xff;
+        let fits = false;
+        // cut = how many bytes of the last packet arrived before the candidate:
+        // 0 means it ended on a packet boundary
+        for (let cut = 0; cut <= 4; cut++) {
+            const last = ack - (cut === 0 ? 5 : cut); // start of the last packet seen
+            const before = last - 5; // the complete packet before it
+            if (cut === 0) {
+                const a = counterAt(before);
+                const b = counterAt(last);
+                if (a === null || b === null || b !== (a + 1) >>> 0)
+                    continue;
+                fits = true; // only 0xA5 can start a packet: the candidate is the ACK
+                continue;
+            }
+            const prev = counterAt(before);
+            const prev2 = counterAt(before - 5);
+            if (prev === null || prev2 === null || prev !== (prev2 + 1) >>> 0 || t[last] !== TP) {
+                continue;
+            }
+            const next = (prev + 1) >>> 0;
+            let matches = true;
+            for (let j = 1; j < cut; j++) {
+                if (t[last + j] !== byteOf(next, j - 1))
+                    matches = false;
+            }
+            if (!matches)
+                continue;
+            // The data byte that would sit where the candidate is
+            if (byteOf(next, cut - 1) === OPCODES.ACK_COMMAND_PROCESSED)
+                return false;
+            fits = true;
+        }
+        return fits;
     }
     // ---------------------------------------------------------------------------
     // Factory self-test (SET_FACTORY_TEST 0xA8) and the red-LED override
@@ -18151,20 +18499,35 @@ class Shimmer3RClient extends BaseShimmerClient {
             // so refuse deterministically — callers are expected to sequence
             throw new SdTransferError('another SD command is already in flight', SD_STATUS.BUSY);
         }
+        const link = this._linkGeneration;
         this._sdAcquire();
         try {
-            return await new Promise((resolve, reject) => {
+            const settled = new Promise((resolve, reject) => {
+                /* Cleared only while it is still this command's slot. A link reset
+                 * rejects this command and empties the slot, but cannot cancel its
+                 * write: one that fails after the next link's SD command has taken the
+                 * slot would otherwise clear that command's expectation, and its
+                 * response would be ignored until it timed out. */
+                const clearSlot = () => {
+                    if (this._sdExpect === expectation)
+                        this._sdExpect = null;
+                };
                 const t = setTimeout(() => {
-                    this._sdExpect = null;
+                    clearSlot();
                     reject(new Error(`SD response 0x${rspOpcode.toString(16)} timeout`));
                 }, timeoutMs);
-                this._sdExpect = {
+                const expectation = {
                     opcode: rspOpcode,
                     resolve: (b) => {
                         clearTimeout(t);
                         resolve(b);
                     },
+                    reject: (e) => {
+                        clearTimeout(t);
+                        reject(e);
+                    },
                 };
+                this._sdExpect = expectation;
                 this._writeExpectingAck(cmd, timeoutMs)
                     .then((ackRemainder) => {
                     // When the ACK and the response share a notification the command
@@ -18174,10 +18537,11 @@ class Shimmer3RClient extends BaseShimmerClient {
                 })
                     .catch((e) => {
                     clearTimeout(t);
-                    this._sdExpect = null;
+                    clearSlot();
                     reject(e);
                 });
             });
+            return await this._settledOnLink(settled, link, 'the SD response');
         }
         finally {
             this._sdRelease();
@@ -18267,9 +18631,10 @@ class Shimmer3RClient extends BaseShimmerClient {
         }
         const blockLen = opts.blockPayloadLen ?? SD_BLOCK_PAYLOAD_DEFAULT;
         const stallTimeoutMs = opts.stallTimeoutMs ?? 6000;
+        const link = this._linkGeneration;
         this._sdAcquire();
         try {
-            return await new Promise((resolve, reject) => {
+            const settled = new Promise((resolve, reject) => {
                 let session = null;
                 let expectedSeq = 0;
                 let bytesReceived = 0;
@@ -18280,6 +18645,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                         clearTimeout(stallTimer);
                     this._sdFrameListener = null;
                     this._sdCrcErrorListener = null;
+                    this._sdWindowFail = null;
                     opts.signal?.removeEventListener('abort', onAbort);
                 };
                 const fail = (err) => {
@@ -18305,6 +18671,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                     void this.sdAbortTransfer().catch(() => { });
                     fail(new DOMException('SD read aborted', 'AbortError'));
                 };
+                this._sdWindowFail = fail;
                 this._sdCrcErrorListener = () => fail(new Error('SD data frame failed CRC check'));
                 this._sdFrameListener = (frame) => {
                     // Adopt the first session id that is not a leftover of the
@@ -18358,6 +18725,7 @@ class Shimmer3RClient extends BaseShimmerClient {
                 })
                     .catch((e) => fail(e instanceof Error ? e : new Error(String(e))));
             });
+            return await this._settledOnLink(settled, link, 'SD data');
         }
         finally {
             this._sdRelease();
@@ -23148,6 +23516,32 @@ const SDLOG_EXP_BRD_ID = Object.freeze({
     GSR_UNIFIED: 48,
     BR_AMP_UNIFIED: 49,
 });
+/**
+ * SD header byte 224, `SDH_PRESSURE_SENSOR_ID` (log-and-stream-common
+ * `SDCard/shimmer_sd_header.h`; DEV-1123): the pressure part the firmware
+ * found. Bits 0-6 are the sensor id, numbered as the 0xA7 reply's
+ * (`PRESSURE_SENSOR_ID`); bit 7 means the id was inferred from the board's SR
+ * number because the chip-id check was inconclusive. The firmware pre-fills
+ * the header with 0xFF, so older files read `NOT_RECORDED` here.
+ */
+const SDLOG_PRESSURE_SENSOR_ID = Object.freeze({
+    OFFSET: 224,
+    ID_MASK: 0x7f,
+    INFERRED_BIT: 0x80,
+    /** No pressure sensor fitted (Shimmer3 only). */
+    NONE: 0xfe,
+    /** Not recorded: the firmware predates the field. */
+    NOT_RECORDED: 0xff,
+});
+/**
+ * First LogAndStream version that writes {@link SDLOG_PRESSURE_SENSOR_ID},
+ * per hardware id. Shimmer3 and Shimmer3R version numbers overlap, so the
+ * gate has to know which hardware it is looking at.
+ */
+const SDLOG_PRESSURE_SENSOR_ID_MIN_FIRMWARE = Object.freeze({
+    [SDLOG_HW_ID.SHIMMER_3]: Object.freeze({ major: 1, minor: 1, internal: 6 }),
+    [SDLOG_HW_ID.SHIMMER_3R]: Object.freeze({ major: 1, minor: 1, internal: 18 }),
+});
 
 /**
  * SD-log channel tables and raw datatype decoding.
@@ -23257,6 +23651,12 @@ const bmp581Channel = (name, unit) => ({
     sizeBytes: 3,
 });
 /**
+ * Suffix naming the pressure pair after its part (`_BMP280`), or none for an
+ * unrecognised part or one the header says is not fitted: those emit the
+ * part-neutral `PRESSURE`/`TEMPERATURE`, raw (DEV-1123).
+ */
+const pressureNameSuffix = (pressure) => pressure === 'unknown' || pressure === 'none' ? '' : `_${pressure.toUpperCase()}`;
+/**
  * Build the Shimmer3 (256-byte header) channel list from the enabled-sensors
  * value. The order and datatypes replicate the "modern Shimmer3" branch of
  * ShimmerSDLog#interpretdatapacketformat (ShimmerSDLog.java lines 817-1271)
@@ -23266,8 +23666,10 @@ const bmp581Channel = (name, unit) => ({
  * @param newImuSensors  True when the expansion-board bytes identify a
  *   new-IMU board (LSM303AHTR/MPU9250/BMP280 generation) — flips the mag
  *   channels to little-endian X, Y, Z and renames the BMP channels.
+ * @param pressure The pressure part, when the header records one (byte 224);
+ *   it names the pair instead of `newImuSensors`. Either way the pair is raw.
  */
-function buildShimmer3SdLogChannels(enabledSensors, newImuSensors) {
+function buildShimmer3SdLogChannels(enabledSensors, newImuSensors, pressure) {
     const has = (mask) => hasSensorBit(enabledSensors, mask);
     const ch = [];
     if (has(SDLogHeaderBitmask.ACCEL_LN)) {
@@ -23320,9 +23722,9 @@ function buildShimmer3SdLogChannels(enabledSensors, newImuSensors) {
         ch.push(uncal('MAG_MPU_X', 'i16'), uncal('MAG_MPU_Y', 'i16'), uncal('MAG_MPU_Z', 'i16'));
     }
     if (has(SDLogHeaderBitmask.BMPX80)) {
-        const suffix = newImuSensors ? 'BMP280' : 'BMP180';
-        ch.push(uncal(`TEMPERATURE_${suffix}`, 'u16r'));
-        ch.push(uncal(`PRESSURE_${suffix}`, 'u24r'));
+        const suffix = pressureNameSuffix(pressure ?? (newImuSensors ? 'bmp280' : 'bmp180'));
+        ch.push(uncal(`TEMPERATURE${suffix}`, 'u16r'));
+        ch.push(uncal(`PRESSURE${suffix}`, 'u24r'));
     }
     if (has(SDLogHeaderBitmask.EXG1_24BIT)) {
         ch.push(uncal('Exg1_Status', 'u8'), uncal('Exg1_CH1_24Bit', 'i24r'), uncal('Exg1_CH2_24Bit', 'i24r'));
@@ -23410,7 +23812,7 @@ const SHIMMER3R_SIGNAL_ID_TABLE = Object.freeze({
     0x17: uncal('ALT_MAG_X', 'i16'),
     0x18: uncal('ALT_MAG_Y', 'i16'),
     0x19: uncal('ALT_MAG_Z', 'i16'),
-    // BMP390. A BMP581 board gets bmp581Channel instead (buildShimmer3RSdLogChannels).
+    // BMP390. Any other part is named by buildShimmer3RSdLogChannels instead.
     0x1a: uncal('TEMPERATURE_BMP390', 'u24'),
     0x1b: uncal('PRESSURE_BMP390', 'u24'),
     0x1c: gsrChannel(),
@@ -23433,21 +23835,28 @@ const SHIMMER3R_SIGNAL_ID_TABLE = Object.freeze({
  * signal IDs). Unknown IDs fall back to a `u12` channel named after the ID,
  * matching the Java catch-all (ShimmerObject.java:3579-3583).
  *
- * @param bmp581 True when `0x1A`/`0x1B` are a BMP581 rather than a BMP390. The
- *   header carries no sensor id, so the caller decides from the board's SR
- *   number (`isBmp581PresentPerSrNumber`), as the Java driver does
- *   (ShimmerObject.java:3470-3497, `isSupportedBmp581()`).
+ * @param pressure The part behind `0x1A`/`0x1B`. Header byte 224 names it on
+ *   newer firmware (DEV-1123); otherwise the caller decides between a BMP390
+ *   and a BMP581 from the board's SR number (`isBmp581PresentPerSrNumber`), as
+ *   the Java driver does (ShimmerObject.java:3470-3497, `isSupportedBmp581()`).
+ *   Only a BMP581 pair is emitted calibrated; any other part's is raw, and an
+ *   unknown or absent part's is the part-neutral `PRESSURE`/`TEMPERATURE`.
  */
-function buildShimmer3RSdLogChannels(signalIds, bmp581 = false) {
+function buildShimmer3RSdLogChannels(signalIds, pressure = 'bmp390') {
     const ch = [];
     for (let i = 0; i < signalIds.length; i++) {
         const id = signalIds[i];
-        if (bmp581 && id === 0x1a) {
+        if (pressure === 'bmp581' && id === 0x1a) {
             ch.push(bmp581Channel(SDLOG_BMP581_TEMPERATURE_NAME, CHANNEL_UNITS.DEGREES_CELSIUS));
             continue;
         }
-        if (bmp581 && id === 0x1b) {
+        if (pressure === 'bmp581' && id === 0x1b) {
             ch.push(bmp581Channel(SDLOG_BMP581_PRESSURE_NAME, CHANNEL_UNITS.KPASCAL));
+            continue;
+        }
+        if (pressure !== 'bmp390' && (id === 0x1a || id === 0x1b)) {
+            const kind = id === 0x1a ? 'TEMPERATURE' : 'PRESSURE';
+            ch.push(uncal(`${kind}${pressureNameSuffix(pressure)}`, 'u24'));
             continue;
         }
         const spec = SHIMMER3R_SIGNAL_ID_TABLE[id];
@@ -23614,6 +24023,38 @@ function parseImuRanges(bytes, hw) {
     const lnAccel = hw === SDLOG_HW_ID.SHIMMER_3R ? (setup3 >> 6) & 0x03 : 0;
     return { lnAccel, wrAccel, gyro, mag, altAccel: 0, altMag: 0 };
 }
+/**
+ * Read the pressure part from header byte 224 (`SDH_PRESSURE_SENSOR_ID`,
+ * DEV-1123), or `sensor: null` when the header does not record one. The byte
+ * is trusted only from LogAndStream firmware at or above the per-hardware
+ * {@link SDLOG_PRESSURE_SENSOR_ID_MIN_FIRMWARE}: older firmware leaves it at
+ * the 0xFF pre-fill, which reads as "not recorded" here too.
+ *
+ * HARDWARE-VERIFY: byte layout and version gates taken from the firmware
+ * change (log-and-stream-common `SDCard/shimmer_sd_header.h`) only; no SD file
+ * carrying the field, from either a Shimmer3 or a Shimmer3R, has been decoded.
+ */
+function readPressureSensorField(bytes, hw, fwId, v) {
+    const notRecorded = { sensor: null, id: null, inferred: false };
+    const min = SDLOG_PRESSURE_SENSOR_ID_MIN_FIRMWARE[hw];
+    if (fwId !== SDLOG_FW_ID.LOGANDSTREAM ||
+        !min ||
+        !atLeast(v, min.major, min.minor, min.internal)) {
+        return notRecorded;
+    }
+    const raw = bytes[SDLOG_PRESSURE_SENSOR_ID.OFFSET];
+    if (raw === SDLOG_PRESSURE_SENSOR_ID.NOT_RECORDED)
+        return notRecorded;
+    if (raw === SDLOG_PRESSURE_SENSOR_ID.NONE)
+        return { sensor: 'none', id: null, inferred: false };
+    const id = raw & SDLOG_PRESSURE_SENSOR_ID.ID_MASK;
+    return {
+        // 0x04-0x7D are reserved for future parts; 0x7E-0x7F are never allocated.
+        sensor: PRESSURE_SENSOR_ID[id] ?? 'unknown',
+        id,
+        inferred: (raw & SDLOG_PRESSURE_SENSOR_ID.INFERRED_BIT) !== 0,
+    };
+}
 function macFromBytes(b) {
     let s = '';
     for (let i = 24; i <= 29; i++)
@@ -23746,11 +24187,58 @@ function parseSdLog(bytes) {
         ? { id: bytes[214], rev: bytes[215], revSpecial: bytes[216] }
         : null;
     const newImu = isNewImuSensors(hardwareVersion, expansionBoard);
+    // Which pressure part is fitted. Until header byte 224 the header named
+    // none, so the board decides: on a Shimmer3 its expansion-board revision
+    // (new-IMU boards carry a BMP280), on a Shimmer3R its SR number, as the
+    // firmware's own fallback does — a BMP581 leaves the calibration region
+    // unwritten rather than marking it (SDCard/shimmer_sd_header.c:209-215).
+    // Byte 224, when the header records it, overrides that rule.
+    // HARDWARE-VERIFY: the SR-number path is pinned by synthetic headers only; no
+    // SD file from a BMP581 unit has been decoded and checked against a Consensys
+    // export yet.
+    const warnings = [];
+    const pressureField = readPressureSensorField(bytes, hardwareVersion, firmwareId, fwVersion);
+    let ruleSensor;
+    let ruleSource;
+    if (hardwareVersion === SDLOG_HW_ID.SHIMMER_3R) {
+        const board = expansionBoard && {
+            boardId: expansionBoard.id,
+            boardRev: expansionBoard.rev,
+            specialRev: expansionBoard.revSpecial,
+        };
+        const srBmp581 = isBmp581PresentPerSrNumber({
+            hardwareVersion,
+            firmwareId,
+            firmwareVersion: fwVersion,
+            board,
+        });
+        ruleSensor = srBmp581 ? 'bmp581' : 'bmp390';
+        ruleSource = board ? `the board's SR number (${formatShimmerSrCode(board)})` : 'the board';
+    }
+    else {
+        ruleSensor = newImu ? 'bmp280' : 'bmp180';
+        ruleSource = "the expansion board's revision";
+    }
+    const named = pressureField.sensor;
+    const pressureSensor = named ?? ruleSensor;
+    if (named === 'unknown') {
+        warnings.push(`Header names an unrecognised pressure sensor (id 0x${(pressureField.id ?? 0).toString(16).padStart(2, '0')}); pressure and temperature are left uncalibrated.`);
+    }
+    else if (named !== null && named !== 'none' && named !== ruleSensor) {
+        warnings.push(`Header names a ${named.toUpperCase()} pressure sensor, but ${ruleSource} implies a ${ruleSensor.toUpperCase()}; decoding as the header's ${named.toUpperCase()}.`);
+    }
+    if (pressureField.inferred) {
+        warnings.push("The pressure sensor was inferred from the board's SR number, not confirmed by chip id.");
+    }
     // Calibration parameter blocks (kept raw — see SdLogCalibrationBytes).
-    const pressureLen = newImu ? 24 : 22;
+    // BMP280/BMP390 trim runs on into bytes 222-223; a BMP180's stops at 22.
+    const longPressureTrim = pressureSensor === 'bmp280' ||
+        pressureSensor === 'bmp390' ||
+        (pressureSensor !== 'bmp180' && newImu);
+    const pressureLen = longPressureTrim ? 24 : 22;
     const pressure = new Uint8Array(pressureLen);
     pressure.set(bytes.slice(160, 182), 0);
-    if (newImu)
+    if (longPressureTrim)
         pressure.set(bytes.slice(222, 224), 22); // BMP280/BMP390 extra bytes
     const calibrationBytes = {
         wrAccel: bytes.slice(76, 97),
@@ -23768,28 +24256,17 @@ function parseSdLog(bytes) {
         if (315 + nChannels > headerLengthBytes) {
             throw new SdLogFormatError('BAD_HEADER', `Shimmer3R channel table overruns the header (nChannels=${nChannels}).`);
         }
-        // The header names no pressure part, and a BMP581 leaves the calibration
-        // region unwritten rather than marking it (SDCard/shimmer_sd_header.c:209-215),
-        // so the board's SR number decides, as the firmware's own fallback does.
-        // HARDWARE-VERIFY: pinned by synthetic headers only; no SD file from a
-        // BMP581 unit has been decoded and checked against a Consensys export yet.
-        const bmp581 = isBmp581PresentPerSrNumber({
-            hardwareVersion,
-            firmwareId,
-            firmwareVersion: fwVersion,
-            board: expansionBoard && {
-                boardId: expansionBoard.id,
-                boardRev: expansionBoard.rev,
-                specialRev: expansionBoard.revSpecial,
-            },
-        });
-        channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels), bmp581);
+        channels = buildShimmer3RSdLogChannels(bytes.subarray(315, 315 + nChannels), pressureSensor);
     }
     else {
-        channels = buildShimmer3SdLogChannels(enabledSensors, newImu);
+        channels = buildShimmer3SdLogChannels(enabledSensors, newImu, pressureSensor);
     }
     if (channels.length === 0) {
         throw new SdLogFormatError('BAD_HEADER', 'Header enables no data channels.');
+    }
+    if (pressureSensor === 'none' &&
+        channels.some((c) => c.name === 'PRESSURE' || c.name === 'TEMPERATURE')) {
+        warnings.push('Header says no pressure sensor is fitted, but pressure channels are enabled; they are left uncalibrated.');
     }
     const timestampBytes = sdTimestampBytes(hardwareVersion, firmwareId, fwVersion);
     const packetSizeBytes = timestampBytes + channels.reduce((sum, c) => sum + c.sizeBytes, 0);
@@ -23834,6 +24311,10 @@ function parseSdLog(bytes) {
         calibration: [],
         exg1,
         exg2,
+        pressureSensor: pressureField.sensor,
+        pressureSensorId: pressureField.id,
+        pressureSensorInferred: pressureField.inferred,
+        warnings,
     };
     return { header, channels, syncFraming, samplesPerBlock, wallClockFreqHz };
 }
@@ -24075,13 +24556,16 @@ function calibrateGsr(raw, gsrRangeSetting) {
     return calibrateGsrSample(raw, gsrRangeSetting).conductanceUSiemens;
 }
 /**
- * Locate the BMP581 pair, or null when the file has neither channel — which is
- * every file whose board the SR rule gives a BMP390, because only
- * `buildShimmer3RSdLogChannels` names these.
+ * Locate the calibrated BMP581 pair, or null when the file has neither channel
+ * — which is every file not decided as a Shimmer3R BMP581, because only
+ * `buildShimmer3RSdLogChannels` emits these calibrated. Every other pressure
+ * pair, including an unknown part's or one the header says is not fitted
+ * (DEV-1123), stays raw.
  */
 function findBmp581(channels) {
-    const pressure = channels.findIndex((c) => c.name === SDLOG_BMP581_PRESSURE_NAME);
-    const temperature = channels.findIndex((c) => c.name === SDLOG_BMP581_TEMPERATURE_NAME);
+    const find = (name) => channels.findIndex((c) => c.name === name && c.calibrated);
+    const pressure = find(SDLOG_BMP581_PRESSURE_NAME);
+    const temperature = find(SDLOG_BMP581_TEMPERATURE_NAME);
     return pressure < 0 && temperature < 0 ? null : { pressure, temperature };
 }
 /**
