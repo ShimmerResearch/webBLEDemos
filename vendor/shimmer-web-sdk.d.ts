@@ -10634,6 +10634,7 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      *   the next link's.
      */
     private _waitForAck;
+    /** @param link as for {@link Shimmer3RClient._waitForAck}: read before the command's write. */
     private _waitForResponse;
     /**
      * Await an instream response — one of the messages the firmware answers
@@ -10646,8 +10647,16 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      *   exact length: a Shimmer3 sends one status byte where a Shimmer3R sends
      *   two, and a caller that has not yet asked which it is talking to must not
      *   time out on the shorter answer.
+     * @param link as for {@link Shimmer3RClient._waitForAck}: read before the command's write.
      */
     private _waitForInstreamResponse;
+    /**
+     * What a waiter fails with when its link is reset under it. Every waiter on
+     * the temp plane notes the link it was registered on and, on a later link's
+     * traffic, gives up with this instead of taking it: a command stranded by a
+     * drop must not acknowledge, or answer, the next link's commands.
+     */
+    private _linkResetError;
     private _onTemp;
     private _offTemp;
     private _emitTemp;
@@ -10876,6 +10885,8 @@ declare class Shimmer3RClient extends BaseShimmerClient {
     private _sdUsers;
     private _sdHandlerAttached;
     private _sdExpect;
+    /** Fails the SD read window in flight, if there is one: see _resetLinkProtocolState. */
+    private _sdWindowFail;
     private _sdFrameListener;
     private _sdCrcErrorListener;
     private _sdKnownSession;
