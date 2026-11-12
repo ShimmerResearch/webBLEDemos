@@ -12,3 +12,19 @@
 The Face Landmarker task model is vendored at `vendor/mediapipe/models/face_landmarker.task` and is used only for on-device webcam analysis. The JavaScript, WebAssembly, type information, package metadata, and upstream README are stored in `vendor/mediapipe/`.
 
 MediaPipe's privacy notice is linked from its package metadata: https://goo.gle/mediapipe-privacy
+
+## Chart.js
+
+- Vendored file: `chart.min.js`
+- Vendored version: 4.5.1
+- Copyright: Chart.js Contributors
+- License: MIT (notice kept at the top of the file)
+- Project: https://www.chartjs.org
+
+## JSZip
+
+- Vendored file: `jszip.min.js`
+- Vendored version: 3.10.1
+- Copyright: Stuart Knightley
+- License: dual MIT or GPLv3, used under MIT (notice kept at the top of the file)
+- Project: https://github.com/Stuk/jszip

@@ -29,6 +29,37 @@ if (!manifest.content_security_policy?.extension_pages?.includes("wasm-unsafe-ev
   throw new Error("The extension CSP must permit local MediaPipe WebAssembly.");
 }
 
+// Access to a page comes only from the toolbar click (activeTab). Host
+// permissions or a content script on every site would bring back the
+// "read and change all your data on all websites" warning and the store's
+// in-depth review; see README.md.
+const permissions = [...(manifest.permissions || [])].sort();
+if (permissions.join(",") !== "activeTab,scripting,storage") {
+  throw new Error(`Unexpected permissions: ${permissions.join(", ")}. Justify any addition in README.md and PRIVACY.md.`);
+}
+if (manifest.host_permissions?.length || manifest.optional_host_permissions?.length) {
+  throw new Error("The extension must not request host permissions.");
+}
+if (manifest.content_scripts?.length) {
+  throw new Error("The content script is injected on the toolbar click, not declared for every site.");
+}
+// Every web-accessible file lets any site detect the extension. Only the overlay
+// page needs it; the files that page loads are fetched by the extension itself.
+const webAccessible = (manifest.web_accessible_resources || []).flatMap((entry) => entry.resources || []);
+if (webAccessible.join(",") !== "shimmercompanion.html") {
+  throw new Error(`Only shimmercompanion.html may be web-accessible, not: ${webAccessible.join(", ")}`);
+}
+
+// The companion and the content script talk through extension messaging only:
+// window.postMessage would let the page read the recording timeline and spoof commands.
+const contentScript = readFileSync(resolve(extensionRoot, "content.js"), "utf8");
+if (/\bpostMessage\s*\(/.test(companion)) {
+  throw new Error("shimmercompanion.js must not use window.postMessage; send overlay commands with toHost().");
+}
+if (/addEventListener\(\s*["']message["']/.test(contentScript)) {
+  throw new Error("content.js must not listen for window messages; handle commands in chrome.runtime.onMessage.");
+}
+
 const workerSandbox = {
   importScripts() {},
   self: {

@@ -40,4 +40,6 @@ Classic Bluetooth and USB. Keep that stated on any new demo page.
 
 ## CI
 
-`html-format.yml` only. `verify.yml` went to `shimmer-capture-web` with the page it tested.
+`html-format.yml` formats HTML. `checks.yml` checks the vendored SDK and runs
+`shimmer-extension`'s Node tests (listed in its README). `verify.yml` went to
+`shimmer-capture-web` with the page it tested.

@@ -1,6 +1,43 @@
 import { Shimmer3RClient, SensorBitmapShimmer3 } from "./vendor/shimmer-web-sdk.esm.js";
-import { signIn, signOut, getAuth, uploadSession, DEFAULT_API_BASE } from "./cloudsync.js";
+import { signIn, signOut, getAuth, getSignInDefaults, uploadSession, csvText, DEFAULT_API_BASE } from "./cloudsync.js";
 import { WebcamAnalysis } from "./webcam.js";
+
+// ===== Opened by the extension? =====
+// shimmercompanion.html is web-accessible so the content script can show it in an
+// iframe, which means any page could embed it as well. The content script passes a
+// one-time token in the URL fragment; the background worker accepts it once, for
+// this tab. Without it the companion shows a notice and starts nothing.
+let hostTabId = null; // the tab this companion is shown in, from the background worker
+
+async function claimOverlay() {
+  const token = location.hash.slice(1);
+  if (!token) return false;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "CLAIM_OVERLAY", token });
+    if (response?.ok !== true || !Number.isInteger(response.tabId)) return false;
+    hostTabId = response.tabId;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Overlay and immersive-mode commands for the content script in this tab. They go
+// through the extension's own messaging, not window.postMessage, so the page the
+// companion sits on never sees when recording, the rest period or playback start.
+function toHost(message) {
+  chrome.tabs.sendMessage(hostTabId, message, { frameId: 0 }).catch(() => {
+    // The page navigated or the content script is gone: nothing to control.
+  });
+}
+
+if (!(await claimOverlay())) {
+  const notice = document.createElement("p");
+  notice.textContent = "Open Shimmer Companion from its toolbar button.";
+  notice.style.cssText = "margin:0;padding:16px;font:14px system-ui,sans-serif;color:#e8eaed;background:#1c1f26;border-radius:12px";
+  document.body.replaceChildren(notice);
+  throw new Error("Shimmer Companion was not opened by the extension; not starting.");
+}
 
 // ===== Charts =====
 const gsrCtx = document.getElementById('gsrChart').getContext('2d');
@@ -478,12 +515,12 @@ setConn('offline', 'Offline');
 // ===== Window controls =====
 closeBtn.onclick = () => {
   stopWebcam();
-  window.parent.postMessage({ type: 'CLOSE_OVERLAY' }, '*');
+  toHost({ type: 'CLOSE_OVERLAY' });
 };
 window.addEventListener("beforeunload", () => webcam.stop());
 
 function toggleMinimize() {
-  window.parent.postMessage({ type: 'MINIMIZE_OVERLAY' }, '*');
+  toHost({ type: 'MINIMIZE_OVERLAY' });
   body.classList.toggle('is-minimized');
 }
 // Collapse/expand to a known state (toggleMinimize alone would flip whichever
@@ -503,7 +540,7 @@ function bindDrag(el) {
   el.addEventListener('mousedown', (e) => {
     if (e.target.closest('button')) return;
     e.preventDefault();
-    window.parent.postMessage({ type: 'DRAG_START' }, '*');
+    toHost({ type: 'DRAG_START' });
   });
 }
 bindDrag(dragHeader);
@@ -513,7 +550,7 @@ bindDrag(dragHeaderMin);
 document.querySelectorAll('.rz').forEach((h) => {
   h.addEventListener('mousedown', (e) => {
     e.preventDefault();
-    window.parent.postMessage({ type: 'RESIZE_START', edges: h.dataset.edges }, '*');
+    toHost({ type: 'RESIZE_START', edges: h.dataset.edges });
   });
 });
 
@@ -537,6 +574,9 @@ let captureBusy = false;
 function captureScreenshot(reason, meta = {}) {
   // meta: { clickTMs, eventId, kind } — kind 'onset' | 'settled' for click events
   if (!isRecording) return;
+  // The page is in a background tab or a minimized window: whatever is showing
+  // is not the recording tab, so there is nothing of ours to capture.
+  if (document.visibilityState === "hidden") return;
   captureQueue.push({ reason, meta, retried: false });
   pumpCaptureQueue();
 }
@@ -549,6 +589,8 @@ function pumpCaptureQueue() {
   chrome.runtime.sendMessage({ type: "TAKE_SCREENSHOT" }, (response) => {
     const ok = !chrome.runtime.lastError && response?.ok && response.dataUrl;
     if (ok && isRecording) recordShot(job, response.dataUrl);
+    // Refused because the recording tab was not the one showing: drop it, never retry.
+    else if (response?.skipped) console.info("Screenshot skipped:", response.error);
     else if (!ok && !job.retried) { job.retried = true; captureQueue.unshift(job); }
     else if (!ok) console.error("Screenshot failed:", chrome.runtime.lastError?.message || response?.error);
     setTimeout(() => { captureBusy = false; pumpCaptureQueue(); }, 600);
@@ -717,7 +759,7 @@ chrome.runtime.onMessage.addListener((message) => {
   // it fires once, and only when we entered immersive for this recording.
   if (message.ended && immersiveActive) {
     immersiveActive = false;
-    window.parent.postMessage({ type: 'EXIT_IMMERSIVE' }, '*');
+    toHost({ type: 'EXIT_IMMERSIVE' });
     setMinimized(false);
   }
 });
@@ -892,12 +934,12 @@ function startRest() {
       showRest(restRemaining);
       // The widget is hidden by fullscreen, so the countdown the participant
       // sees is the one drawn on the neutral field by the content script.
-      window.parent.postMessage({ type: 'REST_TICK', remaining: restRemaining }, '*');
+      toHost({ type: 'REST_TICK', remaining: restRemaining });
       return;
     }
     cancelRest();
     streamBtnText.textContent = "Stop Recording";
-    window.parent.postMessage({ type: 'PLAY_VIDEO' }, '*');
+    toHost({ type: 'PLAY_VIDEO' });
   }, 1000);
 }
 
@@ -913,7 +955,7 @@ function startRecording() {
   // the baseline — not at video onset, where the transition would confound the
   // stimulus response.
   if (immersiveEnable.checked) {
-    window.parent.postMessage({ type: 'ENTER_IMMERSIVE', restSeconds: restSeconds() }, '*');
+    toHost({ type: 'ENTER_IMMERSIVE', restSeconds: restSeconds() });
     setMinimized(true);
     immersiveActive = true;
   }
@@ -928,7 +970,7 @@ function stopRecording() {
   captureQueue.length = 0;
   body.classList.remove('is-recording');
   streamBtnText.textContent = "Start Recording";
-  window.parent.postMessage({ type: 'EXIT_IMMERSIVE' }, '*');
+  toHost({ type: 'EXIT_IMMERSIVE' });
   immersiveActive = false;
   setMinimized(false);
   if (shimmer.device?.gatt?.connected) setConn('online', 'Online');
@@ -1096,7 +1138,8 @@ downloadBtn.onclick = async () => {
   const header = ["Timestamp", "Elapsed (s)", "Video Title", "Video Time (s)", "GSR (uS)", "PPG (Raw)"];
   const csvContent = [
     header.join(","),
-    ...csvRows.map(r => `${r.timestamp},${((r.tMs - t0ms) / 1000).toFixed(3)},${r.videoTitle},${r.videoTime},${r.gsr},${r.ppg ?? ""}`)
+    // Titles come from the page: csvText quotes them and defuses spreadsheet formulas.
+    ...csvRows.map(r => `${r.timestamp},${((r.tMs - t0ms) / 1000).toFixed(3)},${csvText(r.videoTitle)},${r.videoTime},${r.gsr},${r.ppg ?? ""}`)
   ].join("\n");
 
   try {
@@ -1120,7 +1163,7 @@ downloadBtn.onclick = async () => {
       const eventsCsv = [
         evHeader.join(","),
         ...screenshots.map(s =>
-          `${s.timestamp},${(((s.tMs ?? t0ms) - t0ms) / 1000).toFixed(3)},${s.clickTMs != null ? ((s.clickTMs - t0ms) / 1000).toFixed(3) : ""},${s.eventId ?? ""},${s.kind ?? ""},${s.videoTime},${s.reason},${(s.title || "").replace(/,/g, "")},${s.file}`)
+          `${s.timestamp},${(((s.tMs ?? t0ms) - t0ms) / 1000).toFixed(3)},${s.clickTMs != null ? ((s.clickTMs - t0ms) / 1000).toFixed(3) : ""},${s.eventId ?? ""},${s.kind ?? ""},${s.videoTime},${s.reason},${csvText(s.title || "")},${s.file}`)
       ].join("\n");
       zip.file("events.csv", eventsCsv);
       const folder = zip.folder("screenshots");
@@ -1170,8 +1213,10 @@ function cloudShowView(auth) {
 
 async function cloudOpen() {
   const auth = await getAuth();
-  cloudApiBase.value = auth?.apiBase || DEFAULT_API_BASE;
-  if (auth?.login) cloudEmail.value = auth.login;
+  const defaults = auth ? null : await getSignInDefaults();
+  cloudApiBase.value = auth?.apiBase || defaults?.apiBase || DEFAULT_API_BASE;
+  const login = auth?.login || defaults?.login;
+  if (login) cloudEmail.value = login;
   cloudShowView(auth);
   cloudSetStatus("");
   cloudProgressFill.style.width = "0%";

@@ -13,3 +13,6 @@
 # port into a pull request three times, because `git add -A` cannot tell an
 # untracked local file from a new one that belongs.
 .vscode/settings.json
+
+# Chrome Web Store uploads built by shimmer-extension/tools/package.mjs.
+shimmer-extension/dist/

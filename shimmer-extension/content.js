@@ -90,8 +90,9 @@ function broadcastData() {
 }
 
 
-// The content script is injected on every page, so stay idle until the
-// companion overlay is first opened — no polling or DOM observation before then.
+// The content script is injected only when the toolbar button is clicked
+// (background.js), and even then stays idle until the companion overlay is
+// first opened — no polling or DOM observation before then.
 let broadcasting = false;
 let broadcastTimer = null;
 let broadcastObserver = null;
@@ -122,10 +123,21 @@ let captureOverlay = null; // transparent full-page layer for smooth drag/resize
 const DEFAULT_W = 360, DEFAULT_H = 640;
 const MIN_W = 300, MIN_H = 200, MINIMIZED_H = 52;
 
-function createOverlay() {
+// shimmercompanion.html has to be web-accessible for this iframe, so any page could
+// embed it too. A one-time token tells the companion that this content script opened
+// it: the token is registered with the background worker for this tab, travels in
+// the iframe's URL, and is spent when the companion starts (shimmercompanion.js).
+async function createOverlay() {
+  const token = crypto.randomUUID();
+  let registered = null;
+  try {
+    registered = await chrome.runtime.sendMessage({ type: 'REGISTER_OVERLAY', token });
+  } catch { /* extension reloaded under this tab */ }
+  if (!registered?.ok) return;
+
   startBroadcasting();
   overlayIframe = document.createElement('iframe');
-  overlayIframe.src = chrome.runtime.getURL('shimmercompanion.html');
+  overlayIframe.src = `${chrome.runtime.getURL('shimmercompanion.html')}#${token}`;
   const top = 20;
   const left = Math.max(20, window.innerWidth - DEFAULT_W - 20);
   Object.assign(overlayIframe.style, {
@@ -141,8 +153,14 @@ function createOverlay() {
   document.body.appendChild(overlayIframe);
 }
 
+let overlayCreating = null;
+
 function toggleOverlay() {
-  if (!overlayIframe) { createOverlay(); return; }
+  if (overlayCreating) return; // a second click while the first is still registering
+  if (!overlayIframe) {
+    overlayCreating = createOverlay().finally(() => { overlayCreating = null; });
+    return;
+  }
   overlayIframe.style.display = overlayIframe.style.display === 'none' ? 'block' : 'none';
 }
 
@@ -304,15 +322,14 @@ function endInteraction() {
   captureOverlay = null;
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'TOGGLE_OVERLAY') toggleOverlay();
-});
-
-window.addEventListener('message', (event) => {
-  // Only the extension iframe may control the injected overlay or host page.
-  // Without this check, the host page could spoof immersive/play/resize commands.
-  if (event.source !== overlayIframe?.contentWindow) return;
-  const d = event.data;
+// Commands arrive from the background worker (TOGGLE_OVERLAY) and from the
+// companion (chrome.tabs.sendMessage). Extension messaging, unlike
+// window.postMessage, can be neither read nor sent by the page, so the page can
+// neither spoof these commands nor see the recording timeline they reveal.
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (sender.id !== chrome.runtime.id) return;
+  const d = message;
+  if (d?.type === 'TOGGLE_OVERLAY') { toggleOverlay(); return; }
   if (!d || !overlayIframe) return;
 
   switch (d.type) {
