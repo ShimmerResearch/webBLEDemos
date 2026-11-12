@@ -90,8 +90,9 @@ function broadcastData() {
 }
 
 
-// The content script is injected on every page, so stay idle until the
-// companion overlay is first opened — no polling or DOM observation before then.
+// The content script is injected only when the toolbar button is clicked
+// (background.js), and even then stays idle until the companion overlay is
+// first opened — no polling or DOM observation before then.
 let broadcasting = false;
 let broadcastTimer = null;
 let broadcastObserver = null;

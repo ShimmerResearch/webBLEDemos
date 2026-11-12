@@ -12,9 +12,16 @@ All Shimmer3R BLE communication uses the [`shimmer-web-sdk`](https://github.com/
 
 Reload the extension from `chrome://extensions/` after changing its source files.
 
+Open the companion by clicking the toolbar button on the page you want to record. The extension has
+no access to any page until then: the click adds the companion to that one tab (`activeTab` and
+`scripting`), so there is no content script on other sites and nothing to reload after installing.
+After reloading the extension, reload the page too.
+
 ## Recording and exports
 
 The extension can record PPG and GSR signals, associate them with the active page and media timeline, capture timestamped screenshots, and generate a session report. Local downloads are available without signing in.
+
+Screenshots are only ever of the tab the companion is open in, and only while that tab is the one showing in its window. A periodic or on-click shot taken while the participant is on another tab, or with the window minimized, is skipped rather than capturing whatever is on screen (`background.js`).
 
 Cloud uploads are split into typed files rather than one large payload:
 
@@ -41,7 +48,9 @@ For best results, use even front lighting, keep the face reasonably centered, an
 
 ## ASM Cloud uploads
 
-The **Server** field expects the tenant-specific API origin in the form `https://XXXXapi.verisense.net`. This is intentionally a placeholder; the extension does not contain a default production server.
+The **Server** field expects the tenant-specific API origin in the form `https://XXXXapi.verisense.net`. This is intentionally a placeholder; the extension does not contain a default production server. Only `https://` addresses under `verisense.net`, with no port or embedded credentials, are accepted (`normalizeApiBase` in `cloudsync.js`), so a participant cannot be talked into sending their password to another server. Presigned upload URLs must be HTTPS too.
+
+The session manifest records the page address without its query string or fragment, which can carry search terms or tokens. The content hash and `canonical` field still identify the content.
 
 The compatible ASM Cloud deployment must provide:
 
@@ -56,6 +65,34 @@ The API currently accepts at most 200 files in one upload-URL request. A session
 
 Only generated session artifacts are uploaded. Raw webcam frames are never included.
 
+## Privacy and the Chrome Web Store
+
+[`PRIVACY.md`](PRIVACY.md) is a draft privacy policy: what the extension records, what it stores
+and uploads, and why it needs each permission. The Web Store requires a privacy policy at a public
+URL, so it has to be reviewed, its open questions answered, and hosted before a listing.
+
+The store's **Privacy practices** tab also asks for the following. These are suggested answers
+based on the code; confirm them against the final policy.
+
+- **Single purpose:** record Shimmer3R GSR and PPG signals alongside the page or video a study
+  participant is viewing.
+- **Permission justifications:** as in the permissions table in `PRIVACY.md`. No remote code.
+- **Data collected:**
+  - health information (GSR, PPG);
+  - personally identifiable information (the sign-in email address);
+  - authentication information (password, access token);
+  - website content (screenshots, page titles);
+  - web history (the page address);
+  - user activity (click times, with on-click screenshots).
+
+A store listing gets its own extension ID, not the one the `key` in `manifest.json` pins for
+unpacked installs. Remove `key` from the uploaded package, then add the new
+`chrome-extension://<id>` origin wherever the old one is allowed, including the tenant-bucket CORS
+rule that ASM Cloud sets up.
+
+Package from a list of the files the extension needs, not the whole folder, so `tests/`, source
+maps and any local `.claude/` settings stay out.
+
 ## Checks
 
 Run the automated checks from this directory:
@@ -64,6 +101,7 @@ Run the automated checks from this directory:
 node tests/static-check.mjs
 node tests/export-check.mjs
 node tests/webcam-camera-check.mjs
+node tests/background-check.mjs
 ```
 
 Third-party versions and license information are listed in `THIRD_PARTY_NOTICES.md`.

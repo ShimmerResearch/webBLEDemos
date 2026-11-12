@@ -29,6 +29,21 @@ if (!manifest.content_security_policy?.extension_pages?.includes("wasm-unsafe-ev
   throw new Error("The extension CSP must permit local MediaPipe WebAssembly.");
 }
 
+// Access to a page comes only from the toolbar click (activeTab). Host
+// permissions or a content script on every site would bring back the
+// "read and change all your data on all websites" warning and the store's
+// in-depth review; see README.md.
+const permissions = [...(manifest.permissions || [])].sort();
+if (permissions.join(",") !== "activeTab,scripting,storage") {
+  throw new Error(`Unexpected permissions: ${permissions.join(", ")}. Justify any addition in README.md and PRIVACY.md.`);
+}
+if (manifest.host_permissions?.length || manifest.optional_host_permissions?.length) {
+  throw new Error("The extension must not request host permissions.");
+}
+if (manifest.content_scripts?.length) {
+  throw new Error("The content script is injected on the toolbar click, not declared for every site.");
+}
+
 const workerSandbox = {
   importScripts() {},
   self: {

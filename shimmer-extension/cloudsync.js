@@ -13,6 +13,34 @@ const STORAGE_KEY = 'neurolynqAuth';
 // but must never be mistaken for a real server address.
 const DEFAULT_API_BASE = '';
 
+// The participant's password and session data only ever go to an ASM Cloud API
+// over HTTPS. Plain http, another domain, a port or embedded credentials are all
+// refused, so nobody can talk a participant into signing in somewhere else.
+const API_DOMAIN = 'verisense.net';
+const API_BASE_HINT = 'The server must be an https://…verisense.net address, such as https://XXXXapi.verisense.net.';
+
+/** The API origin for a Server field value, or an error if it is not an allowed server. */
+export function normalizeApiBase(input) {
+  let u;
+  try { u = new URL(String(input ?? '').trim()); } catch { throw new Error(API_BASE_HINT); }
+  const host = u.hostname.toLowerCase();
+  const allowed = u.protocol === 'https:' && host.endsWith(`.${API_DOMAIN}`)
+    && !u.port && !u.username && !u.password;
+  if (!allowed) throw new Error(API_BASE_HINT);
+  return u.origin;
+}
+
+/** A page URL without its query string and fragment, which can carry search terms or tokens. */
+export function stripUrlQuery(rawUrl) {
+  if (!rawUrl) return '';
+  try {
+    const u = new URL(rawUrl);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return '';
+  }
+}
+
 // ---- storage -------------------------------------------------------------
 
 function storageGet(key) {
@@ -139,7 +167,7 @@ function pick(obj, ...names) {
 }
 
 export async function signIn(apiBase, login, password) {
-  const base = apiBase.replace(/\/+$/, '');
+  const base = normalizeApiBase(apiBase);
   const result = await postJson(`${base}/api/auth/sign_in`, { Login: login, Password: password });
 
   // The API returns its own envelope; surface whatever error it gives us.
@@ -167,7 +195,12 @@ export async function getAuth() { return storageGet(STORAGE_KEY); }
 export async function signOut() { await storageSet(STORAGE_KEY, null); }
 
 async function requestUploadUrls(auth, deviceMac, contentHash, files) {
-  const result = await postJson(`${auth.apiBase}/api/neurolynq/upload_urls`, {
+  // A sign-in saved before the server check existed may hold any address.
+  let base;
+  try { base = normalizeApiBase(auth.apiBase); } catch (error) {
+    throw new Error(`Sign out and sign in again. ${error.message}`);
+  }
+  const result = await postJson(`${base}/api/neurolynq/upload_urls`, {
     Token: auth.token,
     DeviceMac: deviceMac,
     ContentHash: contentHash,
@@ -264,13 +297,15 @@ export async function buildSessionFiles({ csvRows, visionRows, screenshots, repo
   }
 
   // The manifest is the only place the plaintext URL is stored — the S3 key itself
-  // carries only the opaque hash.
+  // carries only the opaque hash. The query string and fragment are dropped: they
+  // can hold search terms or session tokens, and `canonical` already identifies
+  // the content (a YouTube or Vimeo id where there is one).
   const manifest = {
     schema: 'neurolynq/session/v1',
     startedAt: started.toISOString(),
     endedAt: new Date(csvRows[csvRows.length - 1].tMs).toISOString(),
     deviceMac,
-    content: { canonical, url: pageInfo?.url || '', title: pageInfo?.title || '' },
+    content: { canonical, url: stripUrlQuery(pageInfo?.url), title: pageInfo?.title || '' },
     sampleCount: csvRows.length,
     visionSampleCount: visionRows?.length ?? 0,
     screenshotCount: screenshots?.length ?? 0,
@@ -302,6 +337,9 @@ export async function uploadSession({ auth, deviceMac, session, onProgress }) {
   for (const file of files) {
     const url = byName.get(file.name);
     if (!url) throw new Error(`No upload URL returned for ${file.name}.`);
+    let secure = false;
+    try { secure = new URL(url).protocol === 'https:'; } catch { /* not a URL */ }
+    if (!secure) throw new Error(`The server returned a non-HTTPS upload URL for ${file.name}.`);
 
     let res;
     try {

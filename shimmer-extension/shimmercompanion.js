@@ -537,6 +537,9 @@ let captureBusy = false;
 function captureScreenshot(reason, meta = {}) {
   // meta: { clickTMs, eventId, kind } — kind 'onset' | 'settled' for click events
   if (!isRecording) return;
+  // The page is in a background tab or a minimized window: whatever is showing
+  // is not the recording tab, so there is nothing of ours to capture.
+  if (document.visibilityState === "hidden") return;
   captureQueue.push({ reason, meta, retried: false });
   pumpCaptureQueue();
 }
@@ -549,6 +552,8 @@ function pumpCaptureQueue() {
   chrome.runtime.sendMessage({ type: "TAKE_SCREENSHOT" }, (response) => {
     const ok = !chrome.runtime.lastError && response?.ok && response.dataUrl;
     if (ok && isRecording) recordShot(job, response.dataUrl);
+    // Refused because the recording tab was not the one showing: drop it, never retry.
+    else if (response?.skipped) console.info("Screenshot skipped:", response.error);
     else if (!ok && !job.retried) { job.retried = true; captureQueue.unshift(job); }
     else if (!ok) console.error("Screenshot failed:", chrome.runtime.lastError?.message || response?.error);
     setTimeout(() => { captureBusy = false; pumpCaptureQueue(); }, 600);
