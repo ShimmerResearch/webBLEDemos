@@ -43,6 +43,12 @@ if (manifest.host_permissions?.length || manifest.optional_host_permissions?.len
 if (manifest.content_scripts?.length) {
   throw new Error("The content script is injected on the toolbar click, not declared for every site.");
 }
+// Every web-accessible file lets any site detect the extension. Only the overlay
+// page needs it; the files that page loads are fetched by the extension itself.
+const webAccessible = (manifest.web_accessible_resources || []).flatMap((entry) => entry.resources || []);
+if (webAccessible.join(",") !== "shimmercompanion.html") {
+  throw new Error(`Only shimmercompanion.html may be web-accessible, not: ${webAccessible.join(", ")}`);
+}
 
 const workerSandbox = {
   importScripts() {},

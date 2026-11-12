@@ -30,8 +30,9 @@ are not saved or uploaded. Only the yes/no face-presence value is recorded.
 
 ## What is stored on the computer
 
-- **Sign-in:** the server address, the participant's email address, an access token and the
-  participant ID, in the extension's local storage, until the participant signs out.
+- **Sign-in:** the access token and participant ID, in the extension's session storage, until the
+  participant signs out or closes Chrome. The server address and email address are kept in local
+  storage to fill in the sign-in form next time.
 - **Preferences:** webcam preview and debug settings and the chosen camera, in the extension's
   local storage.
 

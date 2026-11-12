@@ -11,7 +11,15 @@ function load({ tabs = {}, windows = {}, afterCapture } = {}) {
   const calls = { capture: [], inject: [], sendMessage: [] };
   let onMessage, onClicked;
   let sendMessageFailures = 0;
+  const session = {};
   const chrome = {
+    storage: {
+      session: {
+        get: async (key) => (key in session ? { [key]: session[key] } : {}),
+        set: async (items) => { Object.assign(session, items); },
+        remove: async (key) => { delete session[key]; },
+      },
+    },
     runtime: {
       lastError: null,
       onMessage: { addListener: (fn) => { onMessage = fn; } },
@@ -110,4 +118,20 @@ const showing = { tabs: { 7: { id: 7, active: true, windowId: 1 } }, windows: { 
   assert.equal(calls.sendMessage.length, 1);
 }
 
-console.log("Background checks passed (screenshots only of the showing companion tab, on-demand injection).");
+// The companion starts only with the one-time token its content script registered
+// for the same tab: a page embedding shimmercompanion.html itself has none.
+{
+  const { send } = load(showing);
+  const claim = (token, tabId = 7) => send({ type: "CLAIM_OVERLAY", token }, { tab: { id: tabId } });
+  assert.equal((await claim("never-registered")).ok, false);
+  assert.equal((await send({ type: "REGISTER_OVERLAY", token: "t1" }, { tab: { id: 7 }, frameId: 3 })).ok, false,
+    "only the top frame's content script registers");
+  assert.equal((await send({ type: "REGISTER_OVERLAY", token: "t1" }, { tab: { id: 7 }, frameId: 0 })).ok, true);
+  assert.equal((await claim("t1", 8)).ok, false, "another tab cannot use it");
+  assert.equal((await claim("wrong")).ok, false);
+  assert.equal((await claim("t1")).ok, true);
+  assert.equal((await claim("t1")).ok, false, "the token is spent on first use");
+  assert.equal((await send({ type: "CLAIM_OVERLAY", token: "t1" }, {})).ok, false);
+}
+
+console.log("Background checks passed (screenshots only of the showing companion tab, on-demand injection, one-time overlay token).");

@@ -11,7 +11,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["shimmercompanion.html", "shimmercompanion.js", "chart.min.js", "vendor/shimmer-web-sdk.esm.js", "cloudsync.js"],
+      "resources": ["shimmercompanion.html"],
       "matches": [
         "http://*/*",
         "https://*/*"

@@ -123,10 +123,21 @@ let captureOverlay = null; // transparent full-page layer for smooth drag/resize
 const DEFAULT_W = 360, DEFAULT_H = 640;
 const MIN_W = 300, MIN_H = 200, MINIMIZED_H = 52;
 
-function createOverlay() {
+// shimmercompanion.html has to be web-accessible for this iframe, so any page could
+// embed it too. A one-time token tells the companion that this content script opened
+// it: the token is registered with the background worker for this tab, travels in
+// the iframe's URL, and is spent when the companion starts (shimmercompanion.js).
+async function createOverlay() {
+  const token = crypto.randomUUID();
+  let registered = null;
+  try {
+    registered = await chrome.runtime.sendMessage({ type: 'REGISTER_OVERLAY', token });
+  } catch { /* extension reloaded under this tab */ }
+  if (!registered?.ok) return;
+
   startBroadcasting();
   overlayIframe = document.createElement('iframe');
-  overlayIframe.src = chrome.runtime.getURL('shimmercompanion.html');
+  overlayIframe.src = `${chrome.runtime.getURL('shimmercompanion.html')}#${token}`;
   const top = 20;
   const left = Math.max(20, window.innerWidth - DEFAULT_W - 20);
   Object.assign(overlayIframe.style, {
@@ -142,8 +153,14 @@ function createOverlay() {
   document.body.appendChild(overlayIframe);
 }
 
+let overlayCreating = null;
+
 function toggleOverlay() {
-  if (!overlayIframe) { createOverlay(); return; }
+  if (overlayCreating) return; // a second click while the first is still registering
+  if (!overlayIframe) {
+    overlayCreating = createOverlay().finally(() => { overlayCreating = null; });
+    return;
+  }
   overlayIframe.style.display = overlayIframe.style.display === 'none' ? 'block' : 'none';
 }
 

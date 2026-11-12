@@ -1,6 +1,30 @@
 import { Shimmer3RClient, SensorBitmapShimmer3 } from "./vendor/shimmer-web-sdk.esm.js";
-import { signIn, signOut, getAuth, uploadSession, DEFAULT_API_BASE } from "./cloudsync.js";
+import { signIn, signOut, getAuth, getSignInDefaults, uploadSession, csvText, DEFAULT_API_BASE } from "./cloudsync.js";
 import { WebcamAnalysis } from "./webcam.js";
+
+// ===== Opened by the extension? =====
+// shimmercompanion.html is web-accessible so the content script can show it in an
+// iframe, which means any page could embed it as well. The content script passes a
+// one-time token in the URL fragment; the background worker accepts it once, for
+// this tab. Without it the companion shows a notice and starts nothing.
+async function claimOverlay() {
+  const token = location.hash.slice(1);
+  if (!token) return false;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "CLAIM_OVERLAY", token });
+    return response?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+if (!(await claimOverlay())) {
+  const notice = document.createElement("p");
+  notice.textContent = "Open Shimmer Companion from its toolbar button.";
+  notice.style.cssText = "margin:0;padding:16px;font:14px system-ui,sans-serif;color:#e8eaed;background:#1c1f26;border-radius:12px";
+  document.body.replaceChildren(notice);
+  throw new Error("Shimmer Companion was not opened by the extension; not starting.");
+}
 
 // ===== Charts =====
 const gsrCtx = document.getElementById('gsrChart').getContext('2d');
@@ -1101,7 +1125,8 @@ downloadBtn.onclick = async () => {
   const header = ["Timestamp", "Elapsed (s)", "Video Title", "Video Time (s)", "GSR (uS)", "PPG (Raw)"];
   const csvContent = [
     header.join(","),
-    ...csvRows.map(r => `${r.timestamp},${((r.tMs - t0ms) / 1000).toFixed(3)},${r.videoTitle},${r.videoTime},${r.gsr},${r.ppg ?? ""}`)
+    // Titles come from the page: csvText quotes them and defuses spreadsheet formulas.
+    ...csvRows.map(r => `${r.timestamp},${((r.tMs - t0ms) / 1000).toFixed(3)},${csvText(r.videoTitle)},${r.videoTime},${r.gsr},${r.ppg ?? ""}`)
   ].join("\n");
 
   try {
@@ -1125,7 +1150,7 @@ downloadBtn.onclick = async () => {
       const eventsCsv = [
         evHeader.join(","),
         ...screenshots.map(s =>
-          `${s.timestamp},${(((s.tMs ?? t0ms) - t0ms) / 1000).toFixed(3)},${s.clickTMs != null ? ((s.clickTMs - t0ms) / 1000).toFixed(3) : ""},${s.eventId ?? ""},${s.kind ?? ""},${s.videoTime},${s.reason},${(s.title || "").replace(/,/g, "")},${s.file}`)
+          `${s.timestamp},${(((s.tMs ?? t0ms) - t0ms) / 1000).toFixed(3)},${s.clickTMs != null ? ((s.clickTMs - t0ms) / 1000).toFixed(3) : ""},${s.eventId ?? ""},${s.kind ?? ""},${s.videoTime},${s.reason},${csvText(s.title || "")},${s.file}`)
       ].join("\n");
       zip.file("events.csv", eventsCsv);
       const folder = zip.folder("screenshots");
@@ -1175,8 +1200,10 @@ function cloudShowView(auth) {
 
 async function cloudOpen() {
   const auth = await getAuth();
-  cloudApiBase.value = auth?.apiBase || DEFAULT_API_BASE;
-  if (auth?.login) cloudEmail.value = auth.login;
+  const defaults = auth ? null : await getSignInDefaults();
+  cloudApiBase.value = auth?.apiBase || defaults?.apiBase || DEFAULT_API_BASE;
+  const login = auth?.login || defaults?.login;
+  if (login) cloudEmail.value = login;
   cloudShowView(auth);
   cloudSetStatus("");
   cloudProgressFill.style.width = "0%";

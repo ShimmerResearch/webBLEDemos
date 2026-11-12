@@ -37,8 +37,41 @@ async function takeScreenshot(tab) {
     return shot;
 }
 
+// One-time overlay tokens, one per tab (see createOverlay in content.js). Kept in
+// session storage, which survives the service worker being stopped and is not
+// readable from content scripts.
+const overlayKey = (tabId) => `overlayToken:${tabId}`;
+
+async function registerOverlay(tabId, token) {
+    await chrome.storage.session.set({ [overlayKey(tabId)]: token });
+    return { ok: true };
+}
+
+async function claimOverlay(tabId, token) {
+    const key = overlayKey(tabId);
+    const stored = await chrome.storage.session.get(key);
+    if (!token || stored[key] !== token) return { ok: false };
+    await chrome.storage.session.remove(key);
+    return { ok: true };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === "VIDEO_TIME") {
+    if (message.type === "REGISTER_OVERLAY") {
+        // From the content script in the tab's top frame only.
+        if (sender.tab?.id == null || sender.frameId !== 0 || typeof message.token !== "string") {
+            sendResponse({ ok: false });
+            return;
+        }
+        registerOverlay(sender.tab.id, message.token).then(sendResponse);
+        return true;
+    } else if (message.type === "CLAIM_OVERLAY") {
+        if (sender.tab?.id == null || typeof message.token !== "string") {
+            sendResponse({ ok: false });
+            return;
+        }
+        claimOverlay(sender.tab.id, message.token).then(sendResponse);
+        return true;
+    } else if (message.type === "VIDEO_TIME") {
         chrome.runtime.sendMessage(message);
     } else if (message.type === "TAKE_SCREENSHOT") {
         if (sender.tab?.id == null) {

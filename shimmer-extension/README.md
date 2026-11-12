@@ -17,11 +17,20 @@ no access to any page until then: the click adds the companion to that one tab (
 `scripting`), so there is no content script on other sites and nothing to reload after installing.
 After reloading the extension, reload the page too.
 
+`shimmercompanion.html` is the only web-accessible file, because the content script shows it in an
+iframe; the scripts and assets it loads are fetched by the extension itself. Being web-accessible
+means any page could embed it, so the companion only starts when the content script opened it: the
+content script registers a one-time token for its tab with the background worker and passes it in
+the iframe's URL fragment, and the companion spends it on start. A page that embeds the companion
+itself gets a notice to use the toolbar button instead.
+
 ## Recording and exports
 
 The extension can record PPG and GSR signals, associate them with the active page and media timeline, capture timestamped screenshots, and generate a session report. Local downloads are available without signing in.
 
 Screenshots are only ever of the tab the companion is open in, and only while that tab is the one showing in its window. A periodic or on-click shot taken while the participant is on another tab, or with the window minimized, is skipped rather than capturing whatever is on screen (`background.js`).
+
+Page and media titles come from the page, so in every CSV, downloaded or uploaded, they are quoted, and a title starting with `=`, `+`, `-` or `@` gets a leading apostrophe so a spreadsheet does not run it as a formula (`csvText` in `cloudsync.js`).
 
 Cloud uploads are split into typed files rather than one large payload:
 
@@ -51,6 +60,8 @@ For best results, use even front lighting, keep the face reasonably centered, an
 The **Server** field expects the tenant-specific API origin in the form `https://XXXXapi.verisense.net`. This is intentionally a placeholder; the extension does not contain a default production server. Only `https://` addresses under `verisense.net`, with no port or embedded credentials, are accepted (`normalizeApiBase` in `cloudsync.js`), so a participant cannot be talked into sending their password to another server. Presigned upload URLs must be HTTPS too.
 
 The session manifest records the page address without its query string or fragment, which can carry search terms or tokens. The content hash and `canonical` field still identify the content.
+
+The access token is kept in `chrome.storage.session`, which Chrome clears when it closes, so participants sign in once per browser session and a shared computer does not stay signed in. The server address and email are kept in `chrome.storage.local` to prefill the form. Earlier versions kept the token in local storage; this version deletes it the first time it reads the sign-in.
 
 The compatible ASM Cloud deployment must provide:
 

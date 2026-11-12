@@ -3,8 +3,55 @@ import { readFileSync } from "node:fs";
 
 const cloudSyncSource = readFileSync(new URL("../cloudsync.js", import.meta.url), "utf8");
 const cloudSyncModuleUrl = `data:text/javascript;base64,${Buffer.from(cloudSyncSource).toString("base64")}`;
-const { buildSessionFiles, uploadSession, signIn, normalizeApiBase, stripUrlQuery, DEFAULT_API_BASE } = await import(cloudSyncModuleUrl);
+const {
+  buildSessionFiles, uploadSession, signIn, signOut, getAuth, getSignInDefaults,
+  normalizeApiBase, stripUrlQuery, csvText, DEFAULT_API_BASE,
+} = await import(cloudSyncModuleUrl);
 assert.equal(DEFAULT_API_BASE, "");
+
+// Page titles in CSV: quoted, and a leading = + - @ cannot run as a formula.
+assert.equal(csvText("Plain title"), "Plain title");
+assert.equal(csvText("Title, with comma"), '"Title, with comma"');
+assert.equal(csvText("=1+1"), "'=1+1");
+assert.equal(csvText("-5"), "'-5");
+assert.equal(csvText("@SUM(A1)"), "'@SUM(A1)");
+assert.equal(csvText('=HYPERLINK("https://x.test","y")'), '"\'=HYPERLINK(""https://x.test"",""y"")"');
+assert.equal(csvText(null), "");
+
+// Sign-in storage: the token lives in chrome.storage.session only. Server and
+// email are kept in chrome.storage.local to prefill the form; an older version's
+// token left in local storage is removed.
+{
+  const areas = { local: {}, session: {} };
+  const area = (name) => ({
+    get: (keys, callback) => callback(Object.fromEntries(keys.filter((k) => k in areas[name]).map((k) => [k, areas[name][k]]))),
+    set: (items, callback) => { Object.assign(areas[name], items); callback(); },
+    remove: (key, callback) => { delete areas[name][key]; callback(); },
+  });
+  const savedChrome = globalThis.chrome;
+  const savedFetch = globalThis.fetch;
+  globalThis.chrome = { storage: { local: area("local"), session: area("session") } };
+
+  areas.local.neurolynqAuth = { apiBase: "https://oldapi.verisense.net", login: "p@example.test", token: "old-token" };
+  assert.equal(await getAuth(), null, "an old local token does not count as signed in");
+  assert.equal("neurolynqAuth" in areas.local, false, "the old local token is deleted");
+  assert.deepEqual(await getSignInDefaults(), { apiBase: "https://oldapi.verisense.net", login: "p@example.test" });
+
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ AccesToken: "new-token", ParticipantId: "42" }) });
+  const auth = await signIn("https://tenantapi.verisense.net", "p@example.test", "pw");
+  assert.equal(auth.token, "new-token");
+  assert.equal(areas.session.neurolynqAuth.token, "new-token");
+  assert.equal(JSON.stringify(areas.local).includes("new-token"), false, "no token in local storage");
+  assert.deepEqual(areas.local.neurolynqSignInDefaults, { apiBase: "https://tenantapi.verisense.net", login: "p@example.test" });
+  assert.equal((await getAuth()).token, "new-token");
+
+  await signOut();
+  assert.equal(await getAuth(), null);
+  assert.equal((await getSignInDefaults()).login, "p@example.test", "the email is still prefilled after signing out");
+
+  globalThis.chrome = savedChrome;
+  globalThis.fetch = savedFetch;
+}
 
 // Only https://…verisense.net servers receive credentials.
 assert.equal(normalizeApiBase(" https://TenantAPI.verisense.net/ "), "https://tenantapi.verisense.net");
@@ -74,6 +121,18 @@ const withQuery = await buildSessionFiles({
 });
 const manifestWithQuery = JSON.parse(await withQuery.find((file) => file.type === "manifest").blob.text());
 assert.equal(manifestWithQuery.content.url, "https://example.test/demo");
+
+// A page title in the uploaded events CSV cannot run as a spreadsheet formula.
+const withFormulaTitle = await buildSessionFiles({
+  ...baseSession,
+  visionRows: [],
+  screenshots: [{
+    timestamp: "2026-08-02T00:00:00.200Z", tMs: 1200, reason: "periodic", videoTime: "0.2",
+    title: '=HYPERLINK("https://x.test","click")', file: "shot_0001.jpg", dataUrl: "data:image/jpeg;base64,AAAA",
+  }],
+});
+const eventsCsv = await withFormulaTitle.find((file) => file.type === "events").blob.text();
+assert.match(eventsCsv, /,"'=HYPERLINK\(""https:\/\/x\.test"",""click""\)",shot_0001\.jpg$/m);
 
 const originalFetch = globalThis.fetch;
 globalThis.chrome = {

@@ -8,7 +8,11 @@
 // Trial, participant and destination bucket are resolved server-side from the
 // access token, so nothing about identity is asserted by this client.
 
+// The signed-in account, access token included, lives in chrome.storage.session:
+// Chrome clears it when it closes, so a shared lab computer does not stay signed
+// in. Only the server and email are kept across restarts, to prefill the form.
 const STORAGE_KEY = 'neurolynqAuth';
+const DEFAULTS_KEY = 'neurolynqSignInDefaults';
 // Deliberately blank: the UI placeholder shows the required tenant-specific shape,
 // but must never be mistaken for a real server address.
 const DEFAULT_API_BASE = '';
@@ -43,12 +47,30 @@ export function stripUrlQuery(rawUrl) {
 
 // ---- storage -------------------------------------------------------------
 
-function storageGet(key) {
-  return new Promise((resolve) => chrome.storage.local.get([key], (r) => resolve(r?.[key] ?? null)));
+function storageGet(area, key) {
+  return new Promise((resolve) => chrome.storage[area].get([key], (r) => resolve(r?.[key] ?? null)));
 }
 
-function storageSet(key, value) {
-  return new Promise((resolve) => chrome.storage.local.set({ [key]: value }, () => resolve()));
+function storageSet(area, key, value) {
+  return new Promise((resolve) => chrome.storage[area].set({ [key]: value }, () => resolve()));
+}
+
+function storageRemove(area, key) {
+  return new Promise((resolve) => chrome.storage[area].remove(key, () => resolve()));
+}
+
+// Earlier versions kept the whole sign-in, token included, in chrome.storage.local.
+// Keep its server and email as form defaults and delete the rest, once per page.
+let legacyAuthChecked = false;
+async function dropLegacyAuth() {
+  if (legacyAuthChecked) return;
+  legacyAuthChecked = true;
+  const legacy = await storageGet('local', STORAGE_KEY);
+  if (!legacy) return;
+  if (!(await storageGet('local', DEFAULTS_KEY)) && (legacy.apiBase || legacy.login)) {
+    await storageSet('local', DEFAULTS_KEY, { apiBase: legacy.apiBase || '', login: legacy.login || '' });
+  }
+  await storageRemove('local', STORAGE_KEY);
 }
 
 // ---- content hash --------------------------------------------------------
@@ -103,9 +125,19 @@ function stamp(date) {
     + `_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
-function csvEscape(value) {
+export function csvEscape(value) {
   const s = value == null ? '' : String(value);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * A CSV cell for text a web page supplied, such as a page or media title.
+ * Spreadsheets run a cell that starts with = + - @ (or a tab or carriage return)
+ * as a formula, so such text gets a leading apostrophe before it is quoted.
+ */
+export function csvText(value) {
+  const s = value == null ? '' : String(value);
+  return csvEscape(/^[=+\-@\t\r]/.test(s) ? `'${s}` : s);
 }
 
 function dataUrlToBlob(dataUrl) {
@@ -187,12 +219,25 @@ export async function signIn(apiBase, login, password) {
     isTemporaryPassword: !!pick(result, 'isTemporaryPassword'),
     signedInAt: Date.now(),
   };
-  await storageSet(STORAGE_KEY, auth);
+  await dropLegacyAuth();
+  await storageSet('session', STORAGE_KEY, auth);
+  await storageSet('local', DEFAULTS_KEY, { apiBase: base, login });
   return auth;
 }
 
-export async function getAuth() { return storageGet(STORAGE_KEY); }
-export async function signOut() { await storageSet(STORAGE_KEY, null); }
+/** The signed-in account for this browser session, or null. */
+export async function getAuth() {
+  await dropLegacyAuth();
+  return storageGet('session', STORAGE_KEY);
+}
+
+/** The server and email last signed in with, to prefill the form; never a token. */
+export async function getSignInDefaults() {
+  await dropLegacyAuth();
+  return storageGet('local', DEFAULTS_KEY);
+}
+
+export async function signOut() { await storageRemove('session', STORAGE_KEY); }
 
 async function requestUploadUrls(auth, deviceMac, contentHash, files) {
   // A sign-in saved before the server check existed may hold any address.
@@ -279,7 +324,7 @@ export async function buildSessionFiles({ csvRows, visionRows, screenshots, repo
         csvEscape(s.kind ?? ''),
         csvEscape(s.videoTime ?? ''),
         csvEscape(s.reason ?? ''),
-        csvEscape(s.title ?? ''),
+        csvText(s.title ?? ''),
         csvEscape(s.file ?? ''),
       ].join(',')),
     ].join('\n');
