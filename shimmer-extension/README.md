@@ -102,13 +102,31 @@ based on the code; confirm them against the final policy.
   - web history (the page address);
   - user activity (click times, with on-click screenshots).
 
-A store listing gets its own extension ID, not the one the `key` in `manifest.json` pins for
-unpacked installs. Remove `key` from the uploaded package, then add the new
-`chrome-extension://<id>` origin wherever the old one is allowed, including the tenant-bucket CORS
-rule that ASM Cloud sets up.
+### Publishing a beta
 
-Package from a list of the files the extension needs, not the whole folder, so `tests/`, source
-maps and any local `.claude/` settings stay out.
+1. **Build the upload.** Run `node tools/package.mjs` from this directory. It writes
+   `dist/shimmer-companion-<version>.zip` (ignored by git) from the list in `PACKAGE_FILES`: the
+   files the extension loads and `THIRD_PARTY_NOTICES.md`, nothing else. So `tests/`, `tools/`,
+   source maps, the unused SDK and MediaPipe builds, and any local `.claude/` or `.vscode/` settings
+   stay out. It also removes `key` from the manifest, which the store does not accept. The build
+   fails if shipped code names a file in this folder that the list leaves out.
+2. **Add an icon.** The store needs a 128 × 128 px icon declared in the manifest's `icons`. The
+   extension has none yet, and the build warns until it does.
+3. **Upload the ZIP as a new item** and set its visibility to **Unlisted** or **Private** (trusted
+   testers) for the beta, not Public. Each later upload needs a higher `version` in
+   `manifest.json`.
+4. **Allow the new extension ID in ASM Cloud.** The store assigns the item its own ID, shown in
+   the dashboard after the first upload; it is not the ID the `key` pins for unpacked installs.
+   Uploads need `chrome-extension://<new-id>` in tenant-bucket CORS:
+   - **New buckets:** add the origin to ASM Cloud's list of allowed bucket origins.
+   - **Existing buckets:** CORS is written only when a bucket is created, so each existing
+     tenant bucket needs its CORS rule updated once.
+
+   Unpacked installs keep the pinned ID, so both origins stay allowed.
+5. **Fill in the privacy fields:** the hosted policy's URL and the answers above.
+
+The extension ships the shimmer-web-sdk build in `vendor/` (0.5.1, built from commit `15a216d`,
+which is on the SDK's `main`). The build prints the version it packaged.
 
 ## Checks
 
@@ -119,6 +137,7 @@ node tests/static-check.mjs
 node tests/export-check.mjs
 node tests/webcam-camera-check.mjs
 node tests/background-check.mjs
+node tests/package-check.mjs
 ```
 
 Third-party versions and license information are listed in `THIRD_PARTY_NOTICES.md`.

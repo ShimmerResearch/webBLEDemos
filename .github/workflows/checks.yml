@@ -56,9 +56,10 @@ jobs:
         with:
           node-version: "22"
 
-      # The four Node checks shimmer-extension/README.md lists: DOM ids, webcam
+      # The five Node checks shimmer-extension/README.md lists: DOM ids, webcam
       # assets and permissions; the cloud export and server check; camera
-      # selection; and the background worker's screenshot guard.
+      # selection; the background worker's screenshot guard; and the Web Store
+      # package's contents.
       - name: Run the extension's Node tests
         working-directory: shimmer-extension
         run: |
@@ -66,3 +67,4 @@ jobs:
           node tests/export-check.mjs
           node tests/webcam-camera-check.mjs
           node tests/background-check.mjs
+          node tests/package-check.mjs
