@@ -52,7 +52,8 @@ async function claimOverlay(tabId, token) {
     const stored = await chrome.storage.session.get(key);
     if (!token || stored[key] !== token) return { ok: false };
     await chrome.storage.session.remove(key);
-    return { ok: true };
+    // The companion addresses its overlay commands to this tab's content script.
+    return { ok: true, tabId };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

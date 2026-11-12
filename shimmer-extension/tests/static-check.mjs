@@ -50,6 +50,16 @@ if (webAccessible.join(",") !== "shimmercompanion.html") {
   throw new Error(`Only shimmercompanion.html may be web-accessible, not: ${webAccessible.join(", ")}`);
 }
 
+// The companion and the content script talk through extension messaging only:
+// window.postMessage would let the page read the recording timeline and spoof commands.
+const contentScript = readFileSync(resolve(extensionRoot, "content.js"), "utf8");
+if (/\bpostMessage\s*\(/.test(companion)) {
+  throw new Error("shimmercompanion.js must not use window.postMessage; send overlay commands with toHost().");
+}
+if (/addEventListener\(\s*["']message["']/.test(contentScript)) {
+  throw new Error("content.js must not listen for window messages; handle commands in chrome.runtime.onMessage.");
+}
+
 const workerSandbox = {
   importScripts() {},
   self: {

@@ -322,15 +322,14 @@ function endInteraction() {
   captureOverlay = null;
 }
 
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'TOGGLE_OVERLAY') toggleOverlay();
-});
-
-window.addEventListener('message', (event) => {
-  // Only the extension iframe may control the injected overlay or host page.
-  // Without this check, the host page could spoof immersive/play/resize commands.
-  if (event.source !== overlayIframe?.contentWindow) return;
-  const d = event.data;
+// Commands arrive from the background worker (TOGGLE_OVERLAY) and from the
+// companion (chrome.tabs.sendMessage). Extension messaging, unlike
+// window.postMessage, can be neither read nor sent by the page, so the page can
+// neither spoof these commands nor see the recording timeline they reveal.
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (sender.id !== chrome.runtime.id) return;
+  const d = message;
+  if (d?.type === 'TOGGLE_OVERLAY') { toggleOverlay(); return; }
   if (!d || !overlayIframe) return;
 
   switch (d.type) {

@@ -7,15 +7,28 @@ import { WebcamAnalysis } from "./webcam.js";
 // iframe, which means any page could embed it as well. The content script passes a
 // one-time token in the URL fragment; the background worker accepts it once, for
 // this tab. Without it the companion shows a notice and starts nothing.
+let hostTabId = null; // the tab this companion is shown in, from the background worker
+
 async function claimOverlay() {
   const token = location.hash.slice(1);
   if (!token) return false;
   try {
     const response = await chrome.runtime.sendMessage({ type: "CLAIM_OVERLAY", token });
-    return response?.ok === true;
+    if (response?.ok !== true || !Number.isInteger(response.tabId)) return false;
+    hostTabId = response.tabId;
+    return true;
   } catch {
     return false;
   }
+}
+
+// Overlay and immersive-mode commands for the content script in this tab. They go
+// through the extension's own messaging, not window.postMessage, so the page the
+// companion sits on never sees when recording, the rest period or playback start.
+function toHost(message) {
+  chrome.tabs.sendMessage(hostTabId, message, { frameId: 0 }).catch(() => {
+    // The page navigated or the content script is gone: nothing to control.
+  });
 }
 
 if (!(await claimOverlay())) {
@@ -502,12 +515,12 @@ setConn('offline', 'Offline');
 // ===== Window controls =====
 closeBtn.onclick = () => {
   stopWebcam();
-  window.parent.postMessage({ type: 'CLOSE_OVERLAY' }, '*');
+  toHost({ type: 'CLOSE_OVERLAY' });
 };
 window.addEventListener("beforeunload", () => webcam.stop());
 
 function toggleMinimize() {
-  window.parent.postMessage({ type: 'MINIMIZE_OVERLAY' }, '*');
+  toHost({ type: 'MINIMIZE_OVERLAY' });
   body.classList.toggle('is-minimized');
 }
 // Collapse/expand to a known state (toggleMinimize alone would flip whichever
@@ -527,7 +540,7 @@ function bindDrag(el) {
   el.addEventListener('mousedown', (e) => {
     if (e.target.closest('button')) return;
     e.preventDefault();
-    window.parent.postMessage({ type: 'DRAG_START' }, '*');
+    toHost({ type: 'DRAG_START' });
   });
 }
 bindDrag(dragHeader);
@@ -537,7 +550,7 @@ bindDrag(dragHeaderMin);
 document.querySelectorAll('.rz').forEach((h) => {
   h.addEventListener('mousedown', (e) => {
     e.preventDefault();
-    window.parent.postMessage({ type: 'RESIZE_START', edges: h.dataset.edges }, '*');
+    toHost({ type: 'RESIZE_START', edges: h.dataset.edges });
   });
 });
 
@@ -746,7 +759,7 @@ chrome.runtime.onMessage.addListener((message) => {
   // it fires once, and only when we entered immersive for this recording.
   if (message.ended && immersiveActive) {
     immersiveActive = false;
-    window.parent.postMessage({ type: 'EXIT_IMMERSIVE' }, '*');
+    toHost({ type: 'EXIT_IMMERSIVE' });
     setMinimized(false);
   }
 });
@@ -921,12 +934,12 @@ function startRest() {
       showRest(restRemaining);
       // The widget is hidden by fullscreen, so the countdown the participant
       // sees is the one drawn on the neutral field by the content script.
-      window.parent.postMessage({ type: 'REST_TICK', remaining: restRemaining }, '*');
+      toHost({ type: 'REST_TICK', remaining: restRemaining });
       return;
     }
     cancelRest();
     streamBtnText.textContent = "Stop Recording";
-    window.parent.postMessage({ type: 'PLAY_VIDEO' }, '*');
+    toHost({ type: 'PLAY_VIDEO' });
   }, 1000);
 }
 
@@ -942,7 +955,7 @@ function startRecording() {
   // the baseline — not at video onset, where the transition would confound the
   // stimulus response.
   if (immersiveEnable.checked) {
-    window.parent.postMessage({ type: 'ENTER_IMMERSIVE', restSeconds: restSeconds() }, '*');
+    toHost({ type: 'ENTER_IMMERSIVE', restSeconds: restSeconds() });
     setMinimized(true);
     immersiveActive = true;
   }
@@ -957,7 +970,7 @@ function stopRecording() {
   captureQueue.length = 0;
   body.classList.remove('is-recording');
   streamBtnText.textContent = "Start Recording";
-  window.parent.postMessage({ type: 'EXIT_IMMERSIVE' }, '*');
+  toHost({ type: 'EXIT_IMMERSIVE' });
   immersiveActive = false;
   setMinimized(false);
   if (shimmer.device?.gatt?.connected) setConn('online', 'Online');

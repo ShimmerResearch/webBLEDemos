@@ -129,7 +129,9 @@ const showing = { tabs: { 7: { id: 7, active: true, windowId: 1 } }, windows: { 
   assert.equal((await send({ type: "REGISTER_OVERLAY", token: "t1" }, { tab: { id: 7 }, frameId: 0 })).ok, true);
   assert.equal((await claim("t1", 8)).ok, false, "another tab cannot use it");
   assert.equal((await claim("wrong")).ok, false);
-  assert.equal((await claim("t1")).ok, true);
+  const claimed = await claim("t1");
+  assert.equal(claimed.ok, true);
+  assert.equal(claimed.tabId, 7, "the companion learns its own tab, to address the content script");
   assert.equal((await claim("t1")).ok, false, "the token is spent on first use");
   assert.equal((await send({ type: "CLAIM_OVERLAY", token: "t1" }, {})).ok, false);
 }

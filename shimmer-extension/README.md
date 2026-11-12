@@ -24,6 +24,12 @@ content script registers a one-time token for its tab with the background worker
 the iframe's URL fragment, and the companion spends it on start. A page that embeds the companion
 itself gets a notice to use the toolbar button instead.
 
+The companion sends its overlay commands (close, minimize, drag, resize) and immersive-mode commands
+(enter, rest countdown, play, exit) to the content script with `chrome.tabs.sendMessage`, addressed
+to the tab the background worker reported when the token was claimed. Extension messaging is
+invisible to the page, which therefore cannot see when a recording starts or send commands of its
+own. Do not switch these back to `window.postMessage`; `tests/static-check.mjs` fails if they are.
+
 ## Recording and exports
 
 The extension can record PPG and GSR signals, associate them with the active page and media timeline, capture timestamped screenshots, and generate a session report. Local downloads are available without signing in.
