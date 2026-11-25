@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-const SDK_VERSION = '0.5.22';
+const SDK_VERSION = '0.5.26';
 
 /**
  * Container for a single decoded sensor frame.
@@ -1710,9 +1710,20 @@ const HUB_FW_UPLOAD_STAGE = Object.freeze({
     ABORT: 0x03,
 });
 /** MAX32674C .msbl image geometry (mirrors firmware flashUpdater.h). A page on
- * the wire is PAGE_PAYLOAD + PAGE_CRC bytes; HEADER_SIZE bytes precede page 0. */
+ * the wire is PAGE_PAYLOAD + PAGE_CRC bytes; HEADER_SIZE bytes precede page 0.
+ *
+ * The header opens with the magic `msbl` and, at OFF_TARGET, the part the image
+ * was built for: NUL-padded ASCII. ADI's MAX32674C images name its die,
+ * `MAX32670`, for example `MAX32670_WHRM_AEC_SCD_WSPO2_C_50.4.4.msbl`, the v50.4.4
+ * the SR68 hubs report. A MAX32664 image names `MAX32660`. The device firmware
+ * reads neither field, and it erases the hub before the first page. */
 const MSBL = Object.freeze({
     HEADER_SIZE: 0x4c,
+    MAGIC: 'msbl',
+    OFF_TARGET: 0x08,
+    TARGET_LEN: 16,
+    /** The only target the Verisense algorithm hub (MAX32674C) accepts. */
+    HUB_TARGET: 'MAX32670',
     OFF_NUMPAGES: 0x44,
     PAGE_PAYLOAD: 8192,
     PAGE_CRC: 16,
@@ -18071,7 +18082,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'wrAccelRate.lis2dw12',
         label: 'WR Accel Rate',
-        desc: 'LIS2DW12 (Shimmer3R) rate — ConfigSetupByte0 bits 4-7 (SensorLIS2DW12.java:428).',
+        desc: 'LIS2DW12 (Shimmer3R) rate — ConfigSetupByte0 bits 4-7 (SensorLIS2DW12.java:428). The labels are the high-performance rates; in a low-power mode code 1 is 1.6 Hz and codes 7-9 deliver only 200 Hz.',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 4,
@@ -18084,7 +18095,7 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'wrAccelLpm',
         label: 'WR Accel Low-Power Mode',
-        desc: 'ConfigSetupByte0 bit 1 (bitShiftLSM303DLHCAccelLPM=1, FW wrAccelLpModeLsb).',
+        desc: 'ConfigSetupByte0 bit 1 (bitShiftLSM303DLHCAccelLPM=1, FW wrAccelLpModeLsb). On a Shimmer3R (LIS2DW12) it only picks WHICH low-power mode the part uses while High-Performance Mode is off; with that off the part is in a low-power mode whatever this says. Consensys always sets it to the opposite of High-Performance Mode (SensorLIS2DW12.setLowPowerAccelWR).',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 1,
@@ -18097,14 +18108,30 @@ const SHIMMER3_INFOMEM_FIELD_SCHEMA = Object.freeze([
     {
         key: 'wrAccelHrm',
         label: 'WR Accel High-Resolution Mode',
-        desc: 'ConfigSetupByte0 bit 0 (bitShiftLSM303DLHCAccelHRM=0, FW wrAccelHrMode).',
+        desc: 'LSM303 (Shimmer3) high-resolution mode — ConfigSetupByte0 bit 0 (bitShiftLSM303DLHCAccelHRM=0, FW wrAccelHrMode).',
         kind: 'bit',
         layoutKey: 'idxConfigSetupByte0',
         shift: 0,
         width: 1,
         options: ON_OFF,
         group: 'wrAccel',
-        appliesTo: ALL,
+        appliesTo: SHIMMER3_ONLY,
+        configKey: 'imu.wrAccelHrm',
+    },
+    {
+        // The same bit as `wrAccelHrm`, under the name it has on this chip. Labelled
+        // "High-Resolution" here it read as a resolution setting, and turning it off
+        // put a Shimmer3R's LIS2DW12 into low-power mode at 256 Hz (DEV-1563).
+        key: 'wrAccelHrm.lis2dw12',
+        label: 'WR Accel High-Performance Mode',
+        desc: 'LIS2DW12 (Shimmer3R) high-performance mode — ConfigSetupByte0 bit 0 (FW wrAccelHrMode; Java mHighPerModeAccelWR). The firmware gives the part (this bit << 2) | low-power mode, so this bit alone decides high performance against low power. On: every rate up to 1600 Hz. Off: a low-power mode, which cannot deliver more than 200 Hz, so a sampling rate above that leaves packets with no new wide-range reading. Consensys turns it on whenever the sensor is enabled (SensorLIS2DW12.setDefaultLIS2DW12AccelSensorConfig).',
+        kind: 'bit',
+        layoutKey: 'idxConfigSetupByte0',
+        shift: 0,
+        width: 1,
+        options: ON_OFF,
+        group: 'wrAccel',
+        appliesTo: S3R_ONLY,
         configKey: 'imu.wrAccelHrm',
     },
     // ---- Gyroscope
@@ -19020,115 +19047,6 @@ function defaultTrialIdentity(mac) {
 }
 
 /**
- * Does the configured sensor output rate keep up with the configured packet
- * rate?
- *
- * These are two independent InfoMem fields and nothing in the firmware relates
- * them. The packet rate (`samplingRate`, bytes 0-1) decides how often a frame
- * is assembled; the IMU's ODR (`ConfigSetupByte1`) decides how often the
- * LSM6DSV actually produces a new sample. Set the packet rate above the ODR and
- * the firmware dutifully packages the same sample several times over, with a
- * fresh timestamp on each - so the stream looks perfect (regular timestamps, no
- * loss, valid CRCs) while the plotted signal is a staircase of repeats.
- *
- * That the two are meant to agree is not an inference. The firmware's own
- * Shimmer3R defaults pair a 51.2 Hz packet rate with the ODR immediately above
- * it, and say so:
- *
- *     // LSM6DSV Gyro sampling rate, next highest to 51.2Hz
- *     ShimConfig_gyroRateSet(LSM6DSV_ODR_AT_60Hz);
- *     -- log-and-stream-common Configuration/shimmer_config.c:183-184
- *
- * Consensys maintains the invariant by deriving sensor ODRs from the trial
- * rate, which is why reconfiguring there makes the staircase disappear. A host
- * that edits the fields independently has to check it instead, and this is that
- * check.
- *
- * Deliberately scoped to the LSM6DSV accel/gyro pair. The same trap exists for
- * the wide-range accelerometer and the magnetometers, but each has its own
- * enable bits and its own ODR table, and a warning that fires on a sensor the
- * user has not enabled is worse than no warning at all.
- */
-/** A rate option label parsed to Hz, or null when it names no rate. */
-function labelToHz(label) {
-    // "60.0Hz" / "1.875Hz" / "Power-down". Parsed from the option table rather
-    // than duplicated as numbers, so the two cannot drift apart.
-    const m = /^([\d.]+)\s*Hz$/i.exec(label.trim());
-    if (!m)
-        return null;
-    const hz = Number(m[1]);
-    return Number.isFinite(hz) && hz > 0 ? hz : null;
-}
-/**
- * Output rate of an LSM6DSV accel/gyro ODR code, in Hz.
- *
- * @param code the value stored in `ConfigSetupByte1`
- * @returns the rate in Hz, or null for power-down and for codes with no rate
- *   (the Java table carries one writable value it does not name)
- */
-function lsm6dsvAccelGyroRateHz(code) {
-    const hit = SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS.find(([value]) => value === code);
-    return hit ? labelToHz(hit[1]) : null;
-}
-/** Packet rate in Hz from the stored `samplingRate` divider. */
-function samplingRateHzFromDivider(divider) {
-    if (!Number.isFinite(divider) || divider <= 0)
-        return null;
-    return INFOMEM_SAMPLING_CLOCK_FREQ / divider;
-}
-/**
- * Check the LSM6DSV ODR against the packet rate.
- *
- * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
- * @param opts.imuRateCode stored `ConfigSetupByte1`
- * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
- *   low-noise accelerometer or the gyroscope is actually enabled, since the ODR
- *   is irrelevant to a stream that carries neither
- */
-function checkImuRateCoversPacketRate(opts) {
-    const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
-    const imuRateHz = lsm6dsvAccelGyroRateHz(opts.imuRateCode);
-    const usesImu = (opts.enabledSensors &
-        (SensorBitmapShimmer3.SENSOR_A_ACCEL | SensorBitmapShimmer3.SENSOR_GYRO)) !==
-        0;
-    const none = {
-        packetRateHz,
-        imuRateHz,
-        repeatsPerSample: null,
-        short: false,
-        problem: null,
-    };
-    if (!usesImu || packetRateHz === null)
-        return none;
-    if (imuRateHz === null) {
-        // Power-down with the IMU enabled is its own fault, and a worse one: the
-        // sample never changes at all.
-        return {
-            ...none,
-            short: true,
-            problem: `The accelerometer/gyroscope output rate is set to "power-down" while those ` +
-                `sensors are enabled, so every frame will carry the same reading. Raise it to ` +
-                `at least ${packetRateHz.toFixed(1)} Hz.`,
-        };
-    }
-    if (imuRateHz >= packetRateHz)
-        return { ...none, short: false, problem: null };
-    const repeats = packetRateHz / imuRateHz;
-    return {
-        packetRateHz,
-        imuRateHz,
-        repeatsPerSample: repeats,
-        short: true,
-        problem: `The accelerometer/gyroscope output rate (${imuRateHz} Hz) is below the sampling ` +
-            `rate (${packetRateHz.toFixed(1)} Hz), so the sensor will repeat each reading about ` +
-            `${repeats < 10 ? repeats.toFixed(1) : Math.round(repeats)} times instead of ` +
-            `producing new data. Timestamps and packet loss will still look correct while the ` +
-            `signal is a staircase. Raise "Gyro/Accel Rate" to the next value at or above ` +
-            `${packetRateHz.toFixed(1)} Hz.`,
-    };
-}
-
-/**
  * Derive a sensor's output rate from the configured packet rate, the way the
  * Java driver does.
  *
@@ -19142,7 +19060,8 @@ function checkImuRateCoversPacketRate(opts) {
  *
  * Ported from `SensorLSM6DSV.getGyroRateFromFreq` (`SensorLSM6DSV.java:676`)
  * and `setDefaultLSM6DSVGyroSensorConfig`, against the checkouts in
- * `eclipse-java-workspace_2024`.
+ * `eclipse-java-workspace_2024`, and from `SensorLIS2DW12` for the wide-range
+ * accelerometer (below), against `Shimmer-Java-Android-API` master.
  */
 /** ODR codes with a meaning beyond "this many Hz". */
 const LSM6DSV_ODR = Object.freeze({
@@ -19229,6 +19148,350 @@ function deriveLsm6dsvRateOnEnableChange(opts) {
         })
         : LSM6DSV_ODR.LOW_POWER;
 }
+// ---------------------------------------------------------------------------
+// LIS2DW12 — Shimmer3R wide-range accelerometer
+// ---------------------------------------------------------------------------
+//
+// Ported from `SensorLIS2DW12.getAccelRateFromFreq` and
+// `setDefaultLIS2DW12AccelSensorConfig` (Shimmer-Java-Android-API
+// `ShimmerDriver/.../sensors/lis2dw12/SensorLIS2DW12.java`, master).
+//
+// Unlike the LSM6DSV, the LIS2DW12's low-power state is NOT read back from its
+// rate. It is two bits of ConfigSetupByte0 beside the rate:
+//
+//   bit 1  `wrAccelLpModeLsb` — Java's `mLowPowerAccelWR`
+//   bit 0  `wrAccelHrMode`    — Java's `mHighPerModeAccelWR`
+//
+// and the firmware hands the part `(wrAccelHrMode << 2) | lpMode` as its power
+// mode (`ShimConfig_wrAccelModeGet`, log-and-stream-common
+// `Configuration/shimmer_config.c`). `LIS2DW12_HIGH_PERFORMANCE` is 0x04, so
+// **bit 0 alone decides high performance against low power**: with it clear
+// the part runs in one of its continuous low-power modes whatever bit 1 says,
+// and no low-power mode goes faster than 200 Hz. Java never lets the two
+// disagree — `setLowPowerAccelWR(enable)` sets bit 1 to `enable` and bit 0 to
+// `!enable` — which is why the defaults below always return them as a pair.
+/** LIS2DW12 ODR codes with a meaning beyond "this many Hz". */
+const LIS2DW12_ODR = Object.freeze({
+    /** Sensor off. What the driver writes for a disabled wide-range accelerometer. */
+    POWER_DOWN: 0,
+    /**
+     * `LIS2DW12_XL_ODR_1Hz6_LP_ONLY`: 1.6 Hz in a low-power mode, 12.5 Hz in high
+     * performance. Java's ladder gives it for `freq <= 12.5` (high performance,
+     * where it really is 12.5 Hz) and for every rate when low-power is asked for
+     * (where it is 1.6 Hz).
+     */
+    LOW_POWER: 1,
+});
+/**
+ * The fastest output rate the LIS2DW12 delivers in any low-power mode. ODR
+ * codes 7-9 saturate here (`SensorLIS2DW12.ListofLIS2DW12AccelRateLpm`, and the
+ * firmware's `ShimConfig_lis2dw12OdrToHz`).
+ */
+const LIS2DW12_LOW_POWER_MAX_HZ = 200;
+/**
+ * The ladder from `getAccelRateFromFreq`'s high-performance branch, as
+ * `[maxFreqHz, code]` pairs in the order Java tests them. Code 2 is absent
+ * because Java gives code 1 for `freq <= 12.5` — 12.5 Hz in high performance,
+ * the only mode this branch is ever paired with.
+ */
+const LIS2DW12_LADDER = Object.freeze([
+    [12.5, 1],
+    [25, 3],
+    [50, 4],
+    [100, 5],
+    [200, 6],
+    [400, 7],
+    [800, 8],
+]);
+/** The fastest ODR code, 1600 Hz in high performance. */
+const LIS2DW12_TOP_CODE$1 = 9;
+/**
+ * The LIS2DW12 ODR code for a packet rate — `getAccelRateFromFreq(isEnabled,
+ * freq, isLowPowerMode)`, same inputs, same results.
+ *
+ * @param opts.enabled whether the wide-range accelerometer is enabled
+ * @param opts.samplingRateHz the configured packet rate
+ * @param opts.lowPower Java's `mLowPowerAccelWR`. When set, Java answers code 1
+ *   (1.6 Hz in a low-power mode) whatever the packet rate. A host that never
+ *   wants a rate below its packet rate passes false
+ * @returns the ODR code to store in ConfigSetupByte0 bits 4-7. A non-finite or
+ *   non-positive packet rate gives power-down, as
+ *   {@link deriveLsm6dsvAccelGyroRate} does, rather than Java's fall-through
+ */
+function deriveLis2dw12AccelRate(opts) {
+    if (!opts.enabled)
+        return LIS2DW12_ODR.POWER_DOWN;
+    if (opts.lowPower)
+        return LIS2DW12_ODR.LOW_POWER;
+    const hz = opts.samplingRateHz;
+    if (!Number.isFinite(hz) || hz <= 0)
+        return LIS2DW12_ODR.POWER_DOWN;
+    for (const [maxHz, code] of LIS2DW12_LADDER) {
+        if (hz <= maxHz)
+            return code;
+    }
+    return LIS2DW12_TOP_CODE$1;
+}
+/**
+ * What to store when the wide-range accelerometer's enabled state has just
+ * changed — `setDefaultLIS2DW12AccelSensorConfig(isSensorEnabled)`.
+ *
+ * - **Enabled:** `setLowPowerAccelWR(false)` — low-power off, high-performance
+ *   on, and the rate re-derived from the packet rate. The range is kept.
+ * - **Disabled:** `setLIS2DW12AccelRange(0)` then `setLowPowerAccelWR(true)` —
+ *   ±2 g, low-power on, high-performance off, and the rate re-derived. Java
+ *   sets the enabled state before it applies these defaults
+ *   (`ShimmerDevice.setSensorEnabledState`), so that re-derivation sees a
+ *   disabled sensor and gives power-down. ConfigSetupByte0 ends up `0x02`.
+ *
+ * The disabled default is the state that stranded a Shimmer3R: a host that
+ * later enables the channel without applying the enabled default leaves bit 0
+ * clear, and the part in a low-power mode that cannot pass 200 Hz.
+ *
+ * @param opts.enabled the state being applied
+ * @param opts.samplingRateHz the configured packet rate
+ */
+function deriveLis2dw12ConfigOnEnableChange(opts) {
+    if (opts.enabled) {
+        return {
+            rate: deriveLis2dw12AccelRate({
+                enabled: true,
+                samplingRateHz: opts.samplingRateHz,
+                lowPower: false,
+            }),
+            range: null,
+            lowPower: false,
+            highPerformance: true,
+        };
+    }
+    return {
+        rate: LIS2DW12_ODR.POWER_DOWN,
+        range: 0,
+        lowPower: true,
+        highPerformance: false,
+    };
+}
+
+/**
+ * Does the configured sensor output rate keep up with the configured packet
+ * rate?
+ *
+ * These are two independent InfoMem fields and nothing in the firmware relates
+ * them. The packet rate (`samplingRate`, bytes 0-1) decides how often a frame
+ * is assembled; the IMU's ODR (`ConfigSetupByte1`) decides how often the
+ * LSM6DSV actually produces a new sample. Set the packet rate above the ODR and
+ * the firmware dutifully packages the same sample several times over, with a
+ * fresh timestamp on each - so the stream looks perfect (regular timestamps, no
+ * loss, valid CRCs) while the plotted signal is a staircase of repeats.
+ *
+ * That the two are meant to agree is not an inference. The firmware's own
+ * Shimmer3R defaults pair a 51.2 Hz packet rate with the ODR immediately above
+ * it, and say so:
+ *
+ *     // LSM6DSV Gyro sampling rate, next highest to 51.2Hz
+ *     ShimConfig_gyroRateSet(LSM6DSV_ODR_AT_60Hz);
+ *     -- log-and-stream-common Configuration/shimmer_config.c:183-184
+ *
+ * Consensys maintains the invariant by deriving sensor ODRs from the trial
+ * rate, which is why reconfiguring there makes the staircase disappear. A host
+ * that edits the fields independently has to check it instead, and this is that
+ * check.
+ *
+ * Each check covers one chip, with its own enable bits and its own ODR table,
+ * and stays silent unless that sensor is enabled: a warning that fires on a
+ * sensor the user has not enabled is worse than no warning at all. There are
+ * two: the LSM6DSV accel/gyro pair ({@link checkImuRateCoversPacketRate}) and
+ * the Shimmer3R's LIS2DW12 wide-range accelerometer
+ * ({@link checkWrAccelRateCoversPacketRate}). The magnetometers have the same
+ * trap and no check yet.
+ */
+/** A rate option label parsed to Hz, or null when it names no rate. */
+function labelToHz(label) {
+    // "60.0Hz" / "1.875Hz" / "Power-down". Parsed from the option table rather
+    // than duplicated as numbers, so the two cannot drift apart.
+    const m = /^([\d.]+)\s*Hz$/i.exec(label.trim());
+    if (!m)
+        return null;
+    const hz = Number(m[1]);
+    return Number.isFinite(hz) && hz > 0 ? hz : null;
+}
+/**
+ * Output rate of an LSM6DSV accel/gyro ODR code, in Hz.
+ *
+ * @param code the value stored in `ConfigSetupByte1`
+ * @returns the rate in Hz, or null for power-down and for codes with no rate
+ *   (the Java table carries one writable value it does not name)
+ */
+function lsm6dsvAccelGyroRateHz(code) {
+    const hit = SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS.find(([value]) => value === code);
+    return hit ? labelToHz(hit[1]) : null;
+}
+/** Packet rate in Hz from the stored `samplingRate` divider. */
+function samplingRateHzFromDivider(divider) {
+    if (!Number.isFinite(divider) || divider <= 0)
+        return null;
+    return INFOMEM_SAMPLING_CLOCK_FREQ / divider;
+}
+/**
+ * Check the LSM6DSV ODR against the packet rate.
+ *
+ * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
+ * @param opts.imuRateCode stored `ConfigSetupByte1`
+ * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
+ *   low-noise accelerometer or the gyroscope is actually enabled, since the ODR
+ *   is irrelevant to a stream that carries neither
+ */
+function checkImuRateCoversPacketRate(opts) {
+    const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
+    const imuRateHz = lsm6dsvAccelGyroRateHz(opts.imuRateCode);
+    const usesImu = (opts.enabledSensors &
+        (SensorBitmapShimmer3.SENSOR_A_ACCEL | SensorBitmapShimmer3.SENSOR_GYRO)) !==
+        0;
+    const none = {
+        packetRateHz,
+        imuRateHz,
+        repeatsPerSample: null,
+        short: false,
+        problem: null,
+    };
+    if (!usesImu || packetRateHz === null)
+        return none;
+    if (imuRateHz === null) {
+        // Power-down with the IMU enabled is its own fault, and a worse one: the
+        // sample never changes at all.
+        return {
+            ...none,
+            short: true,
+            problem: `The accelerometer/gyroscope output rate is set to "power-down" while those ` +
+                `sensors are enabled, so every frame will carry the same reading. Raise it to ` +
+                `at least ${packetRateHz.toFixed(1)} Hz.`,
+        };
+    }
+    if (imuRateHz >= packetRateHz)
+        return { ...none, short: false, problem: null };
+    const repeats = packetRateHz / imuRateHz;
+    return {
+        packetRateHz,
+        imuRateHz,
+        repeatsPerSample: repeats,
+        short: true,
+        problem: `The accelerometer/gyroscope output rate (${imuRateHz} Hz) is below the sampling ` +
+            `rate (${packetRateHz.toFixed(1)} Hz), so the sensor will repeat each reading about ` +
+            `${repeats < 10 ? repeats.toFixed(1) : Math.round(repeats)} times instead of ` +
+            `producing new data. Timestamps and packet loss will still look correct while the ` +
+            `signal is a staircase. Raise "Gyro/Accel Rate" to the next value at or above ` +
+            `${packetRateHz.toFixed(1)} Hz.`,
+    };
+}
+// ---------------------------------------------------------------------------
+// LIS2DW12 — Shimmer3R wide-range accelerometer
+// ---------------------------------------------------------------------------
+/** The LIS2DW12's fastest ODR code: 1600 Hz in high performance. */
+const LIS2DW12_TOP_CODE = 9;
+/**
+ * Output rate of a LIS2DW12 ODR code, in Hz, as the part delivers it.
+ *
+ * Mode-dependent, unlike the LSM6DSV's: code 1 is 12.5 Hz in high performance
+ * but 1.6 Hz in a low-power mode, and codes 7-9 deliver only 200 Hz in a
+ * low-power mode. Read from the Java driver's two lists
+ * (`SensorLIS2DW12.ListofLIS2DW12AccelRateHpm` / `...Lpm`), which agree with
+ * the firmware's `ShimConfig_lis2dw12OdrToHz`.
+ *
+ * @param code ConfigSetupByte0 bits 4-7
+ * @param highPerformance ConfigSetupByte0 bit 0 (`wrAccelHrMode`). With it
+ *   clear the part is in a low-power mode, whatever bit 1 says
+ * @returns the rate in Hz, or null for power-down and for codes with no rate
+ */
+function lis2dw12AccelRateHz(code, highPerformance) {
+    const table = highPerformance
+        ? SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS
+        : SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS;
+    const hit = table.find(([value]) => value === code);
+    return hit ? labelToHz(hit[1]) : null;
+}
+/**
+ * Check the Shimmer3R wide-range accelerometer (LIS2DW12) against the packet
+ * rate, and above all flag a low-power mode above 200 Hz.
+ *
+ * That combination is what a Shimmer3R configured in Shimmer Capture at 256 Hz
+ * was found holding: ConfigSetupByte0 `0x62`, high performance off. No
+ * low-power mode passes 200 Hz, so the firmware lowers the rate to that cap,
+ * and on the ticks the part has no new sample the slot goes out unfilled -
+ * about one packet in five at 256 Hz, zero at first and a stale reading after
+ * that. Consensys never writes it: enabling the sensor turns high performance
+ * on (`SensorLIS2DW12.setDefaultLIS2DW12AccelSensorConfig`).
+ *
+ * Shimmer3R only. On a Shimmer3 the same bits drive an LSM303, whose modes and
+ * rates are different.
+ *
+ * @param opts.samplingRateDivider stored `samplingRate` (bytes 0-1)
+ * @param opts.wrAccelRateCode ConfigSetupByte0 bits 4-7
+ * @param opts.highPerformance ConfigSetupByte0 bit 0
+ * @param opts.enabledSensors the sensor bitmap; the check is skipped unless the
+ *   wide-range accelerometer (`SENSOR_D_ACCEL`) is enabled
+ */
+function checkWrAccelRateCoversPacketRate(opts) {
+    const packetRateHz = samplingRateHzFromDivider(opts.samplingRateDivider);
+    const lowPower = !opts.highPerformance;
+    const wrAccelRateHz = lis2dw12AccelRateHz(opts.wrAccelRateCode, opts.highPerformance);
+    const enabled = (opts.enabledSensors & SensorBitmapShimmer3.SENSOR_D_ACCEL) !== 0;
+    const none = {
+        packetRateHz,
+        wrAccelRateHz,
+        lowPower,
+        lowPowerTooSlow: false,
+        unfilledFraction: null,
+        short: false,
+        problem: null,
+    };
+    if (!enabled || packetRateHz === null)
+        return none;
+    const hz = packetRateHz.toFixed(1);
+    if (lowPower && packetRateHz > LIS2DW12_LOW_POWER_MAX_HZ) {
+        const unfilled = 1 - LIS2DW12_LOW_POWER_MAX_HZ / packetRateHz;
+        return {
+            ...none,
+            lowPowerTooSlow: true,
+            unfilledFraction: unfilled,
+            short: true,
+            problem: `The wide-range accelerometer is in low-power mode, which cannot deliver more than ` +
+                `${LIS2DW12_LOW_POWER_MAX_HZ} Hz, and the sampling rate is ${hz} Hz. About ` +
+                `${Math.round(unfilled * 100)}% of packets will carry no new wide-range reading, ` +
+                `while timestamps and packet loss still look correct. Turn on "WR Accel ` +
+                `High-Performance Mode", as Consensys does whenever the sensor is enabled, or lower ` +
+                `the sampling rate to ${LIS2DW12_LOW_POWER_MAX_HZ} Hz or below.`,
+        };
+    }
+    if (wrAccelRateHz === null) {
+        return {
+            ...none,
+            unfilledFraction: 1,
+            short: true,
+            problem: `The wide-range accelerometer output rate is set to "power-down" while the sensor ` +
+                `is enabled, so it will produce no new readings. Raise "WR Accel Rate" to at least ` +
+                `${hz} Hz.`,
+        };
+    }
+    if (wrAccelRateHz >= packetRateHz)
+        return none;
+    // Below the packet rate the firmware gates the read on the part's data-ready
+    // line, so the slots it has nothing for go out unfilled rather than repeated
+    // (shimmer3r-firmware `hal_lis2dw12.c`, `lis2dw12_is_shimmer_freq_higher`).
+    const unfilled = 1 - wrAccelRateHz / packetRateHz;
+    const fastestHz = lis2dw12AccelRateHz(LIS2DW12_TOP_CODE, true) ?? 0;
+    const advice = packetRateHz > fastestHz
+        ? `The part has no faster rate, so lower the sampling rate to ${fastestHz} Hz or below.`
+        : `Raise "WR Accel Rate" to the next value at or above ${hz} Hz.`;
+    return {
+        ...none,
+        unfilledFraction: unfilled,
+        short: true,
+        problem: `The wide-range accelerometer output rate (${wrAccelRateHz} Hz` +
+            `${lowPower ? ' in low-power mode' : ''}) is below the sampling rate (${hz} Hz), so ` +
+            `about ${Math.round(unfilled * 100)}% of packets will carry no new wide-range reading. ` +
+            advice,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // InfoMem constants
@@ -19238,14 +19501,37 @@ function deriveLsm6dsvRateOnEnableChange(opts) {
 // 224+6 stays within one 128-byte InfoMem segment, so a single read suffices.
 const INFOMEM_MAC_OFFSET = 224;
 /**
- * Bytes per InfoMem / calibration-dump write chunk over a **framed** (BLE)
- * transport. The firmware's own ceiling is 128, and a byte stream uses it; BLE
- * gets 64 because that is the chunk size the EEPROM brand-record write is
- * proven to survive on real hardware, where a command has to cross several
- * notifications into a firmware receive buffer that a larger record has
- * overflowed before (DEV-802). Overridable per call via `opts.chunkBytes`.
+ * Bytes per InfoMem / calibration-dump write chunk, over BLE and over a byte
+ * stream alike: one whole 128-byte InfoMem page, so a 384-byte image goes out
+ * as three chunks at 0, 128 and 256. Overridable per call via `opts.chunkBytes`.
+ *
+ * Whole, page-aligned chunks are load-bearing. Shimmer3 and Shimmer3R
+ * LogAndStream firmware up to v1.01.027 copies the config-byte calibration
+ * into its calibration dump only for a SET_INFOMEM chunk that starts at offset
+ * 0 or 128, and after every chunk copies the dump back over the config bytes
+ * (DEV-1562). Calibration sent in a chunk that starts anywhere else is
+ * reverted, and the chunk is still ACKed. With the 64-byte BLE chunks this
+ * client used to send, the chunk at 64 left the gyro block (55-75) half old
+ * and the mag (76-96) and wide-range accel (97-117) blocks old. The firmware
+ * fix only reaches units that update; whole pages protect the rest (DEV-1564).
+ *
+ * The 64-byte BLE default cited DEV-802, but that was a Verisense receive
+ * buffer (102 bytes), not a Shimmer3/3R limit. This firmware takes 128-byte
+ * payloads for both commands (`MAX_COMMAND_ARG_SIZE` 131, plus the opcode), the
+ * IF820 negotiates a 517-byte ATT MTU so the 132-byte command is one write,
+ * and a 128-byte page written over BLE stored exactly on a Shimmer3R on
+ * v1.01.027 (unit 5307, IF820 v1.4.16.16).
+ *
+ * Through this client and a browser's Web Bluetooth (headless Chrome, the
+ * same unit and firmware), the default sent three 132-byte GATT writes at 0,
+ * 128 and 256, and every calibration block read back exactly, in the config
+ * bytes and in the dump. `chunkBytes: 64` on the same link reproduced the
+ * DEV-1562 mix.
+ *
+ * HARDWARE-VERIFY: nothing has tried an RN4678 Shimmer3 over BLE or an IF820
+ * test build.
  */
-const SHIMMER3R_INFOMEM_BLE_CHUNK_BYTES = 64;
+const INFOMEM_WRITE_CHUNK_BYTES = INFOMEM_PAGE_SIZE;
 /**
  * Bytes per calibration-dump READ. Reads are safe at the firmware's full 128
  * regardless of transport — the reply is reassembled across notifications by
@@ -22063,23 +22349,24 @@ class Shimmer3RClient extends BaseShimmerClient {
      * Write a whole {@link INFOMEM_SIZE}-byte configuration image, chunked, each
      * chunk resolving on its own ACK.
      *
-     * `opts.chunkBytes` defaults to **64 over a framed (BLE) transport and 128
-     * over an unframed one**. 128 is the firmware's ceiling and the page size the
-     * dock path uses, and it is what a byte stream — Classic Bluetooth over
-     * RFCOMM, or the dock UART — carries happily. Over BLE the proven size is 64:
-     * that is what the brand-record write survives on real hardware, where a
-     * 128-byte command has to cross four notifications into a firmware receive
-     * buffer that has overflowed on smaller records before (DEV-802). Pass
-     * `chunkBytes` to override either default.
+     * `opts.chunkBytes` defaults to **128 on every transport**, so the image goes
+     * out as whole pages at 0, 128 and 256: the dock path's page-at-a-time write,
+     * and what Consensys sends. 128 is also the firmware's ceiling for the
+     * command.
      *
-     * Note that 64-byte chunks split each page in two, and the firmware does its
-     * own bookkeeping on a chunk that starts exactly at a page base: writing
-     * offset 0 makes it regenerate the calibration dump from config bytes, and
-     * writing offset 128 makes it overwrite the MAC bytes and (on a Shimmer3R)
-     * regenerate the dump again (`Comms/shimmer_bt_uart.c:1322-1360`). It also
-     * runs `checkAndCorrectConfig` after every chunk, so a page is briefly half
-     * old and half new — the same window the page-at-a-time dock write has
-     * between pages, not a new one.
+     * Pass a smaller `chunkBytes` only for a device whose firmware has the
+     * DEV-1562 fix, or for a test. Firmware up to v1.01.027 keeps calibration
+     * from a chunk only when the chunk starts at 0 or 128, so 64-byte chunks
+     * silently revert the gyro, mag and wide-range accel calibration there. See
+     * {@link INFOMEM_WRITE_CHUNK_BYTES}.
+     *
+     * The firmware does its own bookkeeping on a chunk that starts exactly at a
+     * page base: writing offset 0 makes it regenerate the calibration dump from
+     * config bytes, and writing offset 128 makes it overwrite the MAC bytes and
+     * (on a Shimmer3R) regenerate the dump again
+     * (`Comms/shimmer_bt_uart.c:1322-1360`). It also runs `checkAndCorrectConfig`
+     * after every chunk, so between pages the image is briefly part old and part
+     * new, the same window the dock write has.
      *
      * Refuses while this client believes it is streaming: the firmware NACKs a
      * SET mid-stream, and a NACK partway through would leave a half-written image
@@ -22261,9 +22548,9 @@ class Shimmer3RClient extends BaseShimmerClient {
         };
     }
     /**
-     * Chunk size for an InfoMem write: the caller's value when given, else 64 on
-     * a framed (BLE) transport and the firmware's full 128 on a byte stream.
-     * See {@link writeInfoMemBytes} for why the BLE default is lower.
+     * Chunk size for an InfoMem or calibration-dump write: the caller's value
+     * when given, else one whole 128-byte page on every transport. See
+     * {@link INFOMEM_WRITE_CHUNK_BYTES} for why it is not smaller over BLE.
      */
     _infoMemChunkBytes(requested) {
         if (requested !== undefined) {
@@ -22272,7 +22559,7 @@ class Shimmer3RClient extends BaseShimmerClient {
             }
             return requested;
         }
-        return this._unframed ? INFOMEM_PAGE_SIZE : SHIMMER3R_INFOMEM_BLE_CHUNK_BYTES;
+        return INFOMEM_WRITE_CHUNK_BYTES;
     }
     /**
      * Refuse a configuration write while this client believes it is streaming.
@@ -22812,8 +23099,11 @@ class Shimmer3RClient extends BaseShimmerClient {
      * remainder in ("starting with offset > 2 is not accepted",
      * `Calibration/shimmer_calibration.c:343-346`), so an out-of-order write is
      * silently discarded — and discarded without a NACK, since the handler
-     * ignores `ShimCalib_ramWrite`'s failure return. Chunk size follows the same
-     * rule as {@link writeInfoMemBytes}: 64 over BLE, 128 over a byte stream.
+     * ignores `ShimCalib_ramWrite`'s failure return. Chunks default to 128 bytes
+     * on every transport, as {@link writeInfoMemBytes} does, and 128 is the most
+     * `ShimCalib_ramWrite` takes. The dump has no alignment rule of its own; it
+     * shares the InfoMem default because the 64-byte BLE size both used came from
+     * a Verisense limit ({@link INFOMEM_WRITE_CHUNK_BYTES}).
      *
      * A dump written here is NOT the last word on the device's calibration: the
      * firmware regenerates its dump FROM the configuration bytes whenever InfoMem
@@ -30111,7 +30401,8 @@ const SMARTDOCK_BASE_CMD = Object.freeze({
  * and com.shimmerresearch.managers.dockManager.AbstractDock:
  * - `SLOT_CHANGEOVER_DELAY_WITHOUT_SD_CARD` = 1500 ms (AbstractDock.java:96) —
  *   settle delay after a without-SD slot change before talking to the Shimmer.
- * - `CMD_RETRY_ATTEMPTS` = 2 (SmartDockUart.java:30).
+ *
+ * The two retry values are not the Java's: see `CMD_RETRY_ATTEMPTS` below.
  */
 const SMARTDOCK_DEFAULTS = Object.freeze({
     RESPONSE_TIMEOUT_MS: 1000,
@@ -30137,7 +30428,38 @@ const SMARTDOCK_DEFAULTS = Object.freeze({
     SLOT_CHANGEOVER_DELAY_WITH_SD_WIN_MS: 5000,
     /** As above on macOS/Linux (AbstractDock.java:95, selected by `getSDMountDelay()`). */
     SLOT_CHANGEOVER_DELAY_WITH_SD_UNIX_MS: 6000,
-    CMD_RETRY_ATTEMPTS: 2,
+    /**
+     * How many times in all a base command is sent while each try fails: on an
+     * `E`, on no answer in time, or, for a slot change, on an answer naming
+     * another slot (a slot, for `SDD$`).
+     *
+     * The Java has 2 (`CMD_RETRY_ATTEMPTS`, SmartDockUart.java:30), but
+     * `waitForSmartDockResponse` throws on the first `E` and the first timeout,
+     * so Consensys sends each command once. That is not enough. On 24 Nov 2026 a
+     * Base6 (`V,2,1,0,1,0`) answered most `SDC,NN$`, `SDP,NN$` and `SDD$` with an
+     * `E` within 20 ms and others not at all, through a power cycle; sent again
+     * every 2 s, each got through within 6 tries.
+     *
+     * The base firmware loses bytes (smartdock-firmware `CBase6/main.c` at
+     * 66532f8). Its UART interrupt (`USCI_A0_ISR`) keeps only the last byte
+     * received, and the main loop decodes one byte per pass, so a byte that
+     * arrives while the loop is busy is lost. A command short a byte is answered
+     * `E` at its `$`; one that loses its `$` is not answered at all.
+     *
+     * 15, not the 8 first chosen: the same Base6 later refused one select 8
+     * times in a row, so the HIL harness's Base6 driver went to 15
+     * (log-and-stream-common DEV-1533), and shimmer-host-core sends 15 too.
+     *
+     * The cost is time when the base will not answer: a query refused on every
+     * try ends after 28 s, and unanswered after 43 s; a slot change unanswered,
+     * after 178 s.
+     */
+    CMD_RETRY_ATTEMPTS: 15,
+    /**
+     * How long after a try fails the command is sent again: the 2 s that got
+     * every command through on that Base6.
+     */
+    CMD_RETRY_INTERVAL_MS: 2000,
     /**
      * Attempts at the FIRST per-Shimmer read after a slot change
      * (`READ_MAC_RETRY_ATTEMPTS`, AbstractDock.java:92, used by
@@ -30172,8 +30494,10 @@ const BASE_HARDWARE_IDS = Object.freeze({
  * Map a base hardware-version byte to a family + slot count
  * (HwDriverShimmerDeviceDetails.java:313-321: BASE15→15 slots, BASE6→6 slots,
  * BASICDOCK→1). NB: in the Java driver the slot count actually comes from the
- * USB device descriptor, not the version byte — see the SmartDock README
- * hardware-verify note.
+ * USB device descriptor, not the version byte. The version byte alone was
+ * right on a Base6 and a Base15, both firmware 0.1.0 (25 Nov 2026); other
+ * firmware versions and board revisions are unconfirmed — see the SmartDock
+ * README hardware-verify note.
  */
 function baseHardwareType(hardwareVersion) {
     switch (hardwareVersion) {
@@ -30292,7 +30616,8 @@ function parseSmartDockVersion(line) {
  *
  * NB: the Java `remapSlotsSmartDockToUi` remap for the BASE15U *prototype*
  * board (firmware 1.0.0.≤5) is deliberately NOT applied here — it only affects
- * pre-production hardware; see the README hardware-verify note.
+ * pre-production hardware. A Base15 on 1.0.1.0 (identifier 1, firmware 0.1.0)
+ * needed none (25 Nov 2026); see the README hardware-verify note.
  */
 function parseSlotOccupancy(line) {
     if (classifyBaseResponse(line) !== 'occupancy')
@@ -30335,17 +30660,23 @@ function parseActiveSlot(line) {
     return null;
 }
 
-/**
- * Thrown by {@link SmartDockClient} when a base command reply does not arrive
- * within the timeout. Distinguished from an explicit `E` error response so the
- * retry logic re-sends on timeout only (SmartDockUart.java:526-537: a timeout
- * from `waitForSmartDockResponse` triggers a re-send, whereas an error response
- * throws immediately).
- */
+/** What answers a slot change (`SDP,NN$`, `SDC,NN$`) or `SDD$`: `P,NN`, `C,NN`, or `C` / `D` for none. */
+const ACTIVE_SLOT_KINDS = ['slotWithoutSd', 'slotWithSd', 'disconnected'];
+/** The last try of a base command had no answer within its time. */
 class SmartDockTimeoutError extends Error {
     constructor(message) {
         super(message);
         this.name = 'SmartDockTimeoutError';
+    }
+}
+/** The last try of a slot change was answered with another slot (or, for `SDD$`, with a slot). */
+class SmartDockOtherSlotError extends Error {
+    constructor(message, 
+    /** What the base said it routes. */
+    reported) {
+        super(message);
+        this.reported = reported;
+        this.name = 'SmartDockOtherSlotError';
     }
 }
 // ---------------------------------------------------------------------------
@@ -30378,6 +30709,11 @@ class SmartDockTimeoutError extends Error {
  * which naturally resyncs after garbage. Per-op timeouts are ported from Java
  * (normal 1000 ms; slot change 10000 ms).
  *
+ * A base can refuse commands at random, so a command that is refused (`E`),
+ * unanswered, or, for a slot change, answered with another slot is sent again,
+ * up to {@link SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS} (15) tries 2 s apart; see
+ * {@link _sendWithRetry}. Each call still ends with one result.
+ *
  * Transport injection is mandatory — `connect()` with no base transport throws.
  *
  * @example
@@ -30409,11 +30745,19 @@ class SmartDockClient extends BaseShimmerClient {
         this._queue = Promise.resolve();
         this._wired = null;
         this._wiredConnected = false;
+        /** Ends the base command in progress, saying why; it sends nothing more. */
+        this._aborts = new Set();
+        /** The base transport reported a disconnect; cleared by {@link connect}. */
+        this._linkLost = false;
         /** Cached dock info (from the last {@link getDockInfo}). */
         this.dockInfo = null;
         /** The last active slot confirmed by {@link selectSlot} (1-based; -1 when disconnected). */
         this.activeSlot = -1;
         this._handleTransportDisconnect = () => {
+            // A command waiting for its answer, or to be sent again, ends now rather
+            // than writing to a link that has gone; so does every call queued behind it.
+            this._linkLost = true;
+            this._abortCommands('the link was lost');
             this._emitStatus('SmartDock disconnected');
         };
         // ---------------------------------------------------------------------------
@@ -30434,6 +30778,9 @@ class SmartDockClient extends BaseShimmerClient {
             opts.timeouts?.slotChangeTimeoutMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGE_TIMEOUT_MS;
         this._slotChangeoverDelayMs =
             opts.timeouts?.slotChangeoverDelayMs ?? SMARTDOCK_DEFAULTS.SLOT_CHANGEOVER_DELAY_MS;
+        this._retryIntervalMs =
+            opts.timeouts?.retryIntervalMs ?? SMARTDOCK_DEFAULTS.CMD_RETRY_INTERVAL_MS;
+        this._commandTries = Math.max(1, Math.floor(opts.commandTries ?? SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS));
     }
     _log(...args) {
         if (this.debug)
@@ -30473,9 +30820,11 @@ class SmartDockClient extends BaseShimmerClient {
         this._emitStatus('Opening SmartDock base UART connection…');
         await t.connect();
         this._rxBuf = new Uint8Array(0);
+        this._linkLost = false;
         this._emitStatus(`Connected: ${this._reportedDeviceName() ?? unnamedLink(t.kind)}`);
     }
     async disconnect() {
+        this._abortCommands('disconnected');
         try {
             if (this._wired && this._wiredConnected) {
                 await this._wired.disconnect().catch(() => undefined);
@@ -30496,6 +30845,11 @@ class SmartDockClient extends BaseShimmerClient {
             this._temps.clear();
             this._emitStatus('Disconnected');
         }
+    }
+    /** End the base command in progress, if any: it rejects, and sends nothing more. */
+    _abortCommands(why) {
+        for (const abort of [...this._aborts])
+            abort(why);
     }
     /** Streaming is not part of the SmartDock protocol. */
     async startStreaming() {
@@ -30546,12 +30900,17 @@ class SmartDockClient extends BaseShimmerClient {
     /**
      * Select the active slot (WITHOUT SD access — the read path). Sends
      * `SDP,NN$`, awaits the `P,NN` confirmation with the ported ~10 s slot-change
-     * timeout, verifies the returned slot matches the request (Java throws
-     * `DOCK_CMD_ERR_FAIL_SET` on mismatch, SmartDockUart.java:233-241), then waits
+     * timeout, verifies the returned slot matches the request, then waits
      * the ported settle delay (1500 ms) before the per-Shimmer UART is usable
      * (SmartDock.java:674-691). Finally resyncs the per-Shimmer byte stream (the
      * slot re-route may leave stale bytes) — reusing D1's
      * {@link WiredShimmerClient.resyncStream}.
+     *
+     * An answer naming another slot fails that try, and the command is sent
+     * again: it may be a late answer to an earlier command. Only after the last
+     * try does the call fail (`DOCK_CMD_ERR_FAIL_SET`, as the Java does at once,
+     * SmartDockUart.java:233-241), and then {@link activeSlot} is what that last
+     * answer named.
      *
      * @param slotNumber 1-based slot (1..slotCount).
      */
@@ -30563,7 +30922,11 @@ class SmartDockClient extends BaseShimmerClient {
         return this._serialize(() => this._disconnectAllSlotsImpl());
     }
     async _disconnectAllSlotsImpl() {
-        await this._command(SMARTDOCK_BASE_CMD.DISCONNECT_ALL, 'disconnected', this._slotChangeTimeoutMs);
+        const cmd = SMARTDOCK_BASE_CMD.DISCONNECT_ALL;
+        const line = await this._changeSlot(buildBaseCommand(cmd), -1, cmd);
+        if (parseActiveSlot(line)?.slot !== -1) {
+            throw new Error(`SmartDock disconnect all slots failed: got "${line}"`);
+        }
         this.activeSlot = -1;
         this._emitStatus('All slots disconnected');
     }
@@ -30571,9 +30934,9 @@ class SmartDockClient extends BaseShimmerClient {
         if (!this._transport)
             throw new Error('Not connected');
         const cmd = buildSelectSlotCommand(slotNumber, connectionType);
-        // The reply is `P,NN` (without SD) or `C,NN` (with SD).
-        const wantKind = connectionType === SMARTDOCK_CONNECTION_TYPE.WITH_SD_CARD ? 'slotWithSd' : 'slotWithoutSd';
-        const line = await this._sendWithRetry(cmd, [wantKind, 'disconnected'], this._slotChangeTimeoutMs, `select slot ${slotNumber}`);
+        // The reply is `P,NN` (without SD) or `C,NN` (with SD). Like the Java, only
+        // the slot is compared, not whether it was routed with its SD card.
+        const line = await this._changeSlot(cmd, slotNumber, `select slot ${slotNumber}`);
         const active = parseActiveSlot(line);
         if (!active || active.slot !== slotNumber) {
             throw new Error(`SmartDock slot select failed: requested ${slotNumber}, got "${line}" (DOCK_CMD_ERR_FAIL_SET)`);
@@ -30662,67 +31025,165 @@ class SmartDockClient extends BaseShimmerClient {
     // ---------------------------------------------------------------------------
     // Request/response core (base ASCII channel)
     // ---------------------------------------------------------------------------
-    /** Send an ASCII base command and await a response of one of `kinds`. */
+    /**
+     * Send a query (`SDV$`, `SDQ$`) and await its answer of `kind`. A malformed
+     * answer ends the call; the caller says why.
+     */
     async _command(cmd, kind, timeoutMs) {
-        return this._sendWithRetry(buildBaseCommand(cmd), [kind], timeoutMs, cmd);
+        const holds = kind === 'version' ? parseSmartDockVersion : parseSlotOccupancy;
+        return this._sendWithRetry(buildBaseCommand(cmd), [kind], timeoutMs, cmd, (line) => holds(line) ? 'take' : 'malformed');
     }
     /**
-     * Write `cmdBytes` and await a matching response, re-sending the command on a
-     * missed reply for a total of `SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS` (= 2)
-     * attempts before failing — mirroring SmartDockUart.java:526-537
-     * (`txBytesAndWaitForReply`). Retries on TIMEOUT ONLY; an explicit `E` error
-     * response ({@link SmartDockTimeoutError} is not thrown for it) propagates
-     * immediately, matching the Java path where `waitForSmartDockResponse` throws
-     * on an error instead of returning false.
+     * Send a slot change, or `SDD$` (`slot` -1), and await the answer naming
+     * `slot` (-1: none). An answer naming another slot fails that try. If the
+     * last try's does, the call fails, and {@link activeSlot} is what it named:
+     * only the last try's answer is taken as what the base routes.
      */
-    async _sendWithRetry(cmdBytes, kinds, timeoutMs, label) {
-        if (!this._transport)
-            throw new Error('Not connected');
-        let lastErr;
-        for (let attempt = 0; attempt < SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS; attempt++) {
-            await this._transport.write(cmdBytes);
-            try {
-                return await this._waitForResponse(kinds, timeoutMs, label);
-            }
-            catch (err) {
-                // Only a timeout is retryable; an error response fails fast.
-                if (err instanceof SmartDockTimeoutError) {
-                    lastErr = err;
-                    this._log(`command "${label}" timed out (attempt ${attempt + 1}); re-sending`);
-                    continue;
-                }
-                throw err;
-            }
+    async _changeSlot(cmdBytes, slot, label) {
+        try {
+            return await this._sendWithRetry(cmdBytes, ACTIVE_SLOT_KINDS, this._slotChangeTimeoutMs, label, (line) => {
+                const active = parseActiveSlot(line);
+                if (!active)
+                    return 'malformed';
+                return active.slot === slot ? 'take' : 'otherSlot';
+            });
         }
-        throw lastErr instanceof Error ? lastErr : new SmartDockTimeoutError(`timeout (${label})`);
+        catch (err) {
+            if (err instanceof SmartDockOtherSlotError)
+                this.activeSlot = err.reported.slot;
+            throw err;
+        }
     }
     /**
-     * Resolve with the first response line whose classification is in `kinds`;
-     * reject on an `E` error line or timeout. Lines of any other kind (including
-     * `unknown`/garbage) are ignored — this is the resync discipline.
+     * Write `cmdBytes` and await the base's answer of one of `kinds` that
+     * `judge` takes, sending the command again while it is refused or
+     * unanswered. A base can refuse commands at random: it loses bytes that
+     * arrive while its main loop is busy (see
+     * {@link SMARTDOCK_DEFAULTS.CMD_RETRY_ATTEMPTS}). So:
+     *
+     * - The command is sent up to `commandTries` (15) times, `retryIntervalMs`
+     *   (2 s) after each try that fails.
+     * - A try fails on an `E`, on no answer within `timeoutMs`, or on an answer
+     *   `judge` calls `otherSlot`. That answer may be a late one to an earlier
+     *   command, so it is not taken.
+     * - An answer `judge` takes that arrives between tries is still taken, and
+     *   the command is not sent again. Anything else between tries, an `E`
+     *   included, is dropped: it is not this try's.
+     * - A `malformed` answer to a try in flight ends the call at once, with that
+     *   line; the caller says why. It is not a refusal.
+     * - Lines of other kinds (garbage, partial lines) are ignored: the resync
+     *   discipline.
+     * - The call ends with one result: the answer, or the last try's failure.
+     *   It also ends, sending nothing more, when the link is lost or
+     *   {@link disconnect} is called.
+     *
+     * The rule is the one that got every command through on a Base6 refusing
+     * them at random (24 Nov 2026), sent from the HIL harness. This client ran
+     * it from Node on 25 Nov 2026, at commit afc58f6, on that Base6 and on a
+     * Base15 (both firmware 0.1.0), three runs on each: getDockInfo,
+     * getSlotOccupancy, an identify, status and InfoMem read of each docked
+     * Shimmer3 (four on the Base6; six on the Base15, slots 14 and 15
+     * included), and disconnectAllSlots, all passing. In each run the first try
+     * of `SDQ$`, `SDP,01$` and `SDD$` was cut short a byte and refused with
+     * `E`, and the first `SDV$` was sent without its `$` and left unanswered;
+     * each was taken on try 2.
+     *
+     * HARDWARE-VERIFY: not yet seen on a base: two or more failed tries in a
+     * row, and `SDC,NN$` (a select with the SD card).
      */
-    _waitForResponse(kinds, timeoutMs, label) {
+    _sendWithRetry(cmdBytes, kinds, timeoutMs, label, judge) {
+        const transport = this._transport;
+        if (!transport)
+            return Promise.reject(new Error('Not connected'));
+        if (this._linkLost) {
+            return Promise.reject(new Error(`SmartDock link lost (${label}): not sent`));
+        }
+        const tries = this._commandTries;
+        const retryMs = this._retryIntervalMs;
         return new Promise((resolve, reject) => {
-            const t = setTimeout(() => {
-                this._offTemp(handler);
-                reject(new SmartDockTimeoutError(`SmartDock response timeout (${label})`));
-            }, timeoutMs);
-            const handler = (line) => {
-                const k = classifyBaseResponse(line);
-                if (k === 'error') {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    reject(new Error(`SmartDock error response (${label})`));
+            let attempt = 0;
+            /** A try has been written and has neither been answered nor failed. */
+            let inFlight = false;
+            let ended = false;
+            /** The try's answer timeout, or the wait before the next try. */
+            let timer;
+            const onTry = () => (tries > 1 ? `, try ${attempt} of ${tries}` : '');
+            const end = (err, line = '') => {
+                if (ended)
+                    return;
+                ended = true;
+                inFlight = false;
+                clearTimeout(timer);
+                this._offTemp(onLine);
+                this._aborts.delete(abort);
+                if (err)
+                    reject(err);
+                else
+                    resolve(line);
+            };
+            const tryFailed = (err) => {
+                inFlight = false;
+                clearTimeout(timer);
+                if (attempt >= tries) {
+                    end(err);
                     return;
                 }
-                if (kinds.includes(k)) {
-                    clearTimeout(t);
-                    this._offTemp(handler);
-                    resolve(line);
-                }
-                // else: ignore (unrelated line / garbage) and keep waiting.
+                // Scheduled before the status goes out, so a host's onStatus that
+                // throws cannot leave the call waiting for a try that never comes.
+                timer = setTimeout(send, retryMs);
+                const why = `${err.message}; sending again in ${retryMs} ms`;
+                this._log(why);
+                this._emitStatus(why);
             };
-            this._onTemp(handler);
+            const send = () => {
+                if (ended)
+                    return;
+                attempt += 1;
+                const thisTry = attempt;
+                inFlight = true;
+                transport.write(cmdBytes).then(() => {
+                    // Already answered, refused or ended while the write was pending.
+                    if (ended || !inFlight || attempt !== thisTry)
+                        return;
+                    timer = setTimeout(() => tryFailed(new SmartDockTimeoutError(`SmartDock response timeout (${label}): no answer within ${timeoutMs} ms${onTry()}`)), timeoutMs);
+                }, (err) => end(err instanceof Error ? err : new Error(String(err))));
+            };
+            const onLine = (line) => {
+                if (ended)
+                    return;
+                const kind = classifyBaseResponse(line);
+                if (kind === 'error') {
+                    if (inFlight)
+                        tryFailed(new Error(`SmartDock error response (${label}): refused (E)${onTry()}`));
+                    else
+                        this._log(`"${line}" dropped while "${label}" waits to be sent again`);
+                    return;
+                }
+                if (!kinds.includes(kind))
+                    return;
+                const verdict = judge(line);
+                if (verdict === 'take') {
+                    end(null, line);
+                    return;
+                }
+                if (!inFlight) {
+                    this._log(`"${line}" dropped while "${label}" waits to be sent again`);
+                    return;
+                }
+                if (verdict === 'malformed') {
+                    end(null, line);
+                    return;
+                }
+                // `otherSlot`: only a slot judge says it, of a line that parsed.
+                const reported = parseActiveSlot(line);
+                const said = reported.slot === -1 ? 'no slot' : `slot ${reported.slot}`;
+                tryFailed(new SmartDockOtherSlotError(`SmartDock ${label} failed: the base routes ${said} ("${line}")${onTry()} ` +
+                    '(DOCK_CMD_ERR_FAIL_SET)', reported));
+            };
+            const abort = (why) => end(new Error(`SmartDock command "${label}" not finished: ${why}`));
+            this._onTemp(onLine);
+            this._aborts.add(abort);
+            send();
         });
     }
     _delay(ms) {
@@ -36282,6 +36743,17 @@ function validatePendingResponse(pending, msg) {
 // (request timeout / gatt server is disconnected / unexpected response
 // property) so it always aborts the retry loop.
 const CONNECT_CANCELLED_MESSAGE = 'Connect cancelled: disconnect requested during connect attempt.';
+/** A NUL-padded ASCII field of a .msbl header, up to its first NUL, with any
+ * unprintable byte shown as `\xNN` so a wrong file reads clearly in an error. */
+function msblAscii(img, off, len) {
+    let s = '';
+    for (const b of img.subarray(off, off + len)) {
+        if (b === 0)
+            break;
+        s += b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : `\\x${b.toString(16).padStart(2, '0')}`;
+    }
+    return s;
+}
 // ---------------------------------------------------------------------------
 // VerisenseBleDevice
 // ---------------------------------------------------------------------------
@@ -37611,6 +38083,13 @@ class VerisenseBleDevice extends BaseShimmerClient {
      * erased and each page is written. Only SR68 Pulse+ hardware (the only board
      * carrying the hub) accepts it — other hardware NACKs the BEGIN stage.
      *
+     * The image is refused, before anything is sent, unless its header says
+     * `msbl` and names the hub's die, `MAX32670`. BEGIN erases the hub's
+     * application and the device does not read the target, so an image for
+     * another part, such as a MAX32664's (`MAX32660`), would leave the hub empty.
+     * The C-keyed and development-keyed builds both name `MAX32670`, so this
+     * cannot tell which key an image carries.
+     *
      * @param msbl       raw .msbl file bytes
      * @param onProgress optional progress callback (pagesDone, totalPages)
      * @returns the hub application firmware version string read back after flashing
@@ -37619,6 +38098,15 @@ class VerisenseBleDevice extends BaseShimmerClient {
         const img = msbl instanceof Uint8Array ? msbl : new Uint8Array(msbl);
         if (img.length < MSBL.HEADER_SIZE) {
             throw new Error('uploadHubFirmware: file is too small to be a valid .msbl');
+        }
+        const magic = msblAscii(img, 0, MSBL.MAGIC.length);
+        if (magic !== MSBL.MAGIC) {
+            throw new Error(`uploadHubFirmware: not a .msbl image (header starts "${magic}", expected "${MSBL.MAGIC}"); nothing was sent`);
+        }
+        const target = msblAscii(img, MSBL.OFF_TARGET, MSBL.TARGET_LEN);
+        if (target !== MSBL.HUB_TARGET) {
+            throw new Error(`uploadHubFirmware: this .msbl is built for "${target}", not the MAX32674C algorithm hub ` +
+                `(expected "${MSBL.HUB_TARGET}"); nothing was sent and the hub was not erased`);
         }
         const numPages = img[MSBL.OFF_NUMPAGES] | (img[MSBL.OFF_NUMPAGES + 1] << 8);
         const expectedLen = MSBL.HEADER_SIZE + numPages * MSBL.PAGE_FILE_BYTES;
@@ -40601,5 +41089,5 @@ function shimmerFactoryTestReportToCsvRows(parsed, meta = {}) {
     return factoryTestReportToCsvRows(parsed, meta);
 }
 
-export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, AUDIO_FAULT, AUDIO_FILE, AUDIO_FILE_OPEN_REASON, AUDIO_FINGERPRINT_FILE, AUDIO_GAIN_PRESET, AUDIO_MODE, AUDIO_MODE_BYTE, AUDIO_MODE_OPTIONS, AUDIO_OPCODES, AUDIO_STATE, AUDIO_STATUS_BITS, AUDIO_STATUS_LENGTH, AUDIO_STATUS_VERSION, AudioFileFormatError, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BUTTON_LOGGING, BUTTON_LOGGING_OPTIONS, BUTTON_LOG_MODE, BUTTON_MODE, BUTTON_MODE_OPTIONS, BYTE_STREAM_LINK, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_RECONNECT_POLICY, DEFAULT_TRIAL_NAME, DERIVED_GYRO_ON_THE_FLY_CAL, EVENT_CHANNEL, EVENT_CHANNEL_OPCODES, EVENT_CHANNEL_STATUS_LENGTH, EVENT_FILE, EVENT_FILE_OPEN_REASON, EVENT_FRAME_LENGTH, EVENT_INPUT, EVENT_RECORD_FLAG, EVENT_RECORD_TYPE, EVENT_TICKS_PER_SECOND, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, EventFileFormatError, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, GYRO_ON_THE_FLY_THRESHOLD_DPS, GyroOnTheFlyCal, IF820_OTA, IF820_OTA_COMMAND, IF820_OTA_DEFAULT_CHUNK_SIZE, IF820_OTA_FAST_CHUNK_SIZE, IF820_OTA_FIRST_WRITE_TIMEOUT_MS, IF820_OTA_MIN_CHUNK_SIZE, IF820_OTA_MIN_SENSOR_FIRMWARE, IF820_OTA_RECONNECT_ATTEMPTS, IF820_OTA_RECONNECT_DELAY_MS, IF820_OTA_RESPONSE_TIMEOUT_MS, IF820_OTA_SAFE_CHUNK_SIZE, IF820_OTA_SERVICE_UUIDS, IF820_OTA_STATUS, IF820_OTA_TRANSIENT_ERROR_REGEX, IF820_OTA_VERIFY_TIMEOUT_MS, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID$1 as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID$1 as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, If820OtaError, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LOG_TRIGGERS, LOG_TRIGGER_OPTIONS, LSM6DSV_ODR, LogStartRefusedError, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_COMPANION_KINDS, SD_DATA_ROOT, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_MIN_FIRMWARE, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_SR_BOARD_IDS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_OLD_IMU_MAG_FORMATS, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_SR_BOARD_IDS, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_SR_ID_PAGE_SIZE, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SOUND_LEVEL_CHANNEL_ID, SOUND_LEVEL_COUNTS_PER_DB, SOUND_LEVEL_NAME, SOUND_LEVEL_NO_LEVEL, SOUND_LEVEL_UNIT, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, allowsSingleTouch, appendCrc, applyAudioModeRules, applyButtonLogModeRules, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, applyTcxoRule, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, assertShimmerSrBoardWritable, audioFingerprintRecordTicks, audioGainPresetOf, audioModeOf, audioModeRecordsSpeech, audioSampleTicks, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildShimmerSrIdPage, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, buttonModeOf, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, canRecordPressesWith, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareIf820Versions, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, correctAudioMode, correctButtonLogMode, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeButtonLogMode, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describeAudioFault, describeAudioMode, describeAudioState, describeButtonLogMode, describeEventRecord, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, doesPressToggleLogging, doesUndockStartLogging, downloadCsvBlob, downloadSdTree, drainByteStream, encodeAudioMode, encodeButtonLogMode, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, eventChannelBoardSupport, eventFrameLength, eventTicksToUnixMs, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrBoardName, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, gyroOnTheFlyWindow, hasSensorBit, hhmmToMinutesSinceMidnight, if820OtaSensorSupport, if820OtaStatusText, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, inquiryNumChannelsOffset, interpretShimmer3InquiryResponse, isAckCommand, isAudioFaultFatal, isBadResponse, isBmp581PresentPerSrNumber, isButtonDisabled, isCrcMode, isDoublePress, isExgRespirationEnabled, isGenerationSensitiveChannel, isGyroOnTheFlyEnabled, isIf820OtaTransientError, isIf820UpdateAvailable, isLoggingDisabled, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSameShimmerSrBoard, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isTtlInputEnabled, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, joinAudioMode, joinButtonMode, keepsLinkCrcWhenSensingStops, listShimmerSrBoards, localCivilUnixSecondsNow, logTriggersOf, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nearestUserButtonEnable, nextAvailableDuplicateFileName, nextReconnectDelayMs, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseAudioFingerprintFile, parseAudioFingerprintHeader, parseAudioFingerprintRecord, parseAudioStatus, parseAudioWavHeader, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventChannelStatus, parseEventFile, parseEventFrame, parseEventLogPayload, parseEventRecord, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, planStreamResume, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, reconnectDelayMs, recordsAudioFingerprint, recordsButtonPresses, recordsRawAudio, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveReconnectPolicy, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runIf820OtaUpdate, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCompanionKindOf, sdCompanionPathFor, sdCrc16, sdDataPathForCompanion, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3RMayRecordAudio, shimmer3RRecordsAudio, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsSetFeature, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, soundLevelDbA, soundLevelEnabled, soundLevelSupportedByReadback, splitAudioMode, splitButtonMode, startAutoReconnect, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, whenIf820OtaDeviceIdle, wiredPacketLength, withPressRecording, withSoundLevel, withoutPressRecording, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
+export { ADC_BITS, ADC_VREF_VOLTS, ASM_COMMAND, ASM_PROPERTY, AUDIO_FAULT, AUDIO_FILE, AUDIO_FILE_OPEN_REASON, AUDIO_FINGERPRINT_FILE, AUDIO_GAIN_PRESET, AUDIO_MODE, AUDIO_MODE_BYTE, AUDIO_MODE_OPTIONS, AUDIO_OPCODES, AUDIO_STATE, AUDIO_STATUS_BITS, AUDIO_STATUS_LENGTH, AUDIO_STATUS_VERSION, AudioFileFormatError, BASE_HARDWARE_IDS, BATTERY_DIVIDER_RATIO, BLE_LINK_MIN_FW, BLUETOOTH_MODULE_VERSIONS, BMP581_MIN_FIRMWARE, BRAND_BLE_MAX_CHARS, BRAND_BLE_MAX_CHARS_SHIMMER3, BRAND_BT_CLASSIC_MAX_CHARS, BRAND_PLATFORM, BRAND_RECORD_HOST_OFFSET, BRAND_RECORD_LAYOUT_VER, BRAND_RECORD_MAGIC, BRAND_RECORD_SIZE, BRAND_USB_MANUFACTURER_MAX_CHARS, BRAND_USB_PRODUCT_MAX_CHARS, BT_FEATURE, BUTTON_LOGGING, BUTTON_LOGGING_OPTIONS, BUTTON_LOG_MODE, BUTTON_MODE, BUTTON_MODE_OPTIONS, BYTE_STREAM_LINK, BaseShimmerClient, CALIB_READ_SOURCE, CALIB_SENSOR_ID_BY_GROUP, CHANNEL_FORMATS, CHANNEL_FORMAT_OVERRIDES, CHANNEL_UNITS, CHARGING_STATUS_BYTE, CHOP_FREQUENCY_LABELS, COMPARATOR_THRESHOLD_LABELS, CONSENSYS_UNKNOWN_DEVICE, CONVERSION_MODE_LABELS, CRC_MODE, CalibQuality, CalibSensorId, DATA_RATE_LABELS, DATA_RATE_OPTIONS, DEBUG_COMMAND_ID, DEFAULT_RECONNECT_POLICY, DEFAULT_TRIAL_NAME, DERIVED_GYRO_ON_THE_FLY_CAL, EVENT_CHANNEL, EVENT_CHANNEL_OPCODES, EVENT_CHANNEL_STATUS_LENGTH, EVENT_FILE, EVENT_FILE_OPEN_REASON, EVENT_FRAME_LENGTH, EVENT_INPUT, EVENT_RECORD_FLAG, EVENT_RECORD_TYPE, EVENT_TICKS_PER_SECOND, EXG_ANY_MASK, EXG_BANK_LENGTH, EXG_CHIP1, EXG_CHIP2, EXG_CONFLICTING_SENSORS, EXG_KNOBS, EXG_PRESET_ARRAYS, EXG_REG8_STATUS_INDEX, EXG_REGS_RESPONSE, EXG_REGS_RESPONSE_PAYLOAD_LENGTH, EXG_VREF_VOLTS, EventFileFormatError, ExgKnobError, ExgKnobValueError, ExgRespirationLockedError, FACTORY_TEST_ACK_TIMEOUT_MS, FACTORY_TEST_DRAIN_IDLE_MS, FACTORY_TEST_IDLE_FLOOR_MS, FACTORY_TEST_NACK_MESSAGE, FW_ID, FactoryTestError, GAIN_LABELS, GAIN_OPTIONS, GAIN_VALUES, GET_EXG_REGS_COMMAND, GSR_NAME, GSR_RANGE_NAME, GSR_RESISTANCE_NAME, GYRO_ON_THE_FLY_THRESHOLD_DPS, GyroOnTheFlyCal, IF820_OTA, IF820_OTA_COMMAND, IF820_OTA_DEFAULT_CHUNK_SIZE, IF820_OTA_FAST_CHUNK_SIZE, IF820_OTA_FIRST_WRITE_TIMEOUT_MS, IF820_OTA_MIN_CHUNK_SIZE, IF820_OTA_MIN_SENSOR_FIRMWARE, IF820_OTA_RECONNECT_ATTEMPTS, IF820_OTA_RECONNECT_DELAY_MS, IF820_OTA_RESPONSE_TIMEOUT_MS, IF820_OTA_SAFE_CHUNK_SIZE, IF820_OTA_SERVICE_UUIDS, IF820_OTA_STATUS, IF820_OTA_TRANSIENT_ERROR_REGEX, IF820_OTA_VERIFY_TIMEOUT_MS, INERTIAL_UNITS, INFOMEM_ADDR_FLAT, INFOMEM_ADDR_LEGACY, ANY_VERSION as INFOMEM_ANY_VERSION, BIT_SHIFT as INFOMEM_BIT_SHIFT, FW_ID$1 as INFOMEM_FW_ID, GENERAL_CALIBRATION_LENGTH as INFOMEM_GENERAL_CALIBRATION_LENGTH, HW_ID$1 as INFOMEM_HW_ID, MASK as INFOMEM_MASK, MAX_SYNC_NODES as INFOMEM_MAX_SYNC_NODES, INFOMEM_PAGE_SIZE, INFOMEM_SAMPLING_CLOCK_FREQ, INFOMEM_SIZE, INFOMEM_VALIDITY_BYTES, INPUT_SELECTION_LABELS, INVALID_ZERO_WINDOW_TICKS, If820OtaError, LEAD_OFF_COMPARATOR_OPTIONS, LEAD_OFF_CURRENT_LABELS, LEAD_OFF_CURRENT_OPTIONS, LEAD_OFF_DETECTION_LABELS, LEAD_OFF_DETECTION_OPTIONS, LEAD_OFF_FREQUENCY_LABELS, LIS2DW12_LOW_POWER_MAX_HZ, LIS2DW12_ODR, LOG_TRIGGERS, LOG_TRIGGER_OPTIONS, LSM6DSV_ODR, LogStartRefusedError, LoopbackTransport, MAX_CALIB_DUMP_BYTES, MAX_WINDOW_DIVISOR, NEED_MORE, NEW_IMU_EXP_REV, NORDIC_DFU_BUTTONLESS_WITHOUT_BONDS, NORDIC_DFU_BUTTONLESS_WITH_BONDS, NORDIC_DFU_OP_ENTER_BOOTLOADER, NORDIC_DFU_SERVICE, NUS_RX, NUS_SERVICE, NUS_TX, OPCODES, OP_IDX, ObjectCluster, PACKET_OVERHEAD_RESPONSE_DATA, PACKET_OVERHEAD_RESPONSE_OTHER, POWER_DOWN_LABELS, PRESSURE_CALIBRATION_RESPONSE_MAX_PAYLOAD, PRESSURE_COEFFICIENT_BYTES, PRESSURE_NAME, PRESSURE_SENSOR_ID, PRESSURE_SENSOR_ID_BY_KIND, REFERENCE_ELECTRODE_OPTIONS, REORDER_PERIODS, RESPIRATION_CONTROL_LABELS, RESPIRATION_FREQUENCY_LABELS, RESPIRATION_FREQUENCY_OPTIONS, RESPIRATION_PHASE_32KHZ_LABELS, RESPIRATION_PHASE_64KHZ_LABELS, RESYNC, RLD_REFERENCE_SIGNAL_LABELS, RtcDriftMonitor, SCALAR_CALIBRATORS, SC_CALIB_FORMAT_VERSION, SC_CAL_QUALITY_MASK, SC_CAL_QUALITY_SHIFT, SC_CAL_RANGE_MASK, SC_DATA_LEN_IMU, SC_GLOBAL_HEADER_BYTES, SC_SENSOR, SC_SENSOR_NAMES, SDK_VERSION, SDLOG_CLOCK_FREQ, SDLOG_DATA_TYPE_BYTES, SDLOG_FW_ID, SDLOG_HEADER_LENGTH, SDLOG_HW_ID, SDLOG_SYNC_BLOCK_LENGTH, SDLOG_SYNC_OFFSET_LENGTH, SDLogHeaderBitmask, SD_ATTR_DIR, SD_ATTR_NAME_TRUNCATED, SD_BLOCK_PAYLOAD_DEFAULT, SD_BLOCK_PAYLOAD_MAX, SD_BLOCK_PAYLOAD_MIN, SD_COMPANION_KINDS, SD_DATA_ROOT, SD_MAX_PATH_LEN, SD_STATUS, SD_TRANSFER_MIN_FIRMWARE, SD_TRANSFER_OPCODES, SD_XFER, SENSOR_RULE_CONFLICTS, SERIAL_DFU_EXTENDED_ERROR_NAMES, SERIAL_DFU_OBJECT_TYPE, SERIAL_DFU_OP, SERIAL_DFU_RESULT_NAMES, SET_EXG_REGS_COMMAND, SHIMMER3R_DEFAULTS, SHIMMER3R_FACTORY_TEST_ID_NAMES, SHIMMER3R_INQ_CHANNELS_OFFSET, SHIMMER3R_INQ_NUM_CHANNELS_OFFSET, SHIMMER3R_LINK_CRC_MIN_FIRMWARE, SHIMMER3R_RESPONSE_PAYLOAD_LENGTHS, SHIMMER3R_SR_BOARD_IDS, SHIMMER3R_STATUS_PUSH_BUFFER_FIX_FIRMWARE, SHIMMER3R_TWO_BYTE_STATUS_MIN_FIRMWARE, ACK as SHIMMER3_ACK, SHIMMER3_ADXL371_ACCEL_RANGE_OPTIONS, SHIMMER3_ADXL371_ACCEL_RATE_OPTIONS, SHIMMER3_BMP180_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP280_PRESSURE_RESOLUTION_OPTIONS, SHIMMER3_BMP390_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP390_PRESSURE_RATE_OPTIONS, SHIMMER3_BMP581_PRESSURE_OVERSAMPLING_OPTIONS, SHIMMER3_BMP581_PRESSURE_RATE_OPTIONS, SHIMMER3_BT_BAUD_RATE_OPTIONS, SHIMMER3_DEFAULTS, SHIMMER3_FACTORY_TEST_TYPE, SHIMMER3_FACTORY_TEST_TYPES, SHIMMER3_GSR_RANGE_CONDUCTANCE_OPTIONS, SHIMMER3_GSR_RANGE_RESISTANCE_OPTIONS, SHIMMER3_INFOMEM_FIELD_GROUPS, SHIMMER3_INFOMEM_FIELD_SCHEMA, SHIMMER3_INQ_CHANNELS_OFFSET, SHIMMER3_INQ_CONFIG_LENGTH, SHIMMER3_INQ_CONFIG_OFFSET, SHIMMER3_INQ_NUM_CHANNELS_OFFSET, SHIMMER3_LIS2DW12_ACCEL_RANGE_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_HPM_OPTIONS, SHIMMER3_LIS2DW12_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LIS2MDL_MAG_RANGE_OPTIONS, SHIMMER3_LIS2MDL_MAG_RATE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RANGE_OPTIONS, SHIMMER3_LIS3MDL_ALT_MAG_RATE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303AH_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303AH_MAG_RANGE_OPTIONS, SHIMMER3_LSM303AH_MAG_RATE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_HR_OPTIONS, SHIMMER3_LSM303DLHC_ACCEL_RATE_LPM_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RANGE_OPTIONS, SHIMMER3_LSM303DLHC_MAG_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_GYRO_RATE_OPTIONS, SHIMMER3_LSM6DSV_ACCEL_RANGE_OPTIONS, SHIMMER3_LSM6DSV_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_ACCEL_RANGE_OPTIONS, SHIMMER3_MPU9X50_GYRO_RANGE_OPTIONS, SHIMMER3_MPU9X50_MAG_RATE_OPTIONS, NACK as SHIMMER3_NACK, NEED_MORE$1 as SHIMMER3_NEED_MORE, SHIMMER3_OLD_IMU_MAG_FORMATS, SHIMMER3_RESPONSE_PAYLOAD_LENGTHS, RESYNC$1 as SHIMMER3_RESYNC, SHIMMER3_SAMPLING_CLOCK_FREQ, SHIMMER3_SAMPLING_RATES_HZ, SHIMMER3_SENSOR_LABELS, SHIMMER3_SPP_SERIAL_OPTIONS, SHIMMER3_SPP_UUID, SHIMMER3_SR_BOARD_IDS, SHIMMER3_STATUS_PAYLOAD_BYTES, SHIMMER_FACTORY_TEST_CLASSIFIERS, SHIMMER_PLATFORM_NAMES, SHIMMER_SR_BOARD_NAMES, SHIMMER_SR_ID_PAGE_SIZE, SHIMMER_UART_CRC_INIT, SMARTDOCK_BASE_CMD, SMARTDOCK_CONNECTION_TYPE, SMARTDOCK_DEFAULTS, SMARTDOCK_LINE_TERMINATOR, SOUND_LEVEL_CHANNEL_ID, SOUND_LEVEL_COUNTS_PER_DB, SOUND_LEVEL_NAME, SOUND_LEVEL_NO_LEVEL, SOUND_LEVEL_UNIT, SR_BOARD, STREAM_MODE, SdLogFormatError, SdTransferError, SensorADC, SensorBase, SensorBitmapShimmer3, SensorLIS2DW12, SensorLSM6DS3, SensorLSM6DSV, SensorMAX32674, SensorMLX90632, SensorPPG, SensorVD6283, Shimmer3Client, Shimmer3RClient, SlipDecoder, SmartDockClient, StreamStatsTracker, StreamTimeline, TEMPERATURE_NAME, TEST_MODE_ID, TEST_SIGNAL_FREQUENCY_LABELS, TICKS_PER_MS, TICKS_PER_SECOND, TIMESTAMP_FIELD, UART_COMPONENT, UART_CONFIG_COMMANDS, UART_DOCK_BAUD_RATE, UART_PACKET_CMD, UART_PACKET_HEADER, UART_PROP, UNIX_TIMESTAMP_NAME, UNKNOWN_CHANNEL_ASSUMED_BYTES, UnknownExgKnobError, VERISENSE_BLE_SCHEDULE_DEFAULTS, VERISENSE_BLE_SCHEDULE_RANGES, VERISENSE_BLE_SYNC_SCHEDULES, VERISENSE_BLUETOOTH_OFF_MIN_FW, VERISENSE_CALIBRATION_MIN_FW, VERISENSE_DEFAULT_PASSKEY_BY_ID, VERISENSE_DFU_BOOTLOADER_NAME_PREFIX, VERISENSE_DFU_BOOTLOADER_NAME_PREFIXES, VERISENSE_DFU_CONNECT_ATTEMPTS, VERISENSE_DFU_FAST_PACKET_DELAY_MS, VERISENSE_DFU_REBOOT_DELAY_MS, VERISENSE_DFU_RELIABLE_PACKET_DELAY_MS, VERISENSE_DFU_RETRY_DELAY_MS, VERISENSE_DFU_ROUTINE_LOG_REGEX, VERISENSE_DFU_SET_MODE_TIMEOUT_MS, VERISENSE_DFU_TRANSIENT_ERROR_REGEX, VERISENSE_HW_MAJOR_FRIENDLY_NAMES, VERISENSE_MAX_PLAUSIBLE_UNIX_SECONDS, VERISENSE_OPERATIONAL_FIELD_FALLBACK_GROUP_ID, VERISENSE_OPERATIONAL_FIELD_GROUPS, VERISENSE_OPERATIONAL_FIELD_GROUP_SENSOR, VERISENSE_OPERATIONAL_FIELD_SCHEMA, VERISENSE_OP_CONFIG_BYTE_SIZE, VERISENSE_SENSOR_ENABLE_FIELDS, VERISENSE_SENSOR_RATE_DEFAULT_GROUPS, VERISENSE_SERIAL_DFU_OBJECT_ATTEMPTS, VERISENSE_SERIAL_DFU_REQUEST_TIMEOUT_MS, VERISENSE_STREAM_CSV_TIME_COLUMNS, VERISENSE_STREAM_SENSOR_LABELS, VERISENSE_USB_DFU_PID, VERISENSE_USB_DFU_PORT_FILTERS, VERISENSE_USB_DFU_REENUMERATION_DELAY_MS, VERISENSE_USB_DFU_VID, VOLTAGE_REFERENCE_LABELS, VerisenseBleDevice, VerisensePpgLedTestError, VerisenseSerialDfu, WIRED_DEFAULTS, NEED_MORE$2 as WIRED_NEED_MORE, RESYNC$2 as WIRED_RESYNC, WebBluetoothTransport, WebSerialTransport, WiredShimmerClient, allowsSingleTouch, appendCrc, applyAudioModeRules, applyButtonLogModeRules, applyDuplicateSuffix, applyExgKnobEdits, applyExgMustBeBits, applyExgPreset, applyImuCalibration, applySensorToggle, applyTcxoRule, asmRtcBytesToUnixSeconds, asmRtcMinutesBytesToUnixSeconds, assertShimmerSrBoardWritable, audioFingerprintRecordTicks, audioGainPresetOf, audioModeOf, audioModeRecordsSpeech, audioSampleTicks, badResponseReason, baseHardwareType, battAdcToVoltage, battVoltageToPercentage, brandNameProblem, buildAbortCmd, buildBaseCommand, buildBlankBrandRecord, buildBrandRecord, buildDefaultVerisenseCalibrationSet, buildDeleteCmd, buildFreeSpaceCmd, buildGetExgRegsCommand, buildHeader, buildListDirCmd, buildMemReadPayload, buildMemWritePayload, buildMessage, buildParsedCsvFileName, buildProductionConfigPayload, buildReadCmd, buildReadPacket, buildSelectSlotCommand, buildSetExgRegsCommand, buildSetFactoryTestCommand, buildShimmer3Schema, buildShimmerSrIdPage, buildStatCmd, buildStreamSchema, buildUartPacket, buildUploadBinaryFileName, buildVerisenseAdvertisedName, buildVerisenseDfuRequestDeviceOptions, buildWritePacket, buttonModeOf, calibSensorIdForGroup, calibTsBytesToUnixSeconds, calibrateExgSample, calibrateGsrChannel, calibrateGsrDataToResistanceFromAmplifierEq, calibrateGsrSample, calibrateShimmer3RAdcChannel, calibrateStreamFrame, calibrateU12AdcValue, calibrateVector3, calibrationBlobCrc, canRecordPressesWith, channelFormatsFor, channelIdToSensorBit, channelLayoutDiffersByGeneration, checkConfigBytesValid, checkImuRateCoversPacketRate, checkSensorRules, checkWrAccelRateCoversPacketRate, classifyBaseResponse, classifyFactoryTestAckPacket, classifyLiteProtocolAck, classifyPpgLedTestFailure, classifyVerisenseDfuError, clearExgResolutionFlags, compareIf820Versions, compareInfoMemExcluding, compareVerisenseFirmwareVersion, compensateBmp180, compensateBmp280, compensateBmp390, compensateBmp581, compensatePressure, computeVerisensePairingPin, consensysBackupSegments, consensysMacFolderName, correctAudioMode, correctButtonLogMode, crc16_ccitt_false, crc32, crcTrailerBytes, createBlankVerisenseOperationalConfig, createCsvRecorder, createCsvTableWriter, createVerisenseStreamRecorder, csvCell, csvRow, decodeButtonLogMode, decodeExgRegisters, decodeExgRegsResponse, decodeSdLogFile, decodeSdLogValue, decodeSdSession, decodeVerisenseBleOptimizationResult, defaultDeviceName, defaultTrialIdentity, defaultVerisensePasskeyForId, deleteDownloadedFromCard, deriveExpPower, deriveLis2dw12AccelRate, deriveLis2dw12ConfigOnEnableChange, deriveLsm6dsvAccelGyroRate, deriveLsm6dsvRateOnEnableChange, deriveShimmer3FirmwareVersionCode, deriveVerisenseMacIdFromName, describeAudioFault, describeAudioMode, describeAudioState, describeButtonLogMode, describeEventRecord, describePlatformSupport, describeSensorRules, describeShimmerHardware, describeVerisenseChargerStatus, detectExgPreset, detectFactoryTestReportFamily, deviceWriteDivergentRanges, divisorToSamplingRate, doesPressToggleLogging, doesUndockStartLogging, downloadCsvBlob, downloadSdTree, drainByteStream, encodeAudioMode, encodeButtonLogMode, encodeExgRegisters, encodeSdPath, enforceVerisenseBluetoothOffFirmwareGuard, enforceVerisenseCommsChannelInterlock, ensureDirectoryPath, enumerateSdTree, evaluateParsedFileSplit, eventChannelBoardSupport, eventFrameLength, eventTicksToUnixMs, exgBanksEqualIgnoringStatus, exgChannelMillivoltFactor, exgConflictingSensors, exgKnobOptions, exgPresetLabel, exgRateSettingFromFreq, exgResolutionFromSensors, expectedVerisenseStreamSensorIds, expectedVerisenseStreamSensorIdsFromConfig, extractBaseLine, factoryTestReportToCsvRows, fatDateTimeToDate, formatByteArrayAsHex, formatByteAsHex, formatPendingEventProperties, formatSchedulerPayloadForLog, formatSdImportStamp, formatShimmerSrBoardName, formatShimmerSrCode, formatStatusPayloadForLog, formatVerisenseChargerStatus, formatVerisenseFirmwareVersion, formatVerisenseHardwareRevision, formatVerisenseUnixAndHuman, fwCompare, generateCalibDump, generateInfoMem, generateKinematicCalibBlock, generationFromHardwareVersion, getDefaultCalibration, getFirstPayloadIndex, getGroupDefaults, getOversamplingRatioADS1292R, getVerisenseCalibrationSensorAvailability, getVerisenseCalibrationSensors, getVerisenseHardwareCapabilities, getVerisenseHardwareFriendlyName, getVerisenseHardwareRevision, getVerisenseHardwareSensorSupport, getVerisenseStreamSensorLabel, getVerisenseStreamingBatteryVoltageMultiplier, getVerisenseSupportedOperationalFieldGroupIds, groupForCalibSensorId, gsrRangeForSample, gyroOnTheFlyWindow, hasSensorBit, hhmmToMinutesSinceMidnight, if820OtaSensorSupport, if820OtaStatusText, inferShimmer3Generation, inferVerisenseChargerChipFamily, inferVerisenseLookupBankCount, infoMemFieldsFor, inquiryNumChannelsOffset, interpretShimmer3InquiryResponse, isAckCommand, isAudioFaultFatal, isBadResponse, isBmp581PresentPerSrNumber, isButtonDisabled, isCrcMode, isDoublePress, isExgRespirationEnabled, isGenerationSensitiveChannel, isGyroOnTheFlyEnabled, isIf820OtaTransientError, isIf820UpdateAvailable, isLoggingDisabled, isNackCommand, isNewImuSensors, isRoutineVerisenseDfuLogMessage, isSafeFirmwareArchiveName, isSameShimmerSrBoard, isSdLoggingFirmware, isShimmerSrBoardAtLeast, isShimmerSrBoardValid, isSupportedEightByteDerivedSensors, isSupportedMpl, isSupportedRtcConfigViaUart, isSupportedSdLogSync, isTtlInputEnabled, isUniformByteArray, isUsbDfuUnsupportedError, isVerisenseBluetoothEnabled, isVerisenseGsrSupportedHardware, isVerisenseLightDarkChannelEnabled, isVerisenseLipoBatteryHardware, isVerisensePpgLedTestError, isVerisenseSecondGenerationHardware, joinAudioMode, joinButtonMode, keepsLinkCrcWhenSensingStops, lis2dw12AccelRateHz, listShimmerSrBoards, localCivilUnixSecondsNow, logTriggersOf, lsm6dsvAccelGyroRateHz, macShortId, makeKinematicCalibration, matrixInverse3x3, matrixMultiply3x3, minutesSinceMidnightToHHMM, msToRtcBytesLE, nearestUserButtonEnable, nextAvailableDuplicateFileName, nextReconnectDelayMs, normalizeBytePayload, normalizeOperationalConfig, nudgeGsrResistance, objectClusterColumns, objectClusterRow, padVerisenseOperationalConfig, parseActiveSlot, parseAudioFingerprintFile, parseAudioFingerprintHeader, parseAudioFingerprintRecord, parseAudioStatus, parseAudioWavHeader, parseBatteryStatus, parseBleLinkDebugPayload, parseBluetoothModuleVersion, parseBmp180Coefficients, parseBmp280Coefficients, parseBmp390Coefficients, parseBrandRecord, parseCalibDump, parseCalibrationBlob, parseDeleteRsp, parseEventChannelStatus, parseEventFile, parseEventFrame, parseEventLogPayload, parseEventRecord, parseExpansionBoard, parseFreeSpaceRsp, parseHeader, parseHexByteString, parseInfoMem, parseKinematicCalibBlock, parseListDirRsp, parseLookupTablePayload, parseMacId, parseMessage, parsePayloadCrcErrorBankIndexes, parsePendingEvents, parsePressureCalibrationResponse, parseProductionConfigPayload, parseProductionConfigPayloadFull, parseRecordBufferDetailsPayload, parseSchedulerDebugPayload, parseSdLogHeader, parseSdSessionName, parseSdTrialFolderName, parseShimmer3DeviceVersionResponse, parseShimmer3FwVersionResponse, parseShimmer3StatusBytes, parseShimmerFactoryTestReport, parseSlotOccupancy, parseSmartDockVersion, parseStatRsp, parseStatusPayload, parseUartPacket, parseVerisenseAdvertisedName, parseVerisenseFactoryTestReport, parseVersionInfo, patchSecureDfuSendOperation, planStreamResume, promiseWithTimeout, readExgField, readExgKnobs, readInfoMemFieldValue, readVerisenseOperationalFieldValue, reconnectDelayMs, recordsAudioFingerprint, recordsButtonPresses, recordsRawAudio, reorderWindowTicks, requireShimmer3FactoryTestType, requiresExpansionPower, resolveChannelFormat, resolveFieldIndex, resolveHardwarePpgSupport, resolveInfoMemLayout, resolveReconnectPolicy, resolveVerisenseSensorRateFieldKey, respirationPhaseOptions, runIf820OtaUpdate, runVerisenseDfuUpdate, samplingRateHzFromDivider, samplingRateToDivisor, sdCompanionKindOf, sdCompanionPathFor, sdCrc16, sdDataPathForCompanion, sdMessageSpan, sdStatusToString, sdXferStatusToString, selectDumpCalibrations, sensorAvailability, sensorConflicts, sensorRuleLabel, sensorRuleMask, serializeCalibrationBlob, setExgFieldPreserving, setVerisenseDfuModeWithRetry, setVerisenseOperationalBitRange, shimmer3ControlMessageLength, shimmer3FactoryTestTypeInfo, shimmer3RMayRecordAudio, shimmer3RRecordsAudio, shimmer3SensorLabel, shimmer3SupportsBatteryRequest, shimmer3SupportsExg, shimmer3SupportsSetFeature, shimmer3SupportsStatusRequest, shimmer3UsesThreeByteTimestamp, shimmer3rControlMessageLength, shimmerFactoryTestReportToCsvRows, shimmerUartCrcByte, shimmerUartCrcCalc, shimmerUartCrcCheck, shouldOverrideCalibration, slipEncode, soundLevelDbA, soundLevelEnabled, soundLevelSupportedByReadback, splitAudioMode, splitButtonMode, startAutoReconnect, statusPayloadBytesFor, summariseExgBanks, summariseExgCalibration, supportsVerisenseBluetoothOff, supportsVerisenseCalibration, supportsVerisenseMagnetometer, transportAdvice, transportAvailability, tryExtractSdMessage, twoByteCrcOverrunsStatusPush, unixSecondsToAsmRtcBytes, unixSecondsToCalibTsBytes, updateExgSetting, updateVerisenseDfuImageWithRetry, utcToLocalCivilMillis, verifyCrc, verisenseDeviceFileTag, verisenseDfuAttemptLabel, verisenseFactoryTestReportToCsvRows, verisenseStreamCsvKey, verisenseStreamCsvLayout, whenIf820OtaDeviceIdle, wiredPacketLength, withPressRecording, withSoundLevel, withoutPressRecording, writeInfoMemFieldValue, writeVerisenseOperationalFieldValue };
 //# sourceMappingURL=shimmer-web-sdk.esm.js.map
