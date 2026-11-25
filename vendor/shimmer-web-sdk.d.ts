@@ -7,7 +7,7 @@
  * from it by the Bump step in cut-release.yml — the release bumps this file
  * as well as package.json, so a published bundle reports its own version.
  */
-declare const SDK_VERSION = "0.5.22";
+declare const SDK_VERSION = "0.5.25";
 
 /**
  * Discriminated kind tag for a data field in an ObjectCluster.
@@ -12187,23 +12187,24 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * Write a whole {@link INFOMEM_SIZE}-byte configuration image, chunked, each
      * chunk resolving on its own ACK.
      *
-     * `opts.chunkBytes` defaults to **64 over a framed (BLE) transport and 128
-     * over an unframed one**. 128 is the firmware's ceiling and the page size the
-     * dock path uses, and it is what a byte stream — Classic Bluetooth over
-     * RFCOMM, or the dock UART — carries happily. Over BLE the proven size is 64:
-     * that is what the brand-record write survives on real hardware, where a
-     * 128-byte command has to cross four notifications into a firmware receive
-     * buffer that has overflowed on smaller records before (DEV-802). Pass
-     * `chunkBytes` to override either default.
+     * `opts.chunkBytes` defaults to **128 on every transport**, so the image goes
+     * out as whole pages at 0, 128 and 256: the dock path's page-at-a-time write,
+     * and what Consensys sends. 128 is also the firmware's ceiling for the
+     * command.
      *
-     * Note that 64-byte chunks split each page in two, and the firmware does its
-     * own bookkeeping on a chunk that starts exactly at a page base: writing
-     * offset 0 makes it regenerate the calibration dump from config bytes, and
-     * writing offset 128 makes it overwrite the MAC bytes and (on a Shimmer3R)
-     * regenerate the dump again (`Comms/shimmer_bt_uart.c:1322-1360`). It also
-     * runs `checkAndCorrectConfig` after every chunk, so a page is briefly half
-     * old and half new — the same window the page-at-a-time dock write has
-     * between pages, not a new one.
+     * Pass a smaller `chunkBytes` only for a device whose firmware has the
+     * DEV-1562 fix, or for a test. Firmware up to v1.01.027 keeps calibration
+     * from a chunk only when the chunk starts at 0 or 128, so 64-byte chunks
+     * silently revert the gyro, mag and wide-range accel calibration there. See
+     * {@link INFOMEM_WRITE_CHUNK_BYTES}.
+     *
+     * The firmware does its own bookkeeping on a chunk that starts exactly at a
+     * page base: writing offset 0 makes it regenerate the calibration dump from
+     * config bytes, and writing offset 128 makes it overwrite the MAC bytes and
+     * (on a Shimmer3R) regenerate the dump again
+     * (`Comms/shimmer_bt_uart.c:1322-1360`). It also runs `checkAndCorrectConfig`
+     * after every chunk, so between pages the image is briefly part old and part
+     * new, the same window the dock write has.
      *
      * Refuses while this client believes it is streaming: the firmware NACKs a
      * SET mid-stream, and a NACK partway through would leave a half-written image
@@ -12314,9 +12315,9 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      */
     private _infoMemCtx;
     /**
-     * Chunk size for an InfoMem write: the caller's value when given, else 64 on
-     * a framed (BLE) transport and the firmware's full 128 on a byte stream.
-     * See {@link writeInfoMemBytes} for why the BLE default is lower.
+     * Chunk size for an InfoMem or calibration-dump write: the caller's value
+     * when given, else one whole 128-byte page on every transport. See
+     * {@link INFOMEM_WRITE_CHUNK_BYTES} for why it is not smaller over BLE.
      */
     private _infoMemChunkBytes;
     /**
@@ -12572,8 +12573,11 @@ declare class Shimmer3RClient extends BaseShimmerClient {
      * remainder in ("starting with offset > 2 is not accepted",
      * `Calibration/shimmer_calibration.c:343-346`), so an out-of-order write is
      * silently discarded — and discarded without a NACK, since the handler
-     * ignores `ShimCalib_ramWrite`'s failure return. Chunk size follows the same
-     * rule as {@link writeInfoMemBytes}: 64 over BLE, 128 over a byte stream.
+     * ignores `ShimCalib_ramWrite`'s failure return. Chunks default to 128 bytes
+     * on every transport, as {@link writeInfoMemBytes} does, and 128 is the most
+     * `ShimCalib_ramWrite` takes. The dump has no alignment rule of its own; it
+     * shares the InfoMem default because the 64-byte BLE size both used came from
+     * a Verisense limit ({@link INFOMEM_WRITE_CHUNK_BYTES}).
      *
      * A dump written here is NOT the last word on the device's calibration: the
      * firmware regenerates its dump FROM the configuration bytes whenever InfoMem
@@ -18133,6 +18137,13 @@ declare class VerisenseBleDevice extends BaseShimmerClient {
      * operation: it blocks the device for ~1-2 minutes while the hub flash is
      * erased and each page is written. Only SR68 Pulse+ hardware (the only board
      * carrying the hub) accepts it — other hardware NACKs the BEGIN stage.
+     *
+     * The image is refused, before anything is sent, unless its header says
+     * `msbl` and names the hub's die, `MAX32670`. BEGIN erases the hub's
+     * application and the device does not read the target, so an image for
+     * another part, such as a MAX32664's (`MAX32660`), would leave the hub empty.
+     * The C-keyed and development-keyed builds both name `MAX32670`, so this
+     * cannot tell which key an image carries.
      *
      * @param msbl       raw .msbl file bytes
      * @param onProgress optional progress callback (pagesDone, totalPages)
