@@ -13,7 +13,7 @@
      * from it by the Bump step in cut-release.yml — the release bumps this file
      * as well as package.json, so a published bundle reports its own version.
      */
-    const SDK_VERSION = '0.5.26';
+    const SDK_VERSION = '0.5.27';
 
     /**
      * Container for a single decoded sensor frame.
@@ -9548,6 +9548,62 @@
             (out[group] ?? (out[group] = {}))[record.range] = parsed;
         }
         return out;
+    }
+
+    /**
+     * A Shimmer3 still holding the pre-2025 KXTC9-2050 default calibration
+     * (DEV-1528; the rule was agreed on DEV-1521).
+     *
+     * The KXTC9-2050 low-noise accelerometer's output is ratiometric to its
+     * supply: Kionix specifies 1.65 V at zero g and 660 mV/g at Vdd = 3.3 V, with
+     * an offset and a sensitivity ratiometric error. Every Shimmer3 board that
+     * carries it runs it from the 3.0 V rail that is also the ADC's reference, so
+     * it reads 2047 at zero g and 83 counts per m/s², the KXRB5-2042's figures and
+     * this SDK's `shimmer3-new` defaults. Firmware before DEV-4 (log-and-stream-common
+     * `8dce5c2`, Feb 2025) wrote 2253 and 92, the 3.3 V figures, into a new-IMU
+     * unit's own default calibration record, and a unit first set up then still
+     * carries that record. Applied as it stands, it makes the low-noise accel read
+     * gravity about 17 % high.
+     *
+     * The rule is to warn, never to substitute: a host that quietly applied
+     * 2047/83 instead would change a customer's calibrated output partway through
+     * their use, after nothing more than an update. So the record stays in force,
+     * output stays exactly as it was, and the user is told to recalibrate.
+     */
+    /** The offset the pre-2025 firmware wrote for a KXTC9-2050, per axis. */
+    const STALE_KXTC9_DEFAULT_OFFSET = 2253;
+    /** The sensitivity the pre-2025 firmware wrote for a KXTC9-2050, per axis. */
+    const STALE_KXTC9_DEFAULT_SENSITIVITY = 92;
+    /**
+     * The Kionix low-noise accel's default alignment, row-major: the alignment the
+     * stale record carries (stored as int8 × 100: 0, −100, 0, −100, 0, 0, 0, 0, −100).
+     */
+    const KIONIX_DEFAULT_ALIGNMENT = [0, -1, 0, -1, 0, 0, 0, 0, -1];
+    /** What a host tells the user once per connection or SD file when it finds the record. */
+    const STALE_LN_ACCEL_DEFAULT_WARNING = "This sensor's low-noise accelerometer still has the pre-2025 default calibration " +
+        '(offset 2253, sensitivity 92), which reads about 17 % high on a Shimmer3. Raw data is ' +
+        'unaffected. Recalibrate the low-noise accelerometer in Consensys to correct it.';
+    /**
+     * True when a Shimmer3 low-noise accel calibration is exactly the pre-2025
+     * KXTC9-2050 default: offset 2253 and sensitivity 92 on every axis, with the
+     * Kionix default alignment.
+     *
+     * Values alone decide it, with no timestamp or board condition: the firmware
+     * wrote the record with a zero timestamp, but a host that wrote its own old
+     * defaults back to a unit would have stored the same values with a real one,
+     * and either way they are wrong for the hardware. A real calibration never
+     * lands on exactly these numbers. Callers apply it to a Shimmer3's low-noise
+     * accel only; a Shimmer3R's LSM6DSV has nothing to do with it.
+     */
+    function isStaleKxtc9DefaultCalibration(cal) {
+        if (!cal)
+            return false;
+        return (cal.offset.length === 3 &&
+            cal.offset.every((v) => v === STALE_KXTC9_DEFAULT_OFFSET) &&
+            cal.sensitivity.length === 3 &&
+            cal.sensitivity.every((v) => v === STALE_KXTC9_DEFAULT_SENSITIVITY) &&
+            cal.alignment.length === 9 &&
+            cal.alignment.every((v, i) => v === KIONIX_DEFAULT_ALIGNMENT[i]));
     }
 
     /**
@@ -20040,6 +20096,12 @@
              */
             this._adoptedDump = null;
             /**
+             * Whether this link has already warned that a Shimmer3's low-noise accel
+             * calibration is the pre-2025 KXTC9-2050 default (DEV-1528): once per link,
+             * however often the calibration is re-picked.
+             */
+            this._staleLnAccelWarned = false;
+            /**
              * What {@link readSrBoard} last read on this link (`board` is null for a
              * blank id page), or null when it has not been read. Kept as read rather
              * than as a generation, so that the version read may land before it or
@@ -20902,6 +20964,7 @@
             this._deviceCalibrations = {};
             this._dumpCalibrations = {};
             this._adoptedDump = null;
+            this._staleLnAccelWarned = false;
             this._btCommandCalibrations = {};
             this._exgBanks = null;
             this._exgBanksSource = null;
@@ -24081,6 +24144,28 @@
                     next[group] = fromCommand.cal;
             }
             this._deviceCalibrations = next;
+            this._warnIfStaleLnAccelCalibration();
+        }
+        /**
+         * True when a Shimmer3's low-noise accel is being calibrated against the
+         * pre-2025 KXTC9-2050 default record (offset 2253, sensitivity 92), which
+         * reads about 17 % high. See `isStaleKxtc9DefaultCalibration`.
+         */
+        _lnAccelCalibrationIsStaleDefault() {
+            return (this.generation === 'shimmer3' &&
+                isStaleKxtc9DefaultCalibration(this._deviceCalibrations.lnAccel));
+        }
+        /**
+         * Say so, once per link, when the calibration now in force is that stale
+         * record (DEV-1528). It stays in force: substituting the corrected defaults
+         * would change a user's calibrated output partway through their use, so the
+         * output is left exactly as it was and the user is told to recalibrate.
+         */
+        _warnIfStaleLnAccelCalibration() {
+            if (this._staleLnAccelWarned || !this._lnAccelCalibrationIsStaleDefault())
+                return;
+            this._staleLnAccelWarned = true;
+            this._emitStatus(STALE_LN_ACCEL_DEFAULT_WARNING);
         }
         /**
          * Take the calibration a device just handed over as a dump and use it for
@@ -24154,6 +24239,7 @@
                     source,
                     usingDefaultCalibration: source === 'default',
                     unit: defaults.unit,
+                    staleDefault: group === 'lnAccel' && this._lnAccelCalibrationIsStaleDefault(),
                 };
             }
             const gyroBase = this._deviceCalibrations.gyro ??
@@ -27525,6 +27611,8 @@
                     this._drainControl();
                 }
             };
+            /** Whether this link has already warned of a stale LN accel record (DEV-1528). */
+            this._staleLnAccelWarned = false;
             this._injectedTransport = opts.transport ?? null;
             this._forceTimestampFmt = opts.timestampFmt;
             this._timestampFmt = opts.timestampFmt ?? SHIMMER3_DEFAULTS.TIMESTAMP_FMT;
@@ -29147,8 +29235,28 @@
             this._exgBanks = null;
             this._exgBanksSource = null;
             this._pressureCalibration = null;
+            this._staleLnAccelWarned = false;
             // Its estimates are of the old device's gyro, against the old calibration.
             this._gyroOnTheFly.reset();
+        }
+        /**
+         * True when the low-noise accel is being calibrated against the pre-2025
+         * KXTC9-2050 default record (offset 2253, sensitivity 92), which reads about
+         * 17 % high. See `isStaleKxtc9DefaultCalibration`.
+         */
+        _lnAccelCalibrationIsStaleDefault() {
+            return isStaleKxtc9DefaultCalibration(this._deviceCalibrations.lnAccel);
+        }
+        /**
+         * Say so, once per link, when the calibration now in force is that stale
+         * record (DEV-1528). It stays in force; see the Shimmer3R client's method of
+         * the same name for why.
+         */
+        _warnIfStaleLnAccelCalibration() {
+            if (this._staleLnAccelWarned || !this._lnAccelCalibrationIsStaleDefault())
+                return;
+            this._staleLnAccelWarned = true;
+            this._emitStatus(STALE_LN_ACCEL_DEFAULT_WARNING);
         }
         /**
          * Re-pick which stored calibration applies to each inertial group at the
@@ -29170,6 +29278,7 @@
                     next[group] = fromCommand.cal;
             }
             this._deviceCalibrations = next;
+            this._warnIfStaleLnAccelCalibration();
         }
         /**
          * Take a calibration dump this device just produced and use it for streaming.
@@ -29213,6 +29322,7 @@
                     source,
                     usingDefaultCalibration: source === 'default',
                     unit: defaults.unit,
+                    staleDefault: group === 'lnAccel' && this._lnAccelCalibrationIsStaleDefault(),
                 };
             }
             const gyroBase = this._deviceCalibrations.gyro ??
@@ -32089,12 +32199,21 @@
             const usingDefault = parsed === null;
             const calibration = parsed ?? def.calibration;
             entries.push({ group: spec.group, indices: [xi, yi, zi], calibration });
+            // DEV-1528: a Shimmer3 header still carrying the pre-2025 KXTC9-2050
+            // default record. It stays the calibration applied - the output is left
+            // as it was - and the header says so, once (the plan is built more than
+            // once for a session's first file).
+            const staleDefault = spec.group === 'lnAccel' && family !== 'shimmer3r' && isStaleKxtc9DefaultCalibration(parsed);
+            if (staleDefault && !header.warnings.includes(STALE_LN_ACCEL_DEFAULT_WARNING)) {
+                header.warnings.push(STALE_LN_ACCEL_DEFAULT_WARNING);
+            }
             const entryInfo = {
                 group: spec.group,
                 unit: def.unit,
                 usingDefaultCalibration: usingDefault,
                 source: usingDefault ? 'default' : 'sd-header',
                 range: spec.range,
+                staleDefault,
             };
             if (spec.group === 'gyro') {
                 const enabled = isGyroOnTheFlyEnabled(header.derivedSensorsBig);
@@ -41388,6 +41507,9 @@
     exports.SOUND_LEVEL_NO_LEVEL = SOUND_LEVEL_NO_LEVEL;
     exports.SOUND_LEVEL_UNIT = SOUND_LEVEL_UNIT;
     exports.SR_BOARD = SR_BOARD;
+    exports.STALE_KXTC9_DEFAULT_OFFSET = STALE_KXTC9_DEFAULT_OFFSET;
+    exports.STALE_KXTC9_DEFAULT_SENSITIVITY = STALE_KXTC9_DEFAULT_SENSITIVITY;
+    exports.STALE_LN_ACCEL_DEFAULT_WARNING = STALE_LN_ACCEL_DEFAULT_WARNING;
     exports.STREAM_MODE = STREAM_MODE;
     exports.SdLogFormatError = SdLogFormatError;
     exports.SdTransferError = SdTransferError;
@@ -41690,6 +41812,7 @@
     exports.isSdLoggingFirmware = isSdLoggingFirmware;
     exports.isShimmerSrBoardAtLeast = isShimmerSrBoardAtLeast;
     exports.isShimmerSrBoardValid = isShimmerSrBoardValid;
+    exports.isStaleKxtc9DefaultCalibration = isStaleKxtc9DefaultCalibration;
     exports.isSupportedEightByteDerivedSensors = isSupportedEightByteDerivedSensors;
     exports.isSupportedMpl = isSupportedMpl;
     exports.isSupportedRtcConfigViaUart = isSupportedRtcConfigViaUart;
